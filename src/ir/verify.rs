@@ -1260,6 +1260,17 @@ fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
     if expected == actual {
         return true;
     }
+    // A widthless scalar (`UInt(None)` / `SInt(None)`) is signedness
+    // metadata on a 64-bit value with no declared width — file-scope
+    // const / enum-variant substitution emits these (#525). For width
+    // compatibility it is the same wildcard `Unknown` was before the
+    // substitution carried signedness: assignable into (and from) any
+    // scalar local, exactly the pre-#525 accepted set.
+    let widthless =
+        |t: &IrType| matches!(t, IrType::UInt(None) | IrType::SInt(None));
+    if widthless(expected) || widthless(actual) {
+        return true;
+    }
     match (expected, actual) {
         (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
         | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,

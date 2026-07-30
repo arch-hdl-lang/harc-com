@@ -296,7 +296,7 @@ end test T"#,
 /// 64-bit fold does not model. Folding them as plain ops would
 /// silently change their meaning, so they reject structurally.
 #[test]
-fn const_wrap_operator_is_unsupported() {
+fn const_wrap_operator_is_rejected_without_v1_suggestion() {
     let err = lower_src(
         r#"const BAD : uint<8> = 255 +% 1
 
@@ -308,10 +308,135 @@ test T
 end test T"#,
     )
     .expect_err("wrap-op const initializer must fail lowering");
-    let msg = assert_unsupported(&err);
+    // `Invalid`, not `Unsupported`: v1 emits wrap ops UNMASKED into the
+    // constexpr initializer (255 +% 1 gives 256 at uint<8> under v1),
+    // so the diagnostic must not steer users to `--codegen v1`.
+    let msg = assert_invalid(&err);
     assert!(
         msg.contains("const BAD") && msg.contains("+% -% *%"),
         "wrap-op rejection must name the const and the operators; got: {msg}"
+    );
+}
+
+/// Adversarial-review finding (#524 follow-up): const and enum-variant
+/// substitution emits widthless `UInt(None)`/`SInt(None)` literals, and
+/// assigning one into an explicitly width-typed local must verify — this
+/// exact shape (`let x : uint<8> = K`) hit an internal verifier error
+/// ("assigns UInt(None) into local declared UInt(Some(8))") because the
+/// wildcard exemption only covered `IrType::Unknown`.
+#[test]
+fn const_and_enum_assign_to_typed_local() {
+    let cpp = emit_cpp_src(
+        r#"const K : uint<32> = 5
+const NEG : sint<8> = -1
+enum Color { RED, GREEN, BLUE }
+
+test T
+    let dut : Top
+    run
+        let x : uint<8> = K
+        let c : uint<2> = GREEN
+        let s : sint<8> = NEG
+        x = K
+        assert x == 5 else fail("x")
+        assert c == 1 else fail("c")
+        assert s == NEG else fail("s")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((uint64_t)(5))"),
+        "const substitution into typed locals must emit; got:\n{cpp}"
+    );
+}
+
+/// Adversarial-review finding (#524 follow-up): a literal mask bounds a
+/// shift operand's width, so `(wide & 0xFF) >> 4` is a 64-bit-safe shift
+/// even when `wide` is `uint<128>` — the guard must not reject it (it
+/// did, by taking the max over `&` operands). The unmasked wide operand
+/// must still reject, in BOTH directions — `<<` previously had no guard
+/// and silently emitted a wrong 64-bit shift.
+#[test]
+fn wide_shift_guard_is_mask_aware_and_symmetric() {
+    let masked = r#"const M : uint<8> = 0xF0
+
+test T
+    let dut : Top
+    run
+        let wide : uint<128> = 240
+        let x : uint<8> = (wide & 0xFF) >> 4
+        assert x == 15 else fail("x=${x}")
+    end run
+end test T"#;
+    let cpp = emit_cpp_src(masked);
+    assert!(
+        cpp.contains(">> 4"),
+        "masked wide operand must emit a plain 64-bit shift; got:\n{cpp}"
+    );
+
+    for (expr, dir) in [("wide >> 1", "right"), ("wide << 1", "left")] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        let wide : uint<128> = 1
+        let x : uint<64> = {expr}
+        assert x == 2 else fail("x")
+    end run
+end test T"#
+        );
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).expect("lowers");
+        verify::verify_program(&prog).expect("verifies");
+        let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+            .expect_err("unmasked wide shift must fail emission");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains(&format!("{dir} shift above 64 bits")),
+            "wide `{expr}` must reject with a {dir}-shift emit error; got: {msg}"
+        );
+    }
+}
+
+/// Adversarial-review finding (#524 follow-up): a `sint<W>` initializer's
+/// bit pattern is reinterpreted as signed two's complement before the
+/// range check — the mod-2^64 conversion C++20 defines and v1 performs.
+/// `sint<63> = ~0` is -1 (v1 agrees), consistent with `sint<64>`, which
+/// already accepted the same pattern.
+#[test]
+fn const_sint_reinterprets_high_bit_patterns() {
+    let cpp = emit_cpp_src(
+        r#"const ALL63 : sint<63> = 0xFFFFFFFFFFFFFFFF
+const CASTNEG : sint<8> = (0 - 1) as uint<8>
+
+test T
+    let dut : Top
+    run
+        assert ALL63 == 0 - 1 else fail("a")
+        assert CASTNEG == 0 - 1 else fail("c")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(-1))"),
+        "sint reinterpretation must store -1; got:\n{cpp}"
+    );
+    // Positive patterns still range-check: 255 has no negative reading.
+    let err = lower_src(
+        r#"const BAD : sint<8> = 0xFF
+
+test T
+    let dut : Top
+    run
+        assert BAD == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("positive out-of-range sint must still reject");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("does not fit `sint<8>`"),
+        "positive sint overflow must reject; got: {msg}"
     );
 }
 
@@ -514,6 +639,12 @@ end test T"#,
         cpp.contains("255") && cpp.contains("9223372036854775807"),
         "boundary consts must fold to their exact values; got:\n{cpp}"
     );
+    // S8_MIN is a signed const — its use site must emit the signed
+    // literal -128, not the raw 64-bit pattern.
+    assert!(
+        cpp.contains("((int64_t)(-128))"),
+        "sint<8> minimum must substitute as -128; got:\n{cpp}"
+    );
 }
 
 /// #521: illegal evaluations get precise diagnostics naming the const
@@ -571,6 +702,13 @@ end test T"#,
     assert!(
         cpp.contains("18446744073709551615"),
         "relabel-cast const must keep the bit pattern; got:\n{cpp}"
+    );
+    // BACK = (255 as sint<64>) >> 8 — the arithmetic shift of a
+    // positive value is 0, and it must substitute as the signed zero
+    // literal, proving the cast+shift actually folded.
+    assert!(
+        cpp.contains("((int64_t)(0))"),
+        "BACK must fold to signed 0; got:\n{cpp}"
     );
 }
 

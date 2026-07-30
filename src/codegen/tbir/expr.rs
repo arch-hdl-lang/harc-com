@@ -333,12 +333,20 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let a_width = expr_shift_width(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
-            if matches!(op, BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
-                return Err(EmitError(
-                    "right shift above 64 bits is not supported by the TB-IR C++ value model; \
+            // Both shift directions share the guard: the emitter's shift
+            // implementation is 64-bit, so a >64-bit operand must reject
+            // loudly instead of silently truncating (`<<` previously had
+            // no guard and emitted a wrong `((uint64_t)(wide)) << n`).
+            if matches!(op, BinOp::Shl | BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
+                let dir = if matches!(op, BinOp::Shl) {
+                    "left"
+                } else {
+                    "right"
+                };
+                return Err(EmitError(format!(
+                    "{dir} shift above 64 bits is not supported by the TB-IR C++ value model; \
                      use --codegen v1 for wide shifts"
-                        .to_string(),
-                ));
+                )));
             }
             match op {
                 BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
@@ -745,10 +753,26 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
 /// Conservative width propagation for shift operands. Unlike the ordinary
 /// expression-width helper, this takes the maximum known operand/branch
 /// width so a wide value cannot hide behind a narrow sibling and reach the
-/// TB-IR emitter's 64-bit shift implementation.
+/// TB-IR emitter's 64-bit shift implementation. The one narrowing case is
+/// `&`: a mask genuinely bounds the result (`wide & 0xFF` is 8 bits no
+/// matter how wide the other operand is), so `&` takes the minimum of its
+/// known operand bounds, with literal masks bounded by their significant
+/// bits rather than their (widthless) type.
 fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     match e {
         Expr::WideLiteral(words) => words.len().checked_mul(32).map(|w| w as u32),
+        Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
+            let bound = |e: &Expr| -> Option<u32> {
+                if let Expr::Literal { value, .. } = e {
+                    return Some((64 - value.leading_zeros()).max(1));
+                }
+                expr_shift_width(cx, e)
+            };
+            match (bound(lhs), bound(rhs)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (w, None) | (None, w) => w,
+            }
+        }
         Expr::Binary(_, lhs, rhs) => expr_shift_width(cx, lhs).max(expr_shift_width(cx, rhs)),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_shift_width(cx, then_expr).max(expr_shift_width(cx, else_expr))

@@ -169,9 +169,14 @@ fn fold_const(
         // semantics the runtime lowering gives casts (`cast_relabel_width`)
         // and v1's `((uint64_t)(expr))` emission at 64-bit rank.
         ExprKind::Cast { expr, ty } => {
-            if exprs::cast_relabel_width(ty).is_none() {
+            // The runtime relabel helper accepts widths up to 128, but
+            // the const fold's value domain is 64-bit — gate at 64 so
+            // the accepted subset matches the documented one.
+            if !exprs::cast_relabel_width(ty).is_some_and(|w| w <= 64) {
                 return Err(ConstFoldErr::Unsupported(
-                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits)".into(),
+                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits) in a \
+                     constant expression"
+                        .into(),
                 ));
             }
             let v = fold_const(expr, consts, self_name)?;
@@ -236,14 +241,18 @@ fn fold_const(
                 // `+% -% *%` mask to max(W(a), W(b)) per spec §2.4, and
                 // the 64-bit fold domain does not model per-operand
                 // widths — folding them as plain ops would silently
-                // change their meaning, so they stay out of the const
-                // subset until the fold tracks operand widths.
+                // change their meaning. This is `Invalid`, not
+                // `Unsupported`: v1 emits wrap ops UNMASKED into the
+                // constexpr initializer (`255 +% 1` at `uint<8>` gives
+                // 256 under v1), so steering users to `--codegen v1`
+                // would recommend a backend that silently mis-evaluates.
                 BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
-                    Err(ConstFoldErr::Unsupported(
-                        "the wrapping `+% -% *%` operators in a constant expression \
-                         (their §2.4 mask needs static operand widths; use the plain \
-                         operator with an explicit `& ((1 << W) - 1)` mask)"
-                        .into(),
+                    Err(FoldInvalid(
+                        "the wrapping `+% -% *%` operators are not evaluable in a \
+                         constant initializer (their §2.4 mask needs static operand \
+                         widths); use the plain operator and spell the intended \
+                         wrapped value or mask explicitly"
+                            .into(),
                     ))
                 }
                 BinaryOp::Div | BinaryOp::Mod => {
@@ -371,8 +380,9 @@ fn check_const_decl_type(
                 if v.is_negative() {
                     return Err(format!(
                         "value {} does not fit `{}<{w}>` — negative values \
-                         cannot initialize an unsigned constant (wrap \
-                         explicitly with a literal or `& ((1 << {w}) - 1)`)",
+                         cannot initialize an unsigned constant (spell the \
+                         intended {w}-bit value explicitly, e.g. as a hex \
+                         literal)",
                         v.as_i64(),
                         type_keyword(name),
                     ));
@@ -393,17 +403,14 @@ fn check_const_decl_type(
         }
         BuiltinTy::SInt | BuiltinTy::SIntCap => {
             if let Some(w) = width.filter(|w| (1..64).contains(w)) {
+                // The bit pattern is reinterpreted as signed 64-bit two's
+                // complement regardless of the expression's signedness —
+                // the mod-2^64 conversion C++20 defines and v1 performs
+                // (`sint<63> = 0xFFFF_FFFF_FFFF_FFFF` is -1 under v1, and
+                // `sint<64>` already accepted the same pattern here).
                 let s = v.bits as i64;
                 let min = -(1i64 << (w - 1));
                 let max = (1i64 << (w - 1)) - 1;
-                // An unsigned fold result above i64::MAX has no signed
-                // reading; report it via its bit value.
-                if !v.signed && v.bits > i64::MAX as u64 {
-                    return Err(format!(
-                        "value {} does not fit `sint<{w}>` (range {min}..={max})",
-                        v.bits
-                    ));
-                }
                 if s < min || s > max {
                     return Err(format!(
                         "value {s} does not fit `sint<{w}>` (range {min}..={max})"
