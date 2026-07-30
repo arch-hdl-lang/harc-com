@@ -712,6 +712,49 @@ end test T"#,
     );
 }
 
+/// #524 adversarial-review finding 6: signed values keep their
+/// signedness at use sites. (a) A `sint` record field resolves through
+/// the record schema, so `s.bias >> 1` emits an arithmetic shift; (b)
+/// an explicitly `sint`-typed local declares as `int64_t` (v1's
+/// `c_type_for`), so `/`, `%`, and ordered comparisons are signed at
+/// the C++ level; (c) an untyped `let` of a signed expression infers
+/// the RHS signedness (v1's `auto` → int64_t).
+#[test]
+fn signed_use_sites_keep_signedness() {
+    let cpp = emit_cpp_src(
+        r#"const NEG : sint<8> = -1
+
+struct Sample
+    bias : sint<8>
+end struct Sample
+
+test T
+    let dut : Top
+    run
+        let s : Sample
+        s.bias = 0 - 8
+        assert (s.bias >> 1) == 0 - 4 else fail("f")
+        let t : sint<8> = 0 - 8
+        assert (t / 2) == 0 - 4 else fail("t")
+        let d = NEG
+        assert (d >> 1) == NEG else fail("d")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(s.bias)) >> 1"),
+        "sint record field must get an arithmetic shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("int64_t t = 0") && cpp.contains("int64_t d = 0"),
+        "sint-typed and signed-inferred locals must declare int64_t; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(d)) >> 1"),
+        "signed-inferred local must get an arithmetic shift; got:\n{cpp}"
+    );
+}
+
 #[test]
 fn signed_relabel_cast_preserves_narrow_source_value() {
     let cpp = emit_cpp_src(

@@ -235,6 +235,7 @@ pub(super) fn emit_function(
 ) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes,
@@ -437,6 +438,7 @@ pub(super) fn emit_tseq(
     // probe access either (`dut_type` unused → `""`).
     let empty_lanes = HashMap::new();
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -608,10 +610,12 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 /// loop-switch local model.
 pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    // Pure helpers are scalar-only: no DUT access, so no lane table and
-    // no probe access (`dut_type` unused → `""`).
+    // Pure helpers are scalar-only: no DUT access, so no lane table, no
+    // probe access (`dut_type` unused → `""`), and no record fields
+    // (`records` empty).
     let empty_lanes = HashMap::new();
     let cx = ECx {
+        records: &[],
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -1842,6 +1846,7 @@ pub(super) fn emit_method(
     // receiver.
     let has_state = uses_state_receiver(schema);
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2231,6 +2236,7 @@ pub(super) fn clause_expr_cpp(
     let empty_lanes = HashMap::new();
     // Component clause exprs read component fields, not DUT probes.
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2257,6 +2263,7 @@ pub(super) fn tb_service_expr_cpp(
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2290,6 +2297,7 @@ fn emit_component_fn_lambda(
     let empty_lanes = HashMap::new();
     // Component method/on-handler bodies are host-side; no DUT probes.
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2519,6 +2527,7 @@ pub(super) fn emit_target_actor(
         // carries the responder-instance name in its `component` field
         // (v1's `current_component_instance`), so set the trace context.
         let cx = ECx {
+            records: &prog.records,
             func,
             names: &names,
             lanes: &empty_lanes,
@@ -2821,6 +2830,7 @@ pub(super) fn emit_active_bound_driver_actor(
         // worker coroutine has no `self` parameter, unlike the synchronous
         // on-handler lambda.
         let cx = ECx {
+            records: &prog.records,
             func,
             names: &names,
             lanes: &empty_lanes,
@@ -3293,6 +3303,7 @@ pub(super) fn emit_test_hook(
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
     let cx = ECx {
+            records: &prog.records,
         func,
         names: &names,
         lanes: &empty_lanes,

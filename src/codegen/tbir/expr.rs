@@ -14,6 +14,12 @@ pub(super) struct ECx<'a> {
     pub func: &'a TbFunction,
     pub names: &'a [String],
     pub lanes: &'a HashMap<String, u32>,
+    /// Record schemas (`TbProgram::records`) for field-type lookups —
+    /// `expr_is_signed` resolves `Expr::RecordField` signedness through
+    /// these so a `sint` record field gets an arithmetic `>>` (#524
+    /// adversarial-review finding 6). Empty (`&[]`) only in contexts
+    /// that are scalar-only by construction (pure helpers).
+    pub records: &'a [crate::ir::RecordSchema],
     /// Simple name of the DUT type (`CpuPipe`). Used to form the
     /// Verilator-mangled probe accessor `dut->rootp-><DutType>__DOT__
     /// harc_probes__DOT__<name>` for `PortAccess::Probe`/`Force` reads
@@ -799,6 +805,37 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             .locals
             .get(id.0 as usize)
             .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        // A record-field read is a real C++ struct member whose C type
+        // already carries the declared signedness (`int64_t` for a
+        // `sint` field) — resolve it through the record schemas so the
+        // shift emitter picks the arithmetic form v1's raw member
+        // access gets (#524 adversarial-review finding 6). Nested paths
+        // descend through record-typed fields; `Vec` element reads use
+        // the element type carried in `ty`.
+        Expr::RecordField {
+            local, field, path, ..
+        } => {
+            let mut ty = cx
+                .func
+                .locals
+                .get(local.index())
+                .map(|l| l.ty.clone())
+                .unwrap_or(crate::ir::IrType::Unknown);
+            for seg in std::iter::once(field).chain(path.iter()) {
+                let crate::ir::IrType::Record(rid) = ty else {
+                    return false;
+                };
+                let Some(f) = cx
+                    .records
+                    .get(rid.index())
+                    .and_then(|r| r.field(seg))
+                else {
+                    return false;
+                };
+                ty = f.ty.clone();
+            }
+            matches!(ty, crate::ir::IrType::SInt(_))
+        }
         Expr::Unary(_, inner) => expr_is_signed(cx, inner),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
