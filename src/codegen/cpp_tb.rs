@@ -1281,7 +1281,86 @@ pub(crate) fn sanitize_file_component(name: &str) -> String {
 /// touches no other Emitter state. (Listing every field explicitly is
 /// deliberate: a future field addition fails to compile here, forcing a
 /// reviewer to decide whether the randomize path needs it.)
+/// Normalize `Vec<Entry, N>` element type-args on struct/transaction
+/// FIELD declarations (harc#522). The parser's type-arg heuristic parses
+/// a bare NAMED element as `TypeArg::Expr(Ident)` (only builtin heads
+/// parse as `TypeArg::Type`), a shape `fixed_vec_type_args` — and with it
+/// the member-type, default, packed-width, and pack-helper walks — cannot
+/// see: the field silently fell through to the scalar `uint64_t` mapping
+/// and every real use miscompiled in clang. Rewriting the element to
+/// `TypeArg::Type(TypeExpr::Named)` when the ident names a
+/// struct/transaction in the file routes a record-element `Vec` field
+/// through the SAME emission path as a scalar-element one
+/// (`std::array<Entry, N>` member, `{}` default, per-element
+/// `harc_pack_Entry` packing). Scoped to record field declarations —
+/// every other type position keeps the parser's shape.
+fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
+    let record_names: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Struct(s) => Some(s.name.name.as_str()),
+            Item::Transaction(t) => Some(t.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    fn normalize_ty(ty: &mut TypeExpr, record_names: &std::collections::HashSet<&str>) {
+        let TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } = ty
+        else {
+            return;
+        };
+        let Some(first) = args.first_mut() else {
+            return;
+        };
+        let TypeArg::Expr(e) = first else { return };
+        let ExprKind::Ident(id) = &*e.kind else {
+            return;
+        };
+        if !record_names.contains(id.name.as_str()) {
+            return;
+        }
+        *first = TypeArg::Type(TypeExpr::Named {
+            name: Path {
+                segments: vec![id.clone()],
+                span: e.span,
+            },
+            generics: Vec::new(),
+            mode: None,
+            span: e.span,
+        });
+    }
+    let mut out = file.clone();
+    for it in &mut out.items {
+        match it {
+            Item::Struct(s) => {
+                for f in &mut s.fields {
+                    normalize_ty(&mut f.ty, &record_names);
+                }
+                for b in &mut s.body {
+                    if let TxnBodyItem::Field(f) = b {
+                        normalize_ty(&mut f.ty, &record_names);
+                    }
+                }
+            }
+            Item::Transaction(t) => {
+                for b in &mut t.body {
+                    if let TxnBodyItem::Field(f) = b {
+                        normalize_ty(&mut f.ty, &record_names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
+    let file = &normalize_vec_record_elem_fields(file);
     // The tbir backend already desugars impl-for before lowering, so the
     // `file` handed here is classic-form; desugar again is idempotent and
     // keeps the problem-table spans aligned with v1.
@@ -1464,6 +1543,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // desugared, the test looks identical to a classic-form test
     // and threads through the existing pipeline unchanged.
     let file = desugar_impl_for_test_in_file(file);
+    // Route `Vec<Record, N>` fields through the scalar-`Vec` emission
+    // path (see `normalize_vec_record_elem_fields`, harc#522).
+    let file = normalize_vec_record_elem_fields(&file);
     let file = &file;
     let typed_solver_problem_table =
         crate::solver::problem_table::build_typed_solver_problem_table(file);
