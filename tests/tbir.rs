@@ -81,6 +81,13 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+fn emit_cpp_src_result(src: &str) -> Result<String, String> {
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
+    verify::verify_program(&prog).map_err(|e| format!("{e:?}"))?;
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).map_err(|e| e.to_string())
+}
+
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -551,6 +558,24 @@ end test T"#,
     assert!(
         cpp.contains("= ((int64_t)(byte));"),
         "as sint<64> must relabel without sign-extending a narrow source; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_wide_right_shift_is_rejected_in_tbir() {
+    let err = emit_cpp_src_result(
+        r#"test T
+    let dut : Top
+    run
+        let wide : sint<128> = 0
+        assert (wide >> 1) == 0 else fail("wide-shr")
+    end run
+end test T"#,
+    )
+    .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
+    assert!(
+        err.contains("signed right shift above 64 bits"),
+        "wide signed shift must have a targeted diagnostic; got: {err}"
     );
 }
 
