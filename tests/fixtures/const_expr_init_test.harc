@@ -1,14 +1,35 @@
-// Regression fixture for #494 P2a: file-scope `const` initializers that
-// are constant EXPRESSIONS (not just plain integer literals) must fold
-// identically under both `--codegen v1` and `--codegen tbir`. Exercises
-// shifted masks, an OR of two earlier consts, and an arithmetic form.
-// DUT `Top` (top_counter.sv) is only along for the ride so the harness
-// has something to elaborate.
+// Regression fixture for #494 P2a / #521: file-scope `const`
+// initializers that are constant EXPRESSIONS (not just plain integer
+// literals) must fold identically under both `--codegen v1` and
+// `--codegen tbir`. Exercises shifted masks, an OR of two earlier
+// consts, arithmetic forms, chained/derived constants (#521's minimal
+// example), signed constants (arithmetic `>>`, truncating `/`), and
+// boundary widths. DUT `Top` (top_counter.sv) is only along for the
+// ride so the harness has something to elaborate.
 
 const SEEN_FIRST  : uint<64> = 1 << 0
 const SEEN_SECOND : uint<64> = 1 << 1
 const SEEN_BOTH   : uint<64> = SEEN_FIRST | SEEN_SECOND
 const WIDTH_MASK  : uint<32> = (1 << 8) - 1
+
+// #521 minimal example: derived flags and counts.
+const FLAG_A : uint<32> = 1 << 0
+const FLAG_B : uint<32> = 1 << 5
+const ENABLED_FLAGS : uint<32> = FLAG_A | FLAG_B
+const ENTRY_COUNT : uint<32> = 16
+const LAST_ENTRY  : uint<32> = ENTRY_COUNT - 1
+
+// #521: signed constants evaluate with declared signedness — `>>` is
+// an arithmetic shift and `/` truncates toward zero, exactly as v1's
+// `int64_t` constexpr does.
+const NEG_ONE : sint<8>  = -1
+const NEG_SHR : sint<8>  = NEG_ONE >> 1
+const NEG_DIV : sint<32> = (0 - 7) / 2
+
+// #521: boundary widths accept their exact extremes.
+const U8_MAX   : uint<8>  = (1 << 8) - 1
+const S8_MIN   : sint<8>  = 0 - 128
+const ALL_ONES : uint<64> = ~0
 
 testbench ConstExprInitTb
     dut : Top
@@ -20,6 +41,13 @@ impl ConstExprInitTest for ConstExprInitTb
         assert SEEN_SECOND == 2 else fail("second=${SEEN_SECOND}")
         assert SEEN_BOTH == 3 else fail("both=${SEEN_BOTH}")
         assert WIDTH_MASK == 255 else fail("mask=${WIDTH_MASK}")
+        assert ENABLED_FLAGS == 0x21 else fail("flags=${ENABLED_FLAGS}")
+        assert LAST_ENTRY == 15 else fail("last=${LAST_ENTRY}")
+        assert NEG_SHR == NEG_ONE else fail("negshr=${NEG_SHR}")
+        assert NEG_DIV == 0 - 3 else fail("negdiv=${NEG_DIV}")
+        assert U8_MAX == 255 else fail("u8max=${U8_MAX}")
+        assert S8_MIN + 128 == 0 else fail("s8min=${S8_MIN}")
+        assert ALL_ONES == ~0 else fail("ones=${ALL_ONES}")
         wait 1 cycle
     end run
 end impl ConstExprInitTest
