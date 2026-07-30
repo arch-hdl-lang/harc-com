@@ -330,7 +330,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
             }
             let a_signed = expr_is_signed(cx, a);
-            let a_width = expr_static_width(cx, a);
+            let a_width = expr_shift_width(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
             if matches!(op, BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
@@ -739,6 +739,23 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::WidthCast { width, .. } => Some(*width),
         Expr::CycleCount => Some(64),
         _ => None,
+    }
+}
+
+/// Conservative width propagation for shift operands. Unlike the ordinary
+/// expression-width helper, this takes the maximum known operand/branch
+/// width so a wide value cannot hide behind a narrow sibling and reach the
+/// TB-IR emitter's 64-bit shift implementation.
+fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    match e {
+        Expr::WideLiteral(words) => words.len().checked_mul(32).map(|w| w as u32),
+        Expr::Binary(_, lhs, rhs) => expr_shift_width(cx, lhs).max(expr_shift_width(cx, rhs)),
+        Expr::Ternary(_, then_expr, else_expr) => {
+            expr_shift_width(cx, then_expr).max(expr_shift_width(cx, else_expr))
+        }
+        Expr::Unary(_, inner) => expr_shift_width(cx, inner),
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        _ => expr_static_width(cx, e),
     }
 }
 

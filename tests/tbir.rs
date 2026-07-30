@@ -570,6 +570,7 @@ fn signed_wide_right_shift_is_rejected_in_tbir() {
         let wide : sint<128> = 0
         assert (wide >> 1) == 0 else fail("wide-shr")
         assert ((wide + 1) >> 1) == 0 else fail("wide-nested-shr")
+        assert ((1 + wide) >> 1) == 0 else fail("wide-rhs-shr")
     end run
 end test T"#,
     )
