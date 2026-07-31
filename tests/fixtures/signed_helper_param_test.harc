@@ -1,0 +1,68 @@
+// Regression fixture for harc#532: a signed value routed through a pure
+// `function` helper must keep its signedness at the C++ level under BOTH
+// codegens. TB-IR previously emitted every helper param / internal local
+// / return slot as `uint64_t` unconditionally, so `/`, `%`, and ordered
+// comparisons (`< <= > >=`) computed UNSIGNED inside/around a helper —
+// diverging from `--codegen v1` (which types `sint` locals `int64_t`).
+// `>>` was already saved by the shift emitter's forced `(int64_t)` cast.
+//
+// Covers the shapes the func.rs emitter fix resolves: inline helper calls
+// through every signedness-sensitive operator, a helper with a signed
+// INTERNAL local (not just a param), a bool-returning comparison helper,
+// and an explicitly-`sint`-typed stored result reused in a signed op.
+// DUT `Top` (top_counter.sv) is only along for the ride to elaborate.
+
+function div2(x: sint<8>) -> sint<8>
+    return x / 2
+end function div2
+
+function mod3(x: sint<8>) -> sint<8>
+    return x % 3
+end function mod3
+
+function shr1(x: sint<8>) -> sint<8>
+    return x >> 1
+end function shr1
+
+function isneg(x: sint<8>) -> bool
+    return x < 0
+end function isneg
+
+function le_zero(x: sint<8>) -> bool
+    return x <= 0
+end function le_zero
+
+// Signed arithmetic through an INTERNAL signed local, not just the param.
+function halve_twice(x: sint<16>) -> sint<16>
+    let h : sint<16> = x / 2
+    return h / 2
+end function halve_twice
+
+testbench SignedHelperParamTb
+    dut : Top
+end testbench SignedHelperParamTb
+
+impl SignedHelperParamTest for SignedHelperParamTb
+    run
+        let a : sint<8> = 0 - 8
+
+        // Inline calls — every signedness-sensitive operator.
+        assert div2(a) == 0 - 4 else fail("div2=${div2(a)}")
+        assert mod3(a) == 0 - 2 else fail("mod3=${mod3(a)}")
+        assert shr1(a) == 0 - 4 else fail("shr1=${shr1(a)}")
+        assert isneg(a) else fail("isneg=${isneg(a)}")
+        assert le_zero(a) else fail("le_zero=${le_zero(a)}")
+        assert le_zero(0) else fail("le_zero0")
+
+        // Internal signed local inside the helper.
+        let b : sint<16> = 0 - 16
+        assert halve_twice(b) == 0 - 4 else fail("halve_twice=${halve_twice(b)}")
+
+        // Explicitly-typed stored result reused in a signed op.
+        let r : sint<8> = div2(a)
+        assert (r / 2) == 0 - 2 else fail("stored_div r/2=${r / 2}")
+        assert r < 0 else fail("stored_lt r=${r}")
+
+        wait 1 cycle
+    end run
+end impl SignedHelperParamTest
