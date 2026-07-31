@@ -755,6 +755,52 @@ end test T"#,
     );
 }
 
+/// #530 residual (#524 adversarial-review finding 6): signed HOST-STATE
+/// members — `_tb` scalar fields, component/scoreboard scalar fields —
+/// resolve their declared signedness through the owning schema, so
+/// `>>` on them emits the arithmetic form v1's raw member access gets.
+/// (Transactor state is covered end-to-end by
+/// `signed_state_field_test.harc`; it needs a bus-bound DUT.)
+#[test]
+fn signed_host_state_keeps_signedness() {
+    let cpp = emit_cpp_src(
+        r#"scoreboard MSb
+    delta : sint<8> default 0
+
+    hookable half() -> sint<8>
+        return delta >> 1
+    end half
+end scoreboard MSb
+
+testbench HTb
+    dut : Top
+    bias : sint<8> default 0
+end testbench HTb
+
+impl HTest for HTb
+    let env : MSb
+
+    run
+        bias = 0 - 8
+        assert (bias >> 1) == 0 - 4 else fail("t")
+        assert (env.delta >> 1) == 0 - 4 else fail("p")
+    end run
+end impl HTest"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(_tb.bias)) >> 1"),
+        "sint _tb field must get an arithmetic shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(self.delta)) >> 1"),
+        "sint component field read in a method must get an arithmetic shift; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(env.delta)) >> 1"),
+        "sint component field read by path must get an arithmetic shift; got:\n{cpp}"
+    );
+}
+
 #[test]
 fn signed_relabel_cast_preserves_narrow_source_value() {
     let cpp = emit_cpp_src(

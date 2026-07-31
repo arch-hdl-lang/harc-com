@@ -1,0 +1,46 @@
+// Regression fixture for the #530 residual (#524 adversarial-review
+// finding 6): signed HOST-STATE members must keep their declared
+// signedness at use sites under both codegens — testbench scalar
+// fields, component/scoreboard scalar fields (read self-relatively
+// inside a method and by dotted path from the test), and the values
+// they feed. All members emit as `int64_t` struct fields in both
+// backends; the TB-IR shift emitter must resolve their schemas rather
+// than defaulting to an unsigned wrap. DUT `Top` (top_counter.sv) is
+// only along for the ride.
+
+scoreboard SignedModelSb
+    delta : sint<8> default 0
+
+    hookable set_delta(v: sint<8>)
+        delta = v
+    end set_delta
+
+    hookable half() -> sint<8>
+        return delta >> 1
+    end half
+end scoreboard SignedModelSb
+
+env SignedModelEnv
+    sb : SignedModelSb
+end env SignedModelEnv
+
+testbench SignedHostStateTb
+    dut : Top
+    bias : sint<8> default 0
+end testbench SignedHostStateTb
+
+impl SignedHostStateTest for SignedHostStateTb
+    let env : SignedModelEnv
+
+    run
+        bias = 0 - 8
+        assert (bias >> 1) == 0 - 4 else fail("tbshr=${bias >> 1}")
+        assert (bias / 2) == 0 - 4 else fail("tbdiv=${bias / 2}")
+
+        env.sb.set_delta(0 - 8)
+        let h : sint<8> = env.sb.half()
+        assert h == 0 - 4 else fail("selfshr=${h}")
+        assert (env.sb.delta >> 1) == 0 - 4 else fail("pathshr=${env.sb.delta >> 1}")
+        wait 1 cycle
+    end run
+end impl SignedHostStateTest

@@ -54,6 +54,8 @@ int_regs_test           | IntRegs        | int_regs.sv            |
 top_counter_test        | Top            | top_counter.sv         |
 const_expr_init_test    | Top            | top_counter.sv         |
 signed_use_site_test    | Top            | top_counter.sv         |
+signed_host_state_test  | Top            | top_counter.sv         |
+signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 msg_call_hoist_test     | Top            | top_counter.sv         |
 log_paths_test          | Top            | top_counter.sv         |
 heartbeat_idle_test     | Top            | top_counter.sv         |

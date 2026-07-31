@@ -14,12 +14,13 @@ pub(super) struct ECx<'a> {
     pub func: &'a TbFunction,
     pub names: &'a [String],
     pub lanes: &'a HashMap<String, u32>,
-    /// Record schemas (`TbProgram::records`) for field-type lookups —
-    /// `expr_is_signed` resolves `Expr::RecordField` signedness through
-    /// these so a `sint` record field gets an arithmetic `>>` (#524
-    /// adversarial-review finding 6). Empty (`&[]`) only in contexts
-    /// that are scalar-only by construction (pure helpers).
-    pub records: &'a [crate::ir::RecordSchema],
+    /// The whole program, for schema-driven type lookups —
+    /// `expr_is_signed` resolves record fields, `_tb` scalar fields,
+    /// transactor state, and component fields through it so `sint`
+    /// host state gets an arithmetic `>>` (#524 adversarial-review
+    /// finding 6 + residual). `None` only in contexts that are
+    /// scalar-only by construction (pure helpers).
+    pub prog: Option<&'a crate::ir::TbProgram>,
     /// Simple name of the DUT type (`CpuPipe`). Used to form the
     /// Verilator-mangled probe accessor `dut->rootp-><DutType>__DOT__
     /// harc_probes__DOT__<name>` for `PortAccess::Probe`/`Force` reads
@@ -795,37 +796,79 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             .locals
             .get(id.0 as usize)
             .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
-        // A record-field read is a real C++ struct member whose C type
-        // already carries the declared signedness (`int64_t` for a
-        // `sint` field) — resolve it through the record schemas so the
-        // shift emitter picks the arithmetic form v1's raw member
-        // access gets (#524 adversarial-review finding 6). Nested paths
-        // descend through record-typed fields; `Vec` element reads use
-        // the element type carried in `ty`.
+        // Host-state member reads are real C++ struct members whose C
+        // type already carries the declared signedness (`int64_t` for a
+        // `sint` field — every host-state struct emission maps SInt so).
+        // Resolve the declared type through the owning schema so the
+        // shift emitter picks the arithmetic form v1's raw member access
+        // gets (#524 adversarial-review finding 6 + residual: record
+        // fields, `_tb` scalar fields, transactor state, component
+        // fields).
         Expr::RecordField {
             local, field, path, ..
         } => {
-            let mut ty = cx
+            let ty = cx
                 .func
                 .locals
                 .get(local.index())
                 .map(|l| l.ty.clone())
                 .unwrap_or(crate::ir::IrType::Unknown);
-            for seg in std::iter::once(field).chain(path.iter()) {
-                let crate::ir::IrType::Record(rid) = ty else {
-                    return false;
-                };
-                let Some(f) = cx
-                    .records
-                    .get(rid.index())
-                    .and_then(|r| r.field(seg))
-                else {
-                    return false;
-                };
-                ty = f.ty.clone();
-            }
-            matches!(ty, crate::ir::IrType::SInt(_))
+            record_path_is_sint(cx, ty, std::iter::once(field).chain(path.iter()))
         }
+        Expr::TbField(field) => owner_tb(cx)
+            .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| matches!(f.ty, crate::ir::IrType::SInt(_))),
+        Expr::TransactorState { instance, field } => state_transactor(cx, instance)
+            .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::StateFieldKind::Scalar {
+                        ty: crate::ir::IrType::SInt(_),
+                        ..
+                    }
+                )
+            }),
+        Expr::TransactorStateRecordField {
+            instance,
+            field,
+            path,
+        } => state_transactor(cx, instance)
+            .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| match f.kind {
+                crate::ir::StateFieldKind::Record { record } => {
+                    record_path_is_sint(cx, crate::ir::IrType::Record(record), path.iter())
+                }
+                _ => false,
+            }),
+        Expr::ComponentField { base, field } => component_of_base(cx, base)
+            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::ComponentFieldKind::Scalar {
+                        ty: crate::ir::IrType::SInt(_),
+                        ..
+                    }
+                )
+            }),
+        Expr::ScoreboardQuery {
+            sb,
+            query: crate::ir::ScoreboardQuery::Scalar { scalar },
+            ..
+        } => cx
+            .prog
+            .and_then(|p| p.scoreboards.get(sb.index()))
+            .and_then(|s| s.fields.iter().find(|f| f.name == *scalar))
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::ScoreboardFieldKind::Scalar {
+                        ty: crate::ir::IrType::SInt(_),
+                        ..
+                    }
+                )
+            }),
         Expr::Unary(_, inner) => expr_is_signed(cx, inner),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
@@ -837,6 +880,113 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             _ => expr_is_signed(cx, lhs) && expr_is_signed(cx, rhs),
         },
         _ => false,
+    }
+}
+
+/// Walk `segs` from `ty` through record-typed fields and report whether
+/// the final leaf is a `sint`. Nested paths descend record fields; `Vec`
+/// element reads use the element type carried in the field's `ty`.
+fn record_path_is_sint<'a>(
+    cx: &ECx<'_>,
+    mut ty: crate::ir::IrType,
+    segs: impl Iterator<Item = &'a String>,
+) -> bool {
+    let Some(prog) = cx.prog else { return false };
+    for seg in segs {
+        let crate::ir::IrType::Record(rid) = ty else {
+            return false;
+        };
+        let Some(f) = prog.records.get(rid.index()).and_then(|r| r.field(seg)) else {
+            return false;
+        };
+        ty = f.ty.clone();
+    }
+    matches!(ty, crate::ir::IrType::SInt(_))
+}
+
+/// The testbench schema owning the function being emitted, when known.
+fn owner_tb<'a>(cx: &ECx<'a>) -> Option<&'a crate::ir::TestbenchSchema> {
+    cx.prog?.testbenches.get(cx.func.owner?.index())
+}
+
+/// The transactor schema owning `instance`'s persistent state. An empty
+/// instance means we are inside a shared method/responder body (the
+/// state-receiver ABI) — resolve by the body's own function id instead
+/// of the (not-yet-bound) instance name.
+fn state_transactor<'a>(cx: &ECx<'a>, instance: &str) -> Option<&'a crate::ir::TransactorSchema> {
+    let prog = cx.prog?;
+    // Inside a shared method/responder body the state field belongs to
+    // the transactor owning the body itself — resolve by function id.
+    // This also covers a body whose reads carry a baked-in instance
+    // name (single-instance bound targets): the body has no owning
+    // testbench, so the named lookup below cannot apply there.
+    let by_fn = prog.transactors.iter().find(|t| {
+        t.methods.iter().any(|m| m.function == cx.func.id)
+            || t.target_methods.iter().any(|m| m.function == cx.func.id)
+    });
+    if by_fn.is_some() || instance.is_empty() {
+        return by_fn;
+    }
+    let tb = owner_tb(cx)?;
+    // A stateful instance can be declared three ways: a transactor-typed
+    // testbench field, a passive bound target actor (`let target : X
+    // passive = bind mem`), or an unbound state-carrying instance.
+    let tid = tb
+        .transactor_fields
+        .iter()
+        .find(|(n, _)| n == instance)
+        .map(|(_, t)| *t)
+        .or_else(|| {
+            tb.target_tlm_actors
+                .iter()
+                .find(|a| a.instance == *instance)
+                .map(|a| a.transactor)
+        })
+        .or_else(|| {
+            tb.unbound_state_actors
+                .iter()
+                .find(|(n, _)| n == instance)
+                .map(|(_, t)| *t)
+        })?;
+    prog.transactors.get(tid.index())
+}
+
+/// The component schema a `ComponentField` read resolves against.
+/// `SelfField` finds the component owning the method/handler body being
+/// emitted (by function id); `Local` reads the component-typed param
+/// local; `Path` roots at the owning testbench's component field and
+/// descends `Sub` fields.
+fn component_of_base<'a>(
+    cx: &ECx<'a>,
+    base: &crate::ir::ComponentBase,
+) -> Option<&'a crate::ir::ComponentSchema> {
+    let prog = cx.prog?;
+    match base {
+        crate::ir::ComponentBase::SelfField => prog.components.iter().find(|c| {
+            c.methods.iter().any(|m| m.function == cx.func.id)
+                || c.on_handlers.iter().any(|h| h.function == cx.func.id)
+                || c.periodic_handlers.iter().any(|h| h.function == cx.func.id)
+        }),
+        crate::ir::ComponentBase::Local(l) => {
+            let crate::ir::IrType::Component(cid) = cx.func.locals.get(l.index())?.ty else {
+                return None;
+            };
+            prog.components.get(cid.index())
+        }
+        crate::ir::ComponentBase::Path(path) => {
+            let tb = owner_tb(cx)?;
+            let (first, rest) = path.split_first()?;
+            let root = tb.component_fields.iter().find(|b| b.field == *first)?;
+            let mut c = prog.components.get(root.component.index())?;
+            for seg in rest {
+                let f = c.fields.iter().find(|f| f.name == *seg)?;
+                let crate::ir::ComponentFieldKind::Sub { component } = f.kind else {
+                    return None;
+                };
+                c = prog.components.get(component.index())?;
+            }
+            Some(c)
+        }
     }
 }
 
