@@ -575,20 +575,61 @@ pub(super) fn emit_tseq(
     Ok(())
 }
 
+/// C++ scalar type for a pure-helper local (param, internal local, or
+/// return slot). Helper values live in the 64-bit loop-switch domain, so
+/// this is a 64-bit-rank mapping: a `sint` local declares `int64_t` (v1's
+/// `c_type_for` → `cpp_sint_for_width`), everything else `uint64_t`. This
+/// makes the C++ variable's signedness match `expr_is_signed(Local)` —
+/// without it, `sint` values routed through a helper computed `/`, `%`,
+/// and ordered comparisons UNSIGNED, diverging from `--codegen v1`
+/// (harc#532). `>>` was already saved by the forced `(int64_t)` cast the
+/// shift emitter inserts, so only the cast-less operators diverged.
+fn helper_local_cty(ty: &crate::ir::IrType) -> &'static str {
+    match ty {
+        crate::ir::IrType::SInt(_) => "int64_t",
+        _ => "uint64_t",
+    }
+}
+
+/// Return type for a helper: the declared type of its return slot, or
+/// `void` when it has none. Kept identical between the prototype and the
+/// definition so the two C++ signatures match.
+fn helper_ret_cty(func: &TbFunction) -> &'static str {
+    match func.ret {
+        Some(r) => func
+            .locals
+            .get(r.index())
+            .map(|l| helper_local_cty(&l.ty))
+            .unwrap_or("uint64_t"),
+        None => "void",
+    }
+}
+
+/// Comma-joined parameter list for a helper's C++ signature. The first
+/// `params.len()` locals ARE the parameters (TB-IR convention), so each
+/// param's declared type comes from `func.locals[i].ty`.
+fn helper_param_list(func: &TbFunction, names: &[String]) -> String {
+    names[..func.params.len()]
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let cty = func
+                .locals
+                .get(i)
+                .map(|l| helper_local_cty(&l.ty))
+                .unwrap_or("uint64_t");
+            format!("{cty} {n}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Forward declaration for a lowered pure helper, so source-order
 /// emission supports helper-to-helper calls in any order.
 pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
     let names = cpp_local_names(func);
-    let ret_ty = if func.ret.is_some() {
-        "uint64_t"
-    } else {
-        "void"
-    };
-    let params = names[..func.params.len()]
-        .iter()
-        .map(|n| format!("uint64_t {n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let ret_ty = helper_ret_cty(func);
+    let params = helper_param_list(func, &names);
     writeln!(
         out,
         "static {ret_ty} {}({params});",
@@ -626,24 +667,21 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
     };
     let nparams = func.params.len();
 
-    let ret_ty = if func.ret.is_some() {
-        "uint64_t"
-    } else {
-        "void"
-    };
-    let params = names[..nparams]
-        .iter()
-        .map(|n| format!("uint64_t {n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let ret_ty = helper_ret_cty(func);
+    let params = helper_param_list(func, &names);
     writeln!(
         out,
         "static {ret_ty} {}({params}) {{",
         helper_cpp_name(&func.name)
     )
     .ok();
-    for n in &names[nparams..] {
-        writeln!(out, "{INDENT}uint64_t {n} = 0; (void){n};").ok();
+    for (i, n) in names.iter().enumerate().skip(nparams) {
+        let cty = func
+            .locals
+            .get(i)
+            .map(|l| helper_local_cty(&l.ty))
+            .unwrap_or("uint64_t");
+        writeln!(out, "{INDENT}{cty} {n} = 0; (void){n};").ok();
     }
     writeln!(out, "{INDENT}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{INDENT}while (true) {{").ok();

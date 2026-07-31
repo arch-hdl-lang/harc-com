@@ -755,6 +755,58 @@ end test T"#,
     );
 }
 
+/// harc#532: signed values routed through a pure `function` helper must
+/// keep their signedness at the C++ level. The helper's return slot,
+/// params, and internal locals declare `int64_t` for `sint` (matching
+/// v1's `c_type_for` / `cpp_sint_for_width`), so `/`, `%`, and ordered
+/// comparisons compute signed — not just `>>` (which the shift emitter's
+/// forced `(int64_t)` cast already saved). A `bool` return stays
+/// `uint64_t` (a 0/1 value — no signedness divergence); only a `sint`
+/// param flips. Before the fix every helper local was `uint64_t`.
+#[test]
+fn signed_helper_params_locals_return_declare_int64() {
+    let cpp = emit_cpp_src(
+        r#"function div2(x: sint<8>) -> sint<8>
+    return x / 2
+end function div2
+
+function halve_twice(x: sint<16>) -> sint<16>
+    let h : sint<16> = x / 2
+    return h / 2
+end function halve_twice
+
+function isneg(x: sint<8>) -> bool
+    return x < 0
+end function isneg
+
+test T
+    let dut : Top
+    run
+        let a : sint<8> = 0 - 8
+        assert div2(a) == 0 - 4 else fail("d")
+        assert halve_twice(0 - 16) == 0 - 4 else fail("h")
+        assert isneg(a) else fail("n")
+    end run
+end test T"#,
+    );
+    // `sint` param + `sint` return → int64_t.
+    assert!(
+        cpp.contains("static int64_t harc_helper_div2(int64_t x)"),
+        "sint helper param/return must declare int64_t; got:\n{cpp}"
+    );
+    // A helper whose signedness lives in an internal local (not the
+    // param) is int64_t in signature and body.
+    assert!(
+        cpp.contains("static int64_t harc_helper_halve_twice(int64_t x)"),
+        "sint helper with internal sint local must declare int64_t; got:\n{cpp}"
+    );
+    // A `bool` return keeps uint64_t; only the sint param flips.
+    assert!(
+        cpp.contains("static uint64_t harc_helper_isneg(int64_t x)"),
+        "bool-returning helper keeps uint64_t return, int64_t sint param; got:\n{cpp}"
+    );
+}
+
 /// #530 residual (#524 adversarial-review finding 6): signed HOST-STATE
 /// members — `_tb` scalar fields, component/scoreboard scalar fields —
 /// resolve their declared signedness through the owning schema, so
