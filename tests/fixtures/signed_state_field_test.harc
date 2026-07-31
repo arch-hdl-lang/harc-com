@@ -1,0 +1,46 @@
+// Regression fixture for the #530 residual (#524 adversarial-review
+// finding 6): a `sint` persistent STATE field of a bound-to target
+// transactor keeps its signedness at use sites — both inside the
+// responder body (the state-receiver read) and from the test through
+// the bound instance (`target.sacc`). Reuses the runtime-length TLM
+// initiator DUT so the responder actually fires.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>, len: uint<4>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    read_count : uint<32> default 0
+    sacc : sint<8> default 0
+    body_ok : uint<32> default 0
+
+    thread bus.read(addr: uint<8>, len: uint<4>)
+        read_count = read_count + 1
+        sacc = 0 - 8
+        let half : sint<8> = sacc >> 1
+        if half == 0 - 4
+            body_ok = body_ok + 1
+        end if
+        return 4096 + addr + len
+    end thread
+end transactor TlmMemTarget
+
+testbench SignedStateFieldTb
+    dut : TlmReadInitiatorRuntimeLen
+end testbench SignedStateFieldTb
+
+impl SignedStateFieldTest for SignedStateFieldTb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait until dut.done == 1 timeout 100 cycles fail("initiator never finished")
+        assert target.read_count == 2 else fail("count=${target.read_count}")
+        assert (target.sacc >> 1) == 0 - 4 else fail("stateshr=${target.sacc >> 1}")
+        assert target.body_ok == 2 else fail("bodyok=${target.body_ok}")
+        wait 1 cycle
+    end run
+end impl SignedStateFieldTest
