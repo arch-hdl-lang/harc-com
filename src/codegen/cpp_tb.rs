@@ -14107,6 +14107,29 @@ impl Emitter {
             "harc_rt::random::HarcSolverRetryPolicy _harc_rt_retry_policy;"
         )
         .ok();
+        // Apply uniqueness history before seeded preferences. Keep it in its
+        // own frame so the exhaustion fallback can pop the exclusions and
+        // recycle the domain after clearing the persistent history.
+        self.pad(depth + 1);
+        writeln!(self.out, "_s.push();   // unique history constraints").ok();
+        for f in free_fields
+            .iter()
+            .filter(|f| unique_fields.contains(&f.name))
+        {
+            let c_name = c_ident(&f.name);
+            let scope = c_scope_ident(field_attr_unique_scope(f));
+            self.pad(depth + 1);
+            let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
+            writeln!(
+                self.out,
+                "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
+                c_name,
+                c_name,
+                v_expr,
+                escape_c(field_attr_unique_scope(f))
+            )
+            .ok();
+        }
         self.pad(depth + 1);
         writeln!(
             self.out,
@@ -14157,24 +14180,6 @@ impl Emitter {
         writeln!(self.out, "_s.push();   // retry without seeded preferences").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
-        for f in free_fields
-            .iter()
-            .filter(|f| unique_fields.contains(&f.name))
-        {
-            let c_name = c_ident(&f.name);
-            let scope = c_scope_ident(field_attr_unique_scope(f));
-            self.pad(depth + 1);
-            let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
-            writeln!(
-                self.out,
-                "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
-                c_name,
-                c_name,
-                v_expr,
-                escape_c(field_attr_unique_scope(f))
-            )
-            .ok();
-        }
         // Final check: seeded preferences have already been dropped if they
         // conflict. If `[unique]` history saturates the satisfiable space,
         // clear that history and retry under the original hard constraints.
@@ -14187,14 +14192,67 @@ impl Emitter {
         )
         .ok();
         self.pad(depth + 2);
-        writeln!(self.out, "_s.pop();").ok();
+        writeln!(self.out, "bool _harc_recycled_unique_history = false;").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "_s.pop();   // drop preference scope").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "_s.pop();   // drop exhausted unique-history scope").ok();
+        for candidate in free_fields
+            .iter()
+            .filter(|f| unique_fields.contains(&f.name))
+        {
+            let candidate_name = c_ident(&candidate.name);
+            let candidate_scope = c_scope_ident(field_attr_unique_scope(candidate));
+            self.pad(depth + 2);
+            writeln!(self.out, "if (!_harc_recycled_unique_history) {{").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "_s.push();").ok();
+            for other in free_fields
+                .iter()
+                .filter(|f| unique_fields.contains(&f.name) && f.name != candidate.name)
+            {
+                let c_name = c_ident(&other.name);
+                let scope = c_scope_ident(field_attr_unique_scope(other));
+                let v_expr = solver_bv_value_call("_v", other.signed, other.width, solver_width);
+                self.pad(depth + 3);
+                writeln!(
+                    self.out,
+                    "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});",
+                    c_name, c_name, v_expr
+                )
+                .ok();
+            }
+            self.pad(depth + 3);
+            writeln!(self.out, "_r = _s.check();").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "if (_r == z3::sat) {{").ok();
+            self.pad(depth + 4);
+            writeln!(
+                self.out,
+                "harc_rt::random::harc_unique_clear({cache_tag}_unique_{candidate_scope}_{candidate_name});"
+            )
+            .ok();
+            self.pad(depth + 4);
+            writeln!(self.out, "_harc_recycled_unique_history = true;").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "}} else {{").ok();
+            self.pad(depth + 4);
+            writeln!(self.out, "_s.pop();").ok();
+            self.pad(depth + 3);
+            writeln!(self.out, "}}\n").ok();
+            self.pad(depth + 2);
+            writeln!(self.out, "}}")
+                .ok();
+        }
+        self.pad(depth + 2);
+        writeln!(self.out, "if (!_harc_recycled_unique_history) {{").ok();
         for f in free_fields
             .iter()
             .filter(|f| unique_fields.contains(&f.name))
         {
             let c_name = c_ident(&f.name);
             let scope = c_scope_ident(field_attr_unique_scope(f));
-            self.pad(depth + 2);
+            self.pad(depth + 3);
             writeln!(
                 self.out,
                 "harc_rt::random::harc_unique_clear({cache_tag}_unique_{scope}_{});",
@@ -14202,8 +14260,11 @@ impl Emitter {
             )
             .ok();
         }
-        self.pad(depth + 2);
+        self.pad(depth + 3);
         writeln!(self.out, "_r = _s.check();").ok();
+        self.pad(depth + 2);
+        writeln!(self.out, "}}")
+            .ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
 

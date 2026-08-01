@@ -4126,9 +4126,21 @@ end test UniqueTest"#,
             && cpp.contains("harc_rt::random::harc_retry_without_unique_history(")
             && cpp.contains("harc_rt::random::harc_unique_clear(_solver_site_")
             && cpp.contains("harc_rt::random::harc_unique_remember(_solver_site_")
+            && cpp.contains("_s.push();   // unique history constraints")
+            && cpp.contains("_s.pop();   // drop exhausted unique-history scope")
             && !cpp.contains("if (_solver_site_")
             && !cpp.contains("randomize_T(&t);"),
         "unique fields should route bare randomize through scoped recycling solver history; got:\n{cpp}",
+    );
+    let history_pos = cpp
+        .find("for (auto _v : harc_rt::random::harc_unique_values(_solver_site_")
+        .expect("unique history constraint");
+    let preference_pos = cpp
+        .find("_s.push();   // seeded candidate preferences")
+        .expect("seeded preference scope");
+    assert!(
+        history_pos < preference_pos,
+        "unique history must be applied before seeded preferences so preference retry preserves it"
     );
 }
 
