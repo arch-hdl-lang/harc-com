@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::Path;
 
+use harc::constraints::typed_lower::LowerError;
 use harc::parser::parse_source;
 use harc::solver::problem_table::{
     build_typed_solver_problem_table, TypedSolverProblemBuild, TypedSolverProblemSource,
@@ -65,7 +66,8 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
                 TypedSolverProblemBuild::LowerError(errors) => {
                     let label = source_label(&entry.source);
                     let rendered = format!("{} {label}: {errors:#?}", path.display());
-                    if let Some(reason) = expected_lower_error_reason(&path, &entry.source) {
+                    if let Some(reason) = expected_lower_error_reason(&path, &entry.source, &errors)
+                    {
                         expected_lower_errors.push(format!("{rendered}\n  classified: {reason}"));
                     } else {
                         unexpected_lower_errors.push(rendered);
@@ -145,6 +147,7 @@ fn source_label(source: &TypedSolverProblemSource) -> String {
 fn expected_lower_error_reason(
     path: &Path,
     source: &TypedSolverProblemSource,
+    errors: &[LowerError],
 ) -> Option<&'static str> {
     let file = path.file_name().and_then(|s| s.to_str())?;
     if file == "axi_agent.harc" {
@@ -161,6 +164,41 @@ fn expected_lower_error_reason(
             }
         }
     }
+    if file == "uint64_unique_randomize_test.harc" {
+        let fixture_source = fs::read_to_string(path).ok()?;
+        if let TypedSolverProblemSource::RandomizeSite {
+            context,
+            target,
+            transaction,
+            blocking: false,
+            has_with_body: true,
+            ..
+        } = source
+        {
+            if transaction == "Uint64UniqueStim"
+                && context == "Uint64UniqueRandomizeTest: randomize(s)"
+                && target == "s"
+                && errors.len() == 1
+            {
+                if let LowerError::DisallowedInConstraint {
+                    what: "expression form",
+                    span: error_span,
+                } = &errors[0]
+                {
+                    if fixture_source.rfind("s.sample[63:32]") == Some(error_span.start)
+                        && fixture_source.get(error_span.start..error_span.end)
+                            == Some("s.sample[63:32]")
+                    {
+                        return Some(
+                            "behavioral regression fixture uses a relational `randomize ... with` constraint; \
+                             the typed Z3 scaffold currently rejects expression-form constraints, while the \
+                             simulator path covers this behavior",
+                        );
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -171,7 +209,7 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
         transaction: "AxiTxn".to_string(),
         span: Default::default(),
     };
-    let reason = expected_lower_error_reason(path, &source).expect("classified");
+    let reason = expected_lower_error_reason(path, &source, &[]).expect("classified");
     assert!(reason.contains("spec-sketch transaction"));
     assert!(reason.contains("unresolved imported enum-like types"));
 
@@ -183,7 +221,7 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
         has_with_body: false,
         span: Default::default(),
     };
-    assert!(expected_lower_error_reason(path, &site).is_some());
+    assert!(expected_lower_error_reason(path, &site, &[]).is_some());
 
     let unrelated_site = TypedSolverProblemSource::RandomizeSite {
         context: "SmokeTest".to_string(),
@@ -193,5 +231,52 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
         has_with_body: false,
         span: Default::default(),
     };
-    assert!(expected_lower_error_reason(path, &unrelated_site).is_none());
+    assert!(expected_lower_error_reason(path, &unrelated_site, &[]).is_none());
+}
+
+#[test]
+fn classifies_uint64_randomize_with_lowering_gap() {
+    let path = Path::new("tests/fixtures/uint64_unique_randomize_test.harc");
+    let source = fs::read_to_string(path).expect("read uint64 randomize fixture");
+    let parsed = parse_source(&source).expect("parse uint64 randomize fixture");
+    let table = build_typed_solver_problem_table(&parsed);
+    let entry = table
+        .entries
+        .iter()
+        .find(|entry| match &entry.source {
+            TypedSolverProblemSource::RandomizeSite {
+                context,
+                target,
+                transaction,
+                blocking: false,
+                has_with_body: true,
+                ..
+            } if context == "Uint64UniqueRandomizeTest: randomize(s)"
+                && target == "s"
+                && transaction == "Uint64UniqueStim" =>
+            {
+                true
+            }
+            _ => false,
+        })
+        .expect("find uint64 randomize site");
+    let errors = match &entry.build {
+        TypedSolverProblemBuild::LowerError(errors) => errors,
+        build => panic!("expected typed lowering error, got {build:?}"),
+    };
+    let reason = expected_lower_error_reason(path, &entry.source, errors).expect("classified");
+    assert!(reason.contains("relational `randomize ... with` constraint"));
+    assert!(reason.contains("typed Z3 scaffold"));
+
+    let wrong_error = [LowerError::DisallowedInConstraint {
+        what: "field access target",
+        span: Default::default(),
+    }];
+    assert!(expected_lower_error_reason(path, &entry.source, &wrong_error).is_none());
+
+    let wrong_span = [LowerError::DisallowedInConstraint {
+        what: "expression form",
+        span: Default::default(),
+    }];
+    assert!(expected_lower_error_reason(path, &entry.source, &wrong_span).is_none());
 }
