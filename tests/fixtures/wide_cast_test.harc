@@ -1,15 +1,12 @@
-// Wide width-method casts in the 65..128-bit range — the `_harc_u128`
-// model. Companion to `width_methods_test.harc` (which covers ≤ 64-bit
-// only). Exercises `.trunc<N>()` / `.zext<N>()` / `.sext<N>()` /
-// `.resize<N>()` where N lands in 65..128, so both the source value and
-// the result are carried as v1's `_harc_u128` (`__uint128_t`).
+// Wide width-method casts across the `_harc_u128` (65..128-bit) and
+// `HarcWide<N>` (129..1024-bit) representations. Companion to
+// `width_methods_test.harc`, which covers the native ≤64-bit path.
 //
 // Each cast is checked against a hand-computed `uint<128>` constant via
 // whole-value `==` (lowers to `_harc_u128` equality). The TB-IR and v1
 // C++ emitters must produce identical verdicts and identical traces.
 //
-// >128-bit casts (the `HarcWide<N>` word-array model) are intentionally
-// NOT exercised here — they remain unsupported in TB-IR lowering.
+// Non-word-aligned 130-bit cases prove that storage padding is masked.
 
 testbench WideCastTb
     dut : Top
@@ -62,6 +59,42 @@ impl WideCastTest for WideCastTb
         assert chained == 0xFF
             else fail("chained sext<128>.trunc<8>: got 0x${chained:02x}")
 
-        log(info, "PASS: 65..128-bit trunc/zext/sext/resize match the software model")
+        // ── issue #537: pwr_mgr-style widened multiply ─────────────────
+        let pwr_a : uint<48> = 0x123456789ABC
+        let pwr_b : uint<16> = 0xBEEF
+        let product : uint<256> = pwr_a.zext<256>() * pwr_b.zext<256>()
+        let product_low : uint<64> = product.trunc<64>()
+        assert product_low == 0x0D93D70A3D6FFD84
+            else fail("zext<256> multiply: got 0x${product_low:016x}")
+
+        // ── 130-bit non-word-aligned truncation ────────────────────────
+        let all256 : uint<256> = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        let low130 : uint<130> = all256.trunc<130>()
+        assert low130 == 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+            else fail("trunc<130> did not mask storage padding")
+
+        // ── chained sign extension with a HarcWide source ──────────────
+        let neg9 : uint<9> = 0x100
+        let neg130 : sint<130> = neg9.sext<130>()
+        assert neg130 == 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00
+            else fail("sext<130> did not fill through bit 129")
+        let neg256 : sint<256> = neg130.sext<256>()
+        let neg131 = neg256.trunc<131>()
+        assert neg131 == 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00
+            else fail("HarcWide-source sext<256> lost the sign fill")
+
+        // ── resize in both directions ──────────────────────────────────
+        let resized256 : uint<256> = v64.resize<256>()
+        let resized130 : uint<130> = resized256.resize<130>()
+        assert resized130 == 0xDEADBEEFCAFEF00D
+            else fail("resize widen/narrow changed the value")
+
+        // ── language ceiling: 1024-bit destination ─────────────────────
+        let maxwide : uint<1024> = v64.zext<1024>()
+        let maxwide_low : uint<64> = maxwide.trunc<64>()
+        assert maxwide_low == 0xDEADBEEFCAFEF00D
+            else fail("zext<1024>/trunc<64> round trip changed the value")
+
+        log(info, "PASS: 65..1024-bit trunc/zext/sext/resize match the software model")
     end run
 end impl WideCastTest

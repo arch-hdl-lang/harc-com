@@ -586,18 +586,18 @@ fn wide_eq_cpp(
     }))
 }
 
-/// Width-method emission, ≤ 128-bit subset of v1's
-/// `try_emit_width_method` (lowering rejects >128-bit `HarcWide<N>`
-/// casts). Casts ≤ 64 bits target `uint64_t`; 65..128-bit casts target
-/// v1's `_harc_u128` (`cpp_uint_for_width(width)` returns `_harc_u128`
-/// for that range). Per kind:
+/// Width-method emission through the 1024-bit language limit. Casts ≤ 64
+/// bits target `uint64_t`; 65..128-bit casts target v1's `_harc_u128`;
+/// wider casts target `HarcWide<ceil(width/32)>`. Per kind:
 /// - trunc: ≤64 masks (plain cast at width 64), 65..128 routes through
-///   `harc_rt::harc_trunc_u128((_harc_u128)e, width)`.
-/// - zext: plain cast to the width's C type (`uint64_t` or `_harc_u128`).
+///   `harc_rt::harc_trunc_u128`, wider values through `harc_wide_trunc`.
+/// - zext: scalar cast through 128, then width-normalized `harc_wide_zext`.
 /// - sext: shift-fills (≤64) / `harc_rt::harc_sext_u128` (65..128) when
-///   the source width is known and smaller; plain cast otherwise.
+///   the source width is known and smaller; wider values use
+///   `harc_wide_sext`.
 /// - resize: narrows via trunc-shape, widens via plain cast (mask-narrow
-///   when the source width is unknown).
+///   when the source width is unknown); the same choice selects wide
+///   truncation or zero-extension above 128.
 fn width_cast_cpp(
     cx: &ECx<'_>,
     kind: WidthCastKind,
@@ -606,6 +606,29 @@ fn width_cast_cpp(
     inner: &Expr,
 ) -> Result<String, EmitError> {
     let e = expr_cpp(cx, inner)?;
+    if let Some(words) = super::wide_scalar_words(width) {
+        return match kind {
+            WidthCastKind::Trunc => Ok(format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})")),
+            WidthCastKind::Zext => Ok(match src_width {
+                Some(sw) => format!("harc_rt::harc_wide_zext<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_zext<{words}>({e})"),
+            }),
+            WidthCastKind::Sext => Ok(match src_width {
+                Some(sw) if sw < width => {
+                    format!("harc_rt::harc_wide_sext<{words}>({e}, {sw}, {width})")
+                }
+                Some(sw) => format!("harc_rt::harc_wide_trunc<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_zext<{words}>({e})"),
+            }),
+            WidthCastKind::Resize => Ok(match src_width {
+                Some(sw) if width < sw => {
+                    format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})")
+                }
+                Some(sw) => format!("harc_rt::harc_wide_zext<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})"),
+            }),
+        };
+    }
     // The destination C type, mirroring v1's `cpp_uint_for_width`:
     // `_harc_u128` for 65..128-bit casts, `uint64_t` otherwise.
     let c_unsigned = if width > 64 { "_harc_u128" } else { "uint64_t" };

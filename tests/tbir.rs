@@ -8139,6 +8139,179 @@ fn width_methods_dump_ir_snapshot() {
 }
 
 #[test]
+fn wide_cast_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("wide_cast_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("wide_cast_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn wide_zext_256_lowers_and_emits_harcwide() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let small : uint<64> = 0xDEADBEEFCAFEF00D
+        let first_wide : uint<129> = small.zext<129>()
+        let wide : uint<256> = small.zext<256>()
+        let ceiling : uint<1024> = wide.zext<1024>()
+        assert first_wide == 0xDEADBEEFCAFEF00D else fail("first wide zext")
+        assert wide == 0xDEADBEEFCAFEF00D else fail("wide zext")
+        assert ceiling.trunc<64>() == small else fail("ceiling zext")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcWide<5> first_wide")
+            && cpp.contains("harc_rt::HarcWide<8> wide")
+            && cpp.contains("harc_rt::HarcWide<32> ceiling")
+            && cpp.contains("harc_rt::harc_wide_zext<8>")
+            && cpp.contains("harc_rt::harc_wide_zext<32>"),
+        "expected 129/256/1024-bit zext representations:\n{cpp}"
+    );
+}
+
+#[test]
+fn wide_trunc_130_lowers_and_emits_masked_harcwide() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let source : uint<256> = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        let low : uint<130> = source.trunc<130>()
+        assert low == 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF else fail("wide trunc")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcWide<5> low")
+            && cpp.contains("harc_rt::harc_wide_trunc<5>")
+            && cpp.contains(", 130)"),
+        "expected trunc<130> to mask a HarcWide<5>:\n{cpp}"
+    );
+}
+
+#[test]
+fn chained_wide_sext_uses_harcwide_source_and_destination() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let negative : uint<9> = 0x100
+        let sign130 : sint<130> = negative.sext<130>()
+        let sign256 : sint<256> = sign130.sext<256>()
+        assert sign256.trunc<9>() == 0x100 else fail("wide sext chain")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_wide_sext<5>")
+            && cpp.contains("harc_rt::harc_wide_sext<8>")
+            && cpp.contains("sign130, 130, 256"),
+        "expected chained wide sign extension:\n{cpp}"
+    );
+}
+
+#[test]
+fn wide_resize_selects_zero_extension_or_truncation() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let small : uint<64> = 0x123456789ABCDEF0
+        let wide : uint<256> = small.resize<256>()
+        let low : uint<130> = wide.resize<130>()
+        assert low.trunc<64>() == small else fail("wide resize")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_wide_zext<8>")
+            && cpp.contains("harc_rt::harc_wide_trunc<5>")
+            && cpp.contains(", 130)"),
+        "expected wide resize to select zext/trunc helpers:\n{cpp}"
+    );
+}
+
+#[test]
+fn tbir_rejects_width_method_above_language_limit() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let value : uint<1025> = (1 as uint<64>).zext<1025>()
+        log(info, "${value}")
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("zext<1025>") && msg.contains("1024-bit language limit"),
+        "expected language-limit diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn verifier_rejects_malformed_width_cast_bounds() {
+    let source = r#"test T
+    let dut : Top
+    run
+        let source : uint<64> = 1
+        let wide : uint<128> = source.zext<128>()
+    end run
+end test T"#;
+
+    for invalid in [0, 1025] {
+        let mut prog = lower_src(source).expect("lowers");
+        let ir::Stmt::Assign(_, ir::Expr::WidthCast { width, .. }) =
+            &mut prog.functions[0].blocks[0].stmts[1]
+        else {
+            panic!("expected width-cast assignment");
+        };
+        *width = invalid;
+        let errs = verify::verify_program(&prog).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadWidthCast { width, .. } if *width == invalid
+        )));
+    }
+
+    for invalid in [0, 1025] {
+        let mut prog = lower_src(source).expect("lowers");
+        let ir::Stmt::Assign(
+            _,
+            ir::Expr::WidthCast {
+                src_width: Some(src_width),
+                ..
+            },
+        ) = &mut prog.functions[0].blocks[0].stmts[1]
+        else {
+            panic!("expected width-cast assignment with a known source width");
+        };
+        *src_width = invalid;
+        let errs = verify::verify_program(&prog).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadWidthCast {
+                src_width: Some(src_width),
+                ..
+            } if *src_width == invalid
+        )));
+    }
+}
+
+#[test]
 fn bit_not_masks_to_fixed_uint_width() {
     let cpp = emit_cpp_src(
         r#"testbench Tb

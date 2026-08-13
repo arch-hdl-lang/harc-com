@@ -705,16 +705,25 @@ fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
 /// (`Record`/`RecordSeq`) are handled by their own declaration sites,
 /// never this helper.
 pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
-    match ty {
-        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
-            format!("harc_rt::HarcWide<{}>", (*w as usize).div_ceil(32).max(1))
+    if let ir::IrType::UInt(Some(width)) | ir::IrType::SInt(Some(width)) = ty {
+        if let Some(words) = wide_scalar_words(*width) {
+            return format!("harc_rt::HarcWide<{words}>");
         }
+    }
+    match ty {
         ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => {
             "_harc_u128".to_string()
         }
         ir::IrType::SInt(_) => "int64_t".to_string(),
         _ => "uint64_t".to_string(),
     }
+}
+
+/// Number of 32-bit storage words used by the shared wide scalar
+/// representation. Keeping this boundary and sizing in one place prevents a
+/// width-cast expression from disagreeing with its destination local type.
+pub(super) fn wide_scalar_words(width: u32) -> Option<u32> {
+    (width > 128).then(|| width.div_ceil(32))
 }
 
 /// Packed-bit width of a record field's element type — the declared

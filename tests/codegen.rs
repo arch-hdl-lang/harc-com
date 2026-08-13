@@ -6985,6 +6985,28 @@ end impl T"#,
 }
 
 #[test]
+fn v1_rejects_width_method_above_language_limit() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let value : uint<1025> = (1 as uint<64>).zext<1025>()
+        log(info, "${value}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let err = cpp_tb::emit(&parsed).unwrap_err();
+    assert!(
+        err.0.contains("zext<1025>") && err.0.contains("1024-bit language limit"),
+        "expected language-limit diagnostic, got: {}",
+        err.0
+    );
+}
+
+#[test]
 fn uint256_hex_literal_local_uses_harcwide_value_expression() {
     let parsed = parse_source(
         r#"testbench Tb
@@ -7028,6 +7050,40 @@ fn harcwide_mask_and_sign_extension_runtime() {
         assert(s.words[2] == 0xffffffffu);
         assert(s.words[3] == 0xffffffffu);
         assert(s.words[4] == 0x00000003u);
+        "#,
+    );
+}
+
+#[test]
+fn harcwide_sign_extension_accepts_harcwide_source() {
+    compile_and_run_runtime_cpp(
+        "wide_source_sext",
+        r#"
+        auto negative130 = harc_rt::harc_wide_sext<5>(0x100u, 9, 130);
+        auto negative256 = harc_rt::harc_wide_sext<8>(negative130, 130, 256);
+        assert(negative256.words[0] == 0xffffff00u);
+        for (std::size_t i = 1; i < 8; ++i) assert(negative256.words[i] == 0xffffffffu);
+
+        auto positive130 = harc_rt::harc_wide_sext<5>(0x0ffu, 9, 130);
+        auto positive256 = harc_rt::harc_wide_sext<8>(positive130, 130, 256);
+        assert(positive256.words[0] == 0x000000ffu);
+        for (std::size_t i = 1; i < 8; ++i) assert(positive256.words[i] == 0u);
+        "#,
+    );
+}
+
+#[test]
+fn harcwide_zero_extension_masks_source_padding() {
+    compile_and_run_runtime_cpp(
+        "wide_zext_padding",
+        r#"
+        harc_rt::HarcWide<5> dirty;
+        for (auto& word : dirty.words) word = 0xffffffffu;
+        auto extended = harc_rt::harc_wide_zext<8>(dirty, 130);
+        assert(extended.words[0] == 0xffffffffu);
+        assert(extended.words[3] == 0xffffffffu);
+        assert(extended.words[4] == 0x00000003u);
+        for (std::size_t i = 5; i < 8; ++i) assert(extended.words[i] == 0u);
         "#,
     );
 }
