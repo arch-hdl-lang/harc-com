@@ -9894,6 +9894,13 @@ impl Emitter {
             ));
             return true;
         }
+        if width > crate::MAX_WIDTH_METHOD_BITS {
+            self.errors.push(format!(
+                "`.{kind}<{width}>()`: destination width exceeds the {}-bit language limit",
+                crate::MAX_WIDTH_METHOD_BITS
+            ));
+            return true;
+        }
         // Best-effort source-width inference for the type-direction check.
         // We can detect width when the receiver is a literal-typed `let`
         // or an explicit `as uint<W>` / `as sint<W>` cast. Otherwise the

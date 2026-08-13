@@ -1,0 +1,78 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 WideCastTb { dut: Top }
+  test WideCastTest tb=tb0 run=fn0 check=-
+
+fn fn0 run_WideCastTest [kind=Run, owner=tb0]
+  locals:
+    %0 s128 : uint<128>
+    %1 t96 : uint<96>
+    %2 v64 : uint<64>
+    %3 z128 : uint<128>
+    %4 s64 : uint<64>
+    %5 se128 : sint<128>
+    %6 p64 : uint<64>
+    %7 pe128 : sint<128>
+    %8 r128 : uint<128>
+    %9 rn96 : uint<96>
+    %10 chained : unknown
+    %11 pwr_a : uint<48>
+    %12 pwr_b : uint<16>
+    %13 product : uint<256>
+    %14 product_low : uint<64>
+    %15 all256 : uint<256>
+    %16 low130 : uint<130>
+    %17 neg9 : uint<9>
+    %18 neg130 : sint<130>
+    %19 neg256 : sint<256>
+    %20 neg131 : uint<131>
+    %21 resized256 : uint<256>
+    %22 resized130 : uint<130>
+    %23 maxwide : uint<1024>
+    %24 maxwide_low : uint<64>
+  entry = b0
+
+  b0:
+    Assign(%s128, 0xfedcba98765432100123456789abcdef)
+    Assign(%t96, %s128.trunc<96 from 128>())
+    AssertCheck { cond: (%t96 == 0x765432100123456789abcdef), on_fail: "trunc<96>: low64=0x%016llx", %t96 }
+    Assign(%v64, 16045690984503111693)
+    Assign(%z128, %v64.zext<128 from 64>())
+    AssertCheck { cond: (%z128 == 16045690984503111693), on_fail: "zext<128>: low64=0x%016llx", %z128 }
+    Assign(%s64, 18446744073709551615)
+    Assign(%se128, %s64.sext<128 from 64>())
+    AssertCheck { cond: (%se128 == 0xffffffffffffffffffffffffffffffff), on_fail: "sext<128> of all-ones: low64=0x%016llx", %se128 }
+    Assign(%p64, 9223372036854775807)
+    Assign(%pe128, %p64.sext<128 from 64>())
+    AssertCheck { cond: (%pe128 == 9223372036854775807), on_fail: "sext<128> of positive: low64=0x%016llx", %pe128 }
+    Assign(%r128, %v64.resize<128 from 64>())
+    AssertCheck { cond: (%r128 == 16045690984503111693), on_fail: "resize<128> widen: low64=0x%016llx", %r128 }
+    Assign(%rn96, %s128.resize<96 from 128>())
+    AssertCheck { cond: (%rn96 == 0x765432100123456789abcdef), on_fail: "resize<96> narrow: low64=0x%016llx", %rn96 }
+    Assign(%chained, %s64.sext<128 from 64>().trunc<8 from 128>())
+    AssertCheck { cond: (%chained == 255), on_fail: "chained sext<128>.trunc<8>: got 0x%02llx", %chained }
+    Assign(%pwr_a, 20015998343868)
+    Assign(%pwr_b, 48879)
+    Assign(%product, (%pwr_a.zext<256 from 48>() * %pwr_b.zext<256 from 16>()))
+    Assign(%product_low, %product.trunc<64 from 256>())
+    AssertCheck { cond: (%product_low == 978361983049923972), on_fail: "zext<256> multiply: got 0x%016llx", %product_low }
+    Assign(%all256, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+    Assign(%low130, %all256.trunc<130 from 256>())
+    AssertCheck { cond: (%low130 == 0x00000003ffffffffffffffffffffffffffffffff), on_fail: "trunc<130> did not mask storage padding" }
+    Assign(%neg9, 256)
+    Assign(%neg130, %neg9.sext<130 from 9>())
+    AssertCheck { cond: (%neg130 == 0x00000003ffffffffffffffffffffffffffffff00), on_fail: "sext<130> did not fill through bit 129" }
+    Assign(%neg256, %neg130.sext<256 from 130>())
+    Assign(%neg131, %neg256.trunc<131 from 256>())
+    AssertCheck { cond: (%neg131 == 0x00000007ffffffffffffffffffffffffffffff00), on_fail: "HarcWide-source sext<256> lost the sign fill" }
+    Assign(%resized256, %v64.resize<256 from 64>())
+    Assign(%resized130, %resized256.resize<130 from 256>())
+    AssertCheck { cond: (%resized130 == 16045690984503111693), on_fail: "resize widen/narrow changed the value" }
+    Assign(%maxwide, %v64.zext<1024 from 64>())
+    Assign(%maxwide_low, %maxwide.trunc<64 from 1024>())
+    AssertCheck { cond: (%maxwide_low == 16045690984503111693), on_fail: "zext<1024>/trunc<64> round trip changed the value" }
+    Log(info, "PASS: 65..1024-bit trunc/zext/sext/resize match the software model")
+    -> Return

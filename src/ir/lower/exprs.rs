@@ -2074,9 +2074,9 @@ impl FuncBuilder<'_> {
     /// Lower a width-method intrinsic call (`recv.trunc<N>()`, ...).
     /// Mirrors v1's `try_emit_width_method`: constant width required,
     /// zero-width rejected, direction checked against the best-effort
-    /// receiver width, ≤ 128-bit subset (the `_harc_u128` model carries
-    /// 65..128-bit casts; >128-bit `HarcWide<N>` casts are not in the
-    /// IR's expression model yet).
+    /// receiver width. Destinations through the language's 1024-bit
+    /// width-method limit lower to the same `WidthCast` node; storage
+    /// selection is a backend concern.
     fn lower_width_method(
         &mut self,
         kind: WidthCastKind,
@@ -2102,13 +2102,12 @@ impl FuncBuilder<'_> {
                 "`.{kind_name}<{width}>()`: width must be greater than zero"
             )));
         }
-        if width > 128 {
-            return Err(unsupported(
-                &format!("`.{kind_name}<{width}>()` with a width above 128 bits"),
-                "the TB-IR expression model carries scalars up to 128 bits \
-                 (`_harc_u128`); the >128-bit `HarcWide<N>` word-array model \
-                 is not lowered yet",
-            ));
+        if width > crate::MAX_WIDTH_METHOD_BITS {
+            return Err(LowerError::Invalid(format!(
+                "`.{kind_name}<{width}>()`: destination width exceeds the {}-bit \
+                 language limit",
+                crate::MAX_WIDTH_METHOD_BITS
+            )));
         }
         // Best-effort receiver-width inference (v1's
         // `infer_expr_width_best_effort`) for the direction check and

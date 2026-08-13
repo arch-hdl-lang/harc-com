@@ -82,6 +82,14 @@ pub enum VerifyError {
         expected: IrType,
         actual: IrType,
     },
+    /// WidthCast nodes carry language-level bit widths even when they are
+    /// constructed by a compiler pass rather than source lowering.
+    BadWidthCast {
+        func: FunctionId,
+        block: BlockId,
+        width: u32,
+        src_width: Option<u32>,
+    },
     /// Record references resolve: the `RecordId` indexes the records
     /// table and record-typed locals carry the matching `IrType`.
     BadRecord {
@@ -193,6 +201,16 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "fn{}: b{} assigns {:?} into local %{} declared {:?}",
                 func.0, block.0, actual, local.0, expected
+            ),
+            VerifyError::BadWidthCast {
+                func,
+                block,
+                width,
+                src_width,
+            } => write!(
+                f,
+                "fn{}: b{} has invalid width cast destination {} and source {:?}",
+                func.0, block.0, width, src_width
             ),
             VerifyError::BadRecord {
                 func,
@@ -1004,7 +1022,25 @@ impl Checker<'_> {
                 self.check_expr(t, ports_ok, context);
                 self.check_expr(e2, ports_ok, context);
             }
-            Expr::WidthCast { inner, .. } => self.check_expr(inner, ports_ok, context),
+            Expr::WidthCast {
+                width,
+                src_width,
+                inner,
+                ..
+            } => {
+                if *width == 0
+                    || *width > crate::MAX_WIDTH_METHOD_BITS
+                    || src_width.is_some_and(|w| w == 0 || w > crate::MAX_WIDTH_METHOD_BITS)
+                {
+                    self.errs.push(VerifyError::BadWidthCast {
+                        func: self.fid,
+                        block: self.bid,
+                        width: *width,
+                        src_width: *src_width,
+                    });
+                }
+                self.check_expr(inner, ports_ok, context);
+            }
             Expr::RecordField {
                 local,
                 field,

@@ -1997,11 +1997,11 @@ pub enum Expr {
         lo: u32,
     },
     /// Width-method intrinsic (`.trunc<N>()` / `.zext<N>()` /
-    /// `.sext<N>()` / `.resize<N>()`), width ≤ 64 in the lowered
-    /// subset. `src_width` is the best-effort receiver width inferred
-    /// at lowering (typed `let`, `as uint<W>` cast, nested width
-    /// method, literal) — it selects v1's emission shape for
-    /// `sext`/`resize` and `None` selects v1's unknown-width fallback.
+    /// `.sext<N>()` / `.resize<N>()`), with destinations through the
+    /// 1024-bit language limit. `src_width` is the best-effort receiver
+    /// width inferred at lowering (typed `let`, `as uint<W>` cast,
+    /// nested width method, literal) — it selects v1's emission shape
+    /// for `sext`/`resize` and `None` selects v1's unknown-width fallback.
     WidthCast {
         kind: WidthCastKind,
         width: u32,

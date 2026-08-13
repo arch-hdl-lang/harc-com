@@ -222,6 +222,11 @@ inline HarcWide<N> harc_wide_zext(const HarcWide<M>& value) {
 }
 
 template<std::size_t N, typename T>
+inline HarcWide<N> harc_wide_zext(T value, unsigned source_width) {
+    return harc_wide_mask_bits(harc_wide_zext<N>(value), source_width);
+}
+
+template<std::size_t N, typename T>
 inline HarcWide<N> harc_wide_trunc(T value, unsigned width) {
     return harc_wide_mask_bits(HarcWide<N>(value), width);
 }
@@ -233,7 +238,7 @@ inline HarcWide<N> harc_wide_trunc(const HarcWide<M>& value, unsigned width) {
 
 template<std::size_t N, typename T>
 inline HarcWide<N> harc_wide_sext(T value, unsigned source_width, unsigned dest_width) {
-    HarcWide<N> out(value);
+    HarcWide<N> out = harc_wide_zext<N>(value);
     out = harc_wide_mask_bits(out, source_width);
     if (source_width == 0 || dest_width == 0) return HarcWide<N>();
     const unsigned sign_bit = source_width - 1;

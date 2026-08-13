@@ -1340,7 +1340,10 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
             let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
             let err = harc::diagnostics::CompileError::unsupported_syntax(
                 &format!("C++ backend cannot lower `.{method}<N>()` with a non-constant width"),
-                "supported width-method forms for `harc check` and C++ codegen use a literal width in 1..=128",
+                &format!(
+                    "supported width-method forms use a literal width in 1..={}",
+                    harc::MAX_WIDTH_METHOD_BITS
+                ),
                 span,
             );
             return Err(Report::new(err).with_source_code(NamedSource::new(
@@ -1348,11 +1351,14 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
                 src.to_string(),
             )));
         };
-        if width == 0 || width > 128 {
+        if width == 0 || width > harc::MAX_WIDTH_METHOD_BITS {
             let span = tokens[window_start + 1].span.merge(tokens[close_idx].span);
             let err = harc::diagnostics::CompileError::unsupported_syntax(
-                &format!("C++ backend cannot lower `.{method}<{width}>()`"),
-                "supported resize widths for this backend are 1..=128 (65..128 use the `_harc_u128` model); split a >128-bit value into <=128-bit limbs or use an extern helper",
+                &format!("width method `.{method}<{width}>()` is outside the language limit"),
+                &format!(
+                    "width-method destinations must be in 1..={}",
+                    harc::MAX_WIDTH_METHOD_BITS
+                ),
                 span,
             );
             return Err(Report::new(err).with_source_code(NamedSource::new(
@@ -3128,22 +3134,33 @@ mod tests {
     }
 
     #[test]
-    fn check_reports_backend_unsupported_wide_resize() {
-        // >128-bit casts use the `HarcWide<N>` word-array model, which the
-        // C++ backends don't lower yet — these must still be rejected.
+    fn check_accepts_harcwide_resize_widths_through_language_limit() {
         let src = r#"
-            function wide_zext_256_repro(a: uint<48>, b: uint<16>) -> uint<128>
+            function wide_zext_repro(a: uint<48>, b: uint<16>) -> uint<128>
+                let first_wide : uint<129> = a.zext<129>()
                 let product : uint<256> = a.zext<256>() * b.zext<256>()
-                return product.trunc<128>()
-            end function wide_zext_256_repro
+                let ceiling : uint<1024> = first_wide.zext<1024>()
+                return ceiling.trunc<128>()
+            end function wide_zext_repro
         "#;
-        let path = PathBuf::from("wide_zext_256_repro.harc");
+        let path = PathBuf::from("wide_zext_repro.harc");
+        validate_check_backend_codegen_limitations(&path, src).unwrap();
+    }
+
+    #[test]
+    fn check_rejects_resize_above_language_limit() {
+        let src = r#"
+            function too_wide(a: uint<64>) -> uint<64>
+                let value = a.zext<1025>()
+                return value.trunc<64>()
+            end function too_wide
+        "#;
+        let path = PathBuf::from("too_wide.harc");
         let err = validate_check_backend_codegen_limitations(&path, src).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("C++ backend cannot lower `.zext<256>()`")
-                && msg.contains("supported resize widths"),
-            "expected backend unsupported-width diagnostic; got:\n{msg}"
+            msg.contains("`.zext<1025>()`") && msg.contains("1..=1024"),
+            "expected language-limit diagnostic; got:\n{msg}"
         );
     }
 
