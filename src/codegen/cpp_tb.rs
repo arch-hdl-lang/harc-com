@@ -9965,6 +9965,9 @@ impl Emitter {
                     let words = width.div_ceil(32);
                     write!(self.out, "harc_rt::harc_wide_zext<{words}>(").ok();
                     self.emit_expr(target);
+                    if let Some(sw) = source_width {
+                        write!(self.out, ", {sw}").ok();
+                    }
                     write!(self.out, ")").ok();
                 } else {
                     write!(self.out, "(({c_unsigned})(").ok();
@@ -10010,9 +10013,16 @@ impl Emitter {
                             }
                         }
                     } else {
-                        write!(self.out, "(({c_unsigned})(").ok();
-                        self.emit_expr(target);
-                        write!(self.out, "))").ok();
+                        if width > 128 {
+                            let words = width.div_ceil(32);
+                            write!(self.out, "harc_rt::harc_wide_trunc<{words}>(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, ", {sw})").ok();
+                        } else {
+                            write!(self.out, "(({c_unsigned})(").ok();
+                            self.emit_expr(target);
+                            write!(self.out, "))").ok();
+                        }
                     }
                 } else {
                     if width > 128 {
@@ -10058,7 +10068,7 @@ impl Emitter {
                             let words = width.div_ceil(32);
                             write!(self.out, "harc_rt::harc_wide_zext<{words}>(").ok();
                             self.emit_expr(target);
-                            write!(self.out, ")").ok();
+                            write!(self.out, ", {sw})").ok();
                         } else {
                             write!(self.out, "(({c_unsigned})(").ok();
                             self.emit_expr(target);

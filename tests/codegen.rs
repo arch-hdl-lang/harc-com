@@ -7007,6 +7007,36 @@ end impl T"#,
 }
 
 #[test]
+fn v1_normalizes_known_wide_sources_for_extensions() {
+    let parsed = parse_source(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let source : uint<130> = 1
+        let zext : uint<256> = source.zext<256>()
+        let resized : uint<256> = source.resize<256>()
+        let same_sext : sint<130> = source.sext<130>()
+        log(info, "${zext} ${resized} ${same_sext}")
+    end run
+end impl T"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("known-width wide extensions should emit");
+    assert_eq!(
+        cpp.matches("harc_rt::harc_wide_zext<8>(source, 130)")
+            .count(),
+        2,
+        "zext and widening resize must normalize source padding:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_wide_trunc<5>(source, 130)"),
+        "same-width sext must normalize source padding:\n{cpp}"
+    );
+}
+
+#[test]
 fn uint256_hex_literal_local_uses_harcwide_value_expression() {
     let parsed = parse_source(
         r#"testbench Tb
@@ -7044,12 +7074,22 @@ fn harcwide_mask_and_sign_extension_runtime() {
         assert(m.words[2] == 0xffffffffu);
         assert(m.words[3] == 0xffffffffu);
         assert(m.words[4] == 0x00000003u);
-        auto s = harc_rt::harc_wide_sext<5>(0x100u, 9, 130);
-        assert(s.words[0] == 0xffffff00u);
-        assert(s.words[1] == 0xffffffffu);
-        assert(s.words[2] == 0xffffffffu);
-        assert(s.words[3] == 0xffffffffu);
-        assert(s.words[4] == 0x00000003u);
+        auto t129 = harc_rt::harc_wide_trunc<5>(v, 129);
+        auto t130 = harc_rt::harc_wide_trunc<5>(v, 130);
+        assert(t129.words[4] == 0x00000001u);
+        assert(t130.words[4] == 0x00000003u);
+        auto s129 = harc_rt::harc_wide_sext<5>(0x100u, 9, 129);
+        auto s130 = harc_rt::harc_wide_sext<5>(0x100u, 9, 130);
+        assert(s129.words[0] == 0xffffff00u);
+        assert(s129.words[1] == 0xffffffffu);
+        assert(s129.words[2] == 0xffffffffu);
+        assert(s129.words[3] == 0xffffffffu);
+        assert(s129.words[4] == 0x00000001u);
+        assert(s130.words[0] == 0xffffff00u);
+        assert(s130.words[1] == 0xffffffffu);
+        assert(s130.words[2] == 0xffffffffu);
+        assert(s130.words[3] == 0xffffffffu);
+        assert(s130.words[4] == 0x00000003u);
         "#,
     );
 }

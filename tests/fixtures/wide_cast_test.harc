@@ -89,6 +89,21 @@ impl WideCastTest for WideCastTb
         assert resized130 == 0xDEADBEEFCAFEF00D
             else fail("resize widen/narrow changed the value")
 
+        // Arithmetic in the word-array storage can set padding above the
+        // declared 130-bit logical width. Extensions must discard it.
+        let max130 : uint<130> = 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        let one130 : uint<130> = 1
+        let dirty130 : uint<130> = max130 + one130
+        let normalized_zext : uint<256> = dirty130.zext<256>()
+        let normalized_resize : uint<256> = dirty130.resize<256>()
+        let normalized_sext : sint<130> = dirty130.sext<130>()
+        assert normalized_zext == 0
+            else fail("zext preserved source storage padding")
+        assert normalized_resize == 0
+            else fail("resize preserved source storage padding")
+        assert normalized_sext == 0
+            else fail("same-width sext preserved source storage padding")
+
         // ── language ceiling: 1024-bit destination ─────────────────────
         let maxwide : uint<1024> = v64.zext<1024>()
         let maxwide_low : uint<64> = maxwide.trunc<64>()
