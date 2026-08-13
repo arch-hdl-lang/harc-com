@@ -31,8 +31,14 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     %20 neg131 : uint<131>
     %21 resized256 : uint<256>
     %22 resized130 : uint<130>
-    %23 maxwide : uint<1024>
-    %24 maxwide_low : uint<64>
+    %23 max130 : uint<130>
+    %24 one130 : uint<130>
+    %25 dirty130 : uint<130>
+    %26 normalized_zext : uint<256>
+    %27 normalized_resize : uint<256>
+    %28 normalized_sext : sint<130>
+    %29 maxwide : uint<1024>
+    %30 maxwide_low : uint<64>
   entry = b0
 
   b0:
@@ -71,6 +77,15 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     Assign(%resized256, %v64.resize<256 from 64>())
     Assign(%resized130, %resized256.resize<130 from 256>())
     AssertCheck { cond: (%resized130 == 16045690984503111693), on_fail: "resize widen/narrow changed the value" }
+    Assign(%max130, 0x00000003ffffffffffffffffffffffffffffffff)
+    Assign(%one130, 1)
+    Assign(%dirty130, (%max130 + %one130))
+    Assign(%normalized_zext, %dirty130.zext<256 from 130>())
+    Assign(%normalized_resize, %dirty130.resize<256 from 130>())
+    Assign(%normalized_sext, %dirty130.sext<130 from 130>())
+    AssertCheck { cond: (%normalized_zext == 0), on_fail: "zext preserved source storage padding" }
+    AssertCheck { cond: (%normalized_resize == 0), on_fail: "resize preserved source storage padding" }
+    AssertCheck { cond: (%normalized_sext == 0), on_fail: "same-width sext preserved source storage padding" }
     Assign(%maxwide, %v64.zext<1024 from 64>())
     Assign(%maxwide_low, %maxwide.trunc<64 from 1024>())
     AssertCheck { cond: (%maxwide_low == 16045690984503111693), on_fail: "zext<1024>/trunc<64> round trip changed the value" }
