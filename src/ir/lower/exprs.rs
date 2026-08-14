@@ -407,6 +407,12 @@ impl FuncBuilder<'_> {
                         if let Some(q) = self.as_component_quiesced(callee, args)? {
                             return Ok(q);
                         }
+                        // Testbench-owned queue value-queries. `pop()`
+                        // mutates and is accepted only as a standalone let
+                        // RHS by the statement lowering path.
+                        if let Some(q) = self.lower_tb_queue_query_call(callee, args)? {
+                            return Ok(q);
+                        }
                         // Scoreboard queue value-queries: `sb.q.size()`,
                         // `sb.q.empty()`. (`sb.q.pop()` mutates and is
                         // lowered only as a statement — reaching it here
@@ -1011,6 +1017,7 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::DutRead(t, p));
                 Expr::Local(t)
             }
+            Expr::TbQueueQuery { field, query } => Expr::TbQueueQuery { field, query },
             Expr::Binary(op, a, b) => {
                 let a_hint = if matches!(op, BinOp::Eq | BinOp::Ne) {
                     self.expr_type(&b)
@@ -1366,6 +1373,45 @@ impl FuncBuilder<'_> {
             query,
             nested_path,
         }))
+    }
+
+    /// Lower `_tb.pending.size()` / `.empty()` on a testbench-owned queue.
+    /// The queue's field identity is explicit in the IR so backend and
+    /// verifier ownership cannot be confused with scoreboard state.
+    fn lower_tb_queue_query_call(
+        &self,
+        callee: &AstExpr,
+        args: &[crate::ast::CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let Some((field, method)) = self.as_tb_queue_call(callee) else {
+            return Ok(None);
+        };
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "testbench queue `{field}.{method}()` takes no arguments"
+            )));
+        }
+        let query = match method.as_str() {
+            "size" => crate::ir::ScoreboardQuery::QueueSize {
+                queue: field.clone(),
+            },
+            "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
+                queue: field.clone(),
+            },
+            "pop" => {
+                return Err(unsupported(
+                    &format!("testbench queue `{field}.pop()` in a nested expression"),
+                    "bind it to its own `let` first — `pop` mutates the queue",
+                ));
+            }
+            other => {
+                return Err(unsupported(
+                    &format!("testbench queue method `{field}.{other}(...)`"),
+                    "only `push`/`pop`/`size`/`empty` are lowered",
+                ));
+            }
+        };
+        Ok(Some(Expr::TbQueueQuery { field, query }))
     }
 
     /// Lower `<recv>.<queue>.size()` / `.empty()` on a composite-component

@@ -510,8 +510,9 @@ pub(super) fn tb_struct(
     tb_name: &str,
     dut_type: &str,
     cov_fields: &[(String, String)],
-    scalar_fields: &[crate::ir::TbScalarFieldSchema],
+    state_fields: &[crate::ir::TbStateFieldSchema],
     scoreboard_fields: &[(String, String)],
+    records: &[crate::ir::RecordSchema],
 ) {
     writeln!(out, "struct {tb_name} {{").ok();
     writeln!(out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
@@ -521,16 +522,24 @@ pub(super) fn tb_struct(
     for (field, sb_type) in scoreboard_fields {
         writeln!(out, "{INDENT}{sb_type} {field};").ok();
     }
-    for f in scalar_fields {
-        let (cty, init) = match f.ty {
-            crate::ir::IrType::Bool => (
-                "bool",
-                if f.default != 0 { "true" } else { "false" }.to_string(),
-            ),
-            crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
-            _ => ("uint64_t", f.default.to_string()),
-        };
-        writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+    for field in state_fields {
+        match field {
+            crate::ir::TbStateFieldSchema::Scalar(f) => {
+                let (cty, init) = match f.ty {
+                    crate::ir::IrType::Bool => (
+                        "bool",
+                        if f.default != 0 { "true" } else { "false" }.to_string(),
+                    ),
+                    crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
+                    _ => ("uint64_t", f.default.to_string()),
+                };
+                writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+            }
+            crate::ir::TbStateFieldSchema::Queue(f) => {
+                let elem = queue_elem_cty(&f.elem, records);
+                writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
+            }
+        }
     }
     writeln!(out, "{INDENT}uint64_t _last_in_cycle = 0;").ok();
     writeln!(out, "{INDENT}uint64_t _last_out_cycle = 0;").ok();

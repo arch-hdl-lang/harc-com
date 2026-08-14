@@ -386,6 +386,41 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         }
     }
     for (ti, tb) in prog.testbenches.iter().enumerate() {
+        let state_scalars: Vec<_> = tb
+            .state_fields
+            .iter()
+            .filter_map(|field| match field {
+                TbStateFieldSchema::Scalar(scalar) => Some(scalar.clone()),
+                TbStateFieldSchema::Queue(_) => None,
+            })
+            .collect();
+        let state_queues: Vec<_> = tb
+            .state_fields
+            .iter()
+            .filter_map(|field| match field {
+                TbStateFieldSchema::Scalar(_) => None,
+                TbStateFieldSchema::Queue(queue) => Some(queue.clone()),
+            })
+            .collect();
+        if state_scalars != tb.scalar_fields || state_queues != tb.queue_fields {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "tb{ti} state_fields does not exactly project to scalar_fields and queue_fields"
+                ),
+            });
+        }
+        let mut state_names = std::collections::HashSet::new();
+        for field in &tb.state_fields {
+            let name = match field {
+                TbStateFieldSchema::Scalar(field) => &field.name,
+                TbStateFieldSchema::Queue(field) => &field.name,
+            };
+            if !state_names.insert(name) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!("tb{ti} declares state field `{name}` more than once"),
+                });
+            }
+        }
         for (field, xid) in &tb.transactor_fields {
             if xid.index() >= prog.transactors.len() {
                 errs.push(VerifyError::BadProgramRef {
@@ -393,6 +428,13 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         "tb{ti} transactor field `{field}` references missing x{}",
                         xid.0
                     ),
+                });
+            }
+        }
+        for edge in &tb.connects {
+            if let Err(detail) = verify_testbench_connect(prog, tb, edge) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!("tb{ti} has invalid connect metadata: {detail}"),
                 });
             }
         }
@@ -411,6 +453,105 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         Ok(())
     } else {
         Err(errs)
+    }
+}
+
+fn verify_testbench_connect(
+    prog: &TbProgram,
+    tb: &TestbenchSchema,
+    edge: &ConnectEdgeSchema,
+) -> Result<(), String> {
+    let src_id = resolve_testbench_component_path(prog, tb, &edge.src_path)?;
+    let src = prog
+        .components
+        .get(src_id.index())
+        .ok_or_else(|| format!("source component c{} does not resolve", src_id.0))?;
+    let payload = match src.field(&edge.src_event) {
+        Some(ComponentFieldSchema {
+            kind: ComponentFieldKind::Event { payload },
+            ..
+        }) => *payload,
+        _ => {
+            return Err(format!(
+                "source `{}.{}` is not an event field",
+                edge.src_path.join("."),
+                edge.src_event
+            ));
+        }
+    };
+
+    let sink_id = resolve_testbench_component_path(prog, tb, &edge.sink_path)?;
+    if sink_id != edge.sink_component {
+        return Err(format!(
+            "sink path `{}` resolves to c{} but edge stores c{}",
+            edge.sink_path.join("."),
+            sink_id.0,
+            edge.sink_component.0
+        ));
+    }
+    let sink = prog
+        .components
+        .get(sink_id.index())
+        .ok_or_else(|| format!("sink component c{} does not resolve", sink_id.0))?;
+    match &edge.sink {
+        ConnectSink::Method { method } => {
+            let Some(m) = sink.method(method) else {
+                return Err(format!("sink method `{method}` does not resolve"));
+            };
+            if !m.hookable || m.n_params != 1 || m.has_ret || m.param_tys.len() != 1 {
+                return Err(format!("sink method `{method}` is not a one-argument void hookable"));
+            }
+            if !event_payload_matches_type(payload, &m.param_tys[0]) {
+                return Err(format!("sink method `{method}` has an incompatible payload type"));
+            }
+        }
+        ConnectSink::Event { event } => match sink.field(event) {
+            Some(ComponentFieldSchema {
+                kind: ComponentFieldKind::Event { payload: sink_payload },
+                ..
+            }) if *sink_payload == payload => {}
+            _ => return Err(format!("sink event `{event}` does not resolve or has a mismatched payload")),
+        },
+    }
+    Ok(())
+}
+
+fn resolve_testbench_component_path(
+    prog: &TbProgram,
+    tb: &TestbenchSchema,
+    path: &[String],
+) -> Result<ComponentId, String> {
+    let Some((root, tail)) = path.split_first() else {
+        return Err("empty component path".to_string());
+    };
+    let mut cid = tb
+        .component_fields
+        .iter()
+        .find(|field| field.field == *root)
+        .map(|field| field.component)
+        .ok_or_else(|| format!("root `{root}` is not a testbench component field"))?;
+    for segment in tail {
+        let component = prog
+            .components
+            .get(cid.index())
+            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+        cid = match component.field(segment) {
+            Some(ComponentFieldSchema {
+                kind: ComponentFieldKind::Sub { component },
+                ..
+            }) => *component,
+            _ => return Err(format!("path segment `{segment}` is not a sub-component")),
+        };
+    }
+    Ok(cid)
+}
+
+fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
+    match (payload, ty) {
+        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
     }
 }
 
@@ -595,6 +736,38 @@ impl Checker<'_> {
                 Stmt::TbFieldWrite { field, value } => {
                     self.check_tb_field(field);
                     self.check_expr(value, false, "TbFieldWrite value");
+                }
+                Stmt::TbQueuePush { field, value } => {
+                    self.check_tb_queue(field);
+                    self.check_expr(value, false, "TbQueuePush value");
+                    if let (Some(elem), Some(actual)) =
+                        (self.tb_queue_elem(field), expr_type(self.func, value))
+                    {
+                        if !queue_elem_matches_type(elem, &actual) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} pushes {:?} into testbench queue `{field}` with element {:?}",
+                                    self.fid.0, self.bid.0, actual, elem
+                                ),
+                            });
+                        }
+                    }
+                }
+                Stmt::TbQueuePop { field, dest } => {
+                    self.check_tb_queue(field);
+                    self.check_local(*dest);
+                    if let (Some(elem), Some(local)) =
+                        (self.tb_queue_elem(field), self.func.locals.get(dest.index()))
+                    {
+                        if !queue_elem_matches_type(elem, &local.ty) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} pops testbench queue `{field}` with element {:?} into local %{} declared {:?}",
+                                    self.fid.0, self.bid.0, elem, dest.0, local.ty
+                                ),
+                            });
+                        }
+                    }
                 }
                 Stmt::TransactorStateWrite { value, .. } => {
                     // Instance/field resolution is a lowering concern
@@ -784,7 +957,11 @@ impl Checker<'_> {
             .func
             .owner
             .and_then(|tb| self.prog.testbenches.get(tb.index()))
-            .is_some_and(|tb| tb.scalar_fields.iter().any(|f| f.name == field));
+            .is_some_and(|tb| {
+                tb.state_fields.iter().any(|state| {
+                    matches!(state, TbStateFieldSchema::Scalar(scalar) if scalar.name == field)
+                })
+            });
         if !ok {
             self.errs.push(VerifyError::BadTbField {
                 func: self.fid,
@@ -792,6 +969,29 @@ impl Checker<'_> {
                 field: field.to_string(),
             });
         }
+    }
+
+    /// The owning testbench must declare queue field `field`.
+    fn check_tb_queue(&mut self, field: &str) {
+        if self.tb_queue_elem(field).is_none() {
+            self.errs.push(VerifyError::BadTbField {
+                func: self.fid,
+                block: self.bid,
+                field: field.to_string(),
+            });
+        }
+    }
+
+    fn tb_queue_elem(&self, field: &str) -> Option<&QueueElem> {
+        self.func
+            .owner
+            .and_then(|tb| self.prog.testbenches.get(tb.index()))
+            .and_then(|tb| {
+                tb.state_fields.iter().find_map(|state| match state {
+                    TbStateFieldSchema::Queue(queue) if queue.name == field => Some(&queue.elem),
+                    _ => None,
+                })
+            })
     }
 
     /// The scoreboard id must resolve and `field` must be a
@@ -996,6 +1196,20 @@ impl Checker<'_> {
             Expr::CycleCount | Expr::ErrorCount => {}
             Expr::Local(l) => self.check_local(*l),
             Expr::TbField(field) => self.check_tb_field(field),
+            Expr::TbQueueQuery { field, query } => {
+                self.check_tb_queue(field);
+                match query {
+                    ScoreboardQuery::QueueSize { queue }
+                    | ScoreboardQuery::QueueEmpty { queue }
+                        if queue == field => {}
+                    _ => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} has malformed query metadata for testbench queue `{field}`",
+                            self.fid.0, self.bid.0
+                        ),
+                    }),
+                }
+            }
             // Transactor-instance state — host state, resolved at
             // lowering against the bound instance; nothing to verify
             // structurally here (no local/port dependency).
@@ -1314,6 +1528,19 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
     }
 }
 
+/// Queue elements erase scalar widths but retain signedness and record
+/// identity. `Unknown` is the inferred type of an unannotated scalar pop,
+/// which is emitted as the queue's runtime scalar representation.
+fn queue_elem_matches_type(elem: &QueueElem, ty: &IrType) -> bool {
+    match (elem, ty) {
+        (_, IrType::Unknown) => true,
+        (QueueElem::Scalar { signed: true }, IrType::SInt(_)) => true,
+        (QueueElem::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (QueueElem::Record(expected), IrType::Record(actual)) => expected == actual,
+        _ => false,
+    }
+}
+
 fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
     if expected == actual {
         return true;
@@ -1534,7 +1761,10 @@ fn check_def_before_use(
                     }
                     check_e(value, &defined, errs);
                 }
-                Stmt::TbFieldWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::TbFieldWrite { value, .. } | Stmt::TbQueuePush { value, .. } => {
+                    check_e(value, &defined, errs)
+                }
+                Stmt::TbQueuePop { dest, .. } => bit_set(&mut defined, dest.index()),
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
                 Stmt::TransactorStateRecordFieldWrite { value, .. } => {
                     check_e(value, &defined, errs)
@@ -1684,6 +1914,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ErrorCount
         | Expr::Port(_)
         | Expr::TbField(_)
+        | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }

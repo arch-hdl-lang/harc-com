@@ -821,6 +821,10 @@ pub struct ComponentMethodSchema {
     pub name: String,
     /// Lowered method body (`kind: ComponentMethod`).
     pub function: FunctionId,
+    /// Declared parameter types after lowering. Connection resolution uses
+    /// this surface before method bodies exist to validate the single
+    /// analysis payload accepted by a hookable sink.
+    pub param_tys: Vec<IrType>,
     pub n_params: usize,
     pub has_ret: bool,
     /// Declared return type after lowering, when present.
@@ -853,7 +857,8 @@ pub struct OnHandlerSchema {
 }
 
 /// One `connect <src>.<event> -> <sink>.<method|event>` edge inside an
-/// env, resolved to the paths the test uses to reach the sub-components.
+/// env or reusable testbench, resolved to the component paths used by its
+/// owning scope.
 /// Two sink shapes (see `ConnectSink`):
 ///   * method sink — `<env>.<src_path>.<event>.push_back([&](auto _t){
 ///     <SinkComp>_<method>(<env>.<sink_path>, _t); })`
@@ -863,8 +868,9 @@ pub struct OnHandlerSchema {
 ///     event→event bridge feeding a driver's `in event` handler).
 #[derive(Debug, Clone)]
 pub struct ConnectEdgeSchema {
-    /// Dotted path from the env-bound test field to the source sub-
-    /// component (e.g. `["source"]` for `env.source`).
+    /// Dotted path from the owning scope to the source component. For an
+    /// env it is relative to the bound env field; for a testbench it starts
+    /// with a testbench-owned component field.
     pub src_path: Vec<String>,
     /// `out event<T>` field on the source sub-component.
     pub src_event: String,
@@ -936,6 +942,18 @@ pub struct TestbenchSchema {
     /// `_tb` struct (v1's component-struct members), read via
     /// `Expr::TbField` and written via `Stmt::TbFieldWrite`.
     pub scalar_fields: Vec<TbScalarFieldSchema>,
+    /// Typed FIFO fields owned directly by the reusable testbench. These
+    /// share the scalar host object's lifetime but use explicit TB-IR queue
+    /// operations so their mutation cannot be confused with a scoreboard or
+    /// component queue.
+    pub queue_fields: Vec<TbQueueFieldSchema>,
+    /// Source-ordered typed host state. The scalar/queue projections above
+    /// remain for existing lowering lookups; emitters and dump-ir use this
+    /// collection to preserve declaration order across state kinds.
+    pub state_fields: Vec<TbStateFieldSchema>,
+    /// `connect` edges owned directly by this testbench. Paths are rooted
+    /// at testbench component fields and are installed before run/check.
+    pub connects: Vec<ConnectEdgeSchema>,
     /// Transaction/struct-typed testbench fields, in declaration order.
     /// These are run/helper/check-shared host records declared once at
     /// test scope and referenced as synthetic record locals in each
@@ -1126,12 +1144,28 @@ pub struct RegblockBinding {
 /// One scalar testbench field (`expected : uint<32> default 0`).
 /// Emitted as a member of the `_tb` struct with v1's C-type mapping
 /// (bool → `bool`, signed → `int64_t`, unsigned → `uint64_t`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TbScalarFieldSchema {
     pub name: String,
     pub ty: IrType,
     /// Declared `default <lit>` value, or 0 (v1's fallback).
     pub default: u64,
+}
+
+/// One testbench-owned FIFO (`pending : queue<uint<32>>` or
+/// `pending : queue<Record>`). Queue elements reuse the shared queue shape
+/// used by scoreboards, components, and transactor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TbQueueFieldSchema {
+    pub name: String,
+    pub elem: QueueElem,
+}
+
+/// One source-ordered testbench host-state declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TbStateFieldSchema {
+    Scalar(TbScalarFieldSchema),
+    Queue(TbQueueFieldSchema),
 }
 
 /// One persistent state field of a bound-to target transactor. A field
@@ -1430,6 +1464,17 @@ pub enum Stmt {
     TbFieldWrite {
         field: String,
         value: Expr,
+    },
+    /// `_tb.<field>.push(value)` on a testbench-owned typed FIFO.
+    TbQueuePush {
+        field: String,
+        value: Expr,
+    },
+    /// `let value = _tb.<field>.pop()` on a testbench-owned typed FIFO.
+    /// A discarded pop is rejected during lowering.
+    TbQueuePop {
+        field: String,
+        dest: LocalId,
     },
     /// `read_count = read_count + 1` inside a target-responder body
     /// (or `target.read_count = ...` from the test): write a bound-to
@@ -1870,6 +1915,12 @@ pub enum Expr {
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
+    /// `_tb.<field>.size()` / `_tb.<field>.empty()` on a testbench-owned
+    /// typed FIFO. `pop()` mutates, so it lowers only as `Stmt::TbQueuePop`.
+    TbQueueQuery {
+        field: String,
+        query: ScoreboardQuery,
+    },
     /// A read of a bound-to target transactor's persistent state field,
     /// either from a responder body (`read_count`) or from the test
     /// (`target.read_count`). `instance` is the bound testbench-field

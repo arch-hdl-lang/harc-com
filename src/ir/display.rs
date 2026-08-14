@@ -22,8 +22,34 @@ impl Display for TbProgram {
             for (field, cov) in &tb.cov_fields {
                 write!(f, " cov {field}=cg{}", cov.0)?;
             }
-            for sf in &tb.scalar_fields {
-                write!(f, " field {}:{}={}", sf.name, type_str(&sf.ty), sf.default)?;
+            for field in &tb.state_fields {
+                match field {
+                    TbStateFieldSchema::Scalar(sf) => {
+                        write!(f, " field {}:{}={}", sf.name, type_str(&sf.ty), sf.default)?;
+                    }
+                    TbStateFieldSchema::Queue(qf) => {
+                        let elem = match qf.elem {
+                            QueueElem::Scalar { signed: true } => "sint".to_string(),
+                            QueueElem::Scalar { signed: false } => "uint".to_string(),
+                            QueueElem::Record(r) => self.records[r.index()].name.clone(),
+                        };
+                        write!(f, " queue {}:{elem}", qf.name)?;
+                    }
+                }
+            }
+            for edge in &tb.connects {
+                let sink = match &edge.sink {
+                    ConnectSink::Method { method } => method,
+                    ConnectSink::Event { event } => event,
+                };
+                write!(
+                    f,
+                    " connect {}.{}->{}.{}",
+                    edge.src_path.join("."),
+                    edge.src_event,
+                    edge.sink_path.join("."),
+                    sink,
+                )?;
             }
             for b in &tb.bus_bindings {
                 write!(f, " bus {}={}", b.field, b.bus)?;
@@ -508,6 +534,12 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::TbFieldWrite { field, value } => {
             format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
         }
+        Stmt::TbQueuePush { field, value } => {
+            format!("TbQueuePush(_tb.{field}, {})", expr_str(func, value))
+        }
+        Stmt::TbQueuePop { field, dest } => {
+            format!("TbQueuePop({} = _tb.{field}.pop())", local_str(func, *dest))
+        }
         Stmt::TransactorStateWrite {
             instance,
             field,
@@ -928,6 +960,11 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             }
         }
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TbQueueQuery { field, query } => match query {
+            crate::ir::ScoreboardQuery::QueueSize { .. } => format!("_tb.{field}.size()"),
+            crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!("_tb.{field}.empty()"),
+            crate::ir::ScoreboardQuery::Scalar { .. } => format!("_tb.{field}"),
+        },
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
         Expr::TransactorStateRecordField {
             instance,

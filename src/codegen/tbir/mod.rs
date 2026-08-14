@@ -36,7 +36,7 @@ const INDENT: &str = "    ";
 /// case — the unused `dut` handle stays a nullptr (synthetic tests use a
 /// bare `dut` local).
 fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
-    !tb.synthetic || !tb.scalar_fields.is_empty()
+    !tb.synthetic || !tb.state_fields.is_empty()
 }
 
 pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
@@ -207,8 +207,9 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
                 &tb.name,
                 &dut_type,
                 &cov_fields,
-                &tb.scalar_fields,
+                &tb.state_fields,
                 &sb_fields,
+                &prog.records,
             );
         }
     }
@@ -379,6 +380,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | RecordFieldWrite { value: e, .. }
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
+        | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
         | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
@@ -398,7 +400,10 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         SeqPush { value, .. }
         | ComponentQueuePush { value, .. }
         | TransactorStateQueuePush { value, .. } => expr_has_probe(value),
-        ComponentQueuePop { .. } | ComponentSubAssign { .. } | TransactorStateQueuePop { .. } => {
+        ComponentQueuePop { .. }
+        | ComponentSubAssign { .. }
+        | TransactorStateQueuePop { .. }
+        | TbQueuePop { .. } => {
             false
         }
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
@@ -585,6 +590,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         Assign(_, e)
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
+        | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
         | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
@@ -612,7 +618,10 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         SeqPush { value, .. }
         | ComponentQueuePush { value, .. }
         | TransactorStateQueuePush { value, .. } => for_each_port_in_expr(value, f),
-        ComponentQueuePop { .. } | ComponentSubAssign { .. } | TransactorStateQueuePop { .. } => {}
+        ComponentQueuePop { .. }
+        | ComponentSubAssign { .. }
+        | TransactorStateQueuePop { .. }
+        | TbQueuePop { .. } => {}
         TlmFork(desc) => desc.args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         TlmJoinAll(pending) => pending
             .iter()
@@ -1183,11 +1192,16 @@ fn emit_one_connect(
     inst_path: &str,
     edge: &ir::ConnectEdgeSchema,
 ) {
-    let src = std::iter::once(inst_path.to_string())
+    let prefix = (!inst_path.is_empty()).then(|| inst_path.to_string());
+    let src = prefix
+        .iter()
+        .cloned()
         .chain(edge.src_path.iter().cloned())
         .collect::<Vec<_>>()
         .join(".");
-    let sink = std::iter::once(inst_path.to_string())
+    let sink = prefix
+        .iter()
+        .cloned()
         .chain(edge.sink_path.iter().cloned())
         .collect::<Vec<_>>()
         .join(".");
@@ -1849,6 +1863,9 @@ fn emit_test(
     // Composite-component connection and lifecycle setup for the instances
     // declared above. Keep this after component method lambdas so connect
     // closures can call `<SinkComp>_<method>(...)`.
+    for edge in &tb.connects {
+        emit_one_connect(out, prog, "", edge);
+    }
     for cf in &tb.component_fields {
         // The top component's own `connect` edges (an env's source→sink, or
         // an agent instantiated directly at test scope), plus any nested

@@ -931,6 +931,14 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}_tb.{field} = {e};").ok();
         }
+        Stmt::TbQueuePush { field, value } => {
+            let e = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}_tb.{field}.push({e});").ok();
+        }
+        Stmt::TbQueuePop { field, dest } => {
+            let name = &names[dest.index()];
+            writeln!(out, "{pad}{name} = _tb.{field}.pop();").ok();
+        }
         Stmt::TransactorStateWrite {
             instance,
             field,

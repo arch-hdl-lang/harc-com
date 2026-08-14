@@ -1183,6 +1183,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -1247,6 +1248,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -1397,6 +1399,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
+        tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
@@ -1827,17 +1830,22 @@ fn validate_testbench_component(
                     // a transactor concept), so reject it rather than
                     // silently drop it.
                     if component_type_names.contains(simple) {
-                        if mode.is_some() {
+                        if matches!(mode, Some(TransactorMode::Active)) {
                             return Err(unsupported(
                                 &format!(
-                                    "an `active`/`passive` mode on composite-component \
+                                    "an `active` mode on composite-component \
                                      testbench field `{}.{} : {simple}`",
                                     c.name.name, f.name.name
                                 ),
-                                "the mode keyword applies to transactor instances, not \
-                                 envs/agents/scoreboards",
+                                "only the passive ownership annotation is accepted for an \
+                                 analysis-source component field",
                             ));
                         }
+                        // v1 requires a mode at this declaration site for
+                        // analysis-source transactors even though their
+                        // methods remain callable host-side. `passive` is
+                        // therefore retained as an ownership annotation;
+                        // it does not suppress method or connect emission.
                         continue;
                     }
                     if scoreboard_ids.contains_key(simple) {
@@ -1897,6 +1905,24 @@ fn validate_testbench_component(
                             "the `sequencer` construct is not in this subset",
                         ));
                     }
+                } else if let TypeExpr::Builtin {
+                    name: BuiltinTy::Queue,
+                    args,
+                    ..
+                } = &f.ty
+                {
+                    if f.default.is_some() {
+                        return Err(unsupported(
+                            &format!("a default on testbench queue field `{}`", f.name.name),
+                            "queues default-construct empty; drop the `default`",
+                        ));
+                    }
+                    components::lower_queue_elem(
+                        &c.name.name,
+                        &f.name.name,
+                        args.first(),
+                        record_ids,
+                    )?;
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
                     return Err(unsupported(
                         &format!(
@@ -1949,6 +1975,9 @@ fn validate_testbench_component(
                 // handler (`on <bool-expr>`) is accepted; its period /
                 // predicate is validated when `lower_test` lowers it.
             }
+            // Testbench-level analysis wiring is resolved after its field
+            // bindings have been collected in `lower_test`.
+            ComponentItem::Connect(_) => {}
             _ => {
                 return Err(unsupported(
                     &format!(
@@ -2803,6 +2832,9 @@ fn lower_test(
     let mut passive_transactor_fields: HashSet<String> = HashSet::new();
     let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
     let mut scalar_fields: Vec<ir::TbScalarFieldSchema> = Vec::new();
+    let mut queue_fields: Vec<ir::TbQueueFieldSchema> = Vec::new();
+    let mut state_fields: Vec<ir::TbStateFieldSchema> = Vec::new();
+    let mut testbench_component_fields: Vec<(String, ir::ComponentId)> = Vec::new();
     let mut record_fields: Vec<(String, RecordId)> = Vec::new();
     let mut tb_methods: HashMap<String, HookableMethod> = HashMap::new();
     // Testbench-scoped `on <N> cycles [phase post_eval]` periodic
@@ -2877,7 +2909,35 @@ fn lower_test(
                             // in the data-only routes above.
                             if let Some(cid) = component_ids.get(simple) {
                                 test_scope_components.push((f.name.name.clone(), *cid));
+                                testbench_component_fields.push((f.name.name.clone(), *cid));
                             }
+                        } else if let TypeExpr::Builtin {
+                            name: BuiltinTy::Queue,
+                            args,
+                            ..
+                        } = &f.ty
+                        {
+                            if f.default.is_some() {
+                                return Err(unsupported(
+                                    &format!(
+                                        "a default on testbench queue field `{}`",
+                                        f.name.name
+                                    ),
+                                    "queues default-construct empty; drop the `default`",
+                                ));
+                            }
+                            let elem = components::lower_queue_elem(
+                                tbn,
+                                &f.name.name,
+                                args.first(),
+                                record_ids,
+                            )?;
+                            let queue = ir::TbQueueFieldSchema {
+                                name: f.name.name.clone(),
+                                elem,
+                            };
+                            queue_fields.push(queue.clone());
+                            state_fields.push(ir::TbStateFieldSchema::Queue(queue));
                         } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
                             let default = match &f.default {
                                 None => 0,
@@ -2905,11 +2965,13 @@ fn lower_test(
                                     }
                                 },
                             };
-                            scalar_fields.push(ir::TbScalarFieldSchema {
+                            let scalar = ir::TbScalarFieldSchema {
                                 name: f.name.name.clone(),
                                 ty,
                                 default,
-                            });
+                            };
+                            scalar_fields.push(scalar.clone());
+                            state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
                         }
                     }
                     ComponentItem::Hookable(h) => {
@@ -3146,6 +3208,14 @@ fn lower_test(
             active: active_bound_instances.contains(field),
         });
     }
+
+    let tb_connects = if let Some(tbn) = &tb_name {
+        let roots: HashMap<String, ir::ComponentId> =
+            testbench_component_fields.iter().cloned().collect();
+        components::resolve_testbench_connects(components[tbn], &roots, &prog.components)?
+    } else {
+        Vec::new()
+    };
 
     // Bus bindings (test-scope `let`s) and transactor fields (testbench
     // component fields) share the `CallTarget::TransactorMethod`
@@ -3644,11 +3714,13 @@ fn lower_test(
                     ));
                 }
             };
-            scalar_fields.push(ir::TbScalarFieldSchema {
+            let scalar = ir::TbScalarFieldSchema {
                 name: l.name.name.clone(),
                 ty,
                 default,
-            });
+            };
+            scalar_fields.push(scalar.clone());
+            state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
         }
         // Drop the promoted lets from the hoisted-let list — they are now
         // `_tb` host fields, not run-function locals.
@@ -3665,6 +3737,9 @@ fn lower_test(
         dut_type,
         cov_fields: cov_fields.clone(),
         scalar_fields: scalar_fields.clone(),
+        queue_fields: queue_fields.clone(),
+        state_fields,
+        connects: tb_connects,
         record_fields: record_fields.clone(),
         bus_bindings: bus_bindings.clone(),
         transactor_fields: transactor_fields.clone(),
@@ -3845,6 +3920,10 @@ fn lower_test(
         consts: consts.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        tb_queue_fields: queue_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.elem.clone()))
+            .collect(),
         tb_record_fields: record_fields.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
@@ -4583,6 +4662,9 @@ pub(crate) struct LowerCtx {
     /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
     /// for `_tb.<field>` access lowering.
     pub tb_scalar_fields: HashSet<String>,
+    /// Testbench-owned typed queue fields (`TestbenchSchema::queue_fields`),
+    /// for `_tb.<field>.push/pop/size/empty` lowering.
+    pub tb_queue_fields: HashMap<String, crate::ir::QueueElem>,
     /// Transaction/struct-typed testbench field names and record ids.
     /// Each owning function declares a synthetic record local with the
     /// same name so existing record-field lowering and verification apply;
@@ -5502,7 +5584,8 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => in_expr(e),
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
-                | ir::Stmt::TbFieldWrite { value, .. } => in_expr(value),
+                | ir::Stmt::TbFieldWrite { value, .. }
+                | ir::Stmt::TbQueuePush { value, .. } => in_expr(value),
                 ir::Stmt::AssertCheck { cond, on_fail } => {
                     in_expr(cond).or_else(|| on_fail.args.iter().find_map(|a| in_expr(&a.expr)))
                 }
@@ -5528,7 +5611,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::SeqPush { value, .. } | ir::Stmt::ComponentQueuePush { value, .. } => {
                     in_expr(value)
                 }
-                ir::Stmt::ComponentQueuePop { .. } | ir::Stmt::ComponentSubAssign { .. } => None,
+                ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::TbQueuePop { .. } => None,
                 // Fork/join descriptors carry their request payload exprs;
                 // a responder body never forks, but scan for completeness.
                 ir::Stmt::TlmFork(desc) => desc.args.iter().find_map(in_expr),
@@ -5601,6 +5686,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::CovHookParam { index: None, .. }
             | ir::Expr::CovHookArg { .. }
             | ir::Expr::TbField(_)
+            | ir::Expr::TbQueueQuery { .. }
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ComponentValue { .. }
             | ir::Expr::ScoreboardQuery { .. }
@@ -5670,7 +5756,8 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => fill_expr(e, instance),
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
-                | ir::Stmt::TbFieldWrite { value, .. } => fill_expr(value, instance),
+                | ir::Stmt::TbFieldWrite { value, .. }
+                | ir::Stmt::TbQueuePush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::AssertCheck { cond, on_fail } => {
                     fill_expr(cond, instance);
                     for a in &mut on_fail.args {
@@ -5702,7 +5789,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentQueuePush { value, .. } => fill_expr(value, instance),
-                ir::Stmt::ComponentQueuePop { .. } | ir::Stmt::ComponentSubAssign { .. } => {}
+                ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::TbQueuePop { .. } => {}
                 ir::Stmt::TlmFork(desc) => {
                     for a in &mut desc.args {
                         fill_expr(a, instance);
@@ -5839,6 +5928,7 @@ fn fill_visit_expr(
         | Expr::CovHookParam { index: None, .. }
         | Expr::CovHookArg { .. }
         | Expr::TbField(_)
+        | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
@@ -5911,6 +6001,7 @@ fn fill_initiator_bus_prefix(
                     | Stmt::RecordFieldWrite { value: e, .. }
                     | Stmt::RecordWriteCb { value: e, .. }
                     | Stmt::TbFieldWrite { value: e, .. }
+                    | Stmt::TbQueuePush { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
                     | Stmt::TransactorStateRecordFieldWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
@@ -5963,7 +6054,8 @@ fn fill_initiator_bus_prefix(
                     }
                     Stmt::ComponentQueuePop { .. }
                     | Stmt::ComponentSubAssign { .. }
-                    | Stmt::TransactorStateQueuePop { .. } => {}
+                    | Stmt::TransactorStateQueuePop { .. }
+                    | Stmt::TbQueuePop { .. } => {}
                     Stmt::TlmFork(desc) => {
                         for a in &mut desc.args {
                             visit_expr(a, placeholder, binding, remap, rewrite, &mut conflict);
