@@ -231,7 +231,7 @@ run_one() {
     # shellcheck disable=SC2086
     out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} --outdir "$outdir" ${HARC_SIM_EXTRA_ARGS:-} 2>&1)" || true
 
-    if echo "$out" | grep -q "ALL TESTS PASSED"; then
+    if [[ "$out" == *"ALL TESTS PASSED"* ]]; then
         echo "  PASS  $test"
         echo "__STATUS__ PASS $test"
     else
