@@ -2057,6 +2057,216 @@ fn analysis_env_connect_emitted_cpp_snapshot() {
     );
 }
 
+/// Analysis `connect` is a typed subscription boundary. A plain `function`
+/// is callable but is not hookable, so it must not silently become a
+/// subscription sink; similarly, signed and unsigned scalar callback shapes
+/// must agree before C++ emission.
+#[test]
+fn analysis_connect_rejects_non_hookable_and_payload_mismatched_sinks() {
+    let non_hookable = r#"
+transactor Source
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Source
+
+scoreboard Sink
+    function accept(v: uint<8>)
+    end accept
+end scoreboard Sink
+
+env E
+    source : Source passive
+    sink : Sink
+
+    connect
+        source.observed -> sink.accept
+    end connect
+end env E
+
+test T
+    let dut : Top
+    let e : E
+    run
+        log(info, "test")
+    end run
+end test T
+"#;
+    let err = lower_src(non_hookable).expect_err("must reject non-hookable sink");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("not hookable"), "unexpected diagnostic: {msg}");
+
+    let mismatched_payload = non_hookable.replace(
+        "function accept(v: uint<8>)\n    end accept",
+        "hookable accept(v: sint<8>)\n    end accept",
+    );
+    let err = lower_src(&mismatched_payload).expect_err("must reject incompatible payloads");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("payload"), "unexpected diagnostic: {msg}");
+}
+
+/// A reusable testbench may own analysis wiring directly. The endpoint paths
+/// are rooted at its component fields, may descend through nested components,
+/// and preserve declaration-order fanout in emitted subscription setup.
+#[test]
+fn testbench_owned_analysis_connects_lower_and_emit() {
+    let src = r#"
+transactor Source
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Source
+
+scoreboard Sink
+    count : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+    end accept
+end scoreboard Sink
+
+env Holder
+    inner : Sink
+end env Holder
+
+testbench ConnectTb
+    dut : Top
+    source : Source passive
+    direct : Sink
+    nested : Holder
+
+    connect
+        source.observed -> direct.accept
+        source.observed -> nested.inner.accept
+    end connect
+end testbench ConnectTb
+
+impl TestbenchConnectTest for ConnectTb
+    run
+        source.publish(7)
+        assert direct.count == 1
+        assert nested.inner.count == 1
+    end run
+end impl TestbenchConnectTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let tb = &prog.testbenches[0];
+    assert_eq!(tb.connects.len(), 2);
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(cpp.contains("source.observed.push_back"), "{cpp}");
+    assert!(cpp.contains("Sink_accept(direct, _t)"), "{cpp}");
+    assert!(cpp.contains("Sink_accept(nested.inner, _t)"), "{cpp}");
+}
+
+#[test]
+fn testbench_owned_state_connect_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("testbench_owned_state_connect_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("testbench_owned_state_connect_dump_ir", format!("{prog}"));
+}
+
+/// The verifier protects TB-IR consumers from malformed testbench-owned
+/// state/connect metadata introduced by a later pass.
+#[test]
+fn verifier_rejects_malformed_testbench_queue_and_connect_metadata() {
+    let mut queue_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
+        .expect("lowers");
+    let run = queue_prog.tests[0].run.index();
+    let push = queue_prog.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|b| b.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePush { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("fixture has queue push");
+    *push = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::SInt(Some(8)),
+    };
+    assert!(verify::verify_program(&queue_prog).is_err());
+
+    let mut connect_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
+        .expect("lowers");
+    connect_prog.testbenches[0].connects[0].sink_component = ir::ComponentId(999);
+    assert!(verify::verify_program(&connect_prog).is_err());
+
+    let mut query_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
+        .expect("lowers");
+    let run = query_prog.tests[0].run.index();
+    let cond = query_prog.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|b| b.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+            _ => None,
+        })
+        .expect("fixture has assertion");
+    *cond = ir::Expr::TbQueueQuery {
+        field: "pending".to_string(),
+        query: ir::ScoreboardQuery::Scalar {
+            scalar: "pending".to_string(),
+        },
+    };
+    assert!(verify::verify_program(&query_prog).is_err());
+}
+
+/// A reusable testbench owns typed FIFO state just like a scoreboard or
+/// component, but the queue lifetime is the `_tb` host object's lifecycle.
+/// Helpers and lifecycle phases must therefore resolve the same queue cell.
+#[test]
+fn testbench_owned_scalar_and_record_queues_lower_and_emit() {
+    let src = r#"
+struct PendingItem
+    value : uint<32>
+end struct PendingItem
+
+testbench QueueTb
+    dut     : Top
+    pending : queue<uint<32>>
+    records : queue<PendingItem>
+
+    function enqueue(v: uint<32>)
+        pending.push(v)
+    end enqueue
+
+    check
+        assert pending.size() == 1
+            else fail("expected one pending item")
+        let got : uint<32> = pending.pop()
+        assert got == 7
+            else fail("wrong queued value")
+        assert pending.empty()
+            else fail("queue must drain")
+    end check
+end testbench QueueTb
+
+impl QueueOwnerTest for QueueTb
+    run
+        enqueue(7)
+    end run
+end impl QueueOwnerTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("testbench queues lower");
+    verify::verify_program(&prog).expect("testbench queues verify");
+    let tb = prog.testbench(prog.tests[0].testbench);
+    assert_eq!(tb.queue_fields.len(), 2, "both queue fields are retained");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("queues emit");
+    assert!(cpp.contains("harc_rt::HarcQueue<uint64_t> pending;"), "{cpp}");
+    assert!(cpp.contains("harc_rt::HarcQueue<PendingItem> records;"), "{cpp}");
+    assert!(cpp.contains("_tb.pending.push"), "{cpp}");
+    assert!(cpp.contains("_tb.pending.pop()"), "{cpp}");
+}
+
 /// Agent subset: an `agent` composing an `event<T>` self-event, an
 /// `on <ev>(arg)` handler (lowered as a one-param `ComponentMethod`),
 /// and the heartbeat `idle_in` predicate. Locks the dump-ir: the

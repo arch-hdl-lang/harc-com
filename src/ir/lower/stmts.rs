@@ -193,6 +193,33 @@ impl FuncBuilder<'_> {
                         return Ok(());
                     }
                 }
+                // Testbench-owned queue mutation: `_tb.pending.push(x)`.
+                // `.pop()` must bind its result in a `let`, matching every
+                // other typed queue owner.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some((field, method)) = self.as_tb_queue_call(callee) {
+                        if method == "push" {
+                            let [CallArg::Expr(arg)] = args.as_slice() else {
+                                return Err(LowerError::Invalid(format!(
+                                    "testbench queue `{field}.push` takes exactly one positional argument"
+                                )));
+                            };
+                            let value = self.lower_expr_no_ports(arg)?;
+                            self.push(Stmt::TbQueuePush { field, value });
+                            return Ok(());
+                        }
+                        if method == "pop" {
+                            return Err(unsupported(
+                                &format!("a discarded testbench queue `{field}.pop()`"),
+                                "bind the popped value: `let v = <queue>.pop()`",
+                            ));
+                        }
+                        return Err(unsupported(
+                            &format!("testbench queue method `{field}.{method}(...)` in statement position"),
+                            "only `push`/`pop`/`size`/`empty` are lowered",
+                        ));
+                    }
+                }
                 // `cov.report()` (post-desugar `_tb.cov.report()`) on a
                 // covergroup-typed testbench field → CovReport.
                 if let ExprKind::Call { callee, args } = &*e.kind {
@@ -492,6 +519,32 @@ impl FuncBuilder<'_> {
         }
         if l.bind {
             return Err(unsupported("`= bind ...` declarations", ""));
+        }
+        // `let v = _tb.pending.pop()` on a testbench-owned queue. This
+        // precedes the generic scalar/record let paths so record-element
+        // pops retain their record type.
+        if let Some(call) = pop_call_callee(&l.value) {
+            if let Some((field, method)) = self.as_tb_queue_call(call) {
+                if method == "pop" {
+                    let elem = self.tb_queue_elem(&field)?;
+                    let id = self.declare(&l.name.name);
+                    match elem {
+                        crate::ir::QueueElem::Record(rid) => {
+                            self.set_local_type(id, IrType::Record(rid));
+                        }
+                        crate::ir::QueueElem::Scalar { .. } => {
+                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
+                                self.let_widths.insert(id, w);
+                            }
+                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+                                self.set_local_type(id, ty);
+                            }
+                        }
+                    }
+                    self.push(Stmt::TbQueuePop { field, dest: id });
+                    return Ok(());
+                }
+            }
         }
         // `let v = <recv>.<queue>.pop()` on a composite-component queue —
         // pop the front into a new local. Checked before the record-typed
@@ -1535,6 +1588,38 @@ impl FuncBuilder<'_> {
             Some(crate::ir::StateFieldKind::Queue { .. })
         )
         .then(|| (id.name.clone(), method.name.clone()))
+    }
+
+    /// Recognize a testbench-owned queue call after impl-form desugaring:
+    /// `_tb.pending.push(x)` / `.pop()` / `.size()` / `.empty()`.
+    pub(crate) fn as_tb_queue_call(
+        &self,
+        callee: &crate::ast::Expr,
+    ) -> Option<(String, String)> {
+        let ExprKind::Field { target, name: method } = &*callee.kind else {
+            return None;
+        };
+        let ExprKind::Field { target, name: field } = &*target.kind else {
+            return None;
+        };
+        let ExprKind::Ident(root) = &*target.kind else {
+            return None;
+        };
+        (self.ctx.tb_field.as_deref() == Some(root.name.as_str())
+            && self.ctx.tb_queue_fields.contains_key(&field.name))
+            .then(|| (field.name.clone(), method.name.clone()))
+    }
+
+    pub(crate) fn tb_queue_elem(
+        &self,
+        field: &str,
+    ) -> Result<crate::ir::QueueElem, LowerError> {
+        self.ctx.tb_queue_fields.get(field).cloned().ok_or_else(|| {
+            unsupported(
+                &format!("an unknown testbench queue field `{field}`"),
+                "declare the queue on the reusable testbench",
+            )
+        })
     }
 
     /// Resolve a scoreboard-field access root. Three forms:

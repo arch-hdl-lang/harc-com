@@ -324,7 +324,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(call, &mut accesses, &mut transactor);
             }
-            Stmt::TbFieldWrite { value, .. } => {
+            Stmt::TbFieldWrite { value, .. } | Stmt::TbQueuePush { value, .. } => {
                 // Host state on the _tb struct — no pin access of its
                 // own; the value expression may carry inline reads.
                 host_service_only = false;
@@ -338,7 +338,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
-            Stmt::TransactorStateQueuePop { .. } => {
+            Stmt::TransactorStateQueuePop { .. } | Stmt::TbQueuePop { .. } => {
                 // Pop into a host local — pure host state, no value expr.
                 host_service_only = false;
             }
@@ -528,6 +528,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::CycleCount
         | Expr::ErrorCount
         | Expr::TbField(_)
+        | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }

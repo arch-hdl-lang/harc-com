@@ -1,0 +1,90 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 OwnedStateConnectTb { dut: Top } queue pending:uint queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept
+  testbench tb1 OwnedStateConnectTb { dut: Top } queue pending:uint queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept
+  test OwnedStateConnectFreshTest tb=tb0 run=fn2 check=-
+  test OwnedStateConnectTest tb=tb1 run=fn3 check=fn4
+  record r0 PendingItem
+    value : uint<32>
+  component c0 TbSource (transactor)
+    field observed : out event<uint>
+    method publish(1 arg) = fn0
+  component c1 TbSink (scoreboard)
+    field count : scalar = 0
+    field sum : scalar = 0
+    method accept(1 arg) = fn1
+  component c2 TbNested (env)
+    field sink : sub c1
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentEmit(self.observed, [%v])
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.count, (self.count + 1))
+    ComponentFieldWrite(self.sum, (self.sum + %v))
+    -> Return
+
+fn fn2 run_OwnedStateConnectFreshTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: _tb.pending.empty(), on_fail: "assertion failed" }
+    AssertCheck { cond: _tb.records.empty(), on_fail: "assertion failed" }
+    AssertCheck { cond: (direct.count == 0), on_fail: "assertion failed" }
+    AssertCheck { cond: (nested.sink.count == 0), on_fail: "assertion failed" }
+    Log(info, "PASS: reusable testbench state starts fresh")
+    -> Return
+
+fn fn3 run_OwnedStateConnectTest [kind=Run, owner=tb1]
+  locals:
+    %0 item : record(r0)
+  entry = b0
+
+  b0:
+    ComponentCall(source.c0::publish([3]))
+    ComponentCall(source.c0::publish([5]))
+    TbQueuePush(_tb.pending, 8)
+    RecordInit(%item, r0)
+    RecordFieldWrite(%item.value, 9)
+    TbQueuePush(_tb.records, %item)
+    AssertCheck { cond: (direct.count == 2), on_fail: "assertion failed" }
+    AssertCheck { cond: (nested.sink.count == 2), on_fail: "assertion failed" }
+    AssertCheck { cond: (direct.sum == 8), on_fail: "assertion failed" }
+    AssertCheck { cond: (nested.sink.sum == 8), on_fail: "assertion failed" }
+    AssertCheck { cond: (_tb.pending.size() == 1), on_fail: "assertion failed" }
+    AssertCheck { cond: (_tb.records.size() == 1), on_fail: "assertion failed" }
+    -> Return
+
+fn fn4 check_OwnedStateConnectTest [kind=Check, owner=tb1]
+  locals:
+    %0 got : unknown
+    %1 record : record(r0)
+  entry = b0
+
+  b0:
+    TbQueuePop(%got = _tb.pending.pop())
+    TbQueuePop(%record = _tb.records.pop())
+    AssertCheck { cond: (%got == 8), on_fail: "assertion failed" }
+    AssertCheck { cond: (%record.value == 9), on_fail: "assertion failed" }
+    AssertCheck { cond: _tb.pending.empty(), on_fail: "assertion failed" }
+    AssertCheck { cond: _tb.records.empty(), on_fail: "assertion failed" }
+    Log(info, "PASS: testbench-owned queue and analysis fanout")
+    -> Return

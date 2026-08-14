@@ -471,6 +471,11 @@ pub(crate) fn lower_component_schema(
             }
             ComponentItem::Hookable(h) => {
                 let n_params = h.params.len();
+                let param_tys = h
+                    .params
+                    .iter()
+                    .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids))
+                    .collect();
                 let has_ret = h.return_ty.is_some();
                 let ret_ty = h
                     .return_ty
@@ -481,6 +486,7 @@ pub(crate) fn lower_component_schema(
                 methods.push(ComponentMethodSchema {
                     name: h.name.name.clone(),
                     function: fid,
+                    param_tys,
                     n_params,
                     has_ret,
                     ret_ty,
@@ -1627,29 +1633,55 @@ pub(crate) fn resolve_connects(
             continue;
         };
         for e in &block.edges {
-            edges.push(resolve_one_connect(env, env_schema, components, e)?);
+            edges.push(resolve_one_connect(env, components, e, |path| {
+                resolve_sub_path(env_schema, components, path)
+            })?);
         }
     }
     Ok(edges)
 }
 
-fn resolve_one_connect(
-    env: &ComponentDecl,
-    env_schema: &ComponentSchema,
+/// Resolve `connect` blocks owned directly by a reusable testbench. Their
+/// endpoint paths remain rooted at testbench component fields for emission.
+pub(crate) fn resolve_testbench_connects(
+    tb: &ComponentDecl,
+    roots: &HashMap<String, ComponentId>,
+    components: &[ComponentSchema],
+) -> Result<Vec<ConnectEdgeSchema>, LowerError> {
+    let mut edges = Vec::new();
+    for it in &tb.items {
+        let ComponentItem::Connect(block) = it else {
+            continue;
+        };
+        for e in &block.edges {
+            edges.push(resolve_one_connect(tb, components, e, |path| {
+                resolve_testbench_path(roots, components, path)
+            })?);
+        }
+    }
+    Ok(edges)
+}
+
+fn resolve_one_connect<F>(
+    owner: &ComponentDecl,
     components: &[ComponentSchema],
     edge: &ConnectEdge,
-) -> Result<ConnectEdgeSchema, LowerError> {
+    resolve_path: F,
+) -> Result<ConnectEdgeSchema, LowerError>
+where
+    F: Fn(&[String]) -> Result<ComponentId, LowerError>,
+{
     // `source.observed -> sb.write_obs`: both sides are dotted paths
     // rooted at an env sub-component field.
     let from = dotted_path(&edge.from).ok_or_else(|| {
         unsupported(
-            &format!("a non-path `connect` source in env `{}`", env.name.name),
+            &format!("a non-path `connect` source in `{}`", owner.name.name),
             "",
         )
     })?;
     let to = dotted_path(&edge.to).ok_or_else(|| {
         unsupported(
-            &format!("a non-path `connect` sink in env `{}`", env.name.name),
+            &format!("a non-path `connect` sink in `{}`", owner.name.name),
             "",
         )
     })?;
@@ -1678,13 +1710,13 @@ fn resolve_one_connect(
     let sink_name = sink_name[0].clone();
 
     // Resolve the source sub-component and verify it exposes `src_event`.
-    let src_cid = resolve_sub_path(env_schema, components, src_path)?;
+    let src_cid = resolve_path(src_path)?;
     let src_comp = &components[src_cid.index()];
-    match src_comp.field(&src_event) {
+    let src_payload = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { .. },
+            kind: ComponentFieldKind::Event { payload },
             ..
-        }) => {}
+        }) => *payload,
         _ => {
             return Err(unsupported(
                 &format!(
@@ -1694,14 +1726,23 @@ fn resolve_one_connect(
                 "",
             ));
         }
-    }
+    };
 
     // Resolve the sink sub-component. The final segment is either a
     // hookable sink method (`sb.write_obs`) or an `in event<T>` field on
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
-    let sink_cid = resolve_sub_path(env_schema, components, sink_path)?;
+    let sink_cid = resolve_path(sink_path)?;
     let sink_comp = &components[sink_cid.index()];
     let sink = if let Some(sm) = sink_comp.method(&sink_name) {
+        if !sm.hookable {
+            return Err(unsupported(
+                &format!(
+                    "a `connect` sink method `{}.{sink_name}` that is not hookable",
+                    sink_path.join(".")
+                ),
+                "analysis sinks must be declared `hookable`",
+            ));
+        }
         if sm.n_params != 1 {
             return Err(unsupported(
                 &format!(
@@ -1711,11 +1752,41 @@ fn resolve_one_connect(
                 "analysis sinks take exactly one payload parameter",
             ));
         }
+        if sm.has_ret {
+            return Err(unsupported(
+                &format!(
+                    "a `connect` sink method `{}.{sink_name}` that returns a value",
+                    sink_path.join(".")
+                ),
+                "analysis sinks must not return a value",
+            ));
+        }
+        if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
+            return Err(unsupported(
+                &format!(
+                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
+                    src_path.join("."),
+                    sink_path.join("."),
+                ),
+                "source and sink payloads must have the same signed scalar shape or record type",
+            ));
+        }
         crate::ir::ConnectSink::Method { method: sink_name }
-    } else if matches!(
-        sink_comp.field(&sink_name).map(|f| &f.kind),
-        Some(ComponentFieldKind::Event { .. })
-    ) {
+    } else if let Some(ComponentFieldSchema {
+        kind: ComponentFieldKind::Event { payload },
+        ..
+    }) = sink_comp.field(&sink_name)
+    {
+        if *payload != src_payload {
+            return Err(unsupported(
+                &format!(
+                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
+                    src_path.join("."),
+                    sink_path.join("."),
+                ),
+                "source and sink event payloads must have the same signed scalar shape or record type",
+            ));
+        }
         crate::ir::ConnectSink::Event { event: sink_name }
     } else {
         return Err(unsupported(
@@ -1735,6 +1806,40 @@ fn resolve_one_connect(
         sink_component: sink_cid,
         sink,
     })
+}
+
+fn resolve_testbench_path(
+    roots: &HashMap<String, ComponentId>,
+    components: &[ComponentSchema],
+    path: &[String],
+) -> Result<ComponentId, LowerError> {
+    let Some((root, tail)) = path.split_first() else {
+        return Err(unsupported("an empty testbench `connect` component path", ""));
+    };
+    let cid = roots.get(root).copied().ok_or_else(|| {
+        unsupported(
+            &format!("a testbench `connect` root `{root}` that is not a component field"),
+            "connect endpoints must be rooted at a testbench-owned component field",
+        )
+    })?;
+    if tail.is_empty() {
+        Ok(cid)
+    } else {
+        resolve_sub_path(&components[cid.index()], components, tail)
+    }
+}
+
+/// Whether a hookable method's declared parameter has the same runtime
+/// callback shape as an analysis event payload. Narrow unsigned values,
+/// `bits`, and `bool` all widen to the unsigned callback representation;
+/// signed values and value records retain distinct shapes.
+fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
+    match (payload, ty) {
+        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
+    }
 }
 
 /// Walk a sub-component path (relative to the env) to the ComponentId it

@@ -1,0 +1,83 @@
+// Reusable-testbench ownership: queue state survives run→check and analysis
+// wiring is declared at the testbench root rather than inside an env.
+
+struct PendingItem
+    value : uint<32>
+end struct PendingItem
+
+transactor TbSource
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor TbSource
+
+scoreboard TbSink
+    count : uint<32> default 0
+    sum   : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+        sum = sum + v
+    end accept
+end scoreboard TbSink
+
+env TbNested
+    sink : TbSink
+end env TbNested
+
+testbench OwnedStateConnectTb
+    dut     : Top
+    source  : TbSource passive
+    direct  : TbSink
+    nested  : TbNested
+    pending : queue<uint<32>>
+    records : queue<PendingItem>
+
+    connect
+        source.observed -> direct.accept
+        source.observed -> nested.sink.accept
+    end connect
+end testbench OwnedStateConnectTb
+
+impl OwnedStateConnectTest for OwnedStateConnectTb
+    run
+        source.publish(3)
+        source.publish(5)
+        pending.push(8)
+        let item : PendingItem
+        item.value = 9
+        records.push(item)
+
+        assert direct.count == 2
+        assert nested.sink.count == 2
+        assert direct.sum == 8
+        assert nested.sink.sum == 8
+        assert pending.size() == 1
+        assert records.size() == 1
+    end run
+
+    check
+        let got = pending.pop()
+        let record = records.pop()
+        assert got == 8
+        assert record.value == 9
+        assert pending.empty()
+        assert records.empty()
+        log(info, "PASS: testbench-owned queue and analysis fanout")
+    end check
+end impl OwnedStateConnectTest
+
+// A second implementation proves each test receives freshly constructed
+// testbench-owned queues and component state, rather than inheriting from the
+// preceding implementation of the same reusable testbench.
+impl OwnedStateConnectFreshTest for OwnedStateConnectTb
+    run
+        assert pending.empty()
+        assert records.empty()
+        assert direct.count == 0
+        assert nested.sink.count == 0
+        log(info, "PASS: reusable testbench state starts fresh")
+    end run
+end impl OwnedStateConnectFreshTest

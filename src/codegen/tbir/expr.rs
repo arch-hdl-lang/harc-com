@@ -237,6 +237,17 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TbQueueQuery { field, query } => match query {
+            crate::ir::ScoreboardQuery::QueueSize { .. } => {
+                format!("((uint64_t)_tb.{field}.size())")
+            }
+            crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!("_tb.{field}.empty()"),
+            crate::ir::ScoreboardQuery::Scalar { .. } => {
+                return Err(EmitError(format!(
+                    "tbir: scalar query on testbench queue `{field}`"
+                )));
+            }
+        },
         // Bound-to target transactor instance state — a member of the
         // generated per-instance struct (`<instance>.<field>`), matching
         // v1's `field_subs` substitution at the responder body and the
