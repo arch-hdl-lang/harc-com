@@ -2177,7 +2177,13 @@ fn testbench_owned_state_connect_dump_ir_snapshot() {
 fn verifier_rejects_malformed_testbench_queue_and_connect_metadata() {
     let mut queue_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
         .expect("lowers");
-    let run = queue_prog.tests[0].run.index();
+    let run = queue_prog
+        .tests
+        .iter()
+        .find(|test| test.name == "OwnedStateConnectTest")
+        .expect("fixture has the queue exercise test")
+        .run
+        .index();
     let push = queue_prog.functions[run]
         .blocks
         .iter_mut()
@@ -2200,7 +2206,13 @@ fn verifier_rejects_malformed_testbench_queue_and_connect_metadata() {
 
     let mut query_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
         .expect("lowers");
-    let run = query_prog.tests[0].run.index();
+    let run = query_prog
+        .tests
+        .iter()
+        .find(|test| test.name == "OwnedStateConnectTest")
+        .expect("fixture has the queue exercise test")
+        .run
+        .index();
     let cond = query_prog.functions[run]
         .blocks
         .iter_mut()
