@@ -8123,3 +8123,115 @@ end test T"#,
         );
     }
 }
+
+/// The full-width sign fill must be spelled `int64_t`, not `uint64_t`.
+/// v1 binds it to `auto`, so an unsigned spelling deduced the opposite
+/// signedness from TB-IR's `int64_t` local and flipped `> 0`, `/`, and
+/// `>>` on the same source. Nothing else in the suite pins this.
+#[test]
+fn v1_full_width_sign_fill_is_signed() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let p : uint<32> = 0xAB
+        let x = p[7:0].sext<64>()
+        assert x > 0 else fail("neg")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)("),
+        "the width-64 fill must be signed so `auto` deduces int64_t; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("((uint64_t)(((int64_t)("),
+        "an unsigned outer cast makes `auto` deduce uint64_t; got:\n{cpp}"
+    );
+}
+
+/// A bare integer literal is not a narrowing source: v1 must not reject
+/// `let b : uint<8> = 300` while TB-IR (which types a bare literal as
+/// widthless) accepts it. Reverting the exclusion re-introduces exactly
+/// that accepted-set divergence, silently.
+#[test]
+fn a_bare_literal_initializer_is_not_a_narrowing_error() {
+    for src in [
+        r#"test T
+    let dut : Top
+    run
+        let b : uint<8> = 300
+        log(info, "${b}")
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<0> = 0
+        log(info, "${z}")
+    end run
+end test T"#,
+    ] {
+        let parsed = parse_source(src).expect("parses");
+        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        assert!(
+            cpp_tb::emit(&merged).is_ok(),
+            "v1 must accept a bare-literal initializer, as TB-IR does"
+        );
+        assert!(
+            harc::ir::lower::lower_program(&merged).is_ok(),
+            "TB-IR must accept it too — the two accepted sets have to match"
+        );
+    }
+}
+
+/// `probe_widths` is keyed by bare probe name, so the wrap-operand lookup
+/// must check the base is `dut`. Without that guard a same-named record
+/// field masked at the probe's width — a silently wrong value — and the
+/// map must also be cleared per test or it leaks into a probe-less one.
+#[test]
+fn probe_width_lookup_does_not_capture_same_named_fields() {
+    let collide = r#"transaction Txn
+    count : uint<32> default 0
+end transaction Txn
+test ProbeCollide
+    let dut : Top
+        probe count : uint<8> at inner.count
+    end let dut
+    run
+        let t : Txn
+        t.count = 250
+        let s : uint<32> = t.count +% 10
+        log(info, "${s}")
+    end run
+end test ProbeCollide"#;
+    let err = v1_emit_err(collide);
+    assert!(
+        err.contains("statically known bit-width"),
+        "a record field must not resolve to a same-named probe's width; got: {err}"
+    );
+
+    // Second test has no probes: the first test's entry must not leak.
+    let leak = r#"test AProbe
+    let dut : Top
+        probe count : uint<8> at inner.count
+    end let dut
+    run
+        let x = dut.count +% 1
+        log(info, "${x}")
+    end run
+end test AProbe
+
+test BPort
+    let dut : Top
+    run
+        let y = dut.count +% 1
+        log(info, "${y}")
+    end run
+end test BPort"#;
+    let err = v1_emit_err(leak);
+    assert!(
+        err.contains("statically known bit-width"),
+        "probe widths must not leak across tests; got: {err}"
+    );
+}

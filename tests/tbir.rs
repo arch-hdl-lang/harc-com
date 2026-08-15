@@ -9745,3 +9745,26 @@ end test T"#,
     .expect("masked wide value lowers");
     verify::verify_program(&prog).expect("verifies");
 }
+
+/// TB-IR's half of the full-width sign fill: the outer cast must be
+/// signed, matching v1's, or the two backends' `> 0` / `/` / `>>` on a
+/// filled `sext<64>` disagree. Nothing else in the suite pins it.
+#[test]
+fn full_width_sign_fill_is_signed() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let p : uint<32> = 0xAB
+        let x = p[7:0].sext<64>()
+        assert x > 0 else fail("neg")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(((int64_t)(") && !cpp.contains("((uint64_t)(((int64_t)("),
+        "the width-64 fill must be signed in TB-IR too; got:\n{cpp}"
+    );
+}

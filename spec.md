@@ -255,15 +255,22 @@ let d : uint<9>  = (a as uint<9>) + 1  // == 256  (plain `+` does not wrap)
 
 Signedness: the mask is the two's-complement low-`W` bit pattern; a `sint<N>`
 operand yields that residue as an unsigned value, so reinterpret with an
-explicit cast if a signed result is wanted. Both backends apply the wrap in
-statement position and reject the same unknown-width and `> 64`-bit operands:
-the legacy `--codegen v1` backend previously treated these as pass-through
-sugar (`+ / - / *`), which made the same source produce different values under
-the two emitters. Two contexts still differ and are not wrap-masked
-equivalently: a `const` initializer (v1 folds the masked value, the TB-IR
-backend rejects the form outright — spell the mask explicitly), and a `keep`
-constraint, where both backends route `+%` through the solver as plain `+`.
-See harc#473.
+explicit cast if a signed result is wanted. Both backends apply the wrap and
+reject the same unknown-width and `> 64`-bit operands: the legacy
+`--codegen v1` backend previously treated these as pass-through sugar
+(`+ / - / *`), which made the same source produce different values under the
+two emitters.
+
+Three caveats remain. A `const` initializer is the one context the backends
+still handle differently — v1 folds the masked value, the TB-IR backend
+rejects the form outright, so spell the mask explicitly there. Inside a `keep`
+constraint the wrap is dropped by *both* backends (`+%` reaches the solver as
+plain `+`); that is a shared gap in the constraint lowering, not a divergence,
+but it does mean a solved value is not masked. And binding a wrap to an
+untyped `let` at width 64 gives the result different signedness under the two
+backends (v1 declares the local `int64_t`, TB-IR `uint64_t`), which changes
+`>`, `/`, and `>>`; annotate the destination (`let y : uint<64> = …`) to pin
+it. See harc#473.
 
 ---
 
