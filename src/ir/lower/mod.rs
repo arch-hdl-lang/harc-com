@@ -16,7 +16,7 @@ mod bus;
 mod components;
 mod control;
 mod covergroups;
-mod exprs;
+pub(crate) mod exprs;
 mod helpers;
 mod records;
 mod regblock;

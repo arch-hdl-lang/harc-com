@@ -8271,8 +8271,7 @@ end test T"#;
 /// of these was a v1-only rejection.
 #[test]
 fn v1_wrap_operand_inference_matches_tbir_on_cast_and_bit_probes() {
-    // Width-less and capitalised scalar casts (TB-IR's `cast_relabel_width`
-    // accepts both; a width-less scalar cast is 64 bits).
+    // A width-less scalar cast is 64 bits, not unknown.
     let cpp = v1_cpp(
         r#"test T
     let dut : Top
@@ -8286,6 +8285,42 @@ end test T"#,
     assert!(
         cpp.contains("+ 100)))"),
         "a width-less cast operand must wrap at 64 bits, not be rejected; got:\n{cpp}"
+    );
+
+    // The capitalised ARCH spellings count too — this half was previously
+    // unpinned, and deleting `UIntCap | SIntCap` left the whole suite green.
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let x = (a as UInt<8>) +% 100
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("& 0xFFULL"),
+        "a capitalised cast operand must wrap at its declared 8 bits; got:\n{cpp}"
+    );
+
+    // A non-literal width argument is unknown, NOT 64 — `cast_relabel_width`
+    // distinguishes "no argument" from "argument we cannot fold", and
+    // collapsing both to 64 made v1 wrap at 64 where TB-IR rejects.
+    let err = v1_emit_err(
+        r#"const W : uint<32> = 8
+test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let x = (a as uint<W>) +% 100
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("statically known bit-width"),
+        "a non-literal cast width must be unknown, matching TB-IR; got: {err}"
     );
 
     // A `Bit` probe is one bit wide, not width-less.
@@ -8304,4 +8339,67 @@ end test T"#,
         cpp.contains("& 0x1ULL"),
         "a Bit probe operand must wrap at 1 bit; got:\n{cpp}"
     );
+}
+
+/// ARCH sized literals (`8'hFF`) are a v1-only form — TB-IR rejects them
+/// and names `--codegen v1` as the escape hatch — so the narrowing check
+/// must not decode them as some invented width. An earlier version
+/// returned a hard-coded 129 bits for any text it could not parse, which
+/// rejected every one of them.
+#[test]
+fn sized_literals_are_not_narrowing_sources() {
+    for lit in ["8'hFF", "4'b1010", "8'd42"] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        let b : uint<8> = {lit}
+        log(info, "${{b}}")
+    end run
+end test T"#
+        );
+        let parsed = parse_source(&src).expect("parses");
+        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        assert!(
+            cpp_tb::emit(&merged).is_ok(),
+            "v1 must still accept the sized literal `{lit}`"
+        );
+    }
+}
+
+/// The reported width must be the literal's true bit count, and must match
+/// TB-IR's, or the same program yields two different numbers in the same
+/// diagnostic. The earlier 129-bit sentinel also blinded the check to a
+/// >128-bit literal narrowing into a wide-but-smaller local.
+#[test]
+fn wide_literal_widths_agree_between_backends() {
+    for (lit, decl, bits) in [
+        ("0xFFFFFFFFFFFFFFFFFFFF", 8u32, "80-bit"),
+        ("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 8, "160-bit"),
+        ("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 140, "160-bit"),
+    ] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        let b : uint<{decl}> = {lit}
+        log(info, "${{b}}")
+    end run
+end test T"#
+        );
+        let parsed = parse_source(&src).expect("parses");
+        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        let v1 = match cpp_tb::emit(&merged) {
+            Ok(_) => panic!("v1 must reject {lit} into uint<{decl}>"),
+            Err(e) => e.0.to_string(),
+        };
+        let tbir = harc::ir::lower::lower_program(&merged)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            v1.contains(bits) && tbir.contains(bits),
+            "both backends must report {bits}; v1: {v1}\ntbir: {tbir}"
+        );
+    }
 }
