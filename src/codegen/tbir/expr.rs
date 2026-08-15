@@ -659,7 +659,14 @@ fn width_cast_cpp(
                 } else {
                     let shift = 64 - sw;
                     if width == 64 {
-                        format!("((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                        // `int64_t`, not `uint64_t`: a full-width fill is
+                        // the one shape whose sign bit survives into the
+                        // result, and v1 binds this expression to `auto`.
+                        // Spelling it unsigned there made `auto` deduce
+                        // `uint64_t` while TB-IR's own local is `int64_t`,
+                        // so `p[7:0].sext<64>() > 0` came out true under v1
+                        // and false under TB-IR.
+                        format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
                     } else {
                         format!(
                             "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) \
@@ -669,7 +676,12 @@ fn width_cast_cpp(
                     }
                 }
             }
-            _ if width <= 64 => format!("((int64_t)({e}))"),
+            // Narrow to `uint64_t` before the signed relabel: a
+            // `HarcWide<N>` receiver converts implicitly to both
+            // `uint64_t` and `_harc_u128`, so a bare `(int64_t)` on one is
+            // an ambiguous conversion. Value-identical for the scalar
+            // receivers, which reinterpret the same low 64 bits either way.
+            _ if width <= 64 => format!("((int64_t)((uint64_t)({e})))"),
             _ => plain_cast(&e),
         },
         WidthCastKind::Resize => match src_width {

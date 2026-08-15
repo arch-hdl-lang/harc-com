@@ -308,9 +308,11 @@ test T
 end test T"#,
     )
     .expect_err("wrap-op const initializer must fail lowering");
-    // `Invalid`, not `Unsupported`: v1 emits wrap ops UNMASKED into the
-    // constexpr initializer (255 +% 1 gives 256 at uint<8> under v1),
-    // so the diagnostic must not steer users to `--codegen v1`.
+    // `Invalid`, not `Unsupported`: `Unsupported` steers users to
+    // `--codegen v1`, and a construct with no defined value in this
+    // backend belongs spelled out at the source. (v1 masks these
+    // correctly in a constexpr initializer now, so it accepts a const
+    // form TB-IR rejects — a residual accepted-set difference.)
     let msg = assert_invalid(&err);
     assert!(
         msg.contains("const BAD") && msg.contains("+% -% *%"),
@@ -502,8 +504,11 @@ end test T"#,
         cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
         "uint relabel casts must use logical right shift; got:\n{cpp}"
     );
+    // The inner `(uint64_t)` narrows before the signed relabel (a
+    // `HarcWide` receiver is otherwise an ambiguous conversion); it is
+    // value-transparent here — `(int64_t)((uint64_t)(-1))` is `-1`.
     assert!(
-        cpp.contains("((int64_t)(((int64_t)(((int64_t)(-1)))))) >> 1"),
+        cpp.contains("((int64_t)(((int64_t)((uint64_t)(((int64_t)(-1))))))) >> 1"),
         "sext results must use arithmetic right shift; got:\n{cpp}"
     );
     assert!(
@@ -866,7 +871,7 @@ fn signed_relabel_cast_preserves_narrow_source_value() {
 end test T"#,
     );
     assert!(
-        cpp.contains("= ((int64_t)(byte));"),
+        cpp.contains("= ((int64_t)((uint64_t)(byte)));"),
         "as sint<64> must relabel without sign-extending a narrow source; got:\n{cpp}"
     );
 }
