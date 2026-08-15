@@ -260,18 +260,25 @@ reject an unknown-width or `> 64`-bit operand: the legacy `--codegen v1`
 backend previously treated these as pass-through sugar (`+ / - / *`), which
 made the same source produce different values under the two emitters.
 
-Four caveats remain, and the accepted operand sets are close but not proven
-identical — the two backends infer operand widths in separate code, so a shape
-one resolves and the other does not is a `--codegen v1`-only rejection rather
-than a value difference.
+Five caveats remain, and the accepted operand sets are close but not proven
+identical in either direction — the two backends infer operand widths in
+separate code, so a shape one resolves and the other does not shows up as a
+backend-specific accept or reject rather than as a value difference.
 
 - A **`const` initializer** is the one context the backends genuinely handle
   differently: v1 folds the masked value, the TB-IR backend rejects the form
   outright. Spell the mask explicitly there.
-- A **`sint<N>` destination** — `let s : sint<8> = a +% b` — is rejected by
-  the TB-IR backend, which types a wrap's result unsigned per the signedness
-  rule above and then refuses to store it in a signed local. v1 accepts it.
-  Assign to a `uint<N>` local and relabel.
+- A **`sint<N>` destination** — `let s : sint<8> = a +% b` — is refused by the
+  TB-IR backend, which types a wrap's result unsigned per the signedness rule
+  above and then will not store it in a signed local. It surfaces as an
+  `internal error` from the post-lowering verifier rather than as a source
+  diagnostic, which is a defect in its own right. v1 accepts it. Assign to a
+  `uint<N>` local and relabel.
+- A **narrower typed destination** — `let x : uint<4> = a +% 1` on an 8-bit
+  `a` — is rejected by the TB-IR backend, which treats the wrap's implicit
+  mask as a width-carrying source and sees an 8-bit value narrowing into 4
+  bits. v1 accepts it and stores the unmasked 8-bit residue. Match the
+  destination to the wrap width, or narrow explicitly with `.trunc<4>()`.
 - Inside a **`keep` constraint** the wrap is dropped by *both* backends (`+%`
   reaches the solver as plain `+`). That is a shared gap in the constraint
   lowering rather than a divergence, but a solved value is not masked.

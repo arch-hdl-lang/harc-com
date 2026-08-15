@@ -10188,24 +10188,16 @@ impl Emitter {
     fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
-            // Mirrors TB-IR's `cast_relabel_width`: the capitalised ARCH
-            // spellings count, and a width-less scalar cast is 64 bits,
-            // not unknown. Without those, `(a as uint) +% 1` and
-            // `(a as UInt<8>) +% 1` were rejected by v1 and wrapped by
-            // TB-IR.
-            ExprKind::Cast { ty, .. } => match ty {
-                TypeExpr::Builtin {
-                    name:
-                        BuiltinTy::UInt
-                        | BuiltinTy::UIntCap
-                        | BuiltinTy::SInt
-                        | BuiltinTy::SIntCap
-                        | BuiltinTy::Bits,
-                    args,
-                    ..
-                } => Some(type_arg_width(args).map(|w| w as u32).unwrap_or(64)),
-                _ => None,
-            },
+            // Delegate to TB-IR's own `cast_relabel_width` rather than
+            // re-deriving the rule: the capitalised ARCH spellings count,
+            // a width-less scalar cast is 64 bits, a non-literal width
+            // argument is unknown (NOT 64), and widths of 0 or >128 are
+            // unknown. Hand-rolling this diverged at three of those four
+            // edges; sharing the function makes the two backends agree by
+            // construction.
+            // `cast_relabel_width` already returns `None` for a
+            // non-builtin target, so no pre-match is needed.
+            ExprKind::Cast { ty, .. } => crate::ir::lower::exprs::cast_relabel_width(ty),
             ExprKind::BitSlice { hi, lo, .. } => {
                 let hi = eval_const_width(hi)?;
                 let lo = eval_const_width(lo)?;
@@ -19345,18 +19337,6 @@ fn cpp_param_names(params: &[Param]) -> Vec<String> {
         .collect()
 }
 
-/// Whether an initializer's inferred width is meaningful for the
-/// narrowing check.
-///
-/// A bare integer literal is excluded: `infer_expr_width_best_effort`
-/// reports a literal's *minimum value width* — the right notion for a
-/// width-method receiver, the wrong one here. TB-IR types a bare literal
-/// as widthless (`IrType::UInt(None)`), which `assign_compatible` treats
-/// as a wildcard, so counting it would make v1 reject `let b : uint<8> =
-/// 300` while the default backend accepts it — a fresh accepted-set
-/// divergence, the opposite of what this check is for. Whether an
-/// out-of-range literal should be an error is a language question for
-/// both backends and `harc check`, not something to settle in v1 alone.
 /// Width of an initializer for the narrowing check, or `None` when the
 /// shape carries no width worth comparing.
 ///
@@ -19376,26 +19356,45 @@ fn narrowing_source_width(e: &Emitter, value: &Expr) -> Option<u32> {
 }
 
 /// `Some(bits)` when an integer literal's text denotes a value wider than
-/// 64 bits; `None` when it fits (or cannot be parsed as one).
+/// 64 bits, using the same bit count TB-IR's `wide_literal_bits` reports
+/// so the two backends quote the same number in the same diagnostic.
+///
+/// `None` means "not a narrowing source": the value fits in 64 bits, or
+/// the text is a form this function does not decode. Never guess a width
+/// for text that failed to parse — an earlier version returned a
+/// hard-coded 129 for any parse failure, which rejected every ARCH sized
+/// literal (`8'hFF`, `4'b1010`), a form v1 fully supports and TB-IR
+/// explicitly delegates to v1.
 fn wide_literal_bit_width(s: &str) -> Option<u32> {
     let t = s.replace('_', "");
-    let (digits, radix) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        (r, 16)
-    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        (r, 2)
-    } else {
-        (t.as_str(), 10)
-    };
-    if digits.is_empty() {
+    // Sized ARCH literals (`8'hFF`) carry their own width and are v1-only;
+    // exempt them exactly as a bare literal that fits is exempt.
+    if t.contains('\'') {
         return None;
     }
-    match u128::from_str_radix(digits, radix) {
-        Ok(v) if v > u64::MAX as u128 => Some(128 - v.leading_zeros()),
-        // Beyond 128 bits the exact width is not worth recovering; report
-        // the smallest value that is unambiguously "too wide to fit".
-        Err(_) => Some(129),
-        Ok(_) => None,
+    let (digits, bits_per_digit) =
+        if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            (r, 4)
+        } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+            (r, 1)
+        } else {
+            // Decimal: no digit-count shortcut, so bound it with u128 and
+            // decline to guess beyond that rather than invent a width.
+            return match t.parse::<u128>() {
+                Ok(v) if v > u64::MAX as u128 => Some(128 - v.leading_zeros()),
+                _ => None,
+            };
+        };
+    // Radix-aligned: the exact width is derivable from the digit count, so
+    // this stays correct past 128 bits where `u128` would overflow.
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_digit(1 << bits_per_digit)) {
+        return None;
     }
+    let lead = u32::from_str_radix(&trimmed[..1], 1 << bits_per_digit).ok()?;
+    let lead_bits = 32 - lead.leading_zeros();
+    let bits = (trimmed.len() as u32 - 1) * bits_per_digit + lead_bits;
+    (bits > 64).then_some(bits)
 }
 
 fn c_binary_op(op: BinaryOp) -> &'static str {
