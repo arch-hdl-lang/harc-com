@@ -889,7 +889,13 @@ reason. Code locations are authoritative.
       `_harc_u128` cast. Wider targets use the `HarcWide<N>` word-array
       helpers, including exact masks for partial final words. `zext` on an
       unknown-width receiver is a plain cast — v1's exact shape, including
-      its documented "assume the receiver already fits" looseness.
+      its documented "assume the receiver already fits" looseness. The
+      `1..=1024` ceiling is on the cast **destination** only: a
+      `WidthCast`'s `src_width` is best-effort receiver metadata read off
+      a declared type, which the language does not bound (a
+      `uint<2048>` local narrowed by `.trunc<64>()` is legal), so the
+      verifier checks it for nonzero and nothing more. Lowering reports an
+      unusable declared width (`uint<0>`) as `None`, never `Some(0)`.
     - *Lane indices* on DUT `Vec` ports may be compile-time constants
       OR runtime expressions (#433): a `PortRef` lane carries a
       `LaneIndex { Const \| Var }`, and a `Var` index renders through the

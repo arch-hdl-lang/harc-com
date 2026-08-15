@@ -91,6 +91,18 @@ struct HarcWide {
         }
     }
 
+    // Widening conversion between word counts: a value is sized by its own
+    // width, its destination slot by the declared width of the local it
+    // lands in, and the two legitimately differ (`let b : uint<256> =
+    // a.zext<200>()`, or a plain `uint<130>` value assigned into a
+    // `uint<256>` local). Copy the source words and zero-fill the rest.
+    // Narrowing stays a compile error: dropping words is only correct
+    // behind an explicit `harc_wide_trunc`, which masks to a stated width.
+    template<std::size_t M, typename = std::enable_if_t<(M < N)>>
+    HarcWide(const HarcWide<M>& other) {
+        for (std::size_t i = 0; i < M; ++i) words[i] = other.words[i];
+    }
+
     uint32_t operator[](std::size_t i) const { return i < N ? words[i] : 0u; }
     uint32_t& operator[](std::size_t i) { return words[i]; }
 

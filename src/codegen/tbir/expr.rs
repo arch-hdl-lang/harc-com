@@ -633,14 +633,19 @@ fn width_cast_cpp(
     // `_harc_u128` for 65..128-bit casts, `uint64_t` otherwise.
     let c_unsigned = if width > 64 { "_harc_u128" } else { "uint64_t" };
     let mask = |w: u32| (1u64 << w) - 1;
-    // Narrow-to-`width` shape (v1's trunc / resize-narrow path).
+    // Narrow-to-`width` shape (v1's trunc / resize-narrow path). The
+    // sub-64 mask narrows to `uint64_t` *before* the `&`: a `HarcWide<N>`
+    // receiver converts implicitly to both `uint64_t` and `_harc_u128`,
+    // so masking it directly is an ambiguous `operator&`. Narrowing first
+    // is value-identical for the `uint64_t` / `_harc_u128` receivers too,
+    // since `width < 64` keeps the kept bits inside the low word.
     let trunc_shape = |e: &str| {
         if width > 64 {
             format!("harc_rt::harc_trunc_u128((_harc_u128)({e}), {width})")
         } else if width == 64 {
             format!("((uint64_t)({e}))")
         } else {
-            format!("((uint64_t)((({e}) & 0x{:X}ULL)))", mask(width))
+            format!("((uint64_t)(((uint64_t)({e}) & 0x{:X}ULL)))", mask(width))
         }
     };
     let plain_cast = |e: &str| format!("(({c_unsigned})({e}))");

@@ -104,6 +104,20 @@ impl WideCastTest for WideCastTb
         assert normalized_sext == 0
             else fail("same-width sext preserved source storage padding")
 
+        // ── cast width narrower than the destination slot ──────────────
+        // A cast is sized by its own width, the local by its declared
+        // width; `zext<200>` (7 words) landing in a `uint<256>` slot
+        // (8 words) must still compile and keep the value. The companion
+        // `trunc<8>` narrows a `HarcWide` receiver through the sub-64
+        // mask shape.
+        let src130 : uint<130> = 0x3FF
+        let w200 : uint<256> = src130.zext<200>()
+        assert w200 == 0x3FF
+            else fail("zext<200> into a uint<256> slot changed the value")
+        let low8 = src130.trunc<8>()
+        assert low8 == 0xFF
+            else fail("trunc<8> of a HarcWide source: got 0x${low8:02x}")
+
         // ── language ceiling: 1024-bit destination ─────────────────────
         let maxwide : uint<1024> = v64.zext<1024>()
         let maxwide_low : uint<64> = maxwide.trunc<64>()

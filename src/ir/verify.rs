@@ -1028,9 +1028,17 @@ impl Checker<'_> {
                 inner,
                 ..
             } => {
+                // `width` is the cast *destination* and carries the
+                // width-method language limit lowering enforces. `src_width`
+                // is best-effort receiver metadata read off a declared type,
+                // and declared widths are not bounded by that limit —
+                // `let big : uint<2048>` narrowed by `big.trunc<64>()` is a
+                // legal program — so only a zero-width source is malformed
+                // here (lowering reports an unusable declared width as
+                // `None`, never `Some(0)`).
                 if *width == 0
                     || *width > crate::MAX_WIDTH_METHOD_BITS
-                    || src_width.is_some_and(|w| w == 0 || w > crate::MAX_WIDTH_METHOD_BITS)
+                    || src_width.is_some_and(|w| w == 0)
                 {
                     self.errs.push(VerifyError::BadWidthCast {
                         func: self.fid,
