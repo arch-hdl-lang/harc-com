@@ -1,0 +1,109 @@
+---
+source: tests/tbir.rs
+expression: "format!(\"{prog}\")"
+---
+tb-ir program
+  testbench tb0 LargeTb { dut: Top } connect lifecycle.seen->sink.accept
+  testbench tb1 LargeTb { dut: Top } connect lifecycle.seen->sink.accept
+  test PassiveAnalysisMonitorFreshTest tb=tb0 run=fn3 check=-
+  test PassiveAnalysisMonitorTest tb=tb1 run=fn4 check=fn5
+  record r0 LifeRec
+    tag : uint<8>
+    stamp : uint<32>
+  component c0 LifecycleMonitor (transactor)
+    field seen : out event<uint>
+    field starts : scalar = 0
+    field stops : scalar = 0
+    field history : queue<LifeRec>
+    method note_start(1 arg) = fn0
+    method note_stop(1 arg) = fn1
+  component c1 LifeSink (scoreboard)
+    field count : scalar = 0
+    field last : scalar = 0
+    method accept(1 arg) = fn2
+
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  params:
+    tag : uint<8>
+  locals:
+    %0 tag : uint<8>
+    %1 r : record(r0)
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.starts, (self.starts + 1))
+    RecordInit(%r, r0)
+    RecordFieldWrite(%r.tag, %tag)
+    RecordFieldWrite(%r.stamp, self.starts)
+    ComponentQueuePush(self.history, %r)
+    ComponentEmit(self.seen, [%tag])
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c0)]
+  params:
+    tag : uint<8>
+  locals:
+    %0 tag : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.stops, (self.stops + 1))
+    ComponentEmit(self.seen, [%tag])
+    -> Return
+
+fn fn2 comp_method_2 [kind=ComponentMethod(c1)]
+  params:
+    v : uint<8>
+  locals:
+    %0 v : uint<8>
+  entry = b0
+
+  b0:
+    ComponentFieldWrite(self.count, (self.count + 1))
+    ComponentFieldWrite(self.last, %v)
+    -> Return
+
+fn fn3 run_PassiveAnalysisMonitorFreshTest [kind=Run, owner=tb0]
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (lifecycle.starts == 0), on_fail: "expected fresh starts, got %lld", lifecycle.starts }
+    AssertCheck { cond: (lifecycle.stops == 0), on_fail: "expected fresh stops, got %lld", lifecycle.stops }
+    AssertCheck { cond: ComponentQueueQuery(lifecycle.history.empty()), on_fail: "expected a fresh empty history" }
+    AssertCheck { cond: (sink.count == 0), on_fail: "expected a fresh sink, got %lld", sink.count }
+    Log(info, "PASS: passive monitor state starts fresh")
+    -> Return
+
+fn fn4 run_PassiveAnalysisMonitorTest [kind=Run, owner=tb1]
+  entry = b0
+
+  b0:
+    ComponentCall(lifecycle.c0::note_start([1]))
+    ComponentCall(lifecycle.c0::note_start([2]))
+    ComponentCall(lifecycle.c0::note_stop([9]))
+    AssertCheck { cond: (lifecycle.starts == 2), on_fail: "starts: expected 2, got %lld", lifecycle.starts }
+    AssertCheck { cond: (lifecycle.stops == 1), on_fail: "stops: expected 1, got %lld", lifecycle.stops }
+    AssertCheck { cond: (ComponentQueueQuery(lifecycle.history.size()) == 2), on_fail: "history size: expected 2, got %lld", ComponentQueueQuery(lifecycle.history.size()) }
+    AssertCheck { cond: (sink.count == 3), on_fail: "sink count: expected 3, got %lld", sink.count }
+    AssertCheck { cond: (sink.last == 9), on_fail: "sink last: expected 9, got %lld", sink.last }
+    -> Return
+
+fn fn5 check_PassiveAnalysisMonitorTest [kind=Check, owner=tb1]
+  locals:
+    %0 first : record(r0)
+    %1 second : record(r0)
+  entry = b0
+
+  b0:
+    AssertCheck { cond: (lifecycle.starts == 2), on_fail: "starts lost across check: %lld", lifecycle.starts }
+    AssertCheck { cond: (lifecycle.stops == 1), on_fail: "stops lost across check: %lld", lifecycle.stops }
+    AssertCheck { cond: (sink.count == 3), on_fail: "sink count lost across check: %lld", sink.count }
+    ComponentQueuePop(%first = lifecycle.history.pop())
+    ComponentQueuePop(%second = lifecycle.history.pop())
+    AssertCheck { cond: (%first.tag == 1), on_fail: "first tag: expected 1, got %lld", %first.tag }
+    AssertCheck { cond: (%first.stamp == 1), on_fail: "first stamp: expected 1, got %lld", %first.stamp }
+    AssertCheck { cond: (%second.tag == 2), on_fail: "second tag: expected 2, got %lld", %second.tag }
+    AssertCheck { cond: (%second.stamp == 2), on_fail: "second stamp: expected 2, got %lld", %second.stamp }
+    AssertCheck { cond: ComponentQueueQuery(lifecycle.history.empty()), on_fail: "history should be drained" }
+    Log(info, "PASS: passive stateful analysis monitor")
+    -> Return

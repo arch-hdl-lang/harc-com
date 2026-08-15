@@ -1,0 +1,161 @@
+// Passive-bound stateful analysis-source monitor (harc#538).
+//
+// Issue 538 reported that a production suite could not reach TB-IR C++
+// emission because lowering rejected the `passive` mode on a
+// composite-component testbench field:
+//
+//     TB-IR lowering does not support an `active`/`passive` mode on
+//     composite-component testbench field
+//     `LargeTb.lifecycle : LifecycleMonitor`
+//
+// `passive` is now accepted there as an ownership annotation — it does
+// not suppress method or connect emission. This fixture pins the shape
+// that motivated the report, which no other fixture covers: an
+// analysis-source transactor that is simultaneously
+//
+//   - stateful across run→check (two `default` counters),
+//   - the owner of a record queue (`history : queue<LifeRec>`),
+//   - an out-event source fanned out through `connect`, and
+//   - reached through more than one always-on `hookable`,
+//
+// all while bound `passive` at the testbench root. The nearby fixtures
+// each cover only part of it: `testbench_owned_state_connect_test` has
+// the out-event fanout but its passive transactor carries no persistent
+// state or queue (the testbench root owns those),
+// `passive_multi_instance_test` has one counter and no queue or event,
+// and `target_nonscalar_state_test` has queues but no counters, events
+// or hookables.
+//
+// What this fixture does and does not prove.
+//
+// It proves `passive` is ACCEPTED here and does not SUPPRESS anything:
+// treating a passive analysis source the way a passive *BFM* transactor
+// is treated — its `when active` methods structurally absent — makes
+// `lifecycle.note_start(1)` fail to resolve, and dropping the `connect`
+// fanout or the run→check persistence of the counters and queue fails
+// the assertions below.
+//
+// It does NOT prove the annotation is otherwise observable, and no test
+// could: `passive` and no-mode-at-all lower byte-identically here (the
+// gate at `src/ir/lower/mod.rs` accepts both and records neither), so
+// nothing downstream can distinguish them. `passive` is an ownership
+// annotation for the reader and for v1 parity, not a lowering input.
+// The mode rules themselves are pinned in `tests/tbir.rs`, including
+// that `active` is still rejected.
+
+struct LifeRec
+    tag   : uint<8>
+    stamp : uint<32>
+end struct LifeRec
+
+transactor LifecycleMonitor
+    seen    : out event<uint<8>>
+    starts  : uint<32> default 0
+    stops   : uint<32> default 0
+    history : queue<LifeRec>
+
+    hookable note_start(tag: uint<8>)
+        starts = starts + 1
+        let r : LifeRec
+        r.tag = tag
+        r.stamp = starts
+        history.push(r)
+        emit seen(tag)
+    end note_start
+
+    hookable note_stop(tag: uint<8>)
+        stops = stops + 1
+        emit seen(tag)
+    end note_stop
+end transactor LifecycleMonitor
+
+scoreboard LifeSink
+    count : uint<32> default 0
+    last  : uint<8>  default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+        last = v
+    end accept
+end scoreboard LifeSink
+
+testbench LargeTb
+    dut       : Top
+    lifecycle : LifecycleMonitor passive
+    sink      : LifeSink
+
+    connect
+        lifecycle.seen -> sink.accept
+    end connect
+end testbench LargeTb
+
+impl PassiveAnalysisMonitorTest for LargeTb
+    run
+        lifecycle.note_start(1)
+        lifecycle.note_start(2)
+        lifecycle.note_stop(9)
+
+        // Methods on a passive analysis source stay callable, and its
+        // counters accumulate.
+        assert lifecycle.starts == 2
+            else fail("starts: expected 2, got ${lifecycle.starts}")
+        assert lifecycle.stops == 1
+            else fail("stops: expected 1, got ${lifecycle.stops}")
+
+        // The record queue the monitor owns retains both entries.
+        assert lifecycle.history.size() == 2
+            else fail("history size: expected 2, got ${lifecycle.history.size()}")
+
+        // `connect` fanout fires on a passive instance for both methods.
+        assert sink.count == 3
+            else fail("sink count: expected 3, got ${sink.count}")
+        // 9, not 1: the emission order is 1, 2, 9, so this pins
+        // last-delivery-wins rather than passing on the first value too.
+        assert sink.last == 9
+            else fail("sink last: expected 9, got ${sink.last}")
+    end run
+
+    check
+        // Counters, fanout state and queued records all survive the
+        // run→check boundary, not just the one counter.
+        assert lifecycle.starts == 2
+            else fail("starts lost across check: ${lifecycle.starts}")
+        assert lifecycle.stops == 1
+            else fail("stops lost across check: ${lifecycle.stops}")
+        assert sink.count == 3
+            else fail("sink count lost across check: ${sink.count}")
+        let first = lifecycle.history.pop()
+        let second = lifecycle.history.pop()
+        assert first.tag == 1
+            else fail("first tag: expected 1, got ${first.tag}")
+        assert first.stamp == 1
+            else fail("first stamp: expected 1, got ${first.stamp}")
+        assert second.tag == 2
+            else fail("second tag: expected 2, got ${second.tag}")
+        assert second.stamp == 2
+            else fail("second stamp: expected 2, got ${second.stamp}")
+        assert lifecycle.history.empty()
+            else fail("history should be drained")
+        log(info, "PASS: passive stateful analysis monitor")
+    end check
+end impl PassiveAnalysisMonitorTest
+
+// A second implementation over the same reusable testbench. The
+// generated dispatcher runs one test per process, so this does not
+// observe leakage from `PassiveAnalysisMonitorTest`; what it pins is
+// that a second impl gets the passive monitor's `default`-initialized
+// counters and an empty queue, rather than any shared or static
+// component storage.
+impl PassiveAnalysisMonitorFreshTest for LargeTb
+    run
+        assert lifecycle.starts == 0
+            else fail("expected fresh starts, got ${lifecycle.starts}")
+        assert lifecycle.stops == 0
+            else fail("expected fresh stops, got ${lifecycle.stops}")
+        assert lifecycle.history.empty()
+            else fail("expected a fresh empty history")
+        assert sink.count == 0
+            else fail("expected a fresh sink, got ${sink.count}")
+        log(info, "PASS: passive monitor state starts fresh")
+    end run
+end impl PassiveAnalysisMonitorFreshTest
