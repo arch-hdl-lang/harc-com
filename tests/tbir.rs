@@ -8367,6 +8367,53 @@ end test T"#;
     verify::verify_program(&prog).expect("zero-width receiver verifies");
 }
 
+/// Dropping `Some(0)` is scoped to the `src_width` *emission* metadata.
+/// The width-method direction check still sees the raw inferred width, so
+/// a zero-width receiver remains a wrong-direction `.trunc<N>()` with a
+/// user-facing diagnostic rather than silently lowering.
+#[test]
+fn zero_width_receiver_still_fails_the_trunc_direction_check() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<0> = 0
+        let t = z.trunc<8>()
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("trunc<8>") && msg.contains("0-bit value"),
+        "expected a wrong-direction diagnostic, got: {msg}"
+    );
+}
+
+/// The wrapping-operator mask reads the same inference helper, and there a
+/// zero width is a usable operand width (`max(0, 1)` → a 1-bit mask), not
+/// metadata to discard. Lowering must not degrade to the "operand width
+/// unknown" hard error.
+#[test]
+fn zero_width_wrapping_operand_keeps_its_inferred_width() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<0> = 0
+        let y = z +% 1
+    end run
+end test T"#,
+    )
+    .expect("zero-width wrapping operand lowers");
+    let ir::Stmt::Assign(_, ir::Expr::WidthCast { width: 1, .. }) =
+        &prog.functions[0].blocks[0].stmts[1]
+    else {
+        panic!("expected the wrap mask to size to 1 bit");
+    };
+    verify::verify_program(&prog).expect("verifies");
+}
+
 #[test]
 fn bit_not_masks_to_fixed_uint_width() {
     let cpp = emit_cpp_src(

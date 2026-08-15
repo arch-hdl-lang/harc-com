@@ -12,21 +12,30 @@
 //!     converts implicitly to both `uint64_t` and `_harc_u128` and so
 //!     makes `operator&` ambiguous.
 //!
-//! This test pins the emitted statements for both backends and then feeds
-//! those same statements to the host C++ compiler against the real
-//! runtime header, so a regression fails here rather than in a Verilator
-//! run nobody runs locally.
+//! This test pins the emitted declarations and cast expressions for both
+//! backends and then feeds those same strings to the host C++ compiler
+//! against the real runtime header, so a regression fails here rather
+//! than in a Verilator run nobody runs locally. The two halves interlock:
+//! the emitters cannot drift without failing the string match, and the
+//! pinned strings cannot be updated to something that does not compile.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Statements the wide-cast fixture must emit, shared by the
-/// string-match assertions and the compiled probe below. `src130` is a
-/// `uint<130>` (`HarcWide<5>`), `w200` a `uint<256>` slot
-/// (`HarcWide<8>`), `low8` a plain `uint64_t`.
-const EMITTED_STMTS: [&str; 2] = [
-    "w200 = harc_rt::harc_wide_zext<7>(src130, 130)",
-    "low8 = ((uint64_t)(((uint64_t)(src130) & 0xFFULL)))",
+/// Local declarations the emitters must produce. The destination slot is
+/// sized from the local's *declared* width (`uint<256>` → 8 words),
+/// independently of the cast's own width (`zext<200>` → 7 words) — that
+/// mismatch is the whole point of the first shape under test, so pinning
+/// the declarations is what makes the probe gate slot sizing rather than
+/// just expression syntax.
+const EMITTED_DECLS: [&str; 2] = ["harc_rt::HarcWide<5> src130", "harc_rt::HarcWide<8> w200"];
+
+/// The cast expressions themselves, RHS only, so the probe can build both
+/// the TB-IR shape (declare, then assign) and the v1 shape (copy-initialise
+/// the slot from the cast) out of one pinned string.
+const CAST_EXPRS: [&str; 2] = [
+    "harc_rt::harc_wide_zext<7>(src130, 130)",
+    "((uint64_t)(((uint64_t)(src130) & 0xFFULL)))",
 ];
 
 const TB: &str = r#"testbench WideSlotTb
@@ -85,16 +94,25 @@ fn emit(codegen: &str, dir: &Path) -> String {
 }
 
 #[test]
-fn both_backends_emit_the_pinned_wide_cast_statements() {
+fn both_backends_emit_the_pinned_wide_cast_shapes() {
     for codegen in ["v1", "tbir"] {
         let dir = fresh_outdir(codegen);
         let cpp = emit(codegen, &dir);
-        for stmt in EMITTED_STMTS {
+        let expected = EMITTED_DECLS
+            .iter()
+            .map(|d| d.to_string())
+            .chain([
+                format!("w200 = {}", CAST_EXPRS[0]),
+                format!("low8 = {}", CAST_EXPRS[1]),
+            ])
+            .collect::<Vec<_>>();
+        for want in &expected {
             assert!(
-                cpp.contains(stmt),
-                "[{codegen}] expected emitted statement `{stmt}`; got:\n{cpp}"
+                cpp.contains(want.as_str()),
+                "[{codegen}] expected emitted text `{want}`; got:\n{cpp}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -121,33 +139,60 @@ fn cxx() -> Option<String> {
 }
 
 #[test]
-fn emitted_wide_cast_statements_compile_and_evaluate() {
+fn emitted_wide_cast_shapes_compile_and_evaluate() {
+    // A silent skip would let the regression this test exists for ship on
+    // any machine without a compiler, so an absent toolchain fails unless
+    // the operator opts out explicitly. Everything this repo produces is
+    // C++ that a host compiler has to build, so requiring one is fair.
     let Some(cxx) = cxx() else {
-        eprintln!(
-            "SKIP emitted_wide_cast_statements_compile_and_evaluate: no C++ compiler on PATH. \
-             This test compiles the emitted wide-cast statements against harc_thread_rt.h."
+        assert!(
+            std::env::var_os("HARC_SKIP_CXX_PROBE").is_some(),
+            "no C++ compiler on PATH (tried $CXX, g++, clang++). This test compiles the \
+             emitted wide-cast shapes against harc_thread_rt.h — without it the wide-cast \
+             C++ is untested outside the Verilator fixture job. Install a compiler, or set \
+             HARC_SKIP_CXX_PROBE=1 to skip deliberately."
         );
+        eprintln!("SKIP emitted_wide_cast_shapes_compile_and_evaluate: HARC_SKIP_CXX_PROBE set.");
         return;
     };
 
     let dir = fresh_outdir("probe");
     let probe = dir.join("probe.cpp");
+    // Both emitter shapes: TB-IR declares the slot and assigns into it,
+    // v1 copy-initialises the slot from the cast. Each needs the widening
+    // `HarcWide<7>` → `HarcWide<8>` conversion, but they are distinct C++
+    // constructs (`operator=` vs a converting constructor), so pinning
+    // only one would leave the other untested.
     std::fs::write(
         &probe,
         format!(
             r#"#include "harc_thread_rt.h"
 #include <cstdio>
 int main() {{
-    harc_rt::HarcWide<5> src130 = 0x3FF;   // uint<130>
-    harc_rt::HarcWide<8> w200 = 0;         // uint<256> slot
-    uint64_t low8 = 0;
-    {};
-    {};
-    printf("%d %llu\n", (int)(w200 == 0x3FF), (unsigned long long)low8);
+    int ok = 0;
+    {{  // TB-IR shape: declare, then assign
+        {decl_src} = 0;
+        {decl_slot} = 0;
+        uint64_t low8 = 0;
+        src130 = 0x3FF;
+        w200 = {cast};
+        low8 = {mask};
+        ok += (w200 == 0x3FF) && (low8 == 0xFF);
+    }}
+    {{  // v1 shape: copy-initialise the slot from the cast
+        {decl_src} = 0x3FF;
+        {decl_slot} = {cast};
+        uint64_t low8 = {mask};
+        ok += (w200 == 0x3FF) && (low8 == 0xFF);
+    }}
+    printf("%d\n", ok);
     return 0;
 }}
 "#,
-            EMITTED_STMTS[0], EMITTED_STMTS[1]
+            decl_src = EMITTED_DECLS[0],
+            decl_slot = EMITTED_DECLS[1],
+            cast = CAST_EXPRS[0],
+            mask = CAST_EXPRS[1],
         ),
     )
     .expect("write probe");
@@ -169,7 +214,7 @@ int main() {{
         .expect("run C++ compiler");
     assert!(
         build.status.success(),
-        "emitted wide-cast statements did not compile:\n{}",
+        "emitted wide-cast shapes did not compile:\n{}",
         String::from_utf8_lossy(&build.stderr),
     );
 
@@ -177,7 +222,8 @@ int main() {{
     assert!(run.status.success(), "probe exited non-zero");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout).trim(),
-        "1 255",
-        "wide-cast statements compiled but computed the wrong values",
+        "2",
+        "wide-cast shapes compiled but computed the wrong values",
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
