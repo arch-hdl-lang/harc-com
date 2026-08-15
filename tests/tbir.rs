@@ -2249,6 +2249,256 @@ end impl TestbenchConnectTest
     assert!(cpp.contains("Sink_accept(nested.inner, _t)"), "{cpp}");
 }
 
+/// Analysis-source transactors use the composite-component IR route, but
+/// retain transactor binding semantics: a direct testbench field needs an
+/// explicit mode, and both active and passive instances are valid.
+#[test]
+fn analysis_source_component_direct_mode_contract() {
+    let src = r#"
+transactor Relay
+    observed : out event<uint<8>>
+    count : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        count = count + 1
+        emit observed(v)
+    end publish
+end transactor Relay
+
+scoreboard Sink
+    count : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + v
+    end accept
+end scoreboard Sink
+
+testbench RelayTb
+    dut : Top
+    active_relay : Relay active
+    passive_relay : Relay passive
+    sink : Sink
+
+    connect
+        active_relay.observed -> sink.accept
+        passive_relay.observed -> sink.accept
+    end connect
+end testbench RelayTb
+
+impl RelayTest for RelayTb
+    run
+        active_relay.publish(2)
+        passive_relay.publish(3)
+        assert active_relay.count == 1
+        assert passive_relay.count == 1
+        assert sink.count == 5
+    end run
+end impl RelayTest
+"#;
+    let prog = lower_src(src).expect("active and passive analysis-source fields lower");
+    verify::verify_program(&prog).expect("mode-correct program verifies");
+    assert_eq!(prog.testbenches[0].component_fields.len(), 3);
+    assert_eq!(
+        prog.testbenches[0].component_fields[0].mode,
+        Some(ir::ComponentInstanceMode::Active)
+    );
+    assert_eq!(
+        prog.testbenches[0].component_fields[1].mode,
+        Some(ir::ComponentInstanceMode::Passive)
+    );
+    assert_eq!(prog.testbenches[0].component_fields[2].mode, None);
+    assert!(format!("{prog}").contains("component active_relay=c0 active"));
+    assert!(format!("{prog}").contains("component passive_relay=c0 passive"));
+
+    let mut malformed = prog.clone();
+    malformed.testbenches[0].component_fields[0].mode = None;
+    assert!(
+        verify::verify_program(&malformed).is_err(),
+        "the verifier must preserve direct transactor mode metadata"
+    );
+
+    let mode_less = src.replace("active_relay : Relay active", "active_relay : Relay");
+    let mode_less_err = lower_src(&mode_less).expect_err("mode-less relay is invalid");
+    let msg = assert_invalid(&mode_less_err);
+    assert!(msg.contains("active_relay") && msg.contains("mode"), "{msg}");
+
+    let structural = src.replace("active_relay : Relay active", "active_relay : Sink active");
+    let structural_err = lower_src(&structural).expect_err("mode on scoreboard is invalid");
+    let msg = assert_invalid(&structural_err);
+    assert!(msg.contains("scoreboard") || msg.contains("Sink"), "{msg}");
+}
+
+/// A mixed-mode analysis source shares one schema, but `when active` members
+/// are callable and registered only for the active binding.
+#[test]
+fn analysis_source_active_surface_is_mode_gated() {
+    let src = r#"
+transactor Relay
+    observed : out event<uint<8>>
+    active_ticks : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+
+    when active
+        hookable bump()
+            active_ticks = active_ticks + 1
+        end bump
+
+        on 1 cycles
+            active_ticks = active_ticks + 1
+        end on
+    end when
+end transactor Relay
+
+testbench RelayTb
+    dut : Top
+    active_relay : Relay active
+    passive_relay : Relay passive
+end testbench RelayTb
+
+impl RelayTest for RelayTb
+    run
+        active_relay.bump()
+        active_relay.publish(1)
+        passive_relay.publish(2)
+    end run
+end impl RelayTest
+"#;
+    let prog = lower_src(src).expect("active surface lowers for mixed-mode source");
+    verify::verify_program(&prog).expect("mixed-mode source verifies");
+    let relay = prog
+        .components
+        .iter()
+        .find(|component| component.name == "Relay")
+        .expect("relay schema");
+    assert_eq!(relay.methods.len(), 2, "one always-on and one active method");
+    assert_eq!(relay.methods[0].activation, ir::Activation::Always);
+    assert_eq!(relay.methods[1].activation, ir::Activation::ActiveOnly);
+    assert_eq!(relay.periodic_handlers[0].activation, ir::Activation::ActiveOnly);
+
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("_per_active_relay_"), "{cpp}");
+    assert!(!cpp.contains("_per_passive_relay_"), "{cpp}");
+
+    let passive_call = src.replace("active_relay.bump()", "passive_relay.bump()");
+    let err = lower_src(&passive_call).expect_err("passive active-only call is invalid");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("passive_relay") && msg.contains("active-only"), "{msg}");
+}
+
+/// A structural env root can carry inherited mode context. A nested explicit
+/// passive mode wins over that context, so it cannot expose active-only work.
+#[test]
+fn analysis_source_nested_mode_inheritance_and_override() {
+    let src = r#"
+transactor Relay
+    observed : out event<uint<8>>
+
+    when active
+        ticks : uint<32> default 0
+
+        hookable bump()
+            ticks = ticks + 1
+        end bump
+
+        on 1 cycles
+            ticks = ticks + 1
+        end on
+    end when
+end transactor Relay
+
+env RelayEnv
+    inherited : Relay
+    overridden : Relay passive
+end env RelayEnv
+
+testbench RelayEnvTb
+    dut : Top
+    env : RelayEnv active
+end testbench RelayEnvTb
+
+impl RelayEnvTest for RelayEnvTb
+    run
+        env.inherited.bump()
+    end run
+end impl RelayEnvTest
+"#;
+    let prog = lower_src(src).expect("inherited mode lowers");
+    verify::verify_program(&prog).expect("inherited mode verifies");
+    assert_eq!(
+        prog.testbenches[0].component_fields[0].mode,
+        Some(ir::ComponentInstanceMode::Active)
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("_per_env_inherited_"), "{cpp}");
+    assert!(!cpp.contains("_per_env_overridden_"), "{cpp}");
+
+    let passive_call = src.replace("env.inherited.bump()", "env.overridden.bump()");
+    let err = lower_src(&passive_call).expect_err("override is passive");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("env.overridden") && msg.contains("active-only"), "{msg}");
+
+    let passive_field = src.replace("env.inherited.bump()", "assert env.overridden.ticks == 0");
+    let err = lower_src(&passive_field).expect_err("active-only field is unavailable on passive");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("env.overridden") && msg.contains("active-only"), "{msg}");
+}
+
+#[test]
+fn analysis_source_active_connects_and_self_access_are_gated() {
+    let src = r#"
+transactor Source
+    when active
+        observed : out event<uint<8>>
+        ticks : uint<32> default 0
+        hookable publish(v: uint<8>)
+            emit observed(v)
+        end publish
+    end when
+end transactor Source
+
+scoreboard Sink
+    count : uint<32> default 0
+    hookable accept(v: uint<8>)
+        count = count + v
+    end accept
+end scoreboard Sink
+
+env SourceEnv
+    source : Source
+    sink : Sink
+    connect
+        source.observed -> sink.accept
+    end connect
+end env SourceEnv
+
+testbench SourceEnvTb
+    dut : Top
+    env : SourceEnv passive
+end testbench SourceEnvTb
+
+impl SourceEnvTest for SourceEnvTb
+    run
+        assert env.sink.count == 0
+    end run
+end impl SourceEnvTest
+"#;
+    let prog = lower_src(src).expect("passive env may contain active-only source surface");
+    verify::verify_program(&prog).expect("active-only connect metadata verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(!cpp.contains("env.source.observed.push_back"), "{cpp}");
+
+    let always_on = src.replace(
+        "    when active\n",
+        "    hookable illegal()\n        ticks = ticks + 1\n    end illegal\n\n    when active\n",
+    );
+    let err = lower_src(&always_on).expect_err("always-on member cannot access active-only state");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("always-on") && msg.contains("active-only"), "{msg}");
+}
+
 #[test]
 fn testbench_owned_state_connect_dump_ir_snapshot() {
     let prog = lower_src(&fixture("testbench_owned_state_connect_test.harc")).expect("lowers");

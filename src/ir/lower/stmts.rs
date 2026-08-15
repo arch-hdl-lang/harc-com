@@ -1917,7 +1917,7 @@ impl FuncBuilder<'_> {
         for (i, seg) in segs.iter().enumerate() {
             let comp = &self.ctx.components[cid.index()];
             match comp.field(seg).map(|f| &f.kind) {
-                Some(crate::ir::ComponentFieldKind::Sub { component }) => {
+                Some(crate::ir::ComponentFieldKind::Sub { component, .. }) => {
                     cid = *component;
                     acc.push(seg.clone());
                 }

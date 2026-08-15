@@ -1064,7 +1064,7 @@ fn component_of_base<'a>(
             let mut c = prog.components.get(root.component.index())?;
             for seg in rest {
                 let f = c.fields.iter().find(|f| f.name == *seg)?;
-                let crate::ir::ComponentFieldKind::Sub { component } = f.kind else {
+                let crate::ir::ComponentFieldKind::Sub { component, .. } = f.kind else {
                     return None;
                 };
                 c = prog.components.get(component.index())?;

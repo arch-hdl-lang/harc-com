@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 TransactorParseTb { dut: AxiLiteRegs } bus axil=BusAxiLite
+  testbench tb0 TransactorParseTb { dut: AxiLiteRegs } bus axil=BusAxiLite component drv=c0 active component obs=c0 passive
   test TransactorParseTest tb=tb0 run=fn3 check=-
   record r0 RegOp
     addr : uint<8>
@@ -12,7 +12,7 @@ tb-ir program
     resp : uint<2>
   component c0 AxilXactor (transactor)
     field completed : out event<Completion>
-    field req : out event<RegOp>
+    field req active-only : out event<RegOp>
     on bus.b.handshake [(dut.axil.b.valid && dut.axil.b.ready)] (rising) = fn1
     on bus.r.handshake [(dut.axil.r.valid && dut.axil.r.ready)] (rising) = fn2
 

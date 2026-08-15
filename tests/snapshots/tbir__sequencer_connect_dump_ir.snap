@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 SequencerConnectTest_tb (synthetic) { dut: Top }
+  testbench tb0 SequencerConnectTest_tb (synthetic) { dut: Top } component env=c2
   test SequencerConnectTest tb=tb0 run=fn2 check=-
   component c0 CountSeq (sequencer)
     field dispatched : out event<uint>

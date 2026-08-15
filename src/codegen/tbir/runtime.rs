@@ -442,7 +442,7 @@ pub(super) fn component_struct(
                 )
                 .ok();
             }
-            ComponentFieldKind::Sub { component } => {
+            ComponentFieldKind::Sub { component, .. } => {
                 let cname = &components[component.index()].name;
                 writeln!(out, "{INDENT}{cname} {};", f.name).ok();
             }
