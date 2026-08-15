@@ -1458,6 +1458,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         txn_keeps: std::collections::HashMap::new(),
         probes: std::collections::HashMap::new(),
         probe_widths: std::collections::HashMap::new(),
+        shadowed_lets: std::collections::HashSet::new(),
         regblocks: std::collections::HashMap::new(),
         addrmaps: std::collections::HashMap::new(),
         let_helper: std::collections::HashMap::new(),
@@ -1947,6 +1948,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         relations,
         probes: std::collections::HashMap::new(),
         probe_widths: std::collections::HashMap::new(),
+        shadowed_lets: std::collections::HashSet::new(),
         regblocks,
         addrmaps,
         let_helper: std::collections::HashMap::new(),
@@ -2454,6 +2456,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.next_tlm_fork_tag.clear();
         e.probes.clear();
         e.probe_widths.clear();
+        e.shadowed_lets.clear();
         e.clock_names.clear();
         e.covers.clear();
         e.actor_threads.clear();
@@ -2549,7 +2552,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
                 if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
                     if let Some(w) = type_arg_width(args) {
-                        e.let_widths.insert(l.name.name.clone(), w as u32);
+                        if e.let_widths.insert(l.name.name.clone(), w).is_some() {
+                            e.shadowed_lets.insert(l.name.name.clone());
+                        }
                     }
                 }
             }
@@ -5784,6 +5789,14 @@ struct Emitter {
     /// without this v1 rejected `dut.<probe> +% 1` as unknown-width while
     /// TB-IR wrapped it. Plain top-level ports stay width-erased in both.
     probe_widths: std::collections::HashMap<String, u32>,
+    /// Names that more than one `let` in the current test declares.
+    /// `let_widths` is keyed by bare source name with no scoping, so an
+    /// inner shadow permanently clobbers the outer name's width. The
+    /// direction checks have always lived with that; the narrowing check
+    /// must not, or a legal `let b : uint<8> = a` after an inner
+    /// `let a : uint<64>` is rejected on a width `a` never had at that
+    /// point. Consulted only to suppress the narrowing check.
+    shadowed_lets: std::collections::HashSet<String>,
     /// RAL regblock declarations indexed by type name. See ast.rs::
     /// `RegblockDecl`. Used to emit one POD mirror struct +
     /// `constexpr` address table per declared regblock at file scope,
@@ -10184,17 +10197,18 @@ impl Emitter {
     /// The result can be `Some(0)` for a `uint<0>` receiver. Callers
     /// emitting a cast shape must filter that out (it would reach the
     /// sext shift-fill as `64 - 0`, UB); the direction checks want the
-    /// raw value. Mirrors TB-IR's `infer_expr_width`.
+    /// raw value.
+    ///
+    /// Mirrors TB-IR's `infer_expr_width` on TB-IR's whole reachable
+    /// domain, but NOT identically for casts: TB-IR caps a cast relabel
+    /// at 128 bits, and this returns the raw declared width above that.
+    /// The two agree in practice only because TB-IR rejects every cast
+    /// outside 1..=128 before inference sees it. Do not "re-unify" them
+    /// by delegating this arm — that is what turned
+    /// `(big as uint<200>).sext<300>()` into a zero-extension.
     fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
-            // Delegate to TB-IR's own `cast_relabel_width` rather than
-            // re-deriving the rule: the capitalised ARCH spellings count,
-            // a width-less scalar cast is 64 bits, a non-literal width
-            // argument is unknown (NOT 64), and widths of 0 or >128 are
-            // unknown. Hand-rolling this diverged at three of those four
-            // edges; sharing the function makes the two backends agree by
-            // construction.
             // RAW width, deliberately not `cast_relabel_width`: that
             // helper caps at 128 and rejects 0, which is right for a wrap
             // operand (see `wrap_operand_width`) but wrong here. The
@@ -16793,7 +16807,9 @@ impl Emitter {
                             ));
                         }
                     }
-                    self.let_widths.insert(l.name.name.clone(), dw);
+                    if self.let_widths.insert(l.name.name.clone(), dw).is_some() {
+                        self.shadowed_lets.insert(l.name.name.clone());
+                    }
                 }
             }
         }
@@ -19388,6 +19404,11 @@ fn narrowing_source_width(e: &Emitter, value: &Expr) -> Option<u32> {
     match &*value.kind {
         ExprKind::Paren(inner) => narrowing_source_width(e, inner),
         ExprKind::Int(s) => wide_literal_bit_width(s),
+        // A name several `let`s declare has no single recorded width —
+        // `let_widths` keeps the last one seen, which may belong to an
+        // inner scope that has already closed. Decline rather than
+        // reject on a width the value may never have had.
+        ExprKind::Ident(id) if e.shadowed_lets.contains(&id.name) => None,
         _ => e.infer_expr_width_best_effort(value),
     }
 }

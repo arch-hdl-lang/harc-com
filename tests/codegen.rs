@@ -8442,3 +8442,72 @@ end test T"#,
         "a >128-bit cast source must still drive the direction check; got: {err}"
     );
 }
+
+/// v1's `let_widths` is keyed by bare name with no scoping, so an inner
+/// shadow clobbers the outer name's recorded width. The direction checks
+/// have always lived with that; the narrowing check must not, or a legal
+/// `let b : uint<8> = a` after an inner `let a : uint<64>` is rejected on
+/// a width `a` never had at that point — which TB-IR, keyed by local id,
+/// accepts.
+#[test]
+fn a_shadowed_name_does_not_trigger_the_narrowing_check() {
+    for src in [
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 1
+        if a == 1
+            let a : uint<64> = 2
+            log(info, "inner=${a}")
+        end if
+        let b : uint<8> = a
+        log(info, "${b}")
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 1
+        if a == 1
+            let a : uint<64> = 2
+        end if
+        let b : uint<8> = 0
+        b = a
+        log(info, "${b}")
+    end run
+end test T"#,
+    ] {
+        let parsed = parse_source(src).expect("parses");
+        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        assert!(
+            cpp_tb::emit(&merged).is_ok(),
+            "v1 must not reject on a shadowed name's width"
+        );
+        assert!(
+            harc::ir::lower::lower_program(&merged).is_ok(),
+            "TB-IR accepts it, so v1 must too"
+        );
+    }
+}
+
+/// The wrap-operand path uses the CAPPED cast rule while the direction
+/// checks use the raw one. Only the capped side rejects a zero-width
+/// cast, so without this the half of the split that differs from raw is
+/// untested — and it is the half most likely to be re-collapsed.
+#[test]
+fn wrap_operand_cast_width_uses_the_capped_rule() {
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let x = (a as uint<0>) +% 1
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("statically known bit-width"),
+        "a zero-width cast operand must be unknown for wrapping, matching TB-IR; got: {err}"
+    );
+}
