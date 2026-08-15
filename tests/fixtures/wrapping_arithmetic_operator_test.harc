@@ -10,10 +10,12 @@
 // is a hard lowering error rather than a silent no-wrap.
 //
 // This fixture is registered in tests/run_fixtures.sh, so the asserted wrap
-// values are checked at RUNTIME under `harc sim` (the tbir backend), not just
-// emit-checked. It is intentionally NOT in tests/tbir_equiv_fixtures.txt: the
-// legacy v1 backend still treats `+%` as pass-through sugar, so the two
-// backends diverge by design here.
+// values are checked at RUNTIME under `harc sim`, and in
+// tests/tbir_equiv_fixtures.txt, so both emitters must agree on every value.
+// v1 used to treat `+%` as pass-through sugar — masking only in tbir — which
+// made this fixture a by-design divergence; v1 now emits the same
+// `max(W(lhs), W(rhs))` mask and rejects the same unknown-width and >64-bit
+// operands, so the two backends are back in lockstep.
 
 test WrappingArithmeticOperatorTest
     let dut : Top

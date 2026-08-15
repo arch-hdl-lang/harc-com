@@ -2279,13 +2279,16 @@ impl FuncBuilder<'_> {
     }
 
     /// Best-effort receiver bit-width: parens recurse, `as uint<W>`
-    /// casts give W, nested width methods give their target width,
-    /// bare literals give their minimum unsigned width, and locals
-    /// resolve through the typed-`let` width table.
+    /// casts give W, constant-bounded bit slices give `hi - lo + 1`,
+    /// nested width methods give their target width, bare literals give
+    /// their minimum unsigned width, and locals resolve through the
+    /// typed-`let` width table.
     ///
-    /// This is v1's `infer_expr_width_best_effort` less its bit-slice
-    /// arm (`src/codegen/cpp_tb.rs`) — the two have never been in full
-    /// parity, and a slice receiver reports `None` here.
+    /// Kept in step with v1's `infer_expr_width_best_effort`
+    /// (`src/codegen/cpp_tb.rs`): the two feed the same direction checks
+    /// and the same `sext` shift-fill, so a shape either backend infers
+    /// and the other does not is a value divergence, not just a missed
+    /// optimization.
     ///
     /// The result can be `Some(0)` for a `uint<0>` receiver. Callers
     /// that store it as `WidthCast::src_width` must filter that out (it
@@ -2295,6 +2298,15 @@ impl FuncBuilder<'_> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width(inner),
             ExprKind::Cast { ty, .. } => cast_relabel_width(ty),
+            // A constant-bounded slice is exactly `hi - lo + 1` bits.
+            // Without this arm `p[7:0].sext<64>()` looked like an
+            // unknown-width receiver and skipped the sign fill, silently
+            // yielding `0x00..AB` where v1 produced `0xFF..AB`.
+            ExprKind::BitSlice { hi, lo, .. } => {
+                let hi = const_eval_width(hi)?;
+                let lo = const_eval_width(lo)?;
+                (hi >= lo).then_some(hi - lo + 1)
+            }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Field { name, .. } = &*callee.kind {
                     if width_cast_kind(&name.name).is_some() {

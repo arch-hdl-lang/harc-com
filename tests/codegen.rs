@@ -7923,3 +7923,141 @@ end test T"#,
         "expected width-64 record_write mirror update with u64::MAX mask; got:\n{cpp}"
     );
 }
+
+// ── v1 ↔ TB-IR parity fixes (review of #543) ─────────────────────────
+//
+// Four defects where the legacy v1 emitter and the TB-IR emitter
+// disagreed. Every one produced a wrong value, a non-compiling
+// translation unit, or an `internal error` for a program `harc check`
+// accepted, so each is pinned against the shape both backends now emit.
+// The TB-IR side of each lives in `tests/tbir.rs`.
+
+fn v1_cpp(src: &str) -> String {
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    cpp_tb::emit(&merged).expect("emit")
+}
+
+fn v1_emit_err(src: &str) -> String {
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    match cpp_tb::emit(&merged) {
+        Ok(_) => panic!("expected emission to fail"),
+        Err(e) => e.0.to_string(),
+    }
+}
+
+/// `a +% b` masks to `max(W(a), W(b))` bits (harc#473). v1 treated the
+/// wrapping operators as pass-through sugar for `+ - *`, so a `uint<8>`
+/// overflow produced 300 where TB-IR produced 44.
+#[test]
+fn v1_wrapping_operators_mask_to_the_operand_width() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let b = a +% 100
+        let c = a -% 250
+        let d = a *% 3
+        log(info, "${b} ${c} ${d}")
+    end run
+end test T"#,
+    );
+    for want in [
+        "((uint64_t)(((uint64_t)((a + 100)) & 0xFFULL)))",
+        "((uint64_t)(((uint64_t)((a - 250)) & 0xFFULL)))",
+        "((uint64_t)(((uint64_t)((a * 3)) & 0xFFULL)))",
+    ] {
+        assert!(cpp.contains(want), "expected `{want}`; got:\n{cpp}");
+    }
+}
+
+/// The mask is the unsigned low-W residue — check the arithmetic, not
+/// just the spelling, by compiling the emitted shapes.
+#[test]
+fn v1_wrapping_mask_computes_the_wrapped_value() {
+    compile_and_run_runtime_cpp(
+        "wrap_mask",
+        "uint64_t a = 200;\n\
+         assert(((uint64_t)(((uint64_t)((a + 100)) & 0xFFULL))) == 44);\n\
+         assert(((uint64_t)(((uint64_t)((a - 250)) & 0xFFULL))) == 206);\n\
+         assert(((uint64_t)(((uint64_t)((a * 3)) & 0xFFULL))) == 88);",
+    );
+}
+
+/// Both backends reject an unknown-width wrap operand rather than
+/// silently not wrapping.
+#[test]
+fn v1_rejects_unknown_width_wrapping_operand() {
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let x = dut.count +% 1
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("statically known bit-width"),
+        "expected the unknown-width wrap diagnostic, got: {err}"
+    );
+}
+
+/// `sext<N>` with nothing to extend is still a signed relabel. Casting
+/// through `uint64_t` made `s.sext<64>() > 0` true for a negative
+/// `sint<64>` — the opposite of TB-IR's verdict on the same source.
+#[test]
+fn v1_sext_without_extension_keeps_the_value_signed() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let s : sint<64> = 0 - 1
+        assert s.sext<64>() > 0 else fail("negative")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("((int64_t)(s))") && !cpp.contains("((uint64_t)(s))"),
+        "expected a signed relabel; got:\n{cpp}"
+    );
+}
+
+/// A narrowing initializer is rejected instead of emitting
+/// `HarcWide<7> b = a;`, which does not compile.
+#[test]
+fn v1_rejects_narrowing_assignment() {
+    for (src, want) in [
+        (
+            r#"test T
+    let dut : Top
+    run
+        let a : uint<256> = 5
+        let b : uint<200> = a
+        log(info, "${b}")
+    end run
+end test T"#,
+            "use `.trunc<200>()`",
+        ),
+        (
+            r#"test T
+    let dut : Top
+    run
+        let a : uint<32> = 5
+        let b : uint<8> = 0
+        b = a
+        log(info, "${b}")
+    end run
+end test T"#,
+            "use `.trunc<8>()`",
+        ),
+    ] {
+        let err = v1_emit_err(src);
+        assert!(
+            err.contains("narrows") && err.contains(want),
+            "expected a narrowing diagnostic containing `{want}`, got: {err}"
+        );
+    }
+}

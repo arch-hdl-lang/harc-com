@@ -10086,3 +10086,105 @@ end impl HookLetShadowTest
     let prog = lower_src(src).expect("scope-aware hook promotion resolves the captured `acc`");
     verify::verify_program(&prog).expect("verifies");
 }
+
+// ── v1 ↔ TB-IR parity fixes (review of #543) ─────────────────────────
+
+/// A constant-bounded bit slice has a known width, so `sext` must fill
+/// from the slice's MSB. TB-IR's inference lacked the arm v1 has, so
+/// `p[7:0].sext<64>()` skipped the fill and yielded `0x00..AB` where v1
+/// produced `0xFF..AB` — same source, two values.
+#[test]
+fn bit_slice_receiver_width_drives_the_sign_fill() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let p : uint<32> = 0xAB
+        let x = p[7:0].sext<64>()
+        log(info, "${x:016x}")
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("<< 56)) >> 56"),
+        "expected an 8-bit shift-fill from the slice width; got:\n{cpp}"
+    );
+}
+
+/// The same inference feeds the direction check, so a no-op `.trunc<N>()`
+/// on an N-bit slice is now caught here exactly as v1 catches it.
+#[test]
+fn bit_slice_receiver_width_drives_the_direction_check() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let p : uint<32> = 0xAB
+        let t = p[7:0].trunc<8>()
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("on a 8-bit value"),
+        "expected the wrong-direction diagnostic, got: {err}"
+    );
+}
+
+/// Narrowing into a declared-width local is a user error with a fix, not
+/// the verifier's internal-error channel.
+#[test]
+fn narrowing_assignment_is_a_lowering_diagnostic() {
+    for (src, want) in [
+        (
+            r#"test T
+    let dut : Top
+    run
+        let a : uint<256> = 5
+        let b : uint<200> = a
+    end run
+end test T"#,
+            "use `.trunc<200>()`",
+        ),
+        (
+            r#"test T
+    let dut : Top
+    run
+        let a : uint<32> = 5
+        let b : uint<8> = 0
+        b = a
+    end run
+end test T"#,
+            "use `.trunc<8>()`",
+        ),
+    ] {
+        let err = lower_src(src).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("narrows") && msg.contains(want),
+            "expected a narrowing diagnostic containing `{want}`, got: {msg}"
+        );
+    }
+}
+
+/// The narrowing check is scoped to the shapes the verifier itself types.
+/// A value provably masked below the declared width (`(wide & 0xFF) >> 4`
+/// into a `uint<8>`) must still lower — lowering's own expression typing
+/// over-approximates a binary as its left operand's declared width.
+#[test]
+fn masked_wide_value_is_not_a_narrowing_assignment() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let wide : uint<128> = 240
+        let x : uint<8> = (wide & 0xFF) >> 4
+        assert x == 15 else fail("x=${x}")
+    end run
+end test T"#,
+    )
+    .expect("masked wide value lowers");
+    verify::verify_program(&prog).expect("verifies");
+}
