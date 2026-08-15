@@ -58,8 +58,8 @@ run_one() {
 
     local has_expected=0
     local has_passed=0
-    if echo "$out" | grep -qF -- "$expected"; then has_expected=1; fi
-    if echo "$out" | grep -q "ALL TESTS PASSED"; then has_passed=1; fi
+    if [[ "$out" == *"$expected"* ]]; then has_expected=1; fi
+    if [[ "$out" == *"ALL TESTS PASSED"* ]]; then has_passed=1; fi
 
     if [ "$has_expected" -eq 1 ] && [ "$has_passed" -eq 0 ]; then
         echo "  PASS  $test  (saw expected failure-mode log line)"

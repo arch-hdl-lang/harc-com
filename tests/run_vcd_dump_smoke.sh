@@ -47,7 +47,7 @@ status=0
 
 # 1. The test itself must pass (proves the post_eval service ran and the
 #    DUT reached the settled state we assert on).
-if echo "$out" | grep -q "ALL TESTS PASSED"; then
+if [[ "$out" == *"ALL TESTS PASSED"* ]]; then
     echo "  PASS  test reached ALL TESTS PASSED"
 else
     echo "  FAIL  test did not report ALL TESTS PASSED"

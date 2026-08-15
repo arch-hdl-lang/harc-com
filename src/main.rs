@@ -3,6 +3,7 @@ use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 mod trace_merge;
 
@@ -138,6 +139,17 @@ enum Cmd {
         /// improve per-test incremental granularity.
         #[arg(long, default_value_t = 4)]
         cpp_split_group_size: usize,
+        /// Parallel workers for HARC's OWN split C++ emission (the
+        /// frontend). `1` is the deterministic serial path; `0` picks
+        /// `min(available CPUs, shard count, 4)`. The cap is a memory
+        /// knob as much as a speed one — each in-flight shard holds a
+        /// whole generated translation unit in memory.
+        ///
+        /// Distinct from `--jobs`, which controls only the downstream
+        /// Verilator/native build. Applies to `--codegen tbir
+        /// --cpp-split tests`; ignored elsewhere.
+        #[arg(long, default_value_t = 0)]
+        emit_jobs: usize,
         /// Output directory for the generated C++ TB and arch_sim_build/
         #[arg(long)]
         outdir: Option<PathBuf>,
@@ -275,8 +287,10 @@ enum Cmd {
         /// docs/2026-07-24-dpi-cosim-exploration.md.
         #[arg(long, value_parser = ["dpi"])]
         cosim: Option<String>,
-        /// Verilator build parallelism. Forwarded as `-j N`; use `0`
-        /// to let Verilator choose based on available CPUs.
+        /// Verilator/native build parallelism. Forwarded as `-j N`; use
+        /// `0` to let Verilator choose based on available CPUs. Controls
+        /// only the backend build — see `--emit-jobs` for HARC's own C++
+        /// emission.
         #[arg(long)]
         jobs: Option<u32>,
         /// Additional argument for the generated simulation binary
@@ -509,6 +523,7 @@ fn main() -> Result<()> {
             codegen,
             cpp_split,
             cpp_split_group_size,
+            emit_jobs,
             outdir,
             seed,
             emit_only,
@@ -596,8 +611,11 @@ fn main() -> Result<()> {
                         test.clone(),
                         compile_scope,
                         codegen,
-                        cpp_split,
-                        cpp_split_group_size,
+                        SplitOpts {
+                            mode: cpp_split,
+                            group_size: cpp_split_group_size,
+                            emit_jobs,
+                        },
                         outdir.clone(),
                         seed,
                         emit_only,
@@ -762,6 +780,29 @@ struct WaveOpts {
     verilator_args: Vec<String>,
     jobs: Option<u32>,
     sim_args: Vec<String>,
+}
+
+/// Split-C++-emission options carried through `cmd_sim`. Groups the
+/// `--cpp-split` family with `--emit-jobs` so the long `cmd_sim` signature
+/// shrinks rather than grows. See `Cmd::Sim` argument docs for the
+/// per-field semantics. Mirrors `WaveOpts`.
+#[derive(Debug, Clone, Copy)]
+struct SplitOpts {
+    mode: CppSplit,
+    group_size: usize,
+    /// Requested frontend emission workers; `0` means automatic. Resolved
+    /// against the actual shard count by `tbir::resolve_emit_jobs`.
+    emit_jobs: usize,
+}
+
+impl Default for SplitOpts {
+    fn default() -> Self {
+        SplitOpts {
+            mode: CppSplit::Off,
+            group_size: 1,
+            emit_jobs: 1,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1517,6 +1558,28 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
     Ok(true)
 }
 
+/// Wall-clock for a build phase, in the one-decimal seconds the rest of
+/// the emit progress output uses.
+fn fmt_secs(d: std::time::Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
+/// Generated-source size in decimal units — these numbers are read next
+/// to `ls`/`du` output, not against memory page counts.
+fn fmt_bytes(n: usize) -> String {
+    const K: f64 = 1_000.0;
+    let n = n as f64;
+    if n >= K * K * K {
+        format!("{:.1} GB", n / (K * K * K))
+    } else if n >= K * K {
+        format!("{:.1} MB", n / (K * K))
+    } else if n >= K {
+        format!("{:.1} kB", n / K)
+    } else {
+        format!("{n} B")
+    }
+}
+
 fn sanitize_file_component(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -2163,8 +2226,7 @@ fn cmd_sim(
     test: Option<String>,
     compile_scope: CompileScope,
     codegen: CodegenKind,
-    cpp_split: CppSplit,
-    cpp_split_group_size: usize,
+    split: SplitOpts,
     outdir: Option<PathBuf>,
     seed: Option<u64>,
     emit_only: bool,
@@ -2198,7 +2260,7 @@ fn cmd_sim(
                 "--cosim dpi requires the default TB-IR codegen path"
             ));
         }
-        if cpp_split == CppSplit::Tests {
+        if split.mode == CppSplit::Tests {
             return Err(miette::miette!(
                 "--cosim dpi does not support --cpp-split tests yet"
             ));
@@ -2246,7 +2308,7 @@ fn cmd_sim(
              (use --check-backends to run under both backends)"
         ));
     }
-    if !dut.is_empty() && cpp_split == CppSplit::Tests {
+    if !dut.is_empty() && split.mode == CppSplit::Tests {
         return Err(miette::miette!(
             "--cpp-split tests is currently supported only with --sv / Verilator builds"
         ));
@@ -2376,7 +2438,7 @@ fn cmd_sim(
         cosim: cosim_opts.clone(),
     };
     let mut cpp_paths = Vec::new();
-    match cpp_split {
+    match split.mode {
         CppSplit::Off => {
             let cpp = match codegen {
                 CodegenKind::V1 => {
@@ -2417,49 +2479,128 @@ fn cmd_sim(
             }
             cpp_paths.push(cpp_path);
         }
-        CppSplit::Tests => {
-            let split = match codegen {
-                CodegenKind::V1 => harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
+        CppSplit::Tests => match codegen {
+            CodegenKind::V1 => {
+                let batch = harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
                     &codegen_source,
                     emit_opts,
                     &format!("{stem}__"),
-                    cpp_split_group_size,
+                    split.group_size,
                 )
-                .map_err(|e| miette::miette!("{}", e))?,
-                CodegenKind::Tbir => {
-                    let prog = harc::ir::lower::lower_program(&codegen_source)
-                        .map_err(|e| miette::miette!("{}", e))?;
-                    uses_solver |= !prog.constraint_sites.is_empty();
-                    harc::ir::verify::verify_program(&prog).map_err(|errs| {
-                        let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
-                        miette::miette!(
-                            "internal error: TB-IR failed verification after lowering:\n{}",
-                            lines.join("\n")
-                        )
-                    })?;
-                    harc::codegen::tbir::emit_split_tests_with_file_prefix(
-                        &prog,
-                        &codegen_source,
-                        emit_opts,
-                        &format!("{stem}__"),
-                        cpp_split_group_size,
-                    )
-                    .map_err(|e| miette::miette!("{}", e))?
-                }
-            };
-            for generated in split.files {
-                let cpp_path = outdir.join(generated.filename);
-                let cpp_changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;
-                if cpp_changed {
-                    eprintln!("emitted {}", cpp_path.display());
-                } else {
-                    eprintln!("reused {} (unchanged)", cpp_path.display());
-                }
-                if cpp_path.extension().is_some_and(|ext| ext == "cpp") {
-                    cpp_paths.push(cpp_path);
+                .map_err(|e| miette::miette!("{}", e))?;
+                for generated in batch.files {
+                    let cpp_path = outdir.join(generated.filename);
+                    let cpp_changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;
+                    if cpp_changed {
+                        eprintln!("emitted {}", cpp_path.display());
+                    } else {
+                        eprintln!("reused {} (unchanged)", cpp_path.display());
+                    }
+                    if cpp_path.extension().is_some_and(|ext| ext == "cpp") {
+                        cpp_paths.push(cpp_path);
+                    }
                 }
             }
-        }
+            // TB-IR streams: the suite is lowered and verified once, the
+            // dispatcher lands before any shard work starts, and each
+            // shard is written and dropped as it completes — so a long
+            // emit is visible while it runs and peak memory is bounded by
+            // the worker count rather than the shard count.
+            CodegenKind::Tbir => {
+                let lower_started = Instant::now();
+                let prog = harc::ir::lower::lower_program(&codegen_source)
+                    .map_err(|e| miette::miette!("{}", e))?;
+                uses_solver |= !prog.constraint_sites.is_empty();
+                harc::ir::verify::verify_program(&prog).map_err(|errs| {
+                    let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
+                    miette::miette!(
+                        "internal error: TB-IR failed verification after lowering:\n{}",
+                        lines.join("\n")
+                    )
+                })?;
+                eprintln!("TBIR lower+verify: {}", fmt_secs(lower_started.elapsed()));
+
+                let plan = harc::codegen::tbir::plan_split_tests(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &format!("{stem}__"),
+                    split.group_size,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+                let shard_count = plan.shards.len();
+                let jobs = harc::codegen::tbir::resolve_emit_jobs(split.emit_jobs, shard_count);
+                eprintln!(
+                    "TBIR split plan: {} tests, {shard_count} shards, group size {}, emit jobs {jobs}",
+                    plan.test_names.len(),
+                    split.group_size,
+                );
+
+                let dispatcher_path = outdir.join(&plan.dispatcher.filename);
+                if write_if_changed(&dispatcher_path, plan.dispatcher.contents.as_bytes())? {
+                    eprintln!("emitted {}", dispatcher_path.display());
+                } else {
+                    eprintln!("reused {} (unchanged)", dispatcher_path.display());
+                }
+                cpp_paths.push(dispatcher_path);
+
+                let emit_started = Instant::now();
+                let mut total_bytes = 0usize;
+                let mut done = 0usize;
+                // Shards complete out of order under `--emit-jobs > 1`;
+                // sort before extending `cpp_paths` so the Verilator
+                // command line stays byte-stable run to run (its own
+                // incremental build keys on that).
+                let mut shard_paths: Vec<(usize, PathBuf)> = Vec::with_capacity(shard_count);
+
+                harc::codegen::tbir::emit_split_shards(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &plan,
+                    jobs,
+                    |shard, cpp, elapsed| {
+                        let path = outdir.join(&shard.filename);
+                        let bytes = cpp.len();
+                        // `cpp` is dropped when this closure returns, so
+                        // peak retained generated C++ stays bounded.
+                        match write_if_changed(&path, cpp.as_bytes()) {
+                            Ok(changed) => {
+                                done += 1;
+                                total_bytes += bytes;
+                                eprintln!(
+                                    "TBIR shard {}/{shard_count}: {} tests, {}, {}, {}",
+                                    shard.index + 1,
+                                    shard.test_indices.len(),
+                                    fmt_bytes(bytes),
+                                    fmt_secs(elapsed),
+                                    if changed { "emitted" } else { "reused" },
+                                );
+                                shard_paths.push((shard.index, path));
+                                Ok(())
+                            }
+                            // Carry the OS reason into the emitter's error
+                            // type: it is what comes back out of
+                            // `emit_split_shards`, so anything left behind
+                            // here is lost to the user.
+                            Err(e) => Err(harc::codegen::cpp_tb::EmitError(format!(
+                                "write {}: {e}",
+                                path.display()
+                            ))),
+                        }
+                    },
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+
+                eprintln!(
+                    "TBIR split emit: {done}/{shard_count} shards, {}, {}",
+                    fmt_bytes(total_bytes),
+                    fmt_secs(emit_started.elapsed()),
+                );
+                shard_paths.sort_by_key(|(i, _)| *i);
+                cpp_paths.extend(shard_paths.into_iter().map(|(_, p)| p));
+            }
+        },
     }
 
     // Drop bundled runtime headers alongside the emitted .cpp so
@@ -2814,8 +2955,7 @@ fn cmd_sim_check_backends(
         test.clone(),
         CompileScope::Suite,
         codegen,
-        CppSplit::Off,
-        1,
+        SplitOpts::default(),
         Some(arch_outdir.clone()),
         resolved_seed,
         false,
@@ -2843,8 +2983,7 @@ fn cmd_sim_check_backends(
         test.clone(),
         CompileScope::Suite,
         codegen,
-        CppSplit::Off,
-        1,
+        SplitOpts::default(),
         Some(sv_outdir.clone()),
         resolved_seed,
         false,
