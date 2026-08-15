@@ -21,6 +21,9 @@ use crate::codegen::cpp_tb::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutp
 use crate::ir::{self, TbProgram};
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const INDENT: &str = "    ";
 
@@ -39,67 +42,147 @@ fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
     !tb.synthetic || !tb.scalar_fields.is_empty()
 }
 
-pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
-    if prog.tests.is_empty() {
-        return Err(EmitError("no `test` declaration found".to_string()));
-    }
+/// Suite-global emission state: everything `emit` computes that does NOT
+/// read `prog.tests`.
+///
+/// The split path builds each shard's program as `prog.clone()` with only
+/// `.tests` overwritten (see `plan_split_tests`), so any value not derived
+/// from `prog.tests` is shard-invariant *by construction* — which is what
+/// makes hoisting it out of the per-shard loop byte-identical rather than
+/// merely plausible. Built once per suite and shared by `&` across shard
+/// workers.
+struct SuiteScaffold {
+    /// From `tests[0]`'s testbench, but `validate_tests_share_dut` proves
+    /// every test agrees, so the string is the same for any test subset.
+    dut_type: String,
+    // The three fields below are suite-invariant BY DESIGN — do NOT narrow
+    // them to the selected tests (harc#538). Each reads an unfiltered
+    // program table, so today every shard is emitted with identical bytes,
+    // including shards whose own tests use no probe and no `randomize`.
+    has_probes: bool,
+    problem_table_cpp: String,
+    randomize_snippets: Vec<String>,
+}
 
-    // All tests in one binary share the DUT type (same v0 rule as v1).
-    let dut_type = validate_tests_share_dut(prog, "one binary")?;
+impl SuiteScaffold {
+    /// `dut_scope` is the phrase used in the multi-DUT diagnostic — "one
+    /// binary" for whole-program emission, "one split binary" for a split
+    /// build.
+    ///
+    /// The order of the fallible steps here is load-bearing: it reproduces
+    /// the order `emit` used before the split refactor, so a program with
+    /// more than one defect still reports the same first error.
+    fn build(
+        prog: &TbProgram,
+        file: &SourceFile,
+        opts: &EmitOpts,
+        dut_scope: &str,
+    ) -> Result<Self, EmitError> {
+        // All tests in one binary share the DUT type (same v0 rule as v1).
+        let dut_type = validate_tests_share_dut(prog, dut_scope)?;
 
-    // `generate_if`-gated bus signals: lowering kept every binding's gates
-    // intact but could not evaluate them (no param env). Resolve each
-    // ACCESSED bus-bound signal's gate against the effective param env now
-    // (the emitter has `EmitOpts` + the `SourceFile`), erroring on a
-    // gated-OFF access exactly as v1's `bus_signal_present` / gated-OFF
-    // diagnostic does. A gated-OFF signal that is never accessed is silent.
-    check_gated_bus_access(prog, file, opts)?;
+        // `generate_if`-gated bus signals: lowering kept every binding's gates
+        // intact but could not evaluate them (no param env). Resolve each
+        // ACCESSED bus-bound signal's gate against the effective param env now
+        // (the emitter has `EmitOpts` + the `SourceFile`), erroring on a
+        // gated-OFF access exactly as v1's `bus_signal_present` / gated-OFF
+        // diagnostic does. A gated-OFF signal that is never accessed is silent.
+        check_gated_bus_access(prog, file, opts)?;
 
-    let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
-
-    // Constraint-solver wiring (randomize sites). The runtime problem
-    // table + per-site Z3-solve snippets are emitted by v1's shared
-    // constraint codegen ("only the call site moves to the IR backend").
-    // Empty when the program has no randomize site — the TB then never
-    // links Z3, exactly like v1.
-    let problem_table_cpp = if prog.constraint_sites.is_empty() {
-        String::new()
-    } else {
-        let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
-        let runtime_table =
-            crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&solver_table);
-        if runtime_table.problems.is_empty() {
+        // Constraint-solver wiring (randomize sites). The runtime problem
+        // table + per-site Z3-solve snippets are emitted by v1's shared
+        // constraint codegen ("only the call site moves to the IR backend").
+        // Empty when the program has no randomize site — the TB then never
+        // links Z3, exactly like v1.
+        let problem_table_cpp = if prog.constraint_sites.is_empty() {
             String::new()
         } else {
-            runtime_table.render_cpp_table("_harc_runtime_random_problem_table")
-        }
-    };
-    // Per-`ConstraintRef` Z3-solve snippets, emitted at the loop-switch
-    // body depth (run/check fn = depth 2 → block stmts at depth 5).
-    let randomize_snippets =
-        crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
+            let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
+            let runtime_table =
+                crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&solver_table);
+            if runtime_table.problems.is_empty() {
+                String::new()
+            } else {
+                runtime_table.render_cpp_table("_harc_runtime_random_problem_table")
+            }
+        };
+        // Per-`ConstraintRef` Z3-solve snippets, emitted at the loop-switch
+        // body depth (run/check fn = depth 2 → block stmts at depth 5).
+        let randomize_snippets =
+            crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
 
-    let mut out = String::new();
-    // Probe reads/forces dereference `dut->rootp->...`, which needs the
-    // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
-    // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
-    // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
-    let has_probes = program_has_probes(&prog);
-    if opts.cosim.is_some() {
-        if opts.mt {
+        // Probe reads/forces dereference `dut->rootp->...`, which needs the
+        // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
+        // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
+        // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
+        let has_probes = program_has_probes(prog);
+        if opts.cosim.is_some() && opts.mt {
             return Err(EmitError(
                 "--cosim dpi does not support --mt yet (actor worker threads \
                  would call into simulator-owned state outside a DPI entrypoint)"
                     .into(),
             ));
         }
+
+        Ok(SuiteScaffold {
+            dut_type,
+            has_probes,
+            problem_table_cpp,
+            randomize_snippets,
+        })
     }
+}
+
+/// Whether a translation unit carries the `main()`-equivalent tail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmitTail {
+    /// `runtime::dispatcher`, or `runtime::cosim_entrypoints` under `--cosim`.
+    Whole,
+    /// No tail — a split shard. `main()` lives in the split dispatcher, and
+    /// the caller applies `finish_shard` to normalize the trailing bytes.
+    ShardBody,
+}
+
+pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<String, EmitError> {
+    if prog.tests.is_empty() {
+        return Err(EmitError("no `test` declaration found".to_string()));
+    }
+    let scaffold = SuiteScaffold::build(prog, file, opts, "one binary")?;
+    let all: Vec<usize> = (0..prog.tests.len()).collect();
+    emit_selected_tests(prog, file, opts, &scaffold, &all, EmitTail::Whole)
+}
+
+/// Emit one translation unit covering `test_indices` (indices into
+/// `prog.tests`), borrowing the whole verified program.
+///
+/// Everything outside the `run_<Test>` bodies is suite-global and comes
+/// either from `scaffold` or from an unfiltered `prog` table; only
+/// `test_names` and the emitted test bodies depend on the selection. That
+/// is exactly the set of things the old clone-and-filter split path varied
+/// per shard, so output is byte-identical to it.
+fn emit_selected_tests(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+    test_indices: &[usize],
+    tail: EmitTail,
+) -> Result<String, EmitError> {
+    // SELECTED test names only — they feed the preamble's test-list comment
+    // and the dispatcher tail, both of which were shard-scoped before.
+    let test_names: Vec<String> = test_indices
+        .iter()
+        .map(|&i| prog.tests[i].name.clone())
+        .collect();
+    let dut_type = &scaffold.dut_type;
+
+    let mut out = String::new();
     runtime::preamble(
         &mut out,
-        &dut_type,
+        dut_type,
         &test_names,
-        &problem_table_cpp,
-        has_probes,
+        &scaffold.problem_table_cpp,
+        scaffold.has_probes,
         opts.cosim.as_ref(),
     );
 
@@ -205,44 +288,80 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
             runtime::tb_struct(
                 &mut out,
                 &tb.name,
-                &dut_type,
+                dut_type,
                 &cov_fields,
                 &tb.scalar_fields,
                 &sb_fields,
             );
         }
     }
-    runtime::context_struct(&mut out, &dut_type);
+    runtime::context_struct(&mut out, dut_type);
 
-    for t in &prog.tests {
-        emit_test(&mut out, prog, t, &dut_type, opts, &randomize_snippets)?;
+    for &i in test_indices {
+        emit_test(
+            &mut out,
+            prog,
+            &prog.tests[i],
+            dut_type,
+            opts,
+            &scaffold.randomize_snippets,
+        )?;
     }
 
-    if opts.cosim.is_some() {
-        runtime::cosim_entrypoints(
+    match tail {
+        EmitTail::Whole if opts.cosim.is_some() => runtime::cosim_entrypoints(
             &mut out,
             &test_names,
             opts.cosim.as_ref().map(|c| c.half_period_ps).unwrap_or(5000),
-        );
-    } else {
-        runtime::dispatcher(&mut out, &test_names);
+        ),
+        EmitTail::Whole => runtime::dispatcher(&mut out, &test_names),
+        EmitTail::ShardBody => {}
     }
     Ok(out)
 }
 
-/// Emit a dispatcher plus one or more self-contained C++ translation units
+/// One shard's share of a split build: which tests it carries and what
+/// file it lands in. Stable and cheap — planning is separate from emission
+/// so a driver can report the whole shape of the build up front and then
+/// emit shards independently, in any order.
+#[derive(Clone, Debug)]
+pub struct SplitShardPlan {
+    /// 0-based position in `SplitCppPlan::shards`. Shards may complete out
+    /// of order under parallel emission; this is what restores determinism.
+    pub index: usize,
+    pub filename: String,
+    /// Indices into `TbProgram::tests`, ascending.
+    pub test_indices: Vec<usize>,
+}
+
+/// A planned split build: the dispatcher (renderable before any shard work
+/// happens) plus one entry per shard. Also carries the suite-global
+/// scaffolding so every shard emission reuses it instead of recomputing it.
+pub struct SplitCppPlan {
+    pub dispatcher: GeneratedCppFile,
+    /// Every test in the suite, in program order — the dispatcher's
+    /// selection table. Shard membership lives in `shards`.
+    pub test_names: Vec<String>,
+    pub shards: Vec<SplitShardPlan>,
+    scaffold: SuiteScaffold,
+}
+
+/// Plan a dispatcher plus one or more self-contained C++ translation units
 /// for TB-IR tests. The split happens after lowering: each shard keeps the
 /// full lowered scaffolding (records, components, helpers, randomize tables)
 /// and emits only its selected `run_<Test>` functions. This mirrors the v1
 /// split-linkage contract while avoiding a shared C++ ABI for TB-IR runtime
 /// internals.
-pub fn emit_split_tests_with_file_prefix(
+///
+/// All suite-wide validation happens here, once, so a shard emission that
+/// starts can only fail on its own test bodies.
+pub fn plan_split_tests(
     prog: &TbProgram,
     file: &SourceFile,
-    opts: EmitOpts,
+    opts: &EmitOpts,
     file_prefix: &str,
     group_size: usize,
-) -> Result<SplitCppOutput, EmitError> {
+) -> Result<SplitCppPlan, EmitError> {
     let group_size = group_size.max(1);
     if prog.tests.is_empty() {
         return Err(EmitError("no `test` declaration found".into()));
@@ -255,40 +374,222 @@ pub fn emit_split_tests_with_file_prefix(
                 .into(),
         ));
     }
-    validate_tests_share_dut(prog, "one split binary")?;
+    let scaffold = SuiteScaffold::build(prog, file, opts, "one split binary")?;
 
     let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
-    let shard_count = test_names.len().div_ceil(group_size);
-    let mut files = Vec::with_capacity(shard_count + 1);
-    files.push(GeneratedCppFile {
-        filename: format!("{file_prefix}main.cpp"),
-        contents: emit_split_dispatcher(&test_names),
-    });
+    let all: Vec<usize> = (0..test_names.len()).collect();
+    let shards: Vec<SplitShardPlan> = all
+        .chunks(group_size)
+        .enumerate()
+        .map(|(index, test_indices)| SplitShardPlan {
+            index,
+            filename: if group_size == 1 {
+                format!(
+                    "{file_prefix}test_{}.cpp",
+                    crate::codegen::cpp_tb::sanitize_file_component(&test_names[test_indices[0]])
+                )
+            } else {
+                format!("{file_prefix}shard{}.cpp", index + 1)
+            },
+            test_indices: test_indices.to_vec(),
+        })
+        .collect();
 
-    for (shard_idx, shard_names) in test_names.chunks(group_size).enumerate() {
-        let mut shard_prog = prog.clone();
-        shard_prog.tests = prog
-            .tests
-            .iter()
-            .filter(|t| shard_names.iter().any(|name| name == &t.name))
-            .cloned()
-            .collect();
-        let cpp = emit(&shard_prog, file, &opts)?;
-        let filename = if group_size == 1 {
-            format!(
-                "{file_prefix}test_{}.cpp",
-                crate::codegen::cpp_tb::sanitize_file_component(&shard_names[0])
-            )
-        } else {
-            format!("{file_prefix}shard{}.cpp", shard_idx + 1)
-        };
-        files.push(GeneratedCppFile {
-            filename,
-            contents: strip_generated_dispatcher(&cpp)?,
-        });
+    Ok(SplitCppPlan {
+        dispatcher: GeneratedCppFile {
+            filename: format!("{file_prefix}main.cpp"),
+            contents: emit_split_dispatcher(&test_names),
+        },
+        test_names,
+        shards,
+        scaffold,
+    })
+}
+
+/// Emit one shard of a planned split build, borrowing the verified program.
+pub fn emit_split_shard(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    plan: &SplitCppPlan,
+    shard: &SplitShardPlan,
+) -> Result<String, EmitError> {
+    let cpp = emit_selected_tests(
+        prog,
+        file,
+        opts,
+        &plan.scaffold,
+        &shard.test_indices,
+        EmitTail::ShardBody,
+    )?;
+    Ok(finish_shard(cpp))
+}
+
+/// Normalize a shard's trailing bytes.
+///
+/// The shard body is emitted without a dispatcher tail, so this reproduces
+/// exactly what the old post-hoc `rfind("\nint main(...)")` strip left
+/// behind: the pre-tail buffer, right-trimmed, plus one newline. Nothing is
+/// emitted between the last test body and the tail, so the two agree
+/// byte-for-byte — without depending on a sentinel that generated user text
+/// could in principle match.
+fn finish_shard(mut cpp: String) -> String {
+    cpp.truncate(cpp.trim_end().len());
+    cpp.push('\n');
+    cpp
+}
+
+/// Resolve `--emit-jobs` against the machine and the build.
+///
+/// `0` means automatic; the cap of 4 is deliberate — each in-flight shard
+/// holds a whole generated translation unit in memory (~100 MB on large
+/// suites), so the worker count is a memory knob as much as a speed one.
+pub fn resolve_emit_jobs(requested: usize, shard_count: usize) -> usize {
+    let shard_count = shard_count.max(1);
+    match requested {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(shard_count)
+            .min(4)
+            .max(1),
+        n => n.min(shard_count).max(1),
+    }
+}
+
+/// Emit every shard in `plan`, handing each finished translation unit to
+/// `on_shard` **on the calling thread** so the caller can write it and drop
+/// it immediately.
+///
+/// Peak retained generated C++ is bounded by `jobs`, not by shard count:
+/// the result channel is bounded, so a worker that finishes while the
+/// caller is still writing blocks instead of piling up more shards.
+///
+/// Determinism: shard bytes and the returned error are independent of
+/// `jobs`. Only the *interleaving* of `on_shard` calls varies — it is
+/// completion order, which is index order at `jobs == 1`.
+pub fn emit_split_shards<F>(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    plan: &SplitCppPlan,
+    jobs: usize,
+    mut on_shard: F,
+) -> Result<(), EmitError>
+where
+    F: FnMut(&SplitShardPlan, String, Duration) -> Result<(), EmitError>,
+{
+    if jobs <= 1 || plan.shards.len() <= 1 {
+        for shard in &plan.shards {
+            let started = Instant::now();
+            let cpp = emit_split_shard(prog, file, opts, plan, shard)?;
+            on_shard(shard, cpp, started.elapsed())?;
+        }
+        return Ok(());
     }
 
-    Ok(SplitCppOutput { files, test_names })
+    let cursor = AtomicUsize::new(0);
+    // Lowest shard index known to have failed. Workers refuse to CLAIM an
+    // index above it, but every index BELOW it is still attempted — that is
+    // what makes "lowest index wins" hold at any job count. A blanket
+    // cancel flag would let a higher shard's error be reported instead,
+    // depending on thread scheduling.
+    let fail_limit = AtomicUsize::new(usize::MAX);
+    // Bounded by the worker count: every worker may hand off one finished
+    // shard and pick up the next while the caller writes, but nothing
+    // further queues up. Peak retained shards therefore stays proportional
+    // to `jobs` and independent of the shard count — the memory bound is
+    // the point of `--emit-jobs`, not a side effect. An unbounded channel
+    // would let a slow writer accumulate every shard in memory, which is
+    // exactly the behavior this replaced.
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<String, EmitError>, Duration)>(jobs);
+
+    let mut first_err: Option<(usize, EmitError)> = None;
+    let mut callback_err: Option<EmitError> = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let tx = tx.clone();
+            let cursor = &cursor;
+            let fail_limit = &fail_limit;
+            scope.spawn(move || loop {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= plan.shards.len() {
+                    break;
+                }
+                if i > fail_limit.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let started = Instant::now();
+                let result = emit_split_shard(prog, file, opts, plan, &plan.shards[i]);
+                if result.is_err() {
+                    fail_limit.fetch_min(i, Ordering::Relaxed);
+                }
+                if tx.send((i, result, started.elapsed())).is_err() {
+                    break;
+                }
+            });
+        }
+        // The loop below ends only once every sender is gone.
+        drop(tx);
+
+        for (i, result, elapsed) in rx {
+            match result {
+                Err(e) => {
+                    if first_err.as_ref().is_none_or(|(j, _)| i < *j) {
+                        first_err = Some((i, e));
+                    }
+                }
+                Ok(cpp) => {
+                    // Never hand out a shard the serial path would not have
+                    // reached, so a failed build writes the same files.
+                    if i > fail_limit.load(Ordering::Relaxed) || callback_err.is_some() {
+                        continue;
+                    }
+                    if let Err(e) = on_shard(&plan.shards[i], cpp, elapsed) {
+                        callback_err = Some(e);
+                    }
+                }
+            }
+        }
+    });
+
+    if let Some(e) = callback_err {
+        return Err(e);
+    }
+    if let Some((_, e)) = first_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Emit a whole split build at once. Retains every shard until the last one
+/// finishes; prefer [`plan_split_tests`] + [`emit_split_shards`], which
+/// streams. Kept for callers that want the batch shape.
+pub fn emit_split_tests_with_file_prefix(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: EmitOpts,
+    file_prefix: &str,
+    group_size: usize,
+) -> Result<SplitCppOutput, EmitError> {
+    let plan = plan_split_tests(prog, file, &opts, file_prefix, group_size)?;
+    let mut files = Vec::with_capacity(plan.shards.len() + 1);
+    files.push(GeneratedCppFile {
+        filename: plan.dispatcher.filename.clone(),
+        contents: plan.dispatcher.contents.clone(),
+    });
+    emit_split_shards(prog, file, &opts, &plan, 1, |shard, cpp, _| {
+        files.push(GeneratedCppFile {
+            filename: shard.filename.clone(),
+            contents: cpp,
+        });
+        Ok(())
+    })?;
+    Ok(SplitCppOutput {
+        files,
+        test_names: plan.test_names,
+    })
 }
 
 fn validate_tests_share_dut(prog: &TbProgram, scope: &str) -> Result<String, EmitError> {
@@ -304,18 +605,6 @@ fn validate_tests_share_dut(prog: &TbProgram, scope: &str) -> Result<String, Emi
         }
     }
     Ok(dut_type)
-}
-
-fn strip_generated_dispatcher(cpp: &str) -> Result<String, EmitError> {
-    let marker = "\nint main(int argc, char** argv) {";
-    let Some(idx) = cpp.rfind(marker) else {
-        return Err(EmitError(
-            "internal error: generated TB-IR C++ did not contain dispatcher main()".into(),
-        ));
-    };
-    let mut out = cpp[..idx].trim_end().to_string();
-    out.push('\n');
-    Ok(out)
 }
 
 fn emit_split_dispatcher(test_names: &[String]) -> String {
