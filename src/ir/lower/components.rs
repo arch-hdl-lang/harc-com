@@ -1835,6 +1835,7 @@ fn resolve_testbench_path(
 /// signed values and value records retain distinct shapes.
 fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
+        (_, IrType::Unknown) => true,
         (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
         (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,

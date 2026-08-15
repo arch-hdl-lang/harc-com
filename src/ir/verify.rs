@@ -548,6 +548,7 @@ fn resolve_testbench_component_path(
 
 fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
+        (_, IrType::Unknown) => true,
         (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
         (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
@@ -1674,7 +1675,8 @@ fn check_def_before_use(
                 }
                 | Stmt::ComponentCall { dest: Some(l), .. }
                 | Stmt::ComponentQueuePop { dest: l, .. }
-                | Stmt::TransactorStateQueuePop { dest: l, .. } => {
+                | Stmt::TransactorStateQueuePop { dest: l, .. }
+                | Stmt::TbQueuePop { dest: l, .. } => {
                     bit_set(&mut gens[bi], l.index());
                 }
                 _ => {}
