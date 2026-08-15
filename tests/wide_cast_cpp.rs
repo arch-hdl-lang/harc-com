@@ -154,8 +154,12 @@ int main() {{
 
     let bin = dir.join("probe");
     let build = Command::new(&cxx)
-        .arg("-std=c++20")
-        .arg("-fcoroutines")
+        // Match the real build: `run_verilator` (`src/main.rs`) sets
+        // `CFG_CXXFLAGS_STD=-std=gnu++20`. That standard level is enough
+        // for the coroutine machinery the runtime header pulls in, and
+        // unlike `-fcoroutines` it is not gcc-specific — CI compiles the
+        // fixtures with clang++.
+        .arg("-std=gnu++20")
         .arg("-I")
         .arg(repo_root().join("runtime"))
         .arg(&probe)
