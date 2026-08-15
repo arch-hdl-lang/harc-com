@@ -2552,7 +2552,6 @@ fn cmd_sim(
                 // command line stays byte-stable run to run (its own
                 // incremental build keys on that).
                 let mut shard_paths: Vec<(usize, PathBuf)> = Vec::with_capacity(shard_count);
-                let mut io_err: Option<miette::Report> = None;
 
                 harc::codegen::tbir::emit_split_shards(
                     &prog,
@@ -2580,18 +2579,18 @@ fn cmd_sim(
                                 shard_paths.push((shard.index, path));
                                 Ok(())
                             }
-                            Err(e) => {
-                                let msg = format!("write {}", path.display());
-                                io_err = Some(e);
-                                Err(harc::codegen::cpp_tb::EmitError(msg))
-                            }
+                            // Carry the OS reason into the emitter's error
+                            // type: it is what comes back out of
+                            // `emit_split_shards`, so anything left behind
+                            // here is lost to the user.
+                            Err(e) => Err(harc::codegen::cpp_tb::EmitError(format!(
+                                "write {}: {e}",
+                                path.display()
+                            ))),
                         }
                     },
                 )
                 .map_err(|e| miette::miette!("{}", e))?;
-                if let Some(e) = io_err {
-                    return Err(e);
-                }
 
                 eprintln!(
                     "TBIR split emit: {done}/{shard_count} shards, {}, {}",

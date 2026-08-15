@@ -418,12 +418,27 @@ fn emit_jobs_does_not_change_generated_output() {
     }
 
     // Re-emitting unchanged sources must reuse every file, so Verilator's
-    // mtime-based skip still holds under parallel emission.
+    // mtime-based skip still holds under parallel emission. Assert on
+    // mtimes rather than on the log: the dispatcher reports `emitted
+    // <path>` while a shard reports `..., emitted` line-final, so a
+    // substring check is easy to write in a way that silently matches
+    // nothing.
+    let mtimes = |outdir: &Path| -> Vec<(String, std::time::SystemTime)> {
+        generated(outdir)
+            .into_iter()
+            .map(|(name, _)| {
+                let m = std::fs::metadata(outdir.join(&name)).expect("stat generated file");
+                (name, m.modified().expect("mtime"))
+            })
+            .collect()
+    };
+    let before = mtimes(&parallel);
     let (ok, log) = run(&parallel, "4");
     assert!(ok, "rerun failed:\n{log}");
-    assert!(
-        !log.contains("emitted "),
-        "unchanged rerun rewrote a generated file:\n{log}"
+    let after = mtimes(&parallel);
+    assert_eq!(
+        before, after,
+        "unchanged rerun rewrote a generated file (mtime moved):\n{log}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

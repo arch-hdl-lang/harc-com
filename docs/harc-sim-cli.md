@@ -190,13 +190,20 @@ identical at every `--emit-jobs` value; only the order of the per-shard
 progress lines varies:
 
 ```
-TBIR lower+verify: 2.4s
-TBIR split plan: 349 tests, 11 shards, group size 32, emit jobs 4
-TBIR shard 3/11: 32 tests, 108.2 MB, 97.1s, emitted
-TBIR shard 1/11: 32 tests, 108.0 MB, 101.8s, reused
-TBIR split emit: 11/11 shards, 1.2 GB, 312.5s
+TBIR lower+verify: 16.0s
+TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4
+TBIR shard 3/11: 32 tests, 31.7 MB, 0.6s, emitted
+TBIR shard 1/11: 32 tests, 31.7 MB, 0.7s, emitted
+TBIR split emit: 11/11 shards, 348.6 MB, 1.5s
 ```
 
+Note shard 3 is reported before shard 1 — under `--emit-jobs > 1` the
+progress lines come in completion order, not index order.
+
 If a shard fails, the command exits non-zero and Verilator is never
-invoked. Shards that already completed stay on disk; the next run
-recomputes them and `write_if_changed` reuses the matching files.
+invoked. The reported diagnostic is always the lowest-indexed failure, so
+it does not depend on thread scheduling. Shards that already completed
+stay on disk — and because a shard above the failing one may have finished
+before the failure was observed, exactly which files remain can vary
+between two identical failing runs. That is harmless: the next run
+recomputes every shard and `write_if_changed` reuses whatever matches.

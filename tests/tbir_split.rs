@@ -584,6 +584,95 @@ fn callback_error_propagates_unchanged_at_every_job_count() {
 }
 
 #[test]
+fn lowest_indexed_failure_is_the_one_reported() {
+    // Two shards fail. Whichever finishes first, the reported diagnostic
+    // must be the lower index — otherwise the error a user sees depends on
+    // thread scheduling. This is what the `fail_limit` claim guard buys
+    // over a blanket cancel flag.
+    let merged = merged_src(&wide_suite(12));
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts::default();
+    let plan = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    assert_eq!(plan.shards.len(), 12);
+
+    for jobs in [1usize, 2, 4, 8] {
+        for _ in 0..10 {
+            let err = tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+                match shard.index {
+                    4 => Err(cpp_tb::EmitError("failure at 4".into())),
+                    9 => Err(cpp_tb::EmitError("failure at 9".into())),
+                    _ => Ok(()),
+                }
+            })
+            .expect_err("shard 4 fails");
+            assert_eq!(err.to_string(), "failure at 4", "jobs={jobs}");
+        }
+    }
+}
+
+#[test]
+fn failed_emit_delivers_each_shard_at_most_once() {
+    // What a failing build guarantees, and what it deliberately does not.
+    //
+    // Serial delivery stops dead at the failure, exactly as the old
+    // batch emitter did. Parallel delivery does NOT: a shard above the
+    // failing index that finished before the failure was observed has
+    // already been handed out, so a failed parallel emit can leave more
+    // files on disk than a failed serial one, and a different set between
+    // two identical runs.
+    //
+    // That is the accepted cost of streaming under a memory bound — the
+    // alternative is holding results back until every lower index has
+    // resolved, which reintroduces unbounded buffering when one early
+    // shard is slow. It is harmless in practice: the command still exits
+    // non-zero without building, and the next run recomputes every shard
+    // and reuses whatever `write_if_changed` finds matching.
+    //
+    // What must hold at every job count is that no shard is delivered
+    // twice, and that the reported error is index-deterministic.
+    let merged = merged_src(&wide_suite(12));
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts::default();
+    let plan = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+
+    for jobs in [1usize, 2, 4, 8] {
+        for _ in 0..10 {
+            let mut delivered: Vec<usize> = Vec::new();
+            let err =
+                tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+                    delivered.push(shard.index);
+                    if shard.index == 5 {
+                        Err(cpp_tb::EmitError("boom".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .expect_err("shard 5 fails");
+            assert_eq!(err.to_string(), "boom", "jobs={jobs}");
+
+            let mut unique = delivered.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                delivered.len(),
+                "jobs={jobs}: a shard was delivered twice: {delivered:?}"
+            );
+            assert!(
+                delivered.contains(&5),
+                "jobs={jobs}: the failing shard must still be offered once"
+            );
+            if jobs == 1 {
+                assert!(
+                    delivered.iter().all(|&i| i <= 5),
+                    "serial delivery must stop at the failure, got {delivered:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_shard_is_offered_exactly_once() {
     let merged = merged_src(&wide_suite(9));
     let prog = program(&merged);

@@ -42,8 +42,8 @@ fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
     !tb.synthetic || !tb.scalar_fields.is_empty()
 }
 
-/// Suite-global emission state: everything `emit` computes that does NOT
-/// read `prog.tests`.
+/// Suite-global emission state: everything `emit` computes that is the
+/// same for any subset of the suite's tests.
 ///
 /// The split path builds each shard's program as `prog.clone()` with only
 /// `.tests` overwritten (see `plan_split_tests`), so any value not derived
@@ -465,9 +465,16 @@ pub fn resolve_emit_jobs(requested: usize, shard_count: usize) -> usize {
 /// the result channel is bounded, so a worker that finishes while the
 /// caller is still writing blocks instead of piling up more shards.
 ///
-/// Determinism: shard bytes and the returned error are independent of
-/// `jobs`. Only the *interleaving* of `on_shard` calls varies — it is
-/// completion order, which is index order at `jobs == 1`.
+/// Determinism, on success: shard bytes are independent of `jobs`, and
+/// every shard is handed to `on_shard` exactly once. Only the *order* of
+/// those calls varies — it is completion order, which is index order at
+/// `jobs == 1`.
+///
+/// Determinism, on failure: the returned error is the lowest-indexed
+/// failure, whether it came from emission or from `on_shard`, so the
+/// diagnostic does not depend on thread scheduling. Which shards were
+/// already handed out is NOT deterministic — see the note at the delivery
+/// site.
 pub fn emit_split_shards<F>(
     prog: &TbProgram,
     file: &SourceFile,
@@ -479,6 +486,12 @@ pub fn emit_split_shards<F>(
 where
     F: FnMut(&SplitShardPlan, String, Duration) -> Result<(), EmitError>,
 {
+    debug_assert!(
+        plan.shards
+            .iter()
+            .all(|s| s.test_indices.iter().all(|&i| i < prog.tests.len())),
+        "split plan was built for a different program than the one being emitted"
+    );
     if jobs <= 1 || plan.shards.len() <= 1 {
         for shard in &plan.shards {
             let started = Instant::now();
@@ -489,11 +502,11 @@ where
     }
 
     let cursor = AtomicUsize::new(0);
-    // Lowest shard index known to have failed. Workers refuse to CLAIM an
-    // index above it, but every index BELOW it is still attempted — that is
-    // what makes "lowest index wins" hold at any job count. A blanket
-    // cancel flag would let a higher shard's error be reported instead,
-    // depending on thread scheduling.
+    // Lowest shard index known to have failed, from either emission or the
+    // caller's `on_shard`. Workers refuse to CLAIM an index above it, but
+    // every index BELOW it is still attempted — that is what makes "lowest
+    // index wins" hold at any job count. A blanket cancel flag would let a
+    // higher shard's error be reported instead, depending on scheduling.
     let fail_limit = AtomicUsize::new(usize::MAX);
     // Bounded by the worker count: every worker may hand off one finished
     // shard and pick up the next while the caller writes, but nothing
@@ -504,63 +517,91 @@ where
     // exactly the behavior this replaced.
     let (tx, rx) = mpsc::sync_channel::<(usize, Result<String, EmitError>, Duration)>(jobs);
 
+    // Lowest-indexed failure seen so far, whichever side it came from.
+    // Keyed by index so the reported error does not depend on which thread
+    // finished first.
     let mut first_err: Option<(usize, EmitError)> = None;
-    let mut callback_err: Option<EmitError> = None;
+    let record_err = |i: usize, e: EmitError, first_err: &mut Option<(usize, EmitError)>| {
+        fail_limit.fetch_min(i, Ordering::Relaxed);
+        if first_err.as_ref().is_none_or(|(j, _)| i < *j) {
+            *first_err = Some((i, e));
+        }
+    };
 
     std::thread::scope(|scope| {
         for _ in 0..jobs {
             let tx = tx.clone();
             let cursor = &cursor;
             let fail_limit = &fail_limit;
-            scope.spawn(move || loop {
-                let i = cursor.fetch_add(1, Ordering::Relaxed);
-                if i >= plan.shards.len() {
-                    break;
-                }
-                if i > fail_limit.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let started = Instant::now();
-                let result = emit_split_shard(prog, file, opts, plan, &plan.shards[i]);
-                if result.is_err() {
-                    fail_limit.fetch_min(i, Ordering::Relaxed);
-                }
-                if tx.send((i, result, started.elapsed())).is_err() {
-                    break;
-                }
-            });
+            // Worker threads default to a 2 MiB stack where the main thread
+            // gets ~8 MiB, and emission recurses over expression, record,
+            // and component trees with no depth guard. Since `--emit-jobs`
+            // defaults to automatic, a deeply nested source that emits fine
+            // serially must not overflow just because it ran on a worker.
+            let spawned = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= plan.shards.len() {
+                        break;
+                    }
+                    if i > fail_limit.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let started = Instant::now();
+                    let result = emit_split_shard(prog, file, opts, plan, &plan.shards[i]);
+                    if result.is_err() {
+                        fail_limit.fetch_min(i, Ordering::Relaxed);
+                    }
+                    if tx.send((i, result, started.elapsed())).is_err() {
+                        break;
+                    }
+                });
+            if let Err(e) = spawned {
+                record_err(
+                    usize::MAX,
+                    EmitError(format!("could not spawn shard emission worker: {e}")),
+                    &mut first_err,
+                );
+                break;
+            }
         }
         // The loop below ends only once every sender is gone.
         drop(tx);
 
         for (i, result, elapsed) in rx {
             match result {
-                Err(e) => {
-                    if first_err.as_ref().is_none_or(|(j, _)| i < *j) {
-                        first_err = Some((i, e));
-                    }
-                }
+                Err(e) => record_err(i, e, &mut first_err),
                 Ok(cpp) => {
-                    // Never hand out a shard the serial path would not have
-                    // reached, so a failed build writes the same files.
-                    if i > fail_limit.load(Ordering::Relaxed) || callback_err.is_some() {
+                    // Skip anything at or above a known failure: those are
+                    // shards the serial path would never have reached.
+                    //
+                    // The converse does NOT hold. A shard above the failing
+                    // index that completed before the failure was observed
+                    // has already been handed out, so a failed parallel emit
+                    // can leave a different set of files on disk than a
+                    // failed serial one — and a different set run to run.
+                    // That is accepted: every shard is recomputed on the next
+                    // run and `write_if_changed` reuses whatever matches, and
+                    // the command still exits non-zero without building.
+                    if i > fail_limit.load(Ordering::Relaxed) {
                         continue;
                     }
                     if let Err(e) = on_shard(&plan.shards[i], cpp, elapsed) {
-                        callback_err = Some(e);
+                        // Also bounds the damage: workers stop claiming
+                        // higher shards instead of emitting hundreds of MB
+                        // that can no longer be written anywhere.
+                        record_err(i, e, &mut first_err);
                     }
                 }
             }
         }
     });
 
-    if let Some(e) = callback_err {
-        return Err(e);
+    match first_err {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
     }
-    if let Some((_, e)) = first_err {
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// Emit a whole split build at once. Retains every shard until the last one
