@@ -242,10 +242,13 @@ fn fold_const(
                 // the 64-bit fold domain does not model per-operand
                 // widths — folding them as plain ops would silently
                 // change their meaning. This is `Invalid`, not
-                // `Unsupported`: v1 emits wrap ops UNMASKED into the
-                // constexpr initializer (`255 +% 1` at `uint<8>` gives
-                // 256 under v1), so steering users to `--codegen v1`
-                // would recommend a backend that silently mis-evaluates.
+                // `Unsupported`: `Unsupported` steers users to
+                // `--codegen v1`, and a construct this backend cannot
+                // give a defined value to should be spelled out at the
+                // source instead of routed to the legacy backend. (v1
+                // does now mask these correctly in a constexpr
+                // initializer, so it computes `255 +% 1` at `uint<8>` as
+                // 0 — it accepts a const form TB-IR rejects.)
                 BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
                     Err(FoldInvalid(
                         "the wrapping `+% -% *%` operators are not evaluable in a \

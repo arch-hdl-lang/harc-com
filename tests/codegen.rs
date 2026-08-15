@@ -7974,34 +7974,93 @@ end test T"#,
 }
 
 /// The mask is the unsigned low-W residue — check the arithmetic, not
-/// just the spelling, by compiling the emitted shapes.
+/// just the spelling, by compiling what the emitter actually produced.
+/// Extracting the expressions from the emitted C++ (rather than
+/// hard-coding them) is what makes this fail if the emitter regresses;
+/// a hard-coded copy would pass against any emitter at all.
 #[test]
 fn v1_wrapping_mask_computes_the_wrapped_value() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let b = a +% 100
+        let c = a -% 250
+        let d = a *% 3
+        log(info, "${b} ${c} ${d}")
+    end run
+end test T"#,
+    );
+    let expr = |lhs: &str| {
+        let needle = format!("{lhs} = ");
+        let start = cpp.find(&needle).expect("assignment present") + needle.len();
+        let rest = &cpp[start..];
+        rest[..rest.find(';').expect("statement ends")].to_string()
+    };
     compile_and_run_runtime_cpp(
         "wrap_mask",
-        "uint64_t a = 200;\n\
-         assert(((uint64_t)(((uint64_t)((a + 100)) & 0xFFULL))) == 44);\n\
-         assert(((uint64_t)(((uint64_t)((a - 250)) & 0xFFULL))) == 206);\n\
-         assert(((uint64_t)(((uint64_t)((a * 3)) & 0xFFULL))) == 88);",
+        &format!(
+            "uint64_t a = 200;\n\
+             assert(({}) == 44);\n\
+             assert(({}) == 206);\n\
+             assert(({}) == 88);",
+            expr("b"),
+            expr("c"),
+            expr("d"),
+        ),
     );
 }
 
-/// Both backends reject an unknown-width wrap operand rather than
-/// silently not wrapping.
+/// A plain top-level port is width-erased, so a wrap on one has no
+/// defined mask width and is rejected rather than silently not wrapping.
+/// Asserted for BOTH backends: a rejection only v1 makes would be an
+/// accepted-set divergence, which is the thing these fixes exist to close.
 #[test]
-fn v1_rejects_unknown_width_wrapping_operand() {
-    let err = v1_emit_err(
-        r#"test T
+fn both_backends_reject_an_unknown_width_wrapping_operand() {
+    let src = r#"test T
     let dut : Top
     run
         let x = dut.count +% 1
         log(info, "${x}")
     end run
+end test T"#;
+    let v1_err = v1_emit_err(src);
+    assert!(
+        v1_err.contains("statically known bit-width"),
+        "v1: expected the unknown-width wrap diagnostic, got: {v1_err}"
+    );
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let tbir_err = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        tbir_err.contains("statically known bit-width"),
+        "tbir: expected the same diagnostic, got: {tbir_err}"
+    );
+}
+
+/// A `probe` read is the one `dut.<field>` shape that carries a static
+/// width. TB-IR reads it off `PortRef::width`; v1 must resolve the same
+/// width or it rejects a wrap the default backend accepts.
+#[test]
+fn v1_wraps_a_probe_operand_at_its_declared_width() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+        probe c : uint<8> at ctr.count_r
+    end let dut
+    run
+        let x = dut.c +% 1
+        log(info, "${x}")
+    end run
 end test T"#,
     );
     assert!(
-        err.contains("statically known bit-width"),
-        "expected the unknown-width wrap diagnostic, got: {err}"
+        cpp.contains("+ 1)) & 0xFFULL"),
+        "expected the wrap to mask at the probe's 8-bit width; got:\n{cpp}"
     );
 }
 
@@ -8019,8 +8078,11 @@ fn v1_sext_without_extension_keeps_the_value_signed() {
     end run
 end test T"#,
     );
+    // The inner `(uint64_t)` narrows before the signed relabel so a
+    // `HarcWide` receiver is not an ambiguous conversion; the outer
+    // `int64_t` is what makes the result signed.
     assert!(
-        cpp.contains("((int64_t)(s))") && !cpp.contains("((uint64_t)(s))"),
+        cpp.contains("((int64_t)((uint64_t)(s)))"),
         "expected a signed relabel; got:\n{cpp}"
     );
 }

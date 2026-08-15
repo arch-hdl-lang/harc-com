@@ -255,11 +255,15 @@ let d : uint<9>  = (a as uint<9>) + 1  // == 256  (plain `+` does not wrap)
 
 Signedness: the mask is the two's-complement low-`W` bit pattern; a `sint<N>`
 operand yields that residue as an unsigned value, so reinterpret with an
-explicit cast if a signed result is wanted. Both backends apply the wrap and
-reject the same unknown-width and `> 64`-bit operands: the legacy
-`--codegen v1` backend previously treated these as pass-through sugar
-(`+ / - / *`), which made the same source produce different values under the
-two emitters. See harc#473.
+explicit cast if a signed result is wanted. Both backends apply the wrap in
+statement position and reject the same unknown-width and `> 64`-bit operands:
+the legacy `--codegen v1` backend previously treated these as pass-through
+sugar (`+ / - / *`), which made the same source produce different values under
+the two emitters. Two contexts still differ and are not wrap-masked
+equivalently: a `const` initializer (v1 folds the masked value, the TB-IR
+backend rejects the form outright — spell the mask explicitly), and a `keep`
+constraint, where both backends route `+%` through the solver as plain `+`.
+See harc#473.
 
 ---
 

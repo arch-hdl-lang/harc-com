@@ -1457,6 +1457,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         record_fields,
         txn_keeps: std::collections::HashMap::new(),
         probes: std::collections::HashMap::new(),
+        probe_widths: std::collections::HashMap::new(),
         regblocks: std::collections::HashMap::new(),
         addrmaps: std::collections::HashMap::new(),
         let_helper: std::collections::HashMap::new(),
@@ -1945,6 +1946,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         txn_keeps,
         relations,
         probes: std::collections::HashMap::new(),
+        probe_widths: std::collections::HashMap::new(),
         regblocks,
         addrmaps,
         let_helper: std::collections::HashMap::new(),
@@ -2489,6 +2491,16 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                     force: p.force,
                                 },
                             );
+                            if let TypeExpr::Builtin { name, args, .. } = &p.ty {
+                                if matches!(
+                                    name,
+                                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
+                                ) {
+                                    if let Some(w) = type_arg_width(args) {
+                                        e.probe_widths.insert(p.name.name.clone(), w);
+                                    }
+                                }
+                            }
                         }
                     } else {
                         other_lets.push(l);
@@ -5756,6 +5768,13 @@ struct Emitter {
     /// the (non-existent) top-level signal of the original DUT. Empty for
     /// probe-less tests — current 76 fixtures all sit in this bucket.
     probes: std::collections::HashMap<String, ProbeAccessor>,
+    /// Declared bit-width of each `probe <name> : uint<W>` on the test's
+    /// `let dut`. A probe read is the one `dut.<field>` shape that carries
+    /// a static width, so it is the one wrapping-operator operand that
+    /// resolves — TB-IR reads the same width off `PortRef::width`, and
+    /// without this v1 rejected `dut.<probe> +% 1` as unknown-width while
+    /// TB-IR wrapped it. Plain top-level ports stay width-erased in both.
+    probe_widths: std::collections::HashMap<String, u32>,
     /// RAL regblock declarations indexed by type name. See ast.rs::
     /// `RegblockDecl`. Used to emit one POD mirror struct +
     /// `constexpr` address table per declared regblock at file scope,
@@ -9954,6 +9973,15 @@ impl Emitter {
         } else {
             c_unsigned.clone()
         };
+        // Narrow to `uint64_t` before that signed relabel: a `HarcWide<N>`
+        // receiver converts implicitly to both `uint64_t` and `_harc_u128`,
+        // so a bare `(int64_t)` on one is an ambiguous conversion. The
+        // scalar receivers reinterpret the same low 64 bits either way.
+        let (sext_narrow, sext_narrow_close) = if width <= 64 {
+            ("(uint64_t)(", ")")
+        } else {
+            ("", "")
+        };
         match kind {
             "trunc" => {
                 if width > 128 {
@@ -10022,7 +10050,12 @@ impl Emitter {
                             let shift = 64 - sw;
                             if width == 64 {
                                 // Want full 64-bit signed-extended view.
-                                write!(self.out, "((uint64_t)(((int64_t)((uint64_t)(").ok();
+                                // `int64_t`, not `uint64_t`: this binds to
+                                // `auto` at the use site, and deducing
+                                // unsigned here made `p[7:0].sext<64>() > 0`
+                                // true under v1 and false under TB-IR, whose
+                                // local for a sext is `int64_t`.
+                                write!(self.out, "((int64_t)(((int64_t)((uint64_t)(").ok();
                                 self.emit_expr(target);
                                 write!(self.out, ") << {shift})) >> {shift}))").ok();
                             } else {
@@ -10040,9 +10073,9 @@ impl Emitter {
                             self.emit_expr(target);
                             write!(self.out, ", {sw})").ok();
                         } else {
-                            write!(self.out, "(({c_sext_plain})(").ok();
+                            write!(self.out, "(({c_sext_plain})({sext_narrow}").ok();
                             self.emit_expr(target);
-                            write!(self.out, "))").ok();
+                            write!(self.out, "){sext_narrow_close})").ok();
                         }
                     }
                 } else {
@@ -10052,9 +10085,9 @@ impl Emitter {
                         self.emit_expr(target);
                         write!(self.out, ")").ok();
                     } else {
-                        write!(self.out, "(({c_sext_plain})(").ok();
+                        write!(self.out, "(({c_sext_plain})({sext_narrow}").ok();
                         self.emit_expr(target);
-                        write!(self.out, "))").ok();
+                        write!(self.out, "){sext_narrow_close})").ok();
                     }
                 }
             }
@@ -10204,6 +10237,9 @@ impl Emitter {
         let Some(dw) = self.let_widths.get(name).copied() else {
             return;
         };
+        if dw == 0 || !narrowing_checkable(value) {
+            return;
+        }
         let Some(aw) = self.infer_expr_width_best_effort(value) else {
             return;
         };
@@ -10266,6 +10302,10 @@ impl Emitter {
                 let r = self.wrap_operand_width(rhs)?;
                 Some(l.max(r))
             }
+            // `dut.<probe>` carries the probe's declared width — the same
+            // width TB-IR reads off `PortRef::width`. A plain top-level
+            // port is width-erased and still reports `None` in both.
+            ExprKind::Field { name, .. } => self.probe_widths.get(&name.name).copied(),
             _ => self.infer_expr_width_best_effort(e),
         }
     }
@@ -16680,6 +16720,7 @@ impl Emitter {
                     let aw = l
                         .value
                         .as_ref()
+                        .filter(|v| dw > 0 && narrowing_checkable(v))
                         .and_then(|v| self.infer_expr_width_best_effort(v));
                     if let Some(aw) = aw {
                         if aw > dw {
@@ -19271,6 +19312,26 @@ fn cpp_param_names(params: &[Param]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Whether an initializer's inferred width is meaningful for the
+/// narrowing check.
+///
+/// A bare integer literal is excluded: `infer_expr_width_best_effort`
+/// reports a literal's *minimum value width* — the right notion for a
+/// width-method receiver, the wrong one here. TB-IR types a bare literal
+/// as widthless (`IrType::UInt(None)`), which `assign_compatible` treats
+/// as a wildcard, so counting it would make v1 reject `let b : uint<8> =
+/// 300` while the default backend accepts it — a fresh accepted-set
+/// divergence, the opposite of what this check is for. Whether an
+/// out-of-range literal should be an error is a language question for
+/// both backends and `harc check`, not something to settle in v1 alone.
+fn narrowing_checkable(value: &Expr) -> bool {
+    match &*value.kind {
+        ExprKind::Int(_) => false,
+        ExprKind::Paren(inner) => narrowing_checkable(inner),
+        _ => true,
+    }
 }
 
 fn c_binary_op(op: BinaryOp) -> &'static str {
