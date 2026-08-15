@@ -8235,3 +8235,73 @@ end test BPort"#;
         "probe widths must not leak across tests; got: {err}"
     );
 }
+
+/// A literal too wide for 64 bits is a genuine narrowing source, unlike
+/// one that fits. v1 used to accept `let b : uint<8> = <80-bit literal>`
+/// and store the low 64 bits; TB-IR reported it. Both must reject, while
+/// still accepting a literal that merely exceeds the declared width.
+#[test]
+fn wide_literal_initializer_is_a_narrowing_error_in_both_backends() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let b : uint<8> = 0xFFFFFFFFFFFFFFFFFFFF
+        log(info, "${b}")
+    end run
+end test T"#;
+    let err = v1_emit_err(src);
+    assert!(
+        err.contains("narrows"),
+        "v1 must reject an 80-bit literal into a uint<8>; got: {err}"
+    );
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let tbir = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        tbir.contains("narrows"),
+        "TB-IR must reject it too; got: {tbir}"
+    );
+}
+
+/// v1's wrap-operand inference must recognise every shape TB-IR's does,
+/// or the "reject the same operands" claim in spec.md §2.4 is false. Each
+/// of these was a v1-only rejection.
+#[test]
+fn v1_wrap_operand_inference_matches_tbir_on_cast_and_bit_probes() {
+    // Width-less and capitalised scalar casts (TB-IR's `cast_relabel_width`
+    // accepts both; a width-less scalar cast is 64 bits).
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let x = (a as uint) +% 100
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("+ 100)))"),
+        "a width-less cast operand must wrap at 64 bits, not be rejected; got:\n{cpp}"
+    );
+
+    // A `Bit` probe is one bit wide, not width-less.
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+        probe flag : Bit at inner.f
+    end let dut
+    run
+        let x = dut.flag +% 1
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("& 0x1ULL"),
+        "a Bit probe operand must wrap at 1 bit; got:\n{cpp}"
+    );
+}
