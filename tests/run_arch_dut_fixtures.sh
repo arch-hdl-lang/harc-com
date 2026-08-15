@@ -71,7 +71,7 @@ run_one() {
     local out
     out="$("$HARC" sim --arch-bin "$ARCH_BIN" --dut "$DUT_DIR/$dut" "$FIX_DIR/$test.harc" --top "$top" 2>&1)" || true
 
-    if echo "$out" | grep -q "ALL TESTS PASSED"; then
+    if [[ "$out" == *"ALL TESTS PASSED"* ]]; then
         echo "  PASS  $test"
         PASS=$((PASS + 1))
     else
@@ -105,12 +105,12 @@ run_equiv_sim() {
     if [ "$expect" = "fail" ]; then
         # Mirrors run_tbir_equiv.sh: nonzero exit, no success sentinel,
         # and a real "N TESTS FAILED" verdict (not infra breakage).
-        if [ "$rc" -eq 0 ] || echo "$out" | grep -q "ALL TESTS PASSED"; then
+        if [ "$rc" -eq 0 ] || [[ "$out" == *"ALL TESTS PASSED"* ]]; then
             echo "  FAIL  $tag (sim --codegen $cg passed, but registry expects fail)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
-        if ! echo "$out" | grep -q "TESTS FAILED"; then
+        if [[ "$out" != *"TESTS FAILED"* ]]; then
             echo "  FAIL  $tag (sim --codegen $cg broke before reaching a test verdict)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
@@ -118,7 +118,7 @@ run_equiv_sim() {
         return 0
     fi
 
-    if ! echo "$out" | grep -q "ALL TESTS PASSED"; then
+    if [[ "$out" != *"ALL TESTS PASSED"* ]]; then
         echo "  FAIL  $tag (sim --codegen $cg did not pass)"
         echo "$out" | tail -20 | sed 's/^/      /'
         return 1

@@ -47,7 +47,7 @@ while IFS='|' read -r name top duts test srcdir; do
   # selectable for A/B during the v1 deprecation soak.)
   out="$("$HARC" sim --check-backends --arch-bin "$ARCH" "${dut_args[@]}" \
         --sv "$TMP/$name.sv" --top "$top" "$srcdir/$test" 2>&1)"
-  if echo "$out" | grep -q "traces match across backends"; then
+  if [[ "$out" == *"traces match across backends"* ]]; then
     echo "  PASS: traces match"
   else
     echo "  FAIL: divergence or error"; echo "$out" | tail -15; fail=1
