@@ -63,6 +63,8 @@ heartbeat_idle_test     | Top            | top_counter.sv         |
 analysis_sink_connect_test | Top         | top_counter.sv         |
 testbench_owned_state_connect_test | Top  | top_counter.sv         | | | OwnedStateConnectTest
 testbench_owned_state_connect_test | Top  | top_counter.sv         | | | OwnedStateConnectFreshTest
+passive_analysis_monitor_test | Top    | top_counter.sv         | | | PassiveAnalysisMonitorTest
+passive_analysis_monitor_test | Top    | top_counter.sv         | | | PassiveAnalysisMonitorFreshTest
 wait_until_quiesce_test | Top            | top_counter.sv         |
 wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |

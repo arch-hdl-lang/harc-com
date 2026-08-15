@@ -2467,6 +2467,170 @@ fn sequencer_connect_emitted_cpp_snapshot() {
     );
 }
 
+/// Source for the mode-VARIANT tests only: the same analysis-source
+/// shape as `tests/fixtures/passive_analysis_monitor_test.harc`, reduced
+/// to what the mode gate cares about, with `{mode}` substituted.
+///
+/// The shipped fixture is bound `passive`, so the `active` and
+/// mode-less variants cannot come from it and need this parameterized
+/// source. The `passive` case deliberately does NOT use this helper — it
+/// loads the fixture, so what CI pins is the shape actually shipped
+/// rather than a copy here that can drift out of sync with it.
+fn passive_monitor_src(mode: &str) -> String {
+    format!(
+        r#"
+struct LifeRec
+    tag   : uint<8>
+    stamp : uint<32>
+end struct LifeRec
+
+transactor LifecycleMonitor
+    seen    : out event<uint<8>>
+    starts  : uint<32> default 0
+    history : queue<LifeRec>
+
+    hookable note_start(tag: uint<8>)
+        starts = starts + 1
+        let r : LifeRec
+        r.tag = tag
+        r.stamp = starts
+        history.push(r)
+        emit seen(tag)
+    end note_start
+
+    hookable note_stop(tag: uint<8>)
+        emit seen(tag)
+    end note_stop
+end transactor LifecycleMonitor
+
+scoreboard LifeSink
+    count : uint<32> default 0
+    hookable accept(v: uint<8>)
+        count = count + 1
+    end accept
+end scoreboard LifeSink
+
+testbench LargeTb
+    dut       : Top
+    lifecycle : LifecycleMonitor{MODE}
+    sink      : LifeSink
+
+    connect
+        lifecycle.seen -> sink.accept
+    end connect
+end testbench LargeTb
+
+impl T for LargeTb
+    run
+        lifecycle.note_start(1)
+        assert lifecycle.starts == 1 else fail("x")
+    end run
+end impl T
+"#,
+        MODE = mode
+    )
+}
+
+/// harc#538 regression: a `passive` analysis-source component bound as a
+/// testbench field lowers.
+///
+/// This is the shape that used to abort a whole production suite before
+/// C++ emission ("TB-IR lowering does not support an `active`/`passive`
+/// mode on composite-component testbench field"). `passive` is now an
+/// ownership annotation on this path — it must NOT suppress the
+/// component's methods or its `connect` fanout, which is exactly what
+/// would happen if a passive analysis source were treated like a passive
+/// BFM transactor (whose `when active` methods structurally do not
+/// exist).
+#[test]
+fn passive_analysis_monitor_testbench_field_lowers() {
+    let src = fixture("passive_analysis_monitor_test.harc");
+    let prog = lower_src(&src).expect("a passive analysis-source component field lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+
+    assert!(
+        dump.contains("component c0 LifecycleMonitor (transactor)"),
+        "monitor should lower as a composite component: {dump}"
+    );
+    // The annotation must not strip the always-on methods.
+    assert!(
+        dump.contains("method note_start") && dump.contains("method note_stop"),
+        "passive must keep the monitor's always-on methods: {dump}"
+    );
+    // Nor its persistent state or record queue.
+    assert!(
+        dump.contains("field starts : scalar = 0")
+            && dump.contains("field history : queue<LifeRec>"),
+        "passive must keep the monitor's counters and record queue: {dump}"
+    );
+    // Nor the analysis fanout declared in `connect`.
+    assert!(
+        dump.contains("connect lifecycle.seen->sink.accept"),
+        "passive must keep the connect fanout: {dump}"
+    );
+
+    // Carry it through CODEGEN too, not just lowering. `connect` fanout
+    // surviving in the IR does not prove it survives emission, and the
+    // end-to-end fixture that would catch that is Verilator-gated and
+    // skips in CI — so without this the stated CI guarantee has a hole.
+    let merged = merged_src(&src);
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("LifeSink_accept("),
+        "passive monitor's connect fanout must reach the emitted C++: {cpp}"
+    );
+    assert!(
+        cpp.contains("LifecycleMonitor_note_start(") && cpp.contains("LifecycleMonitor_note_stop("),
+        "passive monitor's always-on methods must reach the emitted C++"
+    );
+}
+
+/// Full IR shape for the passive analysis monitor, so a regression on
+/// this path is caught even where the targeted assertions above do not
+/// look. Mirrors `testbench_owned_state_connect_dump_ir_snapshot`.
+#[test]
+fn passive_analysis_monitor_dump_ir_snapshot() {
+    let prog = lower_src(&fixture("passive_analysis_monitor_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    insta::assert_snapshot!("passive_analysis_monitor_dump_ir", format!("{prog}"));
+}
+
+/// The same field with no mode at all also lowers.
+///
+/// Note this is not independent coverage of the passive case: `passive`
+/// and no-mode lower byte-identically (the gate accepts both and records
+/// neither), so this documents that a composite component needs no
+/// transactor mode rather than exercising a distinct path.
+#[test]
+fn modeless_analysis_monitor_testbench_field_lowers() {
+    let prog = lower_src(&passive_monitor_src("")).expect("a mode-less component field lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert!(format!("{prog}").contains("component c0 LifecycleMonitor (transactor)"));
+}
+
+/// `active` on a composite-component field stays rejected, and is
+/// rejected loudly rather than silently dropped.
+///
+/// `active`/`passive` is a transactor concept; on an analysis-source
+/// component only the passive ownership annotation is meaningful.
+/// Accepting `active` here would let a suite express a mode that has no
+/// effect on emission.
+#[test]
+fn active_mode_on_analysis_monitor_field_is_rejected() {
+    let err = lower_src(&passive_monitor_src(" active"))
+        .expect_err("`active` on a composite-component field is out of subset");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("`active` mode on composite-component"),
+        "diagnostic should name the offending mode and construct: {msg}"
+    );
+    assert!(
+        msg.contains("LargeTb.lifecycle"),
+        "diagnostic should locate the offending field: {msg}"
+    );
+}
+
 /// A method-bearing scoreboard lowers as a composite component
 /// (per-instance state materialized). Since the testbench-field-binding
 /// slice it binds BOTH as a test-scope `let` AND as a `testbench` FIELD
