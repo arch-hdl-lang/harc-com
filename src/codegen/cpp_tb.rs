@@ -9930,6 +9930,11 @@ impl Emitter {
                 _ => {}
             }
         }
+        // The direction checks above want the raw inferred width; a zero
+        // width is not usable emission metadata (it would reach the sext
+        // shift-fill as `64 - 0`, UB), so drop to the unknown-source
+        // shapes. Matches TB-IR's `lower_width_method`.
+        let source_width = source_width.filter(|w| *w > 0);
         // Emit. Pattern follows arch-com's cast_to_bits / shift-fill
         // for sext. Sub-64 narrowing (`trunc`, `resize` down) narrows to
         // `uint64_t` *before* the mask: a `HarcWide<N>` receiver converts
@@ -10122,15 +10127,12 @@ impl Emitter {
     ///   - Bare integer literal → minimum unsigned bit-width of the
     ///     literal value (cheap heuristic: `64 - leading_zeros(v)` for
     ///     positive values; `None` for negatives).
+    ///
+    /// The result can be `Some(0)` for a `uint<0>` receiver. Callers
+    /// emitting a cast shape must filter that out (it would reach the
+    /// sext shift-fill as `64 - 0`, UB); the direction checks want the
+    /// raw value. Mirrors TB-IR's `infer_expr_width`.
     fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
-        // A zero-width declared type (`uint<0>`) carries no usable source
-        // metadata; reporting it as unknown keeps the sext shift-fill from
-        // emitting a `64 - 0` shift (UB). Matches the TB-IR lowering's
-        // `infer_expr_width`, so both backends pick the same cast shape.
-        self.infer_declared_width(e).filter(|w| *w > 0)
-    }
-
-    fn infer_declared_width(&self, e: &Expr) -> Option<u32> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
             ExprKind::Cast { ty, .. } => match ty {

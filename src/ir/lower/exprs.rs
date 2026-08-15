@@ -522,7 +522,9 @@ impl FuncBuilder<'_> {
                     let src_width = if matches!(kind, WidthCastKind::Sext) {
                         Some(width)
                     } else {
-                        self.infer_expr_width(expr)
+                        // `Some(0)` (a `uint<0>` receiver) is not usable
+                        // emission metadata — see `infer_expr_width`.
+                        self.infer_expr_width(expr).filter(|w| *w > 0)
                     };
                     let inner = self.lower_expr(expr)?;
                     return Ok(Expr::WidthCast {
@@ -2133,6 +2135,12 @@ impl FuncBuilder<'_> {
                 _ => {}
             }
         }
+        // The direction check above wants the raw inferred width (a
+        // zero-width receiver is still a wrong-direction `.trunc<N>()`),
+        // but a zero width is not usable *emission* metadata: it would
+        // reach the sext shift-fill as `64 - 0` (UB). Record it as
+        // unknown, which selects the plain-cast shape instead.
+        let src_width = src_width.filter(|w| *w > 0);
         let inner = self.lower_expr(target)?;
         Ok(Expr::WidthCast {
             kind,
@@ -2224,30 +2232,32 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// Best-effort receiver bit-width (v1's
-    /// `infer_expr_width_best_effort`): parens recurse, `as uint<W>`
+    /// Best-effort receiver bit-width: parens recurse, `as uint<W>`
     /// casts give W, nested width methods give their target width,
     /// bare literals give their minimum unsigned width, and locals
     /// resolve through the typed-`let` width table.
     ///
-    /// A zero-width declared type (`uint<0>`) reports `None`, not
-    /// `Some(0)`: it carries no usable source metadata, and the value
-    /// would flow into the extension shapes as a `64 - 0` shift-fill
-    /// (UB) rather than a width.
+    /// This is v1's `infer_expr_width_best_effort` less its bit-slice
+    /// arm (`src/codegen/cpp_tb.rs`) — the two have never been in full
+    /// parity, and a slice receiver reports `None` here.
+    ///
+    /// The result can be `Some(0)` for a `uint<0>` receiver. Callers
+    /// that store it as `WidthCast::src_width` must filter that out (it
+    /// would reach the sext shift-fill as `64 - 0`, UB); callers doing
+    /// direction or operand-width checks want the raw value.
     fn infer_expr_width(&self, e: &AstExpr) -> Option<u32> {
-        let width = match &*e.kind {
+        match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width(inner),
             ExprKind::Cast { ty, .. } => cast_relabel_width(ty),
             ExprKind::Call { callee, args } => {
-                let mut w = None;
                 if let ExprKind::Field { name, .. } = &*callee.kind {
                     if width_cast_kind(&name.name).is_some() {
-                        if let Some(CallArg::Expr(arg)) = args.first() {
-                            w = const_eval_width(arg);
+                        if let Some(CallArg::Expr(w)) = args.first() {
+                            return const_eval_width(w);
                         }
                     }
                 }
-                w
+                None
             }
             ExprKind::Int(s) => {
                 let v = parse_int_literal(s)?;
@@ -2258,8 +2268,7 @@ impl FuncBuilder<'_> {
                 self.let_widths.get(&local).copied()
             }
             _ => None,
-        };
-        width.filter(|w| *w > 0)
+        }
     }
 }
 
