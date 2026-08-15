@@ -8403,3 +8403,42 @@ end test T"#
         );
     }
 }
+
+/// The wrap-operand width rule (capped at 128, 0 rejected) must NOT leak
+/// into the direction checks or the `sext` emission shape, which need the
+/// raw declared width. Delegating all three to `cast_relabel_width` turned
+/// `(big as uint<200>).sext<300>()` into a zero-extension — a silent value
+/// change with no diagnostic — and dropped the wrong-direction rejection.
+#[test]
+fn casts_above_128_bits_keep_their_raw_width_for_sext_and_direction_checks() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let big : uint<200> = 1
+        let x = (big as uint<200>).sext<300>()
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("harc_wide_sext<10>") && cpp.contains(", 200, 300)"),
+        "a >128-bit cast source must still sign-fill from its declared width; got:\n{cpp}"
+    );
+
+    // Same width, wrong direction: the raw width is what makes this an error.
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let big : uint<200> = 1
+        let y = (big as uint<129>).zext<100>()
+        log(info, "${y}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("on a 129-bit value"),
+        "a >128-bit cast source must still drive the direction check; got: {err}"
+    );
+}
