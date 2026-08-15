@@ -37,8 +37,11 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     %26 normalized_zext : uint<256>
     %27 normalized_resize : uint<256>
     %28 normalized_sext : sint<130>
-    %29 maxwide : uint<1024>
-    %30 maxwide_low : uint<64>
+    %29 src130 : uint<130>
+    %30 w200 : uint<256>
+    %31 low8 : unknown
+    %32 maxwide : uint<1024>
+    %33 maxwide_low : uint<64>
   entry = b0
 
   b0:
@@ -86,6 +89,11 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%normalized_zext == 0), on_fail: "zext preserved source storage padding" }
     AssertCheck { cond: (%normalized_resize == 0), on_fail: "resize preserved source storage padding" }
     AssertCheck { cond: (%normalized_sext == 0), on_fail: "same-width sext preserved source storage padding" }
+    Assign(%src130, 1023)
+    Assign(%w200, %src130.zext<200 from 130>())
+    AssertCheck { cond: (%w200 == 1023), on_fail: "zext<200> into a uint<256> slot changed the value" }
+    Assign(%low8, %src130.trunc<8 from 130>())
+    AssertCheck { cond: (%low8 == 255), on_fail: "trunc<8> of a HarcWide source: got 0x%02llx", %low8 }
     Assign(%maxwide, %v64.zext<1024 from 64>())
     Assign(%maxwide_low, %maxwide.trunc<64 from 1024>())
     AssertCheck { cond: (%maxwide_low == 16045690984503111693), on_fail: "zext<1024>/trunc<64> round trip changed the value" }

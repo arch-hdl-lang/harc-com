@@ -9931,7 +9931,12 @@ impl Emitter {
             }
         }
         // Emit. Pattern follows arch-com's cast_to_bits / shift-fill
-        // for sext.
+        // for sext. Sub-64 narrowing (`trunc`, `resize` down) narrows to
+        // `uint64_t` *before* the mask: a `HarcWide<N>` receiver converts
+        // implicitly to both `uint64_t` and `_harc_u128`, so masking it
+        // directly is an ambiguous `operator&`. Narrowing first is
+        // value-identical for the `uint64_t` / `_harc_u128` receivers,
+        // since `width < 64` keeps the kept bits inside the low word.
         let c_unsigned = cpp_uint_for_width(Some(width));
         match kind {
             "trunc" => {
@@ -9950,7 +9955,7 @@ impl Emitter {
                     write!(self.out, "))").ok();
                 } else {
                     let mask = (1u64 << width) - 1;
-                    write!(self.out, "(({c_unsigned})(((").ok();
+                    write!(self.out, "(({c_unsigned})(((uint64_t)(").ok();
                     self.emit_expr(target);
                     write!(self.out, ") & 0x{mask:X}ULL)))").ok();
                 }
@@ -10058,7 +10063,7 @@ impl Emitter {
                             write!(self.out, "))").ok();
                         } else {
                             let mask = (1u64 << width) - 1;
-                            write!(self.out, "(({c_unsigned})(((").ok();
+                            write!(self.out, "(({c_unsigned})(((uint64_t)(").ok();
                             self.emit_expr(target);
                             write!(self.out, ") & 0x{mask:X}ULL)))").ok();
                         }
@@ -10094,7 +10099,7 @@ impl Emitter {
                         write!(self.out, "))").ok();
                     } else {
                         let mask = (1u64 << width) - 1;
-                        write!(self.out, "(({c_unsigned})(((").ok();
+                        write!(self.out, "(({c_unsigned})(((uint64_t)(").ok();
                         self.emit_expr(target);
                         write!(self.out, ") & 0x{mask:X}ULL)))").ok();
                     }
@@ -10118,6 +10123,14 @@ impl Emitter {
     ///     literal value (cheap heuristic: `64 - leading_zeros(v)` for
     ///     positive values; `None` for negatives).
     fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
+        // A zero-width declared type (`uint<0>`) carries no usable source
+        // metadata; reporting it as unknown keeps the sext shift-fill from
+        // emitting a `64 - 0` shift (UB). Matches the TB-IR lowering's
+        // `infer_expr_width`, so both backends pick the same cast shape.
+        self.infer_declared_width(e).filter(|w| *w > 0)
+    }
+
+    fn infer_declared_width(&self, e: &Expr) -> Option<u32> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
             ExprKind::Cast { ty, .. } => match ty {

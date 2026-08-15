@@ -8287,28 +8287,84 @@ end test T"#;
         )));
     }
 
-    for invalid in [0, 1025] {
-        let mut prog = lower_src(source).expect("lowers");
-        let ir::Stmt::Assign(
-            _,
-            ir::Expr::WidthCast {
-                src_width: Some(src_width),
-                ..
-            },
-        ) = &mut prog.functions[0].blocks[0].stmts[1]
-        else {
-            panic!("expected width-cast assignment with a known source width");
-        };
-        *src_width = invalid;
-        let errs = verify::verify_program(&prog).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            verify::VerifyError::BadWidthCast {
-                src_width: Some(src_width),
-                ..
-            } if *src_width == invalid
-        )));
-    }
+    // A zero-width source is malformed: lowering reports an unusable
+    // declared width as `None`, never `Some(0)`.
+    let mut prog = lower_src(source).expect("lowers");
+    let ir::Stmt::Assign(
+        _,
+        ir::Expr::WidthCast {
+            src_width: Some(src_width),
+            ..
+        },
+    ) = &mut prog.functions[0].blocks[0].stmts[1]
+    else {
+        panic!("expected width-cast assignment with a known source width");
+    };
+    *src_width = 0;
+    let errs = verify::verify_program(&prog).unwrap_err();
+    assert!(errs.iter().any(|e| matches!(
+        e,
+        verify::VerifyError::BadWidthCast {
+            src_width: Some(0),
+            ..
+        }
+    )));
+}
+
+/// `src_width` is best-effort *receiver* metadata, not a cast destination:
+/// declared widths are not bounded by `MAX_WIDTH_METHOD_BITS`, so a legal
+/// narrowing out of an oversized declared type must survive verification
+/// rather than trip `BadWidthCast` after a clean `harc check`.
+#[test]
+fn verifier_accepts_source_width_past_the_width_method_limit() {
+    let source = r#"test T
+    let dut : Top
+    run
+        let big : uint<2048> = 0
+        let narrow : uint<64> = big.trunc<64>()
+    end run
+end test T"#;
+
+    let prog = lower_src(source).expect("lowers");
+    let ir::Stmt::Assign(
+        _,
+        ir::Expr::WidthCast {
+            src_width: Some(2048),
+            width: 64,
+            ..
+        },
+    ) = &prog.functions[0].blocks[0].stmts[1]
+    else {
+        panic!("expected a 64-bit cast carrying the 2048-bit source width");
+    };
+    verify::verify_program(&prog).expect("oversized declared source width verifies");
+}
+
+/// A zero-width declared type carries no usable source metadata, so
+/// lowering records `None` — feeding `0` into the sext shift-fill would
+/// emit a `64 - 0` shift (UB) and, before that, fail verification on a
+/// program `harc check` accepts.
+#[test]
+fn zero_width_receiver_lowers_to_an_unknown_source_width() {
+    let source = r#"test T
+    let dut : Top
+    run
+        let z : uint<0> = 0
+        let w = z.sext<64>()
+    end run
+end test T"#;
+
+    let prog = lower_src(source).expect("lowers");
+    let ir::Stmt::Assign(
+        _,
+        ir::Expr::WidthCast {
+            src_width: None, ..
+        },
+    ) = &prog.functions[0].blocks[0].stmts[1]
+    else {
+        panic!("expected a width cast with no source width");
+    };
+    verify::verify_program(&prog).expect("zero-width receiver verifies");
 }
 
 #[test]

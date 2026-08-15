@@ -2229,19 +2229,25 @@ impl FuncBuilder<'_> {
     /// casts give W, nested width methods give their target width,
     /// bare literals give their minimum unsigned width, and locals
     /// resolve through the typed-`let` width table.
+    ///
+    /// A zero-width declared type (`uint<0>`) reports `None`, not
+    /// `Some(0)`: it carries no usable source metadata, and the value
+    /// would flow into the extension shapes as a `64 - 0` shift-fill
+    /// (UB) rather than a width.
     fn infer_expr_width(&self, e: &AstExpr) -> Option<u32> {
-        match &*e.kind {
+        let width = match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width(inner),
             ExprKind::Cast { ty, .. } => cast_relabel_width(ty),
             ExprKind::Call { callee, args } => {
+                let mut w = None;
                 if let ExprKind::Field { name, .. } = &*callee.kind {
                     if width_cast_kind(&name.name).is_some() {
-                        if let Some(CallArg::Expr(w)) = args.first() {
-                            return const_eval_width(w);
+                        if let Some(CallArg::Expr(arg)) = args.first() {
+                            w = const_eval_width(arg);
                         }
                     }
                 }
-                None
+                w
             }
             ExprKind::Int(s) => {
                 let v = parse_int_literal(s)?;
@@ -2252,7 +2258,8 @@ impl FuncBuilder<'_> {
                 self.let_widths.get(&local).copied()
             }
             _ => None,
-        }
+        };
+        width.filter(|w| *w > 0)
     }
 }
 
