@@ -2492,14 +2492,22 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                                     force: p.force,
                                 },
                             );
+                            // Mirrors TB-IR's `probe_scalar_width`: a
+                            // `Bit`/`Bool` probe is one bit wide, not
+                            // width-less. Omitting those made v1 reject a
+                            // `dut.<bit probe> +% 1` that TB-IR wraps.
                             if let TypeExpr::Builtin { name, args, .. } = &p.ty {
-                                if matches!(
-                                    name,
-                                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits
-                                ) {
-                                    if let Some(w) = type_arg_width(args) {
-                                        e.probe_widths.insert(p.name.name.clone(), w);
+                                let w = match name {
+                                    BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => {
+                                        Some(1)
                                     }
+                                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => {
+                                        type_arg_width(args)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(w) = w {
+                                    e.probe_widths.insert(p.name.name.clone(), w);
                                 }
                             }
                         }
@@ -10180,12 +10188,22 @@ impl Emitter {
     fn infer_expr_width_best_effort(&self, e: &Expr) -> Option<u32> {
         match &*e.kind {
             ExprKind::Paren(inner) => self.infer_expr_width_best_effort(inner),
+            // Mirrors TB-IR's `cast_relabel_width`: the capitalised ARCH
+            // spellings count, and a width-less scalar cast is 64 bits,
+            // not unknown. Without those, `(a as uint) +% 1` and
+            // `(a as UInt<8>) +% 1` were rejected by v1 and wrapped by
+            // TB-IR.
             ExprKind::Cast { ty, .. } => match ty {
                 TypeExpr::Builtin {
-                    name: BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits,
+                    name:
+                        BuiltinTy::UInt
+                        | BuiltinTy::UIntCap
+                        | BuiltinTy::SInt
+                        | BuiltinTy::SIntCap
+                        | BuiltinTy::Bits,
                     args,
                     ..
-                } => type_arg_width(args).map(|w| w as u32),
+                } => Some(type_arg_width(args).map(|w| w as u32).unwrap_or(64)),
                 _ => None,
             },
             ExprKind::BitSlice { hi, lo, .. } => {
@@ -10238,10 +10256,10 @@ impl Emitter {
         let Some(dw) = self.let_widths.get(name).copied() else {
             return;
         };
-        if dw == 0 || !narrowing_checkable(value) {
+        if dw == 0 {
             return;
         }
-        let Some(aw) = self.infer_expr_width_best_effort(value) else {
+        let Some(aw) = narrowing_source_width(self, value) else {
             return;
         };
         if aw > dw {
@@ -16733,8 +16751,8 @@ impl Emitter {
                     let aw = l
                         .value
                         .as_ref()
-                        .filter(|v| dw > 0 && narrowing_checkable(v))
-                        .and_then(|v| self.infer_expr_width_best_effort(v));
+                        .filter(|_| dw > 0)
+                        .and_then(|v| narrowing_source_width(self, v));
                     if let Some(aw) = aw {
                         if aw > dw {
                             self.errors.push(format!(
@@ -19339,11 +19357,44 @@ fn cpp_param_names(params: &[Param]) -> Vec<String> {
 /// divergence, the opposite of what this check is for. Whether an
 /// out-of-range literal should be an error is a language question for
 /// both backends and `harc check`, not something to settle in v1 alone.
-fn narrowing_checkable(value: &Expr) -> bool {
+/// Width of an initializer for the narrowing check, or `None` when the
+/// shape carries no width worth comparing.
+///
+/// A literal that fits in 64 bits is exempt, matching TB-IR, which types
+/// one as widthless (`UInt(None)`) and treats that as an assignment
+/// wildcard — counting its minimum *value* width would make v1 reject
+/// `let b : uint<8> = 300` alone. A literal that does NOT fit is a
+/// different case: TB-IR types it as `WideLiteral` and does check it, and
+/// v1 was silently storing the low 64 bits of an 80-bit value into a
+/// local the user declared 8 bits wide.
+fn narrowing_source_width(e: &Emitter, value: &Expr) -> Option<u32> {
     match &*value.kind {
-        ExprKind::Int(_) => false,
-        ExprKind::Paren(inner) => narrowing_checkable(inner),
-        _ => true,
+        ExprKind::Paren(inner) => narrowing_source_width(e, inner),
+        ExprKind::Int(s) => wide_literal_bit_width(s),
+        _ => e.infer_expr_width_best_effort(value),
+    }
+}
+
+/// `Some(bits)` when an integer literal's text denotes a value wider than
+/// 64 bits; `None` when it fits (or cannot be parsed as one).
+fn wide_literal_bit_width(s: &str) -> Option<u32> {
+    let t = s.replace('_', "");
+    let (digits, radix) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (r, 16)
+    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (r, 2)
+    } else {
+        (t.as_str(), 10)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    match u128::from_str_radix(digits, radix) {
+        Ok(v) if v > u64::MAX as u128 => Some(128 - v.leading_zeros()),
+        // Beyond 128 bits the exact width is not worth recovering; report
+        // the smallest value that is unambiguously "too wide to fit".
+        Err(_) => Some(129),
+        Ok(_) => None,
     }
 }
 
