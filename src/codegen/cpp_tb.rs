@@ -10195,9 +10195,38 @@ impl Emitter {
             // unknown. Hand-rolling this diverged at three of those four
             // edges; sharing the function makes the two backends agree by
             // construction.
-            // `cast_relabel_width` already returns `None` for a
-            // non-builtin target, so no pre-match is needed.
-            ExprKind::Cast { ty, .. } => crate::ir::lower::exprs::cast_relabel_width(ty),
+            // RAW width, deliberately not `cast_relabel_width`: that
+            // helper caps at 128 and rejects 0, which is right for a wrap
+            // operand (see `wrap_operand_width`) but wrong here. The
+            // direction checks and the `sext` emission shape need the
+            // declared width even above 128 — losing it turned
+            // `(big as uint<200>).sext<300>()` into a zero-extension,
+            // silently, and dropped the wrong-direction rejection.
+            //
+            // The arms below still mirror `cast_relabel_width`'s *shape*
+            // rules: the capitalised ARCH spellings count, an absent
+            // width argument is 64 bits, and a width argument that is not
+            // an integer literal is unknown rather than 64.
+            ExprKind::Cast { ty, .. } => match ty {
+                TypeExpr::Builtin {
+                    name:
+                        BuiltinTy::UInt
+                        | BuiltinTy::UIntCap
+                        | BuiltinTy::SInt
+                        | BuiltinTy::SIntCap
+                        | BuiltinTy::Bits,
+                    args,
+                    ..
+                } => match args.first() {
+                    None => Some(64),
+                    Some(TypeArg::Expr(e)) => match &*e.kind {
+                        ExprKind::Int(s) => s.replace('_', "").parse().ok(),
+                        _ => None,
+                    },
+                    Some(_) => None,
+                },
+                _ => None,
+            },
             ExprKind::BitSlice { hi, lo, .. } => {
                 let hi = eval_const_width(hi)?;
                 let lo = eval_const_width(lo)?;
@@ -10313,6 +10342,14 @@ impl Emitter {
                 let r = self.wrap_operand_width(rhs)?;
                 Some(l.max(r))
             }
+            // A cast operand uses TB-IR's own `cast_relabel_width`, which
+            // caps at 128 and rejects 0 — TB-IR's wrap inference routes
+            // through the same helper, so sharing it keeps the two
+            // backends' accepted operand sets aligned by construction.
+            // This is the one consumer that wants the capped rule; the
+            // direction checks and emission shapes read the raw declared
+            // width from `infer_expr_width_best_effort` instead.
+            ExprKind::Cast { ty, .. } => crate::ir::lower::cast_relabel_width(ty),
             // `dut.<probe>` carries the probe's declared width — the same
             // width TB-IR reads off `PortRef::width`. A plain top-level
             // port is width-erased and still reports `None` in both.
