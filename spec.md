@@ -286,6 +286,12 @@ backend-specific accept or reject rather than as a value difference.
   different signedness under the two backends (v1 declares the local
   `int64_t`, TB-IR `uint64_t`), which changes `>`, `/`, and `>>`. Annotate the
   destination (`let y : uint<64> = …`) to pin it.
+- The **capitalised `UInt<N>`/`SInt<N>` spellings on a typed `let`** are
+  width-erased under `--codegen v1`: it records widths only for the
+  lower-case forms, so `let a : UInt<8> = 255` then `a.sext<16>()` yields 255
+  under v1 and 65535 under the TB-IR backend. Prefer the lower-case spelling
+  on a `let` whose width the width methods or `+%` depend on. (The cast form,
+  `x as UInt<8>`, is recognised by both.)
 
 See harc#473.
 
