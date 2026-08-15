@@ -9943,6 +9943,17 @@ impl Emitter {
         // value-identical for the `uint64_t` / `_harc_u128` receivers,
         // since `width < 64` keeps the kept bits inside the low word.
         let c_unsigned = cpp_uint_for_width(Some(width));
+        // `sext` with nothing to extend (source already ≥ the destination,
+        // or unknown) is still a *signed* relabel: the result feeds signed
+        // comparison, division, and shifts. Casting it through `uint64_t`
+        // silently made `s.sext<64>() > 0` true for a negative `sint<64>`
+        // — TB-IR emits `((int64_t)(...))` here and the two backends
+        // returned opposite verdicts for the same source.
+        let c_sext_plain = if width <= 64 {
+            "int64_t".to_string()
+        } else {
+            c_unsigned.clone()
+        };
         match kind {
             "trunc" => {
                 if width > 128 {
@@ -10029,7 +10040,7 @@ impl Emitter {
                             self.emit_expr(target);
                             write!(self.out, ", {sw})").ok();
                         } else {
-                            write!(self.out, "(({c_unsigned})(").ok();
+                            write!(self.out, "(({c_sext_plain})(").ok();
                             self.emit_expr(target);
                             write!(self.out, "))").ok();
                         }
@@ -10041,7 +10052,7 @@ impl Emitter {
                         self.emit_expr(target);
                         write!(self.out, ")").ok();
                     } else {
-                        write!(self.out, "(({c_unsigned})(").ok();
+                        write!(self.out, "(({c_sext_plain})(").ok();
                         self.emit_expr(target);
                         write!(self.out, "))").ok();
                     }
@@ -10183,6 +10194,105 @@ impl Emitter {
 
     fn is_width_method_name(name: &str) -> bool {
         matches!(name, "trunc" | "zext" | "sext" | "resize")
+    }
+
+    /// Reject a narrowing scalar assignment into a declared-width local.
+    /// TB-IR's `check_scalar_assign_width` is the counterpart; v1 used to
+    /// emit `HarcWide<7> b = a;` for a 256-bit `a` (which does not
+    /// compile) and silently accept the ≤64-bit cases.
+    fn check_scalar_assign_width(&mut self, name: &str, value: &Expr) {
+        let Some(dw) = self.let_widths.get(name).copied() else {
+            return;
+        };
+        let Some(aw) = self.infer_expr_width_best_effort(value) else {
+            return;
+        };
+        if aw > dw {
+            self.errors.push(format!(
+                "assignment of a {aw}-bit value to `{name}`, declared {dw} bits, \
+                 narrows. Widths must not shrink implicitly — use `.trunc<{dw}>()` \
+                 to narrow explicitly, or widen the declaration to {aw} bits."
+            ));
+        }
+    }
+
+    /// Mask width for a wrapping operator: `max(W(lhs), W(rhs))`, the
+    /// wider operand's width with no widening (harc#473). Mirrors TB-IR's
+    /// `wrap_to_operand_width` / `infer_wrap_operand_width`, including its
+    /// two rejections, so both backends accept and reject the same
+    /// programs. `Err` carries the user-facing diagnostic.
+    fn wrap_result_width(&self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Result<u32, String> {
+        let sym = match op {
+            BinaryOp::SubWrap => "-%",
+            BinaryOp::MulWrap => "*%",
+            _ => "+%",
+        };
+        let wl = self.wrap_operand_width(lhs);
+        let wr = self.wrap_operand_width(rhs);
+        let (Some(wl), Some(wr)) = (wl, wr) else {
+            return Err(format!(
+                "wrapping operator `{sym}` needs both operands to have a statically \
+                 known bit-width so the wrap width `max(W(lhs), W(rhs))` is defined \
+                 (left is {}, right is {}). Give the operand(s) a scalar type \
+                 (`let x : uint<N>`), a cast (`x as uint<N>`), or a width method.",
+                if wl.is_some() { "known" } else { "unknown" },
+                if wr.is_some() { "known" } else { "unknown" },
+            ));
+        };
+        let width = wl.max(wr);
+        if width > 64 {
+            return Err(format!(
+                "wrapping operator `{sym}` at width {width} (> 64 bits) is not \
+                 supported: wrapping arithmetic is lowered for operand widths up \
+                 to 64 bits; wider datapaths need the `HarcWide<N>` model, which \
+                 is not wired through the wrapping mask yet"
+            ));
+        }
+        Ok(width)
+    }
+
+    /// Operand bit-width for a wrapping-op mask: the receiver-width
+    /// inference, plus composition through a nested wrap so a chain
+    /// (`(a +% b) *% c`) masks at each step's own operand width.
+    fn wrap_operand_width(&self, e: &Expr) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.wrap_operand_width(inner),
+            ExprKind::Binary {
+                op: BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap,
+                lhs,
+                rhs,
+            } => {
+                let l = self.wrap_operand_width(lhs)?;
+                let r = self.wrap_operand_width(rhs)?;
+                Some(l.max(r))
+            }
+            _ => self.infer_expr_width_best_effort(e),
+        }
+    }
+
+    /// `((uint64_t)(((uint64_t)((lhs OP rhs)) & 0xMASK)))` — the same
+    /// narrow-to-`width` shape the `.trunc<N>()` intrinsic emits, so the
+    /// two spellings of a wrap are byte-identical, and identical to what
+    /// TB-IR emits for the `WidthCast::Trunc` its lowering inserts.
+    fn emit_wrapping_binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, width: u32) {
+        let c_unsigned = cpp_uint_for_width(Some(width));
+        let s = c_binary_op(op);
+        if width == 64 {
+            write!(self.out, "(({c_unsigned})(").ok();
+        } else {
+            write!(self.out, "(({c_unsigned})(((uint64_t)(").ok();
+        }
+        write!(self.out, "(").ok();
+        self.emit_expr(lhs);
+        write!(self.out, " {s} ").ok();
+        self.emit_expr(rhs);
+        write!(self.out, ")").ok();
+        if width == 64 {
+            write!(self.out, "))").ok();
+        } else {
+            let mask = (1u64 << width) - 1;
+            write!(self.out, ") & 0x{mask:X}ULL)))").ok();
+        }
     }
 
     /// Is a plain bus signal present (not gated OFF) at this bind site?
@@ -15880,6 +15990,13 @@ impl Emitter {
                 self.emit_signal_assignment(target, value, depth);
             }
             StmtKind::Assign { target, value } => {
+                // Same narrowing rejection as the typed-`let` initializer:
+                // reassigning a wider value into a declared-width local is
+                // the identical defect (`b = a` for a 256-bit `a` into a
+                // 200-bit `b`), and TB-IR rejects both.
+                if let ExprKind::Ident(id) = &*target.kind {
+                    self.check_scalar_assign_width(&id.name, value);
+                }
                 self.pad(depth);
                 self.emit_signal_assignment(target, value, depth);
             }
@@ -16554,7 +16671,28 @@ impl Emitter {
         if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
             if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
                 if let Some(w) = type_arg_width(args) {
-                    self.let_widths.insert(l.name.name.clone(), w as u32);
+                    // Narrowing initializer: reject before emitting. v1
+                    // used to emit `HarcWide<7> b = a;` for a 256-bit `a`,
+                    // which does not compile, and silently accepted the
+                    // ≤64-bit cases TB-IR rejects. Same diagnostic and same
+                    // accepted set as TB-IR's `check_scalar_assign_width`.
+                    let dw = w as u32;
+                    let aw = l
+                        .value
+                        .as_ref()
+                        .and_then(|v| self.infer_expr_width_best_effort(v));
+                    if let Some(aw) = aw {
+                        if aw > dw {
+                            self.errors.push(format!(
+                                "assignment of a {aw}-bit value to `{}`, declared {dw} \
+                                 bits, narrows. Widths must not shrink implicitly — use \
+                                 `.trunc<{dw}>()` to narrow explicitly, or widen the \
+                                 declaration to {aw} bits.",
+                                l.name.name
+                            ));
+                        }
+                    }
+                    self.let_widths.insert(l.name.name.clone(), dw);
                 }
             }
         }
@@ -18390,6 +18528,26 @@ impl Emitter {
                 self.emit_expr(expr);
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                // Wrapping arithmetic (`+% / -% / *%`, harc#473) masks the
+                // result to `max(W(lhs), W(rhs))` bits. v1 used to treat
+                // these as pass-through sugar for `+ - *`, so an
+                // overflowing `uint<8>` add produced 300 where TB-IR
+                // produced 44 — the same source, two answers.
+                if matches!(
+                    op,
+                    BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+                ) {
+                    match self.wrap_result_width(*op, lhs, rhs) {
+                        Ok(width) => {
+                            self.emit_wrapping_binary(*op, lhs, rhs, width);
+                            return;
+                        }
+                        Err(msg) => {
+                            self.errors.push(msg);
+                            return;
+                        }
+                    }
+                }
                 // Wide-literal == / != routing: when either operand is
                 // a > 128-bit hex literal, route through
                 // `harc_rt::harc_eq_words(sig, {w0, w1, ...})` so the

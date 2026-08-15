@@ -937,7 +937,60 @@ impl FuncBuilder<'_> {
         {
             self.set_local_type(id, ty);
         }
+        self.check_scalar_assign_width(id, &e, &l.name.name)?;
         self.push(Stmt::Assign(id, e));
+        Ok(())
+    }
+
+    /// Reject a narrowing scalar assignment at lowering, where it can
+    /// carry a source-level fix.
+    ///
+    /// The verifier's invariant 15 already rejects `let b : uint<200> = a`
+    /// on a 256-bit `a` — but that channel reports compiler bugs, so the
+    /// user saw `internal error: TB-IR failed verification after
+    /// lowering` for a program `harc check` had just accepted. v1 had no
+    /// diagnostic at all and emitted `HarcWide<7> b = a;`, which does not
+    /// compile (narrowing between word counts is deliberately not a
+    /// conversion). Both now name the offending widths and the fix.
+    fn check_scalar_assign_width(
+        &self,
+        dest: crate::ir::LocalId,
+        e: &Expr,
+        name: &str,
+    ) -> Result<(), LowerError> {
+        // Only the expression shapes invariant 15's own `expr_type`
+        // resolves — exactly the set that would otherwise reach the
+        // internal-error channel, so this adds no rejection the verifier
+        // was not already making. A binary/ternary/call RHS is
+        // deliberately excluded: lowering's `expr_type` over-approximates
+        // one as its left operand's declared width, which would reject a
+        // provably narrowed value such as `(wide & 0xFF) >> 4`.
+        if !matches!(
+            e,
+            Expr::Literal { .. }
+                | Expr::WideLiteral(_)
+                | Expr::Local(_)
+                | Expr::BitSlice { .. }
+                | Expr::WidthCast { .. }
+        ) {
+            return Ok(());
+        }
+        let dw = match self.local_type(dest) {
+            IrType::UInt(Some(w)) | IrType::SInt(Some(w)) => *w,
+            _ => return Ok(()),
+        };
+        let aw = match self.expr_type(e) {
+            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) => w,
+            _ => return Ok(()),
+        };
+        if aw > dw {
+            return Err(LowerError::Invalid(format!(
+                "assignment of a {aw}-bit value to `{name}`, declared {dw} bits, \
+                 narrows. Widths must not shrink implicitly — use \
+                 `.trunc<{dw}>()` to narrow explicitly, or widen the \
+                 declaration to {aw} bits."
+            )));
+        }
         Ok(())
     }
 
@@ -1225,6 +1278,7 @@ impl FuncBuilder<'_> {
                         ));
                     }
                 }
+                self.check_scalar_assign_width(local, &e, &id.name)?;
                 self.push(Stmt::Assign(local, e));
                 return Ok(());
             }

@@ -130,6 +130,7 @@ packed_vec_lane_test | PackedVecLane | packed_vec_lane.sv | - | pass
 vec_lane_var_index_test | PackedVecLane | packed_vec_lane.sv | - | pass
 width_methods_test | Top | top_counter.sv | - | pass
 wide_cast_test | Top | top_counter.sv | - | pass
+wrapping_arithmetic_operator_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass
 record_let_copy_test | Top | top_counter.sv | - | pass
 record_vec_field_copy_test | Top | top_counter.sv | - | pass
