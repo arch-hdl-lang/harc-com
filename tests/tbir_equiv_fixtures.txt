@@ -154,7 +154,8 @@ tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - |
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 analysis_sink_connect_test | Top | top_counter.sv | - | pass
-testbench_owned_state_connect_test | Top | top_counter.sv | - | pass
+testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectTest
+testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectFreshTest
 keep_constraints_test | Top | top_counter.sv | top_counter.arch | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest
 agent_on_handler_test | Top | top_counter.sv | - | pass

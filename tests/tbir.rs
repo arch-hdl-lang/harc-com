@@ -2107,6 +2107,43 @@ end test T
     assert!(msg.contains("payload"), "unexpected diagnostic: {msg}");
 }
 
+/// An omitted hookable-parameter annotation leaves the front-end type as
+/// `Unknown`; it must remain compatible with an event payload because v0
+/// source permits unannotated parameters and the callback value is still
+/// supplied by the typed source event.
+#[test]
+fn analysis_connect_accepts_unannotated_hookable_payload() {
+    let src = r#"
+transactor Source
+    observed : out event<uint<8>>
+end transactor Source
+
+scoreboard Sink
+    hookable accept(v)
+    end accept
+end scoreboard Sink
+
+testbench ConnectTb
+    dut : Top
+    source : Source passive
+    sink : Sink
+
+    connect
+        source.observed -> sink.accept
+    end connect
+end testbench ConnectTb
+
+impl ConnectTest for ConnectTb
+    run
+        log(info, "test")
+    end run
+end impl ConnectTest
+"#;
+    let prog = lower_src(src).expect("unannotated sink payload lowers");
+    verify::verify_program(&prog).expect("unannotated sink payload verifies");
+    assert_eq!(prog.testbenches[0].connects.len(), 1);
+}
+
 /// A reusable testbench may own analysis wiring directly. The endpoint paths
 /// are rooted at its component fields, may descend through nested components,
 /// and preserve declaration-order fanout in emitted subscription setup.
@@ -2277,6 +2314,31 @@ end impl QueueOwnerTest
     assert!(cpp.contains("harc_rt::HarcQueue<PendingItem> records;"), "{cpp}");
     assert!(cpp.contains("_tb.pending.push"), "{cpp}");
     assert!(cpp.contains("_tb.pending.pop()"), "{cpp}");
+}
+
+/// A queue pop defines its destination for every successor block, just like
+/// scoreboard/component queue pops. This source puts the read after a branch
+/// so the verifier must propagate the definition through its dataflow `gens`.
+#[test]
+fn testbench_queue_pop_definition_reaches_successor_blocks() {
+    let src = r#"
+testbench QueueTb
+    dut : Top
+    pending : queue<uint<32>>
+end testbench QueueTb
+
+impl QueuePopBranchTest for QueueTb
+    run
+        pending.push(7)
+        let got = pending.pop()
+        if pending.empty()
+            assert got == 7
+        end if
+    end run
+end impl QueuePopBranchTest
+"#;
+    let prog = lower_src(src).expect("cross-block queue pop lowers");
+    verify::verify_program(&prog).expect("queue pop definition reaches successor blocks");
 }
 
 /// Agent subset: an `agent` composing an `event<T>` self-event, an
