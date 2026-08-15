@@ -2453,6 +2453,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.pending_tlm_forks.clear();
         e.next_tlm_fork_tag.clear();
         e.probes.clear();
+        e.probe_widths.clear();
         e.clock_names.clear();
         e.covers.clear();
         e.actor_threads.clear();
@@ -10305,7 +10306,19 @@ impl Emitter {
             // `dut.<probe>` carries the probe's declared width — the same
             // width TB-IR reads off `PortRef::width`. A plain top-level
             // port is width-erased and still reports `None` in both.
-            ExprKind::Field { name, .. } => self.probe_widths.get(&name.name).copied(),
+            //
+            // The base MUST be checked, not just the field name: this map
+            // is keyed by bare probe name, so an unguarded lookup masked a
+            // same-named record field (`t.count +% 10` on a `uint<32>`
+            // field, with a `probe count : uint<8>` in scope) at the
+            // probe's width — a silently wrong value. Mirrors the
+            // read-only-probe guard on the write path.
+            ExprKind::Field { target, name } => match &*target.kind {
+                ExprKind::Ident(id) if id.name == "dut" => {
+                    self.probe_widths.get(&name.name).copied()
+                }
+                _ => None,
+            },
             _ => self.infer_expr_width_best_effort(e),
         }
     }
