@@ -2373,6 +2373,41 @@ case and only locally-determinable `Assign` types are compared).
     be pinned to one outcome keeps `Unsupported`. Closing a gap is the
     cheap half; classifying one honestly is the expensive half.
 
+37. **Seventh probe sweep: a construct v1 emits but never runs
+    (2026-08-16).** Three transactor item shapes, each probed in the
+    outer, `when active`, and passive landings before anything was
+    claimed.
+
+    - **`on N cycles` on a transactor** already lowers in both
+      declaration positions. Not a gap; nothing to do.
+    - **`watchdog` on a transactor** looked like a clean gap — v1 emits
+      a complete `<T>_watchdog` lambda with pre/post hook vectors, the
+      `max_idle` check against `_last_in_cycle`/`_last_out_cycle`, the
+      FAIL line and the error bump. Grepping for a CALL SITE turns up
+      nothing, in all three landings. The control settles it: an AGENT
+      watchdog does get one (`Producer_watchdog(_tb.prod)` inside a
+      periodic closure), so this is specific to the transactor flavor.
+      v1 compiles the construct and the watchdog silently never fires.
+      `NotImplemented` / silently-mis-lowers, on the two UNBOUND sites.
+
+      The bound-to and initiator-side watchdog sites keep `Unsupported`:
+      reaching them needs a bus declaration from a sibling file, so no
+      v1 output was observed for those paths. Three unverified
+      reclassifications in three sweeps is enough — a `V1Status` with no
+      emission behind it does not go in.
+    - **`connect` on a transactor** is left UNCLASSIFIED. The first
+      probe used an empty block (nothing to wire, so it proved nothing);
+      the second tripped the separate `out event`-field gate before
+      reaching the connect path. Neither is evidence, and a guess here
+      would be the same mistake in a new place.
+
+    **The refinement this sweep adds to the probe method:** "v1 emits"
+    was never the question, and neither is "v1 emits code that
+    compiles". The question is whether the emitted code RUNS. A
+    definition with no call site compiles perfectly and does nothing,
+    which is indistinguishable from a working feature until you look for
+    the call.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

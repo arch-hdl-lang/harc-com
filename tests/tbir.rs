@@ -13476,3 +13476,85 @@ end impl T"#,
         "the old wording blamed the DUT handle: {msg}"
     );
 }
+
+/// A `watchdog` on a transactor is NOT a v1 escape hatch, and the reason
+/// only shows up if you check whether the emitted code ever RUNS. v1
+/// emits a complete `<T>_watchdog` lambda — pre/post hook vectors, the
+/// `max_idle` check against `_last_in_cycle`/`_last_out_cycle`, the FAIL
+/// line, the error bump — and then never calls it.
+///
+/// The control that makes this a v1 bug rather than a global design: an
+/// AGENT watchdog DOES get a call site (`Producer_watchdog(_tb.prod)`
+/// inside a periodic closure, in `watchdog_quiesce_test`). A transactor
+/// watchdog gets none, so it compiles and silently never fires.
+///
+/// Only the two UNBOUND-transactor sites carry the reclassification.
+/// The bound-to and initiator-side sites need a bus declaration from a
+/// sibling file to reach, so no v1 output was observed for them and they
+/// keep `Unsupported` — an unverified V1Status is the failure this
+/// method exists to prevent.
+#[test]
+fn a_transactor_watchdog_does_not_point_at_v1() {
+    let src = |wd_pos: &str| {
+        let (outer, inner) = match wd_pos {
+            "outer" => (WD_BLOCK, ""),
+            _ => ("", WD_BLOCK),
+        };
+        format!(
+            r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+{outer}
+    when active
+{inner}        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#
+        )
+    };
+    const WD_BLOCK: &str = "    watchdog\n        period 5 cycles\n        max_idle 100 cycles\n        log(info, \"wdog\")\n    end watchdog\n";
+
+    for pos in ["outer", "when"] {
+        let err = lower_src(&src(pos)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("transactor `Xt` watchdogs"), "{pos}: {msg}");
+        assert!(
+            msg.contains("never schedules it"),
+            "the diagnostic must say WHY v1 is not a way out: {msg}"
+        );
+    }
+}
+
+/// The control, pinned so the claim above stays true: an `agent`
+/// watchdog really is scheduled under tbir, so "watchdogs never run" is
+/// specific to the transactor flavor rather than a blanket statement.
+#[test]
+fn an_agent_watchdog_is_scheduled() {
+    let cpp = emit_fixture_cpp("watchdog_quiesce_test.harc");
+    // Defined once, and CALLED — the call site is what a transactor
+    // watchdog never gets. (tbir suffixes the name per instantiation,
+    // hence the prefix match.)
+    let defs = cpp.matches("auto Producer_watchdog").count();
+    let calls = cpp
+        .lines()
+        .filter(|l| l.contains("Producer_watchdog") && !l.contains("auto Producer_watchdog"))
+        .count();
+    assert_eq!(defs, 1, "one watchdog body:\n{cpp}");
+    assert!(
+        calls >= 1,
+        "the agent watchdog is called, not just defined:\n{cpp}"
+    );
+}
