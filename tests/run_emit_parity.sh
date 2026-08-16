@@ -29,8 +29,10 @@
 #   2. CONSTRAINT-TEXT PARITY. The §2.4 wrap mask and the whole solver
 #      lowering live in a randomize emitter both backends call, but they
 #      construct it differently (`build_randomize_emitter` has no per-test
-#      statement state). The ordered `_s.add/push/pop(...)` sequence must
-#      therefore be byte-identical between the two. The surrounding
+#      statement state). The ordered `_s.add/push/pop/check/set(...)`
+#      sequence must be byte-identical between the two — `check()` in
+#      particular, since it is the call that consumes the assertions and
+#      soft-constraint lowering interleaves it between adds. The surrounding
 #      scaffolding is legitimately different — roughly 200 lines per file
 #      — so comparing whole files would be pure noise.
 #
