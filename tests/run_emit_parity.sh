@@ -10,8 +10,10 @@
 # fixture exercised the shape and nothing compared acceptance.
 #
 # This script needs no Verilator, no Z3 and no simulation — just
-# `--emit-only` under both backends — so it runs in the fast check job and
-# covers every fixture, including ones the sim jobs cannot run.
+# `--emit-only` under both backends — so it runs in the fast check job,
+# in seconds, and does not need a fixture to be runnable to compare it.
+# It covers the shared fixture table (tests/fixtures.tbl), which is the
+# same set run_fixtures.sh drives — not every file in tests/fixtures/.
 #
 # Two properties, per fixture:
 #
@@ -25,11 +27,14 @@
 #   2. CONSTRAINT-TEXT PARITY. The §2.4 wrap mask and the whole solver
 #      lowering live in a randomize emitter both backends call, but they
 #      construct it differently (`build_randomize_emitter` has no per-test
-#      statement state). Every `_s.add(...)` line must therefore be
-#      byte-identical between the two. The surrounding scaffolding is
-#      legitimately different — roughly 200 lines per file — so comparing
-#      whole files would be pure noise; the assertion lines are the part
-#      that has to agree.
+#      statement state). The ordered `_s.add/push/pop(...)` sequence must
+#      therefore be byte-identical between the two. The surrounding
+#      scaffolding is legitimately different — roughly 200 lines per file
+#      — so comparing whole files would be pure noise.
+#
+#      Scope honestly: only ~15 of the ~148 rows emit any solver text at
+#      all. For the rest this half compares nothing and the run reports
+#      acceptance parity only. The summary line prints both counts.
 #
 # Run from harc-com repo root:
 #     ./tests/run_emit_parity.sh
