@@ -14850,6 +14850,45 @@ impl Emitter {
         writeln!(self.out, "}}").ok();
     }
 
+    /// Operand bit-width of a constraint expression, for the `+% -% *%`
+    /// mask. Mirrors `constraint_expr_is_signed`'s shape: a transaction
+    /// field carries its declared width, a literal is self-sized, parens
+    /// and nested wraps compose. `None` when no operand carries a width —
+    /// the same "wrap width undefined" condition both emitters reject at
+    /// the statement level.
+    fn constraint_expr_width(
+        &self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    ) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Ident(id) => field_info.get(&id.name).map(txn_field_solver_width),
+            ExprKind::Field { target, name } => matches!(&*target.kind, ExprKind::Ident(_))
+                .then(|| field_info.get(&name.name).map(txn_field_solver_width))
+                .flatten(),
+            ExprKind::Paren(inner) => self.constraint_expr_width(inner, field_info),
+            ExprKind::Cast { ty, .. } => crate::ir::lower::cast_relabel_width(ty),
+            ExprKind::Int(s) => {
+                let v: u64 = s.replace('_', "").parse().ok().or_else(|| {
+                    let t = s.replace('_', "");
+                    t.strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .and_then(|r| u64::from_str_radix(r, 16).ok())
+                })?;
+                Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
+            }
+            ExprKind::Binary {
+                op: BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap,
+                lhs,
+                rhs,
+            } => Some(
+                self.constraint_expr_width(lhs, field_info)?
+                    .max(self.constraint_expr_width(rhs, field_info)?),
+            ),
+            _ => None,
+        }
+    }
+
     fn constraint_expr_is_signed(
         &self,
         e: &Expr,
@@ -15600,6 +15639,46 @@ impl Emitter {
                 // logical / bitwise / shift use the natural overloads.
                 let signed = self.constraint_expr_is_signed(lhs, field_info)
                     || self.constraint_expr_is_signed(rhs, field_info);
+                // `+% -% *%` mask the result to `max(W(lhs), W(rhs))`
+                // (spec §2.4). The solver variable is a 64-bit bitvector
+                // with the field's width carried as a separate range
+                // assumption, so the wrap does NOT fall out of the
+                // bitvector semantics — it has to be applied explicitly.
+                // Without it `keep len +% 10 == 5` on a `uint<8>` field
+                // was solved as `len + 10 == 5 && len < 256`, reported
+                // unsatisfiable where `len = 251` is a solution.
+                let wrap_mask = match op {
+                    AddWrap | SubWrap | MulWrap => {
+                        match self.constraint_expr_width(e, field_info) {
+                            Some(w) if w < 64 => Some((1u64 << w) - 1),
+                            // A 64-bit wrap needs no mask — the solver
+                            // bitvector is already 64 bits wide.
+                            Some(_) => None,
+                            None => {
+                                self.errors.push(format!(
+                                    "wrapping operator `{}` in a constraint needs both \
+                                     operands to have a statically known bit-width so \
+                                     the §2.4 mask is defined; give the operand(s) a \
+                                     transaction field type or a cast",
+                                    match op {
+                                        SubWrap => "-%",
+                                        MulWrap => "*%",
+                                        _ => "+%",
+                                    }
+                                ));
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                if wrap_mask.is_some() {
+                    // TWO parens: the inner one groups the arithmetic, the
+                    // outer one guards the whole masked value. C++ binds
+                    // `&` looser than `==`, so `(a + b) & mask == 5` would
+                    // parse as `(a + b) & (mask == 5)`.
+                    write!(self.out, "((").ok();
+                }
                 let (sep, fname) = match op {
                     Add | AddWrap => (" + ", None),
                     Sub | SubWrap => (" - ", None),
@@ -15711,6 +15790,10 @@ impl Emitter {
                         blocking,
                         list_unroll_bounds,
                     );
+                }
+                if let Some(mask) = wrap_mask {
+                    // `bvand` with the low-W mask, at the solver's width.
+                    write!(self.out, ") & _ctx.bv_val((uint64_t)0x{mask:X}, {width}))").ok();
                 }
             }
             _ => {

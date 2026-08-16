@@ -93,6 +93,7 @@ vec_record_decl_only_test | Top          | top_counter.sv         |
 queue_state_hookable_test | Top          | top_counter.sv         |
 record_return_helper_test | Top          | top_counter.sv         |
 keep_constraints_test   | Top            | top_counter.sv         |
+wrapping_keep_constraint_test | Top      | top_counter.sv         |
 soft_constraint_randomize_test | Top      | top_counter.sv         |
 uint64_unique_randomize_test | Top        | top_counter.sv         |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
