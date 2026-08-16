@@ -5869,7 +5869,7 @@ struct Emitter {
     /// Runtime problem id per concrete `randomize(...)` target span.
     /// Emitted as metadata touches only during the scaffold phase; current
     /// behavior still uses the existing PRNG / inline Z3 solve paths.
-    runtime_randomize_problem_ids: std::collections::HashMap<(usize, usize), u32>,
+    runtime_randomize_problem_ids: std::collections::HashMap<(u32, u32), u32>,
     /// Free-standing `relation` declarations indexed by name (spec
     /// §4.2). `Call(Ident(R), args)` inside a constraint expression
     /// expands to R's body with formal parameters substituted by the
@@ -5958,7 +5958,7 @@ struct Emitter {
     /// In-flight substitutions for temporal SystemCall expressions during
     /// property emission. Keyed by AST span so the rewrite finds the right
     /// occurrence. Set/cleared around each `emit_property_check` call.
-    prop_subs: std::collections::HashMap<(usize, usize), String>,
+    prop_subs: std::collections::HashMap<(u32, u32), String>,
     /// Event name → C++ inner type (e.g. `uint64_t`). Populated when
     /// emitting `let e : event<T>`; consulted when emitting `emit e(arg)`
     /// and `on e(arg) ... end on` so the lambda gets the right param type.

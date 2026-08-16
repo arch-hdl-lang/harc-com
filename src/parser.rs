@@ -70,7 +70,7 @@ impl Parser {
     /// Used at sites where `(` could be a parameter list opener or the
     /// start of a body expression.
     fn newline_before_peek(&self, prev_end: usize) -> bool {
-        let next = self.peek_span().start;
+        let next = self.peek_span().start_usize();
         if next <= prev_end || next > self.source.len() {
             return false;
         }
@@ -1960,7 +1960,9 @@ impl Parser {
         // `property foo(args)\n  body` — params attach if `(` is on the same
         // line as the name. A newline before `(` means the `(` is the start
         // of the body expression (e.g. `(dut.x == 15) |=> dut.y`).
-        let params = if self.check(TokenKind::LParen) && !self.newline_before_peek(name.span.end) {
+        let params = if self.check(TokenKind::LParen)
+            && !self.newline_before_peek(name.span.end_usize())
+        {
             self.parse_paren_params()?
         } else {
             Vec::new()
@@ -1982,7 +1984,9 @@ impl Parser {
         let start = self.expect(TokenKind::Pseq)?.span;
         let name = self.expect_ident()?;
         // Same newline-disambiguation as parse_property — see comment there.
-        let params = if self.check(TokenKind::LParen) && !self.newline_before_peek(name.span.end) {
+        let params = if self.check(TokenKind::LParen)
+            && !self.newline_before_peek(name.span.end_usize())
+        {
             self.parse_paren_params()?
         } else {
             Vec::new()
@@ -2933,11 +2937,11 @@ impl Parser {
             Some(TokenKind::Gt) => Ok(self.advance().unwrap().span),
             Some(TokenKind::Shr) => {
                 let span = self.peek_span();
-                let half = Span::new(span.start, span.start + 1);
+                let half = Span::new(span.start_usize(), span.start_usize() + 1);
                 // Rewrite this token in place to be a single `>` whose span
                 // covers the second char; do NOT advance past it.
                 self.tokens[self.pos].kind = TokenKind::Gt;
-                self.tokens[self.pos].span = Span::new(span.start + 1, span.end);
+                self.tokens[self.pos].span = Span::new(span.start_usize() + 1, span.end_usize());
                 Ok(half)
             }
             Some(other) => Err(CompileError::unexpected_token(
@@ -3027,9 +3031,10 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::Let) => {
                 let l = self.parse_let_stmt()?;
+                let span = l.span;
                 Ok(Stmt {
-                    kind: StmtKind::Let(l.clone()),
-                    span: l.span,
+                    kind: StmtKind::Let(Box::new(l)),
+                    span,
                 })
             }
             Some(TokenKind::For) => {

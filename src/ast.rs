@@ -1342,7 +1342,13 @@ pub struct Stmt {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
-    Let(LetStmt),
+    /// Boxed: `LetStmt` is by far the fattest variant here (an `Ident`, an
+    /// `Option<TypeExpr>`, and two `Vec`s for probes/bind-remaps), and an
+    /// enum is as large as its largest variant. Inline, it forced every
+    /// `Stmt` — every assignment, every `wait`, every `assert` — to 240
+    /// bytes. Boxing keeps `let` at one extra indirection, which it can
+    /// afford: it is a small minority of statements in real suites.
+    Let(Box<LetStmt>),
     Assign {
         target: Expr,
         value: Expr,

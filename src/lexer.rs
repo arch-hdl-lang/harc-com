@@ -7,15 +7,37 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Byte range into a source file.
+///
+/// `u32` rather than `usize`: a `Span` is embedded in nearly every AST node —
+/// every `Ident`, every `Expr`, every `Stmt` — so its width multiplies across
+/// the whole tree. Halving it takes `Expr` from 24 bytes to 16 and `Ident`
+/// from 40 to 32. The cap is 4 GiB per source file, which is several orders
+/// of magnitude above anything the parser can handle in memory anyway;
+/// `Span::new` saturates rather than wrapping so an over-long file yields a
+/// clamped span instead of a nonsensical one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
 }
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Self {
+            start: start.min(u32::MAX as usize) as u32,
+            end: end.min(u32::MAX as usize) as u32,
+        }
+    }
+
+    /// Byte offset of the first character, as a slice index.
+    pub fn start_usize(self) -> usize {
+        self.start as usize
+    }
+
+    /// Byte offset one past the last character, as a slice index.
+    pub fn end_usize(self) -> usize {
+        self.end as usize
     }
 
     pub fn merge(self, other: Span) -> Span {

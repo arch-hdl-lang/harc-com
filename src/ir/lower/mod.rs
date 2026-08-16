@@ -1188,7 +1188,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
     // Randomize-target span → problem-id, keyed exactly like v1's
     // `runtime_randomize_problem_ids` (only Z3-ready sites populate).
-    let mut randomize_problem_ids: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut randomize_problem_ids: HashMap<(u32, u32), u32> = HashMap::new();
     for entry in &solver_table.entries {
         let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite { span, .. } =
             entry.source
@@ -2127,7 +2127,7 @@ fn lower_test(
     extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
-    randomize_problem_ids: &HashMap<(usize, usize), u32>,
+    randomize_problem_ids: &HashMap<(u32, u32), u32>,
     tseq_records: &HashMap<String, TseqElem>,
     constraint_sites: &RefCell<Vec<ConstraintSite>>,
     dut_poking_bfm_names: &HashSet<String>,
@@ -2770,7 +2770,7 @@ fn lower_test(
                 }
                 test_let_names.insert(l.name.name.clone());
                 test_let_stmts.push(AstStmt {
-                    kind: StmtKind::Let(l.clone()),
+                    kind: StmtKind::Let(Box::new(l.clone())),
                     span: l.span,
                 });
             }
@@ -4812,7 +4812,7 @@ pub(crate) struct LowerCtx {
     /// (`ConstraintProblemId.0`) the constraint-IR layer assigned to the
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
     /// `None` at a site means no Z3-ready problem (lower/backend error).
-    pub randomize_problem_ids: HashMap<(usize, usize), u32>,
+    pub randomize_problem_ids: HashMap<(u32, u32), u32>,
     /// `tseq` name → element type (`TseqElem::Record`/`TseqElem::Scalar`).
     /// A `let txns = Name(args)` whose callee is in this map lowers to a
     /// `CallTarget::Tseq` whose result types the local as the element's

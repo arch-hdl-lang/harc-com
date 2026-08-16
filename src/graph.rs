@@ -2078,7 +2078,7 @@ fn span_info(span: Span, src: &str) -> SpanInfo {
     let mut line = 1usize;
     let mut col = 1usize;
     for (idx, ch) in src.char_indices() {
-        if idx >= span.start {
+        if idx >= span.start_usize() {
             break;
         }
         if ch == '\n' {
@@ -2089,8 +2089,8 @@ fn span_info(span: Span, src: &str) -> SpanInfo {
         }
     }
     SpanInfo {
-        start: span.start,
-        end: span.end,
+        start: span.start_usize(),
+        end: span.end_usize(),
         line,
         col,
     }

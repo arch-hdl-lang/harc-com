@@ -58,7 +58,10 @@ pub enum CompileError {
 }
 
 pub fn span_to_source_span(span: Span) -> SourceSpan {
-    SourceSpan::new(span.start.into(), (span.end - span.start).into())
+    SourceSpan::new(
+        span.start_usize().into(),
+        (span.end_usize() - span.start_usize()).into(),
+    )
 }
 
 impl CompileError {
