@@ -286,15 +286,21 @@ backend-specific accept or reject rather than as a value difference.
   Spell the masked value explicitly if you need the legacy backend
   (harc#554).
 - Inside a **`keep` constraint** the wrap is masked to `max(W(lhs), W(rhs))`
-  like anywhere else, but the width has to be resolvable from the constraint
-  expression alone — a transaction field (including a nested `hdr.len`, a
-  list element, or a bit-slice) or a literal. An operand whose width the
-  constraint lowering cannot name (`(len + 1) +% 10`, `len +% (0 - 1)`) is
-  rejected rather than solved unmasked; casts are not accepted in constraint
-  position at all, so the width must come from a field. Unlike statement
-  position, a `> 64`-bit operand is accepted here — the solver bitvector is
-  `max(field widths).max(64)` wide, so the mask is expressible — which makes
-  the constraint path slightly more permissive than the statement path.
+  like anywhere else, but the width must be resolvable from the constraint
+  expression alone. These operands carry one: a transaction field (including
+  a nested `hdr.len`), a list element (`items[i]`, and so a `foreach` loop
+  variable), a bit-slice or bit-select, a `const`, an enum variant, a `let`
+  under `blocking randomize`, a sized literal (`8'hAB`), and a plain integer
+  literal in any base. These do not, and are rejected rather than solved
+  unmasked: `sum(...)` and `.len()`, which the solver represents as internal
+  variables with no declared source width; a compound non-wrap subexpression
+  (`(len + 1) +% 10`, `len +% (0 - 1)`); and a cast, which constraint
+  position rejects outright, so unlike statement position a cast cannot be
+  used to supply a width here. Also unlike statement position, a `> 64`-bit
+  operand *is* accepted — the solver bitvector is `max(field widths).max(64)`
+  wide, so the mask stays expressible. A wrap whose result would exceed that
+  bitvector (reachable only through an unbounded bit-slice such as
+  `a[70:0]`) is rejected.
 - The **capitalised `UInt<N>`/`SInt<N>` spellings on a typed `let`** are
   width-erased under `--codegen v1`: it records widths only for the
   lower-case forms, so `let a : UInt<8> = 255` then `a.sext<16>()` yields 255
