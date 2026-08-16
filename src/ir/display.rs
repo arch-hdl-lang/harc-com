@@ -528,6 +528,11 @@ fn type_str(t: &IrType) -> String {
         IrType::UInt(None) => "uint".to_string(),
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
+        IrType::Event(p) => match p {
+            EventPayload::Scalar { signed: true } => "event<sint>".to_string(),
+            EventPayload::Scalar { signed: false } => "event<uint>".to_string(),
+            EventPayload::Record(r) => format!("event<r{}>", r.0),
+        },
         IrType::Bool => "bool".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
@@ -655,6 +660,19 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::PropertyCheck(p) => format!("PropertyCheck(p{})", p.0),
         Stmt::CoverCheck(c) => format!("CoverCheck(c{})", c.0),
         Stmt::CycleHandler(h) => format!("CycleHandler(h{})", h.0),
+        Stmt::EventSubscribe { event, handler } => format!(
+            "EventSubscribe({} <- fn{})",
+            local_str(func, *event),
+            handler.0
+        ),
+        Stmt::EventEmit { event, args } => format!(
+            "EventEmit({}({}))",
+            local_str(func, *event),
+            args.iter()
+                .map(|a| expr_str(func, a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Stmt::TransactorCall { dest, call } => match dest {
             Some(d) => format!(
                 "TransactorCall({} = {})",

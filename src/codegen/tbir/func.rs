@@ -951,6 +951,27 @@ fn emit_cycle_handler(
     Ok(())
 }
 
+/// C++ payload type of an event-channel local — the parameter type of
+/// its `std::function`. Mirrors v1's `payload_type_for_arg`: a scalar
+/// widens to `uint64_t` / `int64_t`, a record payload is the record
+/// struct by value.
+fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<String, EmitError> {
+    match cx.func.locals.get(event.index()).map(|l| &l.ty) {
+        Some(IrType::Event(crate::ir::EventPayload::Scalar { signed })) => Ok(if *signed {
+            "int64_t".to_string()
+        } else {
+            "uint64_t".to_string()
+        }),
+        Some(IrType::Event(crate::ir::EventPayload::Record(r))) => {
+            Ok(prog.records[r.index()].name.clone())
+        }
+        _ => Err(EmitError(format!(
+            "tbir: {} uses local {} as an event channel but it is not event-typed",
+            cx.func.name, event.0
+        ))),
+    }
+}
+
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
@@ -1321,6 +1342,43 @@ fn emit_stmt(
                 ))
             })?;
             emit_cover_check(out, cx, schema, depth)?;
+        }
+        // v1's shape exactly: a subscriber is a closure pushed onto the
+        // channel vector, and `emit` calls each subscriber synchronously
+        // in subscription order. The subscriber BODY is a separate
+        // test-scope lambda (like a cycle handler's) so the pushed
+        // closure outlives the block that registered it.
+        Stmt::EventSubscribe { event, handler } => {
+            let chan = &names[event.index()];
+            let body = &prog
+                .functions
+                .get(handler.index())
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: {} subscribes to fn{} which does not resolve",
+                        func.name, handler.0
+                    ))
+                })?
+                .name;
+            let ty = event_payload_cty(prog, cx, *event)?;
+            writeln!(
+                out,
+                "{pad}{chan}.push_back([&]({ty} _p) {{ {body}(_p); }});"
+            )
+            .ok();
+        }
+        Stmt::EventEmit { event, args } => {
+            let chan = &names[event.index()];
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(cx, a)?);
+            }
+            writeln!(
+                out,
+                "{pad}for (auto& _s : {chan}) _s({});",
+                rendered.join(", ")
+            )
+            .ok();
         }
         Stmt::CycleHandler(h) => {
             let schema = prog.cycle_handlers.get(h.index()).ok_or_else(|| {
@@ -2021,6 +2079,29 @@ fn declare_locals(
             IrType::Seq(ref scalar) => {
                 let cty = super::local_scalar_cty(scalar);
                 writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
+            }
+            // A test-scope event channel — v1's subscriber vector.
+            IrType::Event(payload) => {
+                let cty = match payload {
+                    crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
+                    crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+                    crate::ir::EventPayload::Record(r) => prog
+                        .records
+                        .get(r.index())
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: event local `{n}` in {} references missing record r{}",
+                                func.name, r.0
+                            ))
+                        })?
+                        .name
+                        .clone(),
+                };
+                writeln!(
+                    out,
+                    "{pad}std::vector<std::function<void({cty})>> {n}; (void){n};"
+                )
+                .ok();
             }
             // Scalar local. Wide (>64-bit) `uint`/`sint` locals — e.g. a
             // wide method param hoisted as the first N locals — take v1's

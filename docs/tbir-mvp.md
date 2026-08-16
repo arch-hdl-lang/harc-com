@@ -1928,6 +1928,36 @@ case and only locally-determinable `Assign` types are compared).
     "hello";` — a compile error) and a **float literal** (v1 emits
     `int64_t f = 1.5;`, which compiles and silently truncates to 1).
 
+29. **Test-scope event channels (spec §3.4, 2026-08-16).**
+    `let e : event<T>` inside a run or check body now lowers to an
+    `IrType::Event` local — v1's subscriber-vector shape, a
+    `std::vector<std::function<void(payload)>>` in the enclosing
+    coroutine. `on e(v) ... end on` is a `Stmt::EventSubscribe` (push a
+    closure), `emit e(x)` is a `Stmt::EventEmit` (synchronous fan-out in
+    subscription order, `for (auto& _s : e) _s(x);`). Payload resolution
+    reuses the component-field rules: a scalar ≤ 64 bits widens to
+    `uint64_t`/`int64_t`, a `transaction`/`struct` payload is carried by
+    value as the record struct.
+
+    Same structural difference as the cycle handlers: the subscriber body
+    is its own ONE-parameter `FunctionKind::TestHook` function declared at
+    test scope, because a lambda declared inside the run coroutine's
+    `switch` case would die with the case block while the pushed closure
+    still referenced it. v1 inlines the body into the pushed closure.
+
+    This is distinct from a component's `in`/`out event<T>` FIELD, which
+    lives on the component struct and is reached through `ComponentEmit`
+    and the `connect` graph — that path already lowered.
+
+    Malformed use is a program error under every backend, so it surfaces
+    as `Invalid`: an initializer on the channel, an `emit` arity other
+    than one, a non-name payload binding.
+
+    `tests/concurrent_check_cpp.rs` builds the emitted declaration,
+    subscriptions, and fan-out and checks that two emits each reach both
+    of two subscribers — a fan-out that stopped at the first subscriber
+    would still string-match.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

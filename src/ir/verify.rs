@@ -939,6 +939,66 @@ impl Checker<'_> {
                 // own right); here only the link is checked — the id
                 // resolves and points at a zero-parameter `TestHook`,
                 // which is what the registration closure can call.
+                // The channel local must resolve and be event-typed, and
+                // a subscriber body must be a one-parameter `TestHook`
+                // whose parameter matches the channel's payload — emission
+                // pushes it into a `std::function<void(payload)>` vector.
+                Stmt::EventSubscribe { event, handler } => {
+                    self.check_local(*event);
+                    let payload = self.event_payload(*event);
+                    if payload.is_none() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "EventSubscribe target {} is not an event channel",
+                                event.0
+                            ),
+                        });
+                    }
+                    match self.prog.functions.get(handler.index()) {
+                        Some(f) if f.kind == FunctionKind::TestHook && f.params.len() == 1 => {}
+                        Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "event subscriber fn{} is {:?} with {} param(s), not a \
+                                 one-parameter TestHook",
+                                f.id.0,
+                                f.kind,
+                                f.params.len()
+                            ),
+                        }),
+                        None => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("event subscriber references missing fn{}", handler.0),
+                        }),
+                    }
+                }
+                Stmt::EventEmit { event, args } => {
+                    self.check_local(*event);
+                    if self.event_payload(*event).is_none() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("EventEmit target {} is not an event channel", event.0),
+                        });
+                    }
+                    if args.len() != 1 {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "EventEmit carries {} argument(s); an event payload is exactly one",
+                                args.len()
+                            ),
+                        });
+                    }
+                    for a in args {
+                        self.check_expr(a, false, "EventEmit arg");
+                    }
+                }
                 Stmt::CycleHandler(h) => {
                     match self.prog.cycle_handlers.get(h.index()) {
                         None => self.errs.push(VerifyError::BadConcurrentCheck {
@@ -1354,6 +1414,15 @@ impl Checker<'_> {
                 "transactor `{}` has no method `{method}`",
                 schema.name
             )));
+        }
+    }
+
+    /// The payload of an event-channel local, or `None` when the local
+    /// does not resolve or is not event-typed.
+    fn event_payload(&self, l: LocalId) -> Option<crate::ir::EventPayload> {
+        match self.func.locals.get(l.index()).map(|t| &t.ty) {
+            Some(IrType::Event(p)) => Some(*p),
+            _ => None,
         }
     }
 
@@ -2005,6 +2074,17 @@ fn check_def_before_use(
                 // Concurrent-check bodies reference DUT ports and host
                 // state, never function locals — nothing to def-check.
                 Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {}
+                // The channel local is DEFINED by its declaration (the
+                // emitter declares the subscriber vector at the hoisted
+                // local site), so subscribing/emitting only reads it —
+                // and reading it is not an expression, so there is
+                // nothing for `check_e` to walk. The payload args are.
+                Stmt::EventSubscribe { .. } => {}
+                Stmt::EventEmit { args, .. } => {
+                    for a in args {
+                        check_e(a, &defined, errs);
+                    }
+                }
                 Stmt::ProbeRelease(_) => {}
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {

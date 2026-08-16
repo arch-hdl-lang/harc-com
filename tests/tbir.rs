@@ -11139,3 +11139,135 @@ end impl T"#,
     .unwrap_err();
     assert_unsupported(&err);
 }
+
+// ── Test-scope event channels (spec §3.4) ────────────────────────────
+//
+// `let e : event<T>` declares a subscriber list local to the enclosing
+// function; `on e(v) ... end on` pushes a subscriber and `emit e(x)` fans
+// out synchronously in subscription order. Same shape v1 emits — a
+// `std::vector<std::function<void(payload)>>` plus a `for` loop — with
+// the subscriber body factored into its own function.
+
+#[test]
+fn test_scope_event_channels_lower() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        on e(v)
+            log(info, "got ${v}")
+        end on
+        emit e(3)
+        wait 1 cycle
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("a test-scope event channel lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(dump.contains("EventSubscribe"), "{dump}");
+    assert!(dump.contains("EventEmit"), "{dump}");
+
+    // The subscriber body is a ONE-parameter TestHook — the payload is
+    // its parameter, so the pushed closure can forward it.
+    let handler = prog
+        .functions
+        .iter()
+        .find(|f| f.kind == ir::FunctionKind::TestHook)
+        .expect("a subscriber body function");
+    assert_eq!(handler.params.len(), 1);
+
+    let cpp = emit_cpp_src(src);
+    for needle in [
+        "std::vector<std::function<void(uint64_t)>> e;",
+        "e.push_back([&](uint64_t _p) { _on_event_0(_p); });",
+        "for (auto& _s : e) _s(3);",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+}
+
+/// A record payload carries the record struct by value, matching v1's
+/// `std::function<void(Txn)>`.
+#[test]
+fn a_record_payload_event_channel_lowers() {
+    let cpp = emit_cpp_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let e : event<Txn>
+        let t : Txn
+        on e(x)
+            log(info, "a=${x.a}")
+        end on
+        emit e(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("std::vector<std::function<void(Txn)>> e;"),
+        "a record payload is carried by value; got:\n{cpp}"
+    );
+    assert!(cpp.contains("e.push_back([&](Txn _p)"), "{cpp}");
+}
+
+/// The channel is a value, not a variable: an initializer, a wrong arity,
+/// or a non-name payload binding are program errors, not subset gaps.
+#[test]
+fn malformed_event_channel_use_is_a_program_error() {
+    for (src, want) in [
+        (
+            r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        emit e(1, 2)
+        wait 1 cycle
+    end run
+end test T"#,
+            "exactly one",
+        ),
+        (
+            r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        on e(1)
+            log(info, "x")
+        end on
+        wait 1 cycle
+    end run
+end test T"#,
+            "payload binding must be a name",
+        ),
+    ] {
+        let err = lower_src(src).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// A bare `emit` with no channel and no enclosing component now names
+/// both places a channel could come from.
+#[test]
+fn emit_with_no_channel_names_both_sources() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        emit nope(1)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("test-scope event channel"),
+        "the message must mention the test-scope form too: {msg}"
+    );
+}

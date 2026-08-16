@@ -42,6 +42,30 @@ impl ChkTest for ChkTb
 end impl ChkTest
 "#;
 
+/// A test-scope event channel: two subscribers on one channel, then two
+/// emits. Pins the fan-out order and that every subscriber sees every
+/// emit — a `push_back` that captured the wrong thing, or a fan-out that
+/// stopped at the first subscriber, would still string-match.
+const EVENT_TB: &str = r#"testbench EvTb
+    dut : Top
+end testbench EvTb
+
+impl EvTest for EvTb
+    run
+        let e : event<uint<8>>
+        on e(v)
+            log(info, "a")
+        end on
+        on e(w)
+            log(info, "b")
+        end on
+        emit e(1)
+        emit e(2)
+        wait 1 cycle
+    end run
+end impl EvTest
+"#;
+
 /// Statement-position `on` handlers: a rising-edge trigger and a
 /// periodic one. Both arm a `_checkers` closure at the statement
 /// position, like v1's `emit_cycle_trigger`.
@@ -407,6 +431,91 @@ int main() {{
     assert_eq!(
         got, "2 2",
         "expected 2 rising-edge firings and 2 periodic firings; got `{got}`"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build the emitted event-channel declaration, subscriptions, and
+/// fan-out against stub subscriber bodies, then check that each of two
+/// emits reached both subscribers in subscription order.
+#[test]
+fn emitted_event_channel_fans_out_to_every_subscriber() {
+    let Some(cxx) = cxx() else {
+        assert!(
+            std::env::var_os("HARC_SKIP_CXX_PROBE").is_some(),
+            "no C++ compiler on PATH (tried $CXX, g++, clang++)."
+        );
+        eprintln!("SKIP emitted_event_channel_fans_out_to_every_subscriber.");
+        return;
+    };
+
+    let dir = fresh_outdir("evprobe");
+    let cpp = emit_src(&dir, "ev_tb", EVENT_TB);
+    // Pull the channel declaration plus every statement that touches it,
+    // in emitted order, so the probe runs the real sequence.
+    let decl = cpp
+        .lines()
+        .find(|l| l.contains("std::vector<std::function<void(uint64_t)>> e;"))
+        .unwrap_or_else(|| panic!("missing the channel declaration in:\n{cpp}"))
+        .trim()
+        .to_string();
+    let ops: Vec<String> = cpp
+        .lines()
+        .filter(|l| l.contains("e.push_back(") || l.contains("for (auto& _s : e)"))
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert_eq!(
+        ops.len(),
+        4,
+        "two subscriptions and two emits, in order; got {ops:?}"
+    );
+
+    let probe = dir.join("probe.cpp");
+    let ops_src = ops.join("\n    ");
+    std::fs::write(
+        &probe,
+        format!(
+            r#"#include <cstdint>
+#include <cstdio>
+#include <functional>
+#include <vector>
+
+// Stand-ins for the test-scope subscriber lambdas the emitter declares.
+static long long seen_a = 0, seen_b = 0;
+static void _on_event_0(uint64_t v) {{ seen_a += (long long)v; }}
+static void _on_event_1(uint64_t v) {{ seen_b += (long long)v * 10; }}
+
+int main() {{
+    {decl}
+    {ops_src}
+    printf("%lld %lld\n", seen_a, seen_b);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write probe");
+
+    let bin = dir.join("probe");
+    let compile = Command::new(&cxx)
+        .arg("-std=c++20")
+        .arg(&probe)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("run the C++ compiler");
+    assert!(
+        compile.status.success(),
+        "the emitted event-channel statements did not compile:\n{}\n--- probe ---\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        std::fs::read_to_string(&probe).unwrap_or_default(),
+    );
+    let run = Command::new(&bin).output().expect("run the probe");
+    assert!(run.status.success(), "probe crashed");
+    let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert_eq!(
+        got, "3 30",
+        "both subscribers must see both emits (1+2 and 10*(1+2)); got `{got}`"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

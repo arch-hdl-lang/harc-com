@@ -187,6 +187,19 @@ impl SideTables {
         for h in &mut self.cycle_handlers {
             h.function = FunctionId(base + h.function.0);
         }
+        // `Stmt::EventSubscribe` carries its handler's placeholder id
+        // inline in a function body rather than in a schema, so the
+        // rewrite is a walk over every body — including the ones just
+        // pushed, since an `on` handler may itself subscribe.
+        for f in &mut prog.functions {
+            for b in &mut f.blocks {
+                for s in &mut b.stmts {
+                    if let ir::Stmt::EventSubscribe { handler, .. } = s {
+                        *handler = FunctionId(base + handler.0);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5871,6 +5884,10 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 | ir::Stmt::PropertyCheck(_)
                 | ir::Stmt::CoverCheck(_)
                 | ir::Stmt::CycleHandler(_)
+                // A test-scope event channel is a run-function local, not
+                // per-instance transactor state.
+                | ir::Stmt::EventSubscribe { .. }
+                | ir::Stmt::EventEmit { .. }
                 | ir::Stmt::ProbeRelease(_) => None,
             };
             if found.is_some() {
@@ -6062,6 +6079,8 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 | ir::Stmt::PropertyCheck(_)
                 | ir::Stmt::CoverCheck(_)
                 | ir::Stmt::CycleHandler(_)
+                | ir::Stmt::EventSubscribe { .. }
+                | ir::Stmt::EventEmit { .. }
                 | ir::Stmt::ProbeRelease(_) => {}
             }
         }
@@ -6333,7 +6352,9 @@ fn fill_initiator_bus_prefix(
                     // the binding is already concrete.
                     | Stmt::PropertyCheck(_)
                     | Stmt::CoverCheck(_)
-                    | Stmt::CycleHandler(_) => {}
+                    | Stmt::CycleHandler(_)
+                    | Stmt::EventSubscribe { .. }
+                    | Stmt::EventEmit { .. } => {}
                 }
             }
             match &mut block.terminator {

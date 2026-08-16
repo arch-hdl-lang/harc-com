@@ -1966,7 +1966,7 @@ pub(crate) fn lower_queue_elem(
 /// scalar nor a known record (enum / Vec / nested / unknown) is rejected
 /// precisely — those genuinely unsupported payload shapes gate on later
 /// slices.
-fn lower_event_payload(
+pub(crate) fn lower_event_payload(
     comp: &str,
     fname: &str,
     arg: Option<&TypeArg>,
@@ -2804,11 +2804,44 @@ impl super::FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // Test-scope event channel: `emit e(x)` on a `let e : event<T>`
+        // local. v1 emits the same synchronous fan-out
+        // (`for (auto& _s : e) _s(x);`).
+        if segs.len() == 1 {
+            if let Some(local) = self.lookup(&segs[0]) {
+                if let IrType::Event(payload) = *self.local_type(local) {
+                    if args.len() != 1 {
+                        return Err(LowerError::Invalid(format!(
+                            "`emit {}` carries {} argument(s); an event payload is exactly one",
+                            segs[0],
+                            args.len()
+                        )));
+                    }
+                    let lowered = self.lower_component_call_args(args)?;
+                    if !event_payload_matches_ir_type(
+                        payload,
+                        &self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown),
+                    ) && matches!(payload, EventPayload::Record(_))
+                    {
+                        return Err(LowerError::Invalid(format!(
+                            "`emit {}` payload does not match the channel's record type",
+                            segs[0]
+                        )));
+                    }
+                    self.push(IrStmt::EventEmit {
+                        event: local,
+                        args: lowered,
+                    });
+                    return Ok(());
+                }
+            }
+        }
         // Self-relative form, inside a method/on-handler body.
         let cid = self.self_component.ok_or_else(|| {
             unsupported(
-                "`emit` outside a component method body",
-                "only a component event field supports `emit` in this subset",
+                "`emit` outside a component method body or a test-scope event channel",
+                "`emit <e>(x)` needs either a component `event` field or a test-scope \
+                 `let <e> : event<T>` in scope",
             )
         })?;
         if name.segments.len() != 1 {

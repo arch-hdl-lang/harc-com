@@ -546,6 +546,31 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    /// `Some(payload)` when this `let` declares a test-scope event
+    /// channel (`let e : event<T>`), resolving `T` through the same
+    /// payload rules a component's `event<T>` FIELD uses. `None` for
+    /// every other `let`.
+    fn event_let_payload(
+        &self,
+        l: &crate::ast::LetStmt,
+    ) -> Result<Option<crate::ir::EventPayload>, LowerError> {
+        let Some(TypeExpr::Builtin {
+            name: BuiltinTy::Event,
+            args,
+            ..
+        }) = l.ty.as_ref()
+        else {
+            return Ok(None);
+        };
+        let payload = super::components::lower_event_payload(
+            "<test scope>",
+            &l.name.name,
+            args.first(),
+            &self.ctx.record_ids,
+        )?;
+        Ok(Some(payload))
+    }
+
     fn lower_let(&mut self, l: &crate::ast::LetStmt) -> Result<(), LowerError> {
         if !l.probes.is_empty() {
             return Err(unsupported("probe declarations", ""));
@@ -823,6 +848,23 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::RecordInit(id, rid));
                 return Ok(());
             }
+        }
+        // A test-scope event channel (`let e : event<uint<8>>`, spec
+        // §3.4). v1 declares it as a subscriber vector local in the run
+        // coroutine; `on e(v)` pushes, `emit e(x)` fans out. It has no
+        // initializer by construction, so it is decided before the
+        // uninitialized-scalar arm below.
+        if let Some(payload) = self.event_let_payload(l)? {
+            if l.value.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {} : event<...>` takes no initializer — an event channel starts \
+                     empty and gains subscribers through `on {}(...)`",
+                    l.name.name, l.name.name
+                )));
+            }
+            let id = self.declare(&l.name.name);
+            self.set_local_type(id, IrType::Event(payload));
+            return Ok(());
         }
         let Some(value) = &l.value else {
             // Uninitialized scalar `let x: uint<N>;` — the declare-then-
@@ -2337,6 +2379,99 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// `on <channel>(<param>) ... end on` — subscribe to a test-scope
+    /// event channel. The body becomes a ONE-parameter
+    /// `FunctionKind::TestHook` function whose parameter is the payload;
+    /// the registration statement pushes a closure calling it onto the
+    /// channel vector, exactly as v1 pushes its inline closure.
+    fn lower_event_subscription(
+        &mut self,
+        h: &crate::ast::OnHandler,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<(), LowerError> {
+        let ExprKind::Ident(id) = &*callee.kind else {
+            return Err(unsupported(
+                "an `on <path>.<event>(arg)` subscription in statement position",
+                "subscribe from the component that owns the `event` field",
+            ));
+        };
+        let Some(channel) = self.lookup(&id.name) else {
+            return Err(unsupported(
+                &format!(
+                    "an `on {}(...)` subscription in statement position",
+                    id.name
+                ),
+                "only a test-scope `let <e> : event<T>` channel can be subscribed to here; \
+                 a component's `event` field subscribes from the component",
+            ));
+        };
+        let IrType::Event(payload) = *self.local_type(channel) else {
+            return Err(LowerError::Invalid(format!(
+                "`on {}(...)`: `{}` is not an event channel",
+                id.name, id.name
+            )));
+        };
+        // Exactly one parameter, and it must be a plain binding name —
+        // the payload the emitter passes in.
+        let param = match args {
+            [CallArg::Expr(e)] => match &*e.kind {
+                ExprKind::Ident(p) => p.name.clone(),
+                _ => {
+                    return Err(LowerError::Invalid(format!(
+                        "`on {}(...)`: the payload binding must be a name",
+                        id.name
+                    )))
+                }
+            },
+            _ => {
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)` takes exactly one payload binding, got {}",
+                    id.name,
+                    args.len()
+                )))
+            }
+        };
+
+        let pending_id = {
+            let tables = self.side_tables.borrow();
+            crate::ir::FunctionId(tables.pending_functions.len() as u32)
+        };
+        let param_ty = match payload {
+            crate::ir::EventPayload::Scalar { signed: true } => IrType::SInt(None),
+            crate::ir::EventPayload::Scalar { signed: false } => IrType::UInt(None),
+            crate::ir::EventPayload::Record(r) => IrType::Record(r),
+        };
+        let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
+        super::reserve_tb_record_names(&mut b, self.ctx);
+        // The payload binding is local 0, which is the verifier's
+        // parameter convention (`locals[..params.len()]` mirror the
+        // params one-to-one and are defined at entry).
+        let p = b.declare(&param);
+        b.set_local_type(p, param_ty.clone());
+        b.lower_block_stmts(&h.body)?;
+        if !b.is_terminated() {
+            b.terminate(Terminator::Return);
+        }
+        let mut f = b.finish(
+            pending_id,
+            format!("_on_event_{}", pending_id.0),
+            crate::ir::FunctionKind::TestHook,
+            self.ctx.owner,
+        )?;
+        f.params = vec![crate::ir::TypedParam {
+            name: param,
+            ty: param_ty,
+        }];
+
+        self.side_tables.borrow_mut().pending_functions.push(f);
+        self.push(Stmt::EventSubscribe {
+            event: channel,
+            handler: pending_id,
+        });
+        Ok(())
+    }
+
     /// A statement-position `on ... end on` handler inside a run or check
     /// body (spec §7.10 and the cycle-trigger form).
     ///
@@ -2361,15 +2496,13 @@ impl FuncBuilder<'_> {
                  site runs, not at a point inside the run body",
             ));
         }
-        // An event subscription names an `event`-typed field; those live on
-        // components, and a test-scope `on <ev>(arg)` has no owning
-        // instance to subscribe against in this subset.
+        // `on e(v) ... end on` — an event subscription. A test-scope
+        // channel (`let e : event<T>`) subscribes here; a component's
+        // `event` FIELD is reached through the component path instead,
+        // which a statement position cannot name.
         if !h.periodic {
-            if let ExprKind::Call { .. } = &*h.event.kind {
-                return Err(unsupported(
-                    "an `on <event>(arg)` subscription in statement position",
-                    "subscribe from the component that owns the `event` field",
-                ));
+            if let ExprKind::Call { callee, args } = &*h.event.kind {
+                return self.lower_event_subscription(h, callee, args);
             }
         }
 

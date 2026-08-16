@@ -1533,6 +1533,15 @@ pub enum IrType {
     /// Only ever a parameter local in this subset — never a `let` body
     /// local — so it has no value-construction or randomize support.
     Component(ComponentId),
+    /// A TEST-SCOPE event channel local (`let e : event<uint<8>>`,
+    /// spec §3.4). Emitted as v1 emits it: a
+    /// `std::vector<std::function<void(<payload>)>>` local in the
+    /// enclosing coroutine. `on e(v) ... end on` pushes a subscriber
+    /// (`Stmt::EventSubscribe`), `emit e(x)` fans out synchronously
+    /// (`Stmt::EventEmit`). Distinct from a component's `in`/`out
+    /// event<T>` FIELD, which lives on the component struct and is
+    /// reached through `ComponentEmit` / the connect graph.
+    Event(EventPayload),
     Unknown,
 }
 
@@ -1743,6 +1752,23 @@ pub enum Stmt {
     /// `_post_eval_services` closure installed at this statement's
     /// position, exactly where v1's `emit_cycle_trigger` pushes it.
     CycleHandler(CycleHandlerId),
+    /// `on e(v) ... end on` on a test-scope event local — push a
+    /// subscriber onto the channel. `handler` is a one-parameter
+    /// `FunctionKind::TestHook` function (the payload is its parameter),
+    /// declared at test scope so the pushed closure outlives the block
+    /// that registered it.
+    EventSubscribe {
+        event: LocalId,
+        handler: FunctionId,
+    },
+    /// `emit e(x)` on a test-scope event local — call every subscriber
+    /// synchronously, in subscription order. Mirrors v1's
+    /// `for (auto& _s : e) _s(x);`. A channel with no subscribers is a
+    /// no-op, as in v1.
+    EventEmit {
+        event: LocalId,
+        args: Vec<Expr>,
+    },
     CovReport(CovgroupInstance),
     /// A sequence→transactor method call — the Tier-1/Tier-0 placement
     /// seam. `call` is ALWAYS `Expr::Call(CallTarget::TransactorMethod

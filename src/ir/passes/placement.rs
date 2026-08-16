@@ -349,6 +349,11 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             // checker pass, not here — but it is not a pure host-service
             // statement either: it arms DUT observation that must survive
             // wherever this block is placed.
+            // Fanning out to subscribers is host-side work; the
+            // subscriber bodies are their own functions.
+            Stmt::EventSubscribe { .. } | Stmt::EventEmit { .. } => {
+                host_service_only = false;
+            }
             Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {
                 host_service_only = false;
             }
