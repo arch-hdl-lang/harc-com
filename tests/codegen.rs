@@ -8937,7 +8937,11 @@ end test WideShiftHatch"#;
         }
     };
     assert!(
-        err.contains("use --codegen v1"),
+        // Including `for`: run_emit_parity.sh's needle is
+        // `use--codegenv1for`, so asserting the shorter prefix leaves a
+        // reword like "use --codegen v1 instead: ..." green here while
+        // the gate reclassifies the escape hatch as a divergence.
+        err.contains("use --codegen v1 for"),
         "run_emit_parity.sh greps this exact phrase to classify the wide-shift \
          gap as an escape hatch; got: {err}"
     );

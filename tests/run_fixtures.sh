@@ -120,6 +120,8 @@ trap 'rm -rf "$RESDIR"' EXIT
 n=0
 while IFS= read -r row; do
     [ -z "$(echo "$row" | xargs)" ] && continue
+    # `#` comments, as in every sibling list file in tests/.
+    case "$(echo "$row" | xargs)" in '#'*) continue ;; esac
     printf '%s\n' "$row" >"$RESDIR/$n.row"
     n=$((n + 1))
 done <<<"$FIXTURES"

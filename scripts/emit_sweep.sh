@@ -60,16 +60,18 @@ build_at() { # build_at <rev|WORKTREE> <label> -> echoes binary path
     echo "$TMP/target_$label/debug/harc"
 }
 
+TABLE="$ROOT/tests/fixtures.tbl"
+[ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
+
 echo "Building $BASE_REV ..." >&2
 BASE_BIN="$(build_at "$BASE_REV" base)" || { echo "failed to build $BASE_REV" >&2; exit 1; }
 echo "Building ${HEAD_REV:-working tree} ..." >&2
 HEAD_BIN="$(build_at "${HEAD_REV:-WORKTREE}" head)" || { echo "failed to build head" >&2; exit 1; }
 
-TABLE="$ROOT/tests/fixtures.tbl"
-[ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
 FIXTURES="$(cat "$TABLE")"
 exitdiff=0; textdiff=0; total=0
 while IFS='|' read -r name top svs extra ref tstruct; do
+    case "$(echo "$name" | xargs)" in '#'*) continue ;; esac
     name="$(echo "$name" | xargs)"; top="$(echo "$top" | xargs)"
     svs="$(echo "$svs" | xargs)"; extra="$(echo "$extra" | xargs)"
     tstruct="$(echo "$tstruct" | xargs)"

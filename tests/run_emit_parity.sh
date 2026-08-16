@@ -57,6 +57,10 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # or `HARC=../target/debug/harc` from tests/ would silently mean something
 # else once cwd changes.
 _INVOKED_FROM="$PWD"
+# Our own path, resolved before the cd. `$0` is whatever the caller typed,
+# so after chdir a relative one no longer names this script and the
+# `--worker` re-exec silently fails for every row.
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 HARC="${HARC:-$ROOT/target/release/harc}"
 case "$HARC" in /*) ;; *) HARC="$_INVOKED_FROM/$HARC" ;; esac
 cd "$ROOT" || { echo "error: cannot cd to $ROOT" >&2; exit 1; }
@@ -126,6 +130,10 @@ is_subset_gap() {
     esac
     return 1
 }
+
+# Minimum work this gate must actually do. See the floor check at the end.
+MIN_COMPARED="${MIN_COMPARED:-148}"
+MIN_SOLVER="${MIN_SOLVER:-15}"
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
 
@@ -255,7 +263,7 @@ while [ "$i" -lt "$n" ]; do
     running=0
     while [ "$i" -lt "$n" ] && [ "$running" -lt "$JOBS" ]; do
         mkdir -p "$TMP/o$i"
-        "$0" --worker "$TMP/o$i" "$RESDIR/$i.row" >"$TMP/o$i.out" 2>&1 &
+        "$SELF" --worker "$TMP/o$i" "$RESDIR/$i.row" >"$TMP/o$i.out" 2>&1 &
         i=$((i + 1)); running=$((running + 1))
     done
     wait
@@ -292,9 +300,23 @@ echo "        $nostatus lost"
 # wholesale with a declared-gap diagnostic — the gate would otherwise
 # report success while checking nothing. That is the exact silent-green
 # failure this gate exists to remove, so it must not be one itself.
+# Floors, not a floor of one. `compared > 0` would let 148 of 149 rows
+# silently stop being checked — which is the same corpus-wide-regression
+# shape this gate exists to catch, merely with one survivor. The corpus is
+# a checked-in table, so the expected counts are knowable and pinned:
+# growing them is fine, shrinking them has to be a deliberate edit here.
 compared=$((pass + passc))
-if [ "$compared" -eq 0 ]; then
-    echo "error: no fixture was compared — $skip skipped, $known known." >&2
-    echo "       A gate that checks nothing must not report success." >&2
+floors_ok=1
+if [ "$compared" -lt "$MIN_COMPARED" ]; then
+    echo "error: only $compared fixtures were compared, expected >= $MIN_COMPARED" >&2
+    echo "       ($skip skipped, $known known-exempt, $fail divergent)." >&2
+    echo "       If the corpus legitimately shrank, lower MIN_COMPARED." >&2
+    floors_ok=0
 fi
-[ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ] && [ "$compared" -gt 0 ]
+if [ "$passc" -lt "$MIN_SOLVER" ]; then
+    echo "error: only $passc fixtures had their solver text compared, expected >= $MIN_SOLVER" >&2
+    echo "       The constraint-text half of this gate checked almost nothing." >&2
+    echo "       If that is intended, lower MIN_SOLVER." >&2
+    floors_ok=0
+fi
+[ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ] && [ "$floors_ok" -eq 1 ]

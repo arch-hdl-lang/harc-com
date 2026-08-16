@@ -72,7 +72,12 @@ is_wired() {
     # it moved to fixtures.tbl so run_fixtures.sh and run_emit_parity.sh
     # share one source of truth, and this check has to follow it or every
     # correctly-registered fixture looks unwired.
-    if grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)" tests/fixtures.tbl 2>/dev/null; then
+    # Comment rows are stripped here for the same reason as in the loop
+    # below: a commented-out registry row means the fixture is NOT run, so
+    # reading it as wiring reinstates the exact silent-never-executes hole
+    # this script exists to catch (harc#514).
+    if grep -vE '^[[:space:]]*#' tests/fixtures.tbl 2>/dev/null \
+        | grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)"; then
         return 0
     fi
     # Any other shell runner, Rust test, or fixture list. Two kinds of
