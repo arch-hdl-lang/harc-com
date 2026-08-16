@@ -577,9 +577,13 @@ fn lower_bound_target_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {
@@ -999,9 +1003,13 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {
@@ -1070,9 +1078,13 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {

@@ -13488,11 +13488,12 @@ end impl T"#,
 /// inside a periodic closure, in `watchdog_quiesce_test`). A transactor
 /// watchdog gets none, so it compiles and silently never fires.
 ///
-/// Only the two UNBOUND-transactor sites carry the reclassification.
-/// The bound-to and initiator-side sites need a bus declaration from a
-/// sibling file to reach, so no v1 output was observed for them and they
-/// keep `Unsupported` — an unverified V1Status is the failure this
-/// method exists to prevent.
+/// All five watchdog sites carry it — unbound, bound-to target, and
+/// initiator-side. An earlier pass reclassified only the two unbound
+/// ones on the belief that the others needed a sibling bus file to
+/// reach; they do not (`bus … end bus` sits inline beside a bound-to
+/// transactor in `dma_engine_tlm_target_test`), and single-file probes
+/// of both bound flavors show the same defined-never-called lambda.
 #[test]
 fn a_transactor_watchdog_does_not_point_at_v1() {
     let src = |wd_pos: &str| {
@@ -13538,23 +13539,80 @@ end impl T"#
     }
 }
 
-/// The control, pinned so the claim above stays true: an `agent`
-/// watchdog really is scheduled under tbir, so "watchdogs never run" is
-/// specific to the transactor flavor rather than a blanket statement.
+/// The control, pinned so the claim above stays true. It must check
+/// **v1's** output, not tbir's: the claim is about what `cpp_tb` emits.
+/// And it must count real CALL lines — a watchdog that is never
+/// scheduled still emits its `_pre`/`_post` vector declarations and two
+/// internal hook loops, so a bare "name appears" count is satisfied by
+/// exactly the dead shape this test exists to distinguish from.
 #[test]
-fn an_agent_watchdog_is_scheduled() {
-    let cpp = emit_fixture_cpp("watchdog_quiesce_test.harc");
-    // Defined once, and CALLED — the call site is what a transactor
-    // watchdog never gets. (tbir suffixes the name per instantiation,
-    // hence the prefix match.)
-    let defs = cpp.matches("auto Producer_watchdog").count();
-    let calls = cpp
-        .lines()
-        .filter(|l| l.contains("Producer_watchdog") && !l.contains("auto Producer_watchdog"))
-        .count();
-    assert_eq!(defs, 1, "one watchdog body:\n{cpp}");
+fn an_agent_watchdog_is_scheduled_under_v1() {
+    let merged = merged_src(&fixture("watchdog_quiesce_test.harc"));
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+
+    let is_call = |l: &&str| {
+        l.contains("Producer_watchdog(")
+            && !l.contains("auto Producer_watchdog")
+            && !l.contains("Producer_watchdog_pre")
+            && !l.contains("Producer_watchdog_post")
+    };
+    let calls: Vec<&str> = cpp.lines().filter(is_call).collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "an agent watchdog is CALLED exactly once, from its periodic closure; \
+         got {calls:?}"
+    );
+
+    // And the transactor flavor, through the same emitter, has none —
+    // which is the whole basis for the reclassification above.
+    let merged = merged_src(
+        r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+
+    watchdog
+        period 5 cycles
+        max_idle 100 cycles
+        log(info, "wdog")
+    end watchdog
+
+    when active
+        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    );
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
     assert!(
-        calls >= 1,
-        "the agent watchdog is called, not just defined:\n{cpp}"
+        cpp.contains("auto Xt_watchdog"),
+        "v1 defines the transactor watchdog body:\n{cpp}"
+    );
+    let calls: Vec<&str> = cpp
+        .lines()
+        .filter(|l| {
+            l.contains("Xt_watchdog(")
+                && !l.contains("auto Xt_watchdog")
+                && !l.contains("Xt_watchdog_pre")
+                && !l.contains("Xt_watchdog_post")
+        })
+        .collect();
+    assert!(
+        calls.is_empty(),
+        "…and never calls it — if this ever fires, the reclassification is stale \
+         and the diagnostic must go back to `Unsupported`; got {calls:?}"
     );
 }

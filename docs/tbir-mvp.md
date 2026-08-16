@@ -2388,13 +2388,17 @@ case and only locally-determinable `Assign` types are compared).
       watchdog does get one (`Producer_watchdog(_tb.prod)` inside a
       periodic closure), so this is specific to the transactor flavor.
       v1 compiles the construct and the watchdog silently never fires.
-      `NotImplemented` / silently-mis-lowers, on the two UNBOUND sites.
+      `NotImplemented` / silently-mis-lowers, on ALL FIVE sites —
+      unbound, bound-to target, and initiator-side.
 
-      The bound-to and initiator-side watchdog sites keep `Unsupported`:
-      reaching them needs a bus declaration from a sibling file, so no
-      v1 output was observed for those paths. Three unverified
-      reclassifications in three sweeps is enough — a `V1Status` with no
-      emission behind it does not go in.
+      The first pass reclassified only the two unbound sites, on the
+      belief that the bound flavors needed a bus declaration from a
+      sibling file and so could not be reached. That was wrong: `bus …
+      end bus` sits inline beside a bound-to transactor in
+      `dma_engine_tlm_target_test`, and single-file probes of both bound
+      flavors show the same defined-never-called lambda. Being too
+      cautious is not free either — it left three sites telling users to
+      re-run under a backend where their watchdog would not fire.
     - **`connect` on a transactor** is left UNCLASSIFIED. The first
       probe used an empty block (nothing to wire, so it proved nothing);
       the second tripped the separate `out event`-field gate before
@@ -2406,7 +2410,12 @@ case and only locally-determinable `Assign` types are compared).
     compiles". The question is whether the emitted code RUNS. A
     definition with no call site compiles perfectly and does nothing,
     which is indistinguishable from a working feature until you look for
-    the call.
+    the call — and the control matters as much as the finding, because
+    "the name appears in the output" is satisfied by the dead shape
+    itself (an unscheduled watchdog still emits its `_pre`/`_post`
+    vectors and two internal hook loops). The test that pins this
+    asserts a call COUNT against v1's emitter, and goes red if either
+    call site is removed.
 
 ### The probe method
 
