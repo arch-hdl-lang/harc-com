@@ -553,7 +553,7 @@ pub(crate) fn fold_const(
 /// compile-time error instead. Widths ≥ 64 (and missing/unknown
 /// types) pass through unchecked — the 64-bit fold domain cannot
 /// overflow them.
-fn check_const_decl_type(
+pub(crate) fn check_const_decl_type(
     ty: Option<&crate::ast::TypeExpr>,
     v: ConstVal,
 ) -> Result<ConstVal, String> {
@@ -3219,31 +3219,20 @@ fn lower_test(
                             queue_fields.push(queue.clone());
                             state_fields.push(ir::TbStateFieldSchema::Queue(queue));
                         } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
+                            // Same rule as the component / scoreboard /
+                            // transactor-state field defaults: folded
+                            // through the file's constant table, so
+                            // `default K` means the same thing on a
+                            // testbench field as on an `env` field in
+                            // the same source.
                             let default = match &f.default {
                                 None => 0,
-                                Some(d) => match &*d.kind {
-                                    ExprKind::Int(s) => {
-                                        exprs::parse_int_literal(s).ok_or_else(|| {
-                                            unsupported(
-                                                &format!(
-                                                    "testbench field default `{} default {s}`",
-                                                    f.name.name
-                                                ),
-                                                "not a plain integer literal",
-                                            )
-                                        })?
-                                    }
-                                    ExprKind::Bool(b) => *b as u64,
-                                    _ => {
-                                        return Err(unsupported(
-                                            &format!(
-                                                "a non-literal default on testbench field `{}`",
-                                                f.name.name
-                                            ),
-                                            "",
-                                        ));
-                                    }
-                                },
+                                Some(d) => components::fold_field_default(
+                                    d,
+                                    Some(&f.ty),
+                                    &const_vals_from(consts, const_signed),
+                                    &format!("testbench field `{}`", f.name.name),
+                                )?,
                             };
                             let scalar = ir::TbScalarFieldSchema {
                                 name: f.name.name.clone(),
@@ -5068,24 +5057,35 @@ pub(crate) struct LowerCtx {
 }
 
 impl LowerCtx {
-    /// The two constant tables recombined into the shape `fold_const`
-    /// wants. Built on demand — only the field-default paths need it,
-    /// and only when a field actually carries a `default`, so the clone
-    /// never happens on the common path.
+    /// See `const_vals_from`. Built on demand rather than stored, and
+    /// only ever reached from a field default that is not a plain
+    /// literal — `fold_field_default` answers the common shapes without
+    /// consulting the table at all.
     pub(crate) fn const_vals(&self) -> HashMap<String, ConstVal> {
-        self.consts
-            .iter()
-            .map(|(k, &bits)| {
-                (
-                    k.clone(),
-                    ConstVal {
-                        bits,
-                        signed: self.const_signed.get(k).copied().unwrap_or(false),
-                    },
-                )
-            })
-            .collect()
+        const_vals_from(&self.consts, &self.const_signed)
     }
+}
+
+/// Recombine the two split constant tables (`consts` bit patterns +
+/// `const_signed` signedness) into the single map `fold_const` wants.
+/// The split exists because use-site substitution needs the two
+/// separately; constant FOLDING needs them together.
+pub(crate) fn const_vals_from(
+    consts: &HashMap<String, u64>,
+    const_signed: &HashMap<String, bool>,
+) -> HashMap<String, ConstVal> {
+    consts
+        .iter()
+        .map(|(k, &bits)| {
+            (
+                k.clone(),
+                ConstVal {
+                    bits,
+                    signed: const_signed.get(k).copied().unwrap_or(false),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on

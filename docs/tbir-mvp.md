@@ -2272,14 +2272,29 @@ case and only locally-determinable `Assign` types are compared).
       remaining rejection is a default that is not constant at all
       (`default "x"`), now a `NotImplemented` / silently-mis-lowers.
 
-    - **The directional-field family** (`in`/`inout` on an event, queue,
-      scalar, or named-type component field) is five sites with one
-      rule: v1 never reads the direction. An `in event<T>` emits the
-      same `std::vector<std::function<void(T)>>` fan-out an `out event`
-      does, so an INPUT pipe becomes an output port; a directional
-      scalar emits an UNINITIALIZED member where a non-directional one
-      gets `= 0`. All five are `NotImplemented` / silently-mis-lowers,
-      checked structurally like the probe/bind-remap family.
+    The fold reaches component, scoreboard, transactor-state AND
+    testbench fields, so `default K` means the same thing everywhere in
+    one source file. Range checking rides along: the folded value goes
+    through the same `check_const_decl_type` a `const` declaration gets,
+    so `uint<8> default -1` and `default 300` are rejected here rather
+    than emitted as a 64-bit bit pattern. The three error classes stay
+    distinct — a non-constant expression is a `NotImplemented`, while an
+    illegal evaluation (division by zero, a value that does not fit) is
+    a `LowerError::Invalid`, matching what a `const` declaration reports
+    for the same expression.
+
+    **A reclassification that did not survive review.** The five
+    directional-component-field rejections (`in`/`inout` on an event,
+    queue, scalar, or named-type field) were reclassified on the premise
+    that v1 "never reads the direction" — and that premise is false. v1
+    emits byte-identical, WORKING C++ for `event`, `in event`, and
+    `inout event` on an agent, and honors defaults on directional
+    scalars just as it does on plain ones. `--codegen v1` is an honest
+    escape hatch for all five, so all five keep `Unsupported`. This is
+    the third sweep in a row where a plausible reading of one emission
+    turned out not to generalize; the rule that keeps surviving is that
+    a `V1Status` claim needs v1's output for the shape being claimed, not
+    for a neighbouring one.
 
     Left open, and worth a slice of its own: a **transaction-typed field
     on an unbound `transactor`** (`cur : Txn`). v1 emits a real `Txn`

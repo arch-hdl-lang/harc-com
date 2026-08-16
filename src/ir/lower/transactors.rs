@@ -35,9 +35,7 @@
 //! generics, event ports, `on` handlers, TLM target threads, watchdogs —
 //! is an explicit `Unsupported`.
 
-use super::{
-    helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
-};
+use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
     TypeArg, TypeExpr,
@@ -1272,23 +1270,19 @@ fn lower_state_field(
              a whole value-record, or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
         ));
     };
-    // Same rule as the component/scoreboard field defaults: folded
-    // through the file's constant table. v1 emits the default's SOURCE
-    // TEXT into the member initializer, so a literal or a `const` name
-    // works there but anything else silently degrades to `= 0` — a
-    // `default 1 + 1` state field starts at 0, not 2.
+    // Same rule as the component/scoreboard field defaults, and the
+    // same `check_const_decl_type` range check a `const` declaration
+    // gets. v1 emits the default's SOURCE TEXT into the member
+    // initializer, so a literal or a `const` name works there but
+    // anything else silently degrades to `= 0` — a `default 1 + 1`
+    // state field starts at 0, not 2.
     let default = match &f.default {
         None => 0,
-        Some(d) => super::components::fold_field_default(d, &record_ctx.const_vals()).map_err(
-            |detail| {
-                not_implemented(
-                    &format!(
-                        "a non-constant default on transactor `{tname}` state field `{fname}`"
-                    ),
-                    detail,
-                    V1Status::SilentlyMisLowers,
-                )
-            },
+        Some(d) => super::components::fold_field_default(
+            d,
+            Some(&f.ty),
+            &record_ctx.const_vals(),
+            &format!("transactor `{tname}` state field `{fname}`"),
         )?,
     };
     Ok(StateFieldSchema {

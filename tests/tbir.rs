@@ -13060,70 +13060,17 @@ end impl T"#,
 
 /// A default that is not constant at all is not a v1 escape hatch: v1
 /// emits `= 0` and runs, so the field silently holds the wrong value.
+/// An ILLEGAL constant evaluation is a different class again — it gets
+/// the `LowerError::Invalid` a `const` declaration would get for the
+/// same expression, including the field's own range check.
 #[test]
-fn a_non_constant_field_default_does_not_point_at_v1() {
-    let err = lower_src(
-        r#"env E
-    s : uint<8> default "x"
-end env E
+fn a_bad_field_default_is_classified_by_why_it_is_bad() {
+    let src = |init: &str| {
+        format!(
+            r#"const K = 7
 
-testbench Tb
-    dut : Top
-    top : E
-end testbench Tb
-impl T for Tb
-    run
-        wait 1 cycle
-    end run
-end impl T"#,
-    )
-    .unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(
-        msg.contains("non-constant default on component field `E.s`"),
-        "{msg}"
-    );
-}
-
-/// Directional component fields are ONE family with ONE rule: v1 never
-/// reads the direction. An `in`/`inout` event emits the same
-/// `std::vector<std::function<void(T)>>` fan-out an `out` event does, so
-/// an input pipe becomes an output port; a directional scalar emits an
-/// UNINITIALIZED member where a non-directional one gets `= 0`. Every
-/// arm carries that rule — fixing one and leaving the rest pointing at
-/// v1 is the failure mode this pins.
-#[test]
-fn the_directional_field_family_has_one_rule() {
-    let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ir/lower/components.rs"),
-    )
-    .expect("read the component lowering");
-    for tag in [
-        "an `inout` event field",
-        "an `in` event field",
-        "a directional queue field",
-        "a directional scalar field",
-        "a directional named-type field",
-    ] {
-        let at = src
-            .find(tag)
-            .unwrap_or_else(|| panic!("missing arm: {tag}"));
-        let opener = src[..at]
-            .rfind("_implemented(\n")
-            .or_else(|| src[..at].rfind("unsupported(\n"));
-        let opener = opener.unwrap_or_else(|| panic!("no error constructor before: {tag}"));
-        assert!(
-            src[opener..].starts_with("_implemented("),
-            "`{tag}` must be a NotImplemented — v1 drops the direction rather than \
-             implementing it, so `--codegen v1` is not an escape hatch"
-        );
-    }
-
-    // Two arms end-to-end so the scan cannot pass over dead code.
-    for field in ["x : in uint<8>", "e : in event<uint<8>>"] {
-        let err = lower_src(&format!(
-            r#"env E
-    {field}
+env E
+    n : uint<8> default {init}
 end env E
 
 testbench Tb
@@ -13135,8 +13082,52 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#
-        ))
-        .unwrap_err();
-        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        )
+    };
+
+    // Not constant at all → a backend-gap report, and NOT a pointer at
+    // v1, which accepts it and emits `= 0`.
+    let err = lower_src(&src(r#""x""#)).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("non-constant default on component field `E.n`"),
+        "{msg}"
+    );
+
+    // Constant, but illegal — the same three shapes a `const`
+    // declaration rejects, reported the same way.
+    for (init, want) in [
+        ("1 / 0", "division by zero"),
+        ("-1", "negative values cannot initialize an unsigned constant"),
+        ("300", "does not fit `uint<8>` (max 255)"),
+    ] {
+        let err = lower_src(&src(init)).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(msg.contains(want), "`default {init}`: {msg}");
+        assert!(
+            msg.contains("component field `E.n`"),
+            "the diagnostic names the field: {msg}"
+        );
     }
 }
+
+/// The fold reaches testbench fields too, so `default K` means the same
+/// thing on a testbench field as on an `env` field in the same source.
+#[test]
+fn a_testbench_field_default_folds_like_a_component_one() {
+    let cpp = emit_cpp_src(
+        r#"const K = 7
+
+testbench Tb
+    dut : Top
+    n : uint<8> default K + 1
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("n = 8;"), "{cpp}");
+}
+

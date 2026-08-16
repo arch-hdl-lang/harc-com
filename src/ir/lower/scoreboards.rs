@@ -21,7 +21,7 @@
 //!     `queue<SomeStruct>` — needs the record-payload-in-queue seam);
 //!   - non-scalar / >64-bit scalar fields.
 
-use super::{not_implemented, unsupported, LowerError, V1Status};
+use super::{unsupported, LowerError};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
@@ -66,7 +66,7 @@ pub(crate) fn lower_scoreboard(
                 let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids)?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
-                        let default = scalar_default(&f.default, sb, fname, consts)?;
+                        let default = scalar_default(&f.default, sb, fname, &f.ty, consts)?;
                         ScoreboardFieldKind::Scalar { ty, default }
                     }
                     other => {
@@ -187,14 +187,14 @@ fn scalar_default(
     default: &Option<crate::ast::Expr>,
     sb: &str,
     fname: &str,
+    ty: &crate::ast::TypeExpr,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
     let Some(d) = default else { return Ok(0) };
-    super::components::fold_field_default(d, consts).map_err(|detail| {
-        not_implemented(
-            &format!("a non-constant default on scoreboard field `{sb}.{fname}`"),
-            detail,
-            V1Status::SilentlyMisLowers,
-        )
-    })
+    super::components::fold_field_default(
+        d,
+        Some(ty),
+        consts,
+        &format!("scoreboard field `{sb}.{fname}`"),
+    )
 }

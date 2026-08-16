@@ -906,26 +906,17 @@ fn lower_field(
             ..
         } => {
             if matches!(f.direction, Some(Direction::InOut)) {
-                // v1 does not read the direction at all: an `in` /
-                // `inout` event emits the same
-                // `std::vector<std::function<void(T)>>` fan-out member an
-                // `out` event does, so an input pipe silently becomes an
-                // output port.
-                return Err(not_implemented(
+                return Err(unsupported(
                     &format!("an `inout` event field `{comp}.{fname}`"),
                     "only `out event<T>` analysis ports, directionless agent \
                      self-events, and `in event<T>` transactor input pipes are lowered",
-                    V1Status::SilentlyMisLowers,
                 ));
             }
             if matches!(f.direction, Some(Direction::In)) && !is_transactor {
-                // Same rule as the `inout` arm above: the direction is
-                // dropped and the field becomes an output fan-out.
-                return Err(not_implemented(
+                return Err(unsupported(
                     &format!("an `in` event field `{comp}.{fname}`"),
                     "an `in event<T>` input pipe is only lowered on an event-driven \
                      transactor (consumer BFM); use a directionless self-event elsewhere",
-                    V1Status::SilentlyMisLowers,
                 ));
             }
             let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
@@ -938,10 +929,9 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(not_implemented(
+                return Err(unsupported(
                     &format!("a directional queue field `{comp}.{fname}`"),
-                    "the direction is dropped, leaving a plain queue member",
-                    V1Status::SilentlyMisLowers,
+                    "",
                 ));
             }
             // The element is a scalar ≤ 64 bits or a value-record
@@ -956,11 +946,9 @@ fn lower_field(
         // AnalysisSource passive` / `sb : AnalysisSb`).
         TypeExpr::Builtin { .. } => {
             if f.direction.is_some() {
-                return Err(not_implemented(
+                return Err(unsupported(
                     &format!("a directional scalar field `{comp}.{fname}`"),
-                    "the direction is dropped, and the member is left \
-                     UNINITIALIZED (a non-directional field gets `= 0`)",
-                    V1Status::SilentlyMisLowers,
+                    "",
                 ));
             }
             let ty = scalar_ir_type(&f.ty).ok_or_else(|| {
@@ -969,15 +957,14 @@ fn lower_field(
                     "only uint/sint/bits/bool fields up to 64 bits are lowered",
                 )
             })?;
-            let default = scalar_default(&f.default, comp, fname, consts)?;
+            let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
         }
         TypeExpr::Named { name, .. } => {
             if f.direction.is_some() {
-                return Err(not_implemented(
+                return Err(unsupported(
                     &format!("a directional named-type field `{comp}.{fname}`"),
-                    "the direction is dropped, leaving a plain member",
-                    V1Status::SilentlyMisLowers,
+                    "",
                 ));
             }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -2100,31 +2087,64 @@ fn scalar_default(
     default: &Option<crate::ast::Expr>,
     comp: &str,
     fname: &str,
+    ty: &TypeExpr,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
     let Some(d) = default else { return Ok(0) };
-    fold_field_default(d, consts).map_err(|detail| {
-        not_implemented(
-            &format!("a non-constant default on component field `{comp}.{fname}`"),
-            detail,
-            V1Status::SilentlyMisLowers,
-        )
-    })
+    fold_field_default(d, Some(ty), consts, &format!("component field `{comp}.{fname}`"))
 }
 
-/// Shared by the component and scoreboard field paths: fold a `default`
-/// expression to its 64-bit value, or report why it is not constant.
+/// Shared by the component, scoreboard and transactor-state field
+/// paths: fold a `default` to the value its member is initialized with.
+///
+/// `ty` is the field's declared type, run through the SAME
+/// `check_const_decl_type` a `const` declaration gets — so a negative
+/// value in an unsigned field, or one wider than the field, is rejected
+/// here rather than emitted as a 64-bit bit pattern. `what` names the
+/// field for the diagnostic.
+///
+/// The three error classes stay distinct: a non-constant expression is
+/// a `NotImplemented` (v1 accepts it and silently emits `= 0`), while an
+/// illegal evaluation — division by zero, an out-of-range shift, a value
+/// that does not fit the field — is a `LowerError::Invalid`, matching
+/// what a `const` declaration reports for the same expression.
 pub(crate) fn fold_field_default(
     d: &crate::ast::Expr,
+    ty: Option<&crate::ast::TypeExpr>,
     consts: &HashMap<String, super::ConstVal>,
-) -> Result<u64, String> {
-    // `""` as the self-name: a field default has no enclosing `const`
-    // to form a cycle with, so no identifier can be a self-reference.
-    match super::fold_const(d, consts, "") {
-        Ok(v) => Ok(v.bits),
-        Err(super::ConstFoldErr::Unsupported(detail))
-        | Err(super::ConstFoldErr::Invalid(detail)) => Err(detail),
-    }
+    what: &str,
+) -> Result<u64, LowerError> {
+    // Fast path: a plain literal or bool needs no constant table, and is
+    // what almost every `default` actually is.
+    let folded = match &*d.kind {
+        ExprKind::Int(lit) => super::exprs::parse_int_literal(lit).map(|bits| super::ConstVal {
+            bits,
+            signed: bits <= i64::MAX as u64,
+        }),
+        ExprKind::Bool(b) => Some(super::ConstVal {
+            bits: *b as u64,
+            signed: true,
+        }),
+        _ => None,
+    };
+    // `""` as the self-name: a field default has no enclosing `const` to
+    // form a cycle with, so no identifier can be a self-reference.
+    let v = match folded {
+        Some(v) => v,
+        None => super::fold_const(d, consts, "").map_err(|e| match e {
+            super::ConstFoldErr::Unsupported(detail) => not_implemented(
+                &format!("a non-constant default on {what}"),
+                detail,
+                V1Status::SilentlyMisLowers,
+            ),
+            super::ConstFoldErr::Invalid(detail) => {
+                LowerError::Invalid(format!("the default on {what}: {detail}"))
+            }
+        })?,
+    };
+    super::check_const_decl_type(ty, v)
+        .map(|v| v.bits)
+        .map_err(|detail| LowerError::Invalid(format!("the default on {what}: {detail}")))
 }
 
 // --- access resolution on FuncBuilder (test-body + method-body) ---
