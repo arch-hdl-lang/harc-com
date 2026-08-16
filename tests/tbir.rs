@@ -19,7 +19,7 @@ fn fixture(name: &str) -> String {
 
 fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
     let parsed = parse_source(src).expect("fixture parses");
-    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     lower::lower_program(&merged)
 }
 
@@ -27,7 +27,7 @@ fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
 /// needs for the constraint-IR / randomize seam — empty otherwise).
 fn merged_src(src: &str) -> harc::ast::SourceFile {
     let parsed = parse_source(src).expect("fixture parses");
-    merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge")
+    merge::merge_for_sim(vec![parsed], None).expect("merge")
 }
 
 /// Multi-file variant for fixtures that split helpers across files
@@ -37,7 +37,7 @@ fn lower_fixtures(names: &[&str]) -> Result<ir::TbProgram, lower::LowerError> {
         .iter()
         .map(|n| parse_source(&fixture(n)).unwrap_or_else(|e| panic!("{n} parses: {e:?}")))
         .collect();
-    let merged = merge::merge_for_sim(&parsed, None).expect("merge");
+    let merged = merge::merge_for_sim(parsed, None).expect("merge");
     lower::lower_program(&merged)
 }
 
@@ -57,7 +57,7 @@ fn lower_with_stdlib_bus(
     let bus_src = std::fs::read_to_string(&bus_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
     let bus = parse_source(&bus_src).expect("stdlib bus parses");
-    let merged = merge::merge_for_sim(&[fix, bus], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![fix, bus], None).expect("merge");
     lower::lower_program(&merged)
 }
 

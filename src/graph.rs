@@ -1667,7 +1667,7 @@ fn index_lowered_ir(builder: &mut GraphBuilder, parsed: &[ParsedFile]) {
                 asts.push(bus_file.ast.clone());
             }
         }
-        let Ok(merged) = codegen::merge::merge_for_sim(&asts, None) else {
+        let Ok(merged) = codegen::merge::merge_for_sim(asts, None) else {
             continue;
         };
         let Ok(program) = ir::lower::lower_program(&merged) else {

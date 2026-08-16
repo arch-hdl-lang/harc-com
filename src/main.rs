@@ -1475,7 +1475,7 @@ fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>, profile: Option<String
     let extra_files = resolve_use_imports(&parsed_files, files.first());
     let mut all_files = parsed_files;
     all_files.extend(extra_files);
-    let merged = harc::codegen::merge::merge_for_sim(&all_files, None)
+    let merged = harc::codegen::merge::merge_for_sim(all_files, None)
         .map_err(|e| miette::miette!("{}", e))?;
     let prog = harc::ir::lower::lower_program(&merged).map_err(|e| miette::miette!("{}", e))?;
     harc::ir::verify::verify_program(&prog).map_err(|errs| {
@@ -2317,10 +2317,12 @@ fn cmd_sim(
 
     // Parse every input file, then fold `extend test T` blocks into their
     // matching base test before codegen.
+    let parse_started = Instant::now();
     let mut parsed_files = Vec::with_capacity(files.len());
     for f in &files {
         parsed_files.push(parse_file(f)?);
     }
+    let parse_elapsed = parse_started.elapsed();
     // Resolve `use Name` declarations against the search path. For each
     // unresolved `use`, look for `<Name>.arch` (or `<Name>.harc`) in
     // a small set of conventional locations, parse it, and append any
@@ -2328,15 +2330,27 @@ fn cmd_sim(
     // uses silently no-op (back-compat — many existing fixtures
     // include `use arc.stdlib.X` lines that don't resolve to anything
     // yet).
+    // `resolve_use_imports` probes the search path and PARSES whatever it
+    // resolves, so it is timed with parse rather than merge — folding it
+    // into "merge" hid an imported file's parse cost under the wrong label.
+    let imports_started = Instant::now();
     let extra_files = resolve_use_imports(&parsed_files, files.first());
     let mut all_files = parsed_files;
     all_files.extend(extra_files);
+    let parse_elapsed = parse_elapsed + imports_started.elapsed();
 
-    let merged = harc::codegen::merge::merge_for_sim(&all_files, test.as_deref())
+    let merge_started = Instant::now();
+    let merged = harc::codegen::merge::merge_for_sim(all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
-
+    let merge_elapsed = merge_started.elapsed();
+    // Suite scope hands the merged file straight to codegen. It used to
+    // `.clone()` here, which on a large suite is a deep copy of the whole
+    // merged AST — 9.4s of a 46s frontend on the 352-test benchmark — and
+    // `merged` is not read again either way. Test scope still borrows it
+    // to build a filtered copy, which is why the move lives in the arm
+    // rather than above the match.
     let codegen_source = match compile_scope {
-        CompileScope::Suite => merged.clone(),
+        CompileScope::Suite => merged,
         CompileScope::Test => {
             let selected = test
                 .as_deref()
@@ -2508,10 +2522,21 @@ fn cmd_sim(
             // emit is visible while it runs and peak memory is bounded by
             // the worker count rather than the shard count.
             CodegenKind::Tbir => {
+                // Phase timings for the whole frontend, not just emission:
+                // once split emission stopped being the long pole, "where
+                // did the other 40 seconds go" needed an answer that did not
+                // require a profiler (harc#538 goal 6, harc#546 §1b).
+                eprintln!(
+                    "TBIR parse: {} | merge: {}",
+                    fmt_secs(parse_elapsed),
+                    fmt_secs(merge_elapsed),
+                );
                 let lower_started = Instant::now();
                 let prog = harc::ir::lower::lower_program(&codegen_source)
                     .map_err(|e| miette::miette!("{}", e))?;
+                let lower_elapsed = lower_started.elapsed();
                 uses_solver |= !prog.constraint_sites.is_empty();
+                let verify_started = Instant::now();
                 harc::ir::verify::verify_program(&prog).map_err(|errs| {
                     let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
                     miette::miette!(
@@ -2519,8 +2544,18 @@ fn cmd_sim(
                         lines.join("\n")
                     )
                 })?;
-                eprintln!("TBIR lower+verify: {}", fmt_secs(lower_started.elapsed()));
+                eprintln!(
+                    "TBIR lower: {} | verify: {}",
+                    fmt_secs(lower_elapsed),
+                    fmt_secs(verify_started.elapsed()),
+                );
 
+                // Planning builds the suite-global scaffold every shard
+                // reuses (solver problem table, randomize snippets, gated-bus
+                // check), which on a large suite costs more than parsing —
+                // so it gets its own number rather than hiding between the
+                // lower and emit lines.
+                let plan_started = Instant::now();
                 let plan = harc::codegen::tbir::plan_split_tests(
                     &prog,
                     &codegen_source,
@@ -2532,9 +2567,11 @@ fn cmd_sim(
                 let shard_count = plan.shards.len();
                 let jobs = harc::codegen::tbir::resolve_emit_jobs(split.emit_jobs, shard_count);
                 eprintln!(
-                    "TBIR split plan: {} tests, {shard_count} shards, group size {}, emit jobs {jobs}",
+                    "TBIR split plan: {} tests, {shard_count} shards, group size {}, \
+                     emit jobs {jobs}, planned in {}",
                     plan.test_names.len(),
                     split.group_size,
+                    fmt_secs(plan_started.elapsed()),
                 );
 
                 let dispatcher_path = outdir.join(&plan.dispatcher.filename);
