@@ -2303,6 +2303,76 @@ case and only locally-determinable `Assign` types are compared).
     through different machinery, so this is a design step, not a missing
     arm. It keeps its `--codegen v1` suggestion, which is honest.
 
+36. **Sixth probe sweep: `connect` endpoints and record-typed
+    transactor fields (2026-08-16).** Twelve `connect` endpoint shapes
+    plus the transaction-typed transactor field divergence 35 left open.
+    One gap closed, seven diagnostics reclassified.
+
+    - **A record-typed field on an UNBOUND `transactor`** (`cur : Beat`).
+      v1 emits a real struct member, writes it from the method body as
+      `self.cur.tag = …`, and reads it back from the test — a working
+      feature TB-IR refused outright. The unbound path now routes record
+      fields through the same `lower_state_field` the bound-to path
+      already used, which produces `StateFieldKind::Record`.
+
+      Reaching it exposed a latent emitter bug worth recording, because
+      it is what makes "close the gap" different from "delete the
+      rejection": `Stmt::TransactorStateRecordFieldWrite` interpolated
+      its `instance` RAW, while the read side and the scalar write both
+      went through `resolve_state_instance`. A transactor's own method
+      body carries an EMPTY instance for a self-reference, so the first
+      emission was `.cur.tag = 5;` — a leading-dot member access, not
+      C++. The rejection had been hiding a broken path, and lifting it
+      without compiling the result would have shipped exactly the
+      silent-mis-lowering this sweep exists to remove.
+      `transactor_record_field_test` is the equivalence fixture.
+
+    - **`connect` endpoint diagnostics: reclassified, then reverted.**
+      Six endpoint shapes (a sink with no method, a source with no event
+      field, a source that is not an `out event`, a path segment naming
+      something that is not a sub-component) and two sink SIGNATURE
+      checks were reclassified — and all eight came back. What v1 does
+      with a bad edge depends on where the edge SITS, not on how it is
+      malformed:
+
+      | landing | what v1 does |
+      |---|---|
+      | instantiated env, multi-segment path | emits the path verbatim into a `push_back` / range-for; usually does not compile |
+      | single-segment endpoint | resolves the owner's own hookable / `out event` and WORKS (`E_take(_tb.top, _t)`) |
+      | uninstantiated env | emits no wiring at all, so the malformed edge is invisible and v1 SUCCEEDS |
+
+      tbir resolves `connect` for every env in the merged file, so it
+      sees edges v1 never reaches at all. One site, three outcomes: no
+      `V1Status` is honest, and all eight keep `Unsupported`.
+
+    The record unlock also surfaced three follow-on gaps that the
+    rejection had been hiding, each a design step rather than a missing
+    arm, and each left with an honest diagnostic:
+
+    - A `Vec` subfield inside a record state field (`cur.lanes[1] = 7`).
+      v1 emits `self.cur.lanes[1] = 7;` and it works; the write path has
+      no indexed form for `TransactorStateRecordFieldWrite`.
+    - A record-typed field on a transactor reached through an `env`,
+      which comes through the COMPONENT-field machinery.
+      `ComponentFieldKind` has no record variant, so the field used to
+      fall through to the DUT-handle arm and report "more than one DUT
+      handle field (dut, cur)" — a diagnostic naming the wrong problem
+      entirely. It now names the real one.
+    - Record state in the `when active` position was closed in the same
+      pass (v1 compiles either position, so half a feature was not worth
+      shipping), as was the duplicate-name check the new branch had
+      skipped — `cur : uint<32>` plus `cur : Beat` emitted two `cur`
+      members instead of an error.
+
+    **Three sweeps, three reverted reclassifications.** Batch 4 read one
+    landing of a whole-`Vec` read, batch 5 read one landing of a
+    directional field, batch 6 read one landing of a `connect` edge —
+    each generalized, each wrong, each caught only by review. The
+    working rule from here: a `V1Status` claim needs v1's output from
+    EVERY landing the site can be reached from, and a site that cannot
+    be pinned to one outcome keeps `Unsupported`. Closing a gap is the
+    cheap half; classifying one honestly is the expensive half.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

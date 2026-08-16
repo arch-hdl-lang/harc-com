@@ -981,6 +981,20 @@ fn lower_field(
             if let Some(cid) = ids.get(simple) {
                 return Ok(ComponentFieldKind::Sub { component: *cid });
             }
+            // A record type held BY VALUE. The standalone-transactor
+            // path lowers this to `StateFieldKind::Record`, but a
+            // transactor reached through an `env` comes through the
+            // component-field machinery, which has no record kind — so
+            // it must not fall through to the DUT-handle arm below and
+            // report a second DUT handle, which is what it used to do.
+            // v1 emits a plain `Beat cur;` member here and it works.
+            if record_ids.contains_key(simple) {
+                return Err(unsupported(
+                    &format!("a record-typed field `{comp}.{fname}` of type `{simple}`"),
+                    "record state lowers on a standalone `transactor`; through an \
+                     `env` the component-field schema has no record kind yet",
+                ));
+            }
             // On a transactor, an unknown named type is the module-typed
             // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
             if is_transactor {
@@ -1698,6 +1712,18 @@ where
     // The source path is `<subcomp>.<event>` (final segment is the event
     // port on the source sub-component).
     if from.len() < 2 {
+        // NOT reclassified, and the reason is worth keeping: what v1
+        // does with a malformed `connect` edge depends on where the edge
+        // SITS, not on how it is malformed. In an INSTANTIATED env v1
+        // emits the path verbatim and the result usually does not
+        // compile — but a single-segment endpoint resolves against the
+        // owner's own hookable / `out event` and works
+        // (`E_take(_tb.top, _t)`), and an UNINSTANTIATED env emits no
+        // wiring at all, so every malformed edge in one is invisible and
+        // v1 simply succeeds. tbir resolves `connect` for every env in
+        // the merged file, so it sees edges v1 never reaches. One site,
+        // three outcomes — the `--codegen v1` suggestion stays, because
+        // it is true somewhere.
         return Err(unsupported(
             &format!(
                 "a `connect` source `{}` without an event field",
