@@ -2787,6 +2787,28 @@ impl FuncBuilder<'_> {
             ),
         };
 
+        // `assert <temporal> else fail("...")` — the clause names what
+        // the failure means, which is strictly more useful than the
+        // generic property line, so it replaces it. The message renders
+        // in the same per-cycle closure as the condition, so it is held
+        // to the same rule: it may read locals and ports, but it may not
+        // push a statement into the test.
+        //
+        // Lowered with NO slot map, like a latch operand. `lower_fmt`
+        // re-parses each `${…}` capture as a standalone fragment, whose
+        // spans are relative to the fragment rather than to the file, so
+        // a capture's span can collide with a real temporal occurrence
+        // and get rewritten into that occurrence's `Expr::TemporalSlot`.
+        // With the map empty a `${past(x)}` reaches the ordinary
+        // temporal gate and is rejected by name instead.
+        let message = match v.else_fail.as_ref() {
+            Some(e) => {
+                let msg = self.else_fail_literal(e)?;
+                Some(self.with_check_body(&[], construct, |b| b.lower_fmt(&msg))?)
+            }
+            None => None,
+        };
+
         let id = {
             let mut tables = self.side_tables.borrow_mut();
             let id = crate::ir::PropertyCheckId(tables.property_checks.len() as u32);
@@ -2796,6 +2818,7 @@ impl FuncBuilder<'_> {
                 severity,
                 shape,
                 temporals: slots,
+                message,
             });
             id
         };
@@ -2813,6 +2836,19 @@ impl FuncBuilder<'_> {
             return Ok(());
         };
         self.require_test_body("a `cover` witness")?;
+        // A `cover` has no failure line to name: it counts the cycles
+        // its predicate held and reports hit/total. The parser accepts
+        // the clause on any `verify` statement, and v1 drops it here
+        // without a word — the same "written, accepted, lost" shape
+        // that `else fail(...)` on a concurrent `assert` had.
+        if v.else_fail.is_some() {
+            return Err(LowerError::Invalid(
+                "`cover` counts witnesses; it has no failure to report, so an \
+                 `else fail(...)` clause has nothing to name (use `assert` if the \
+                 condition must hold)"
+                    .to_string(),
+            ));
+        }
         let construct = "a `cover` witness";
         let label = match &*raw.kind {
             ExprKind::Ident(id) => id.name.clone(),
@@ -2857,9 +2893,28 @@ impl FuncBuilder<'_> {
         // transactor call edge hoists ahead of the check.
         let cond = self.lower_expr(expr)?;
         let cond = self.hoist_transactor_calls(cond);
-        let on_fail = self.lower_fmt("assumption failed")?;
+        let msg = match v.else_fail.as_ref() {
+            Some(e) => self.else_fail_literal(e)?,
+            None => "assumption failed".to_string(),
+        };
+        let on_fail = self.lower_fmt(&msg)?;
         self.push(Stmt::AssumeCheck { cond, on_fail });
         Ok(())
+    }
+
+    /// The string literal in an `else fail("...")` clause. A non-literal
+    /// message is rejected the same way for `assert` and `assume`, in
+    /// the immediate and concurrent forms alike.
+    fn else_fail_literal(&self, e: &AstExpr) -> Result<String, LowerError> {
+        match &*e.kind {
+            ExprKind::String(s) => Ok(s.clone()),
+            _ => Err(not_implemented(
+                "non-string-literal `else fail(...)` message",
+                "interpolate the value into the literal instead — \
+                 `else fail(\"x=${v}\")`",
+                V1Status::SilentlyMisLowers,
+            )),
+        }
     }
 
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
@@ -2874,13 +2929,6 @@ impl FuncBuilder<'_> {
         // legacy `property` keyword still parses but no longer changes
         // dispatch — same rule as v1's `is_concurrent_assertion`.
         if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
-            if v.else_fail.is_some() {
-                return Err(unsupported(
-                    "an `else fail(...)` clause on a concurrent `assert`",
-                    "a concurrent assertion reports through its property failure line; \
-                     drop the `else fail(...)` or use an immediate `assert`",
-                ));
-            }
             return self.lower_property_check(crate::ir::PropertySeverity::Fail, v, expr);
         }
         // Ports stay inline (lazy assert eval), but a transactor-method
@@ -2890,17 +2938,7 @@ impl FuncBuilder<'_> {
         let cond = self.lower_expr(expr)?; // ports allowed in assert conditions
         let cond = self.hoist_transactor_calls(cond);
         let msg = match v.else_fail.as_ref() {
-            Some(e) => match &*e.kind {
-                ExprKind::String(s) => s.clone(),
-                _ => {
-                    return Err(not_implemented(
-                        "non-string-literal `else fail(...)` message",
-                        "interpolate the value into the literal instead — \
-                         `else fail(\"x=${v}\")`",
-                        V1Status::SilentlyMisLowers,
-                    ));
-                }
-            },
+            Some(e) => self.else_fail_literal(e)?,
             None => "assertion failed".to_string(),
         };
         let on_fail = self.lower_fmt(&msg)?;
@@ -2958,11 +2996,19 @@ impl FuncBuilder<'_> {
             "warn" => FileLogLevel::Warn,
             "error" => FileLogLevel::Error,
             "fatal" => FileLogLevel::Fatal,
+            // Spec §7.7: `Severity` is a closed enum
+            // (`debug`/`info`/`warn`/`error`/`fatal`), so anything else
+            // names no severity. This is not a missing feature in
+            // either backend — v1 accepts it by uppercasing whatever
+            // ident it finds, which turns a typo (`log(errror, ...)`)
+            // into an `ERRROR`-tagged line that never bumps the failure
+            // counter. Rejecting it is what makes `log(error, ...)`
+            // trustworthy.
             other => {
-                return Err(unsupported(
-                    &format!("log severity `{other}`"),
-                    "supported: debug, info, warn, error, fatal",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "`{other}` is not a log severity; spec §7.7 defines \
+                     `Severity` as debug, info, warn, error, fatal"
+                )));
             }
         };
         let level = match file {

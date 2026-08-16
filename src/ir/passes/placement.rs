@@ -498,6 +498,11 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         }
         Expr::Unary(_, a) => visit_expr(a, accesses, transactor),
         Expr::BitSlice { target, .. } => visit_expr(target, accesses, transactor),
+        Expr::BitSliceDyn { target, hi, lo } => {
+            visit_expr(target, accesses, transactor);
+            visit_expr(hi, accesses, transactor);
+            visit_expr(lo, accesses, transactor);
+        }
         Expr::Ternary(c, t, e) => {
             visit_expr(c, accesses, transactor);
             visit_expr(t, accesses, transactor);

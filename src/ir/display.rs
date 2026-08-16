@@ -414,6 +414,9 @@ impl Display for TbProgram {
                 crate::ir::PropertyShape::Invariant(e) => check_expr_str(e),
             };
             writeln!(f, "  property p{i} {sev} `{}` [{}] {body}", p.label, p.tag)?;
+            if let Some(m) = &p.message {
+                writeln!(f, "    else fail \"{}\"", m.fmt.escape_debug())?;
+            }
             for (si, slot) in p.temporals.iter().enumerate() {
                 writeln!(f, "    latch #{si} <- {}", check_expr_str(&slot.inner))?;
             }
@@ -1128,6 +1131,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::BitSlice { target, hi, lo } => {
             format!("{}[{hi}:{lo}]", expr_str(func, target))
         }
+        Expr::BitSliceDyn { target, hi, lo } => format!(
+            "{}[{}:{}]",
+            expr_str(func, target),
+            expr_str(func, hi),
+            expr_str(func, lo)
+        ),
         Expr::WidthCast {
             kind,
             width,
@@ -1213,6 +1222,12 @@ fn cover_expr_str(e: &Expr) -> String {
             )
         }
         Expr::BitSlice { target, hi, lo } => format!("{}[{hi}:{lo}]", cover_expr_str(target)),
+        Expr::BitSliceDyn { target, hi, lo } => format!(
+            "{}[{}:{}]",
+            cover_expr_str(target),
+            cover_expr_str(hi),
+            cover_expr_str(lo)
+        ),
         Expr::WidthCast {
             kind, width, inner, ..
         } => {

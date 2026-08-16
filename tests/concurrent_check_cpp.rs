@@ -86,6 +86,28 @@ impl OnTest for OnTb
 end impl OnTest
 "#;
 
+/// An `else fail(...)` clause on a concurrent check, plus a bit slice
+/// whose low bound is a runtime local. Both render INSIDE the per-cycle
+/// closure, so both have to survive the `[&]` capture: the message's
+/// `${lo}` reads a test-scope local, and the slice's bound reads the
+/// same one. Interpolation into a `printf` format is also where a
+/// mismatched argument count or a lost `harc_printf_ll` wrapper turns
+/// into garbage output rather than a compile error, which is why this
+/// probe checks the printed text and not just that it built.
+const MSG_TB: &str = r#"testbench MsgTb
+    dut : Top
+end testbench MsgTb
+
+impl MsgTest for MsgTb
+    run
+        let lo = 0
+        assert past(dut.a) == 0 else fail("a was ${dut.a} lo=${lo}")
+        assert dut.b[lo:0] == 1 |-> dut.c == 1 else fail("b lsb set without c")
+        wait 1 cycle
+    end run
+end impl MsgTest
+"#;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -516,6 +538,126 @@ int main() {{
     assert_eq!(
         got, "3 30",
         "both subscribers must see both emits (1+2 and 10*(1+2)); got `{got}`"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `assert <concurrent> else fail("...")` must report the user's own
+/// message, with its interpolations, instead of the generic
+/// ``property `<inline>` failed`` line — and a runtime-bounded bit slice
+/// inside the same closure must evaluate against the DUT value, not a
+/// truncated copy.
+///
+/// v1 parses the `else fail(...)` clause and then drops it on the floor,
+/// so under that backend both checks below print the same anonymous
+/// line and a failing run tells you nothing about which one failed.
+#[test]
+fn emitted_check_messages_and_runtime_slices_compile_and_print() {
+    let Some(cxx) = cxx() else {
+        assert!(
+            std::env::var_os("HARC_SKIP_CXX_PROBE").is_some(),
+            "no C++ compiler on PATH (tried $CXX, g++, clang++)."
+        );
+        eprintln!("SKIP emitted_check_messages_and_runtime_slices_compile_and_print.");
+        return;
+    };
+
+    let dir = fresh_outdir("msgprobe");
+    let cpp = emit_src(&dir, "msg_tb", MSG_TB);
+    let closures = checker_closures(&cpp);
+    assert_eq!(
+        closures.len(),
+        2,
+        "one closure per concurrent check; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("property `<inline>` failed"),
+        "an `else fail(...)` clause must replace the generic line, not sit beside it:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_bits(harc_rt::harc_read(dut->b)"),
+        "a runtime-bounded slice of a whole port must widen through `harc_read` before \
+         slicing, so a wide signal is not truncated first:\n{cpp}"
+    );
+
+    // Stimulus, one row per primary-clock edge: (a, b, c).
+    //
+    //  cyc0  a=0 b=1 c=0   past(a) latch is 0 → holds; b[0]=1 and c=0 →
+    //                      the `|->` fires with its own message
+    //  cyc1  a=1 b=0 c=0   past(a) is cyc0's 0 → holds; b[0]=0 → no fire
+    //  cyc2  a=0 b=0 c=0   past(a) is cyc1's 1 → the invariant fires,
+    //                      printing the live a (0) and lo (0)
+    //
+    // Expected stdout: the `|->` message once, then the interpolated
+    // invariant message once.
+    let probe = dir.join("probe.cpp");
+    let body = closures.join("\n");
+    std::fs::write(
+        &probe,
+        format!(
+            r#"#include "harc_thread_rt.h"
+#include <cstdarg>
+#include <cstdio>
+#include <functional>
+#include <vector>
+
+struct Dut {{ uint64_t a = 0, b = 0, c = 0; }};
+static Dut _dut_storage;
+static Dut* dut = &_dut_storage;
+
+static struct {{ long errors = 0; }} ctx;
+static void sim_log_line(const char* sev, const char* fmt, ...) {{
+    printf("%s|", sev);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}}
+
+int main() {{
+    // The test-scope local both the message and the slice bound capture.
+    int64_t lo = 0;
+    std::vector<std::function<void()>> _checkers;
+{body}
+    const uint64_t stim[3][3] = {{ {{0,1,0}}, {{1,0,0}}, {{0,0,0}} }};
+    for (int i = 0; i < 3; i++) {{
+        dut->a = stim[i][0];
+        dut->b = stim[i][1];
+        dut->c = stim[i][2];
+        for (auto& c : _checkers) c();
+    }}
+    printf("errors=%ld\n", ctx.errors);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write probe");
+
+    let bin = dir.join("probe");
+    let compile = Command::new(&cxx)
+        .arg("-std=c++20")
+        .arg("-I")
+        .arg(repo_root().join("runtime"))
+        .arg(&probe)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("run the C++ compiler");
+    assert!(
+        compile.status.success(),
+        "the emitted check messages did not compile:\n{}\n--- probe ---\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        std::fs::read_to_string(&probe).unwrap_or_default(),
+    );
+    let run = Command::new(&bin).output().expect("run the probe");
+    assert!(run.status.success(), "probe crashed");
+    let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert_eq!(
+        got, "FAIL|b lsb set without c\nFAIL|a was 0 lo=0\nerrors=2",
+        "each check must report its own `else fail(...)` message, with `${{dut.a}}` and \
+         `${{lo}}` interpolated from the live values; got:\n{got}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

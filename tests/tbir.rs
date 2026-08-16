@@ -8506,7 +8506,9 @@ impl TbRecordFreeHelperFenceTest for Tb
 end impl TbRecordFreeHelperFenceTest
 "#;
     let err = lower_src(src).expect_err("free helper must not capture testbench record field");
-    let msg = assert_unsupported(&err);
+    // v1 has no rejection here: it passes `cur.value` through as C++
+    // member syntax inside a free function that never declared `cur`.
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("field access on a non-DUT value ending in `.value`"),
         "{msg}"
@@ -10609,7 +10611,7 @@ end test T"#,
     .expect_err("nested temporal readings must not lower");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("cannot be nested inside another temporal reading"),
+        msg.contains("not nested inside another temporal reading"),
         "got: {msg}"
     );
 }
@@ -10632,7 +10634,7 @@ end test T"#,
     .expect_err("a bare temporal reading must be rejected");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("only meaningful inside a concurrent"),
+        msg.contains("only meaningful in the CONDITION of a concurrent"),
         "got: {msg}"
     );
 }
@@ -11787,23 +11789,44 @@ end test T"#,
     assert!(msg.contains("bitbash"), "{msg}");
 }
 
-/// The counterpart: `log(<unknown severity>, …)` DOES work under v1 —
-/// it passes the word through as the log tag — so that rejection keeps
-/// its `--codegen v1` suggestion. The two classes must stay distinct.
+/// `log(<unknown severity>, …)` is neither a TB-IR gap nor a v1 escape
+/// hatch: spec §7.7 defines `Severity` as a closed five-variant enum, so
+/// `trace` names no severity. v1 "accepts" it only by uppercasing
+/// whatever ident it finds, which is exactly what makes a typo
+/// dangerous — `log(errror, …)` prints an `ERRROR` line and never bumps
+/// the failure counter, so a test that should fail passes. The
+/// diagnostic must be an `Invalid`, never a pointer at `--codegen v1`.
 #[test]
-fn an_unknown_log_severity_still_suggests_v1() {
-    let err = lower_src(
-        r#"test T
+fn an_unknown_log_severity_is_invalid_not_a_v1_gap() {
+    for (sev, call) in [
+        ("trace", r#"log(trace, "x")"#),
+        ("errror", r#"log(errror, "x")"#),
+        ("trace", r#"logf("f.log", trace, "x")"#),
+    ] {
+        let err = lower_src(&format!(
+            r#"test T
     let dut : Top
     run
-        log(trace, "x")
+        {call}
         wait 1 cycle
     end run
-end test T"#,
-    )
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("log severity `trace`"), "{msg}");
+end test T"#
+        ))
+        .unwrap_err();
+        let lower::LowerError::Invalid(msg) = &err else {
+            panic!("`{call}` must be Invalid, not a backend gap: {err:?}");
+        };
+        assert!(
+            msg.contains(&format!("`{sev}` is not a log severity"))
+                && msg.contains("debug, info, warn, error, fatal"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("codegen v1"),
+            "a typo'd severity must not send the user to a backend that accepts it \
+             silently: {msg}"
+        );
+    }
 }
 
 /// Probes and bind remaps on a NON-`dut` binding are one family with one
@@ -11895,5 +11918,489 @@ end impl T"#,
     assert!(
         msg.contains("no other binding gets a probe accessor"),
         "the family's shared explanation must be present: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Runtime-bounded bit slices, `else fail(...)` on a concurrent check,
+// and the diagnostics around them.
+// ---------------------------------------------------------------------
+
+/// A bit slice whose bounds are not both literals lowers through the
+/// runtime `harc_bits` helper — the same shape v1 emits for EVERY slice,
+/// constant bounds included. Before this, `x[i:0]` was rejected as
+/// "not supported yet" with a pointer at a backend that had always
+/// handled it.
+#[test]
+fn a_runtime_bounded_bit_slice_lowers_through_the_helper() {
+    for slice in ["dut.a[i:0]", "dut.a[3:i]", "dut.a[i:i]", "dut.a[i + 1:i]"] {
+        let cpp = emit_cpp_src(&format!(
+            r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let i = 1
+        let b = {slice}
+        wait 1 cycle
+    end run
+end impl T"#
+        ));
+        assert!(
+            cpp.contains("harc_rt::harc_bits("),
+            "`{slice}` must lower to the runtime helper:\n{cpp}"
+        );
+    }
+
+    // Literal bounds keep folding into the shift-and-mask form — the
+    // helper is the fallback for unknown widths, not a replacement.
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let b = dut.a[3:1]
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        !cpp.contains("harc_rt::harc_bits("),
+        "a constant slice must still fold to a shift and mask:\n{cpp}"
+    );
+}
+
+/// A reversed literal slice names no bits. Neither backend "supports"
+/// it: v1 emits `harc_bits(v, 0, 3)`, whose `hi < lo` guard returns 0,
+/// so the read is silently always-zero. The diagnostic must be an
+/// `Invalid` that says so, not a gap report.
+#[test]
+fn a_reversed_literal_bit_slice_is_invalid() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let b = dut.a[0:3]
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let lower::LowerError::Invalid(msg) = &err else {
+        panic!("a reversed slice is malformed, not a backend gap: {err:?}");
+    };
+    assert!(
+        msg.contains("`[0:3]` is reversed") && msg.contains("`[3:0]`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("codegen v1"), "{msg}");
+}
+
+/// `lower_property_check` destructures the top-level `|->` / `|=>` into
+/// a `PropertyShape`, so one reaching the expression lowering sat
+/// somewhere the subset does not lower: a value position, or nested
+/// inside another implication (legal property syntax, just not lowered
+/// here). v1 accepts BOTH and emits the C++ comma operator
+/// (`a /* unsupported-op */ , b`), which compiles and evaluates to the
+/// right operand alone — so the antecedent is silently dropped and the
+/// check runs on half the expression. Pointing a user there would be
+/// worse than saying nothing.
+#[test]
+fn an_implication_outside_the_top_level_does_not_point_at_v1() {
+    let nested = [
+        // Value position.
+        "let x = (dut.a == 1) |-> (dut.b == 1)",
+        // Nested inside another implication.
+        "assert dut.a |-> (dut.b |-> dut.c)",
+        // Nested under the `|=>` spelling.
+        "assert dut.a |=> (dut.b |=> dut.c)",
+    ];
+    for stmt in nested {
+        let err = lower_src(&format!(
+            r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        {stmt}
+        wait 1 cycle
+    end run
+end impl T"#
+        ))
+        .unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("outside the top level of an `assert` / `assume`"),
+            "`{stmt}`: {msg}"
+        );
+    }
+}
+
+/// The SVA sequence operators reach no emitter in either backend. v1
+/// accepts them by emitting the C++ comma operator, so
+/// `assert a throughout b` compiles into a check on `b` alone — the
+/// worst outcome available, and exactly why the diagnostic must not
+/// name v1 as an escape hatch.
+#[test]
+fn the_sequence_operators_are_not_implemented_by_either_backend() {
+    for (op, name) in [
+        ("throughout", "throughout"),
+        ("within", "within"),
+        ("intersect", "intersect"),
+    ] {
+        let err = lower_src(&format!(
+            r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert (dut.a == 1) {op} (dut.b == 1)
+        wait 1 cycle
+    end run
+end impl T"#
+        ))
+        .unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains(&format!("the `{name}` sequence operator")), "{msg}");
+    }
+}
+
+/// An index or field access on something neither backend can index is
+/// not a v1 escape hatch: v1 passes the syntax straight through, so
+/// `a[0]` on a scalar local emits `int64_t b = a[0];` and `x.foo` emits
+/// `int64_t y = x.foo;` — neither compiles.
+#[test]
+fn indexing_and_field_access_on_a_scalar_do_not_point_at_v1() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let a = 5
+        let b = a[0]
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("index expressions"), "{msg}");
+
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let x = 1
+        let y = x.foo
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("field access on a non-DUT value ending in `.foo`"),
+        "{msg}"
+    );
+}
+
+/// `assert <concurrent> else fail("...")` reports the user's message.
+/// v1 parses the clause and discards it, so every concurrent failure
+/// there prints the same anonymous ``property `<inline>` failed`` line
+/// no matter how many checks are registered.
+#[test]
+fn a_concurrent_assert_reports_its_else_fail_message() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("a moved")
+        assert rose(dut.b) |-> dut.c else fail("rise without c")
+        assert stable(dut.c)
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains(r#"sim_log_line("FAIL", "a moved")"#), "{cpp}");
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "rise without c")"#),
+        "the message replaces the generic line INCLUDING its `(|->)` suffix:\n{cpp}"
+    );
+    // The check written without a clause keeps the generic line.
+    assert!(
+        cpp.contains("property `<inline>` failed"),
+        "a check with no `else fail(...)` still reports generically:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("(|->)"),
+        "no generic implication line survives when both implications carry a message:\n{cpp}"
+    );
+}
+
+/// The message is lowered inside the check body, so it obeys the same
+/// rule as the condition: it may read locals and ports, but it may not
+/// push statements into the test. A message whose interpolation would
+/// need a hoisted call is rejected rather than silently evaluated once
+/// at registration.
+#[test]
+fn a_concurrent_check_message_interpolates_from_the_closure() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let lo = 0
+        assert past(dut.a) == 0 else fail("a=${dut.a} lo=${lo}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "a=%lld lo=%lld""#),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_read(dut->a)") && cpp.contains("harc_printf_ll(lo)"),
+        "both captures render inside the closure:\n{cpp}"
+    );
+}
+
+/// An `assume` honors the clause the same way, in both the immediate
+/// and the concurrent form. v1 drops it in both, so an `assume` failure
+/// there is always the bare word "assumption failed".
+#[test]
+fn an_assume_reports_its_else_fail_message() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assume dut.a == 1 else fail("immediate assume")
+        assume past(dut.b) == 0 else fail("concurrent assume")
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("ASSUME", "immediate assume")"#),
+        "{cpp}"
+    );
+    // The concurrent form keeps its own `ASSUME-FAIL` tag; only the
+    // message text comes from the clause.
+    assert!(
+        cpp.contains(r#"sim_log_line("ASSUME-FAIL", "concurrent assume")"#),
+        "{cpp}"
+    );
+    // An `assume` never bumps the error counter, message or not.
+    assert!(
+        !cpp.contains("assumption failed"),
+        "the clause replaces the generic wording:\n{cpp}"
+    );
+}
+
+/// `dump-ir` must show the message, so a check's identity in the IR
+/// dump matches the line it will print.
+#[test]
+fn the_ir_dump_shows_a_check_message() {
+    let prog = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("a moved")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect("lowers");
+    let dump = format!("{prog}");
+    assert!(dump.contains(r#"else fail "a moved""#), "{dump}");
+}
+
+/// A runtime slice of a WIDE value must slice out of all its words. The
+/// `HarcWide<N>` → `_harc_u128` conversion keeps only the low four, so
+/// casting the target before the call would make `w[200:193]` on a
+/// `uint<256>` read 0. The target is passed uncast so overload
+/// resolution binds the wide `harc_bits`.
+#[test]
+fn a_runtime_slice_of_a_wide_value_is_not_cast_to_128_bits() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let i = 200
+        let w : uint<256> = 5
+        let b = w[i:1]
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_bits((w), (uint32_t)(i), (uint32_t)(1))"),
+        "a wide target must reach `harc_bits` uncast:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_harc_u128)(w)"),
+        "casting to `_harc_u128` first drops every word above the low four:\n{cpp}"
+    );
+}
+
+/// A transactor-method call inside a runtime slice bound is still a call
+/// edge. `expr_has_transactor_edge` gates the `wait until` predicate on
+/// exactly that, and a walker missing the new node would let one through
+/// into a per-cycle predicate.
+#[test]
+fn a_transactor_call_in_a_slice_bound_is_still_a_call_edge() {
+    let err = lower_src(&fixture_with_transactor_call_in_slice_bound()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("transactor method call inside a `wait until` predicate"),
+        "a call edge hidden in a slice bound must still trip the predicate gate: {msg}"
+    );
+}
+
+fn fixture_with_transactor_call_in_slice_bound() -> String {
+    // A `wait until` whose predicate slices a port by a bound that calls
+    // a sibling method — the call is two levels down, inside the `hi`
+    // operand of the slice, where a walker missing `BitSliceDyn` would
+    // not find it.
+    r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable idx() -> uint<8>
+            return 3
+        end idx
+
+        hookable wait_slice()
+            wait until dut.a[idx():0] == 1
+        end wait_slice
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtSliceBoundCallTest for XtTb
+    run
+        xt.dut = dut
+        xt.wait_slice()
+    end run
+end impl XtSliceBoundCallTest
+"#
+    .to_string()
+}
+
+/// `cover` counts witnesses; it reports hit/total, not a failure, so an
+/// `else fail(...)` clause has nothing to name. The parser accepts the
+/// clause on any verify statement and v1 drops it silently — the exact
+/// "written, accepted, lost" shape this sweep set out to remove.
+#[test]
+fn a_cover_rejects_an_else_fail_clause() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        cover rose(dut.a) else fail("never covered")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let lower::LowerError::Invalid(msg) = &err else {
+        panic!("a cover cannot carry a failure message: {err:?}");
+    };
+    assert!(
+        msg.contains("`cover` counts witnesses") && msg.contains("use `assert`"),
+        "{msg}"
+    );
+}
+
+/// The `else fail(...)` message is lowered with NO temporal slot map:
+/// `lower_fmt` re-parses each capture as a standalone fragment whose
+/// spans are fragment-relative, so a capture's span can collide with a
+/// real temporal occurrence's and get rewritten into that occurrence's
+/// `Expr::TemporalSlot`. With the map empty, a `${past(x)}` reaches the
+/// ordinary temporal gate and is rejected by name.
+#[test]
+fn a_check_message_cannot_read_a_temporal_slot() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("was ${past(dut.a)}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("not in that check's `else fail(...)` message"),
+        "{msg}"
+    );
+
+    // The span-collision itself: a message whose capture is a plain
+    // port read must stay a port read, never a latch. This is the
+    // shape that silently emitted `_harc_ps0` before the map was
+    // cleared.
+    let prog = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("b=${dut.b}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect("lowers");
+    let msg = prog.property_checks[0]
+        .message
+        .as_ref()
+        .expect("the clause lowered");
+    assert!(
+        msg.args
+            .iter()
+            .all(|a| !matches!(a.expr, ir::Expr::TemporalSlot { .. })),
+        "a message capture must never alias a latch slot: {:?}",
+        msg.args
+    );
+    // …and the emitted closure reads the port, not the latch.
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("b=${dut.b}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "b=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->b)))"#),
+        "{cpp}"
     );
 }

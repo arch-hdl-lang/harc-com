@@ -5903,6 +5903,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
             ir::Expr::BitSlice { target, .. } => in_expr(target),
+            ir::Expr::BitSliceDyn { target, hi, lo } => {
+                in_expr(target).or_else(|| in_expr(hi)).or_else(|| in_expr(lo))
+            }
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.
@@ -6017,6 +6020,11 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             }
             ir::Expr::Unary(_, a) => fill_expr(a, instance),
             ir::Expr::BitSlice { target, .. } => fill_expr(target, instance),
+            ir::Expr::BitSliceDyn { target, hi, lo } => {
+                fill_expr(target, instance);
+                fill_expr(hi, instance);
+                fill_expr(lo, instance);
+            }
             ir::Expr::Ternary(c, t, f) => {
                 fill_expr(c, instance);
                 fill_expr(t, instance);
@@ -6268,6 +6276,11 @@ fn fill_visit_expr(
         | Expr::WidthCast { inner: a, .. }
         | Expr::ComponentIdle { n: a, .. } => {
             fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict)
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            fill_visit_expr(target, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(hi, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(lo, placeholder, binding, remap, rewrite, conflict);
         }
         Expr::Ternary(c, t, f) => {
             fill_visit_expr(c, placeholder, binding, remap, rewrite, conflict);

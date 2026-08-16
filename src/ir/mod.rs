@@ -280,6 +280,11 @@ pub struct PropertyCheckSchema {
     /// Temporal latch slots referenced by `Expr::TemporalSlot` inside
     /// `shape`, in slot-index order.
     pub temporals: Vec<TemporalSlot>,
+    /// `else fail("...")` message, replacing the generic
+    /// ``property `<label>` failed`` line. `None` for a check written
+    /// without one. (v1 parses the clause and then discards it, so a
+    /// concurrent assertion there always reports the generic line.)
+    pub message: Option<FmtArgs>,
 }
 
 /// One registered concurrent `cover` witness counter (spec §5): every
@@ -2295,6 +2300,18 @@ pub enum Expr {
         target: Box<Expr>,
         hi: u32,
         lo: u32,
+    },
+    /// Runtime bit slice `expr[hi:lo]` where at least one bound is not a
+    /// literal — `x[i:0]`, `x[hi:hi-3]`. The width is not known at
+    /// lowering, so this cannot fold into a shift-and-mask; it emits the
+    /// runtime `harc_rt::harc_bits(value, hi, lo)` helper (the same one
+    /// v1 emits), which yields 0 for an out-of-range or reversed bound
+    /// rather than shifting by an undefined amount. Value type is
+    /// `uint64_t`, matching the helper's return.
+    BitSliceDyn {
+        target: Box<Expr>,
+        hi: Box<Expr>,
+        lo: Box<Expr>,
     },
     /// Width-method intrinsic (`.trunc<N>()` / `.zext<N>()` /
     /// `.sext<N>()` / `.resize<N>()`), with destinations through the
