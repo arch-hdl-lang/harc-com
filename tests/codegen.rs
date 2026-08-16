@@ -9039,7 +9039,7 @@ end test T"#,
 fn const_and_enum_variant_wrap_operands_carry_a_width() {
     let cpp = v1_cpp(
         r#"enum Color { RED, GREEN, BLUE }
-const BUMP : uint<8> = 10
+const BUMP : uint<16> = 10
 transaction Txn
     len : uint<8> default 0
     keep len +% BUMP == 5
@@ -9054,12 +9054,17 @@ test T
     end run
 end test T"#,
     );
+    // The const is declared 16 bits and initialised to 10, and the field
+    // is 8 — so the mask distinguishes sizing the const by its declared
+    // type (16, correct per §2.4) from sizing it by its value (4, which
+    // would let the field's 8 bits win and solve to a value the source
+    // constraint rejects).
     assert!(
         cpp.contains(
             "((_z_len + _ctx.bv_val((uint64_t)10, 64)) \
-             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="
         ),
-        "a `const` operand must resolve a width; got:\n{cpp}"
+        "a `const` operand must size to its declared type; got:\n{cpp}"
     );
     assert!(
         cpp.contains(
@@ -9067,6 +9072,145 @@ end test T"#,
              & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
         ),
         "an enum-variant operand must resolve a width; got:\n{cpp}"
+    );
+}
+
+/// Under `blocking randomize` the emitter inlines any remaining in-scope
+/// C++ expression, so the width oracle has to keep up with it: a record
+/// field and a DUT probe both carry declared widths the statement path
+/// already knows. Rejecting them turned building testbenches into build
+/// errors, with a diagnostic telling the user to use a transaction field
+/// type they had already used.
+#[test]
+fn blocking_record_field_and_probe_wrap_operands_carry_a_width() {
+    let record = v1_cpp(
+        r#"struct Cfg
+    max : uint<8>
+end struct Cfg
+transaction Txn
+    len : uint<16> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let c : Cfg
+        let t : Txn
+        blocking randomize(t) with
+            t.len +% c.max == 5
+        end randomize
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        record.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)(c.max), 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="
+        ),
+        "a record-field operand must resolve its declared width; got:\n{record}"
+    );
+
+    let probe = v1_cpp(
+        r#"transaction Txn
+    len : uint<16> default 0
+end transaction Txn
+test T
+    let dut : Top
+        probe cnt : uint<8> at count
+    end let dut
+    run
+        let t : Txn
+        blocking randomize(t) with
+            t.len +% dut.cnt == 5
+        end randomize
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        probe.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="),
+        "a DUT-probe operand must resolve its declared width; got:\n{probe}"
+    );
+}
+
+/// A sized literal states a width, but nothing truncates its digits to it
+/// — `c_int_literal` emits `4'hFF` as `0xFF`. The mask has to cover the
+/// value the emitter actually wrote, or oracle and emitter disagree about
+/// the same token.
+#[test]
+fn an_overwide_sized_literal_masks_to_the_value_actually_emitted() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<4> default 0
+    keep len +% 4'hFF == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)0xFF, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "4'hFF emits 0xFF, so the mask must be 8 bits not the declared 4; got:\n{cpp}"
+    );
+}
+
+/// A sized literal can declare more bits than the solver bitvector has,
+/// which is the second way (besides an unbounded bit-slice) to reach an
+/// unrepresentable residue.
+#[test]
+fn a_sized_literal_wider_than_the_solver_bitvector_is_rejected() {
+    let err = v1_emit_err(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% 128'h1 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("wider than the 64-bit solver bitvector"),
+        "expected the unrepresentable-residue diagnostic; got: {err}"
+    );
+}
+
+/// The membership call site passes `target_root` too — a nested signed
+/// field in `x in [lo..hi]` must compare signed.
+#[test]
+fn membership_range_signedness_resolves_the_dotted_path() {
+    let cpp = v1_cpp(
+        r#"struct Hdr
+    s : sint<64>
+end struct Hdr
+transaction Txn
+    hdr : Hdr
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t) with
+            t.hdr.s in [0..100]
+        end randomize
+        log(info, "x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("_z_hdr_s >= ") && !cpp.contains("z3::uge(_z_hdr_s"),
+        "a signed nested field in a range must use the signed comparison; got:\n{cpp}"
     );
 }
 
