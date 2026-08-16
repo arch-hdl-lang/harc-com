@@ -14019,3 +14019,44 @@ impl T for Tb
     end run
 end impl T
 "#;
+
+/// A file-scope `const` as a coverpoint slice bound. v1 emits one as
+/// `(uint32_t)(K)` against its own `static constexpr K` — identical
+/// semantics to the literal — while TB-IR refused anything but a plain
+/// integer.
+///
+/// The probe that established this mutates `cov_expr_targets_test`, a
+/// fixture BOTH backends already pass and which the equivalence harness
+/// trace-diffs. Starting from a registered fixture rather than a
+/// synthetic one is what made the result trustworthy: two earlier
+/// synthetic covergroup probes measured files in which neither backend
+/// had emitted any sampling logic at all, because a covergroup that is
+/// never instantiated emits none.
+#[test]
+fn a_const_coverpoint_slice_bound_folds() {
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cov_expr_targets_test.harc"),
+    )
+    .expect("read the registered fixture");
+    let with_const = |k: u32| {
+        format!("const K = {k}\n\n")
+            + &fixture.replace(
+                "cover dut.count_out[3:0]\n",
+                "cover dut.count_out[K:0]\n",
+            )
+    };
+
+    // The fold gives byte-identical output to the literal bound…
+    let literal = emit_cpp_src(&fixture);
+    let k3 = emit_cpp_src(&with_const(3));
+    assert_eq!(
+        literal, k3,
+        "`[K:0]` with `const K = 3` must lower exactly like `[3:0]`"
+    );
+
+    // …and the VALUE is genuinely used, so the equality above is not
+    // the fold silently dropping the bound.
+    let k7 = emit_cpp_src(&with_const(7));
+    assert_ne!(k3, k7, "a different const must produce a different mask");
+}

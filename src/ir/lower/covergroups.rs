@@ -63,6 +63,7 @@ pub(crate) fn lower_covergroup(
                 &hook_params,
                 helpers,
                 extern_fns,
+                consts,
             )?;
             let mut bins = Vec::new();
             for b in &p.bins {
@@ -241,6 +242,7 @@ fn lower_hook_param_field(
     point: &str,
     target: &AstExpr,
     hook_params: &[String],
+    consts: &HashMap<String, u64>,
 ) -> Result<Option<Expr>, LowerError> {
     if hook_params.is_empty() {
         return Ok(None);
@@ -267,7 +269,7 @@ fn lower_hook_param_field(
         // Covergroup schemas lower before any runtime scope, so a Vec
         // lane index can only be a constant literal here (same rule as
         // DUT-port lanes). Represent it as a constant `Expr::Literal`.
-        let v = cover_const_u64(group, point, i)?;
+        let v = cover_const_u64(group, point, i, consts)?;
         index = Some(Box::new(Expr::Literal {
             value: v,
             ty: IrType::Unknown,
@@ -311,6 +313,7 @@ fn lower_point_target(
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
+    consts: &HashMap<String, u64>,
 ) -> Result<Expr, LowerError> {
     let unsupported_target = || {
         unsupported(
@@ -326,11 +329,16 @@ fn lower_point_target(
     // later), so carry the param name + field; codegen renders it as the
     // closure arg `param.field` (mirrors v1 emitting `t.burst` over the
     // by-value closure param).
-    if let Some(hp) = lower_hook_param_field(group, point, target, hook_params)? {
+    if let Some(hp) = lower_hook_param_field(group, point, target, hook_params, consts)? {
         return Ok(hp);
     }
 
-    fn lower_port(group: &str, point: &str, e: &AstExpr) -> Result<Option<PortRef>, LowerError> {
+    fn lower_port(
+        group: &str,
+        point: &str,
+        e: &AstExpr,
+        consts: &HashMap<String, u64>,
+    ) -> Result<Option<PortRef>, LowerError> {
         let mut cur = e;
         let mut lane = None;
         if let ExprKind::Index { target, index } = &*cur.kind {
@@ -339,7 +347,7 @@ fn lower_point_target(
             // constant is in subset (`cover_const_u64` rejects anything
             // else). Kept as `LaneIndex::Const`.
             lane = Some(crate::ir::LaneIndex::Const(cover_const_u64(
-                group, point, index,
+                group, point, index, consts,
             )?));
             cur = target;
         }
@@ -368,7 +376,7 @@ fn lower_point_target(
         }
     }
 
-    if let Some(port) = lower_port(group, point, target)? {
+    if let Some(port) = lower_port(group, point, target, consts)? {
         return Ok(Expr::Port(port));
     }
 
@@ -390,8 +398,15 @@ fn lower_point_target(
                 });
             }
             ExprKind::Unary { op, expr } => {
-                let inner =
-                    lower_point_target(group, point, expr, hook_params, helpers, extern_fns)?;
+                let inner = lower_point_target(
+                    group,
+                    point,
+                    expr,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -401,8 +416,24 @@ fn lower_point_target(
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let op = super::exprs::lower_bin_op(*op)?;
-                let lhs = lower_point_target(group, point, lhs, hook_params, helpers, extern_fns)?;
-                let rhs = lower_point_target(group, point, rhs, hook_params, helpers, extern_fns)?;
+                let lhs = lower_point_target(
+                    group,
+                    point,
+                    lhs,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
+                let rhs = lower_point_target(
+                    group,
+                    point,
+                    rhs,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
                 return Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)));
             }
             ExprKind::Ternary {
@@ -410,8 +441,15 @@ fn lower_point_target(
                 then_branch,
                 else_branch,
             } => {
-                let cond =
-                    lower_point_target(group, point, cond, hook_params, helpers, extern_fns)?;
+                let cond = lower_point_target(
+                    group,
+                    point,
+                    cond,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
                 let then_branch = lower_point_target(
                     group,
                     point,
@@ -419,6 +457,7 @@ fn lower_point_target(
                     hook_params,
                     helpers,
                     extern_fns,
+                    consts,
                 )?;
                 let else_branch = lower_point_target(
                     group,
@@ -427,6 +466,7 @@ fn lower_point_target(
                     hook_params,
                     helpers,
                     extern_fns,
+                    consts,
                 )?;
                 return Ok(Expr::Ternary(
                     Box::new(cond),
@@ -435,15 +475,22 @@ fn lower_point_target(
                 ));
             }
             ExprKind::BitSlice { target, hi, lo } => {
-                let hi = cover_const_u32(group, point, hi)?;
-                let lo = cover_const_u32(group, point, lo)?;
+                let hi = cover_const_u32(group, point, hi, consts)?;
+                let lo = cover_const_u32(group, point, lo, consts)?;
                 if hi < lo {
                     return Err(LowerError::Invalid(format!(
                         "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
                     )));
                 }
-                let target =
-                    lower_point_target(group, point, target, hook_params, helpers, extern_fns)?;
+                let target = lower_point_target(
+                    group,
+                    point,
+                    target,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
                 return Ok(Expr::BitSlice {
                     target: Box::new(target),
                     hi,
@@ -451,13 +498,21 @@ fn lower_point_target(
                 });
             }
             ExprKind::Cast { expr, ty } => {
-                let width = cover_cast_width(group, point, ty)?.ok_or_else(unsupported_target)?;
-                let inner =
-                    lower_point_target(group, point, expr, hook_params, helpers, extern_fns)?;
+                let width =
+                    cover_cast_width(group, point, ty, consts)?.ok_or_else(unsupported_target)?;
+                let inner = lower_point_target(
+                    group,
+                    point,
+                    expr,
+                    hook_params,
+                    helpers,
+                    extern_fns,
+                    consts,
+                )?;
                 return Ok(Expr::WidthCast {
                     kind: WidthCastKind::Resize,
                     width,
-                    src_width: cover_infer_expr_width(group, point, expr)?,
+                    src_width: cover_infer_expr_width(group, point, expr, consts)?,
                     inner: Box::new(inner),
                 });
             }
@@ -489,6 +544,7 @@ fn lower_point_target(
                             hook_params,
                             helpers,
                             extern_fns,
+                            consts,
                         )?;
                         return Ok(Expr::Call(CallTarget::Helper(id.name.clone()), args));
                     }
@@ -509,6 +565,7 @@ fn lower_point_target(
                             hook_params,
                             helpers,
                             extern_fns,
+                            consts,
                         )?;
                         return Ok(Expr::Call(CallTarget::ExternFn(id.name.clone()), args));
                     }
@@ -520,8 +577,8 @@ fn lower_point_target(
                             Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
                             _ => return Err(unsupported_target()),
                         };
-                        let width = cover_width_arg(group, point, &name.name, width_expr)?;
-                        let src_width = cover_infer_expr_width(group, point, recv)?;
+                        let width = cover_width_arg(group, point, &name.name, width_expr, consts)?;
+                        let src_width = cover_infer_expr_width(group, point, recv, consts)?;
                         let inner = lower_point_target(
                             group,
                             point,
@@ -529,6 +586,7 @@ fn lower_point_target(
                             hook_params,
                             helpers,
                             extern_fns,
+                            consts,
                         )?;
                         let kind = match name.name.as_str() {
                             "trunc" => WidthCastKind::Trunc,
@@ -568,6 +626,12 @@ fn lower_point_target(
     }
 }
 
+// Eight parameters, one over the lint's threshold, and the last five are
+// the same lowering context every function in this chain forwards
+// unchanged (`hook_params`, `helpers`, `extern_fns`, `consts`). Bundling
+// them into a context struct is the right cleanup and touches the whole
+// file; it is deliberately not folded into a diagnostics change.
+#[allow(clippy::too_many_arguments)]
 fn lower_point_call_args(
     group: &str,
     point: &str,
@@ -576,6 +640,7 @@ fn lower_point_call_args(
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
+    consts: &HashMap<String, u64>,
 ) -> Result<Vec<Expr>, LowerError> {
     let mut lowered = Vec::with_capacity(args.len());
     for arg in args {
@@ -587,6 +652,7 @@ fn lower_point_call_args(
                 hook_params,
                 helpers,
                 extern_fns,
+                consts,
             )?),
             crate::ast::CallArg::Named { .. } => {
                 return Err(unsupported(
@@ -599,9 +665,27 @@ fn lower_point_call_args(
     Ok(lowered)
 }
 
-fn cover_const_u64(group: &str, point: &str, e: &AstExpr) -> Result<u64, LowerError> {
+/// A constant in a coverpoint target — a `Vec` lane index or a slice
+/// bound. Covergroup schemas lower before any runtime scope exists, so
+/// these reference no locals; a file-scope `const` or enum variant is
+/// still fair game, and v1 emits one as `(uint32_t)(K)` against its own
+/// `static constexpr K` — identical semantics to the literal. Verified
+/// by mutating `cov_expr_targets_test`, which BOTH backends pass, one
+/// bound at a time.
+fn cover_const_u64(
+    group: &str,
+    point: &str,
+    e: &AstExpr,
+    consts: &HashMap<String, u64>,
+) -> Result<u64, LowerError> {
     match &*e.kind {
-        ExprKind::Paren(inner) => cover_const_u64(group, point, inner),
+        ExprKind::Paren(inner) => cover_const_u64(group, point, inner, consts),
+        ExprKind::Ident(id) => consts.get(&id.name).copied().ok_or_else(|| {
+            unsupported(
+                &format!("covergroup `{group}` point `{point}` non-constant index/slice bound"),
+                format!("`{}` is not a file-scope const or enum variant", id.name),
+            )
+        }),
         ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
             unsupported(
                 &format!("covergroup `{group}` point `{point}` constant"),
@@ -615,8 +699,13 @@ fn cover_const_u64(group: &str, point: &str, e: &AstExpr) -> Result<u64, LowerEr
     }
 }
 
-fn cover_const_u32(group: &str, point: &str, e: &AstExpr) -> Result<u32, LowerError> {
-    let v = cover_const_u64(group, point, e)?;
+fn cover_const_u32(
+    group: &str,
+    point: &str,
+    e: &AstExpr,
+    consts: &HashMap<String, u64>,
+) -> Result<u32, LowerError> {
+    let v = cover_const_u64(group, point, e, consts)?;
     u32::try_from(v).map_err(|_| {
         LowerError::Invalid(format!(
             "covergroup `{group}` point `{point}` constant {v} does not fit in u32"
@@ -624,8 +713,14 @@ fn cover_const_u32(group: &str, point: &str, e: &AstExpr) -> Result<u32, LowerEr
     })
 }
 
-fn cover_width_arg(group: &str, point: &str, method: &str, e: &AstExpr) -> Result<u32, LowerError> {
-    let width = cover_const_u32(group, point, e)?;
+fn cover_width_arg(
+    group: &str,
+    point: &str,
+    method: &str,
+    e: &AstExpr,
+    consts: &HashMap<String, u64>,
+) -> Result<u32, LowerError> {
+    let width = cover_const_u32(group, point, e, consts)?;
     if width == 0 {
         return Err(LowerError::Invalid(format!(
             "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
@@ -644,6 +739,7 @@ fn cover_cast_width(
     group: &str,
     point: &str,
     ty: &crate::ast::TypeExpr,
+    consts: &HashMap<String, u64>,
 ) -> Result<Option<u32>, LowerError> {
     let width = match ty {
         crate::ast::TypeExpr::Builtin {
@@ -652,7 +748,7 @@ fn cover_cast_width(
             args,
             ..
         } => match args.first() {
-            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(group, point, e)?),
+            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(group, point, e, consts)?),
             Some(_) => None,
             None => Some(64),
         },
@@ -678,12 +774,13 @@ fn cover_infer_expr_width(
     group: &str,
     point: &str,
     e: &AstExpr,
+    consts: &HashMap<String, u64>,
 ) -> Result<Option<u32>, LowerError> {
     match &*e.kind {
-        ExprKind::Paren(inner) => cover_infer_expr_width(group, point, inner),
+        ExprKind::Paren(inner) => cover_infer_expr_width(group, point, inner, consts),
         ExprKind::BitSlice { hi, lo, .. } => {
-            let hi = cover_const_u32(group, point, hi)?;
-            let lo = cover_const_u32(group, point, lo)?;
+            let hi = cover_const_u32(group, point, hi, consts)?;
+            let lo = cover_const_u32(group, point, lo, consts)?;
             if hi < lo {
                 return Err(LowerError::Invalid(format!(
                     "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
@@ -691,7 +788,7 @@ fn cover_infer_expr_width(
             }
             Ok(Some(hi - lo + 1))
         }
-        ExprKind::Cast { ty, .. } => cover_cast_width(group, point, ty),
+        ExprKind::Cast { ty, .. } => cover_cast_width(group, point, ty, consts),
         ExprKind::Call { callee, args } => {
             if let ExprKind::Field { name, .. } = &*callee.kind {
                 if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
@@ -699,7 +796,9 @@ fn cover_infer_expr_width(
                         Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
                         _ => return Ok(None),
                     };
-                    return Ok(Some(cover_width_arg(group, point, &name.name, width_expr)?));
+                    return Ok(Some(cover_width_arg(
+                        group, point, &name.name, width_expr, consts,
+                    )?));
                 }
             }
             Ok(None)
@@ -813,7 +912,7 @@ fn lower_bin_bound(
             // (v1 renders the bound with the same `emit_expr` it uses for
             // point targets). It rejects anything outside the sampler
             // subset with a precise diagnostic.
-            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns)?;
+            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns, consts)?;
             Ok(CovBinBound::Runtime(expr))
         }
     }
