@@ -941,6 +941,46 @@ impl ComponentSchema {
     pub fn method(&self, name: &str) -> Option<&ComponentMethodSchema> {
         self.methods.iter().find(|m| m.name == name)
     }
+
+    /// Whether this schema contains behavior or storage selected by an
+    /// instance's active/passive mode.
+    pub fn has_active_surface(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| matches!(field.activation, Activation::ActiveOnly))
+            || self
+                .methods
+                .iter()
+                .any(|method| matches!(method.activation, Activation::ActiveOnly))
+            || self
+                .on_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .periodic_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .cycle_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .watchdog
+                .as_ref()
+                .is_some_and(|handler| matches!(handler.activation, Activation::ActiveOnly))
+    }
+
+    /// Whether an instance binding must carry a resolved mode. Connect edges
+    /// are included for transactors because an active-only endpoint changes
+    /// per-instance registration, even when no owned field/function is active.
+    pub fn requires_instance_mode(&self) -> bool {
+        matches!(self.kind, ComponentKindTag::Transactor)
+            && (self.has_active_surface()
+                || self.connects.iter().any(|edge| {
+                    matches!(edge.src_activation, Activation::ActiveOnly)
+                        || matches!(edge.sink_activation, Activation::ActiveOnly)
+                }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

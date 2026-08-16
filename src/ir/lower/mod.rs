@@ -1218,11 +1218,46 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Analysis-source transactors deliberately route through the composite
     // component table, but unlike envs and scoreboards they retain the
     // transactor mode contract at a direct testbench binding.
-    let analysis_source_transactor_names: HashSet<String> = file
+    let mode_sensitive_analysis_source_names: HashSet<String> = file
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Transactor(t) if components::transactor_is_analysis_source(t) => {
+            Item::Transactor(t)
+                if components::transactor_has_mode_sensitive_analysis_surface(t) =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Always-on analysis monitors have no active surface to select. Keep the
+    // #538 compatibility policy even when another shape classifier also sees
+    // them (for example, because they have a periodic observation handler):
+    // modeless and `passive` are valid, while `active` is meaningless.
+    let always_on_analysis_source_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t)
+                if components::transactor_is_analysis_source(t)
+                    && !components::transactor_has_mode_sensitive_analysis_surface(t) =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Preserve the source declaration kind after shape-based routing into the
+    // component table. This distinguishes always-on transactor monitors (where
+    // `passive` is a compatible ownership annotation) from actual structural
+    // env/agent/scoreboard/sequencer fields, which reject transactor modes.
+    let component_transactor_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
                 Some(t.name.name.clone())
             }
             _ => None,
@@ -1404,7 +1439,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &transactor_ids,
                         &scoreboard_ids,
                         &component_type_names,
-                        &analysis_source_transactor_names,
+                        &mode_sensitive_analysis_source_names,
+                        &always_on_analysis_source_names,
+                        &component_transactor_names,
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
                         &dut_poking_bfm_names,
@@ -2145,7 +2182,9 @@ fn validate_testbench_component(
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
-    analysis_source_transactor_names: &HashSet<String>,
+    mode_sensitive_analysis_source_names: &HashSet<String>,
+    always_on_analysis_source_names: &HashSet<String>,
+    component_transactor_names: &HashSet<String>,
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
     dut_poking_bfm_names: &HashSet<String>,
@@ -2186,7 +2225,7 @@ fn validate_testbench_component(
                     if covgroup_ids.contains_key(simple) {
                         continue;
                     }
-                    if analysis_source_transactor_names.contains(simple) {
+                    if mode_sensitive_analysis_source_names.contains(simple) {
                         match mode {
                             Some(TransactorMode::Active) | Some(TransactorMode::Passive) => {
                                 continue;
@@ -2199,6 +2238,20 @@ fn validate_testbench_component(
                                 )));
                             }
                         }
+                    }
+                    if always_on_analysis_source_names.contains(simple) {
+                        if matches!(mode, Some(TransactorMode::Active)) {
+                            return Err(unsupported(
+                                &format!(
+                                    "an `active` mode on composite-component \
+                                     testbench field `{}.{} : {simple}`",
+                                    c.name.name, f.name.name
+                                ),
+                                "only the passive ownership annotation is accepted for an \
+                                 always-on analysis-source component field",
+                            ));
+                        }
+                        continue;
                     }
                     // A reactive monitor / checker transactor field (`mon :
                     // MemXactor passive`) routes to a `ComponentSchema`;
@@ -2294,28 +2347,33 @@ fn validate_testbench_component(
                         }
                     }
                     // A composite-component type (method-bearing
-                    // scoreboard, analysis-source transactor, env, or
-                    // agent) bound as a testbench field. Accepted by the
-                    // testbench-field-binding slice: the field routes to a
-                    // `ComponentSchema` instance just like a test-scope
-                    // `let env : <Env>` does. A structural `env` root may
-                    // carry a mode as inherited context for nested
-                    // transactors; a scoreboard/agent/sequencer root may
-                    // not, because it cannot carry a transactor path.
+                    // scoreboard, always-on analysis monitor, env, or
+                    // agent) bound as a testbench field. A mode is not a
+                    // property of these structural fields. `passive` stays
+                    // accepted for the legacy analysis-monitor ownership
+                    // annotation; `active` remains a loud rejection. Mode
+                    // inheritance for nested transactors starts at a
+                    // test-scope `let`, not at a reusable testbench field.
                     if component_type_names.contains(simple) {
-                        let is_structural_env = components.get(simple).is_some_and(|component| {
-                            matches!(component.kind, crate::ast::ComponentKind::Env)
-                        });
-                        if mode.is_some() && !is_structural_env {
+                        if component_transactor_names.contains(simple) {
+                            if matches!(mode, Some(TransactorMode::Active)) {
+                                return Err(unsupported(
+                                    &format!(
+                                        "an `active` mode on composite-component \
+                                         testbench field `{}.{} : {simple}`",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "only the passive ownership annotation is accepted for an \
+                                     analysis-source component field",
+                                ));
+                            }
+                            continue;
+                        }
+                        if mode.is_some() {
                             return Err(LowerError::Invalid(format!(
-                                "a transactor mode on {} field `{}.{} : {simple}`",
-                                if components.contains_key(simple) {
-                                    "structural component"
-                                } else {
-                                    "component"
-                                },
-                                c.name.name,
-                                f.name.name,
+                                "a transactor mode on structural component field `{}.{} : \
+                                 {simple}`",
+                                c.name.name, f.name.name
                             )));
                         }
                         continue;

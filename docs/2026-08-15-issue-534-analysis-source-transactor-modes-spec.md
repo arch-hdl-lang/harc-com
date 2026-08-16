@@ -37,10 +37,13 @@ excluding active-only access and registration. A field whose declared type is an
 actual env, agent, scoreboard, or sequencer will continue to reject a transactor
 mode with a precise source-level diagnostic.
 
-A direct testbench transactor field has no inherited mode and therefore requires
-an explicit `active` or `passive` annotation. The no-mode case will be tested as a
-precise rejection, matching the v1 backend and documenting that no root-level
-default exists.
+A direct testbench analysis-source transactor field that declares a nonempty
+`when active` surface has no inherited mode and therefore requires an explicit
+`active` or `passive` annotation. An entirely always-on analysis monitor retains
+the compatibility contract pinned by #538: no mode and `passive` lower
+with identical behavior, while `active` is rejected because it would select no
+behavior. TB-IR may retain the passive ownership annotation as diagnostic-only
+binding metadata.
 
 ## User Stories
 
@@ -55,7 +58,7 @@ default exists.
 9. As a reusable testbench author, I want an active binding to include the `when active` surface and its registrations, so that active-only event handlers and lifecycle behavior execute as declared.
 10. As a HARC verification author, I want calls to active-only methods through a passive instance to fail during compilation, so that orphan active code cannot be invoked accidentally.
 11. As a HARC verification author, I want accesses to active-only fields or events through a passive instance to fail precisely, so that mode errors are caught before C++ compilation or simulation.
-12. As a HARC verification author, I want a direct testbench transactor field without a mode to receive a clear diagnostic, so that I understand that root-level bindings have no inherited default.
+12. As a HARC verification author, I want a direct testbench transactor field with a `when active` surface but without a mode to receive a clear diagnostic, so that I understand that root-level bindings have no inherited default.
 13. As a HARC verification author, I want mode annotations on actual env declarations to remain invalid, so that transactor ownership semantics do not leak into unrelated constructs.
 14. As a HARC verification author, I want mode annotations on actual agent declarations to remain invalid, so that declaration kind remains authoritative.
 15. As a HARC verification author, I want mode annotations on actual scoreboard declarations to remain invalid regardless of their internal schema route, so that method-bearing and data-only scoreboards follow one source rule.
@@ -87,9 +90,11 @@ default exists.
   semantic binding mode. Multithreaded driver emission will ask whether the
   binding includes the active surface rather than interpreting a backend-specific
   boolean.
-- A direct testbench transactor field requires an explicit mode. The mode-less
-  case is invalid because there is no parent binding from which to inherit a
-  mode.
+- A direct testbench analysis-source transactor field with a nonempty `when
+  active` surface requires an explicit mode. The mode-less case is invalid
+  because there is no parent binding from which to inherit a mode. An
+  always-on-only analysis monitor is not mode-sensitive: modeless and `passive`
+  bindings remain behaviorally equivalent, and `active` remains invalid.
 - A mode attached to a field whose declared type is an env, agent, scoreboard,
   or sequencer is a source-level error. A test-scope root `let root : Env active`
   remains a legal inheritance carrier for descendant transactors, because that
@@ -116,14 +121,15 @@ default exists.
 - Always-on registrations remain installed for both modes.
 - Explicit mode metadata on nested transactor fields will be retained. A child
   transactor's explicit mode overrides its inherited root/parent context; an
-  unannotated transactor inherits it. A transactor leaf with no explicit or
-  inherited mode is invalid. Mode propagation through an unmoded structural
+  unannotated transactor inherits it. A mode-sensitive transactor leaf with no
+  explicit or inherited mode is invalid; an always-on analysis monitor is the
+  compatibility exception. Mode propagation through an unmoded structural
   env/agent node does not turn that node into an active or passive instance.
 - The verifier will enforce that only source-declared transactor schemas own
-  active-surface metadata, that transactor bindings have a resolved mode, that
-  structural field bindings have no declared mode of their own, and that every
-  active-surface reference resolves to its owning schema. A root inheritance
-  carrier is verified separately from an instance's own mode.
+  active-surface metadata, that mode-sensitive transactor bindings have a
+  resolved mode, that structural field bindings have no declared mode of their
+  own, and that every active-surface reference resolves to its owning schema. A
+  root inheritance carrier is verified separately from an instance's own mode.
 - The textual IR display will include enough mode and activation information to
   diagnose incorrect lowering without relying on emitted-C++ snapshots alone.
 - Parser, AST, and pretty-printer syntax do not change; the feature corrects
@@ -138,14 +144,20 @@ default exists.
 - **Inherited mode** is the mode context passed from a test-scope root or a
   structural ancestor while resolving a descendant path.
 - **Effective mode** is the declared mode when present, otherwise the inherited
-  mode. Every source-declared transactor leaf must have an effective mode.
+  mode. Every source-declared transactor leaf with a nonempty active surface
+  must have an effective mode; an always-on analysis monitor is the compatibility
+  exception.
 - **Activation** classifies a transactor member as `always` or `active-only`.
   The latter means that the member originated inside `when active`.
 - **Structural component** means an env, agent, scoreboard, or sequencer. It may
   contain a transactor, but it does not itself gain transactor behavior.
 - **Analysis-source transactor** is a source `transactor` lowered through
   `ComponentSchema`, rather than through the dedicated bound/DUT-poking
-  `TransactorSchema` route.
+  `TransactorSchema` route. Its instance mode is semantically required only
+  when a nonempty `when active` surface gives that mode something to select.
+- **Always-on analysis monitor** is an analysis-source transactor without a
+  `when active` surface. For #538 compatibility, a direct binding may be
+  modeless or `passive`; `active` is rejected as meaningless.
 
 These concepts must remain distinct. In particular, an inherited mode passing
 through an env is path-resolution context, not an assertion that the env itself
@@ -164,7 +176,8 @@ For a root and a component path, the effective-mode algorithm is:
    traversing it, but do not assign that mode to the structural instance.
 6. Reject a mode written on a structural field at the declaration-validation
    seam. It must not become an inheritance override by accident.
-7. Reject any transactor leaf whose effective mode remains unresolved.
+7. Reject any mode-sensitive transactor leaf whose effective mode remains
+   unresolved. Permit an always-on analysis monitor to remain modeless.
 
 This algorithm is shared by field/event access, method calls, connect endpoint
 resolution, handler registration, lifecycle registration, and nested emission.
@@ -296,8 +309,9 @@ Implementation should proceed in these phases:
 
 1. Build the declaration catalog from merged AST declarations.
 2. Validate every testbench field and nested component field against the
-   catalog. A direct analysis-source transactor field requires an explicit mode;
-   a structural field rejects one.
+   catalog. A direct mode-sensitive analysis-source transactor field requires an
+   explicit mode; an always-on monitor accepts no mode or `passive`; a
+   structural field rejects a mode.
 3. Build each shared `ComponentSchema` in two source-body walks: ordinary items
    with `Activation::Always`, followed by `when active` items with
    `Activation::ActiveOnly`. Preserve existing FunctionId reservation order.
@@ -380,7 +394,7 @@ lives on a shared schema.
 The following are `LowerError::Invalid` source errors and must not recommend
 `--codegen v1`:
 
-- a direct transactor binding with no effective mode;
+- a direct mode-sensitive transactor binding with no effective mode;
 - a mode on a structural field;
 - an active-only method, field, event, or queue operation through a passive path;
 - an always-on method body that references an active-only sibling member.
@@ -408,7 +422,9 @@ The verifier must enforce:
 - every active FunctionId exists and belongs to a method, handler, lifecycle
   callback, or watchdog in its owning schema;
 - active-surface references contain no duplicates;
-- every direct or resolved source-transactor binding has an effective mode;
+- every direct or resolved source-transactor binding with a nonempty active
+  surface has an effective mode; an always-on analysis monitor may remain
+  modeless;
 - structural field bindings have no declared transactor mode;
 - a nested mode override targets a source transactor, not an env, agent,
   scoreboard, or sequencer;
@@ -417,9 +433,11 @@ The verifier must enforce:
 - connect metadata never references an unknown field or function and preserves
   any required activation classification.
 
-Dump-IR should annotate bindings with `mode=active|passive`, fields and functions
-with `activation=always|active-only`, and root inheritance carriers separately
-from an instance's effective mode. Per-member annotations are preferred over an
+Dump-IR should annotate component bindings with `mode=active|passive` when a
+mode is present, and fields and functions with
+`activation=always|active-only`. This makes an always-on monitor's inert
+`passive` ownership annotation diagnostically visible even though it does not
+change lowering or emission. Per-member annotations are preferred over an
 opaque list because they make snapshots and failure triage readable.
 
 ## Testing Decisions
@@ -435,8 +453,11 @@ opaque list because they make snapshots and failure triage readable.
   always-on method availability, output-event fanout, and an active-only side
   effect that occurs only for the active instance.
 - A focused negative test will prove that a direct testbench transactor field
-  without a mode is rejected consistently and explains that no root-level
-  inherited mode exists.
+  with a `when active` surface and without a mode is rejected consistently and
+  explains that no root-level inherited mode exists.
+- Compatibility tests will prove that an always-on analysis monitor accepts no
+  mode and `passive`, rejects `active`, and differs only by binding metadata in
+  dump-IR—not by methods, state, fanout, or emitted behavior.
 - Focused negative tests will prove that active and passive annotations on actual
   env, agent, method-bearing scoreboard, and data-only scoreboard fields remain
   invalid and name the relevant declaration kind.
@@ -511,7 +532,10 @@ stable semantic fragments rather than an entire message.
 | direct active analysis source | binding mode is active; program verifies |
 | direct passive analysis source | binding mode is passive; program verifies |
 | active and passive instances of one type | one ComponentId/schema, distinct binding modes |
-| direct transactor with no mode | `Invalid`; path and missing effective mode named; no v1 suggestion |
+| direct mode-sensitive transactor with no mode | `Invalid`; path and missing effective mode named; no v1 suggestion |
+| always-on analysis monitor with no mode | accepted; identical behavior to passive binding |
+| always-on analysis monitor with passive mode | accepted; methods/state/fanout retained |
+| always-on analysis monitor with active mode | rejected as a meaningless composite-component mode |
 | env field with active/passive mode | `Invalid`; source kind `env` named |
 | agent field with active/passive mode | `Invalid`; source kind `agent` named |
 | method-bearing scoreboard with mode | `Invalid`; source kind `scoreboard` named |
@@ -536,7 +560,7 @@ component-path representation.
 Start from a valid lowered program, clone it, corrupt one fact at a time, and
 assert a precise verifier failure for:
 
-- removing the effective mode from a transactor binding;
+- removing the effective mode from a mode-sensitive transactor binding;
 - adding a mode to a structural field binding;
 - attaching active-surface metadata to a non-transactor schema;
 - naming an unknown or duplicate active field;
@@ -660,10 +684,10 @@ The issue is resolved only when all of the following hold:
   recent adjacent change accepts `passive` through the generic
   composite-component gate. This is only partial behavior, not resolution of the
   issue.
-- Current TB-IR also accepts a mode-less direct component-path transactor, while
-  v1 rejects it because the testbench root supplies no inherited mode. This
-  specification treats the v1 behavior as authoritative and documents the
-  no-mode case as a rejection.
+- Current TB-IR accepts a mode-less always-on analysis monitor, as pinned by
+  #538. This specification narrows the no-mode rejection to component-path
+  transactors with a nonempty `when active` surface, where an effective mode is
+  required to decide which members and registrations exist.
 - The current generic exception accepts `passive` on real component kinds and
   must be narrowed as part of this work.
 - The component schema already retains a transactor declaration-kind tag. The

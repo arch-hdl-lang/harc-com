@@ -184,6 +184,15 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
     has_event && !has_named_field
 }
 
+/// Whether an analysis-source transactor has behavior or storage whose
+/// availability depends on the instance mode.
+pub(crate) fn transactor_has_mode_sensitive_analysis_surface(t: &TransactorDecl) -> bool {
+    transactor_is_analysis_source(t)
+        && t.when_active
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+}
+
 /// True when a transactor routes to the COMPONENT path purely as a
 /// **DUT-poking hookable BFM** — `hookable` methods + exactly the
 /// module-typed DUT handle, with NO `on`/event handler and no `bound to`,

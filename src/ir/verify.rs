@@ -480,31 +480,9 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         if let Some(handler) = &component.watchdog {
             check_component_function("watchdog", handler.function);
         }
-        let active_member = component
-            .fields
-            .iter()
-            .any(|field| matches!(field.activation, Activation::ActiveOnly))
-            || component
-                .methods
-                .iter()
-                .any(|method| matches!(method.activation, Activation::ActiveOnly))
-            || component
-                .on_handlers
-                .iter()
-                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
-            || component
-                .periodic_handlers
-                .iter()
-                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
-            || component
-                .cycle_handlers
-                .iter()
-                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
-            || component
-                .watchdog
-                .as_ref()
-                .is_some_and(|handler| matches!(handler.activation, Activation::ActiveOnly));
-        if active_member && !matches!(component.kind, ComponentKindTag::Transactor) {
+        if component.has_active_surface()
+            && !matches!(component.kind, ComponentKindTag::Transactor)
+        {
             errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "component c{ci} `{}` is not a transactor but has active-only members",
@@ -689,7 +667,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
             match prog.components.get(binding.component.index()) {
-                Some(component) if matches!(component.kind, ComponentKindTag::Transactor) => {
+                Some(component) if component.requires_instance_mode() => {
                     if binding.mode.is_none() {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(
