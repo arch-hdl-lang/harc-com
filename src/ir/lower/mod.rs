@@ -5117,6 +5117,17 @@ pub(crate) struct FuncBuilder<'a> {
     /// precise test-scope-let rejection (see `LowerCtx::
     /// test_scope_lets`).
     pub(crate) in_check: bool,
+    /// True only while lowering a test's own `run` / `check` body.
+    ///
+    /// The registration statements — concurrent checks, statement-position
+    /// `on` handlers, event subscriptions — install something that lives
+    /// for the rest of the simulation. That is only sound where the
+    /// statement runs exactly once, in the test body. In a transactor
+    /// method, a helper, or another handler's body it would re-register on
+    /// every call (unbounded growth), and its `[&]` capture would outlive
+    /// the parameters it captured. `false` in every such nested builder,
+    /// which is what closes that door.
+    pub(crate) in_test_body: bool,
     /// Best-effort bit widths of locals with an explicit scalar type
     /// annotation (`let s64 : uint<64> = ...`). Consulted only by the
     /// width-method receiver inference (v1's `let_widths`); the
@@ -5187,6 +5198,10 @@ fn lower_function<'a>(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.in_check = kind == FunctionKind::Check;
+    // `lower_function` is only ever called for a test's own run / check
+    // body, which is exactly where a once-per-simulation registration is
+    // sound. See `FuncBuilder::in_test_body`.
+    b.in_test_body = true;
     declare_tb_record_fields(&mut b, ctx);
     // Regblock mirror locals: declared + default-constructed (to their
     // reset values) at the head of the Run function, mirroring v1's
@@ -5397,6 +5412,44 @@ fn declare_tb_record_fields(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     }
 }
 
+/// A stand-in `TbFunction` occupying a reserved slot in
+/// `SideTables::pending_functions` while its real body is being lowered.
+/// Reserving the slot up front is what keeps a nested registration from
+/// claiming the same index; the placeholder is always overwritten before
+/// the tables are drained, so it never reaches a backend.
+pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
+    TbFunction {
+        id,
+        name: format!("_pending_{}", id.0),
+        kind: FunctionKind::TestHook,
+        params: Vec::new(),
+        locals: Vec::new(),
+        blocks: vec![BasicBlock {
+            stmts: Vec::new(),
+            terminator: Terminator::Return,
+        }],
+        entry: BlockId(0),
+        owner: None,
+        ret: None,
+    }
+}
+
+/// Whether any block of `f` ends in a terminator that advances simulated
+/// time. Used to keep a suspending body out of a context that cannot
+/// suspend (a per-cycle checker closure).
+pub(crate) fn function_suspends(f: &TbFunction) -> bool {
+    f.blocks.iter().any(|b| {
+        matches!(
+            b.terminator,
+            Terminator::WaitCycles(..)
+                | Terminator::WaitCyclesSync(..)
+                | Terminator::WaitUntil { .. }
+                | Terminator::WaitUntilTimeout { .. }
+                | Terminator::WaitTimePs(..)
+        )
+    })
+}
+
 pub(crate) fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     for (name, _) in &ctx.tb_record_fields {
         b.reserve_local_name(name);
@@ -5434,6 +5487,7 @@ impl<'a> FuncBuilder<'a> {
             current_body_name: None,
             target_state_fields: HashMap::new(),
             in_check: false,
+            in_test_body: false,
             let_widths: HashMap::new(),
             self_component: None,
             side_tables,

@@ -6,7 +6,9 @@ use crate::ast::{
     BuiltinTy, CallArg, Expr as AstExpr, ExprKind, Ident, Stmt as AstStmt, StmtKind, TypeArg,
     TypeExpr,
 };
-use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
+use crate::ir::{
+    Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, TbFunction, Terminator,
+};
 
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
@@ -2379,6 +2381,45 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// A registration statement installs something that outlives the
+    /// statement — a `_checkers` closure, an event subscriber. That is
+    /// only sound in a test's own `run`/`check` body, where the statement
+    /// runs exactly once. Anywhere else (a transactor method, a helper,
+    /// another handler's body) it would re-register on every call, and
+    /// its `[&]` capture would outlive the parameters it captured.
+    fn require_test_body(&self, what: &str) -> Result<(), LowerError> {
+        if self.in_test_body {
+            return Ok(());
+        }
+        // v1 is no escape hatch here: it emits the registration inline in
+        // the method/helper lambda, so the program builds and then
+        // re-registers on every call while its `[&]` capture reads
+        // parameters that died with the call.
+        Err(not_implemented(
+            &format!("{what} outside a test's `run`/`check` body"),
+            "a registration installs a closure that outlives the statement, so it must run \
+             exactly once — move it into the test's `run` (or `check`) body",
+            V1Status::SilentlyMisLowers,
+        ))
+    }
+
+    /// Reserve a slot in the out-of-line function table BEFORE lowering
+    /// the body, so a nested registration inside that body claims the
+    /// NEXT slot instead of colliding on the same index. The placeholder
+    /// is overwritten by `commit_pending_function`.
+    fn reserve_pending_function(&mut self) -> crate::ir::FunctionId {
+        let mut tables = self.side_tables.borrow_mut();
+        let id = crate::ir::FunctionId(tables.pending_functions.len() as u32);
+        tables
+            .pending_functions
+            .push(super::placeholder_function(id));
+        id
+    }
+
+    fn commit_pending_function(&mut self, id: crate::ir::FunctionId, f: TbFunction) {
+        self.side_tables.borrow_mut().pending_functions[id.index()] = f;
+    }
+
     /// `on <channel>(<param>) ... end on` — subscribe to a test-scope
     /// event channel. The body becomes a ONE-parameter
     /// `FunctionKind::TestHook` function whose parameter is the payload;
@@ -2390,6 +2431,7 @@ impl FuncBuilder<'_> {
         callee: &AstExpr,
         args: &[CallArg],
     ) -> Result<(), LowerError> {
+        self.require_test_body("an `on <event>(...)` subscription")?;
         let ExprKind::Ident(id) = &*callee.kind else {
             return Err(unsupported(
                 "an `on <path>.<event>(arg)` subscription in statement position",
@@ -2433,10 +2475,7 @@ impl FuncBuilder<'_> {
             }
         };
 
-        let pending_id = {
-            let tables = self.side_tables.borrow();
-            crate::ir::FunctionId(tables.pending_functions.len() as u32)
-        };
+        let pending_id = self.reserve_pending_function();
         let param_ty = match payload {
             crate::ir::EventPayload::Scalar { signed: true } => IrType::SInt(None),
             crate::ir::EventPayload::Scalar { signed: false } => IrType::UInt(None),
@@ -2464,7 +2503,7 @@ impl FuncBuilder<'_> {
             ty: param_ty,
         }];
 
-        self.side_tables.borrow_mut().pending_functions.push(f);
+        self.commit_pending_function(pending_id, f);
         self.push(Stmt::EventSubscribe {
             event: channel,
             handler: pending_id,
@@ -2488,6 +2527,7 @@ impl FuncBuilder<'_> {
     /// (`on <ev>(arg)`) need a subscriber list on a component field.
     fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
+        self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
             return Err(unsupported(
                 "an `on <obj>.<method> pre/post` hook in statement position",
@@ -2535,10 +2575,7 @@ impl FuncBuilder<'_> {
         // separate IR functions, so v1's shared `[&]` capture is not
         // representable); testbench fields and DUT ports resolve as usual,
         // and an unresolved name is reported by the ordinary lookup path.
-        let pending_id = {
-            let tables = self.side_tables.borrow();
-            crate::ir::FunctionId(tables.pending_functions.len() as u32)
-        };
+        let pending_id = self.reserve_pending_function();
         let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
         super::reserve_tb_record_names(&mut b, self.ctx);
         b.lower_block_stmts(&h.body)?;
@@ -2552,9 +2589,22 @@ impl FuncBuilder<'_> {
             self.ctx.owner,
         )?;
 
+        // The handler runs FROM the per-cycle checker pass, which `tick()`
+        // drives. A `wait` in the body lowers to `tick()`, so the body
+        // would re-enter the checker pass that called it and recurse
+        // until the stack runs out. v1 has the same shape and the same
+        // hazard; refuse rather than reproduce it.
+        if super::function_suspends(&f) {
+            return Err(unsupported(
+                "a `wait` inside a statement-position `on` handler body",
+                "the body runs from the per-cycle checker pass, and a wait there re-enters \
+                 that same pass — move the wait into the run body, or gate the run body on \
+                 the same condition with `wait until`",
+            ));
+        }
+        self.commit_pending_function(pending_id, f);
         let id = {
             let mut tables = self.side_tables.borrow_mut();
-            tables.pending_functions.push(f);
             let id = crate::ir::CycleHandlerId(tables.cycle_handlers.len() as u32);
             tables.cycle_handlers.push(CycleHandlerSchema {
                 kind,
@@ -2704,6 +2754,7 @@ impl FuncBuilder<'_> {
             crate::ir::PropertySeverity::Fail => "a concurrent `assert`",
             crate::ir::PropertySeverity::AssumeFail => "a concurrent `assume`",
         };
+        self.require_test_body(construct)?;
         let body = self.resolve_check_body(raw);
         let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
         let slots = self.lower_temporal_slots(&temporals, construct)?;
@@ -2754,6 +2805,7 @@ impl FuncBuilder<'_> {
             // always produces one, so this is unreachable in practice.
             return Ok(());
         };
+        self.require_test_body("a `cover` witness")?;
         let construct = "a `cover` witness";
         let label = match &*raw.kind {
             ExprKind::Ident(id) => id.name.clone(),
@@ -2768,7 +2820,11 @@ impl FuncBuilder<'_> {
             let mut tables = self.side_tables.borrow_mut();
             let id = crate::ir::CoverCheckId(tables.cover_checks.len() as u32);
             tables.cover_checks.push(crate::ir::CoverCheckSchema {
-                tag: format!("c_{}_{}", raw.span.start, raw.span.end),
+                // The index, not just the span, keys the counter: one
+                // source `cover` inlined at two call sites is two
+                // registrations, and two file-scope statics with the same
+                // name would not compile.
+                tag: format!("c{}_{}_{}", id.0, raw.span.start, raw.span.end),
                 label,
                 cond,
                 temporals: slots,

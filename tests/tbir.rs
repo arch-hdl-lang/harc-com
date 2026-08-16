@@ -11271,3 +11271,217 @@ end test T"#,
         "the message must mention the test-scope form too: {msg}"
     );
 }
+
+// ── Review-gate regressions ──────────────────────────────────────────
+//
+// Each test below pins one defect found in the pre-PR review of the
+// concurrent-check / `on`-handler / event-channel work.
+
+/// A registration installs a closure that outlives the statement, so it
+/// is only sound where the statement runs exactly once. In a transactor
+/// method it would re-register on every call and its `[&]` capture would
+/// read parameters that died with the call — and v1 does exactly that,
+/// so the diagnostic must not offer v1 as an escape hatch.
+#[test]
+fn registrations_outside_the_test_body_are_rejected() {
+    let cases = [
+        ("cover dut.rst == 1", "a `cover` witness"),
+        ("assert dut.a |-> dut.b", "a concurrent `assert`"),
+        (
+            "on dut.rst == 1\n                log(info, \"x\")\n            end on",
+            "an `on ... end on` handler",
+        ),
+    ];
+    for (stmt, want) in cases {
+        let src = format!(
+            r#"transactor Drv
+    dut : Top
+    when active
+        hookable go()
+            {stmt}
+            dut.a = 1
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        drv.go()
+        wait 1 cycle
+    end run
+end impl T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+        assert!(
+            msg.contains("run"),
+            "the message must say where it belongs: {msg}"
+        );
+    }
+}
+
+/// One source `cover` inlined at two call sites is TWO registrations.
+/// Keying the counter on the source span alone gave both the same
+/// file-scope static name — a C++ redefinition, and a summary that read
+/// one counter twice.
+#[test]
+fn covers_inlined_at_two_call_sites_get_distinct_counters() {
+    let src = r#"function poke(d: Top)
+    cover d.rst == 1
+    d.rst = 1
+    wait 1 cycle
+end function poke
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        poke(dut)
+        poke(dut)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("lowers");
+    assert_eq!(
+        prog.cover_checks.len(),
+        2,
+        "one registration per inline site"
+    );
+    assert_ne!(
+        prog.cover_checks[0].tag, prog.cover_checks[1].tag,
+        "two file-scope statics may not share a name"
+    );
+    let cpp = emit_cpp_src(src);
+    let decls: Vec<&str> = cpp
+        .lines()
+        .filter(|l| l.starts_with("static uint64_t _cov_"))
+        .collect();
+    assert_eq!(decls.len(), 2, "{decls:?}");
+    assert_ne!(
+        decls[0], decls[1],
+        "duplicate counter declaration: {decls:?}"
+    );
+}
+
+/// A `wait` inside a statement-position `on` body lowers to `tick()`,
+/// and `tick()` runs the checker pass that called the body — unbounded
+/// recursion once the trigger fires. v1 emits the same shape; refuse
+/// rather than reproduce it.
+#[test]
+fn a_wait_inside_an_on_handler_body_is_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait 1 cycle
+            log(info, "x")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("a suspending handler body must not lower");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("re-enters that same pass"), "got: {msg}");
+}
+
+/// A check body may legitimately read a local of the function that
+/// registered it (the emitted closure captures it by reference, exactly
+/// as v1 does). `harc dump-ir` renders check bodies outside any local
+/// table, so it must fall back rather than index one that lacks them.
+#[test]
+fn dump_ir_renders_a_check_body_that_reads_a_local() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = 3
+        cover x == 3
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("lowers");
+    let dump = format!("{prog}"); // must not panic
+    assert!(dump.contains("cover c0"), "{dump}");
+}
+
+/// Emitting a record into a scalar channel would pass a struct to a
+/// `std::function<void(uint64_t)>`. The shape check must catch it;
+/// signedness alone must NOT be rejected (both backends widen a scalar
+/// payload to a 64-bit slot).
+#[test]
+fn event_payload_shape_is_checked_but_signedness_is_not() {
+    let err = lower_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        let t : Txn
+        emit e(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a record payload into a scalar channel must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("event<uint>"), "got: {msg}");
+
+    lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        let s : sint<8> = 0 - 1
+        emit e(s)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("a signedness difference is the benign widening v1 also performs");
+}
+
+/// A probe read that appears ONLY inside an `on <trigger>` predicate is
+/// still a program probe access: the trigger renders in the registration
+/// closure as `dut->rootp->…`, which needs the root header included.
+#[test]
+fn a_probe_read_only_in_an_on_trigger_still_pulls_the_root_header() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+end testbench Tb
+
+impl T for Tb
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+    end let dut
+
+    run
+        on dut.alu_a == 7
+            log(info, "hit")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("___024root.h"),
+        "the probe accessor needs the root header; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("rootp"),
+        "the trigger must read through the probe accessor"
+    );
+}

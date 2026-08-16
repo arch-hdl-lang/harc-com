@@ -935,7 +935,14 @@ fn fmt_args_str(func: &TbFunction, a: &FmtArgs) -> String {
 }
 
 fn local_str(func: &TbFunction, l: LocalId) -> String {
-    format!("%{}", func.local(l).name)
+    // A concurrent-check body is rendered outside any function's local
+    // table (its operands are ports, host state, and — legitimately —
+    // locals of whatever function registered it), so fall back to the
+    // raw id rather than indexing a scope that does not hold it.
+    match func.locals.get(l.index()) {
+        Some(t) => format!("%{}", t.name),
+        None => format!("%#{}", l.0),
+    }
 }
 
 /// Render a record-field chain `field[.path…]` with its element

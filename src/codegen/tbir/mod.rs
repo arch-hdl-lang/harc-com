@@ -882,6 +882,14 @@ fn for_each_check_body_expr(prog: &TbProgram, mut f: impl FnMut(&ir::Expr)) {
             f(&slot.inner);
         }
     }
+    // A statement-position `on <trigger>` predicate is rendered in the
+    // registration closure, so its port reads are real program port
+    // accesses even though `Stmt::CycleHandler` carries none itself.
+    for h in &prog.cycle_handlers {
+        if let ir::CycleHandlerKind::Trigger { trigger, .. } = &h.kind {
+            f(trigger);
+        }
+    }
 }
 
 /// Per-bind effective `generate_if` param env, mirroring v1's

@@ -1798,6 +1798,11 @@ case and only locally-determinable `Assign` types are compared).
       `rose(...)`. TB-IR gives a cover body the same latch machinery as a
       property body.
 
+    A `cover` counter is keyed by its REGISTRATION index, not by the
+    source span alone: one source `cover` inside a helper inlined at two
+    call sites is two registrations, and two file-scope statics may not
+    share a name.
+
     Carried over from v1 unchanged: `past(e, N)` ignores `N` and reads
     the immediately previous cycle (one latch slot per occurrence). A
     deeper history would diverge from v1, so fixing it belongs in a
@@ -1957,6 +1962,48 @@ case and only locally-determinable `Assign` types are compared).
     subscriptions, and fan-out and checks that two emits each reach both
     of two subscribers — a fan-out that stopped at the first subscriber
     would still string-match.
+
+30. **Where a registration may appear (2026-08-16).**
+    The registration statements — concurrent `assert`/`assume`/`cover`,
+    statement-position `on` handlers, event subscriptions — install a
+    closure that outlives the statement. That is only sound where the
+    statement runs exactly once, so lowering admits them **only in a
+    test's own `run` / `check` body** (`FuncBuilder::in_test_body`).
+
+    In a transactor method, a helper, or another handler's body, a
+    registration would re-register on every call (unbounded growth of the
+    checker list) and its `[&]` capture would read parameters that died
+    with the call. v1 emits exactly that — the program builds and then
+    misbehaves — so the rejection carries `V1Status::SilentlyMisLowers`,
+    not a `--codegen v1` suggestion.
+
+    Two related rules from the same pass:
+
+    - **A `wait` inside a statement-position `on` body is rejected.** The
+      body runs from the per-cycle checker pass, and a `wait` there lowers
+      to `tick()`, which re-enters that same pass — unbounded recursion
+      once the trigger fires. v1 has the identical shape and the identical
+      hazard.
+    - **Out-of-line handler bodies reserve their table slot before
+      lowering**, so a nested registration inside a body claims the next
+      slot rather than colliding on the same index
+      (`reserve_pending_function` / `commit_pending_function`). The
+      test-body rule above already forbids the nesting; reserving first
+      makes the invariant hold independently of it.
+
+    A check body may legitimately read a local of the function that
+    registered it — the emitted closure captures it by reference, as v1's
+    does — so `harc dump-ir`, which renders check bodies outside any
+    local table, falls back to the raw id instead of indexing a scope
+    that does not hold it.
+
+    A statement-position `on <trigger>` predicate renders inside the
+    registration closure, so its port reads are real program port
+    accesses even though `Stmt::CycleHandler` carries none: the
+    probe-detection and gated-bus walks visit `cycle_handlers` alongside
+    the check bodies. Without that, a probe read appearing only in a
+    trigger left `V<Top>___024root.h` out of the preamble while the
+    trigger still emitted `dut->rootp->…`.
 
 ## Negative tests: where rejection actually fires
 

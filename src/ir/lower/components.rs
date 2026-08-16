@@ -2818,13 +2818,31 @@ impl super::FuncBuilder<'_> {
                         )));
                     }
                     let lowered = self.lower_component_call_args(args)?;
-                    if !event_payload_matches_ir_type(
-                        payload,
-                        &self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown),
-                    ) && matches!(payload, EventPayload::Record(_))
-                    {
+                    // Shape must agree: the channel renders as
+                    // `std::function<void(uint64_t)>` or
+                    // `std::function<void(<Record>)>`, and passing one
+                    // where the other is expected is a hard C++ error.
+                    // Signedness is left alone — both backends widen a
+                    // scalar payload to a 64-bit slot, so `sint` into an
+                    // `event<uint<8>>` is the same benign conversion v1
+                    // performs.
+                    let arg_ty = self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown);
+                    let shape_ok = match (payload, &arg_ty) {
+                        (_, IrType::Unknown) => true,
+                        (EventPayload::Record(want), IrType::Record(got)) => want == *got,
+                        (EventPayload::Record(_), _) => false,
+                        (EventPayload::Scalar { .. }, IrType::Record(_)) => false,
+                        (EventPayload::Scalar { .. }, _) => true,
+                    };
+                    if !shape_ok {
+                        let want = match payload {
+                            EventPayload::Scalar { signed: true } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),
+                        };
                         return Err(LowerError::Invalid(format!(
-                            "`emit {}` payload does not match the channel's record type",
+                            "`emit {}`: the channel carries `event<{want}>`, but the payload \
+                             does not match that shape",
                             segs[0]
                         )));
                     }
