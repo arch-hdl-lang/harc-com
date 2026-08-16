@@ -317,32 +317,6 @@ fn fold_const(
                              {width})"
                         )));
                     }
-                    // v1 emits the unmasked arithmetic into a `constexpr`
-                    // initializer at the operands' natural C++ type, so a
-                    // sum that overflows signed 64-bit is a hard g++ error
-                    // there ("overflow in constant expression"). Folding it
-                    // here would build under one backend and not the other.
-                    // Decline instead, keeping the two in step; the
-                    // underlying v1 emission bug is tracked separately.
-                    let signed_overflows = {
-                        let (x, y) = (a.bits as i64, b.bits as i64);
-                        x >= 0
-                            && y >= 0
-                            && match op {
-                                BinaryOp::SubWrap => false,
-                                BinaryOp::MulWrap => x.checked_mul(y).is_none(),
-                                _ => x.checked_add(y).is_none(),
-                            }
-                    };
-                    if signed_overflows {
-                        return Err(FoldInvalid(
-                            "this wrapping constant overflows the signed 64-bit \
-                             range before its mask is applied, which cannot be \
-                             expressed as a C++ `constexpr` initializer; spell the \
-                             masked value explicitly"
-                                .into(),
-                        ));
-                    }
                     let raw = match op {
                         BinaryOp::SubWrap => a.bits.wrapping_sub(b.bits),
                         BinaryOp::MulWrap => a.bits.wrapping_mul(b.bits),

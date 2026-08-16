@@ -1043,13 +1043,13 @@ impl FuncBuilder<'_> {
             _ => return Ok(()),
         };
         if a_signed != d_signed {
-            let (from, to) = if a_signed {
-                ("signed", "unsigned")
+            let (article, from, to) = if a_signed {
+                ("a", "signed", "unsigned")
             } else {
-                ("unsigned", "signed")
+                ("an", "unsigned", "signed")
             };
             return Err(LowerError::Invalid(format!(
-                "assignment of a {from} {aw}-bit value to `{name}`, declared \
+                "assignment of {article} {from} {aw}-bit value to `{name}`, declared \
                  {to} {dw} bits. Signedness must match — relabel the value \
                  explicitly with `as {}<{dw}>`.",
                 if d_signed { "sint" } else { "uint" }

@@ -260,17 +260,29 @@ reject an unknown-width or `> 64`-bit operand: the legacy `--codegen v1`
 backend previously treated these as pass-through sugar (`+ / - / *`), which
 made the same source produce different values under the two emitters.
 
-Both backends now fold a wrap in a `const` initializer at the same operand
-width, reject a narrower typed destination (`let x : uint<4> = a +% 1` on an
-8-bit `a` — the residue is 8 bits wide), reject a signed destination
-(`let s : sint<8> = a +% b` — the residue is unsigned; relabel explicitly),
-and give an untyped `let` the unsigned type the residue actually has.
+Both backends now reject a narrower typed destination (`let x : uint<4> =
+a +% 1` on an 8-bit `a` — the residue is 8 bits wide) and a signed
+destination in a `let` initializer (`let s : sint<8> = a +% b` — the residue
+is unsigned; relabel with `as sint<8>`), give an untyped `let` the unsigned
+type the residue actually has, and fold a `const` initializer's wrap at
+`max(W(lhs), W(rhs))`.
 
-Two caveats remain, and the accepted operand sets are close but not proven
+Four caveats remain, and the accepted operand sets are close but not proven
 identical in either direction — the two backends infer operand widths in
 separate code, so a shape one resolves and the other does not shows up as a
 backend-specific accept or reject rather than as a value difference.
 
+- The **assignment form of a signed destination** — `s = a +% b` into an
+  already-declared `sint<N>` local — is rejected by the TB-IR backend and
+  accepted by `--codegen v1`, which does not track a local's declared
+  signedness at the assignment site. The `let`-initializer spelling is
+  rejected by both.
+- A **`const` wrap whose unmasked arithmetic overflows C++'s natural type
+  for its operands** folds correctly under the TB-IR backend but makes
+  `--codegen v1` emit a `constexpr` initializer the C++ compiler rejects
+  (`overflow in constant expression`): v1 emits the operands at their own
+  type rather than promoting to `uint64_t`. Spell the masked value
+  explicitly if you need the legacy backend.
 - Inside a **`keep` constraint** the wrap is dropped by *both* backends (`+%`
   reaches the solver as plain `+`, at 64-bit rank with a separate range
   assumption). That is a shared gap in the constraint lowering rather than a

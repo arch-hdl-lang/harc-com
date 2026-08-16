@@ -8681,9 +8681,17 @@ end test T"#;
     );
 }
 
-/// The signed-destination rejection must see through parentheses, cover
-/// the assignment form, and fire for the capitalised spelling — each of
-/// those escaped the first attempt while TB-IR rejected them.
+/// The signed-destination rejection must see through parentheses and fire
+/// for the capitalised spelling — both escaped the first attempt while
+/// TB-IR rejected them.
+///
+/// The ASSIGNMENT form (`s = a +% b`) is deliberately not covered: doing
+/// so needs the destination's declared signedness at the assignment site,
+/// and the only way v1 can supply that today is another flat name-keyed
+/// table — which false-rejected on a shadowed name and on an unrelated
+/// same-named local in any function emitted before the run body. A missed
+/// rejection is preferable to rejecting valid source; tracked in spec
+/// §2.4 and #548.
 #[test]
 fn signed_wrap_destination_is_rejected_in_every_spelling() {
     for (label, src) in [
@@ -8694,18 +8702,6 @@ fn signed_wrap_destination_is_rejected_in_every_spelling() {
     run
         let a : sint<8> = 100
         let s : sint<8> = (a +% a)
-        log(info, "${s}")
-    end run
-end test T"#,
-        ),
-        (
-            "assignment form",
-            r#"test T
-    let dut : Top
-    run
-        let a : sint<8> = 100
-        let s : sint<8> = 0
-        s = a +% a
         log(info, "${s}")
     end run
 end test T"#,
@@ -8765,5 +8761,50 @@ end test T"#,
     assert!(
         cpp.contains("auto z =") && !cpp.contains("int64_t z ="),
         "a parenthesised wrap destination must deduce unsigned; got:\n{cpp}"
+    );
+}
+
+/// The shadowed-name guard must stop at a CAST: `wrap_operand_width`
+/// takes a cast operand's width from the cast target, so a shadowed name
+/// underneath contributes nothing and must not suppress the check.
+#[test]
+fn a_cast_operand_is_checked_even_under_a_shadowed_name() {
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 1
+        if a == 1
+            let a : uint<64> = 2
+        end if
+        let b : uint<4> = (a as uint<8>) +% 1
+        log(info, "${b}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("narrows"),
+        "a cast operand's width is independent of the shadowed name; got: {err}"
+    );
+}
+
+/// The signedness diagnostic must quote the VALUE's width and read
+/// grammatically — v1 printed the destination's width for both, and
+/// TB-IR rendered "a unsigned".
+#[test]
+fn signedness_diagnostics_quote_the_value_width() {
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<64> = 1
+        let s : sint<8> = (a as uint<64>) +% 1
+        log(info, "${s}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("an unsigned 64-bit value") && err.contains("declared signed 8 bits"),
+        "must quote the value's width and the destination's separately; got: {err}"
     );
 }

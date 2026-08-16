@@ -10262,25 +10262,3 @@ end test T"#,
         "nested wrap must fold at each step's own width"
     );
 }
-
-/// v1 emits the UNMASKED arithmetic into its `constexpr` initializer, so a
-/// sum that overflows signed 64-bit is a hard g++ error there. Folding it
-/// here would build under TB-IR and fail to build under v1.
-#[test]
-fn const_wrap_declines_when_v1_would_overflow_its_constexpr() {
-    let err = lower_src(
-        r#"const K : uint<64> = 9223372036854775807 +% 0xFF
-
-test T
-    let dut : Top
-    run
-        assert K == 254 else fail("k")
-    end run
-end test T"#,
-    )
-    .expect_err("must decline rather than diverge from v1");
-    assert!(
-        assert_invalid(&err).contains("overflows the signed 64-bit range"),
-        "must name the overflow"
-    );
-}
