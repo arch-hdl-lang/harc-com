@@ -20,7 +20,7 @@
 //! `bound to` source transactors, and non-scalar event payloads. Those
 //! gate on the agent/sequencer/event slices.
 
-use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError};
+use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, Direction, ExprKind,
     HookableMethod, TransactorDecl, TypeArg, TypeExpr,
@@ -2856,10 +2856,15 @@ impl super::FuncBuilder<'_> {
         }
         // Self-relative form, inside a method/on-handler body.
         let cid = self.self_component.ok_or_else(|| {
-            unsupported(
+            // Reaching here means the channel did not resolve at all. v1
+            // emits the fan-out anyway (`for (auto& _s : a.b) _s(x);`),
+            // naming a symbol that does not exist, so the generated TB
+            // does not compile.
+            not_implemented(
                 "`emit` outside a component method body or a test-scope event channel",
                 "`emit <e>(x)` needs either a component `event` field or a test-scope \
                  `let <e> : event<T>` in scope",
+                V1Status::EmitsUncompilable,
             )
         })?;
         if name.segments.len() != 1 {

@@ -19,7 +19,7 @@
 //!   Run/Check functions only). Backends expand the edge themselves;
 //!   the tbir backend mirrors v1's req/rsp wire protocol.
 
-use super::{unsupported, FuncBuilder, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BusDecl, CallArg, Expr as AstExpr, ExprKind, HandshakeChannel, LetStmt, TlmMethod, TypeExpr,
 };
@@ -51,7 +51,12 @@ pub(super) fn lower_bus_binding(
 ) -> Result<(ir::BusBindingSchema, BusDecl), LowerError> {
     let bind = &l.name.name;
     if !l.probes.is_empty() {
-        return Err(unsupported("probe declarations on a bus binding", ""));
+        return Err(not_implemented(
+            "probe declarations on a bus binding",
+            "declare probes on `let dut` — no other binding gets a probe accessor, so \
+             the declaration is inert and any read of it fails to compile",
+            V1Status::EmitsUncompilable,
+        ));
     }
     // `bind ... with { ch.sig: "port", ... }` signal remaps. Each path
     // must be exactly `<channel>.<signal>` (2 segments), mirroring v1's

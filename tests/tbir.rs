@@ -11290,8 +11290,9 @@ end test T"#,
     }
 }
 
-/// A bare `emit` with no channel and no enclosing component now names
-/// both places a channel could come from.
+/// A bare `emit` with no channel and no enclosing component names both
+/// places a channel could come from — and does not send the user to v1,
+/// which emits the fan-out over a symbol that does not exist.
 #[test]
 fn emit_with_no_channel_names_both_sources() {
     let err = lower_src(
@@ -11304,7 +11305,7 @@ fn emit_with_no_channel_names_both_sources() {
 end test T"#,
     )
     .unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("test-scope event channel"),
         "the message must mention the test-scope form too: {msg}"
@@ -11709,5 +11710,190 @@ end impl T"#,
         cpp.contains("int64_t _wu_start = (int64_t)cycle_count;")
             && cpp.contains(") < _wu_budget) tick();"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
+    );
+}
+
+/// Second probe sweep: six more constructs where `--codegen v1` is not an
+/// escape hatch. Each `V1Status` below was established by emitting the
+/// construct with `--codegen v1` and reading the generated C++ — the
+/// comment on each case records what that output was.
+#[test]
+fn probe_sweep_two_constructs_v1_does_not_really_support() {
+    // v1 emits the fixed text "fail() with non-string arg" and DROPS the
+    // expression, so the failure line says nothing about the value.
+    let f = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let m = 1
+        fail(m)
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&f, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("${v}"), "the message must show the fix: {msg}");
+
+    // Same drop on the `else fail(...)` clause — v1 emits the default
+    // "assertion failed" text.
+    let ef = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let m = 1
+        assert dut.a == 1 else fail(m)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&ef, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("`else fail(...)` message"),
+        "the fixture must trip the else-fail gate, not another          SilentlyMisLowers site: {msg}"
+    );
+
+    // v1 parses the `with { … }` clause and emits nothing for it, so the
+    // TB drives the un-remapped port name.
+    let remap = lower_src(
+        r#"testbench Tb
+end testbench Tb
+impl T for Tb
+    let dut : Top = bind top with { a: "aa" }
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&remap, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("bind remaps on `let dut`"),
+        "the fixture must trip the dut-remap gate: {msg}"
+    );
+
+    // v1 emits a call to a `bitbash(...)` function it never defines.
+    let bb = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        bitbash(dut.a)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&bb, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("bitbash"), "{msg}");
+}
+
+/// The counterpart: `log(<unknown severity>, …)` DOES work under v1 —
+/// it passes the word through as the log tag — so that rejection keeps
+/// its `--codegen v1` suggestion. The two classes must stay distinct.
+#[test]
+fn an_unknown_log_severity_still_suggests_v1() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        log(trace, "x")
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("log severity `trace`"), "{msg}");
+}
+
+/// Probes and bind remaps on a NON-`dut` binding are one family with one
+/// rule, and the family is large (bus, regblock, addrmap, initiator BFM,
+/// bound-to transactor, target responder, component, transactor). Fixing
+/// one arm and leaving the rest saying "re-run with `--codegen v1`" is
+/// the failure mode this pins.
+///
+/// v1's behavior is uniform: it emits no probe accessor for any binding
+/// but `dut` (so the declaration is inert and a read of it does not
+/// compile), and it drops a `with { … }` remap clause entirely. Most
+/// arms need a differently-shaped fixture to reach, so the family rule is
+/// checked structurally over the lowering sources — one representative
+/// arm is exercised end-to-end below it.
+#[test]
+fn probe_and_remap_rejections_are_one_family_with_one_rule() {
+    let lower_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ir/lower");
+    let mut offenders = Vec::new();
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&lower_dir).expect("read src/ir/lower") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read lowering source");
+        for (i, _) in src
+            .match_indices("\"probe declarations on")
+            .chain(src.match_indices("\"bind remaps on"))
+        {
+            seen += 1;
+            // Walk back to the nearest constructor call and check which
+            // one it is.
+            let head = &src[..i];
+            let ni = head
+                .rfind("not_implemented(")
+                .map(|x| x as isize)
+                .unwrap_or(-1);
+            let un = head.rfind("unsupported(").map(|x| x as isize).unwrap_or(-1);
+            if un > ni {
+                let line = src[..i].matches('\n').count() + 1;
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+        }
+    }
+    assert!(
+        seen >= 12,
+        "expected to find the whole probe/bind-remap family; found {seen} sites"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these probe/bind-remap rejections still send the user to `--codegen v1`, \
+         which emits no probe accessor and drops remap clauses: {offenders:?}"
+    );
+}
+
+/// One arm of that family exercised end-to-end, so the structural scan
+/// above cannot pass over dead code.
+#[test]
+fn a_probe_on_a_transactor_instance_is_rejected_without_pointing_at_v1() {
+    let err = lower_src(
+        r#"transactor Drv
+    dut : Top
+    when active
+        hookable go()
+            dut.a = 1
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let drv : Drv active
+        probe p : uint<8> at inner.sig
+    end let drv
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect_err("probes on a transactor instance are rejected");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("probe declarations on a transactor instance"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("no other binding gets a probe accessor"),
+        "the family's shared explanation must be present: {msg}"
     );
 }
