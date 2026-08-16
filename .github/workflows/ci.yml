@@ -78,6 +78,19 @@ jobs:
           done
           exit $fail
 
+      - name: v1 vs TB-IR emitted parity
+        # Acceptance + solver-constraint-text parity between the two
+        # emitters, across the whole fixture corpus. Complements
+        # run_tbir_equiv.sh, which trace-diffs: that needs Verilator, needs
+        # both backends to build AND run, and is therefore blind to a
+        # one-sided rejection — the shape harc#559 shipped with every job
+        # green. This one only needs --emit-only, so it lives in the fast
+        # job and does not need a fixture to be runnable to compare it.
+        # Scope is the shared table (tests/fixtures.tbl). See harc#551.
+        run: ./tests/run_emit_parity.sh
+        env:
+          HARC: ./target/release/harc
+
       - name: harc fmt round-trip
         # Pretty-print → reparse → pretty-print again must be a fixed point.
         run: |
