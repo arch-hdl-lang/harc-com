@@ -74,6 +74,10 @@ const RESERVED: &[&str] = &[
     "__bb",
     "__done",
     "_wu_budget",
+    // The synchronous timed-wait poll loop's start stamp. Without this,
+    // a user local named `_wu_start` in a method body shadows the
+    // snapshot and the elapsed-cycle bound compares the wrong value.
+    "_wu_start",
     "_wu_satisfied",
     // C++ keywords that are plausible HARC identifiers.
     "auto",
@@ -2850,9 +2854,39 @@ fn emit_component_fn_lambda(
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            // Same synchronous poll loop as a transactor method body —
+            // a component method / `on` handler lambda has no scheduler
+            // to defer to either, so both sync body emitters render the
+            // timed wait identically. (Lowering no longer gates this
+            // terminator out of method bodies, so the arm has to exist in
+            // BOTH of them or a component-method timed wait falls into
+            // the internal error below.)
+            Terminator::WaitUntilTimeout {
+                preds,
+                mode,
+                cycles,
+                on_fire,
+                on_timeout,
+            } => {
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                let n = expr_cpp(&cx, cycles)?;
+                writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
+                writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
+                writeln!(
+                    out,
+                    "{pad3}while (!({cond}) && ((int64_t)cycle_count - _wu_start) < _wu_budget) \
+                     tick();"
+                )
+                .ok();
+                writeln!(
+                    out,
+                    "{pad3}if ({cond}) {{ __bb = {}; }} else {{ ctx.errors++; __bb = {}; }}",
+                    on_fire.0, on_timeout.0
+                )
+                .ok();
+            }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
-            | Terminator::WaitUntilTimeout { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: component method `{}` contains terminator {other:?} — \

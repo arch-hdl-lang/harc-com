@@ -7159,11 +7159,15 @@ fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
     // The coroutine awaiter must NOT appear in the method body — a
     // method lambda cannot `co_await`.
     let body_start = cpp.find("Xt_pulse = [&]").expect("the method lambda");
-    let body_end = body_start + cpp[body_start..].find("\n    };").unwrap_or(0);
+    let body_end = body_start
+        + cpp[body_start..]
+            .find("\n    };")
+            .expect("the method lambda closes");
+    let body = &cpp[body_start..body_end];
+    assert!(body.contains("_wu_budget"), "wrong slice: {body}");
     assert!(
-        !cpp[body_start..body_end].contains("co_await"),
-        "a synchronous method body must not co_await:\n{}",
-        &cpp[body_start..body_end]
+        !body.contains("co_await"),
+        "a synchronous method body must not co_await:\n{body}"
     );
 }
 
@@ -11652,4 +11656,58 @@ end test T"#,
     )
     .unwrap_err();
     assert_not_implemented(&y, lower::V1Status::Rejects);
+}
+
+/// Review-gate regressions for the sync timed-wait emission.
+///
+/// The poll loop introduces `_wu_start` alongside `_wu_budget`; without
+/// reserving it, a user local of that name in a method body shadows the
+/// cycle-count snapshot and the elapsed-cycle bound compares the wrong
+/// value. And a component method / `on` handler is the OTHER synchronous
+/// body emitter — lowering no longer gates the terminator out of method
+/// bodies, so both emitters must render it or the second falls into an
+/// internal "lowering gate failed" error.
+#[test]
+fn sync_timed_wait_reserves_its_state_and_covers_both_body_emitters() {
+    let shadowing = XACTOR_SRC.replace(
+        "wait 1 cycle\n            dut.en = 0",
+        "let _wu_start = 7\n            wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
+    );
+    let cpp = emit_cpp_src(&shadowing);
+    assert!(
+        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;"),
+        "the snapshot must keep its own name; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("uint64_t _wu_start = 0;"),
+        "a user local must be renamed away from the reserved snapshot:\n{cpp}"
+    );
+
+    // A component method body — the second synchronous emitter.
+    let cpp = emit_cpp_src(
+        r#"scoreboard Sb
+    hits : uint<32> default 0
+    function watch()
+        wait until hits == 1 timeout 5 cycles
+        hits = hits + 1
+    end function watch
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        sb.watch()
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;")
+            && cpp.contains(") < _wu_budget) tick();"),
+        "a component method must render the same sync poll loop; got:\n{cpp}"
+    );
 }
