@@ -285,11 +285,16 @@ backend-specific accept or reject rather than as a value difference.
   time, not from `harc check` or `--emit-only`, both of which succeed.
   Spell the masked value explicitly if you need the legacy backend
   (harc#554).
-- Inside a **`keep` constraint** the wrap is dropped by *both* backends (`+%`
-  reaches the solver as plain `+`, at 64-bit rank with a separate range
-  assumption). That is a shared gap in the constraint lowering rather than a
-  divergence, but a solved value is not masked, and a constraint whose only
-  solutions require the wrap is reported unsatisfiable.
+- Inside a **`keep` constraint** the wrap is masked to `max(W(lhs), W(rhs))`
+  like anywhere else, but the width has to be resolvable from the constraint
+  expression alone — a transaction field (including a nested `hdr.len`, a
+  list element, or a bit-slice) or a literal. An operand whose width the
+  constraint lowering cannot name (`(len + 1) +% 10`, `len +% (0 - 1)`) is
+  rejected rather than solved unmasked; casts are not accepted in constraint
+  position at all, so the width must come from a field. Unlike statement
+  position, a `> 64`-bit operand is accepted here — the solver bitvector is
+  `max(field widths).max(64)` wide, so the mask is expressible — which makes
+  the constraint path slightly more permissive than the statement path.
 - The **capitalised `UInt<N>`/`SInt<N>` spellings on a typed `let`** are
   width-erased under `--codegen v1`: it records widths only for the
   lower-case forms, so `let a : UInt<8> = 255` then `a.sext<16>()` yields 255
