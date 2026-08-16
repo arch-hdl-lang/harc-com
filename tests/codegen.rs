@@ -7938,6 +7938,22 @@ fn v1_cpp(src: &str) -> String {
     cpp_tb::emit(&merged).expect("emit")
 }
 
+/// The constraint text the **TB-IR** backend emits for each randomize
+/// site. The §2.4 wrap mask lives in a randomize emitter both backends
+/// call, but they construct it differently — the TB-IR one is built
+/// per-site with no per-test statement state. A v1-only assertion
+/// therefore proves nothing about the default backend, which is how a
+/// blocking-operand regression reached the default path unnoticed.
+fn tbir_constraint_snippets(src: &str) -> Result<String, String> {
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let prog = harc::ir::lower::lower_program(&merged).map_err(|e| e.to_string())?;
+    let opts = harc::codegen::cpp_tb::EmitOpts::default();
+    cpp_tb::emit_randomize_snippets(&merged, &opts, &prog.constraint_sites, 5)
+        .map(|snippets| snippets.join("\n"))
+        .map_err(|e| e.0.to_string())
+}
+
 fn v1_emit_err(src: &str) -> String {
     let parsed = parse_source(src).expect("parses");
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
@@ -9073,6 +9089,29 @@ end test T"#,
         ),
         "an enum-variant operand must resolve a width; got:\n{cpp}"
     );
+    // Both emitter constructors populate `const_widths`; dropping it from
+    // the TB-IR one is invisible to any v1-only assertion.
+    let tbir = tbir_constraint_snippets(
+        r#"enum Color { RED, GREEN, BLUE }
+const BUMP : uint<16> = 10
+transaction Txn
+    len : uint<8> default 0
+    keep len +% BUMP == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    )
+    .expect("tbir lowers");
+    assert!(
+        tbir.contains("harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)"),
+        "the default backend must size the const identically; got:\n{tbir}"
+    );
 }
 
 /// Under `blocking randomize` the emitter inlines any remaining in-scope
@@ -9080,11 +9119,83 @@ end test T"#,
 /// field and a DUT probe both carry declared widths the statement path
 /// already knows. Rejecting them turned building testbenches into build
 /// errors, with a diagnostic telling the user to use a transaction field
-/// type they had already used.
+
+/// A sized literal states a width, but nothing truncates its digits to it
+/// — `c_int_literal` emits `4'hFF` as `0xFF`. The mask has to cover the
+/// value the emitter actually wrote, or oracle and emitter disagree about
+
+/// A sized literal masks at its **declared** width, the same rule a
+/// `const` follows, so the two agree about a token spellable either way.
+/// The digits are not consulted: nothing truncates an overwide literal
+/// (`4'hFF` emits as `0xFF`, harc#565), and widening the mask to cover
+/// the digits turns this constraint from solvable into unsatisfiable —
+/// `(len + 255) & 0xF == 15` solves at `len = 0`, while
+/// `(len + 255) & 0xFF == 15` needs `len = 16`, outside a `uint<4>`.
 #[test]
-fn blocking_record_field_and_probe_wrap_operands_carry_a_width() {
-    let record = v1_cpp(
-        r#"struct Cfg
+fn a_sized_literal_masks_at_its_declared_width() {
+    let src = r#"transaction Txn
+    len : uint<4> default 0
+    keep len +% 4'hFF == 15
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#;
+    let cpp = v1_cpp(src);
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)0xFF, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000000fULL, 64)) =="
+        ),
+        "4'hFF must mask at its declared 4 bits; got:\n{cpp}"
+    );
+    let tbir = tbir_constraint_snippets(src).expect("tbir lowers");
+    assert!(
+        tbir.contains("harc_z3_bv_value(_ctx, (uint64_t)0x000000000000000fULL, 64)"),
+        "the default backend must mask identically; got:\n{tbir}"
+    );
+}
+
+/// A sized literal whose value overflows `u64` still has a perfectly
+/// good declared width, and at a solver width that wide it needs no mask
+/// at all. Parsing the digits to size it made this a build error.
+#[test]
+fn a_sized_literal_wider_than_u64_still_resolves() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    m : bits<128> default 0
+    keep m +% 128'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF == 1
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.m}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("_s.add(_z_m + harc_z3_bv_value"),
+        "a 128-bit wrap at a 128-bit solver width needs no mask and must not be \
+         rejected; got:\n{cpp}"
+    );
+}
+
+/// Under `blocking randomize` the emitter inlines an arbitrary in-scope
+/// C++ expression, and the width oracle cannot resolve those on the
+/// default backend: `emit_randomize_snippets` builds its emitter per-site
+/// with no statement state, so `let_types`/`let_widths`/`probe_widths`
+/// are empty by construction. Resolving them on v1 only would make the
+/// backends disagree about the same source — the exact divergence #552's
+/// fix promised not to introduce — so both reject. Tracked in harc#566.
+#[test]
+fn blocking_non_target_wrap_operands_are_rejected_by_both_backends() {
+    let src = r#"struct Cfg
     max : uint<8>
 end struct Cfg
 transaction Txn
@@ -9100,18 +9211,22 @@ test T
         end randomize
         log(info, "${t.len}")
     end run
-end test T"#,
-    );
+end test T"#;
+    let v1 = v1_emit_err(src);
     assert!(
-        record.contains(
-            "((_z_len + _ctx.bv_val((uint64_t)(c.max), 64)) \
-             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="
-        ),
-        "a record-field operand must resolve its declared width; got:\n{record}"
+        v1.contains("statically known bit-width"),
+        "v1 must reject a blocking non-target wrap operand; got: {v1}"
+    );
+    let tbir = tbir_constraint_snippets(src).expect_err("tbir must reject too");
+    assert!(
+        tbir.contains("statically known bit-width"),
+        "the default backend must reject it the same way, not diverge; got: {tbir}"
     );
 
-    let probe = v1_cpp(
-        r#"transaction Txn
+    // A DUT probe is the shape the statement path's `wrap_operand_width`
+    // *can* resolve, so it is the one that would silently come back as a
+    // v1-only acceptance if the fallback were reinstated.
+    let probe_src = r#"transaction Txn
     len : uint<16> default 0
 end transaction Txn
 test T
@@ -9125,40 +9240,43 @@ test T
         end randomize
         log(info, "${t.len}")
     end run
-end test T"#,
-    );
+end test T"#;
+    let v1_probe = v1_emit_err(probe_src);
     assert!(
-        probe.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="),
-        "a DUT-probe operand must resolve its declared width; got:\n{probe}"
+        v1_probe.contains("statically known bit-width"),
+        "v1 must reject a blocking probe operand; got: {v1_probe}"
+    );
+    let tbir_probe = tbir_constraint_snippets(probe_src).expect_err("tbir must reject too");
+    assert!(
+        tbir_probe.contains("statically known bit-width"),
+        "the default backend must reject the probe the same way; got: {tbir_probe}"
     );
 }
 
-/// A sized literal states a width, but nothing truncates its digits to it
-/// — `c_int_literal` emits `4'hFF` as `0xFF`. The mask has to cover the
-/// value the emitter actually wrote, or oracle and emitter disagree about
-/// the same token.
+/// `cast_relabel_width` returns `None` both for "not a width type" and
+/// for "out of range", so a caller that falls back on `None` cannot tell
+/// them apart — a `uint<200>` const would silently take its initializer's
+/// 4-bit value width. It must be loud instead.
 #[test]
-fn an_overwide_sized_literal_masks_to_the_value_actually_emitted() {
-    let cpp = v1_cpp(
-        r#"transaction Txn
-    len : uint<4> default 0
-    keep len +% 4'hFF == 5
+fn an_out_of_range_const_width_is_rejected_not_silently_value_sized() {
+    let err = v1_emit_err(
+        r#"const K : uint<200> = 10
+transaction Txn
+    len : uint<8> default 0
+    keep len +% K == 5
 end transaction Txn
 test T
     let dut : Top
     run
         let t : Txn
         randomize(t)
-        log(info, "${t.len}")
     end run
 end test T"#,
     );
     assert!(
-        cpp.contains(
-            "((_z_len + _ctx.bv_val((uint64_t)0xFF, 64)) \
-             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
-        ),
-        "4'hFF emits 0xFF, so the mask must be 8 bits not the declared 4; got:\n{cpp}"
+        err.contains("200-bit result"),
+        "a uint<200> const must report its declared width, not fall back to the \
+         initializer's value width; got: {err}"
     );
 }
 
@@ -9216,33 +9334,6 @@ end test T"#,
 
 /// The last link in that fallback chain: under `blocking randomize` the
 /// emitter inlines a `let` local straight into the constraint, so the
-/// width oracle has to read `let_widths` too.
-#[test]
-fn blocking_let_wrap_operands_carry_a_width() {
-    let cpp = v1_cpp(
-        r#"transaction Txn
-    len : uint<8> default 0
-end transaction Txn
-test T
-    let dut : Top
-    run
-        let n : uint<8> = 10
-        let t : Txn
-        blocking randomize(t) with
-            t.len +% n == 5
-        end randomize
-        log(info, "${t.len}")
-    end run
-end test T"#,
-    );
-    assert!(
-        cpp.contains(
-            "((_z_len + _ctx.bv_val((uint64_t)(n), 64)) \
-             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
-        ),
-        "a blocking `let` operand must resolve a width; got:\n{cpp}"
-    );
-}
 
 /// `randomize(t) with t +% 10 == 5` on a transaction whose field is named
 /// after the target variable. Routing a bare ident through
