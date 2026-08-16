@@ -287,24 +287,31 @@ backend-specific accept or reject rather than as a value difference.
   (harc#554).
 - Inside a **`keep` constraint** the wrap is masked to `max(W(lhs), W(rhs))`
   like anywhere else, but the width must be resolvable from the constraint
-  expression alone. These operands carry one: a transaction field (including
-  a nested `hdr.len`), a list element (`items[i]`, and so a `foreach` loop
-  variable), a bit-slice or bit-select, a `const` with a declared type or a
-  literal initializer (whose *declared* width is used, not its value's), an
-  enum variant, a decimal/`0x`/`0b` literal, a sized literal (`8'hAB`), and —
-  under `blocking randomize` only — a `let`, a record field (`c.max`) or a
-  DUT probe (`dut.count`), matching the expressions the emitter inlines
-  there. These do not carry a width and are rejected rather than solved
-  unmasked: `sum(...)` and `.len()`, which the solver represents as internal
-  variables with no declared source width; a compound non-wrap subexpression
-  (`(len + 1) +% 10`, `len +% (0 - 1)`); and a cast, which constraint
-  position rejects outright, so unlike statement position a cast cannot be
-  used to supply a width here. Also unlike statement position, a `> 64`-bit
+  expression alone, and *declared* widths are what count — never the value an
+  initializer or a literal's digits happen to hold. These operands carry a
+  width: a transaction field (including a nested `hdr.len`), a list element
+  (`items[i]`, and so a `foreach` loop variable), a bit-slice or bit-select,
+  a `const` (its declared type, or its initializer's width when untyped), an
+  enum variant, a decimal/`0x`/`0b` literal, and a sized literal (`8'hAB`,
+  which masks at the declared 8 whatever its digits say). These do not, and
+  are rejected rather than solved unmasked: `sum(...)` and `.len()`, which
+  the solver represents as internal variables with no declared source width;
+  a compound non-wrap subexpression (`(len + 1) +% 10`, `len +% (0 - 1)`); a
+  cast, which constraint position rejects outright, so unlike statement
+  position a cast cannot be used to supply a width here; and — under
+  `blocking randomize` — any operand the emitter inlines from the
+  surrounding scope rather than from the randomize target, such as a `let`,
+  a record field (`c.max`) or a DUT probe (`dut.count`). That last group is
+  a genuine gap rather than a rule: the widths exist, but the default
+  backend builds its randomize emitter per site with no statement scope, so
+  resolving them on `--codegen v1` alone would make the two backends
+  disagree about the same source. Both reject (harc#566).
+  Also unlike statement position, a `> 64`-bit
   operand *is* accepted — the solver bitvector is `max(field widths).max(64)`
   wide, so the mask stays expressible. A wrap whose result would exceed that
-  bitvector is rejected; that needs either an unbounded bit-slice
-  (`a[70:0]`) or a sized literal declaring more bits than the solver has
-  (`128'h1` where every field fits in 64).
+  bitvector is rejected as unrepresentable: an unbounded bit-slice
+  (`a[70:0]`), a sized literal (`128'h1`), or a `const` (`uint<200>`)
+  declaring more bits than the solver has.
 - The **capitalised `UInt<N>`/`SInt<N>` spellings on a typed `let`** are
   width-erased under `--codegen v1`: it records widths only for the
   lower-case forms, so `let a : UInt<8> = 255` then `a.sext<16>()` yields 255

@@ -1457,7 +1457,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
                     consts.insert(c.name.name.clone(), text.clone());
                     if let Some(w) =
                         c.ty.as_ref()
-                            .and_then(crate::ir::lower::cast_relabel_width)
+                            .and_then(declared_type_bit_width)
                             .or_else(|| literal_operand_bit_width(text))
                     {
                         const_widths.insert(c.name.name.clone(), w);
@@ -1822,7 +1822,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
                     consts.insert(c.name.name.clone(), text.clone());
                     if let Some(w) =
                         c.ty.as_ref()
-                            .and_then(crate::ir::lower::cast_relabel_width)
+                            .and_then(declared_type_bit_width)
                             .or_else(|| literal_operand_bit_width(text))
                     {
                         const_widths.insert(c.name.name.clone(), w);
@@ -5399,27 +5399,49 @@ fn value_bit_width(v: u64) -> u32 {
 /// path's own `parse_int_literal`, so the same literal sizes identically
 /// in both positions.
 ///
-/// An ARCH sized literal states a width, but nothing in the lexer,
-/// parser or either backend truncates its digits to it — `c_int_literal`
-/// emits `4'hFF` as `0xFF`. Taking the declared width alone would mask
-/// narrower than the value the emitter actually wrote, so the two would
-/// disagree about the same token. Take whichever is wider: for a
-/// well-formed literal that is the declared width, and for an overwide
-/// one the mask still covers what was emitted.
+/// An ARCH sized literal states its width outright, and that width is
+/// what §2.4 masks at — the same declared-width rule a `const` follows,
+/// so the two agree about a token like `8'd300` that can be spelled
+/// either way. The digits are deliberately NOT consulted: nothing in the
+/// lexer, parser or either backend truncates an overwide literal
+/// (`c_int_literal` emits `4'hFF` as `0xFF`, harc#565), and letting the
+/// digits widen the mask turned `keep len +% 4'hFF == 15` on a `uint<4>`
+/// field from solvable into unsatisfiable. Not parsing them also keeps a
+/// literal whose value overflows `u64` (`128'hFFFF...`) resolvable, where
+/// its declared width is all the mask ever needed.
 fn literal_operand_bit_width(s: &str) -> Option<u32> {
     let Some(idx) = s.find('\'') else {
         return crate::ir::lower::parse_int_literal(s).map(value_bit_width);
     };
     let declared: u32 = s[..idx].replace('_', "").parse().ok()?;
-    let tail = &s[idx + 1..];
-    let radix = match tail.chars().next()? {
-        'h' | 'H' => 16,
-        'b' | 'B' => 2,
-        _ => 10,
+    // `0'h0` lexes. A zero-bit value can only be zero, which this
+    // module sizes as one bit; rejecting it instead would fail a build
+    // that succeeds today.
+    Some(declared.max(1))
+}
+
+/// Raw declared width of a width-carrying builtin type, for a `const`'s
+/// wrap-operand width. Deliberately NOT `cast_relabel_width`: that helper
+/// caps at 128 and returns `None` both for "not a width type" and for
+/// "out of range", and a caller that falls back on `None` cannot tell
+/// those apart — `const K : uint<200> = 10` would silently take the
+/// initializer's 4-bit value width instead of being rejected as
+/// unrepresentable. A non-width type still returns `None`, which is a
+/// real "no declared width" and correctly falls back.
+fn declared_type_bit_width(t: &TypeExpr) -> Option<u32> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
     };
-    let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
-    let value = u64::from_str_radix(&digits, radix).ok()?;
-    Some(declared.max(value_bit_width(value)))
+    match name {
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::SInt
+        | BuiltinTy::SIntCap
+        | BuiltinTy::Bits => Some(type_arg_width(args).unwrap_or(64)),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(1),
+        BuiltinTy::Int => Some(32),
+        _ => None,
+    }
 }
 
 fn txn_field_solver_width(f: &TxnFieldInfo) -> u32 {
@@ -14991,9 +15013,8 @@ impl Emitter {
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         target_root: Option<&str>,
-        blocking: bool,
     ) -> Option<u32> {
-        let recur = |inner| self.constraint_expr_width(inner, field_info, target_root, blocking);
+        let recur = |inner| self.constraint_expr_width(inner, field_info, target_root);
         match &*e.kind {
             // A bare ident is its own whole path — resolve it the way the
             // emitter's `Ident` arm does, NOT through `expr_field_path`,
@@ -15009,30 +15030,11 @@ impl Emitter {
                 if let Some(idx) = self.enum_variants.get(&id.name) {
                     return u64::try_from(*idx).ok().map(value_bit_width);
                 }
-                // Under `blocking` the emitter inlines any remaining
-                // in-scope C++ expression, so the oracle has to keep up
-                // with it or a constraint the emitter would emit becomes
-                // a build error.
-                blocking.then(|| self.wrap_operand_width(e)).flatten()
+                None
             }
-            ExprKind::Field { .. } => {
-                if let Some(info) =
-                    expr_field_path(e, target_root).and_then(|field| field_info.get(&field))
-                {
-                    return Some(txn_field_solver_width(info));
-                }
-                // Same `blocking` inlining as above, and the one that
-                // matters most in practice: a record field (`c.max`) or a
-                // DUT probe (`dut.count`) whose declared width the
-                // statement path already knows.
-                if !blocking {
-                    return None;
-                }
-                if let Some(w) = self.wrap_operand_width(e) {
-                    return Some(w);
-                }
-                self.record_field_scalar_width(e)
-            }
+            ExprKind::Field { .. } => expr_field_path(e, target_root)
+                .and_then(|field| field_info.get(&field))
+                .map(txn_field_solver_width),
             // `items[i]` — a list element has the list's element width.
             // A `foreach` clause is unrolled into exactly this shape, so
             // without it every `foreach` constraint containing a wrap
@@ -15062,32 +15064,6 @@ impl Emitter {
             } => Some(recur(lhs)?.max(recur(rhs)?)),
             _ => None,
         }
-    }
-
-    /// Declared width of `local.field` where `local` is a record-typed
-    /// `let`. Under `blocking randomize` the emitter inlines such a path
-    /// straight into the constraint, so the wrap mask needs its width;
-    /// `wrap_operand_width` only knows `dut.<probe>`. Only a direct
-    /// scalar leaf resolves — a nested record path stays unknown, which
-    /// is the honest answer rather than a guessed width.
-    fn record_field_scalar_width(&self, e: &Expr) -> Option<u32> {
-        let ExprKind::Field { target, name } = &*e.kind else {
-            return None;
-        };
-        let ExprKind::Ident(base) = &*target.kind else {
-            return None;
-        };
-        let ty = self.let_types.get(&base.name)?;
-        let field = self
-            .record_fields
-            .get(ty)?
-            .iter()
-            .find(|f| f.name.name == name.name)?;
-        if is_list_type(&field.ty) || record_type_name(&field.ty).is_some() {
-            return None;
-        }
-        let (width, _) = scalar_field_shape(&field.ty);
-        (width != 0).then_some(width)
     }
 
     /// Signedness of a constraint expression, picking `<` vs `z3::ult`,
@@ -15869,7 +15845,7 @@ impl Emitter {
                             MulWrap => "*%",
                             _ => "+%",
                         };
-                        match self.constraint_expr_width(e, field_info, target_root, blocking) {
+                        match self.constraint_expr_width(e, field_info, target_root) {
                             // A wrap exactly as wide as the solver bitvector
                             // needs no mask. That bitvector is `solver_width`
                             // — `max(field widths).max(64)`, so it is >= 64,
