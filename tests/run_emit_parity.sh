@@ -18,11 +18,13 @@
 # Two properties, per fixture:
 #
 #   1. ACCEPTANCE PARITY. Both backends must agree on whether the program
-#      emits at all. The one allowed asymmetry is TB-IR's documented
-#      subset gap: a `LowerError::Unsupported` names `--codegen v1` as the
-#      escape hatch, and those are tracked separately (harc#548). Any
-#      other disagreement — v1 emits and TB-IR errors for some other
-#      reason, or TB-IR emits and v1 does not — is a failure.
+#      emits at all. The only allowed asymmetries are TB-IR's declared
+#      subset gaps, which say so in the diagnostic by offering v1 as a
+#      real escape hatch — see `is_subset_gap` below, and note that
+#      merely naming `--codegen v1` is NOT the criterion. Those are
+#      tracked separately (harc#548). Any other disagreement, in either
+#      direction, is a failure unless it has a row in
+#      tests/emit_parity_known.txt naming an issue.
 #
 #   2. CONSTRAINT-TEXT PARITY. The §2.4 wrap mask and the whole solver
 #      lowering live in a randomize emitter both backends call, but they
