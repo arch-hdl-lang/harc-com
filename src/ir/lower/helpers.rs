@@ -32,7 +32,8 @@
 //! scanner might miss inside unrecognized constructs).
 
 use super::{
-    exprs::width_cast_kind, unsupported, FuncBuilder, InlineFrame, LowerCtx, LowerError, SideTables,
+    exprs::width_cast_kind, not_implemented, unsupported, FuncBuilder, InlineFrame, LowerCtx,
+    LowerError, SideTables, V1Status,
 };
 use crate::ast::{
     Block, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, FunctionDecl, Item, SourceFile,
@@ -73,13 +74,16 @@ impl<'a> HelperRegistry<'a> {
             scans.insert(d.name.name.as_str(), scan_decl(d));
         }
 
-        // Recursion check: DFS over helper-only call edges.
-        check_acyclic(&decls, &scans)?;
-
         // Impurity fixpoint: a helper is impure if its own body is, or
         // if it calls an impure helper (an inlined body cannot live
         // inside a file-scope C++ function), or if it calls a name
         // that is not a declared helper (defer the error to use site).
+        //
+        // Runs BEFORE the recursion check, because whether a cycle is
+        // admissible depends on purity: a PURE helper emits as a
+        // file-scope C++ function with a prototype ahead of every body,
+        // so it can call itself. An impure one is CFG-inlined at each
+        // call site, and inlining a cycle does not terminate.
         let mut impure: HashSet<&str> = scans
             .iter()
             .filter(|(_, s)| s.impure)
@@ -103,6 +107,10 @@ impl<'a> HelperRegistry<'a> {
                 break;
             }
         }
+
+        // Recursion check: DFS over helper-only call edges, rejecting a
+        // cycle only when it passes through an impure (inlined) helper.
+        check_acyclic(&decls, &scans, &impure)?;
 
         let mut by_name = HashMap::new();
         for d in decls {
@@ -209,9 +217,18 @@ impl FuncBuilder<'_> {
             ));
         }
         if self.inline_frames.iter().any(|f| f.name == name) {
-            return Err(unsupported(
-                "recursive helper functions",
-                format!("`{name}` is already being inlined"),
+            // Only reachable for an INLINED (impure) helper — a pure one
+            // is called, not inlined, and its recursion is admissible.
+            // v1 emits every helper as an `auto` lambda, and a lambda
+            // that names itself inside its own initializer does not
+            // compile, so there is no v1 escape hatch here.
+            return Err(not_implemented(
+                "recursive DUT/sync-touching helper functions",
+                format!(
+                    "`{name}` is already being inlined; a PURE recursive helper lowers fine \
+                     (it emits as a real C++ function)"
+                ),
+                V1Status::EmitsUncompilable,
             ));
         }
 
@@ -362,9 +379,14 @@ impl FuncBuilder<'_> {
         }
         let frame_name = format!("_tb.{name}");
         if self.inline_frames.iter().any(|f| f.name == frame_name) {
-            return Err(unsupported(
+            // Testbench methods are always inlined (they capture the
+            // shared `_tb` host state), so a cycle cannot terminate.
+            // v1 emits them as `auto` lambdas, which cannot name
+            // themselves in their own initializer — no v1 escape hatch.
+            return Err(not_implemented(
                 "recursive testbench methods",
                 format!("`{name}` is already being inlined"),
+                V1Status::EmitsUncompilable,
             ));
         }
 
@@ -699,9 +721,22 @@ fn scan_expr(e: &AstExpr, s: &mut Scan) {
 
 /// DFS cycle check over helper-to-helper call edges. Rejects direct
 /// and mutual recursion with the offending cycle path in the message.
+/// Reject helper-call cycles that pass through an impure helper.
+///
+/// A PURE helper lowers to a file-scope C++ function whose prototype is
+/// emitted ahead of every body (`emit_helper_prototype`), so a recursive
+/// call resolves and the program terminates on its own base case — the
+/// cycle is admissible and left alone. (v1 cannot do this: it emits
+/// every helper as an `auto` lambda, and a lambda that names itself in
+/// its own initializer does not compile.)
+///
+/// An IMPURE helper is CFG-inlined at each call site, and inlining a
+/// cycle does not terminate, so those are rejected here — with the
+/// cycle path in the message.
 fn check_acyclic<'a>(
     decls: &[&'a FunctionDecl],
     scans: &'a HashMap<&'a str, Scan>,
+    impure: &HashSet<&str>,
 ) -> Result<(), LowerError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Color {
@@ -713,6 +748,7 @@ fn check_acyclic<'a>(
     fn dfs<'a>(
         n: &'a str,
         scans: &'a HashMap<&'a str, Scan>,
+        impure: &HashSet<&str>,
         color: &mut HashMap<&'a str, Color>,
         path: &mut Vec<&'a str>,
     ) -> Result<(), LowerError> {
@@ -729,12 +765,23 @@ fn check_acyclic<'a>(
                         let start = path.iter().position(|p| *p == key).unwrap_or(0);
                         let mut cycle: Vec<&str> = path[start..].to_vec();
                         cycle.push(key);
-                        return Err(unsupported(
-                            "recursive helper functions",
-                            format!("cycle: {}", cycle.join(" -> ")),
-                        ));
+                        // A cycle among PURE helpers is fine — they emit
+                        // as real recursive C++ functions. Only an
+                        // inlined member makes it non-terminating.
+                        if cycle.iter().any(|m| impure.contains(*m)) {
+                            return Err(not_implemented(
+                                "a recursive helper cycle through a DUT/sync-touching helper",
+                                format!(
+                                    "cycle: {}; such a helper is inlined at each call site, \
+                                     so the inlining would not terminate — a PURE recursive \
+                                     helper lowers fine",
+                                    cycle.join(" -> ")
+                                ),
+                                V1Status::EmitsUncompilable,
+                            ));
+                        }
                     }
-                    Color::White => dfs(key, scans, color, path)?,
+                    Color::White => dfs(key, scans, impure, color, path)?,
                     Color::Black => {}
                 }
             }
@@ -749,7 +796,7 @@ fn check_acyclic<'a>(
     for d in decls {
         let n = d.name.name.as_str();
         if color[n] == Color::White {
-            dfs(n, scans, &mut color, &mut Vec::new())?;
+            dfs(n, scans, impure, &mut color, &mut Vec::new())?;
         }
     }
     Ok(())

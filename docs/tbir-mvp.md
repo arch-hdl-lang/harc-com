@@ -1901,6 +1901,33 @@ case and only locally-determinable `Assign` types are compared).
     site. So the gap a user actually has is the `apply`, and that is now
     what gets reported.
 
+28. **Recursive PURE helpers (2026-08-16).**
+    A helper with no DUT access and no waits lowers to a file-scope C++
+    function whose prototype is emitted ahead of every body
+    (`emit_helper_prototype`), so it can call itself — directly or
+    mutually. The registry's recursion check therefore runs AFTER the
+    purity fixpoint rather than before it, and rejects a cycle only when
+    some member of it is impure (an impure helper is CFG-inlined at each
+    call site, and inlining a cycle does not terminate).
+
+    **TB-IR is strictly ahead of v1 here.** v1 emits every helper as an
+    `auto` lambda, and a lambda that names itself inside its own
+    initializer is a C++ compile error ("use of `f` before deduction of
+    `auto`"), so no recursive helper has ever worked under v1. The
+    diagnostics for the cases that remain rejected — recursion through an
+    impure helper, and recursive testbench methods (always inlined,
+    because they capture the shared `_tb` host state) — say that rather
+    than suggesting `--codegen v1`.
+
+    `tests/pure_recursion_cpp.rs` extracts the emitted helper functions
+    and builds them, so `fact(5) == 120` is checked by the host compiler,
+    not by a string match on the prototype.
+
+    Also reclassified in the same pass, after checking v1 directly: a
+    **string value in expression position** (v1 emits `int64_t s =
+    "hello";` — a compile error) and a **float literal** (v1 emits
+    `int64_t f = 1.5;`, which compiles and silently truncates to 1).
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

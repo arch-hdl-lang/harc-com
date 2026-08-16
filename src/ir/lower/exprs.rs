@@ -634,8 +634,22 @@ impl FuncBuilder<'_> {
             // subset until v1 grows a real string-local surface (audit #425
             // deferral). String *interpolation* (`${...}`) and `log`/`logf`
             // format strings are separate statement-level paths that work.
-            ExprKind::String(_) => Err(unsupported("string values in expression position", "")),
-            ExprKind::Float(_) => Err(unsupported("float literals", "")),
+            // HARC's value slot is a 64-bit integer; a string is only a
+            // `log`/`fail` message operand. v1 emits the literal into an
+            // integer slot (`int64_t s = "hello";`), which is a C++
+            // compile error.
+            ExprKind::String(_) => Err(not_implemented(
+                "a string value in expression position",
+                "strings are `log`/`fail`/`logf` message operands, not values",
+                V1Status::EmitsUncompilable,
+            )),
+            // Same integer value slot: v1 emits `int64_t f = 1.5;`, which
+            // COMPILES and silently truncates to 1.
+            ExprKind::Float(_) => Err(not_implemented(
+                "a float literal",
+                "HARC values are integers; scale to a fixed-point integer instead",
+                V1Status::SilentlyMisLowers,
+            )),
             ExprKind::Time(s) => {
                 // Bare `time` value in expression position (`let t : time =
                 // 100ns`). v1's `emit_expr_with_arrow` emits the leading

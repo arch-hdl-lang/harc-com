@@ -4054,9 +4054,13 @@ fn helper_inline_param_remapping() {
     );
 }
 
-/// Direct recursion is rejected up front with the cycle path.
+/// Recursion through a DUT/sync-touching helper is rejected with the
+/// cycle path: such a helper is CFG-inlined at each call site, and
+/// inlining a cycle does not terminate. v1 has no answer here either —
+/// it emits every helper as an `auto` lambda, which cannot name itself
+/// in its own initializer — so the diagnostic must not point at v1.
 #[test]
-fn helper_direct_recursion_is_unsupported() {
+fn recursion_through_an_impure_helper_is_rejected() {
     let src = r#"
 function spin(d: Top) -> uint<8>
     return spin(d)
@@ -4070,18 +4074,54 @@ test RecTest
 end test RecTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("recursive helper functions"), "{msg}");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("DUT/sync-touching helper"), "{msg}");
     assert!(msg.contains("spin -> spin"), "names the cycle: {msg}");
 }
 
-/// Mutual recursion is rejected even when the helpers are never called
-/// (the call-graph DFS runs before any body lowers).
+/// A PURE helper emits as a file-scope C++ function with its prototype
+/// ahead of every body, so it can call itself — direct or mutual. v1
+/// cannot express this at all (its helpers are `auto` lambdas), which is
+/// why the recursion check now runs AFTER the purity fixpoint rather
+/// than before it.
 #[test]
-fn helper_mutual_recursion_is_unsupported() {
-    let src = r#"
+fn pure_helper_recursion_lowers() {
+    let direct = r#"
+function fact(n: uint<8>) -> uint<32>
+    if n <= 1
+        return 1
+    end if
+    return n * fact(n - 1)
+end function fact
+
+test RecTest
+    let dut : Top
+    run
+        let x = fact(5)
+        assert x == 120 else fail("fact")
+    end run
+end test RecTest
+"#;
+    let prog = lower_src(direct).expect("a pure recursive helper lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = emit_cpp_src(direct);
+    assert!(
+        cpp.contains("static uint64_t harc_helper_fact(uint64_t n);"),
+        "the prototype must precede the body so the self-call resolves; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_helper_fact((n - 1))"),
+        "the self-call must emit as a real call; got:\n{cpp}"
+    );
+
+    // Mutual recursion among pure helpers is the same story — every
+    // prototype is emitted before any body.
+    let mutual = r#"
 function ping(x: uint<8>) -> uint<8>
-    return pong(x)
+    if x == 0
+        return 0
+    end if
+    return pong(x - 1)
 end function ping
 
 function pong(x: uint<8>) -> uint<8>
@@ -4091,17 +4131,12 @@ end function pong
 test MutRecTest
     let dut : Top
     run
-        dut.en = 1
+        dut.en = ping(3)
     end run
 end test MutRecTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("recursive helper functions"), "{msg}");
-    assert!(
-        msg.contains("ping -> pong -> ping") || msg.contains("pong -> ping -> pong"),
-        "names the cycle: {msg}"
-    );
+    let prog = lower_src(mutual).expect("mutually recursive pure helpers lower");
+    verify::verify_program(&prog).expect("verifies");
 }
 
 /// An impure helper call inside a `${...}` message capture cannot be
