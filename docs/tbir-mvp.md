@@ -2303,6 +2303,120 @@ case and only locally-determinable `Assign` types are compared).
     through different machinery, so this is a design step, not a missing
     arm. It keeps its `--codegen v1` suggestion, which is honest.
 
+36. **Sixth probe sweep: `connect` endpoints and record-typed
+    transactor fields (2026-08-16).** Twelve `connect` endpoint shapes
+    plus the transaction-typed transactor field divergence 35 left open.
+    One gap closed, seven diagnostics reclassified.
+
+    - **A record-typed field on an UNBOUND `transactor`** (`cur : Beat`).
+      v1 emits a real struct member, writes it from the method body as
+      `self.cur.tag = …`, and reads it back from the test — a working
+      feature TB-IR refused outright. The unbound path now routes record
+      fields through the same `lower_state_field` the bound-to path
+      already used, which produces `StateFieldKind::Record`.
+
+      Reaching it exposed a latent emitter bug worth recording, because
+      it is what makes "close the gap" different from "delete the
+      rejection": `Stmt::TransactorStateRecordFieldWrite` interpolated
+      its `instance` RAW, while the read side and the scalar write both
+      went through `resolve_state_instance`. A transactor's own method
+      body carries an EMPTY instance for a self-reference, so the first
+      emission was `.cur.tag = 5;` — a leading-dot member access, not
+      C++. The rejection had been hiding a broken path, and lifting it
+      without compiling the result would have shipped exactly the
+      silent-mis-lowering this sweep exists to remove.
+      `transactor_record_field_test` is the equivalence fixture.
+
+    - **`connect` endpoint diagnostics: reclassified, then reverted.**
+      Six endpoint shapes (a sink with no method, a source with no event
+      field, a source that is not an `out event`, a path segment naming
+      something that is not a sub-component) and two sink SIGNATURE
+      checks were reclassified — and all eight came back. What v1 does
+      with a bad edge depends on where the edge SITS, not on how it is
+      malformed:
+
+      | landing | what v1 does |
+      |---|---|
+      | instantiated env, multi-segment path | emits the path verbatim into a `push_back` / range-for; usually does not compile |
+      | single-segment endpoint | resolves the owner's own hookable / `out event` and WORKS (`E_take(_tb.top, _t)`) |
+      | uninstantiated env | emits no wiring at all, so the malformed edge is invisible and v1 SUCCEEDS |
+
+      tbir resolves `connect` for every env in the merged file, so it
+      sees edges v1 never reaches at all. One site, three outcomes: no
+      `V1Status` is honest, and all eight keep `Unsupported`.
+
+    The record unlock also surfaced three follow-on gaps that the
+    rejection had been hiding, each a design step rather than a missing
+    arm, and each left with an honest diagnostic:
+
+    - A `Vec` subfield inside a record state field (`cur.lanes[1] = 7`).
+      v1 emits `self.cur.lanes[1] = 7;` and it works; the write path has
+      no indexed form for `TransactorStateRecordFieldWrite`.
+    - A record-typed field on a transactor reached through an `env`,
+      which comes through the COMPONENT-field machinery.
+      `ComponentFieldKind` has no record variant, so the field used to
+      fall through to the DUT-handle arm and report "more than one DUT
+      handle field (dut, cur)" — a diagnostic naming the wrong problem
+      entirely. It now names the real one.
+    - Record state in the `when active` position was closed in the same
+      pass (v1 compiles either position, so half a feature was not worth
+      shipping), as was the duplicate-name check the new branch had
+      skipped — `cur : uint<32>` plus `cur : Beat` emitted two `cur`
+      members instead of an error.
+
+    **Three sweeps, three reverted reclassifications.** Batch 4 read one
+    landing of a whole-`Vec` read, batch 5 read one landing of a
+    directional field, batch 6 read one landing of a `connect` edge —
+    each generalized, each wrong, each caught only by review. The
+    working rule from here: a `V1Status` claim needs v1's output from
+    EVERY landing the site can be reached from, and a site that cannot
+    be pinned to one outcome keeps `Unsupported`. Closing a gap is the
+    cheap half; classifying one honestly is the expensive half.
+
+37. **Seventh probe sweep: a construct v1 emits but never runs
+    (2026-08-16).** Three transactor item shapes, each probed in the
+    outer, `when active`, and passive landings before anything was
+    claimed.
+
+    - **`on N cycles` on a transactor** already lowers in both
+      declaration positions. Not a gap; nothing to do.
+    - **`watchdog` on a transactor** looked like a clean gap — v1 emits
+      a complete `<T>_watchdog` lambda with pre/post hook vectors, the
+      `max_idle` check against `_last_in_cycle`/`_last_out_cycle`, the
+      FAIL line and the error bump. Grepping for a CALL SITE turns up
+      nothing, in all three landings. The control settles it: an AGENT
+      watchdog does get one (`Producer_watchdog(_tb.prod)` inside a
+      periodic closure), so this is specific to the transactor flavor.
+      v1 compiles the construct and the watchdog silently never fires.
+      `NotImplemented` / silently-mis-lowers, on ALL FIVE sites —
+      unbound, bound-to target, and initiator-side.
+
+      The first pass reclassified only the two unbound sites, on the
+      belief that the bound flavors needed a bus declaration from a
+      sibling file and so could not be reached. That was wrong: `bus …
+      end bus` sits inline beside a bound-to transactor in
+      `dma_engine_tlm_target_test`, and single-file probes of both bound
+      flavors show the same defined-never-called lambda. Being too
+      cautious is not free either — it left three sites telling users to
+      re-run under a backend where their watchdog would not fire.
+    - **`connect` on a transactor** is left UNCLASSIFIED. The first
+      probe used an empty block (nothing to wire, so it proved nothing);
+      the second tripped the separate `out event`-field gate before
+      reaching the connect path. Neither is evidence, and a guess here
+      would be the same mistake in a new place.
+
+    **The refinement this sweep adds to the probe method:** "v1 emits"
+    was never the question, and neither is "v1 emits code that
+    compiles". The question is whether the emitted code RUNS. A
+    definition with no call site compiles perfectly and does nothing,
+    which is indistinguishable from a working feature until you look for
+    the call — and the control matters as much as the finding, because
+    "the name appears in the output" is satisfied by the dead shape
+    itself (an unscheduled watchdog still emits its `_pre`/`_post`
+    vectors and two internal hook loops). The test that pins this
+    asserts a call COUNT against v1's emitter, and goes red if either
+    call site is removed.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

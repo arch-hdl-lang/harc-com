@@ -43,7 +43,12 @@ esac
 # are relative to FIX_DIR. Multiple files within a field are space-
 # separated. The 6th field (test_struct) is passed via `--test` when the
 # loaded harc files declare more than one test struct.
-FIXTURES="$(cat "$SCRIPT_DIR/fixtures.tbl")"
+TABLE="$SCRIPT_DIR/fixtures.tbl"
+# Fail CLOSED. This was a heredoc until the table was shared with
+# run_emit_parity.sh; a heredoc could not go missing, a path can. Without
+# this the primary sim gate reports success over an empty corpus.
+[ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
+FIXTURES="$(cat "$TABLE")"
 
 # run_one <outdir> <row>
 # Pure worker: runs one fixture and prints its human log, ending with a

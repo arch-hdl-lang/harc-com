@@ -1194,8 +1194,13 @@ fn emit_stmt(
             path,
             value,
         } => {
+            // Through the same receiver resolver the READ side and the
+            // scalar write already use. Written raw, an empty instance —
+            // which is what a transactor's own method body carries for a
+            // self-reference — emitted a leading-dot `.cur.tag = 5;`.
+            let recv = super::expr::resolve_state_instance(cx, instance)?;
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{instance}.{field}.{} = {e};", path.join(".")).ok();
+            writeln!(out, "{pad}{recv}.{field}.{} = {e};", path.join(".")).ok();
         }
         // `pending.push(value)` on a bound-to target transactor `queue<T>`
         // state field — a `harc_rt::HarcQueue<T>` member of the per-

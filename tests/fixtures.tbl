@@ -146,3 +146,4 @@ passive_multi_instance_test | Top            | top_counter.sv         |
 multi_active_instance_test | Top            | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |
 record_vec_field_iter_test | Top         | top_counter.sv         |
+transactor_record_field_test | Top       | top_counter.sv         |

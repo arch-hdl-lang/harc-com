@@ -6,7 +6,7 @@
 # test answers: "how much of the corpus does my change actually move?"
 # During harc#559 it was run by hand at every step, and its most useful
 # result was almost always ZERO — being able to say "this touches two
-# lines of emitted output across 186 fixtures" is what bounded a change
+# lines of emitted output across the fixture table" is what bounded a change
 # whose review kept turning up surprises.
 #
 # Note the corollary, which is the substance of harc#551: a sweep that
@@ -53,8 +53,9 @@ build_at() { # build_at <rev|WORKTREE> <label> -> echoes binary path
     fi
     local wt="$TMP/wt_$label"
     git -C "$ROOT" worktree add -q --detach "$wt" "$rev" || return 1
-    # Share the parent's build cache so a sweep does not rebuild every
-    # dependency from scratch.
+    # A dedicated target dir, so the sweep never writes into the target
+    # dir you are working in. It shares nothing, so this IS a cold build
+    # of every dependency — the price of not touching your cache.
     (cd "$wt" && CARGO_TARGET_DIR="$TMP/target_$label" cargo build -q --bin harc) || return 1
     echo "$TMP/target_$label/debug/harc"
 }

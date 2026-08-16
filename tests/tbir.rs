@@ -13131,3 +13131,488 @@ end impl T"#,
     assert!(cpp.contains("n = 8;"), "{cpp}");
 }
 
+
+// ---------------------------------------------------------------------
+// Batch 6: record-typed fields on an unbound transactor, and the
+// `connect` endpoint diagnostics.
+// ---------------------------------------------------------------------
+
+/// A record-typed field on an UNBOUND `transactor` routes through the
+/// same `lower_state_field` the bound-to path already used. v1 emits a
+/// real struct member and it works, so this was a real gap.
+///
+/// Reaching it exposed a latent emitter bug:
+/// `Stmt::TransactorStateRecordFieldWrite` interpolated its `instance`
+/// raw, and a transactor's own method body carries an EMPTY instance for
+/// a self-reference — so the write emitted `.cur.tag = 5;`, with a
+/// leading dot, which is not C++.
+#[test]
+fn a_record_field_on_an_unbound_transactor_lowers() {
+    let cpp = emit_cpp_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : Beat
+
+    when active
+        hookable go()
+            cur.tag = 5
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+        assert xt.cur.tag == 5 else fail("tag")
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("Beat cur{};"), "the member is declared:\n{cpp}");
+    assert!(
+        cpp.contains("self_state.cur.tag = 5;"),
+        "the self-write resolves its receiver — a raw empty instance emitted \
+         `.cur.tag = 5;`:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains(" .cur."),
+        "no leading-dot member access survives:\n{cpp}"
+    );
+    assert!(cpp.contains("xt.cur.tag == 5"), "the test reads it back:\n{cpp}");
+}
+
+/// A malformed `connect` endpoint keeps its `--codegen v1` suggestion,
+/// and the reason is the whole point of the class system: what v1 does
+/// with a bad edge depends on where the edge SITS, not on how it is
+/// malformed.
+///
+///   - In an INSTANTIATED env, v1 emits the path verbatim into a
+///     `push_back` or a range-for, and the result usually does not
+///     compile.
+///   - A SINGLE-SEGMENT endpoint resolves against the owner's own
+///     hookable or `out event` and works — `E_take(_tb.top, _t)`.
+///   - In an UNINSTANTIATED env, v1 emits no wiring at all, so every
+///     malformed edge there is invisible and v1 simply succeeds. tbir
+///     resolves `connect` for every env in the merged file, so it sees
+///     edges v1 never reaches.
+///
+/// One site, three outcomes. No single `V1Status` is honest, so the
+/// suggestion stays — it is true somewhere.
+#[test]
+fn a_malformed_connect_endpoint_keeps_its_v1_suggestion() {
+    let src = |edge: &str, inst: &str| {
+        format!(
+            r#"transactor Src
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+    hookable take(v: uint<8>)
+        seen = seen + 1
+    end take
+end scoreboard Sink
+
+env E
+    src  : Src passive
+    sink : Sink
+
+    connect
+        {edge}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+{inst}
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The control: the well-formed edge lowers.
+    emit_cpp_src(&src("src.observed -> sink.take", "    top : E"));
+
+    for (edge, want) in [
+        ("src.observed -> sink", "sink `sink` without a method"),
+        ("src -> sink.take", "source `src` without an event field"),
+        (
+            "src.n -> sink.take",
+            "source `src.n` that is not an `out event` port",
+        ),
+        (
+            "nosuch.observed -> sink.take",
+            "path segment `nosuch` that is not a sub-component",
+        ),
+        (
+            "src.observed -> nosuch.take",
+            "path segment `nosuch` that is not a sub-component",
+        ),
+        (
+            "src.observed -> sink.take",
+            "", // control; skipped by the empty `want`
+        ),
+    ] {
+        if want.is_empty() {
+            continue;
+        }
+        let err = lower_src(&src(edge, "    top : E")).unwrap_err();
+        let msg = assert_unsupported(&err);
+        assert!(msg.contains(want), "`{edge}`: {msg}");
+
+        // The SAME edge in an UNINSTANTIATED env: v1 emits no wiring
+        // there at all, so it succeeds where tbir still rejects. This
+        // is the landing that makes any `NotImplemented` claim on these
+        // sites false.
+        let err = lower_src(&src(edge, "")).unwrap_err();
+        assert_unsupported(&err);
+    }
+}
+
+/// The sink SIGNATURE checks keep the suggestion too, for the same
+/// reason: v1 raises its own error for a bad arity or a non-void return
+/// only when the owning env is instantiated.
+#[test]
+fn a_bad_connect_sink_signature_keeps_its_v1_suggestion() {
+    let src = |sink: &str, method: &str| {
+        format!(
+            r#"transactor Src
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+{method}
+end scoreboard Sink
+
+env E
+    src  : Src passive
+    sink : Sink
+
+    connect
+        src.observed -> sink.{sink}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    let err = lower_src(&src(
+        "two",
+        "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
+    ))
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("with 2 parameters"), "{msg}");
+
+    let err = lower_src(&src(
+        "ret",
+        "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
+    ))
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("that returns a value"), "{msg}");
+}
+
+/// Record state is legal in BOTH transactor declaration positions —
+/// above `when active` and inside it. v1 compiles either, so closing
+/// only the outer one would leave half a feature.
+#[test]
+fn a_record_field_lowers_in_both_transactor_positions() {
+    for decl in [
+        // Above `when active`.
+        "    cur : Beat\n\n    when active\n",
+        // Inside it.
+        "\n    when active\n        cur : Beat\n",
+    ] {
+        let cpp = emit_cpp_src(&format!(
+            r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+{decl}        hookable go()
+            cur.tag = 5
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+        assert xt.cur.tag == 5 else fail("tag")
+    end run
+end impl T"#
+        ));
+        assert!(cpp.contains("Beat cur{};"), "{cpp}");
+        assert!(cpp.contains("self_state.cur.tag = 5;"), "{cpp}");
+    }
+}
+
+/// The record branch makes the same duplicate-name check the scalar
+/// branch does. Without it, `cur : uint<32>` plus `cur : Beat` emitted
+/// TWO `cur` members into the state struct.
+#[test]
+fn a_duplicate_transactor_state_field_is_rejected() {
+    let err = lower_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : uint<32> default 0
+    cur : Beat
+
+    when active
+        hookable go()
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("declares state field `cur` more than once"),
+        "{msg}"
+    );
+}
+
+/// A record-typed field on a transactor reached through an `env` comes
+/// through the COMPONENT-field machinery, which has no record kind. It
+/// used to fall through to the DUT-handle arm and report "more than one
+/// DUT handle field (dut, cur)" — a diagnostic that names the wrong
+/// problem entirely. v1 emits a plain member here and it works, so the
+/// `--codegen v1` suggestion is honest; only the wording was wrong.
+#[test]
+fn an_env_held_transactor_record_field_names_the_real_problem() {
+    let err = lower_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : Beat
+
+    when active
+        hookable go()
+            cur.tag = 5
+        end go
+    end when
+end transactor Xt
+
+env E
+    xt : Xt active
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("a record-typed field `Xt.cur` of type `Beat`"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("DUT handle"),
+        "the old wording blamed the DUT handle: {msg}"
+    );
+}
+
+/// A `watchdog` on a transactor is NOT a v1 escape hatch, and the reason
+/// only shows up if you check whether the emitted code ever RUNS. v1
+/// emits a complete `<T>_watchdog` lambda — pre/post hook vectors, the
+/// `max_idle` check against `_last_in_cycle`/`_last_out_cycle`, the FAIL
+/// line, the error bump — and then never calls it.
+///
+/// The control that makes this a v1 bug rather than a global design: an
+/// AGENT watchdog DOES get a call site (`Producer_watchdog(_tb.prod)`
+/// inside a periodic closure, in `watchdog_quiesce_test`). A transactor
+/// watchdog gets none, so it compiles and silently never fires.
+///
+/// All five watchdog sites carry it — unbound, bound-to target, and
+/// initiator-side. An earlier pass reclassified only the two unbound
+/// ones on the belief that the others needed a sibling bus file to
+/// reach; they do not (`bus … end bus` sits inline beside a bound-to
+/// transactor in `dma_engine_tlm_target_test`), and single-file probes
+/// of both bound flavors show the same defined-never-called lambda.
+#[test]
+fn a_transactor_watchdog_does_not_point_at_v1() {
+    let src = |wd_pos: &str| {
+        let (outer, inner) = match wd_pos {
+            "outer" => (WD_BLOCK, ""),
+            _ => ("", WD_BLOCK),
+        };
+        format!(
+            r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+{outer}
+    when active
+{inner}        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#
+        )
+    };
+    const WD_BLOCK: &str = "    watchdog\n        period 5 cycles\n        max_idle 100 cycles\n        log(info, \"wdog\")\n    end watchdog\n";
+
+    for pos in ["outer", "when"] {
+        let err = lower_src(&src(pos)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("transactor `Xt` watchdogs"), "{pos}: {msg}");
+        assert!(
+            msg.contains("never schedules it"),
+            "the diagnostic must say WHY v1 is not a way out: {msg}"
+        );
+    }
+}
+
+/// The control, pinned so the claim above stays true. It must check
+/// **v1's** output, not tbir's: the claim is about what `cpp_tb` emits.
+/// And it must count real CALL lines — a watchdog that is never
+/// scheduled still emits its `_pre`/`_post` vector declarations and two
+/// internal hook loops, so a bare "name appears" count is satisfied by
+/// exactly the dead shape this test exists to distinguish from.
+#[test]
+fn an_agent_watchdog_is_scheduled_under_v1() {
+    let merged = merged_src(&fixture("watchdog_quiesce_test.harc"));
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+
+    let is_call = |l: &&str| {
+        l.contains("Producer_watchdog(")
+            && !l.contains("auto Producer_watchdog")
+            && !l.contains("Producer_watchdog_pre")
+            && !l.contains("Producer_watchdog_post")
+    };
+    let calls: Vec<&str> = cpp.lines().filter(is_call).collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "an agent watchdog is CALLED exactly once, from its periodic closure; \
+         got {calls:?}"
+    );
+
+    // And the transactor flavor, through the same emitter, has none —
+    // which is the whole basis for the reclassification above.
+    let merged = merged_src(
+        r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+
+    watchdog
+        period 5 cycles
+        max_idle 100 cycles
+        log(info, "wdog")
+    end watchdog
+
+    when active
+        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    );
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+    assert!(
+        cpp.contains("auto Xt_watchdog"),
+        "v1 defines the transactor watchdog body:\n{cpp}"
+    );
+    let calls: Vec<&str> = cpp
+        .lines()
+        .filter(|l| {
+            l.contains("Xt_watchdog(")
+                && !l.contains("auto Xt_watchdog")
+                && !l.contains("Xt_watchdog_pre")
+                && !l.contains("Xt_watchdog_post")
+        })
+        .collect();
+    assert!(
+        calls.is_empty(),
+        "…and never calls it — if this ever fires, the reclassification is stale \
+         and the diagnostic must go back to `Unsupported`; got {calls:?}"
+    );
+}

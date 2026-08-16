@@ -85,7 +85,8 @@ jobs:
         # both backends to build AND run, and is therefore blind to a
         # one-sided rejection — the shape harc#559 shipped with every job
         # green. This one only needs --emit-only, so it lives in the fast
-        # job and sees every fixture. See harc#551.
+        # job and does not need a fixture to be runnable to compare it.
+        # Scope is the shared table (tests/fixtures.tbl). See harc#551.
         run: ./tests/run_emit_parity.sh
         env:
           HARC: ./target/release/harc

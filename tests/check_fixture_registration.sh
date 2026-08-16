@@ -75,15 +75,22 @@ is_wired() {
     if grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)" tests/fixtures.tbl 2>/dev/null; then
         return 0
     fi
-    # Any other shell runner, Rust test, or fixture list. The allowlist is
-    # excluded: it names unwired fixtures, so counting it would make every
-    # allowlisted entry look wired (and then stale).
+    # Any other shell runner, Rust test, or fixture list. Two kinds of
+    # file are excluded because naming a fixture in them means the
+    # OPPOSITE of "wired":
+    #   - the allowlist names fixtures that are deliberately not run;
+    #   - emit_parity_known.txt names backend asymmetries, and a row
+    #     there is an exemption, not an execution.
+    # Comment lines are skipped for the same reason: "X is deliberately
+    # absent from this registry" must not read as a registration.
     local candidate
     for candidate in tests/*.sh tests/*.rs tests/*.txt tests/*.tbl; do
         [ -e "$candidate" ] || continue
         [ "$candidate" = "$ALLOWLIST" ] && continue
+        [ "$candidate" = "tests/emit_parity_known.txt" ] && continue
         [ "$candidate" = "tests/check_fixture_registration.sh" ] && continue
-        if grep -qF "$base" "$candidate" 2>/dev/null; then
+        if grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null \
+            | grep -qF "$base"; then
             return 0
         fi
     done

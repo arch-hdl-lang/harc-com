@@ -8861,54 +8861,79 @@ end test T"#;
 
 // ── harc#551: backend subset gaps, pinned so they stay declared ──────
 
-/// Shapes v1 emits and TB-IR refuses. Each refusal MUST name
-/// `--codegen v1`, because that escape hatch is what marks it a declared
-/// subset gap (harc#548) rather than a divergence — and
-/// `tests/run_emit_parity.sh` keys its whole acceptance check on exactly
-/// that string. A gap that silently stops naming it becomes a CI-visible
-/// backend divergence, which is the outcome that check exists to force.
+/// The exact strings `tests/run_emit_parity.sh` greps to decide that a
+/// TB-IR rejection is a real escape hatch rather than a divergence. Five
+/// diagnostics name `--codegen v1` and only these two mean "use v1
+/// instead"; the other three say v1 is broken on the construct. If a
+/// rendering here changes wording, the gate silently reclassifies a
+/// declared gap as a divergence (spurious red) — so pin the phrases, not
+/// merely the flag.
 #[test]
-fn backend_subset_gaps_still_name_the_v1_escape_hatch() {
-    for (label, body) in [
-        (
-            "ARCH sized literal",
-            r#"        let a : uint<8> = 8'hFF
-        assert a == 255 else fail("x")"#,
-        ),
-        (
-            "cast above 128 bits",
-            r#"        let big : uint<200> = 1
-        let w = (big as uint<200>).zext<300>()
-        assert w == 1 else fail("x")"#,
-        ),
-    ] {
-        let src = format!(
-            r#"test SubsetGap
+fn the_escape_hatch_phrases_the_parity_gate_greps_are_stable() {
+    // 1. LowerError::Unsupported — v1 implements the construct.
+    let src = r#"transaction Txn
+    items : list<uint<8>>
+    keep items.len() <= 2
+end transaction Txn
+test EscapeHatch
     let dut : Top
     run
-{body}
+        let t : Txn
+        randomize(t)
         log(info, "x")
     end run
-end test SubsetGap"#
-        );
-        // v1 accepts.
-        let parsed = parse_source(&src).expect("parses");
-        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
-        assert!(
-            cpp_tb::emit(&merged).is_ok(),
-            "{label}: v1 should still accept this shape"
-        );
-        // TB-IR rejects, and says how to proceed.
-        let err = harc::ir::lower::lower_program(&merged)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            err.contains("--codegen v1"),
-            "{label}: TB-IR's rejection must name the v1 escape hatch, or \
-             run_emit_parity.sh will read it as a divergence; got: {err}"
-        );
-    }
+end test EscapeHatch"#;
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    assert!(
+        cpp_tb::emit(&merged).is_ok(),
+        "v1 must still implement the construct, or it is not an escape hatch"
+    );
+    let err = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("re-run with `--codegen v1`"),
+        "run_emit_parity.sh greps this exact phrase; got: {err}"
+    );
+}
+
+/// The other side of the same contract: a `NotImplemented` rendering must
+/// NOT look like an escape hatch. All three of its clauses mention
+/// `--codegen v1`, and two of them mean v1 accepts the construct and
+/// produces bad output — the shape the gate most needs to flag. An
+/// earlier version of the gate matched the bare flag and auto-exempted
+/// exactly these.
+#[test]
+fn a_not_implemented_rendering_is_not_mistakable_for_an_escape_hatch() {
+    let src = r#"test NotImpl
+    let dut : Top
+    run
+        let big : uint<200> = 1
+        let w = (big as uint<200>).zext<300>()
+        assert w == 1 else fail("x")
+    end run
+end test NotImpl"#;
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    // v1 accepts this one, which is precisely why TB-IR refusing it is a
+    // divergence worth reporting rather than a gap worth exempting.
+    assert!(cpp_tb::emit(&merged).is_ok(), "v1 accepts a >128-bit cast");
+    let err = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("--codegen v1"),
+        "the diagnostic should still say what v1 does; got: {err}"
+    );
+    assert!(
+        !err.contains("re-run with `--codegen v1`"),
+        "a NotImplemented rendering must not carry the escape-hatch phrase, or \
+         the parity gate will exempt a case where v1's output is known bad; \
+         got: {err}"
+    );
 }
 
 /// `let s : sint<8> = a +% b` — harc#551 records this as an *internal

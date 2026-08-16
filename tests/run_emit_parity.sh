@@ -1,5 +1,5 @@
 #!/bin/bash
-# v1 <-> TB-IR EMITTED-TEXT parity across the whole fixture corpus.
+# v1 <-> TB-IR EMITTED-TEXT parity across the shared fixture table.
 #
 # This is deliberately NOT run_tbir_equiv.sh. That script trace-diffs two
 # simulations, which is the stronger check but needs Verilator, needs both
@@ -51,8 +51,13 @@ JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
 if [ ! -x "$HARC" ]; then
     echo "Building harc..."
-    cargo build --release --bin harc
+    cargo build --release --bin harc || {
+        echo "error: cargo build failed" >&2; exit 1; }
 fi
+# Without this every row gets rc=127 from both backends, the codes match,
+# and all of them take the "both backends reject" path — a green run over
+# a corpus that was never compiled.
+[ -x "$HARC" ] || { echo "error: $HARC is not executable" >&2; exit 1; }
 case "$HARC" in
     /*) ;;
     *) HARC="$PWD/$HARC" ;;
@@ -70,44 +75,63 @@ TABLE="$SCRIPT_DIR/fixtures.tbl"
 [ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
 FIXTURES="$(cat "$TABLE")"
 
-# Flatten a miette-rendered diagnostic to one line: strip the box-drawing
-# continuation gutter and collapse whitespace. miette hard-wraps at 80
-# columns when stdout is not a TTY, so a phrase we need to match can be
-# split across lines depending on how long the construct name happens to
-# be. Matching the flattened form removes that dependency.
+# Collapse a miette-rendered diagnostic to a whitespace-free string:
+# strip the box-drawing continuation gutter, then remove ALL whitespace.
+#
+# miette hard-wraps at 80 columns when stdout is not a TTY, and it breaks
+# at hyphens as well as spaces — so `re-run` can arrive as `re-` + newline
+# + `run`, and `--codegen` can split too. Joining lines with a space is
+# not enough; matching a needle with the whitespace removed as well makes
+# the match independent of where any wrap lands.
 flatten_log() {
-    printf '%s' "$1" | tr '\n' ' ' | sed 's/[│┌└─╭╰]/ /g' | tr -s ' '
+    printf '%s' "$1" | sed 's/[│┌└─╭╰╮╯├┤┬┴]//g' | tr -d '[:space:]'
 }
 
-# Is a TB-IR rejection a DECLARED subset gap, i.e. one where `--codegen
-# v1` is a real escape hatch?
+# Is a rejection one where `--codegen v1` is a REAL escape hatch?
 #
-# It is NOT enough to look for the flag. `LowerError` deliberately
-# distinguishes four cases and all four name it (src/ir/lower/mod.rs):
+# It is not enough to look for the flag. Five distinct diagnostics name
+# it, and only two of them mean "use v1 instead":
 #
-#   Unsupported                        "; re-run with `--codegen v1`"
-#   NotImplemented/Rejects             "`--codegen v1` does not implement it either"
-#   NotImplemented/EmitsUncompilable   "`--codegen v1` accepts it but emits C++ that does not compile"
-#   NotImplemented/SilentlyMisLowers   "`--codegen v1` accepts it but silently emits something else"
+#   ESCAPE HATCHES
+#     LowerError::Unsupported     "; re-run with `--codegen v1`"
+#     tbir emitter (EmitError)    "use --codegen v1 for wide shifts"
+#                                 (src/codegen/tbir/expr.rs)
+#   NOT ESCAPE HATCHES — v1 is broken on the construct
+#     NotImplemented/Rejects            "`--codegen v1` does not implement it either"
+#     NotImplemented/EmitsUncompilable  "`--codegen v1` accepts it but emits C++ that does not compile"
+#     NotImplemented/SilentlyMisLowers  "`--codegen v1` accepts it but silently emits something else"
 #
-# Only the first is an escape hatch. The last two mean v1 is BROKEN on
-# the construct — v1 emits, TB-IR refuses, and v1's output is known bad.
-# That is the single most dangerous shape this gate exists to surface, so
-# matching the bare flag would auto-exempt exactly the wrong class. Match
-# the escape-hatch phrase itself.
+# The last two are the single most dangerous shape this gate exists to
+# surface: v1 emits, the default backend refuses, and v1's output is
+# known bad. Matching the bare flag would auto-exempt exactly those.
 is_subset_gap() {
-    flatten_log "$1" | grep -q -- 're-run with `--codegen v1`'
+    local f
+    f="$(flatten_log "$1")"
+    case "$f" in
+        *'re-runwith`--codegenv1`'*) return 0 ;;
+        *'use--codegenv1for'*)       return 0 ;;
+    esac
+    return 1
 }
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
 
 # known_exemption <name> <direction> -> 0 if this asymmetry is a recorded
 # decision. Rows carry an issue number; see the file header.
+# NOTE: no pipeline into `grep -q`. Under `set -o pipefail` an early
+# match makes grep exit first, the upstream loop dies with SIGPIPE (141),
+# and pipefail propagates that as failure — so a recorded exemption near
+# the top of a long file would be silently ignored.
 known_exemption() {
     [ -f "$KNOWN" ] || return 1
-    grep -vE '^\s*(#|$)' "$KNOWN" | while IFS='|' read -r n d rest; do
-        [ "$(echo "$n" | xargs)" = "$1" ] && [ "$(echo "$d" | xargs)" = "$2" ] && echo HIT
-    done | grep -q HIT
+    local n d
+    while IFS='|' read -r n d _; do
+        case "$n" in ''|'#'*) continue ;; esac
+        [ "$(echo "$n" | xargs)" = "$1" ] || continue
+        [ "$(echo "$d" | xargs)" = "$2" ] || continue
+        return 0
+    done <"$KNOWN"
+    return 1
 }
 
 run_one() { # run_one <outdir> <row>
@@ -161,18 +185,21 @@ run_one() { # run_one <outdir> <row>
         return 0
     fi
 
-    # 2. Constraint-text parity. Ordered, and including push/pop: Z3's
-    # returned model depends on assertion order, and an `_s.add` that
-    # moves across a `push` boundary changes which assertions survive the
-    # matching `pop`. Sorting would call both of those identical.
+    # 2. Constraint-text parity. Ordered, and covering every solver-state
+    # call, not just `add`: Z3's returned model depends on assertion
+    # order, an `_s.add` moving across a `push` boundary changes which
+    # assertions survive the matching `pop`, and `_s.check()` is the call
+    # that actually consumes the assertions — soft-constraint lowering
+    # interleaves it between adds. Sorting, or matching `add` alone,
+    # would call all of those identical.
     if ! ls "${dirs[0]}"/*.cpp >/dev/null 2>&1 || ! ls "${dirs[1]}"/*.cpp >/dev/null 2>&1; then
         echo "  FAIL  $name  (emitted no .cpp despite exit 0)"
         echo "__STATUS__ FAIL $name"
         return 0
     fi
     local a b
-    a="$(cat "${dirs[0]}"/*.cpp | grep -oE '_s\.(add|push|pop)\(.*')"
-    b="$(cat "${dirs[1]}"/*.cpp | grep -oE '_s\.(add|push|pop)\(.*')"
+    a="$(cat "${dirs[0]}"/*.cpp | grep -oE '_s\.(add|push|pop|check|set)\(.*')"
+    b="$(cat "${dirs[1]}"/*.cpp | grep -oE '_s\.(add|push|pop|check|set)\(.*')"
     if [ "$a" != "$b" ]; then
         echo "  FAIL  $name  (solver constraint text differs between backends)"
         diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -12 | sed 's/^/    /'
