@@ -193,9 +193,17 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::TargetTlmThread(_) => {
-                return Err(unsupported(
+                // v1 emits NOTHING for a target thread on an unbound
+                // transactor: its C++ is byte-identical with and without
+                // the `thread` item. The negative anchor is the bound-to
+                // TARGET form, where the same item changes 42 lines — so
+                // v1 implements target threads where it owns them, and
+                // silently drops this one.
+                return Err(not_implemented(
                     &format!("transactor `{tname}` TLM target threads"),
-                    "",
+                    "a target thread is served through a `bound to <bus>` transactor; \
+                     on an unbound one v1 discards it silently",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -303,9 +311,17 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::TargetTlmThread(_) => {
-                return Err(unsupported(
+                // v1 emits NOTHING for a target thread on an unbound
+                // transactor: its C++ is byte-identical with and without
+                // the `thread` item. The negative anchor is the bound-to
+                // TARGET form, where the same item changes 42 lines — so
+                // v1 implements target threads where it owns them, and
+                // silently drops this one.
+                return Err(not_implemented(
                     &format!("transactor `{tname}` TLM target threads"),
-                    "",
+                    "a target thread is served through a `bound to <bus>` transactor; \
+                     on an unbound one v1 discards it silently",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Watchdog(_) => {

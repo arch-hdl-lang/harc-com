@@ -13804,3 +13804,91 @@ impl T for Tb
         drv.go()
     end run
 end impl T"#;
+
+/// A `thread bus.<m>(...)` responder on an UNBOUND transactor is
+/// discarded by v1 — its C++ is byte-identical with and without the
+/// item. The NEGATIVE anchor is what makes that a statement about the
+/// unbound path rather than about target threads in general: the same
+/// item on a `bound to` transactor changes v1's output substantially,
+/// so the emitter serves target threads where it owns them.
+#[test]
+fn a_target_thread_on_an_unbound_transactor_is_discarded_by_v1() {
+    let src = |thread: &str| {
+        format!(
+            r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+{thread}
+    when active
+        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#
+        )
+    };
+    const THREAD: &str = "    thread bus.read(addr)\n        n = n + 1\n        return 7\n    end thread\n";
+
+    let err = lower_src(&src(THREAD)).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("TLM target threads"), "{msg}");
+
+    // Control, with a positive anchor so equality cannot pass vacuously.
+    let with = cpp_tb::emit(&merged_src(&src(THREAD))).expect("v1 emits");
+    let without = cpp_tb::emit(&merged_src(&src(""))).expect("v1 emits");
+    assert!(
+        without.contains("struct Xt") && without.contains("Xt_go"),
+        "the control compares real output:\n{without}"
+    );
+    assert_eq!(with, without, "v1 discards the thread on an unbound transactor");
+
+    // Negative anchor: the SAME item on a bound-to transactor DOES
+    // change v1's output. Without this, the equality above would be
+    // consistent with v1 not implementing target threads at all.
+    let bound = |item: &str| {
+        format!(
+            r#"bus MemBus
+    tlm_method read(addr: uint<32>) -> uint<32>: blocking;
+end bus MemBus
+
+transactor MemTarget bound to MemBus
+    n : uint<32> default 0
+{item}
+end transactor MemTarget
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    let mem : MemBus = bind dut
+    let target : MemTarget passive = bind mem
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let a = cpp_tb::emit(&merged_src(&bound(THREAD))).expect("v1 emits");
+    let b = cpp_tb::emit(&merged_src(&bound(
+        "    hookable go()\n        n = n + 1\n    end go\n",
+    )))
+    .expect("v1 emits");
+    assert_ne!(
+        a, b,
+        "v1 DOES serve target threads on a bound-to transactor — that contrast is \
+         what makes the unbound byte-identity meaningful"
+    );
+}
+

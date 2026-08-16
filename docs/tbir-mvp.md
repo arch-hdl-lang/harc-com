@@ -2442,6 +2442,40 @@ case and only locally-determinable `Assign` types are compared).
     asserts a call COUNT against v1's emitter, and goes red if either
     call site is removed.
 
+38. **Ninth probe sweep: the control diff gets a negative anchor, and
+    a reachability check (2026-08-16).**
+
+    - **`thread bus.<m>(…)` on an UNBOUND transactor** is discarded by
+      v1: byte-identical output with and without the item, in both
+      declaration positions. The NEGATIVE anchor makes that a statement
+      about the unbound path rather than about target threads in
+      general — the same item on a `bound to` transactor changes 42
+      lines, so v1 serves them where it owns them.
+      `NotImplemented` / silently-mis-lowers on both unbound sites.
+
+    - **A lifecycle hook was reclassified and reverted, for a NEW
+      reason.** `on build` on a transactor does change v1's output — so
+      the control diff read "implemented" — and what it emits is a
+      cycle-trigger closure whose predicate is the phase NAME as an
+      expression, `(bool)(build)`, against a `build` it never declares.
+      Differing output is not working output.
+
+      But the reclassification still came out, because the construct
+      never reaches the arm it was applied to: TB-IR parses `on build`
+      as a cycle-trigger `on <expr>` too, and rejects it earlier with
+      "the unresolved name `build`" — a diagnostic that is already
+      correct and already carries the right status.
+      `ComponentItem::Lifecycle` is reached by some other syntax that
+      was never probed, so its arm keeps `Unsupported`.
+
+    **The check this sweep adds: does the probe reach the SITE?** Every
+    earlier rule was about reading v1 correctly. This one is about the
+    other half of the comparison — a probe that trips a different tbir
+    gate first tells you nothing about the arm you are editing, however
+    good the v1 evidence is. The cheap test is to confirm the error
+    message you get back is the one produced by the site you intend to
+    change.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
