@@ -1294,7 +1294,15 @@ pub(crate) fn sanitize_file_component(name: &str) -> String {
 /// (`std::array<Entry, N>` member, `{}` default, per-element
 /// `harc_pack_Entry` packing). Scoped to record field declarations —
 /// every other type position keeps the parser's shape.
-fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
+/// Returns the file unchanged (borrowed) when no `Vec<Record, N>` field
+/// needs rewriting, which is the common case.
+///
+/// This used to clone the whole `SourceFile` unconditionally and then
+/// mutate a handful of declarations. On a large suite that is a couple of
+/// GB of AST copied for, usually, no edit at all — and it sits on the
+/// randomize-emitter path, so it ran for every suite with a `randomize`
+/// site.
+fn normalize_vec_record_elem_fields(file: &SourceFile) -> std::borrow::Cow<'_, SourceFile> {
     let record_names: std::collections::HashSet<&str> = file
         .items
         .iter()
@@ -1304,7 +1312,32 @@ fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
             _ => None,
         })
         .collect();
+    // Single source of truth for "does this type need rewriting". The
+    // pre-pass below and the mutator both go through it, so the borrow
+    // decision cannot drift away from the edit it guards — getting those
+    // two out of step would silently skip the transform rather than fail
+    // a test.
+    fn vec_record_elem(ty: &TypeExpr, record_names: &std::collections::HashSet<&str>) -> bool {
+        let TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } = ty
+        else {
+            return false;
+        };
+        let Some(TypeArg::Expr(e)) = args.first() else {
+            return false;
+        };
+        let ExprKind::Ident(id) = &*e.kind else {
+            return false;
+        };
+        record_names.contains(id.name.as_str())
+    }
     fn normalize_ty(ty: &mut TypeExpr, record_names: &std::collections::HashSet<&str>) {
+        if !vec_record_elem(ty, record_names) {
+            return;
+        }
         let TypeExpr::Builtin {
             name: BuiltinTy::Vec,
             args,
@@ -1320,9 +1353,6 @@ fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
         let ExprKind::Ident(id) = &*e.kind else {
             return;
         };
-        if !record_names.contains(id.name.as_str()) {
-            return;
-        }
         *first = TypeArg::Type(TypeExpr::Named {
             name: Path {
                 segments: vec![id.clone()],
@@ -1333,6 +1363,29 @@ fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
             span: e.span,
         });
     }
+    // Read-only pre-pass: does anything actually need rewriting? This
+    // walks record/struct field types only — never statement bodies — so
+    // it is orders of magnitude cheaper than the clone it avoids.
+    let needs_rewrite = file.items.iter().any(|it| match it {
+        Item::Struct(s) => {
+            s.fields
+                .iter()
+                .any(|f| vec_record_elem(&f.ty, &record_names))
+                || s.body.iter().any(|b| match b {
+                    TxnBodyItem::Field(f) => vec_record_elem(&f.ty, &record_names),
+                    _ => false,
+                })
+        }
+        Item::Transaction(t) => t.body.iter().any(|b| match b {
+            TxnBodyItem::Field(f) => vec_record_elem(&f.ty, &record_names),
+            _ => false,
+        }),
+        _ => false,
+    });
+    if !needs_rewrite {
+        return std::borrow::Cow::Borrowed(file);
+    }
+
     let mut out = file.clone();
     for it in &mut out.items {
         match it {
@@ -1356,7 +1409,7 @@ fn normalize_vec_record_elem_fields(file: &SourceFile) -> SourceFile {
             _ => {}
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
@@ -19761,7 +19814,29 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
 ///
 /// Tests with `for_testbench: None` (classic form) pass through
 /// unchanged.
-pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
+/// Returns the file unchanged (borrowed) when no test carries an
+/// `impl <Test> for <Tb>` binding.
+///
+/// It used to clone the entire `SourceFile` up front regardless, which on
+/// a large classic-form suite is the biggest single allocation in the
+/// frontend for an edit that never happens.
+///
+/// NOT a no-op for impl-for sources, which is most of this repo's corpus.
+/// `lower_program` desugars into a local binding that dies when it
+/// returns, and `cmd_sim` hands the ORIGINAL merged file to every
+/// consumer, so such a suite still pays this clone once per caller —
+/// `dut_probes`, lowering, and the randomize emitter. Desugaring once up
+/// front in `cmd_sim` would collapse all three to a borrow; see harc#546.
+pub(crate) fn desugar_impl_for_test_in_file(
+    file: &SourceFile,
+) -> std::borrow::Cow<'_, SourceFile> {
+    if !file
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Test(t) if t.for_testbench.is_some()))
+    {
+        return std::borrow::Cow::Borrowed(file);
+    }
     // Index components by name so the desugarer can resolve the
     // bound testbench's field list without re-walking the file.
     let mut components: std::collections::HashMap<String, ComponentDecl> =
@@ -20186,7 +20261,7 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> SourceFile {
         // printer for diagnostics, etc.) sees the classic shape.
         t.for_testbench = None;
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 fn merge_lifecycle_blocks(

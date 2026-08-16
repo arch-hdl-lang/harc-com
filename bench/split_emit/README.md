@@ -27,17 +27,19 @@ Not wired into CI — it takes minutes and writes hundreds of MB.
 without reaching for a profiler:
 
 ```
-TBIR parse: 6.1s | merge: 0.1s
-TBIR lower: 10.9s | verify: 0.4s
-TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4, planned in 10.8s
+TBIR parse: 7.4s | merge: 0.1s
+TBIR lower: 3.2s | verify: 0.4s
+TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4, planned in 0.5s
 TBIR shard 3/11: 32 tests, 31.7 MB, 0.3s, emitted
-TBIR split emit: 11/11 shards, 348.6 MB, 0.7s
+TBIR split emit: 11/11 shards, 348.6 MB, 0.8s
 ```
 
-These cover everything between reading the sources and the last shard
-hitting disk. What they do *not* cover is process teardown — dropping the
-AST and the lowered program at exit was measured at ~6 s on this suite —
-so the printed phases will sum to less than the wall clock.
+These are one representative run, not the medians tabulated below, so
+they will not sum to any figure in this file. They cover everything
+between reading the sources and the last shard hitting disk. What they do
+*not* cover is process startup and teardown — dropping the AST and the
+lowered program at exit — which is the largest unprinted contributor and
+was measured at several seconds on this suite.
 
 The final rerun in the script re-emits an unchanged suite. Every shard
 then reports `reused`, so `write_if_changed` reads and compares but never
@@ -72,17 +74,64 @@ were not. An earlier revision of this table reported 1.4 s for the
 receiver-side `--emit-jobs 4` cell, which did not survive re-measurement —
 non-interleaved timings on this host are not trustworthy.
 
+### Memory and the no-op AST copies
+
+Peak RSS on this suite was 6.7 GiB for 62 MB of source — about 115x the
+input — and roughly half of it came from two `SourceFile` clones taken
+before checking whether they had anything to rewrite:
+
+- `desugar_impl_for_test_in_file` clones, then rewrites tests carrying an
+  `impl <Test> for <Tb>` binding.
+- `normalize_vec_record_elem_fields` clones, then rewrites `Vec<Record, N>`
+  field types.
+
+Both now return `Cow` and borrow when the transform is a no-op.
+ABBA-interleaved, 6 runs per arm, medians with observed ranges:
+
+| | before | after |
+|---|---|---|
+| wall | 29.1 s (23.6-33.8) | **11.9 s** (10.9-12.8) |
+| peak RSS | 6866 MiB (6859-6866) | **3250 MiB** (3239-3252) |
+| lower | 11.1 s (4.1-12.6) | 2.35 s (2.0-3.3) |
+| split plan | 10.1 s (8.3-10.9) | 0.55 s (0.5-0.8) |
+
+Peak RSS reproduces to within 0.2% run to run, so it can be read at face
+value; the wall figures are from a shared host and only the interleaved
+comparison means anything.
+
+**This suite is the best case, not the typical one.** `gen_suite.py`
+emits classic-form tests, so both transforms borrow throughout. 166 of
+this repo's 185 fixtures use `impl <Test> for <Tb>`, and for those the
+TB-IR path still takes the desugar clone three times over: `lower_program`
+desugars into a local binding that dies when it returns, and `cmd_sim`
+passes the original merged file to `dut_probes`, to lowering, and to the
+randomize emitter. Desugaring once in `cmd_sim` would collapse all three
+to a borrow and is the obvious follow-up; it is a pipeline change rather
+than a local one, so it is not in this measurement.
+
+Split planning being ~10 s was previously read as its solver work, which
+is what the name suggests. It was mostly these copies — the scaffold build
+itself is ~0.5 s.
+
+What remains is mostly live data: the AST and the lowered `TbProgram`,
+resident together because shard emission needs the source file. A
+parse-only `harc check` on this suite peaks at 2.9 GiB, which bounds the
+AST's own footprint. Going lower means changing its representation —
+string interning or arena allocation — rather than removing copies.
+
 What this measurement establishes:
 
 1. **Shard I/O was the Amdahl ceiling on `--emit-jobs`, and it is gone.**
    The remaining sublinearity at 4 workers is the host having exactly 4
    cores.
-2. **The frontend, not emission, is where the time goes.** Emission is
-   under a second; parse, lower and split planning are each an order of
-   magnitude larger. Split *planning* deserves particular attention — it
-   builds the suite-global scaffold every shard reuses (solver problem
-   table, randomize snippets, gated-bus check) and measures larger than
-   parsing on this suite, which is not obvious from the name.
+2. **Parsing is the largest printed phase.** Emission is under a second,
+   lowering and split planning are a couple of seconds between them, and
+   parse is the rest of what gets printed — though the unprinted
+   startup/teardown residual is comparable to parse, so "long pole" would
+   overstate it. Split planning used to be the largest phase at ~11 s
+   — it builds the suite-global scaffold every shard reuses — but almost
+   all of that turned out to be the no-op AST copies described above, not
+   the solver work its name suggests.
 
 3. **Two whole-AST deep copies used to sit in that path** — `merge_for_sim`
    cloning every item out of the parsed files, and a `merged.clone()` for
