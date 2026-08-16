@@ -1861,6 +1861,46 @@ case and only locally-determinable `Assign` types are compared).
     fires once per 0→1 transition (not once per cycle the predicate
     holds) and that a periodic handler first fires at cycle N.
 
+27. **Diagnostic honesty: `--codegen v1` is only suggested when v1 has
+    it (2026-08-16).**
+    Every TB-IR subset rejection used to end in "re-run with
+    `--codegen v1`". For a large class of constructs that advice is a dead
+    end: v1 raises its own `statement/expression not supported in v0
+    cpp_tb` error, or accepts the source and emits C++ that does not
+    compile, or accepts it and quietly emits something else.
+
+    `LowerError` therefore has a third variant. `Unsupported` keeps its
+    meaning — a TB-IR subset gap where v1 IS a working escape hatch — and
+    `NotImplemented { construct, detail, v1: V1Status }` covers the rest,
+    ending in what v1 actually does (`Rejects` / `EmitsUncompilable` /
+    `SilentlyMisLowers`) instead of a suggestion. `Invalid` is unchanged
+    (a program error under every backend).
+
+    Reclassified after checking v1's behavior directly (`harc sim
+    --emit-only --codegen v1` on a probe per construct):
+
+    | Construct | v1 |
+    |---|---|
+    | `parallel` / `schedule` / `select` (spec §17.1) | rejects |
+    | block-form `fork ... branch ... join_all` | rejects |
+    | `apply` (aspect activation, spec §3.6) | rejects |
+    | `randomize` in expression position | rejects |
+    | `clog2`, `##N` / `[*N]`, cover-sequence `=>`, named arguments, struct/set/`dist` literals, `in` membership, `soft`, `solve_order`, constraint `for` — all in ordinary VALUE position | rejects (`emit_expr` has no arm) |
+    | `= bind ...` in statement position | silently mis-lowers — emits a plain `let`, dropping the bind |
+    | a range expression in value position | silently mis-lowers — emits `/* range a..b */ 0` |
+
+    The constraint-only forms in that list all lower correctly *inside*
+    `randomize ... with`: the typed constraint backend handles them and
+    `lower_expr` never sees them. The rejection is about position, and the
+    messages say so.
+
+    A `package` declaration is now accepted as **inert**, matching v1
+    exactly — v1 has no `Item::Package` arm at all, `merge_for_sim` passes
+    a package through whole rather than hoisting the `extend` blocks
+    inside it, and a package's contents only take effect at an `apply`
+    site. So the gap a user actually has is the `apply`, and that is now
+    what gets reported.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

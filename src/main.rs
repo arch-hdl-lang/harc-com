@@ -35,7 +35,9 @@ enum CodegenKind {
     /// covers the full equivalence-proven fixture corpus
     /// (`tests/tbir_equiv_fixtures.txt`), trace-identical to v1. A
     /// construct outside its subset fails with a structured error naming
-    /// the construct and suggesting `--codegen v1`.
+    /// the construct, and suggests `--codegen v1` only when v1 actually
+    /// implements it — a construct no backend implements says so instead,
+    /// rather than sending you to a dead end.
     #[default]
     Tbir,
 }

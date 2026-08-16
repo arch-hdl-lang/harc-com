@@ -1,7 +1,7 @@
 //! Statement lowering — one IR form per AST construct (design doc
 //! §"Statements within a run / check / transactor body").
 
-use super::{unsupported, FuncBuilder, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, CallArg, Expr as AstExpr, ExprKind, Ident, Stmt as AstStmt, StmtKind, TypeArg,
     TypeExpr,
@@ -148,17 +148,50 @@ impl FuncBuilder<'_> {
             // bus.m(...)`); the block-form `fork ... and ... join`
             // statement is out of subset.
             StmtKind::JoinAll { .. } => self.lower_tlm_join_all(),
-            StmtKind::Fork(_) => Err(unsupported(
-                "block-form `fork ... and ... join`",
-                "only RHS-fork TLM (`let x = fork bus.m(...)`) + `join_all` is lowered",
+            // The block form (`fork branch … end branch … join_all`) has
+            // no emitter in either backend — v1 hits its
+            // "statement not supported in v0 cpp_tb" fallback. Only the
+            // RHS-fork TLM form is implemented, and only in TB-IR.
+            StmtKind::Fork(_) => Err(not_implemented(
+                "block-form `fork ... branch ... join_all`",
+                "only the RHS-fork TLM form (`let x = fork bus.m(...)` + `join_all`) is \
+                 lowered, and only by the TB-IR backend",
+                V1Status::Rejects,
             )),
-            StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
-            StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
-            StmtKind::Select(_) => Err(unsupported("`select`", "")),
+            // The PSS-style activity-composition operators (spec §17.1).
+            // Parsed, but no backend emits them — v1 hits its
+            // "statement not supported in v0 cpp_tb" fallback for each.
+            StmtKind::Parallel(_) => Err(not_implemented(
+                "`parallel`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
+            StmtKind::Schedule(_) => Err(not_implemented(
+                "`schedule`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
+            StmtKind::Select(_) => Err(not_implemented(
+                "`select`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
             StmtKind::On(h) => self.lower_on_handler(h),
             StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
             StmtKind::Yield(e) => self.lower_yield(e),
-            StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
+            // Aspect activation (spec §3.6). Parsed, but no backend
+            // applies an aspect — v1 hits its "statement not supported in
+            // v0 cpp_tb" fallback, so a `package`'s `extend` blocks are
+            // inert under both backends.
+            StmtKind::Apply(_) => Err(not_implemented(
+                "`apply`",
+                "aspect activation (spec §3.6) is parsed but not lowered by any backend, \
+                 so a `package`'s `extend` blocks never take effect",
+                V1Status::Rejects,
+            )),
             StmtKind::Release(e) => self.lower_release(e),
             StmtKind::Assume(v) => self.lower_assume(v),
             StmtKind::Cover(v) => self.lower_cover(v),
@@ -518,7 +551,18 @@ impl FuncBuilder<'_> {
             return Err(unsupported("probe declarations", ""));
         }
         if l.bind {
-            return Err(unsupported("`= bind ...` declarations", ""));
+            // Test-scope bindings (`let axil : BusAxiLite = bind ...`,
+            // regblock / addrmap / transactor binds) are lowered by
+            // `lower_test`, which sees the testbench surface. Reaching
+            // here means a `= bind` in STATEMENT position, which v1
+            // accepts and then emits as an ordinary `let` — the `bind`
+            // is dropped, so the binding the user wrote never happens.
+            return Err(not_implemented(
+                "a `= bind ...` declaration in statement position",
+                "declare the binding at test scope (as a `let` on the test or a field on \
+                 the testbench), where the bind surface is resolved",
+                V1Status::SilentlyMisLowers,
+            ));
         }
         // `let v = _tb.pending.pop()` on a testbench-owned queue. This
         // precedes the generic scalar/record let paths so record-element

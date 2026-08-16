@@ -3,7 +3,7 @@
 //! args, DutRead/DutWrite operands, assert conditions) — everywhere
 //! else `lower_expr_no_ports` hoists DUT reads into `DutRead` temps.
 
-use super::{unsupported, FuncBuilder, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
@@ -528,7 +528,17 @@ impl FuncBuilder<'_> {
                  `fork` INSIDE a transactor responder body (target re-issuing a downstream \
                  TLM call — fork-forwarding) is a follow-up slice",
             )),
-            ExprKind::Randomize { .. } => Err(unsupported("`randomize` expressions", "")),
+            // `let ok = randomize(t)` — the value-producing form. v1's
+            // `emit_expr` has no arm for it (it only handles the
+            // STATEMENT form), so v1 hits its "expression not supported
+            // in v0 cpp_tb" fallback. The statement form IS lowered by
+            // TB-IR (`Terminator::Randomize` + the constraint-IR seam).
+            ExprKind::Randomize { .. } => Err(not_implemented(
+                "`randomize` in expression position",
+                "the statement form (`randomize(t)` / `randomize(t) with ... end randomize`) \
+                 is lowered; a value-producing `let ok = randomize(t)` is not",
+                V1Status::Rejects,
+            )),
             ExprKind::Cast { expr, ty } => {
                 // `e as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64)
                 // is a width relabel: v1 emits `((uint64_t)(e))` (the
@@ -660,7 +670,14 @@ impl FuncBuilder<'_> {
             // the plain-call spelling above: only meaningful inside a
             // concurrent check body, which intercepts them by span.
             ExprKind::SystemCall { name, .. } => match name {
-                crate::ast::SystemFn::Clog2 => Err(unsupported("`clog2`", "")),
+                // v1's `emit_expr` has no `SystemCall` arm at all, so
+                // `clog2(x)` reaches its "expression not supported"
+                // fallback there.
+                crate::ast::SystemFn::Clog2 => Err(not_implemented(
+                    "`clog2`",
+                    "fold the value at the call site, or bind it to a `const`",
+                    V1Status::Rejects,
+                )),
                 _ => Err(LowerError::Invalid(format!(
                     "`{}` is a temporal reading; it is only meaningful inside a concurrent \
                      `assert`/`assume`/`cover` body, and cannot be nested inside another \
@@ -673,25 +690,79 @@ impl FuncBuilder<'_> {
                     }
                 ))),
             },
-            ExprKind::StructLit { .. } => Err(unsupported("struct literals", "")),
-            ExprKind::SetLit(_) => Err(unsupported("set literals", "")),
-            ExprKind::DistLit(_) | ExprKind::DistDirective { .. } => {
-                Err(unsupported("`dist` constraints", ""))
-            }
-            ExprKind::RangeLit { .. } => Err(unsupported("range expressions", "")),
-            ExprKind::Membership { .. } => Err(unsupported("`in` membership tests", "")),
+            // Every arm below is a form that only means something in a
+            // position this function is NOT: a constraint body (which the
+            // typed constraint backend lowers, never `lower_expr`), a
+            // temporal property body, or a cover-sequence pattern. Reaching
+            // here means the construct was written in ordinary VALUE
+            // position, where v1's `emit_expr` has no arm for it either —
+            // hence `not_implemented`, not a v1 escape hatch.
+            ExprKind::StructLit { .. } => Err(not_implemented(
+                "a struct literal in value position",
+                "assign the fields of a `let s : <Struct>` instead",
+                V1Status::Rejects,
+            )),
+            ExprKind::SetLit(_) => Err(not_implemented(
+                "a set literal in value position",
+                "set literals are a constraint form (`keep x inside {…}`)",
+                V1Status::Rejects,
+            )),
+            ExprKind::DistLit(_) | ExprKind::DistDirective { .. } => Err(not_implemented(
+                "a `dist` literal in value position",
+                "`dist` is a constraint form — it lowers inside `randomize ... with`",
+                V1Status::Rejects,
+            )),
+            // v1 DOES have a `RangeLit` arm, but it emits
+            // `/* range a..b */ 0` — the range silently becomes zero.
+            ExprKind::RangeLit { .. } => Err(not_implemented(
+                "a range expression in value position",
+                "ranges are a `for`/`inside` form, not a value",
+                V1Status::SilentlyMisLowers,
+            )),
+            ExprKind::Membership { .. } => Err(not_implemented(
+                "an `in` membership test in value position",
+                "membership is a constraint form — it lowers inside `randomize ... with`",
+                V1Status::Rejects,
+            )),
             ExprKind::ImplicitSelf => Err(unsupported("`.field` shorthand", "")),
-            ExprKind::Send { .. } => Err(unsupported("`<-` sends in expression position", "")),
-            ExprKind::HashHash { .. } | ExprKind::SeqRepeat { .. } => {
-                Err(unsupported("temporal sequence operators", ""))
-            }
-            ExprKind::NamedArg { .. } => Err(unsupported("named arguments", "")),
-            ExprKind::CoverArrow { .. } => Err(unsupported("cover-sequence patterns", "")),
-            ExprKind::SolveOrder { .. } => Err(unsupported("`solve_order`", "")),
-            ExprKind::SoftConstraint(_) => Err(unsupported("`soft` constraints", "")),
-            ExprKind::ForEachConstraint { .. } => {
-                Err(unsupported("constraint `for` comprehensions", ""))
-            }
+            ExprKind::Send { .. } => Err(not_implemented(
+                "a `<-` send in value position",
+                "`<-` is a statement form (`target <- value`)",
+                V1Status::Rejects,
+            )),
+            ExprKind::HashHash { .. } | ExprKind::SeqRepeat { .. } => Err(not_implemented(
+                "a temporal sequence operator (`##N`, `[*N]`)",
+                "sequence operators belong in a `pseq` / property body; no backend lowers \
+                 them yet, in any position",
+                V1Status::Rejects,
+            )),
+            ExprKind::NamedArg { .. } => Err(not_implemented(
+                "a named argument",
+                "pass arguments positionally",
+                V1Status::Rejects,
+            )),
+            ExprKind::CoverArrow { .. } => Err(not_implemented(
+                "a cover-sequence pattern (`a => b`)",
+                "behavioral sequence coverage (spec §17.3) is parsed but not lowered by any \
+                 backend",
+                V1Status::Rejects,
+            )),
+            ExprKind::SolveOrder { .. } => Err(not_implemented(
+                "`solve_order` in value position",
+                "`solve_order` is a constraint form — it lowers inside `randomize ... with`",
+                V1Status::Rejects,
+            )),
+            ExprKind::SoftConstraint(_) => Err(not_implemented(
+                "`soft` in value position",
+                "`soft` is a constraint form — it lowers inside `randomize ... with`",
+                V1Status::Rejects,
+            )),
+            ExprKind::ForEachConstraint { .. } => Err(not_implemented(
+                "a constraint `for` comprehension in value position",
+                "`keep for x in ...` is a constraint form — it lowers inside a \
+                 `transaction` body or `randomize ... with`",
+                V1Status::Rejects,
+            )),
         }
     }
 

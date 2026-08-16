@@ -104,6 +104,25 @@ fn assert_unsupported(err: &lower::LowerError) -> String {
     msg
 }
 
+/// A construct no backend implements. The diagnostic must NOT suggest
+/// `--codegen v1` — that suggestion is only honest when v1 actually
+/// implements the construct, and sending a user to a backend that
+/// rejects (or silently mis-lowers) it is worse than saying nothing.
+fn assert_not_implemented(err: &lower::LowerError, v1: lower::V1Status) -> String {
+    match err {
+        lower::LowerError::NotImplemented { v1: got, .. } => {
+            assert_eq!(*got, v1, "wrong V1Status on: {err:?}")
+        }
+        other => panic!("must be LowerError::NotImplemented: {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("re-run with `--codegen v1`"),
+        "a not-implemented error must not send the user to v1: {msg}"
+    );
+    msg
+}
+
 /// #521 diagnostics contract: an illegal constant evaluation (division
 /// by zero, width violation, cyclic reference, ...) is a program error
 /// under every backend, so it surfaces as `LowerError::Invalid` with a
@@ -10881,4 +10900,207 @@ end test T"#,
         "got: {}",
         assert_unsupported(&period)
     );
+}
+
+// ── Diagnostic honesty: `--codegen v1` only when v1 has it ───────────
+//
+// TB-IR's `Unsupported` diagnostic ends in "re-run with `--codegen v1`".
+// That is only useful advice when v1 implements the construct. For the
+// constructs below it does not — v1 raises its own error, or accepts the
+// source and emits something that does not compile or does not mean what
+// was written — so they carry `LowerError::NotImplemented` instead, which
+// says what v1 actually does.
+
+/// Every activity-composition operator (spec §17.1) plus the block form
+/// of `fork` and `apply`: v1 hits its "statement not supported in v0
+/// cpp_tb" fallback for each.
+#[test]
+fn statements_no_backend_implements_do_not_suggest_v1() {
+    let cases = [
+        (
+            "parallel\n            dut.a = 1\n            dut.b = 2\n        end parallel",
+            "`parallel`",
+        ),
+        (
+            "schedule\n            dut.a = 1\n            dut.b = 2\n        end schedule",
+            "`schedule`",
+        ),
+        (
+            "select\n            dut.a == 1 => dut.b = 1\n            dut.a == 0 => dut.b = 2\n        end select",
+            "`select`",
+        ),
+        (
+            "fork\n            branch\n                dut.a = 1\n            end branch\n            branch\n                dut.b = 2\n            end branch\n        join_all",
+            "block-form `fork",
+        ),
+    ];
+    for (stmt, want) in cases {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        {stmt}
+        wait 1 cycle
+    end run
+end test T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// `apply` is reached only once the enclosing `package` is accepted —
+/// which it now is, inert, exactly as v1 treats it (v1 has no
+/// `Item::Package` arm at all). The gap the user actually has is the
+/// `apply`, and that is what the diagnostic names.
+#[test]
+fn a_package_is_inert_and_apply_is_the_reported_gap() {
+    let src = r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+package Short
+    extend Txn
+        keep a < 4
+    end extend Txn
+end package Short
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+    lower_src(src).expect("an unapplied package is inert under both backends");
+
+    let applied = src.replace(
+        "        wait 1 cycle",
+        "        apply Short\n        wait 1 cycle",
+    );
+    let err = lower_src(&applied).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("`apply`"), "got: {msg}");
+    assert!(
+        msg.contains("never take effect"),
+        "the message must say the aspect does not apply: {msg}"
+    );
+}
+
+/// The value-producing `randomize` form. The STATEMENT form lowers; v1
+/// has no `emit_expr` arm for the expression form.
+#[test]
+fn randomize_in_expression_position_does_not_suggest_v1() {
+    let err = lower_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let t : Txn
+        let ok = randomize(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("expression position"), "got: {msg}");
+}
+
+/// Two constructs v1 accepts and then quietly gets wrong. Pointing a user
+/// at v1 for these is worse than a plain rejection: they would get a
+/// testbench that builds and lies.
+#[test]
+fn constructs_v1_silently_mis_lowers_are_flagged_as_such() {
+    let bind = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = bind dut.a
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&bind, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("statement position"), "got: {msg}");
+    assert!(
+        msg.contains("silently emits something else"),
+        "the message must say what v1 does: {msg}"
+    );
+
+    // v1's `RangeLit` arm emits `/* range a..b */ 0` — the range becomes
+    // zero and the test keeps running.
+    let range = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let r = 0 .. 7
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&range, lower::V1Status::SilentlyMisLowers);
+}
+
+/// Constraint-only forms written in ordinary value position. Each is
+/// lowered fine INSIDE `randomize ... with` (the typed constraint backend
+/// handles them, never `lower_expr`), so the rejection here is about
+/// position, and the message says so.
+#[test]
+fn constraint_forms_in_value_position_do_not_suggest_v1() {
+    // `soft` / `dist` / `solve_order` only PARSE inside a constraint
+    // body, so their value-position arms are unreachable from source;
+    // `inside` parses as an ordinary binary operator anywhere.
+    for (expr, want) in [("dut.a inside {1, 2}", "membership test in value position")] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        let v = {expr}
+        wait 1 cycle
+    end run
+end test T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// The counterpart guarantee: a construct v1 DOES implement keeps the
+/// `Unsupported` shape and the `--codegen v1` suggestion, so the two
+/// classes stay meaningfully distinct.
+#[test]
+fn constructs_v1_implements_still_suggest_v1() {
+    let err = lower_src(
+        r#"transactor Drv
+    dut : Top
+    when active
+        hookable send(v: uint<8>)
+            dut.a = v
+        end send
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        on drv.send post
+            log(info, "sent")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    assert_unsupported(&err);
 }

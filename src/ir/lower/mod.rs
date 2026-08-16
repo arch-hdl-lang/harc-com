@@ -42,12 +42,54 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub enum LowerError {
-    /// The construct is outside the TB-IR MVP subset.
+    /// The construct is outside the TB-IR MVP subset, but the legacy v1
+    /// emitter implements it — so `--codegen v1` is a real escape hatch.
     Unsupported { construct: String, detail: String },
+    /// No backend implements the construct. `--codegen v1` is NOT an
+    /// escape hatch here: it rejects the construct, emits C++ that does
+    /// not compile, or silently mis-lowers it. Naming v1 in the
+    /// diagnostic would send the user down a dead end, so this variant
+    /// says what v1 actually does instead.
+    NotImplemented {
+        construct: String,
+        detail: String,
+        v1: V1Status,
+    },
     /// Structurally invalid input — a program error under every
     /// backend (v1 either rejects it too or silently mis-evaluates
     /// it), never a TB-IR subset gap, so no `--codegen v1` suggestion.
     Invalid(String),
+}
+
+/// What `--codegen v1` does with a construct TB-IR does not implement.
+/// Each value is a claim about observed v1 behavior, not a guess — see
+/// the call sites for which one applies where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V1Status {
+    /// v1 raises its own error ("statement/expression not supported in
+    /// v0 cpp_tb").
+    Rejects,
+    /// v1 emits C++ that does not compile (an out-of-scope symbol, a
+    /// call to a function it never defines).
+    EmitsUncompilable,
+    /// v1 emits code that compiles but does not mean what the source
+    /// says — the worst outcome, and the reason TB-IR refuses rather
+    /// than matching it.
+    SilentlyMisLowers,
+}
+
+impl V1Status {
+    fn clause(self) -> &'static str {
+        match self {
+            V1Status::Rejects => "`--codegen v1` does not implement it either",
+            V1Status::EmitsUncompilable => {
+                "`--codegen v1` accepts it but emits C++ that does not compile"
+            }
+            V1Status::SilentlyMisLowers => {
+                "`--codegen v1` accepts it but silently emits something else"
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for LowerError {
@@ -60,6 +102,17 @@ impl std::fmt::Display for LowerError {
                 }
                 write!(f, "; re-run with `--codegen v1`")
             }
+            LowerError::NotImplemented {
+                construct,
+                detail,
+                v1,
+            } => {
+                write!(f, "HARC does not implement {construct} yet")?;
+                if !detail.is_empty() {
+                    write!(f, " ({detail})")?;
+                }
+                write!(f, "; {}", v1.clause())
+            }
             LowerError::Invalid(msg) => write!(f, "{msg}"),
         }
     }
@@ -71,6 +124,21 @@ pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerEr
     LowerError::Unsupported {
         construct: construct.to_string(),
         detail: detail.into(),
+    }
+}
+
+/// A construct no backend implements. Prefer this over [`unsupported`]
+/// whenever `--codegen v1` would not actually help — the whole point of
+/// the v1 suggestion is that it is a working escape hatch.
+pub(crate) fn not_implemented(
+    construct: &str,
+    detail: impl Into<String>,
+    v1: V1Status,
+) -> LowerError {
+    LowerError::NotImplemented {
+        construct: construct.to_string(),
+        detail: detail.into(),
+        v1,
     }
 }
 
@@ -1164,7 +1232,16 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // above and resolved per `let chip : A = bind helper`
             // binding (each instance becomes its own shifted-offset
             // mirror local); inert at this gate.
-            | Item::Addrmap(_) => {}
+            | Item::Addrmap(_)
+            // `package Name ... end package` — an aspect container (spec
+            // §3.6). Inert under BOTH backends: `merge_for_sim` passes a
+            // package through whole (it does not hoist the `extend`
+            // blocks inside), and a package's contents only take effect
+            // at an `apply` site, which no backend lowers. v1 has no
+            // `Item::Package` arm at all, so it ignores the declaration
+            // outright; accepting it here matches that exactly, and the
+            // `apply` gate below is what actually reports the gap.
+            | Item::Package(_) => {}
             // `extend` was already folded by merge_for_sim; a survivor
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
