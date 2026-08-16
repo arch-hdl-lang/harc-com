@@ -8867,29 +8867,153 @@ test T
     end run
 end test T"#,
     );
-    assert!(
-        cpp.contains("& _ctx.bv_val((uint64_t)0xFF, 64))"),
-        "the wrap must be masked to the field's 8 bits; got:\n{cpp}"
-    );
     // C++ binds `&` looser than `==`, so the masked value needs its own
     // parens or `(a + b) & mask == 5` parses as `(a + b) & (mask == 5)`.
     assert!(
         cpp.contains(
-            "((_z_len + _ctx.bv_val((uint64_t)10, 64)) & _ctx.bv_val((uint64_t)0xFF, 64)) =="
+            "((_z_len + _ctx.bv_val((uint64_t)10, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
         ),
-        "the masked value must be parenthesised against `==`; got:\n{cpp}"
+        "the wrap must be masked to the field's 8 bits, parenthesised against `==`; got:\n{cpp}"
+    );
+}
+
+/// The mask comes from the field the emitter actually solves for, which is
+/// the *dotted* path — `hdr.len` is `_z_hdr_len`. Keying the width lookup
+/// on the leaf name instead would find the unrelated top-level `len` here
+/// and mask a `uint<16>` operand to 8 bits, and a too-narrow mask does not
+/// fail loudly: the solver just returns one of the extra values it admits.
+#[test]
+fn nested_field_wrap_masks_to_the_nested_fields_own_width() {
+    let cpp = v1_cpp(
+        r#"struct Hdr
+    len : uint<16>
+end struct Hdr
+transaction Txn
+    len : uint<8> default 0
+    hdr : Hdr
+    keep hdr.len +% 10 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_hdr_len + _ctx.bv_val((uint64_t)10, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="
+        ),
+        "`hdr.len` is uint<16> and must mask to 16 bits, not to the top-level \
+         `len`'s 8; got:\n{cpp}"
+    );
+}
+
+/// `solver_width` is `max(field widths).max(64)` — at least 64, not always
+/// 64. A transaction carrying any field wider than 64 bits solves every
+/// constraint at that wider rank, so a narrower wrap there still needs its
+/// mask, and that mask no longer fits a `uint64_t`.
+#[test]
+fn wrap_mask_tracks_a_solver_width_above_64_bits() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    m : bits<96> default 0
+    big : bits<128> default 0
+    keep m +% 3 == 1
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.big}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "& harc_z3_bv_value(_ctx, (((_harc_u128)0xffffffffULL << 0) \
+             | ((_harc_u128)0xffffffffULL << 32) \
+             | ((_harc_u128)0xffffffffULL << 64)), 128))"
+        ),
+        "a 96-bit wrap at a 128-bit solver width needs a 96-bit mask; got:\n{cpp}"
+    );
+}
+
+/// A `foreach` clause is unrolled into `items[i]`, and the loop variable is
+/// never a transaction field, so the element width has to come from the
+/// list. Without it every `foreach` constraint containing a wrap would be
+/// rejected for an unknown width.
+#[test]
+fn foreach_list_item_wrap_masks_to_the_element_width() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    items : list<uint<8>>
+    keep items.len() >= 1
+    keep items.len() <= 2
+    keep for item in items
+        item +% 250 == 4
+    end for
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "x")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_items_0 + _ctx.bv_val((uint64_t)250, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "an unrolled list item must mask to the list's element width; got:\n{cpp}"
+    );
+}
+
+/// The literal arm shares `parse_int_literal` with the statement path, so a
+/// `0b` literal sizes the same in both positions. Hand-rolling decimal and
+/// `0x` only made `let c = a +% 0b1010` emit while `keep len +% 0b1010 == 5`
+/// hard-failed.
+#[test]
+fn non_decimal_literal_wrap_operands_size_in_constraints() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% 0b1010 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="),
+        "a 0b literal operand must not defeat the width inference; got:\n{cpp}"
     );
 }
 
 /// A wrap operand with no statically known width has no defined mask, and
 /// is rejected rather than silently solved unmasked — matching what both
-/// emitters already do for a wrap in statement position.
+/// emitters already do for a wrap in statement position. The input has to
+/// be one that produces *only* this diagnostic: an undefined name errors
+/// on its own, so it would pass with the whole check deleted.
 #[test]
 fn unknown_width_wrap_operand_in_a_constraint_is_rejected() {
     let err = v1_emit_err(
         r#"transaction Txn
     len : uint<8> default 0
-    keep len +% unknown_thing == 5
+    keep (len + 1) +% 10 == 5
 end transaction Txn
 test T
     let dut : Top
@@ -8900,7 +9024,7 @@ test T
 end test T"#,
     );
     assert!(
-        err.contains("statically known bit-width") || err.contains("unknown_thing"),
-        "expected a diagnostic naming the unknown operand; got: {err}"
+        err.contains("statically known bit-width"),
+        "expected the wrap-width diagnostic; got: {err}"
     );
 }

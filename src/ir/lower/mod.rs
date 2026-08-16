@@ -18,6 +18,7 @@ mod control;
 mod covergroups;
 mod exprs;
 pub(crate) use exprs::cast_relabel_width;
+pub(crate) use exprs::parse_int_literal;
 mod helpers;
 mod records;
 mod regblock;
