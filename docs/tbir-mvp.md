@@ -2476,6 +2476,48 @@ case and only locally-determinable `Assign` types are compared).
     message you get back is the one produced by the site you intend to
     change.
 
+39. **Tenth probe sweep: addrmap bases, and a comment that was wrong
+    (2026-08-16).**
+
+    A non-literal `@ <base>` or `size` on an addrmap instance is
+    `NotImplemented` / silently-mis-lowers. The comment on
+    `addrmap.rs::fold_const` had claimed v1 "const-folds arbitrary
+    expressions; the corpus uses literals exclusively" — the second half
+    was true and the first half was not. `@ 0x50 + 0x10` folds to ZERO
+    under v1, which emits `AxilHelper_write(helper, (0 + 0x18), …)`: the
+    testbench writes register 0x18 instead of 0x78 and reports nothing.
+    A non-literal `size` collapses the same way, taking the
+    window-overlap check with it — which is why v1 accepted an addrmap
+    whose instances overlap.
+
+    **Reaching the site took three attempts, and rule 4 caught all
+    three.** The fixture `use`s a bus declaration the CLI cannot
+    resolve; an inline bus fixed that but used the wrong channel
+    keyword; and even then the addrmap arm never ran, because an
+    addrmap that is declared but never BOUND AND USED is inert. The
+    tell each time was the control failing with the same diagnostic as
+    the test case — a probe whose control does not lower is measuring
+    something other than the construct.
+
+    Folding constants here (as the field defaults do, divergence 35)
+    would put TB-IR ahead of v1 and is the natural next step; it needs
+    the file constant table threaded to that call site.
+
+    Two covergroup findings from the same batch are recorded WITHOUT a
+    classification, because their anchors failed:
+
+    - A runtime slice bound in a coverpoint (`cover dut.a[dut.b:0]`)
+      emits identically to a whole-port coverpoint under v1 — which
+      reads as "the slice is dropped" until the negative anchor is
+      tried: a CONSTANT slice (`dut.a[3:0]`) emits identically too. So
+      v1 appears to drop EVERY coverpoint slice, and TB-IR, which emits
+      a real one for the constant case, is ahead in a way nothing has
+      documented. Establishing that properly wants TB-IR's output as
+      the anchor rather than v1's.
+    - A non-constant bin spec (`lo = {dut.b}`) is unclassified: the
+      control compared one bin against two, so the diff was not
+      measuring the bin spec at all.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

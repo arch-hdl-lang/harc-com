@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use super::{unsupported, LowerError};
+use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{AddrmapDecl, ExprKind};
 use crate::ir::{Expr, RecordId, RegRegisterSchema};
 
@@ -89,23 +89,29 @@ pub(crate) fn build_binding_ctx(
             )));
         }
         let base = fold_const(&inst.base_addr).ok_or_else(|| {
-            unsupported(
+            not_implemented(
                 &format!(
                     "a non-literal `@ <base>` on addrmap `{chip}` instance `{}`",
                     inst.name.name
                 ),
-                "only plain integer literals are lowered",
+                "v1 accepts a non-literal here and folds it to ZERO — `@ 0x50 + 0x10` \
+                 emits a write to base 0 — so the testbench pokes the wrong \
+                 register rather than failing",
+                V1Status::SilentlyMisLowers,
             )
         })?;
         let size = match &inst.size {
             None => None,
             Some(e) => Some(fold_const(e).ok_or_else(|| {
-                unsupported(
+                not_implemented(
                     &format!(
                         "a non-literal `size` on addrmap `{chip}` instance `{}`",
                         inst.name.name
                     ),
-                    "only plain integer literals are lowered",
+                    "v1 accepts a non-literal here and folds it to ZERO, so the \
+                     declared window collapses and the overlap check it exists for \
+                     silently stops firing",
+                    V1Status::SilentlyMisLowers,
                 )
             })?),
         };
@@ -224,8 +230,19 @@ pub(crate) fn build_binding_ctx(
 }
 
 /// Fold a base/size `Expr` to a constant. Only plain integer literals
-/// are lowered (v1 const-folds arbitrary expressions; the corpus uses
-/// literals exclusively).
+/// are lowered.
+///
+/// The comment this replaces said v1 "const-folds arbitrary
+/// expressions". It does not: `@ 0x50 + 0x10` folds to ZERO there, and
+/// v1 emits a write to base 0 (`AxilHelper_write(helper, (0 + 0x18), …)`)
+/// instead of 0x60. A non-literal `size` collapses the same way, taking
+/// the overlap check with it. Hence the `SilentlyMisLowers` on both
+/// arms rather than a pointer at `--codegen v1`.
+///
+/// Folding constants here (as the component/scoreboard/transactor field
+/// defaults now do, divergence 35) would put TB-IR ahead of v1 and is
+/// the natural next step; it needs the file constant table threaded to
+/// this call site.
 fn fold_const(e: &crate::ast::Expr) -> Option<u64> {
     match &*e.kind {
         ExprKind::Int(s) => super::exprs::parse_int_literal(s),
