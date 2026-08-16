@@ -2423,6 +2423,13 @@ case and only locally-determinable `Assign` types are compared).
     parses — and that is invisible to any probe that only looks at
     whether the compile succeeded.
 
+    A diff needs BOTH anchors to carry weight. A positive one, so
+    equality cannot pass by both sides being empty; and a negative one —
+    the same construct somewhere it IS implemented, shown to change the
+    output — so the equality is a property of the path under test rather
+    than of the fixture. The `connect` test carries both, plus the `env`
+    contrast, and fails if v1 ever grows a transactor implementation.
+
     **The refinement this sweep adds to the probe method:** "v1 emits"
     was never the question, and neither is "v1 emits code that
     compiles". The question is whether the emitted code RUNS. A

@@ -594,7 +594,7 @@ fn lower_bound_target_transactor(
                 return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` connect blocks"),
                     "v1 parses the block and emits NOTHING for it — the edges are silently \
-                     dropped; wire the endpoints from an `env` `connect` instead",
+                     dropped",
                     V1Status::SilentlyMisLowers,
                 ));
             }
@@ -1022,7 +1022,7 @@ fn lower_bound_initiator_transactor(
                 return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` connect blocks"),
                     "v1 parses the block and emits NOTHING for it — the edges are silently \
-                     dropped; wire the endpoints from an `env` `connect` instead",
+                     dropped",
                     V1Status::SilentlyMisLowers,
                 ));
             }
@@ -1099,7 +1099,7 @@ fn lower_bound_initiator_transactor(
                 return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` connect blocks"),
                     "v1 parses the block and emits NOTHING for it — the edges are silently \
-                     dropped; wire the endpoints from an `env` `connect` instead",
+                     dropped",
                     V1Status::SilentlyMisLowers,
                 ));
             }

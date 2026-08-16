@@ -13619,13 +13619,16 @@ end impl T"#,
 
 /// A `connect` block on a transactor is not a v1 escape hatch either,
 /// and the evidence is a CONTROL DIFF rather than a grep: v1's emitted
-/// C++ is byte-identical with and without the block. It does not even
-/// RESOLVE the edges — a nonsense edge naming two endpoints that do not
-/// exist produces the same identical output, where a backend that
-/// resolved anything would have raised an error.
+/// C++ is byte-identical with and without the block.
 ///
-/// Verified across all five sites (unbound ×2, bound-to target,
-/// initiator-side ×2) and both declaration positions.
+/// Note what that does NOT rest on. v1 has a verbatim fallback for an
+/// unresolvable env edge — it emits the path as written and lets the
+/// C++ compiler complain — so "a backend that resolved anything would
+/// have errored" is false, and the byte-identity is not explained by
+/// the edge being nonsense. The positive anchor below is what makes the
+/// comparison mean something: the SAME edge shape inside an `env` does
+/// change v1's output. The emitter wires this edge when it owns it, and
+/// drops it on a transactor.
 #[test]
 fn a_transactor_connect_block_does_not_point_at_v1() {
     let src = |conn_outer: &str, conn_inner: &str| {
@@ -13657,24 +13660,147 @@ end impl T"#
     const OUTER: &str = "    connect\n        a.b -> c.d\n    end connect\n";
     const INNER: &str = "        connect\n            a.b -> c.d\n        end connect\n";
 
+    // All five sites: unbound (both declaration positions), bound-to
+    // target, and initiator-side. Claiming "five sites" while
+    // exercising two is the overclaim this sweep keeps having to undo.
     for (outer, inner) in [(OUTER, ""), ("", INNER)] {
         let err = lower_src(&src(outer, inner)).unwrap_err();
         let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
         assert!(msg.contains("connect blocks"), "{msg}");
+        assert!(msg.contains("emits NOTHING for it"), "{msg}");
+    }
+    for (label, program) in [
+        ("bound-to target", BOUND_TARGET_CONNECT),
+        ("initiator-side", BOUND_INITIATOR_CONNECT),
+    ] {
+        let err = lower_src(program).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("connect blocks"), "{label}: {msg}");
+        // The `env` advice is a dead end for a `bound to` transactor —
+        // both backends reject one as an env sub-field.
         assert!(
-            msg.contains("emits NOTHING for it"),
-            "the diagnostic must say why v1 is not a way out: {msg}"
+            !msg.contains("wire the endpoints from an `env`"),
+            "{label}: the suggested workaround must be reachable: {msg}"
         );
     }
 
-    // The control the classification rests on: v1's output does not
-    // change when the block is added, so the edges are dropped rather
-    // than wired. If this ever starts differing, v1 grew an
-    // implementation and the diagnostic must go back to `Unsupported`.
-    let with = cpp_tb::emit(&merged_src(&src(OUTER, ""))).expect("v1 emits");
+    // The control, in BOTH declaration positions — they are distinct v1
+    // paths (`include_active`), so one does not cover the other.
     let without = cpp_tb::emit(&merged_src(&src("", ""))).expect("v1 emits");
-    assert_eq!(
-        with, without,
-        "v1 emits identical C++ with and without a transactor `connect` block"
+    for (label, outer, inner) in [("outer", OUTER, ""), ("when active", "", INNER)] {
+        let with = cpp_tb::emit(&merged_src(&src(outer, inner))).expect("v1 emits");
+        assert_eq!(
+            with, without,
+            "{label}: v1 emits identical C++ with and without a transactor `connect`"
+        );
+    }
+    // Positive anchor: without this the equality above degenerates to a
+    // tautology the day v1 stops emitting the transactor at all.
+    assert!(
+        without.contains("struct Xt") && without.contains("Xt_go"),
+        "the control compares real output, not two empty strings:\n{without}"
+    );
+
+    // …and the negative anchor: the same edge in an `env` DOES change
+    // v1's output, so byte-identity is a property of the transactor
+    // path, not of the edge.
+    let env_src = |conn: &str| {
+        format!(
+            r#"transactor Src
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+    hookable take(v: uint<8>)
+        seen = seen + 1
+    end take
+end scoreboard Sink
+
+env E
+    src  : Src passive
+    sink : Sink
+{conn}end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let env_with =
+        cpp_tb::emit(&merged_src(&env_src("    connect\n        src.observed -> sink.take\n    end connect\n")))
+            .expect("v1 emits");
+    let env_without = cpp_tb::emit(&merged_src(&env_src(""))).expect("v1 emits");
+    assert_ne!(
+        env_with, env_without,
+        "an `env` connect edge DOES change v1's output — that contrast is what \
+         makes the transactor byte-identity meaningful"
     );
 }
+
+const BOUND_TARGET_CONNECT: &str = r#"bus MemBus
+    tlm_method read(addr: uint<32>) -> uint<32>: blocking;
+end bus MemBus
+
+transactor MemTarget bound to MemBus
+    n : uint<32> default 0
+
+    connect
+        a.b -> c.d
+    end connect
+
+    thread bus.read(addr)
+        n = n + 1
+        return 7
+    end thread
+end transactor MemTarget
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    let mem : MemBus = bind dut
+    let target : MemTarget passive = bind mem
+    run
+        wait 2 cycles
+    end run
+end impl T"#;
+
+const BOUND_INITIATOR_CONNECT: &str = r#"bus RwBus
+    handshake_channel w: send kind: valid_ready
+        data: uint<8>
+    end handshake_channel w
+end bus RwBus
+
+transactor RwDrv bound to RwBus
+    n : uint<32> default 0
+
+    connect
+        a.b -> c.d
+    end connect
+
+    hookable go()
+        n = n + 1
+        wait 1 cycle
+    end go
+end transactor RwDrv
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    let b : RwBus = bind dut
+    let drv : RwDrv active = bind b
+    run
+        drv.go()
+    end run
+end impl T"#;
