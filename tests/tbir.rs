@@ -13892,3 +13892,130 @@ end impl T"#
     );
 }
 
+
+/// A non-literal `@ <base>` or `size` on an addrmap instance is not a
+/// v1 escape hatch. The comment in `addrmap.rs` used to claim v1
+/// "const-folds arbitrary expressions" — it does not: `@ 0x50 + 0x10`
+/// folds to ZERO there, and v1 emits a register write against base 0
+/// instead of 0x60. The testbench pokes the wrong address and reports
+/// nothing.
+///
+/// Both anchors are in the assertions below: v1's output for the
+/// expression matches the LITERAL ZERO base (positive — it really folded
+/// to 0) and differs from the literal 0x60 base (negative — the base
+/// genuinely affects the emitted address, so byte-equality is not a
+/// property of the fixture).
+#[test]
+fn a_non_literal_addrmap_base_does_not_point_at_v1() {
+    let err = lower_src(&addrmap_src("@ 0x50 + 0x10 size 0x30")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("non-literal `@ <base>`"), "{msg}");
+    assert!(msg.contains("folds it to ZERO"), "{msg}");
+
+    let err = lower_src(&addrmap_src("@ 0x00 size 0x18 + 0x18")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("non-literal `size`"), "{msg}");
+
+    // The control lowers, so the probe is reaching the addrmap arm
+    // rather than tripping an earlier gate.
+    emit_cpp_src(&addrmap_src("@ 0x00 size 0x30"));
+
+    // v1's evidence, pinned on the emitted ADDRESS rather than whole
+    // files — `0` and `0x00` are the same value spelled two ways, and
+    // the claim is about the value.
+    let addr_of = |inst: &str| {
+        let cpp = cpp_tb::emit(&merged_src(&addrmap_src(inst))).expect("v1 emits");
+        let at = cpp
+            .find("AxilHelper_write(helper, (")
+            .unwrap_or_else(|| panic!("no addrmap write in v1 output:\n{cpp}"));
+        let rest = &cpp[at + "AxilHelper_write(helper, (".len()..];
+        rest[..rest.find(")").expect("the address expression closes")].to_string()
+    };
+
+    // The expression base folds to ZERO — the write lands at 0x18…
+    assert_eq!(
+        addr_of("@ 0x50 + 0x10 size 0x30").replace("0x00", "0"),
+        "0 + 0x18",
+        "v1 folds a non-literal addrmap base to 0"
+    );
+    // …where the base it was WRITTEN as would have put it at 0x78. That
+    // contrast is what makes the fold a silent bug rather than a
+    // harmless spelling difference.
+    assert_eq!(addr_of("@ 0x60 size 0x30"), "0x60 + 0x18");
+}
+
+fn addrmap_src(inst: &str) -> String {
+    ADDRMAP_TB.replace("@ 0x00 size 0x30", inst)
+}
+
+const ADDRMAP_TB: &str = r#"bus BusAxiLite
+    handshake_channel aw: send kind: valid_ready
+        addr: uint<8>
+    end handshake_channel aw
+    handshake_channel w: send kind: valid_ready
+        data: uint<32>
+        strb: uint<4>
+    end handshake_channel w
+    handshake_channel ar: send kind: valid_ready
+        addr: uint<8>
+    end handshake_channel ar
+    handshake_channel r: receive kind: valid_ready
+        data: uint<32>
+    end handshake_channel r
+end bus BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaChan via AxilHelper width 32
+    /// DMACR — bit 0 is RS (run/stop).
+    register DMACR @ 0x00 access rw
+        field RS : bit @ 0 reset 0 access rw
+    end register DMACR
+
+    /// SA — full-word source address.
+    register SA @ 0x18 access rw
+end regblock DmaChan
+
+addrmap Soc via AxilHelper
+    /// MM2S channel at base 0x00 — register addresses align with the
+    /// AxiLiteRegs MM2S register layout. `size 0x30` declares the
+    /// window so the codegen can statically rule out overlap with
+    /// the s2mm instance below.
+    instance mm2s : DmaChan @ 0x00 size 0x30
+    /// S2MM channel at base 0x30 — DMACR at 0x30, SA at 0x48
+    /// (0x30 + 0x18) — also matches the AxiLiteRegs layout.
+    instance s2mm : DmaChan @ 0x30 size 0x30
+end addrmap Soc
+
+testbench Tb
+    dut : AxiLiteRegs
+end testbench Tb
+impl T for Tb
+    let axil : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let chip   : Soc = bind helper
+    run
+        chip.mm2s.SA = 0x1234
+        wait 2 cycles
+    end run
+end impl T
+"#;
