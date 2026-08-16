@@ -2053,6 +2053,17 @@ case and only locally-determinable `Assign` types are compared).
     | `bitbash(<non-identifier>)` | emits a call to a `bitbash(...)` function it never defines |
     | `emit` with no resolvable channel | emits the fan-out anyway (`for (auto& _s : a.b) _s(x);`), naming a symbol that does not exist |
 
+    The probe / bind-remap rejections are **one family with one rule**:
+    v1 emits no probe accessor for any binding but `dut` (so the
+    declaration is inert and any read of it fails to compile) and drops a
+    `with { … }` remap clause entirely. All fourteen sites — bus,
+    regblock, addrmap, initiator BFM, bound-to event-driven transactor,
+    target-TLM responder, component, transactor, and `let dut` itself —
+    carry that rule. Most need a differently-shaped fixture to reach, so
+    `probe_and_remap_rejections_are_one_family_with_one_rule` checks it
+    structurally over the lowering sources and a companion test exercises
+    one arm end-to-end, so the scan cannot pass over dead code.
+
     **The counterpart matters as much.** `log(<unknown severity>, …)`
     stayed an `Unsupported` with its `--codegen v1` suggestion intact,
     because v1 genuinely handles it — it passes the word through as the

@@ -2466,10 +2466,19 @@ fn lower_test(
                         .is_some_and(|n| regblock_ids.contains_key(n)) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported("probe declarations on a regblock binding", ""));
+                    return Err(not_implemented(
+                        "probe declarations on a regblock binding",
+                        "declare probes on `let dut` — no other binding gets a probe accessor, so \
+                         the declaration is inert and any read of it fails to compile",
+                        V1Status::EmitsUncompilable,
+                    ));
                 }
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported("bind remaps on a regblock binding", ""));
+                    return Err(not_implemented(
+                        "bind remaps on a regblock binding",
+                        "v1 parses the `with { … }` clause and emits nothing for it",
+                        V1Status::SilentlyMisLowers,
+                    ));
                 }
                 let rb_name = type_simple_name(l.ty.as_ref()).unwrap();
                 let rbid = regblock_ids[rb_name];
@@ -2496,10 +2505,19 @@ fn lower_test(
                         .is_some_and(|n| addrmap_decls.contains_key(n)) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported("probe declarations on an addrmap binding", ""));
+                    return Err(not_implemented(
+                        "probe declarations on an addrmap binding",
+                        "declare probes on `let dut` — no other binding gets a probe accessor, so \
+                         the declaration is inert and any read of it fails to compile",
+                        V1Status::EmitsUncompilable,
+                    ));
                 }
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported("bind remaps on an addrmap binding", ""));
+                    return Err(not_implemented(
+                        "bind remaps on an addrmap binding",
+                        "v1 parses the `with { … }` clause and emits nothing for it",
+                        V1Status::SilentlyMisLowers,
+                    ));
                 }
                 let amap_name = type_simple_name(l.ty.as_ref()).unwrap().to_string();
                 // RHS must be a bare helper-instance identifier.
@@ -2538,16 +2556,20 @@ fn lower_test(
                     }) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "probe declarations on an initiator-BFM instance",
-                        "",
+                        "declare probes on `let dut` — no other binding gets a probe \
+                         accessor, so the declaration is inert and any read of it \
+                         fails to compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "bind remaps on an initiator-BFM instance",
                         "the default `<binding>_<ch>_<sig>` wire convention is lowered; \
                          custom signal remaps are a follow-up slice",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
@@ -2609,16 +2631,20 @@ fn lower_test(
                     }) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "probe declarations on a bound-to event-driven transactor instance",
-                        "",
+                        "declare probes on `let dut` — no other binding gets a probe \
+                         accessor, so the declaration is inert and any read of it \
+                         fails to compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "bind remaps on a bound-to event-driven transactor instance",
                         "the default `<binding>_<ch>_<sig>` wire convention is lowered; custom \
                          signal remaps are a follow-up slice",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
@@ -2705,16 +2731,20 @@ fn lower_test(
                     }) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "probe declarations on a target-TLM responder instance",
-                        "",
+                        "declare probes on `let dut` — no other binding gets a probe \
+                         accessor, so the declaration is inert and any read of it \
+                         fails to compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "bind remaps on a target-TLM responder instance",
                         "the default `<binding>_<method>_<sig>` wire convention is lowered; \
                          custom signal remaps are a follow-up slice",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
@@ -2768,9 +2798,12 @@ fn lower_test(
                         .is_some_and(|n| component_ids.contains_key(n)) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "probe declarations on a component instance",
-                        "",
+                        "declare probes on `let dut` — no other binding gets a probe \
+                         accessor, so the declaration is inert and any read of it \
+                         fails to compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 if l.value.is_some() {
@@ -2845,8 +2878,9 @@ fn lower_test(
                     // to compile far from the declaration.
                     return Err(not_implemented(
                         "probe declarations on a transactor instance",
-                        "declare probes on `let dut`, the only instance with a probe accessor",
-                        V1Status::SilentlyMisLowers,
+                        "declare probes on `let dut` — no other binding gets a probe accessor, \
+                         so the declaration is inert and any read of it fails to compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 if l.value.is_some() {
