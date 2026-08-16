@@ -232,3 +232,14 @@ bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass
 wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
+
+# Added by the harc#551 coverage audit. These four run under
+# run_fixtures.sh (default backend only) but were never trace-diffed
+# across the two emitters. Two of them are solver fixtures, which is the
+# area harc#559 spent five review passes in — precisely the coverage that
+# should not have been missing.
+backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
+multi_active_instance_test | Top | top_counter.sv | - | pass
+soft_constraint_randomize_test | Top | top_counter.sv | - | pass
+target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+uint64_unique_randomize_test | Top | top_counter.sv | - | pass

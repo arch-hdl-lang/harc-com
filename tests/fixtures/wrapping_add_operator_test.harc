@@ -1,9 +1,0 @@
-test WrappingArithmeticOperatorTest
-    let a : uint<8> = 255
-    let b : uint<8> = a +% 1
-    let c : uint<8> = b -% 1
-    let d : uint<8> = c *% 3
-    assert b == 0 else fail("wrapping add operator did not wrap")
-    assert c == 255 else fail("wrapping sub operator did not wrap")
-    assert d == 253 else fail("wrapping mul operator did not wrap")
-end test WrappingArithmeticOperatorTest

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Blast-radius sweep: emit every fixture under both backends at two git
+# revisions and diff the generated C++.
+#
+# This is a REVIEW tool, not a CI gate. It answers one question that no
+# test answers: "how much of the corpus does my change actually move?"
+# During harc#559 it was run by hand at every step, and its most useful
+# result was almost always ZERO — being able to say "this touches two
+# lines of emitted output across 186 fixtures" is what bounded a change
+# whose review kept turning up surprises.
+#
+# Note the corollary, which is the substance of harc#551: a sweep that
+# reports no differences also proves the corpus does not exercise your
+# change. Read a clean result as "nothing existing regressed", never as
+# "the new behaviour is right".
+#
+# Usage:
+#     scripts/emit_sweep.sh [BASE_REV] [HEAD_REV]
+#
+# BASE_REV defaults to origin/main, HEAD_REV to the working tree (built
+# in place). Both revisions are built into separate target dirs, so this
+# does not disturb your working tree or its build cache.
+set -uo pipefail
+
+BASE_REV="${1:-origin/main}"
+HEAD_REV="${2:-}"
+DUT_DIR="tests/dut"
+FIX_DIR="tests/fixtures"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TMP="$(mktemp -d)"
+WT=""
+trap 'rm -rf "$TMP"; [ -n "$WT" ] && git -C "$ROOT" worktree remove --force "$WT" >/dev/null 2>&1; git -C "$ROOT" worktree prune >/dev/null 2>&1' EXIT
+
+build_at() { # build_at <rev|WORKTREE> <label> -> echoes binary path
+    local rev="$1" label="$2"
+    if [ "$rev" = "WORKTREE" ]; then
+        (cd "$ROOT" && cargo build -q --bin harc) || return 1
+        echo "$ROOT/target/debug/harc"; return 0
+    fi
+    WT="$TMP/wt_$label"
+    git -C "$ROOT" worktree add -q --detach "$WT" "$rev" || return 1
+    (cd "$WT" && cargo build -q --bin harc) || return 1
+    echo "$WT/target/debug/harc"
+}
+
+echo "Building $BASE_REV ..." >&2
+BASE_BIN="$(build_at "$BASE_REV" base)" || { echo "failed to build $BASE_REV" >&2; exit 1; }
+echo "Building ${HEAD_REV:-working tree} ..." >&2
+HEAD_BIN="$(build_at "${HEAD_REV:-WORKTREE}" head)" || { echo "failed to build head" >&2; exit 1; }
+
+FIXTURES="$(cat "$ROOT/tests/fixtures.tbl")"
+exitdiff=0; textdiff=0; total=0
+while IFS='|' read -r name top svs extra ref tstruct; do
+    name="$(echo "$name" | xargs)"; top="$(echo "$top" | xargs)"
+    svs="$(echo "$svs" | xargs)"; extra="$(echo "$extra" | xargs)"
+    tstruct="$(echo "$tstruct" | xargs)"
+    [ -z "$name" ] && continue
+    args=("$FIX_DIR/$name.harc")
+    for f in $extra; do args+=("$FIX_DIR/$f"); done
+    svargs=(); for f in $svs; do svargs+=(--sv "$DUT_DIR/$f"); done
+    targs=(); [ -n "$tstruct" ] && targs=(--test "$tstruct")
+    for cg in v1 tbir; do
+        total=$((total + 1))
+        for side in base head; do
+            bin="$BASE_BIN"; [ "$side" = head ] && bin="$HEAD_BIN"
+            (cd "$ROOT" && "$bin" sim "${args[@]}" "${svargs[@]}" --top "$top" \
+                --emit-only --codegen "$cg" --outdir "$TMP/$side/$cg/$name" \
+                "${targs[@]}") >/dev/null 2>&1
+            eval "rc_$side=$?"
+        done
+        if [ "$rc_base" != "$rc_head" ]; then
+            echo "EXIT  $cg  $name  ($rc_base -> $rc_head)"
+            exitdiff=$((exitdiff + 1)); continue
+        fi
+        b="$TMP/base/$cg/$name/$name.cpp"; h="$TMP/head/$cg/$name/$name.cpp"
+        if [ -f "$b" ] && [ -f "$h" ] && ! diff -q "$b" "$h" >/dev/null; then
+            echo "TEXT  $cg  $name  ($(diff "$b" "$h" | grep -c '^[<>]') lines)"
+            textdiff=$((textdiff + 1))
+        fi
+    done
+done <<<"$FIXTURES"
+
+echo
+echo "Swept $total fixture×backend pairs: $exitdiff acceptance changes, $textdiff text changes"
+echo "(A clean sweep bounds regressions. It does NOT show the new behaviour is correct —"
+echo " if your change has no corpus coverage, this is exactly what you would see. harc#551.)"
