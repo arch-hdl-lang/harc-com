@@ -10611,7 +10611,7 @@ end test T"#,
     .expect_err("nested temporal readings must not lower");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("cannot be nested inside another temporal reading"),
+        msg.contains("not nested inside another temporal reading"),
         "got: {msg}"
     );
 }
@@ -10634,7 +10634,7 @@ end test T"#,
     .expect_err("a bare temporal reading must be rejected");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("only meaningful inside a concurrent"),
+        msg.contains("only meaningful in the CONDITION of a concurrent"),
         "got: {msg}"
     );
 }
@@ -11999,34 +11999,43 @@ end impl T"#,
     assert!(!msg.contains("codegen v1"), "{msg}");
 }
 
-/// `|->` / `|=>` shape a concurrent check; they are not values. v1
-/// lowers one in value position to the C++ comma operator
-/// (`a /* unsupported-op */ , b`), which compiles and silently
-/// evaluates to the right operand alone — so pointing there would send
-/// the user to a backend that drops half their expression.
+/// `lower_property_check` destructures the top-level `|->` / `|=>` into
+/// a `PropertyShape`, so one reaching the expression lowering sat
+/// somewhere the subset does not lower: a value position, or nested
+/// inside another implication (legal property syntax, just not lowered
+/// here). v1 accepts BOTH and emits the C++ comma operator
+/// (`a /* unsupported-op */ , b`), which compiles and evaluates to the
+/// right operand alone — so the antecedent is silently dropped and the
+/// check runs on half the expression. Pointing a user there would be
+/// worse than saying nothing.
 #[test]
-fn an_implication_in_value_position_is_invalid() {
-    for (src_op, sym) in [("|->", "|->"), ("|=>", "|=>")] {
+fn an_implication_outside_the_top_level_does_not_point_at_v1() {
+    let nested = [
+        // Value position.
+        "let x = (dut.a == 1) |-> (dut.b == 1)",
+        // Nested inside another implication.
+        "assert dut.a |-> (dut.b |-> dut.c)",
+        // Nested under the `|=>` spelling.
+        "assert dut.a |=> (dut.b |=> dut.c)",
+    ];
+    for stmt in nested {
         let err = lower_src(&format!(
             r#"testbench Tb
     dut : Top
 end testbench Tb
 impl T for Tb
     run
-        let x = (dut.a == 1) {src_op} (dut.b == 1)
+        {stmt}
         wait 1 cycle
     end run
 end impl T"#
         ))
         .unwrap_err();
-        let lower::LowerError::Invalid(msg) = &err else {
-            panic!("`{sym}` in value position is malformed: {err:?}");
-        };
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
         assert!(
-            msg.contains(&format!("`{sym}` is a concurrent-assertion operator")),
-            "{msg}"
+            msg.contains("outside the top level of an `assert` / `assume`"),
+            "`{stmt}`: {msg}"
         );
-        assert!(!msg.contains("codegen v1"), "{msg}");
     }
 }
 
@@ -12217,4 +12226,181 @@ end impl T"#,
     .expect("lowers");
     let dump = format!("{prog}");
     assert!(dump.contains(r#"else fail "a moved""#), "{dump}");
+}
+
+/// A runtime slice of a WIDE value must slice out of all its words. The
+/// `HarcWide<N>` → `_harc_u128` conversion keeps only the low four, so
+/// casting the target before the call would make `w[200:193]` on a
+/// `uint<256>` read 0. The target is passed uncast so overload
+/// resolution binds the wide `harc_bits`.
+#[test]
+fn a_runtime_slice_of_a_wide_value_is_not_cast_to_128_bits() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let i = 200
+        let w : uint<256> = 5
+        let b = w[i:1]
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_bits((w), (uint32_t)(i), (uint32_t)(1))"),
+        "a wide target must reach `harc_bits` uncast:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_harc_u128)(w)"),
+        "casting to `_harc_u128` first drops every word above the low four:\n{cpp}"
+    );
+}
+
+/// A transactor-method call inside a runtime slice bound is still a call
+/// edge. `expr_has_transactor_edge` gates the `wait until` predicate on
+/// exactly that, and a walker missing the new node would let one through
+/// into a per-cycle predicate.
+#[test]
+fn a_transactor_call_in_a_slice_bound_is_still_a_call_edge() {
+    let err = lower_src(&fixture_with_transactor_call_in_slice_bound()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("transactor method call inside a `wait until` predicate"),
+        "a call edge hidden in a slice bound must still trip the predicate gate: {msg}"
+    );
+}
+
+fn fixture_with_transactor_call_in_slice_bound() -> String {
+    // A `wait until` whose predicate slices a port by a bound that calls
+    // a sibling method — the call is two levels down, inside the `hi`
+    // operand of the slice, where a walker missing `BitSliceDyn` would
+    // not find it.
+    r#"
+transactor Xt
+    dut : Top
+
+    when active
+        hookable idx() -> uint<8>
+            return 3
+        end idx
+
+        hookable wait_slice()
+            wait until dut.a[idx():0] == 1
+        end wait_slice
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt  : Xt active
+end testbench XtTb
+
+impl XtSliceBoundCallTest for XtTb
+    run
+        xt.dut = dut
+        xt.wait_slice()
+    end run
+end impl XtSliceBoundCallTest
+"#
+    .to_string()
+}
+
+/// `cover` counts witnesses; it reports hit/total, not a failure, so an
+/// `else fail(...)` clause has nothing to name. The parser accepts the
+/// clause on any verify statement and v1 drops it silently — the exact
+/// "written, accepted, lost" shape this sweep set out to remove.
+#[test]
+fn a_cover_rejects_an_else_fail_clause() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        cover rose(dut.a) else fail("never covered")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let lower::LowerError::Invalid(msg) = &err else {
+        panic!("a cover cannot carry a failure message: {err:?}");
+    };
+    assert!(
+        msg.contains("`cover` counts witnesses") && msg.contains("use `assert`"),
+        "{msg}"
+    );
+}
+
+/// The `else fail(...)` message is lowered with NO temporal slot map:
+/// `lower_fmt` re-parses each capture as a standalone fragment whose
+/// spans are fragment-relative, so a capture's span can collide with a
+/// real temporal occurrence's and get rewritten into that occurrence's
+/// `Expr::TemporalSlot`. With the map empty, a `${past(x)}` reaches the
+/// ordinary temporal gate and is rejected by name.
+#[test]
+fn a_check_message_cannot_read_a_temporal_slot() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("was ${past(dut.a)}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("not in that check's `else fail(...)` message"),
+        "{msg}"
+    );
+
+    // The span-collision itself: a message whose capture is a plain
+    // port read must stay a port read, never a latch. This is the
+    // shape that silently emitted `_harc_ps0` before the map was
+    // cleared.
+    let prog = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("b=${dut.b}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect("lowers");
+    let msg = prog.property_checks[0]
+        .message
+        .as_ref()
+        .expect("the clause lowered");
+    assert!(
+        msg.args
+            .iter()
+            .all(|a| !matches!(a.expr, ir::Expr::TemporalSlot { .. })),
+        "a message capture must never alias a latch slot: {:?}",
+        msg.args
+    );
+    // …and the emitted closure reads the port, not the latch.
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("b=${dut.b}")
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "b=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->b)))"#),
+        "{cpp}"
+    );
 }

@@ -447,12 +447,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         for e in exprs {
             check_temporal_slots(e, n, &format!("property check p{pi}"), &mut errs);
         }
-        // The `else fail(...)` message renders inside the same closure,
-        // so a `${past(x)}` capture indexes the same latch table.
+        // The `else fail(...)` message renders inside the same closure
+        // but is lowered with no slot map, so it can hold no
+        // `Expr::TemporalSlot` at all — 0 slots, not `n`. A slot
+        // appearing here means the message picked up an occurrence by
+        // span collision, which is exactly the bug the empty map
+        // prevents; the check keeps that guarantee testable.
         for a in p.message.iter().flat_map(|m| &m.args) {
             check_temporal_slots(
                 &a.expr,
-                n,
+                0,
                 &format!("property check p{pi} message"),
                 &mut errs,
             );

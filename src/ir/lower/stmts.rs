@@ -2789,14 +2789,22 @@ impl FuncBuilder<'_> {
 
         // `assert <temporal> else fail("...")` — the clause names what
         // the failure means, which is strictly more useful than the
-        // generic property line, so it replaces it. The message is
-        // lowered inside `with_check_body` like the condition: it is
-        // evaluated in the per-cycle closure, so it is held to the same
-        // rule that the body pushes no statements into the test.
+        // generic property line, so it replaces it. The message renders
+        // in the same per-cycle closure as the condition, so it is held
+        // to the same rule: it may read locals and ports, but it may not
+        // push a statement into the test.
+        //
+        // Lowered with NO slot map, like a latch operand. `lower_fmt`
+        // re-parses each `${…}` capture as a standalone fragment, whose
+        // spans are relative to the fragment rather than to the file, so
+        // a capture's span can collide with a real temporal occurrence
+        // and get rewritten into that occurrence's `Expr::TemporalSlot`.
+        // With the map empty a `${past(x)}` reaches the ordinary
+        // temporal gate and is rejected by name instead.
         let message = match v.else_fail.as_ref() {
             Some(e) => {
                 let msg = self.else_fail_literal(e)?;
-                Some(self.with_check_body(&temporals, construct, |b| b.lower_fmt(&msg))?)
+                Some(self.with_check_body(&[], construct, |b| b.lower_fmt(&msg))?)
             }
             None => None,
         };
@@ -2828,6 +2836,19 @@ impl FuncBuilder<'_> {
             return Ok(());
         };
         self.require_test_body("a `cover` witness")?;
+        // A `cover` has no failure line to name: it counts the cycles
+        // its predicate held and reports hit/total. The parser accepts
+        // the clause on any `verify` statement, and v1 drops it here
+        // without a word — the same "written, accepted, lost" shape
+        // that `else fail(...)` on a concurrent `assert` had.
+        if v.else_fail.is_some() {
+            return Err(LowerError::Invalid(
+                "`cover` counts witnesses; it has no failure to report, so an \
+                 `else fail(...)` clause has nothing to name (use `assert` if the \
+                 condition must hold)"
+                    .to_string(),
+            ));
+        }
         let construct = "a `cover` witness";
         let label = match &*raw.kind {
             ExprKind::Ident(id) => id.name.clone(),

@@ -412,17 +412,22 @@ impl FuncBuilder<'_> {
                         }
                         // `past(x)` / `rose(x)` / `fell(x)` / `stable(x)`
                         // written as a plain call. Legal only inside a
-                        // concurrent check body, where the slot map
-                        // intercepts it before this arm; anywhere else it
-                        // has no per-cycle latch to read, and v1 emits
-                        // NOTHING for it (`emit_expr` has no arm outside a
-                        // property check), so there is no `--codegen v1`
-                        // escape hatch to point at.
+                        // concurrent check CONDITION, where the slot map
+                        // intercepts it before this arm; the three
+                        // no-slot-map positions inside such a check (a
+                        // latch operand, another temporal's operand, and
+                        // the `else fail(...)` message) land here along
+                        // with every position outside one. All of them
+                        // lack a per-cycle latch to read, and v1 emits
+                        // NOTHING for a temporal outside a property check
+                        // (`emit_expr` has no arm for it), so there is no
+                        // `--codegen v1` escape hatch to point at.
                         if matches!(id.name.as_str(), "past" | "rose" | "fell" | "stable") {
                             return Err(LowerError::Invalid(format!(
-                                "`{}(...)` is a temporal reading; it is only meaningful \
-                                 inside a concurrent `assert`/`assume`/`cover` body, and \
-                                 cannot be nested inside another temporal reading",
+                                "`{}(...)` is a temporal reading; it is only meaningful in \
+                                 the CONDITION of a concurrent `assert`/`assume`/`cover` — \
+                                 not nested inside another temporal reading, and not in \
+                                 that check's `else fail(...)` message",
                                 id.name
                             )));
                         }
@@ -2609,23 +2614,28 @@ pub(crate) fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
         BinaryOp::BitXor => BinOp::BitXor,
         BinaryOp::Shl => BinOp::Shl,
         BinaryOp::Shr => BinOp::Shr,
-        // `|->` / `|=>` shape a concurrent check; `lower_property_check`
-        // destructures the top-level one into `PropertyShape` before any
-        // operand reaches here. Reaching this arm means the operator sat
-        // in a value position (`let x = a |-> b`) or nested inside
-        // another implication — neither names a value. v1 emits the C++
-        // comma operator for it (`a /* unsupported-op */ , b`), which
-        // compiles and silently evaluates to the right operand alone.
+        // `|->` / `|=>` shape a concurrent check, and
+        // `lower_property_check` destructures the TOP-LEVEL one into a
+        // `PropertyShape` before any operand reaches here. Reaching this
+        // arm means the operator sat somewhere else: a value position
+        // (`let x = a |-> b`), or nested inside another implication
+        // (`a |-> (b |-> c)`, which is legal property syntax this
+        // subset does not lower). v1 accepts both and emits the C++
+        // comma operator (`a /* unsupported-op */ , b`), which compiles
+        // and evaluates to the right operand alone — the antecedent is
+        // silently dropped, so the check runs on half the expression.
         BinaryOp::PipeImplies | BinaryOp::PipeImpliesNext => {
             let sym = if matches!(op, BinaryOp::PipeImpliesNext) {
                 "|=>"
             } else {
                 "|->"
             };
-            return Err(LowerError::Invalid(format!(
-                "`{sym}` is a concurrent-assertion operator, not a value: it is only \
-                 meaningful as the top-level operator of an `assert` / `assume`"
-            )));
+            return Err(not_implemented(
+                &format!("`{sym}` outside the top level of an `assert` / `assume`"),
+                "only one implication per check is lowered, and it must be the \
+                 outermost operator",
+                V1Status::SilentlyMisLowers,
+            ));
         }
         // The SVA sequence operators (spec §5). No backend implements
         // them: v1 emits the C++ comma operator, so
@@ -2767,6 +2777,12 @@ pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
         Expr::WidthCast { inner, .. } => expr_has_transactor_edge(inner),
         Expr::ComponentIdle { n, .. } => expr_has_transactor_edge(n),
         Expr::SeqIndex { index, .. } => expr_has_transactor_edge(index),
+        Expr::BitSlice { target, .. } => expr_has_transactor_edge(target),
+        Expr::BitSliceDyn { target, hi, lo } => {
+            expr_has_transactor_edge(target)
+                || expr_has_transactor_edge(hi)
+                || expr_has_transactor_edge(lo)
+        }
         Expr::CovHookParam {
             index: Some(index), ..
         } => expr_has_transactor_edge(index),

@@ -403,16 +403,22 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             };
             format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
         }
-        // Runtime bounds go through the same helper v1 emits. The
-        // target keeps its `harc_read` widening when it is a whole
-        // port, so a wide signal slices out of its full value rather
-        // than out of a truncated `uint64_t`.
+        // Runtime bounds go through the same helper v1 emits. The target
+        // is passed UNCAST so overload resolution picks the right
+        // `harc_bits`: a scalar converts to `_harc_u128`, and a
+        // `HarcWide<N>` binds the wide overload that slices out of all N
+        // words. Casting to `_harc_u128` first would go through
+        // `HarcWide::operator _harc_u128`, which keeps only the low four
+        // words — `w[200:193]` on a `uint<256>` would read 0. A whole
+        // port is the one shape that needs a wrapper: the raw Verilator
+        // signal is a `WData` array with no `harc_bits` overload, so it
+        // widens through `harc_read` (v1's shape) first.
         Expr::BitSliceDyn { target, hi, lo } => {
             let t = match &**target {
                 Expr::Port(p) if p.lane.is_none() => {
                     format!("harc_rt::harc_read({})", port_signal(cx, p))
                 }
-                other => format!("(_harc_u128)({})", expr_cpp(cx, other)?),
+                other => format!("({})", expr_cpp(cx, other)?),
             };
             let hi = expr_cpp(cx, hi)?;
             let lo = expr_cpp(cx, lo)?;
