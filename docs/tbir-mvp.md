@@ -2041,6 +2041,27 @@ case and only locally-determinable `Assign` types are compared).
     | bit-slice bounds above 2^32 | casts the bound to `uint32_t` with no range check — silently slices the wrong bits |
     | `yield` outside a `tseq` body, `randomize` of a non-identifier | raises its own error |
 
+32. **Second probe sweep (2026-08-16).** Six more diagnostics
+    reclassified after emitting each construct under `--codegen v1` and
+    reading the C++:
+
+    | Construct | v1 |
+    |---|---|
+    | non-string-literal `fail(...)` / `else fail(...)` message | emits the FIXED text (`"fail() with non-string arg"` / `"assertion failed"`) and drops the expression, so the failure line says nothing about the value |
+    | bind remaps on `let dut` (`= bind top with { … }`) | parses the clause and emits nothing for it — the TB drives the un-remapped port |
+    | probe declarations on a transactor instance | emits no probe accessor at all; the declaration is silently inert |
+    | `bitbash(<non-identifier>)` | emits a call to a `bitbash(...)` function it never defines |
+    | `emit` with no resolvable channel | emits the fan-out anyway (`for (auto& _s : a.b) _s(x);`), naming a symbol that does not exist |
+
+    **The counterpart matters as much.** `log(<unknown severity>, …)`
+    stayed an `Unsupported` with its `--codegen v1` suggestion intact,
+    because v1 genuinely handles it — it passes the word through as the
+    log tag (`sim_log_line("TRACE", "x")`). TB-IR's stricter check is a
+    deliberate improvement (a typo'd severity becomes an error rather
+    than a new log tag), and the suggestion is honest: v1 really will
+    compile it. The two classes only stay useful if the line between them
+    tracks what v1 actually does.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

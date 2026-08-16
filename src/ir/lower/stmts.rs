@@ -2893,9 +2893,11 @@ impl FuncBuilder<'_> {
             Some(e) => match &*e.kind {
                 ExprKind::String(s) => s.clone(),
                 _ => {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         "non-string-literal `else fail(...)` message",
-                        "",
+                        "interpolate the value into the literal instead — \
+                         `else fail(\"x=${v}\")`",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
             },
@@ -2912,7 +2914,15 @@ impl FuncBuilder<'_> {
         // CFG-inlined calls may be hoisted (matches v1's inline eval).
         match &*msg.kind {
             ExprKind::String(s) => self.lower_fmt_hoisting(s),
-            _ => Err(unsupported("non-string-literal `fail(...)` message", "")),
+            // v1 does not evaluate a non-literal message: it emits the
+            // fixed text "fail() with non-string arg" and DROPS the
+            // expression, so the failure line says nothing about the
+            // value that caused it.
+            _ => Err(not_implemented(
+                "non-string-literal `fail(...)` message",
+                "interpolate the value into the literal instead — `fail(\"x=${v}\")`",
+                V1Status::SilentlyMisLowers,
+            )),
         }
     }
 

@@ -41,7 +41,7 @@
 //!     `on regs.REG` write callbacks (see `detect_regblock_residual`),
 //!   * `addrmap` composition (incl. `alias of`).
 
-use super::{unsupported, LowerError};
+use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
     self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
@@ -532,9 +532,12 @@ impl super::FuncBuilder<'_> {
             CallArg::Named { value, .. } => value,
         };
         let ExprKind::Ident(regs_id) = &*arg.kind else {
-            return Err(unsupported(
+            // v1 emits a call to a `bitbash(...)` function it never
+            // defines, so the generated TB does not link.
+            return Err(not_implemented(
                 "bitbash(<expr>) over a non-identifier argument",
                 "pass the regblock binding directly: `bitbash(regs)`",
+                V1Status::EmitsUncompilable,
             ));
         };
         if !self.is_regblock_binding(&regs_id.name) {

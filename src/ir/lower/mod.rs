@@ -2385,7 +2385,14 @@ fn lower_test(
         match it {
             TestItem::Let(l) if l.name.name == "dut" => {
                 if !l.bind_remap.is_empty() {
-                    return Err(unsupported("bind remaps on `let dut`", ""));
+                    // v1 parses the `with { … }` clause and then emits
+                    // nothing for it — the remap is silently dropped, so
+                    // the TB drives the un-remapped port name.
+                    return Err(not_implemented(
+                        "bind remaps on `let dut`",
+                        "name the DUT port directly",
+                        V1Status::SilentlyMisLowers,
+                    ));
                 }
                 // Collect DUT-internal probe declarations. Each becomes a
                 // `Probe`/`Force` access class in `LowerCtx::probes`,
@@ -2832,9 +2839,14 @@ fn lower_test(
                         .is_some_and(|n| prog.transactors.iter().any(|x| x.name == n)) =>
             {
                 if !l.probes.is_empty() {
-                    return Err(unsupported(
+                    // v1 emits no probe accessor for a non-`dut` instance
+                    // — the declaration is silently inert, so a read of
+                    // the probe name resolves to something else or fails
+                    // to compile far from the declaration.
+                    return Err(not_implemented(
                         "probe declarations on a transactor instance",
-                        "",
+                        "declare probes on `let dut`, the only instance with a probe accessor",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 if l.value.is_some() {

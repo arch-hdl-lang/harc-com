@@ -11290,8 +11290,9 @@ end test T"#,
     }
 }
 
-/// A bare `emit` with no channel and no enclosing component now names
-/// both places a channel could come from.
+/// A bare `emit` with no channel and no enclosing component names both
+/// places a channel could come from — and does not send the user to v1,
+/// which emits the fan-out over a symbol that does not exist.
 #[test]
 fn emit_with_no_channel_names_both_sources() {
     let err = lower_src(
@@ -11304,7 +11305,7 @@ fn emit_with_no_channel_names_both_sources() {
 end test T"#,
     )
     .unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("test-scope event channel"),
         "the message must mention the test-scope form too: {msg}"
@@ -11710,4 +11711,89 @@ end impl T"#,
             && cpp.contains(") < _wu_budget) tick();"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
     );
+}
+
+/// Second probe sweep: six more constructs where `--codegen v1` is not an
+/// escape hatch. Each `V1Status` below was established by emitting the
+/// construct with `--codegen v1` and reading the generated C++ — the
+/// comment on each case records what that output was.
+#[test]
+fn probe_sweep_two_constructs_v1_does_not_really_support() {
+    // v1 emits the fixed text "fail() with non-string arg" and DROPS the
+    // expression, so the failure line says nothing about the value.
+    let f = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let m = 1
+        fail(m)
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&f, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("${v}"), "the message must show the fix: {msg}");
+
+    // Same drop on the `else fail(...)` clause — v1 emits the default
+    // "assertion failed" text.
+    let ef = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let m = 1
+        assert dut.a == 1 else fail(m)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&ef, lower::V1Status::SilentlyMisLowers);
+
+    // v1 parses the `with { … }` clause and emits nothing for it, so the
+    // TB drives the un-remapped port name.
+    let remap = lower_src(
+        r#"testbench Tb
+end testbench Tb
+impl T for Tb
+    let dut : Top = bind top with { a: "aa" }
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&remap, lower::V1Status::SilentlyMisLowers);
+
+    // v1 emits a call to a `bitbash(...)` function it never defines.
+    let bb = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        bitbash(dut.a)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&bb, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("bitbash"), "{msg}");
+}
+
+/// The counterpart: `log(<unknown severity>, …)` DOES work under v1 —
+/// it passes the word through as the log tag — so that rejection keeps
+/// its `--codegen v1` suggestion. The two classes must stay distinct.
+#[test]
+fn an_unknown_log_severity_still_suggests_v1() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        log(trace, "x")
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("log severity `trace`"), "{msg}");
 }
