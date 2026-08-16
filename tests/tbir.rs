@@ -13476,3 +13476,143 @@ end impl T"#,
         "the old wording blamed the DUT handle: {msg}"
     );
 }
+
+/// A `watchdog` on a transactor is NOT a v1 escape hatch, and the reason
+/// only shows up if you check whether the emitted code ever RUNS. v1
+/// emits a complete `<T>_watchdog` lambda — pre/post hook vectors, the
+/// `max_idle` check against `_last_in_cycle`/`_last_out_cycle`, the FAIL
+/// line, the error bump — and then never calls it.
+///
+/// The control that makes this a v1 bug rather than a global design: an
+/// AGENT watchdog DOES get a call site (`Producer_watchdog(_tb.prod)`
+/// inside a periodic closure, in `watchdog_quiesce_test`). A transactor
+/// watchdog gets none, so it compiles and silently never fires.
+///
+/// All five watchdog sites carry it — unbound, bound-to target, and
+/// initiator-side. An earlier pass reclassified only the two unbound
+/// ones on the belief that the others needed a sibling bus file to
+/// reach; they do not (`bus … end bus` sits inline beside a bound-to
+/// transactor in `dma_engine_tlm_target_test`), and single-file probes
+/// of both bound flavors show the same defined-never-called lambda.
+#[test]
+fn a_transactor_watchdog_does_not_point_at_v1() {
+    let src = |wd_pos: &str| {
+        let (outer, inner) = match wd_pos {
+            "outer" => (WD_BLOCK, ""),
+            _ => ("", WD_BLOCK),
+        };
+        format!(
+            r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+{outer}
+    when active
+{inner}        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#
+        )
+    };
+    const WD_BLOCK: &str = "    watchdog\n        period 5 cycles\n        max_idle 100 cycles\n        log(info, \"wdog\")\n    end watchdog\n";
+
+    for pos in ["outer", "when"] {
+        let err = lower_src(&src(pos)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("transactor `Xt` watchdogs"), "{pos}: {msg}");
+        assert!(
+            msg.contains("never schedules it"),
+            "the diagnostic must say WHY v1 is not a way out: {msg}"
+        );
+    }
+}
+
+/// The control, pinned so the claim above stays true. It must check
+/// **v1's** output, not tbir's: the claim is about what `cpp_tb` emits.
+/// And it must count real CALL lines — a watchdog that is never
+/// scheduled still emits its `_pre`/`_post` vector declarations and two
+/// internal hook loops, so a bare "name appears" count is satisfied by
+/// exactly the dead shape this test exists to distinguish from.
+#[test]
+fn an_agent_watchdog_is_scheduled_under_v1() {
+    let merged = merged_src(&fixture("watchdog_quiesce_test.harc"));
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+
+    let is_call = |l: &&str| {
+        l.contains("Producer_watchdog(")
+            && !l.contains("auto Producer_watchdog")
+            && !l.contains("Producer_watchdog_pre")
+            && !l.contains("Producer_watchdog_post")
+    };
+    let calls: Vec<&str> = cpp.lines().filter(is_call).collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "an agent watchdog is CALLED exactly once, from its periodic closure; \
+         got {calls:?}"
+    );
+
+    // And the transactor flavor, through the same emitter, has none —
+    // which is the whole basis for the reclassification above.
+    let merged = merged_src(
+        r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+
+    watchdog
+        period 5 cycles
+        max_idle 100 cycles
+        log(info, "wdog")
+    end watchdog
+
+    when active
+        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    );
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+    assert!(
+        cpp.contains("auto Xt_watchdog"),
+        "v1 defines the transactor watchdog body:\n{cpp}"
+    );
+    let calls: Vec<&str> = cpp
+        .lines()
+        .filter(|l| {
+            l.contains("Xt_watchdog(")
+                && !l.contains("auto Xt_watchdog")
+                && !l.contains("Xt_watchdog_pre")
+                && !l.contains("Xt_watchdog_post")
+        })
+        .collect();
+    assert!(
+        calls.is_empty(),
+        "…and never calls it — if this ever fires, the reclassification is stale \
+         and the diagnostic must go back to `Unsupported`; got {calls:?}"
+    );
+}

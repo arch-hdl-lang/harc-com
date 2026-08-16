@@ -32,10 +32,13 @@
 //! still requires exactly one module-typed DUT handle field.
 //!
 //! Everything outside the subset — `bound to <BusType>` (initiator side),
-//! generics, event ports, `on` handlers, TLM target threads, watchdogs —
-//! is an explicit `Unsupported`.
+//! generics, event ports, `on` handlers, TLM target threads — is an
+//! explicit `Unsupported`. A `watchdog` is the exception: v1 emits its
+//! body and never schedules it, so that one is a `NotImplemented`.
 
-use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
+use super::{
+    helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
+};
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
     TypeArg, TypeExpr,
@@ -196,7 +199,23 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(&format!("transactor `{tname}` watchdogs"), ""));
+                // v1 emits a complete `<T>_watchdog` lambda — pre/post
+                // hook vectors, the `max_idle` check against
+                // `_last_in_cycle`/`_last_out_cycle`, the FAIL line, the
+                // error bump — and then never calls it. An AGENT
+                // watchdog gets a periodic `_checkers` closure installed
+                // at its instantiation site (`Producer_watchdog(_tb.prod)`);
+                // a transactor watchdog gets no call site at all, in the
+                // outer, `when active`, and passive landings alike. So
+                // the construct compiles under v1 and the watchdog
+                // silently never fires — the worst outcome available,
+                // and not something to point a user at.
+                return Err(not_implemented(
+                    &format!("transactor `{tname}` watchdogs"),
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
+                ));
             }
             ComponentItem::Connect(_) => {
                 return Err(unsupported(
@@ -288,7 +307,23 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(&format!("transactor `{tname}` watchdogs"), ""));
+                // v1 emits a complete `<T>_watchdog` lambda — pre/post
+                // hook vectors, the `max_idle` check against
+                // `_last_in_cycle`/`_last_out_cycle`, the FAIL line, the
+                // error bump — and then never calls it. An AGENT
+                // watchdog gets a periodic `_checkers` closure installed
+                // at its instantiation site (`Producer_watchdog(_tb.prod)`);
+                // a transactor watchdog gets no call site at all, in the
+                // outer, `when active`, and passive landings alike. So
+                // the construct compiles under v1 and the watchdog
+                // silently never fires — the worst outcome available,
+                // and not something to point a user at.
+                return Err(not_implemented(
+                    &format!("transactor `{tname}` watchdogs"),
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
+                ));
             }
             ComponentItem::Connect(_) => {
                 return Err(unsupported(
@@ -542,9 +577,13 @@ fn lower_bound_target_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {
@@ -964,9 +1003,13 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {
@@ -1035,9 +1078,13 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Watchdog(_) => {
-                return Err(unsupported(
+                // Same rule as the unbound flavor: v1 emits the
+                // watchdog body and never schedules it.
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` watchdogs"),
-                    "",
+                    "v1 emits the watchdog body but never schedules it, so it never \
+                     fires; declare the watchdog on an `agent` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Connect(_) => {
