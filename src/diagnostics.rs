@@ -37,6 +37,13 @@ pub enum CompileError {
         span: SourceSpan,
     },
 
+    /// Source longer than `u32::MAX` bytes. `Span` stores `u32` offsets
+    /// (see `lexer::Span`), so a larger file could not be spanned without
+    /// silently aliasing distinct positions onto the same offset. Rejected
+    /// up front rather than mis-compiled.
+    #[error("source file is {len} bytes; the maximum supported size is {max} bytes")]
+    SourceTooLarge { len: usize, max: usize },
+
     #[error("{message}")]
     General {
         message: String,

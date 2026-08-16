@@ -15,16 +15,28 @@ pub struct Parser {
     source: String,
 }
 
+/// Render a `tokenize` failure as a `CompileError`. Shared by every entry
+/// point below so the three fragment/file parsers cannot drift apart.
+fn lex_error(err: crate::lexer::LexError) -> CompileError {
+    match err {
+        crate::lexer::LexError::InvalidTokens(spans) => {
+            let span = spans.first().copied().unwrap_or(Span::new(0, 0));
+            CompileError::LexerError {
+                span: crate::diagnostics::span_to_source_span(span),
+            }
+        }
+        crate::lexer::LexError::SourceTooLarge { len } => CompileError::SourceTooLarge {
+            len,
+            max: crate::lexer::MAX_SOURCE_LEN,
+        },
+    }
+}
+
 /// Parse a single expression fragment (for codegen-time string-interpolation
 /// `${expr}` capture). Returns the parsed `Expr`; codegen then routes it
 /// through `emit_expr` so pointer-deref / field rewrites apply correctly.
 pub fn parse_expr_fragment(source: &str) -> Result<Expr, CompileError> {
-    let tokens = crate::lexer::tokenize(source).map_err(|spans| {
-        let span = spans.first().copied().unwrap_or(Span::new(0, 0));
-        CompileError::LexerError {
-            span: crate::diagnostics::span_to_source_span(span),
-        }
-    })?;
+    let tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
     let mut p = Parser::new(tokens, source);
     p.parse_expr()
 }
@@ -34,23 +46,13 @@ pub fn parse_expr_fragment(source: &str) -> Result<Expr, CompileError> {
 /// DUT module's port declaration in its `.arch`/`.archi` interface, reusing the
 /// real type-expr grammar rather than scraping the `<...>` substring by hand.
 pub fn parse_type_expr_fragment(source: &str) -> Result<TypeExpr, CompileError> {
-    let tokens = crate::lexer::tokenize(source).map_err(|spans| {
-        let span = spans.first().copied().unwrap_or(Span::new(0, 0));
-        CompileError::LexerError {
-            span: crate::diagnostics::span_to_source_span(span),
-        }
-    })?;
+    let tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
     let mut p = Parser::new(tokens, source);
     p.parse_type_expr()
 }
 
 pub fn parse_source(source: &str) -> Result<SourceFile, CompileError> {
-    let tokens = crate::lexer::tokenize(source).map_err(|spans| {
-        let span = spans.first().copied().unwrap_or(Span::new(0, 0));
-        CompileError::LexerError {
-            span: crate::diagnostics::span_to_source_span(span),
-        }
-    })?;
+    let tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
     let mut p = Parser::new(tokens, source);
     p.parse_source_file()
 }
@@ -1960,13 +1962,12 @@ impl Parser {
         // `property foo(args)\n  body` — params attach if `(` is on the same
         // line as the name. A newline before `(` means the `(` is the start
         // of the body expression (e.g. `(dut.x == 15) |=> dut.y`).
-        let params = if self.check(TokenKind::LParen)
-            && !self.newline_before_peek(name.span.end_usize())
-        {
-            self.parse_paren_params()?
-        } else {
-            Vec::new()
-        };
+        let params =
+            if self.check(TokenKind::LParen) && !self.newline_before_peek(name.span.end_usize()) {
+                self.parse_paren_params()?
+            } else {
+                Vec::new()
+            };
         let inner_doc = self.consume_inner_doc();
         let body = self.parse_expr()?;
         let end = self.expect_end(TokenKind::Property, &name.name)?;
@@ -1984,13 +1985,12 @@ impl Parser {
         let start = self.expect(TokenKind::Pseq)?.span;
         let name = self.expect_ident()?;
         // Same newline-disambiguation as parse_property — see comment there.
-        let params = if self.check(TokenKind::LParen)
-            && !self.newline_before_peek(name.span.end_usize())
-        {
-            self.parse_paren_params()?
-        } else {
-            Vec::new()
-        };
+        let params =
+            if self.check(TokenKind::LParen) && !self.newline_before_peek(name.span.end_usize()) {
+                self.parse_paren_params()?
+            } else {
+                Vec::new()
+            };
         let inner_doc = self.consume_inner_doc();
         let body = self.parse_expr()?;
         let end = self.expect_end(TokenKind::Pseq, &name.name)?;
