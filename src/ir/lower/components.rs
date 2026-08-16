@@ -1020,7 +1020,7 @@ pub(crate) fn lower_component_bodies(
     schema: &ComponentSchema,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<ComponentBodies, LowerError> {
     let (items, when_active): (&[ComponentItem], Option<&[ComponentItem]>) = match src {
         CompSource::Env(c)
@@ -1057,7 +1057,7 @@ pub(crate) fn lower_component_bodies(
                 cid,
                 ctx,
                 helpers,
-                constraint_sites,
+                side_tables,
             )?);
         }
     }
@@ -1077,7 +1077,7 @@ pub(crate) fn lower_component_bodies(
                 cid,
                 ctx,
                 helpers,
-                constraint_sites,
+                side_tables,
             )?);
         }
     }
@@ -1094,7 +1094,7 @@ pub(crate) fn lower_component_bodies(
             let ph = &schema.periodic_handlers[per_idx];
             per_idx += 1;
             let (body, period) =
-                lower_periodic_body(h, ph.function, cid, ctx, helpers, constraint_sites)?;
+                lower_periodic_body(h, ph.function, cid, ctx, helpers, side_tables)?;
             funcs.push(body);
             periodic_periods.push(period);
         }
@@ -1119,10 +1119,10 @@ pub(crate) fn lower_component_bodies(
                     cid,
                     ctx,
                     helpers,
-                    constraint_sites,
+                    side_tables,
                 )?
             } else {
-                lower_cycle_body(h, ch.function, cid, ctx, helpers, constraint_sites)?
+                lower_cycle_body(h, ch.function, cid, ctx, helpers, side_tables)?
             };
             funcs.push(body);
             cycle_triggers.push(trigger);
@@ -1138,7 +1138,7 @@ pub(crate) fn lower_component_bodies(
                     continue;
                 }
                 let (body, period, max_idle) =
-                    lower_watchdog_body(w, ws.function, cid, ctx, helpers, constraint_sites)?;
+                    lower_watchdog_body(w, ws.function, cid, ctx, helpers, side_tables)?;
                 funcs.push(body);
                 watchdog_clauses = Some((period, max_idle));
                 break;
@@ -1164,9 +1164,9 @@ fn lower_cycle_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
     // `lower_expr` (NOT `_no_ports`): the trigger renders standalone in the
     // per-instance `_checkers` closure, never appended to this body, so it
@@ -1228,7 +1228,7 @@ fn lower_monitor_handshake_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
     // Resolve the channel's payload signals from the bound bus (visible in
     // this context under the placeholder prefix, injected at the per-
@@ -1260,7 +1260,7 @@ fn lower_monitor_handshake_body(
     }
     let payload_sigs: Vec<String> = hs.payload.iter().map(|s| s.name.name.clone()).collect();
 
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
 
     // Capture the channel payload BEFORE the user body (the payload is
@@ -1315,9 +1315,9 @@ fn lower_periodic_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
     // The period is `h.event` in the periodic form (parser stashes the
     // cycle count there). Lower with `lower_expr` (NOT `_no_ports`): the
@@ -1352,9 +1352,9 @@ fn lower_watchdog_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<(TbFunction, Option<crate::ir::Expr>, Option<crate::ir::Expr>), LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
     // `lower_expr` (NOT `_no_ports`): period/max_idle render standalone in
     // the per-instance `_checkers` closure, never appended to this body —
@@ -1392,9 +1392,9 @@ fn lower_on_handler_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
     // The handler's single argument (from `on <event>(<arg>)`). The
     // param type mirrors the subscribed event's payload: a scalar
@@ -1567,9 +1567,9 @@ fn lower_method_body(
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
-    constraint_sites: &std::cell::RefCell<Vec<crate::ir::ConstraintSite>>,
+    side_tables: &std::cell::RefCell<super::SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
     // Bind parameters as the first locals (the run/check convention: a
     // LocalId < params.len() *is* the i-th param). Same shape as a
@@ -1966,7 +1966,7 @@ pub(crate) fn lower_queue_elem(
 /// scalar nor a known record (enum / Vec / nested / unknown) is rejected
 /// precisely — those genuinely unsupported payload shapes gate on later
 /// slices.
-fn lower_event_payload(
+pub(crate) fn lower_event_payload(
     comp: &str,
     fname: &str,
     arg: Option<&TypeArg>,
@@ -2804,11 +2804,62 @@ impl super::FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // Test-scope event channel: `emit e(x)` on a `let e : event<T>`
+        // local. v1 emits the same synchronous fan-out
+        // (`for (auto& _s : e) _s(x);`).
+        if segs.len() == 1 {
+            if let Some(local) = self.lookup(&segs[0]) {
+                if let IrType::Event(payload) = *self.local_type(local) {
+                    if args.len() != 1 {
+                        return Err(LowerError::Invalid(format!(
+                            "`emit {}` carries {} argument(s); an event payload is exactly one",
+                            segs[0],
+                            args.len()
+                        )));
+                    }
+                    let lowered = self.lower_component_call_args(args)?;
+                    // Shape must agree: the channel renders as
+                    // `std::function<void(uint64_t)>` or
+                    // `std::function<void(<Record>)>`, and passing one
+                    // where the other is expected is a hard C++ error.
+                    // Signedness is left alone — both backends widen a
+                    // scalar payload to a 64-bit slot, so `sint` into an
+                    // `event<uint<8>>` is the same benign conversion v1
+                    // performs.
+                    let arg_ty = self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown);
+                    let shape_ok = match (payload, &arg_ty) {
+                        (_, IrType::Unknown) => true,
+                        (EventPayload::Record(want), IrType::Record(got)) => want == *got,
+                        (EventPayload::Record(_), _) => false,
+                        (EventPayload::Scalar { .. }, IrType::Record(_)) => false,
+                        (EventPayload::Scalar { .. }, _) => true,
+                    };
+                    if !shape_ok {
+                        let want = match payload {
+                            EventPayload::Scalar { signed: true } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),
+                        };
+                        return Err(LowerError::Invalid(format!(
+                            "`emit {}`: the channel carries `event<{want}>`, but the payload \
+                             does not match that shape",
+                            segs[0]
+                        )));
+                    }
+                    self.push(IrStmt::EventEmit {
+                        event: local,
+                        args: lowered,
+                    });
+                    return Ok(());
+                }
+            }
+        }
         // Self-relative form, inside a method/on-handler body.
         let cid = self.self_component.ok_or_else(|| {
             unsupported(
-                "`emit` outside a component method body",
-                "only a component event field supports `emit` in this subset",
+                "`emit` outside a component method body or a test-scope event channel",
+                "`emit <e>(x)` needs either a component `event` field or a test-scope \
+                 `let <e> : event<T>` in scope",
             )
         })?;
         if name.segments.len() != 1 {

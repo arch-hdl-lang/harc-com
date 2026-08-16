@@ -747,6 +747,231 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
     Ok(())
 }
 
+/// C++ name of the file-scope hit counter behind one `cover` check.
+/// File scope (not a closure-local `static`) so the end-of-test summary,
+/// which lives in the test's `run_*` function rather than inside the run
+/// coroutine, can read it. v1 declares the same counter as a `static`
+/// local INSIDE the coroutine lambda and then reads it from the enclosing
+/// function — a scope error that makes v1's `cover` emission fail to
+/// compile (documented divergence; see `docs/tbir-mvp.md`).
+pub(super) fn cover_counter_name(tag: &str) -> String {
+    format!("_cov_{tag}_hits")
+}
+
+/// Declare each temporal latch's `static` previous-value cell and this
+/// cycle's value local, at the head of a concurrent-check closure.
+/// Returns nothing; the matching write-back is `emit_temporal_writeback`.
+fn emit_temporal_latches(
+    out: &mut String,
+    cx: &ECx<'_>,
+    temporals: &[crate::ir::TemporalSlot],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    for (i, _) in temporals.iter().enumerate() {
+        writeln!(out, "{pad}static int64_t _harc_ps{i} = 0;").ok();
+    }
+    for (i, slot) in temporals.iter().enumerate() {
+        let inner = expr_cpp(cx, &slot.inner)?;
+        writeln!(out, "{pad}int64_t _harc_cur{i} = (int64_t)({inner});").ok();
+    }
+    Ok(())
+}
+
+/// Copy each latch's current value into its `static` cell, so the next
+/// cycle's `past`/`rose`/`fell`/`stable` reads see it.
+fn emit_temporal_writeback(out: &mut String, n: usize, depth: usize) {
+    let pad = INDENT.repeat(depth);
+    for i in 0..n {
+        writeln!(out, "{pad}_harc_ps{i} = _harc_cur{i};").ok();
+    }
+}
+
+/// One concurrent property check: a `_checkers` closure evaluated after
+/// every primary-clock edge from this registration point onward. Mirrors
+/// v1's `emit_property_check` — same three temporal shapes, same failure
+/// lines, same error-counter policy (`assert` bumps, `assume` does not).
+fn emit_property_check(
+    out: &mut String,
+    cx: &ECx<'_>,
+    schema: &crate::ir::PropertyCheckSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    use crate::ir::PropertyShape;
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let sev = schema.severity.tag();
+    let label = escape_c(&schema.label);
+
+    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
+    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+
+    // The failure arm is identical across shapes apart from the operator
+    // suffix in the message, so build it once.
+    let fail_arm = |out: &mut String, suffix: &str| {
+        writeln!(
+            out,
+            "{pad2}sim_log_line(\"{sev}\", \"property `{label}` failed{suffix}\");"
+        )
+        .ok();
+        if schema.severity.counts_as_error() {
+            writeln!(out, "{pad2}ctx.errors++;").ok();
+        }
+    };
+
+    match &schema.shape {
+        // `a |=> b` — the antecedent is remembered for one cycle, so the
+        // check fires on the cycle AFTER `a` held.
+        PropertyShape::ImpliesNext { ante, cons } => {
+            let a = expr_cpp(cx, ante)?;
+            let b = expr_cpp(cx, cons)?;
+            writeln!(out, "{pad1}static bool _harc_prev = false;").ok();
+            writeln!(out, "{pad1}bool _harc_a = (bool)({a});").ok();
+            writeln!(out, "{pad1}bool _harc_b = (bool)({b});").ok();
+            writeln!(out, "{pad1}if (_harc_prev && !_harc_b) {{").ok();
+            fail_arm(out, " (|=>)");
+            writeln!(out, "{pad1}}}").ok();
+            writeln!(out, "{pad1}_harc_prev = _harc_a;").ok();
+        }
+        PropertyShape::Implies { ante, cons } => {
+            let a = expr_cpp(cx, ante)?;
+            let b = expr_cpp(cx, cons)?;
+            writeln!(out, "{pad1}if ((bool)({a}) && !(bool)({b})) {{").ok();
+            fail_arm(out, " (|->)");
+            writeln!(out, "{pad1}}}").ok();
+        }
+        PropertyShape::Invariant(e) => {
+            let c = expr_cpp(cx, e)?;
+            writeln!(out, "{pad1}if (!({c})) {{").ok();
+            fail_arm(out, "");
+            writeln!(out, "{pad1}}}").ok();
+        }
+    }
+
+    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
+/// One concurrent `cover` witness: a `_checkers` closure that bumps the
+/// check's file-scope hit counter on every primary-clock edge where the
+/// predicate holds. Mirrors v1's `StmtKind::Cover` emission, plus the
+/// temporal-latch machinery v1's cover path lacks.
+fn emit_cover_check(
+    out: &mut String,
+    cx: &ECx<'_>,
+    schema: &crate::ir::CoverCheckSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let counter = cover_counter_name(&schema.tag);
+    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
+    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let cond = expr_cpp(cx, &schema.cond)?;
+    writeln!(out, "{pad1}if ((bool)({cond})) {counter}++;").ok();
+    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
+/// Arm one statement-position `on` handler: a `_checkers` /
+/// `_post_eval_services` closure that calls the handler body's lambda
+/// when its trigger fires. Byte-for-byte the state machine v1's
+/// `emit_cycle_trigger` installs — a rising/falling edge latch or a
+/// last-fire stamp — with the body factored into a named lambda instead
+/// of inlined, because the TB-IR body is its own function.
+///
+/// The body lambda is declared at test scope (the `TestHook` emission
+/// loop in `mod::emit_test`), NOT here: a lambda declared inside the
+/// run coroutine's `switch` case would die at the end of the case block
+/// while the registered closure still referenced it.
+fn emit_cycle_handler(
+    out: &mut String,
+    cx: &ECx<'_>,
+    prog: &TbProgram,
+    id: crate::ir::CycleHandlerId,
+    schema: &crate::ir::CycleHandlerSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    use crate::ir::CycleHandlerKind;
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let lambda = &prog
+        .functions
+        .get(schema.function.index())
+        .ok_or_else(|| EmitError(format!("tbir: cycle handler h{} has no body", id.0)))?
+        .name;
+    // Per-handler tag for the `static` latch cells. Unique per closure
+    // scope already, but tagged by handler id so a debugger shows which
+    // `on` a cell belongs to.
+    let tag = format!("_onh_{}", id.0);
+    let vec = schema.phase.service_vec();
+    writeln!(out, "{pad}{vec}.push_back([&]() {{").ok();
+    match &schema.kind {
+        CycleHandlerKind::Periodic { period } => {
+            // `last = 0` means the FIRST firing is at cycle `period`, not
+            // cycle 0 — "every N cycles", not "now and every N cycles".
+            writeln!(out, "{pad1}static int64_t {tag}_last = 0;").ok();
+            writeln!(
+                out,
+                "{pad1}if ((int64_t)cycle_count - {tag}_last >= {period}) {{"
+            )
+            .ok();
+            writeln!(out, "{pad2}{tag}_last = (int64_t)cycle_count;").ok();
+            writeln!(out, "{pad2}{lambda}();").ok();
+            writeln!(out, "{pad1}}}").ok();
+        }
+        CycleHandlerKind::Trigger { trigger, edge } => {
+            let t = expr_cpp(cx, trigger)?;
+            match edge {
+                crate::ir::CycleEdge::Level => {
+                    writeln!(out, "{pad1}if ((bool)({t})) {{").ok();
+                    writeln!(out, "{pad2}{lambda}();").ok();
+                    writeln!(out, "{pad1}}}").ok();
+                }
+                crate::ir::CycleEdge::Rising | crate::ir::CycleEdge::Falling => {
+                    writeln!(out, "{pad1}static bool {tag}_prev = false;").ok();
+                    writeln!(out, "{pad1}bool {tag}_curr = (bool)({t});").ok();
+                    let cond = match edge {
+                        crate::ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
+                        _ => format!("{tag}_prev && !{tag}_curr"),
+                    };
+                    writeln!(out, "{pad1}if ({cond}) {{").ok();
+                    writeln!(out, "{pad2}{lambda}();").ok();
+                    writeln!(out, "{pad1}}}").ok();
+                    writeln!(out, "{pad1}{tag}_prev = {tag}_curr;").ok();
+                }
+            }
+        }
+    }
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
+/// C++ payload type of an event-channel local — the parameter type of
+/// its `std::function`. Mirrors v1's `payload_type_for_arg`: a scalar
+/// widens to `uint64_t` / `int64_t`, a record payload is the record
+/// struct by value.
+fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<String, EmitError> {
+    match cx.func.locals.get(event.index()).map(|l| &l.ty) {
+        Some(IrType::Event(crate::ir::EventPayload::Scalar { signed })) => Ok(if *signed {
+            "int64_t".to_string()
+        } else {
+            "uint64_t".to_string()
+        }),
+        Some(IrType::Event(crate::ir::EventPayload::Record(r))) => {
+            Ok(prog.records[r.index()].name.clone())
+        }
+        _ => Err(EmitError(format!(
+            "tbir: {} uses local {} as an event channel but it is not event-typed",
+            cx.func.name, event.0
+        ))),
+    }
+}
+
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
@@ -1089,8 +1314,80 @@ fn emit_stmt(
             writeln!(out, "{pad}{INDENT}ctx.errors++;").ok();
             writeln!(out, "{pad}}}").ok();
         }
+        // Same guard shape as `AssertCheck`, minus the error bump — an
+        // assumption bounds the inputs, it does not fail the test.
+        Stmt::AssumeCheck { cond, on_fail } => {
+            let cond = expr_cpp(cx, cond)?;
+            writeln!(out, "{pad}if (!({cond})) {{").ok();
+            emit_log_call(out, cx, "ASSUME", None, on_fail, depth + 1)?;
+            writeln!(out, "{pad}}}").ok();
+        }
         Stmt::CovReport(inst) => {
             writeln!(out, "{pad}_tb.{}.report();", inst.tb_field).ok();
+        }
+        Stmt::PropertyCheck(p) => {
+            let schema = prog.property_checks.get(p.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing property check p{}",
+                    func.name, p.0
+                ))
+            })?;
+            emit_property_check(out, cx, schema, depth)?;
+        }
+        Stmt::CoverCheck(c) => {
+            let schema = prog.cover_checks.get(c.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing cover check c{}",
+                    func.name, c.0
+                ))
+            })?;
+            emit_cover_check(out, cx, schema, depth)?;
+        }
+        // v1's shape exactly: a subscriber is a closure pushed onto the
+        // channel vector, and `emit` calls each subscriber synchronously
+        // in subscription order. The subscriber BODY is a separate
+        // test-scope lambda (like a cycle handler's) so the pushed
+        // closure outlives the block that registered it.
+        Stmt::EventSubscribe { event, handler } => {
+            let chan = &names[event.index()];
+            let body = &prog
+                .functions
+                .get(handler.index())
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: {} subscribes to fn{} which does not resolve",
+                        func.name, handler.0
+                    ))
+                })?
+                .name;
+            let ty = event_payload_cty(prog, cx, *event)?;
+            writeln!(
+                out,
+                "{pad}{chan}.push_back([&]({ty} _p) {{ {body}(_p); }});"
+            )
+            .ok();
+        }
+        Stmt::EventEmit { event, args } => {
+            let chan = &names[event.index()];
+            let mut rendered = Vec::with_capacity(args.len());
+            for a in args {
+                rendered.push(expr_cpp(cx, a)?);
+            }
+            writeln!(
+                out,
+                "{pad}for (auto& _s : {chan}) _s({});",
+                rendered.join(", ")
+            )
+            .ok();
+        }
+        Stmt::CycleHandler(h) => {
+            let schema = prog.cycle_handlers.get(h.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing cycle handler h{}",
+                    func.name, h.0
+                ))
+            })?;
+            emit_cycle_handler(out, cx, prog, *h, schema, depth)?;
         }
         Stmt::FailDiag { guard, args } => match guard {
             // Per-sub-predicate breakdown: log only if the predicate
@@ -1782,6 +2079,29 @@ fn declare_locals(
             IrType::Seq(ref scalar) => {
                 let cty = super::local_scalar_cty(scalar);
                 writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
+            }
+            // A test-scope event channel — v1's subscriber vector.
+            IrType::Event(payload) => {
+                let cty = match payload {
+                    crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
+                    crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+                    crate::ir::EventPayload::Record(r) => prog
+                        .records
+                        .get(r.index())
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: event local `{n}` in {} references missing record r{}",
+                                func.name, r.0
+                            ))
+                        })?
+                        .name
+                        .clone(),
+                };
+                writeln!(
+                    out,
+                    "{pad}std::vector<std::function<void({cty})>> {n}; (void){n};"
+                )
+                .ok();
             }
             // Scalar local. Wide (>64-bit) `uint`/`sint` locals — e.g. a
             // wide method param hoisted as the first N locals — take v1's

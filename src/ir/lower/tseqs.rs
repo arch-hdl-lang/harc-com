@@ -45,12 +45,11 @@ use std::collections::HashMap;
 
 use crate::ast::{BuiltinTy, ExprKind, Item, SourceFile, TseqDecl, TypeArg, TypeExpr};
 use crate::ir::{
-    ConstraintSite, FunctionId, FunctionKind, IrType, RecordId, TbFunction, Terminator, TseqElem,
-    TypedParam,
+    FunctionId, FunctionKind, IrType, RecordId, TbFunction, Terminator, TseqElem, TypedParam,
 };
 
 use super::helpers::{ir_type_of, HelperRegistry};
-use super::{unsupported, FuncBuilder, LowerCtx, LowerError};
+use super::{unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
 /// single identifier (record element). `None` for a missing/non-`TSeq`
@@ -154,9 +153,9 @@ pub(crate) fn lower_tseq<'a>(
     elem: TseqElem,
     ctx: &'a LowerCtx,
     helpers: &'a HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     // Params first, so locals 0..nparams mirror them.
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {

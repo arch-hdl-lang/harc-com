@@ -1,12 +1,14 @@
 //! Statement lowering — one IR form per AST construct (design doc
 //! §"Statements within a run / check / transactor body").
 
-use super::{unsupported, FuncBuilder, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, CallArg, Expr as AstExpr, ExprKind, Ident, Stmt as AstStmt, StmtKind, TypeArg,
     TypeExpr,
 };
-use crate::ir::{Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, Terminator};
+use crate::ir::{
+    Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, TbFunction, Terminator,
+};
 
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
@@ -148,20 +150,53 @@ impl FuncBuilder<'_> {
             // bus.m(...)`); the block-form `fork ... and ... join`
             // statement is out of subset.
             StmtKind::JoinAll { .. } => self.lower_tlm_join_all(),
-            StmtKind::Fork(_) => Err(unsupported(
-                "block-form `fork ... and ... join`",
-                "only RHS-fork TLM (`let x = fork bus.m(...)`) + `join_all` is lowered",
+            // The block form (`fork branch … end branch … join_all`) has
+            // no emitter in either backend — v1 hits its
+            // "statement not supported in v0 cpp_tb" fallback. Only the
+            // RHS-fork TLM form is implemented, and only in TB-IR.
+            StmtKind::Fork(_) => Err(not_implemented(
+                "block-form `fork ... branch ... join_all`",
+                "only the RHS-fork TLM form (`let x = fork bus.m(...)` + `join_all`) is \
+                 lowered, and only by the TB-IR backend",
+                V1Status::Rejects,
             )),
-            StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
-            StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
-            StmtKind::Select(_) => Err(unsupported("`select`", "")),
-            StmtKind::On(_) => Err(unsupported("`on` handlers", "")),
+            // The PSS-style activity-composition operators (spec §17.1).
+            // Parsed, but no backend emits them — v1 hits its
+            // "statement not supported in v0 cpp_tb" fallback for each.
+            StmtKind::Parallel(_) => Err(not_implemented(
+                "`parallel`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
+            StmtKind::Schedule(_) => Err(not_implemented(
+                "`schedule`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
+            StmtKind::Select(_) => Err(not_implemented(
+                "`select`",
+                "the activity-composition operators (spec §17.1) are parsed but not \
+                 lowered by any backend",
+                V1Status::Rejects,
+            )),
+            StmtKind::On(h) => self.lower_on_handler(h),
             StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
             StmtKind::Yield(e) => self.lower_yield(e),
-            StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
+            // Aspect activation (spec §3.6). Parsed, but no backend
+            // applies an aspect — v1 hits its "statement not supported in
+            // v0 cpp_tb" fallback, so a `package`'s `extend` blocks are
+            // inert under both backends.
+            StmtKind::Apply(_) => Err(not_implemented(
+                "`apply`",
+                "aspect activation (spec §3.6) is parsed but not lowered by any backend, \
+                 so a `package`'s `extend` blocks never take effect",
+                V1Status::Rejects,
+            )),
             StmtKind::Release(e) => self.lower_release(e),
-            StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
-            StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
+            StmtKind::Assume(v) => self.lower_assume(v),
+            StmtKind::Cover(v) => self.lower_cover(v),
             StmtKind::Expr(e) => {
                 // Statement-position `fork bus.m(...)` — issue the request
                 // now and discard the response at the next `join_all`.
@@ -513,12 +548,48 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    /// `Some(payload)` when this `let` declares a test-scope event
+    /// channel (`let e : event<T>`), resolving `T` through the same
+    /// payload rules a component's `event<T>` FIELD uses. `None` for
+    /// every other `let`.
+    fn event_let_payload(
+        &self,
+        l: &crate::ast::LetStmt,
+    ) -> Result<Option<crate::ir::EventPayload>, LowerError> {
+        let Some(TypeExpr::Builtin {
+            name: BuiltinTy::Event,
+            args,
+            ..
+        }) = l.ty.as_ref()
+        else {
+            return Ok(None);
+        };
+        let payload = super::components::lower_event_payload(
+            "<test scope>",
+            &l.name.name,
+            args.first(),
+            &self.ctx.record_ids,
+        )?;
+        Ok(Some(payload))
+    }
+
     fn lower_let(&mut self, l: &crate::ast::LetStmt) -> Result<(), LowerError> {
         if !l.probes.is_empty() {
             return Err(unsupported("probe declarations", ""));
         }
         if l.bind {
-            return Err(unsupported("`= bind ...` declarations", ""));
+            // Test-scope bindings (`let axil : BusAxiLite = bind ...`,
+            // regblock / addrmap / transactor binds) are lowered by
+            // `lower_test`, which sees the testbench surface. Reaching
+            // here means a `= bind` in STATEMENT position, which v1
+            // accepts and then emits as an ordinary `let` — the `bind`
+            // is dropped, so the binding the user wrote never happens.
+            return Err(not_implemented(
+                "a `= bind ...` declaration in statement position",
+                "declare the binding at test scope (as a `let` on the test or a field on \
+                 the testbench), where the bind surface is resolved",
+                V1Status::SilentlyMisLowers,
+            ));
         }
         // `let v = _tb.pending.pop()` on a testbench-owned queue. This
         // precedes the generic scalar/record let paths so record-element
@@ -779,6 +850,23 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::RecordInit(id, rid));
                 return Ok(());
             }
+        }
+        // A test-scope event channel (`let e : event<uint<8>>`, spec
+        // §3.4). v1 declares it as a subscriber vector local in the run
+        // coroutine; `on e(v)` pushes, `emit e(x)` fans out. It has no
+        // initializer by construction, so it is decided before the
+        // uninitialized-scalar arm below.
+        if let Some(payload) = self.event_let_payload(l)? {
+            if l.value.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {} : event<...>` takes no initializer — an event channel starts \
+                     empty and gains subscribers through `on {}(...)`",
+                    l.name.name, l.name.name
+                )));
+            }
+            let id = self.declare(&l.name.name);
+            self.set_local_type(id, IrType::Event(payload));
+            return Ok(());
         }
         let Some(value) = &l.value else {
             // Uninitialized scalar `let x: uint<N>;` — the declare-then-
@@ -2293,16 +2381,501 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// A registration statement installs something that outlives the
+    /// statement — a `_checkers` closure, an event subscriber. That is
+    /// only sound in a test's own `run`/`check` body, where the statement
+    /// runs exactly once. Anywhere else (a transactor method, a helper,
+    /// another handler's body) it would re-register on every call, and
+    /// its `[&]` capture would outlive the parameters it captured.
+    fn require_test_body(&self, what: &str) -> Result<(), LowerError> {
+        if self.in_test_body {
+            return Ok(());
+        }
+        // v1 is no escape hatch here: it emits the registration inline in
+        // the method/helper lambda, so the program builds and then
+        // re-registers on every call while its `[&]` capture reads
+        // parameters that died with the call.
+        Err(not_implemented(
+            &format!("{what} outside a test's `run`/`check` body"),
+            "a registration installs a closure that outlives the statement, so it must run \
+             exactly once — move it into the test's `run` (or `check`) body",
+            V1Status::SilentlyMisLowers,
+        ))
+    }
+
+    /// Reserve a slot in the out-of-line function table BEFORE lowering
+    /// the body, so a nested registration inside that body claims the
+    /// NEXT slot instead of colliding on the same index. The placeholder
+    /// is overwritten by `commit_pending_function`.
+    fn reserve_pending_function(&mut self) -> crate::ir::FunctionId {
+        let mut tables = self.side_tables.borrow_mut();
+        let id = crate::ir::FunctionId(tables.pending_functions.len() as u32);
+        tables
+            .pending_functions
+            .push(super::placeholder_function(id));
+        id
+    }
+
+    fn commit_pending_function(&mut self, id: crate::ir::FunctionId, f: TbFunction) {
+        self.side_tables.borrow_mut().pending_functions[id.index()] = f;
+    }
+
+    /// `on <channel>(<param>) ... end on` — subscribe to a test-scope
+    /// event channel. The body becomes a ONE-parameter
+    /// `FunctionKind::TestHook` function whose parameter is the payload;
+    /// the registration statement pushes a closure calling it onto the
+    /// channel vector, exactly as v1 pushes its inline closure.
+    fn lower_event_subscription(
+        &mut self,
+        h: &crate::ast::OnHandler,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<(), LowerError> {
+        self.require_test_body("an `on <event>(...)` subscription")?;
+        let ExprKind::Ident(id) = &*callee.kind else {
+            return Err(unsupported(
+                "an `on <path>.<event>(arg)` subscription in statement position",
+                "subscribe from the component that owns the `event` field",
+            ));
+        };
+        let Some(channel) = self.lookup(&id.name) else {
+            return Err(unsupported(
+                &format!(
+                    "an `on {}(...)` subscription in statement position",
+                    id.name
+                ),
+                "only a test-scope `let <e> : event<T>` channel can be subscribed to here; \
+                 a component's `event` field subscribes from the component",
+            ));
+        };
+        let IrType::Event(payload) = *self.local_type(channel) else {
+            return Err(LowerError::Invalid(format!(
+                "`on {}(...)`: `{}` is not an event channel",
+                id.name, id.name
+            )));
+        };
+        // Exactly one parameter, and it must be a plain binding name —
+        // the payload the emitter passes in.
+        let param = match args {
+            [CallArg::Expr(e)] => match &*e.kind {
+                ExprKind::Ident(p) => p.name.clone(),
+                _ => {
+                    return Err(LowerError::Invalid(format!(
+                        "`on {}(...)`: the payload binding must be a name",
+                        id.name
+                    )))
+                }
+            },
+            _ => {
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)` takes exactly one payload binding, got {}",
+                    id.name,
+                    args.len()
+                )))
+            }
+        };
+
+        let pending_id = self.reserve_pending_function();
+        let param_ty = match payload {
+            crate::ir::EventPayload::Scalar { signed: true } => IrType::SInt(None),
+            crate::ir::EventPayload::Scalar { signed: false } => IrType::UInt(None),
+            crate::ir::EventPayload::Record(r) => IrType::Record(r),
+        };
+        let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
+        super::reserve_tb_record_names(&mut b, self.ctx);
+        // The payload binding is local 0, which is the verifier's
+        // parameter convention (`locals[..params.len()]` mirror the
+        // params one-to-one and are defined at entry).
+        let p = b.declare(&param);
+        b.set_local_type(p, param_ty.clone());
+        b.lower_block_stmts(&h.body)?;
+        if !b.is_terminated() {
+            b.terminate(Terminator::Return);
+        }
+        let mut f = b.finish(
+            pending_id,
+            format!("_on_event_{}", pending_id.0),
+            crate::ir::FunctionKind::TestHook,
+            self.ctx.owner,
+        )?;
+        f.params = vec![crate::ir::TypedParam {
+            name: param,
+            ty: param_ty,
+        }];
+
+        self.commit_pending_function(pending_id, f);
+        self.push(Stmt::EventSubscribe {
+            event: channel,
+            handler: pending_id,
+        });
+        Ok(())
+    }
+
+    /// A statement-position `on ... end on` handler inside a run or check
+    /// body (spec §7.10 and the cycle-trigger form).
+    ///
+    /// Two shapes lower: the cycle trigger (`on <bool-expr>`, gated on the
+    /// declared edge mode) and the periodic form (`on <N> cycles`). Both
+    /// become a `_checkers` / `_post_eval_services` closure installed at
+    /// this statement's position, which is where v1's `emit_cycle_trigger`
+    /// pushes them — a handler written after a `wait` never observes the
+    /// earlier cycles under either backend.
+    ///
+    /// The remaining shapes stay out of subset with precise messages:
+    /// method hooks (`on <obj>.<m> pre/post`) need the reference-capturing
+    /// hook vectors the component path owns, and event subscriptions
+    /// (`on <ev>(arg)`) need a subscriber list on a component field.
+    fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
+        use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
+        self.require_test_body("an `on ... end on` handler")?;
+        if h.hook.is_some() {
+            return Err(unsupported(
+                "an `on <obj>.<method> pre/post` hook in statement position",
+                "declare the hook on the component or testbench instead — a hook body \
+                 must be registered in the method's pre/post vector before any call \
+                 site runs, not at a point inside the run body",
+            ));
+        }
+        // `on e(v) ... end on` — an event subscription. A test-scope
+        // channel (`let e : event<T>`) subscribes here; a component's
+        // `event` FIELD is reached through the component path instead,
+        // which a statement position cannot name.
+        if !h.periodic {
+            if let ExprKind::Call { callee, args } = &*h.event.kind {
+                return self.lower_event_subscription(h, callee, args);
+            }
+        }
+
+        let kind = if h.periodic {
+            let period = super::tb_periodic_literal(&h.event).ok_or_else(|| {
+                unsupported(
+                    "an `on <N> cycles` handler with a non-literal period",
+                    "the TB-IR backend requires a positive integer-literal cycle count \
+                     (e.g. `on 100 cycles`); a variable period is re-read every cycle \
+                     under v1, which needs host state the registration closure does not \
+                     carry here",
+                )
+            })?;
+            CycleHandlerKind::Periodic { period }
+        } else {
+            // The trigger is re-evaluated every cycle inside the
+            // registration closure, which owns no statement slot — same
+            // constraint as a concurrent check body.
+            let trigger = self.with_check_body(&[], "an `on <bool-expr>` trigger", |b| {
+                b.lower_expr(&h.event)
+            })?;
+            CycleHandlerKind::Trigger {
+                trigger,
+                edge: crate::ir::CycleEdge::from_ast(h.edge),
+            }
+        };
+
+        // The body becomes its own zero-parameter `TestHook` function.
+        // It cannot see the enclosing function's locals (run and hook are
+        // separate IR functions, so v1's shared `[&]` capture is not
+        // representable); testbench fields and DUT ports resolve as usual,
+        // and an unresolved name is reported by the ordinary lookup path.
+        let pending_id = self.reserve_pending_function();
+        let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
+        super::reserve_tb_record_names(&mut b, self.ctx);
+        b.lower_block_stmts(&h.body)?;
+        if !b.is_terminated() {
+            b.terminate(Terminator::Return);
+        }
+        let f = b.finish(
+            pending_id,
+            format!("_on_handler_{}", pending_id.0),
+            crate::ir::FunctionKind::TestHook,
+            self.ctx.owner,
+        )?;
+
+        // The handler runs FROM the per-cycle checker pass, which `tick()`
+        // drives. A `wait` in the body lowers to `tick()`, so the body
+        // would re-enter the checker pass that called it and recurse
+        // until the stack runs out. v1 has the same shape and the same
+        // hazard; refuse rather than reproduce it.
+        if super::function_suspends(&f) {
+            return Err(unsupported(
+                "a `wait` inside a statement-position `on` handler body",
+                "the body runs from the per-cycle checker pass, and a wait there re-enters \
+                 that same pass — move the wait into the run body, or gate the run body on \
+                 the same condition with `wait until`",
+            ));
+        }
+        self.commit_pending_function(pending_id, f);
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            let id = crate::ir::CycleHandlerId(tables.cycle_handlers.len() as u32);
+            tables.cycle_handlers.push(CycleHandlerSchema {
+                kind,
+                function: pending_id,
+                phase: crate::ir::HandlerPhase::from_ast(h.phase),
+            });
+            id
+        };
+        self.push(Stmt::CycleHandler(id));
+        Ok(())
+    }
+
+    /// An explicit `assert property NAME` / `assume property NAME` /
+    /// `cover property NAME` whose `NAME` is not a declared property.
+    ///
+    /// The `property` keyword does not change v1's dispatch (it classifies
+    /// on the property table alone), so v1 falls through to the immediate
+    /// form and emits the bare identifier — a name that does not exist in
+    /// the generated C++. The keyword does, however, state the author's
+    /// intent unambiguously, so name it in the diagnostic instead of
+    /// letting the generic unresolved-name path report it. A program
+    /// error under every backend, hence `Invalid` — no `--codegen v1`
+    /// suggestion.
+    fn reject_unknown_named_property(
+        &self,
+        kw: &str,
+        v: &crate::ast::Verify,
+    ) -> Result<(), LowerError> {
+        if !v.property_kw {
+            return Ok(());
+        }
+        let Some(expr) = &v.expr else {
+            return Ok(());
+        };
+        if let ExprKind::Ident(id) = &*expr.kind {
+            if !self.ctx.properties.contains_key(&id.name) {
+                return Err(LowerError::Invalid(format!(
+                    "{kw} property `{}`: no property declaration with that name",
+                    id.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The check-body operand of a `assert`/`assume`/`cover`: a bare
+    /// identifier naming a declared `property` resolves to that
+    /// property's body, everything else is the written expression. Same
+    /// resolution v1 performs at the reference site.
+    fn resolve_check_body(&self, expr: &AstExpr) -> AstExpr {
+        if let ExprKind::Ident(id) = &*expr.kind {
+            if let Some(body) = self.ctx.properties.get(&id.name) {
+                return body.clone();
+            }
+        }
+        expr.clone()
+    }
+
+    /// Lower one concurrent check body (a property shape or a cover
+    /// predicate) with the temporal latch slots pre-assigned.
+    ///
+    /// A check body executes inside a per-cycle closure that owns no
+    /// statement slot, so nothing it lowers may push a statement into the
+    /// current block: a hoisted DUT read, an inlined impure helper, or a
+    /// transactor call edge would run ONCE at registration instead of
+    /// every cycle. `f` is run with `temporal_slots` installed and the
+    /// block's statement count is checked afterwards; a body that pushed
+    /// is rejected rather than silently mis-lowered.
+    fn with_check_body<T>(
+        &mut self,
+        temporals: &[crate::codegen::cpp_tb::Temporal],
+        construct: &str,
+        f: impl FnOnce(&mut Self) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        let saved = std::mem::take(&mut self.temporal_slots);
+        for (i, t) in temporals.iter().enumerate() {
+            let kind = match t.kind {
+                crate::ast::SystemFn::Past => crate::ir::TemporalFn::Past,
+                crate::ast::SystemFn::Rose => crate::ir::TemporalFn::Rose,
+                crate::ast::SystemFn::Fell => crate::ir::TemporalFn::Fell,
+                crate::ast::SystemFn::Stable => crate::ir::TemporalFn::Stable,
+                // `collect_temporal_occurrences` only yields the four
+                // temporal readings; `clog2` is filtered out upstream.
+                crate::ast::SystemFn::Clog2 => continue,
+            };
+            self.temporal_slots
+                .insert((t.call_span.start, t.call_span.end), (i as u32, kind));
+        }
+        // A body that pushes a statement, opens a block, or moves the
+        // cursor has escaped the closure: an inlined suspending helper
+        // splits the CFG, so checking the current block's length alone
+        // would miss it.
+        let before = (
+            self.current,
+            self.blocks.len(),
+            self.blocks[self.current].stmts.len(),
+        );
+        let out = f(self);
+        self.temporal_slots = saved;
+        let out = out?;
+        let after = (
+            self.current,
+            self.blocks.len(),
+            self.blocks[self.current].stmts.len(),
+        );
+        if after != before {
+            return Err(unsupported(
+                construct,
+                "the body needs a statement-level step (a hoisted DUT read, an inlined \
+                 helper, or a transactor call), which cannot run inside a per-cycle \
+                 concurrent check",
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Lower the latch operands of a check body. Each is lowered with NO
+    /// slot map installed, so a nested `past(past(x))` is rejected by the
+    /// ordinary temporal-system-call gate rather than silently aliasing a
+    /// slot (v1's occurrence walk likewise does not recurse into operands).
+    fn lower_temporal_slots(
+        &mut self,
+        temporals: &[crate::codegen::cpp_tb::Temporal],
+        construct: &str,
+    ) -> Result<Vec<crate::ir::TemporalSlot>, LowerError> {
+        let mut out = Vec::with_capacity(temporals.len());
+        for t in temporals {
+            let inner = self.with_check_body(&[], construct, |b| b.lower_expr(&t.inner))?;
+            out.push(crate::ir::TemporalSlot { inner });
+        }
+        Ok(out)
+    }
+
+    /// `assert`/`assume` whose operand names a declared property or
+    /// carries a temporal operator: a concurrent check registered here
+    /// and evaluated on every primary-clock edge from this point on.
+    fn lower_property_check(
+        &mut self,
+        severity: crate::ir::PropertySeverity,
+        v: &crate::ast::Verify,
+        raw: &AstExpr,
+    ) -> Result<(), LowerError> {
+        use crate::ast::BinaryOp;
+        use crate::ir::{PropertyCheckSchema, PropertyShape};
+
+        let construct = match severity {
+            crate::ir::PropertySeverity::Fail => "a concurrent `assert`",
+            crate::ir::PropertySeverity::AssumeFail => "a concurrent `assume`",
+        };
+        self.require_test_body(construct)?;
+        let body = self.resolve_check_body(raw);
+        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let slots = self.lower_temporal_slots(&temporals, construct)?;
+
+        let shape = match &*body.kind {
+            ExprKind::Binary {
+                op: op @ (BinaryOp::PipeImplies | BinaryOp::PipeImpliesNext),
+                lhs,
+                rhs,
+            } => {
+                let next = matches!(op, BinaryOp::PipeImpliesNext);
+                let (ante, cons) = self.with_check_body(&temporals, construct, |b| {
+                    Ok((b.lower_expr(lhs)?, b.lower_expr(rhs)?))
+                })?;
+                if next {
+                    PropertyShape::ImpliesNext { ante, cons }
+                } else {
+                    PropertyShape::Implies { ante, cons }
+                }
+            }
+            _ => PropertyShape::Invariant(
+                self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?,
+            ),
+        };
+
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            let id = crate::ir::PropertyCheckId(tables.property_checks.len() as u32);
+            tables.property_checks.push(PropertyCheckSchema {
+                tag: format!("_p_{}_{}", raw.span.start, raw.span.end),
+                label: crate::codegen::cpp_tb::property_label(v, raw),
+                severity,
+                shape,
+                temporals: slots,
+            });
+            id
+        };
+        self.push(Stmt::PropertyCheck(id));
+        Ok(())
+    }
+
+    /// `cover <expr>` (spec §5) — a flat witness counter bumped on every
+    /// primary-clock edge the predicate holds, reported at end of test.
+    pub(crate) fn lower_cover(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
+        self.reject_unknown_named_property("cover", v)?;
+        let Some(raw) = &v.expr else {
+            // v1 returns silently on a bodyless `cover`; the parser
+            // always produces one, so this is unreachable in practice.
+            return Ok(());
+        };
+        self.require_test_body("a `cover` witness")?;
+        let construct = "a `cover` witness";
+        let label = match &*raw.kind {
+            ExprKind::Ident(id) => id.name.clone(),
+            _ => format!("cov_{}_{}", raw.span.start, raw.span.end),
+        };
+        let body = self.resolve_check_body(raw);
+        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let slots = self.lower_temporal_slots(&temporals, construct)?;
+        let cond = self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            let id = crate::ir::CoverCheckId(tables.cover_checks.len() as u32);
+            tables.cover_checks.push(crate::ir::CoverCheckSchema {
+                // The index, not just the span, keys the counter: one
+                // source `cover` inlined at two call sites is two
+                // registrations, and two file-scope statics with the same
+                // name would not compile.
+                tag: format!("c{}_{}_{}", id.0, raw.span.start, raw.span.end),
+                label,
+                cond,
+                temporals: slots,
+            });
+            id
+        };
+        self.push(Stmt::CoverCheck(id));
+        Ok(())
+    }
+
+    /// `assume <plain bool>` — an immediate, point-in-time assumption.
+    /// Logs `ASSUME` on violation and, unlike `assert`, does NOT bump the
+    /// error counter (v1's `emit_inline_assume`).
+    pub(crate) fn lower_assume(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
+        self.reject_unknown_named_property("assume", v)?;
+        let Some(expr) = &v.expr else {
+            return Err(LowerError::Invalid("assume without expression".to_string()));
+        };
+        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+            return self.lower_property_check(crate::ir::PropertySeverity::AssumeFail, v, expr);
+        }
+        // Ports stay inline (lazy eval, like an immediate assert); a
+        // transactor call edge hoists ahead of the check.
+        let cond = self.lower_expr(expr)?;
+        let cond = self.hoist_transactor_calls(cond);
+        let on_fail = self.lower_fmt("assumption failed")?;
+        self.push(Stmt::AssumeCheck { cond, on_fail });
+        Ok(())
+    }
+
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
-        if v.named.is_some() {
-            return Err(unsupported("named property `assert`", ""));
-        }
-        if v.property_kw {
-            return Err(unsupported("`assert property`", ""));
-        }
+        self.reject_unknown_named_property("assert", v)?;
         let Some(expr) = &v.expr else {
             return Err(LowerError::Invalid("assert without expression".to_string()));
         };
+        // Spec §2 LL(1) table: a bare identifier naming a declared
+        // `property`, or any expression carrying a temporal operator, is
+        // a CONCURRENT assertion (evaluated every primary-clock edge);
+        // everything else is the immediate point-in-time check. The
+        // legacy `property` keyword still parses but no longer changes
+        // dispatch — same rule as v1's `is_concurrent_assertion`.
+        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+            if v.else_fail.is_some() {
+                return Err(unsupported(
+                    "an `else fail(...)` clause on a concurrent `assert`",
+                    "a concurrent assertion reports through its property failure line; \
+                     drop the `else fail(...)` or use an immediate `assert`",
+                ));
+            }
+            return self.lower_property_check(crate::ir::PropertySeverity::Fail, v, expr);
+        }
         // Ports stay inline (lazy assert eval), but a transactor-method
         // call edge cannot stay nested in the condition — hoist it into a
         // preceding `Stmt::TransactorCall` (the seam rule, and the call may

@@ -67,6 +67,21 @@ ir_id!(
     ComponentId
 );
 ir_id!(
+    /// Index into `TbProgram::property_checks` — one registered
+    /// concurrent `assert`/`assume` (spec §5). See `PropertyCheckSchema`.
+    PropertyCheckId
+);
+ir_id!(
+    /// Index into `TbProgram::cover_checks` — one registered concurrent
+    /// `cover` witness counter (spec §5). See `CoverCheckSchema`.
+    CoverCheckId
+);
+ir_id!(
+    /// Index into `TbProgram::cycle_handlers` — one statement-position
+    /// `on` handler inside a run/check body. See `CycleHandlerSchema`.
+    CycleHandlerId
+);
+ir_id!(
     /// Index into `TbProgram::constraint_sites` — the handle a
     /// `Terminator::Randomize` carries into the constraint-IR layer.
     /// See `ConstraintSite` and the `Terminator::Randomize` doc.
@@ -126,6 +141,170 @@ pub struct TbProgram {
     /// `ConstraintRef` indexes. One entry per lowered `randomize(t)` /
     /// `randomize(t) with {...}` site. See `ConstraintSite`.
     pub constraint_sites: Vec<ConstraintSite>,
+    /// Concurrent (`per-primary-clock-edge`) property checks — the table
+    /// `Stmt::PropertyCheck` indexes. One entry per lowered `assert`
+    /// / `assume` whose body is a named property reference or carries a
+    /// temporal operator (spec §5). See `PropertyCheckSchema`.
+    pub property_checks: Vec<PropertyCheckSchema>,
+    /// Concurrent `cover` witness counters — the table
+    /// `Stmt::CoverCheck` indexes, and the source of the end-of-test
+    /// cover summary. See `CoverCheckSchema`.
+    pub cover_checks: Vec<CoverCheckSchema>,
+    /// Statement-position `on` handlers — the table `Stmt::CycleHandler`
+    /// indexes. One entry per `on <bool-expr>` / `on <N> cycles` handler
+    /// written inside a run or check body. See `CycleHandlerSchema`.
+    pub cycle_handlers: Vec<CycleHandlerSchema>,
+}
+
+/// One statement-position `on` handler (spec §7.10 / §7.x cycle
+/// triggers) written inside a run or check body, as opposed to the
+/// testbench-declaration-scoped forms in `TestbenchSchema::
+/// {periodic_services, cycle_services}`.
+///
+/// The difference is WHEN it arms: a testbench-scoped handler registers
+/// during test setup, while this one registers where the statement
+/// appears, so a handler written after a `wait` never observes the
+/// earlier cycles. v1 makes the same distinction — its `emit_cycle_trigger`
+/// pushes into `_checkers` inline at the statement position.
+///
+/// The body is a zero-parameter `FunctionKind::TestHook` function
+/// (emitted as a free `[&]`-capturing lambda at test scope, like every
+/// other hook body) so the per-cycle registration closure can call it
+/// without capturing anything that dies with the enclosing block.
+#[derive(Debug, Clone)]
+pub struct CycleHandlerSchema {
+    pub kind: CycleHandlerKind,
+    /// Lowered handler body (`kind: TestHook`, zero params).
+    pub function: FunctionId,
+    /// `phase` modifier (`on <expr> phase post_eval`). `Checker`
+    /// (default) registers into `_checkers`; `PostEval` into
+    /// `_post_eval_services`.
+    pub phase: HandlerPhase,
+}
+
+/// What arms a `CycleHandlerSchema`.
+#[derive(Debug, Clone)]
+pub enum CycleHandlerKind {
+    /// `on <bool-expr> ... end on` — re-evaluate the predicate every
+    /// primary-clock cycle and fire the body per `edge`.
+    Trigger { trigger: Expr, edge: CycleEdge },
+    /// `on <N> cycles ... end on` — fire once every `period` primary-clock
+    /// cycles. The period is a positive integer literal in this subset;
+    /// v1 re-reads a variable period each cycle, which needs a host-state
+    /// read the registration closure does not carry here.
+    Periodic { period: u64 },
+}
+
+/// Severity band of a concurrent property check — which log tag the
+/// failure line carries and whether it bumps the test error counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertySeverity {
+    /// `assert` — logs `FAIL` and bumps `ctx.errors`.
+    Fail,
+    /// `assume` — logs `ASSUME-FAIL` and does NOT bump the error
+    /// counter (an assumption is an input constraint, not a DUT bug).
+    AssumeFail,
+}
+
+impl PropertySeverity {
+    /// The `sim_log_line` severity tag (v1's `emit_property_check`
+    /// `severity` argument).
+    pub fn tag(self) -> &'static str {
+        match self {
+            PropertySeverity::Fail => "FAIL",
+            PropertySeverity::AssumeFail => "ASSUME-FAIL",
+        }
+    }
+    /// Whether a failure bumps the test's error counter.
+    pub fn counts_as_error(self) -> bool {
+        matches!(self, PropertySeverity::Fail)
+    }
+}
+
+/// The top-level temporal shape of a concurrent property body. v1's
+/// `emit_property_check` switches on exactly these three cases; the
+/// classification moves to lowering so the backend is a renderer.
+#[derive(Debug, Clone)]
+pub enum PropertyShape {
+    /// `a |-> b` — same-cycle implication: fail when `a && !b`.
+    Implies { ante: Expr, cons: Expr },
+    /// `a |=> b` — one-cycle-delayed implication: fail when the
+    /// PREVIOUS cycle's `a` held and this cycle's `b` does not. Carries
+    /// one implicit `prev` latch, distinct from the `temporals` slots.
+    ImpliesNext { ante: Expr, cons: Expr },
+    /// A plain boolean invariant — fail when it is false.
+    Invariant(Expr),
+}
+
+/// One `past(e)` / `rose(e)` / `fell(e)` / `stable(e)` latch inside a
+/// concurrent check body. The backend gives each slot a `static`
+/// previous-value cell plus a per-call current-value local; references
+/// to the slot inside the body are `Expr::TemporalSlot`, so the tree is
+/// self-contained (v1 threads the same information through a span-keyed
+/// `prop_subs` side table during emission).
+#[derive(Debug, Clone)]
+pub struct TemporalSlot {
+    /// The argument expression, latched into `<tag>_cur<i>` each cycle
+    /// and copied into `<tag>_ps<i>` after the body runs.
+    pub inner: Expr,
+}
+
+/// Which temporal reading a `Expr::TemporalSlot` takes of its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalFn {
+    /// `past(e)` — the previous cycle's value.
+    Past,
+    /// `rose(e)` — 0 → 1 this cycle.
+    Rose,
+    /// `fell(e)` — 1 → 0 this cycle.
+    Fell,
+    /// `stable(e)` — unchanged from the previous cycle.
+    Stable,
+}
+
+/// One registered concurrent property check (`assert`/`assume` whose
+/// body is a named-property reference or carries a temporal operator).
+/// Registered at the source statement's position (v1 pushes the closure
+/// into `_checkers` inline, so a check declared mid-`run` only observes
+/// cycles from that point on) and evaluated once per primary-clock edge.
+#[derive(Debug, Clone)]
+pub struct PropertyCheckSchema {
+    /// Unique C++ identifier stem for this check's `static` state,
+    /// derived from the source span (v1's `_p_<start>_<end>`).
+    pub tag: String,
+    /// Human-readable name in the failure line — the property name for
+    /// a named reference, else `<inline>`.
+    pub label: String,
+    pub severity: PropertySeverity,
+    pub shape: PropertyShape,
+    /// Temporal latch slots referenced by `Expr::TemporalSlot` inside
+    /// `shape`, in slot-index order.
+    pub temporals: Vec<TemporalSlot>,
+}
+
+/// One registered concurrent `cover` witness counter (spec §5): every
+/// primary-clock edge on which `cond` holds bumps a persistent hit
+/// count, and the end-of-test summary reports hit/total plus a
+/// per-point line. Flat (no bins) — a covergroup is the binned form.
+#[derive(Debug, Clone)]
+pub struct CoverCheckSchema {
+    /// Unique C++ identifier stem for the hit counter (`_cov_<tag>_hits`),
+    /// derived from the source span (v1's `c_<start>_<end>`).
+    pub tag: String,
+    /// Report label — the property/identifier name for a named cover,
+    /// else `cov_<start>_<end>` (v1's fallback).
+    pub label: String,
+    /// The witness predicate, evaluated once per primary-clock edge.
+    pub cond: Expr,
+    /// Temporal latch slots referenced by `Expr::TemporalSlot` inside
+    /// `cond`, in slot-index order.
+    ///
+    /// **Documented divergence from v1:** v1 does not translate temporal
+    /// calls inside a `cover` body (`emit_expr` has no `SystemCall` arm
+    /// outside a property check, so the operand vanishes and the emitted
+    /// C++ does not compile). TB-IR gives a cover body the same latch
+    /// machinery as a property body, so `cover rose(dut.valid)` works.
+    pub temporals: Vec<TemporalSlot>,
 }
 
 /// One `randomize` site, resolved into the constraint-IR layer.
@@ -911,6 +1090,11 @@ pub struct TestSchema {
     /// period because codegen needs concrete picoseconds — the design
     /// doc's schema is extended here by compilation necessity.
     pub clocks: Vec<ClockSpec>,
+    /// Concurrent `cover` checks registered anywhere in this test, in
+    /// registration order. The end-of-test summary reports exactly these
+    /// (v1 clears its `covers` list per test and emits the summary in the
+    /// same order). Empty for a test with no `cover` statement.
+    pub cover_checks: Vec<CoverCheckId>,
 }
 
 /// One `clock <name> = <period-or-domain>` declaration, resolved.
@@ -1349,6 +1533,15 @@ pub enum IrType {
     /// Only ever a parameter local in this subset — never a `let` body
     /// local — so it has no value-construction or randomize support.
     Component(ComponentId),
+    /// A TEST-SCOPE event channel local (`let e : event<uint<8>>`,
+    /// spec §3.4). Emitted as v1 emits it: a
+    /// `std::vector<std::function<void(<payload>)>>` local in the
+    /// enclosing coroutine. `on e(v) ... end on` pushes a subscriber
+    /// (`Stmt::EventSubscribe`), `emit e(x)` fans out synchronously
+    /// (`Stmt::EventEmit`). Distinct from a component's `in`/`out
+    /// event<T>` FIELD, which lives on the component struct and is
+    /// reached through `ComponentEmit` / the connect graph.
+    Event(EventPayload),
     Unknown,
 }
 
@@ -1531,6 +1724,50 @@ pub enum Stmt {
     AssertCheck {
         cond: Expr,
         on_fail: FmtArgs,
+    },
+    /// `assume <plain bool>` — the IMMEDIATE, point-in-time form of an
+    /// assumption. Logs `ASSUME` when the predicate is false and, unlike
+    /// `AssertCheck`, does NOT bump the error counter: an assumption
+    /// bounds the inputs the test is meaningful over, it is not a DUT
+    /// bug (v1's `emit_inline_assume`). The concurrent form
+    /// (`assume` over a named property or a temporal expression) is a
+    /// `PropertyCheck` with `PropertySeverity::AssumeFail` instead.
+    AssumeCheck {
+        cond: Expr,
+        on_fail: FmtArgs,
+    },
+    /// Register the concurrent property check at `TbProgram::property_checks`
+    /// index — a `_checkers` closure evaluated once per primary-clock edge
+    /// from this statement's position onward. Mirrors v1, which pushes the
+    /// closure inline where the `assert`/`assume` statement appears, so a
+    /// check declared after a `wait` never observes the earlier cycles.
+    PropertyCheck(PropertyCheckId),
+    /// Register the concurrent `cover` witness counter at
+    /// `TbProgram::cover_checks` index. Same per-cycle registration
+    /// discipline as `PropertyCheck`; the counter itself is a file-scope
+    /// `static` so the end-of-test summary can read it.
+    CoverCheck(CoverCheckId),
+    /// Arm the statement-position `on` handler at
+    /// `TbProgram::cycle_handlers` index — a `_checkers` /
+    /// `_post_eval_services` closure installed at this statement's
+    /// position, exactly where v1's `emit_cycle_trigger` pushes it.
+    CycleHandler(CycleHandlerId),
+    /// `on e(v) ... end on` on a test-scope event local — push a
+    /// subscriber onto the channel. `handler` is a one-parameter
+    /// `FunctionKind::TestHook` function (the payload is its parameter),
+    /// declared at test scope so the pushed closure outlives the block
+    /// that registered it.
+    EventSubscribe {
+        event: LocalId,
+        handler: FunctionId,
+    },
+    /// `emit e(x)` on a test-scope event local — call every subscriber
+    /// synchronously, in subscription order. Mirrors v1's
+    /// `for (auto& _s : e) _s(x);`. A channel with no subscribers is a
+    /// no-op, as in v1.
+    EventEmit {
+        event: LocalId,
+        args: Vec<Expr>,
     },
     CovReport(CovgroupInstance),
     /// A sequence→transactor method call — the Tier-1/Tier-0 placement
@@ -1915,6 +2152,18 @@ pub enum Expr {
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
+    /// A temporal reading (`past`/`rose`/`fell`/`stable`) of latch slot
+    /// `slot` in the enclosing concurrent check's `temporals` list.
+    ///
+    /// Only legal inside a `PropertyCheckSchema::shape` or a
+    /// `CoverCheckSchema::cond` — those are the only bodies the backend
+    /// wraps in a per-cycle closure that owns the latch cells. The
+    /// verifier enforces that (a stray `TemporalSlot` in a run-function
+    /// expression would render a reference to an undeclared C++ local).
+    TemporalSlot {
+        slot: u32,
+        kind: TemporalFn,
+    },
     /// `_tb.<field>.size()` / `_tb.<field>.empty()` on a testbench-owned
     /// typed FIFO. `pop()` mutates, so it lowers only as `Stmt::TbQueuePop`.
     TbQueueQuery {

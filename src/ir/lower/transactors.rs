@@ -35,13 +35,13 @@
 //! generics, event ports, `on` handlers, TLM target threads, watchdogs —
 //! is an explicit `Unsupported`.
 
-use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError};
+use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
     TypeArg, TypeExpr,
 };
 use crate::ir::{
-    self, ConstraintSite, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
+    self, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
     TargetTlmMethodSchema, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
     TransactorSchema, TypedParam,
 };
@@ -60,7 +60,7 @@ pub(crate) fn lower_transactor(
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
     downstream_binds: &HashMap<String, BusDecl>,
-    constraint_sites: &RefCell<Vec<ConstraintSite>>,
+    side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     if !t.params.is_empty() {
@@ -91,7 +91,7 @@ pub(crate) fn lower_transactor(
                 helper_registry,
                 record_ctx,
                 buses,
-                constraint_sites,
+                side_tables,
             );
         }
         return lower_bound_target_transactor(
@@ -101,7 +101,7 @@ pub(crate) fn lower_transactor(
             record_ctx,
             buses,
             downstream_binds,
-            constraint_sites,
+            side_tables,
         );
     }
 
@@ -326,6 +326,8 @@ pub(crate) fn lower_transactor(
         // Method bodies see file-scope consts; they have no testbench,
         // so no scalar fields, helper methods, or test-scope lets.
         consts: record_ctx.consts.clone(),
+        properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -374,7 +376,7 @@ pub(crate) fn lower_transactor(
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
-        let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
+        let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
         b.in_transactor_method = true;
         b.self_transactor = Some(tname.clone());
         b.self_transactor_methods = sibling_methods.clone();
@@ -447,7 +449,7 @@ fn lower_bound_target_transactor(
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
     downstream_binds: &HashMap<String, BusDecl>,
-    constraint_sites: &RefCell<Vec<ConstraintSite>>,
+    side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     // Resolve the bound bus.
@@ -595,6 +597,8 @@ fn lower_bound_target_transactor(
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
+        properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -727,7 +731,7 @@ fn lower_bound_target_transactor(
         }
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
-        let mut b = FuncBuilder::new(&body_ctx, helper_registry, constraint_sites);
+        let mut b = FuncBuilder::new(&body_ctx, helper_registry, side_tables);
         b.target_state_fields = state_names.clone();
         let mut params = Vec::with_capacity(th.params.len());
         for p in &th.params {
@@ -833,7 +837,7 @@ fn lower_bound_initiator_transactor(
     helper_registry: &helpers::HelperRegistry<'_>,
     record_ctx: &LowerCtx,
     buses: &HashMap<String, &BusDecl>,
-    constraint_sites: &RefCell<Vec<ConstraintSite>>,
+    side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     let bus_name = match t.bound_to.as_ref() {
@@ -1073,6 +1077,8 @@ fn lower_bound_initiator_transactor(
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
+        properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1117,7 +1123,7 @@ fn lower_bound_initiator_transactor(
         check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
-        let mut b = FuncBuilder::new(&method_ctx, helper_registry, constraint_sites);
+        let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
         b.in_transactor_method = true;
         b.self_transactor = Some(tname.clone());
         b.self_transactor_methods = sibling_methods.clone();

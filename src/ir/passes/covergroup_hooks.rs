@@ -412,6 +412,7 @@ fn type_name(prog: &TbProgram, ty: &IrType) -> String {
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
         IrType::Bool => "bool".to_string(),
+        IrType::Event(_) => "event channel".to_string(),
         IrType::Record(r) => format!("record `{}`", prog.records[r.index()].name),
         IrType::RecordSeq(r) => format!("TSeq<{}>", prog.records[r.index()].name),
         IrType::Seq(elem) => format!("TSeq<{}>", type_name(prog, elem)),

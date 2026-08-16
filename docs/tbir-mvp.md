@@ -1765,6 +1765,246 @@ case and only locally-determinable `Assign` types are compared).
     cannot compile it). Non-separated literals (`100ns` → `100`) still
     mirror v1 exactly. See issue #451.
 
+25. **Concurrent `assert` / `assume` / `cover` (spec §5, 2026-08-16).**
+    The concurrent verification statements now lower to
+    `TbProgram::property_checks` / `TbProgram::cover_checks` plus a
+    `Stmt::PropertyCheck` / `Stmt::CoverCheck` registration at the source
+    statement's position, emitted as the same per-primary-clock-edge
+    `_checkers` closure v1 builds in `emit_property_check`. Dispatch
+    matches v1 exactly (`is_concurrent_assertion`: a bare identifier
+    naming a declared `property`, or any expression carrying a temporal
+    operator, is concurrent; everything else is the immediate
+    point-in-time check — the legacy `property` keyword does not change
+    dispatch). The three shapes (`a |-> b`, `a |=> b`, plain invariant),
+    the failure lines, and the error-counter policy (`assert` bumps,
+    `assume` does not) are v1's.
+
+    Two deliberate improvements over v1 in this area, both in cases where
+    v1 emits C++ that does not compile — so neither can change the
+    behavior of a program v1 can actually build:
+
+    - **`cover` hit counters live at file scope.** v1 declares each
+      `_cov_<tag>_hits` as a `static` LOCAL at the statement's position
+      *inside the run coroutine lambda*, then reads it from the enclosing
+      function's end-of-test summary — an out-of-scope reference. TB-IR
+      hoists the counter to file scope, which has the same lifetime and
+      compiles. This is also why the old "mixing a bare `cover` statement
+      with a `scope`/`run` block" rejection is gone: it existed only
+      because there was no correct v1 behavior to mirror.
+    - **Temporal readings work inside a `cover` body.** v1 only installs
+      its span-keyed `prop_subs` substitutions around
+      `emit_property_check`, and `emit_expr` has no arm for a temporal
+      system call, so `cover rose(dut.x)` emits a call to a nonexistent
+      `rose(...)`. TB-IR gives a cover body the same latch machinery as a
+      property body.
+
+    A `cover` counter is keyed by its REGISTRATION index, not by the
+    source span alone: one source `cover` inside a helper inlined at two
+    call sites is two registrations, and two file-scope statics may not
+    share a name.
+
+    Carried over from v1 unchanged: `past(e, N)` ignores `N` and reads
+    the immediately previous cycle (one latch slot per occurrence). A
+    deeper history would diverge from v1, so fixing it belongs in a
+    change that moves both backends together.
+
+    Outside a concurrent check body a temporal reading has no per-cycle
+    latch to read, and v1 emits nothing for it; that is a program error
+    under every backend, so it surfaces as `LowerError::Invalid` — no
+    `--codegen v1` suggestion. Same for `assert property NAME` /
+    `assume property NAME` / `cover property NAME` naming an undeclared
+    property.
+
+    Gated by `tests/concurrent_check_cpp.rs`, which splices the emitter's
+    actual `_checkers` closures into a probe with a stub DUT, drives a
+    fixed stimulus, and checks the resulting error / ASSUME / cover-hit
+    counts — a string match cannot tell a correct latch state machine
+    from one that reads its own write.
+
+26. **Statement-position `on` handlers (2026-08-16).**
+    An `on <bool-expr> ... end on` or `on <N> cycles ... end on` written
+    inside a run or check body now lowers to `TbProgram::cycle_handlers`
+    plus a `Stmt::CycleHandler` registration at the statement's position,
+    emitted as the same `_checkers` / `_post_eval_services` closure v1's
+    `emit_cycle_trigger` installs — the same rising/falling edge latch,
+    the same last-fire stamp, the same phase routing. Arming at the
+    statement position (not at test setup) is v1's behavior too: a
+    handler written after a `wait` never observes the earlier cycles
+    under either backend. This is distinct from the
+    testbench-DECLARATION-scoped forms in `TestbenchSchema::
+    {periodic_services, cycle_services}`, which arm during setup.
+
+    Differences from v1, both structural to the function-per-CFG IR:
+
+    - **The body is its own `FunctionKind::TestHook` function**, emitted
+      as a free `[&]`-capturing lambda at test scope and called from the
+      registration closure. v1 inlines the body into the closure. The
+      consequence is that a handler body cannot read the enclosing run
+      function's locals — the same run/check split that forces a
+      test-scope `let` to be promoted to a `_tb` field (#444). Such a
+      reference is reported by the ordinary name-resolution path rather
+      than silently dropped. Testbench fields and DUT ports resolve
+      normally.
+    - **A periodic handler's period must be a positive integer literal.**
+      v1 re-reads a variable period every cycle so a test can override it
+      from host state; the registration closure here carries no such read.
+      A non-literal period is rejected with that explanation.
+
+    Out of subset with precise messages, because a statement position
+    cannot supply what they need: `on <obj>.<method> pre/post` (the hook
+    must be in the method's pre/post vector before any call site runs)
+    and `on <event>(arg)` (needs a subscriber list on a component field).
+
+    Handler bodies are lowered out of line, mid-statement, where no
+    `FunctionId` can be reserved — the builder does not see
+    `TbProgram::functions`. They park in `SideTables::pending_functions`
+    with their slot index as a placeholder id, and `lower_program`
+    assigns dense ids once every source-order function is pushed.
+
+    Gated by `tests/concurrent_check_cpp.rs`, which drives the emitted
+    closures against a stub DUT and checks that a rising-edge handler
+    fires once per 0→1 transition (not once per cycle the predicate
+    holds) and that a periodic handler first fires at cycle N.
+
+27. **Diagnostic honesty: `--codegen v1` is only suggested when v1 has
+    it (2026-08-16).**
+    Every TB-IR subset rejection used to end in "re-run with
+    `--codegen v1`". For a large class of constructs that advice is a dead
+    end: v1 raises its own `statement/expression not supported in v0
+    cpp_tb` error, or accepts the source and emits C++ that does not
+    compile, or accepts it and quietly emits something else.
+
+    `LowerError` therefore has a third variant. `Unsupported` keeps its
+    meaning — a TB-IR subset gap where v1 IS a working escape hatch — and
+    `NotImplemented { construct, detail, v1: V1Status }` covers the rest,
+    ending in what v1 actually does (`Rejects` / `EmitsUncompilable` /
+    `SilentlyMisLowers`) instead of a suggestion. `Invalid` is unchanged
+    (a program error under every backend).
+
+    Reclassified after checking v1's behavior directly (`harc sim
+    --emit-only --codegen v1` on a probe per construct):
+
+    | Construct | v1 |
+    |---|---|
+    | `parallel` / `schedule` / `select` (spec §17.1) | rejects |
+    | block-form `fork ... branch ... join_all` | rejects |
+    | `apply` (aspect activation, spec §3.6) | rejects |
+    | `randomize` in expression position | rejects |
+    | `clog2`, `##N` / `[*N]`, cover-sequence `=>`, named arguments, struct/set/`dist` literals, `in` membership, `soft`, `solve_order`, constraint `for` — all in ordinary VALUE position | rejects (`emit_expr` has no arm) |
+    | `= bind ...` in statement position | silently mis-lowers — emits a plain `let`, dropping the bind |
+    | a range expression in value position | silently mis-lowers — emits `/* range a..b */ 0` |
+
+    The constraint-only forms in that list all lower correctly *inside*
+    `randomize ... with`: the typed constraint backend handles them and
+    `lower_expr` never sees them. The rejection is about position, and the
+    messages say so.
+
+    A `package` declaration is now accepted as **inert**, matching v1
+    exactly — v1 has no `Item::Package` arm at all, `merge_for_sim` passes
+    a package through whole rather than hoisting the `extend` blocks
+    inside it, and a package's contents only take effect at an `apply`
+    site. So the gap a user actually has is the `apply`, and that is now
+    what gets reported.
+
+28. **Recursive PURE helpers (2026-08-16).**
+    A helper with no DUT access and no waits lowers to a file-scope C++
+    function whose prototype is emitted ahead of every body
+    (`emit_helper_prototype`), so it can call itself — directly or
+    mutually. The registry's recursion check therefore runs AFTER the
+    purity fixpoint rather than before it, and rejects a cycle only when
+    some member of it is impure (an impure helper is CFG-inlined at each
+    call site, and inlining a cycle does not terminate).
+
+    **TB-IR is strictly ahead of v1 here.** v1 emits every helper as an
+    `auto` lambda, and a lambda that names itself inside its own
+    initializer is a C++ compile error ("use of `f` before deduction of
+    `auto`"), so no recursive helper has ever worked under v1. The
+    diagnostics for the cases that remain rejected — recursion through an
+    impure helper, and recursive testbench methods (always inlined,
+    because they capture the shared `_tb` host state) — say that rather
+    than suggesting `--codegen v1`.
+
+    `tests/pure_recursion_cpp.rs` extracts the emitted helper functions
+    and builds them, so `fact(5) == 120` is checked by the host compiler,
+    not by a string match on the prototype.
+
+    Also reclassified in the same pass, after checking v1 directly: a
+    **string value in expression position** (v1 emits `int64_t s =
+    "hello";` — a compile error) and a **float literal** (v1 emits
+    `int64_t f = 1.5;`, which compiles and silently truncates to 1).
+
+29. **Test-scope event channels (spec §3.4, 2026-08-16).**
+    `let e : event<T>` inside a run or check body now lowers to an
+    `IrType::Event` local — v1's subscriber-vector shape, a
+    `std::vector<std::function<void(payload)>>` in the enclosing
+    coroutine. `on e(v) ... end on` is a `Stmt::EventSubscribe` (push a
+    closure), `emit e(x)` is a `Stmt::EventEmit` (synchronous fan-out in
+    subscription order, `for (auto& _s : e) _s(x);`). Payload resolution
+    reuses the component-field rules: a scalar ≤ 64 bits widens to
+    `uint64_t`/`int64_t`, a `transaction`/`struct` payload is carried by
+    value as the record struct.
+
+    Same structural difference as the cycle handlers: the subscriber body
+    is its own ONE-parameter `FunctionKind::TestHook` function declared at
+    test scope, because a lambda declared inside the run coroutine's
+    `switch` case would die with the case block while the pushed closure
+    still referenced it. v1 inlines the body into the pushed closure.
+
+    This is distinct from a component's `in`/`out event<T>` FIELD, which
+    lives on the component struct and is reached through `ComponentEmit`
+    and the `connect` graph — that path already lowered.
+
+    Malformed use is a program error under every backend, so it surfaces
+    as `Invalid`: an initializer on the channel, an `emit` arity other
+    than one, a non-name payload binding.
+
+    `tests/concurrent_check_cpp.rs` builds the emitted declaration,
+    subscriptions, and fan-out and checks that two emits each reach both
+    of two subscribers — a fan-out that stopped at the first subscriber
+    would still string-match.
+
+30. **Where a registration may appear (2026-08-16).**
+    The registration statements — concurrent `assert`/`assume`/`cover`,
+    statement-position `on` handlers, event subscriptions — install a
+    closure that outlives the statement. That is only sound where the
+    statement runs exactly once, so lowering admits them **only in a
+    test's own `run` / `check` body** (`FuncBuilder::in_test_body`).
+
+    In a transactor method, a helper, or another handler's body, a
+    registration would re-register on every call (unbounded growth of the
+    checker list) and its `[&]` capture would read parameters that died
+    with the call. v1 emits exactly that — the program builds and then
+    misbehaves — so the rejection carries `V1Status::SilentlyMisLowers`,
+    not a `--codegen v1` suggestion.
+
+    Two related rules from the same pass:
+
+    - **A `wait` inside a statement-position `on` body is rejected.** The
+      body runs from the per-cycle checker pass, and a `wait` there lowers
+      to `tick()`, which re-enters that same pass — unbounded recursion
+      once the trigger fires. v1 has the identical shape and the identical
+      hazard.
+    - **Out-of-line handler bodies reserve their table slot before
+      lowering**, so a nested registration inside a body claims the next
+      slot rather than colliding on the same index
+      (`reserve_pending_function` / `commit_pending_function`). The
+      test-body rule above already forbids the nesting; reserving first
+      makes the invariant hold independently of it.
+
+    A check body may legitimately read a local of the function that
+    registered it — the emitted closure captures it by reference, as v1's
+    does — so `harc dump-ir`, which renders check bodies outside any
+    local table, falls back to the raw id instead of indexing a scope
+    that does not hold it.
+
+    A statement-position `on <trigger>` predicate renders inside the
+    registration closure, so its port reads are real program port
+    accesses even though `Stmt::CycleHandler` carries none: the
+    probe-detection and gated-bus walks visit `cycle_handlers` alongside
+    the check bodies. Without that, a probe read appearing only in a
+    trigger left `V<Top>___024root.h` out of the preamble while the
+    trigger still emitted `dut->rootp->…`.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

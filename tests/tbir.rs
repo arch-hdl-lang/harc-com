@@ -104,6 +104,25 @@ fn assert_unsupported(err: &lower::LowerError) -> String {
     msg
 }
 
+/// A construct no backend implements. The diagnostic must NOT suggest
+/// `--codegen v1` — that suggestion is only honest when v1 actually
+/// implements the construct, and sending a user to a backend that
+/// rejects (or silently mis-lowers) it is worse than saying nothing.
+fn assert_not_implemented(err: &lower::LowerError, v1: lower::V1Status) -> String {
+    match err {
+        lower::LowerError::NotImplemented { v1: got, .. } => {
+            assert_eq!(*got, v1, "wrong V1Status on: {err:?}")
+        }
+        other => panic!("must be LowerError::NotImplemented: {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("re-run with `--codegen v1`"),
+        "a not-implemented error must not send the user to v1: {msg}"
+    );
+    msg
+}
+
 /// #521 diagnostics contract: an illegal constant evaluation (division
 /// by zero, width violation, cyclic reference, ...) is a program error
 /// under every backend, so it surfaces as `LowerError::Invalid` with a
@@ -4035,9 +4054,13 @@ fn helper_inline_param_remapping() {
     );
 }
 
-/// Direct recursion is rejected up front with the cycle path.
+/// Recursion through a DUT/sync-touching helper is rejected with the
+/// cycle path: such a helper is CFG-inlined at each call site, and
+/// inlining a cycle does not terminate. v1 has no answer here either —
+/// it emits every helper as an `auto` lambda, which cannot name itself
+/// in its own initializer — so the diagnostic must not point at v1.
 #[test]
-fn helper_direct_recursion_is_unsupported() {
+fn recursion_through_an_impure_helper_is_rejected() {
     let src = r#"
 function spin(d: Top) -> uint<8>
     return spin(d)
@@ -4051,18 +4074,54 @@ test RecTest
 end test RecTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("recursive helper functions"), "{msg}");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("DUT/sync-touching helper"), "{msg}");
     assert!(msg.contains("spin -> spin"), "names the cycle: {msg}");
 }
 
-/// Mutual recursion is rejected even when the helpers are never called
-/// (the call-graph DFS runs before any body lowers).
+/// A PURE helper emits as a file-scope C++ function with its prototype
+/// ahead of every body, so it can call itself — direct or mutual. v1
+/// cannot express this at all (its helpers are `auto` lambdas), which is
+/// why the recursion check now runs AFTER the purity fixpoint rather
+/// than before it.
 #[test]
-fn helper_mutual_recursion_is_unsupported() {
-    let src = r#"
+fn pure_helper_recursion_lowers() {
+    let direct = r#"
+function fact(n: uint<8>) -> uint<32>
+    if n <= 1
+        return 1
+    end if
+    return n * fact(n - 1)
+end function fact
+
+test RecTest
+    let dut : Top
+    run
+        let x = fact(5)
+        assert x == 120 else fail("fact")
+    end run
+end test RecTest
+"#;
+    let prog = lower_src(direct).expect("a pure recursive helper lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = emit_cpp_src(direct);
+    assert!(
+        cpp.contains("static uint64_t harc_helper_fact(uint64_t n);"),
+        "the prototype must precede the body so the self-call resolves; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_helper_fact((n - 1))"),
+        "the self-call must emit as a real call; got:\n{cpp}"
+    );
+
+    // Mutual recursion among pure helpers is the same story — every
+    // prototype is emitted before any body.
+    let mutual = r#"
 function ping(x: uint<8>) -> uint<8>
-    return pong(x)
+    if x == 0
+        return 0
+    end if
+    return pong(x - 1)
 end function ping
 
 function pong(x: uint<8>) -> uint<8>
@@ -4072,17 +4131,12 @@ end function pong
 test MutRecTest
     let dut : Top
     run
-        dut.en = 1
+        dut.en = ping(3)
     end run
 end test MutRecTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("recursive helper functions"), "{msg}");
-    assert!(
-        msg.contains("ping -> pong -> ping") || msg.contains("pong -> ping -> pong"),
-        "names the cycle: {msg}"
-    );
+    let prog = lower_src(mutual).expect("mutually recursive pure helpers lower");
+    verify::verify_program(&prog).expect("verifies");
 }
 
 /// An impure helper call inside a `${...}` message capture cannot be
@@ -10284,5 +10338,1150 @@ end test T"#,
     assert!(
         format!("{prog}").contains("(1 == 1)"),
         "must fold to the masked value"
+    );
+}
+
+// ── Concurrent verification statements (spec §5) ─────────────────────
+//
+// `assert property NAME` / a bare-identifier `assert` naming a declared
+// property / an inline temporal `assert` all register a per-clock-edge
+// `_checkers` closure, matching v1's `emit_property_check`. `assume`
+// follows the same dispatch with the `ASSUME-FAIL` severity and no error
+// bump; `cover` registers a witness counter reported at end of test.
+
+/// The source used by most of the concurrent-check tests: one declared
+/// property plus a run body that references it.
+fn concurrent_src(body: &str) -> String {
+    format!(
+        r#"property never_x
+    dut.a |-> dut.b
+end property never_x
+
+test T
+    let dut : Top
+    run
+{body}
+        wait 2 cycles
+    end run
+end test T"#
+    )
+}
+
+#[test]
+fn named_property_assert_lowers_to_a_concurrent_check() {
+    for site in ["        assert never_x", "        assert property never_x"] {
+        let prog = lower_src(&concurrent_src(site)).expect("named property assert lowers");
+        assert_eq!(
+            prog.property_checks.len(),
+            1,
+            "one registered check for `{site}`"
+        );
+        let p = &prog.property_checks[0];
+        assert_eq!(p.label, "never_x");
+        assert_eq!(p.severity, ir::PropertySeverity::Fail);
+        assert!(
+            matches!(p.shape, ir::PropertyShape::Implies { .. }),
+            "`a |-> b` must classify as a same-cycle implication; got {:?}",
+            p.shape
+        );
+        let dump = format!("{prog}");
+        assert!(
+            dump.contains("PropertyCheck(p0)"),
+            "the run body must carry the registration statement; got:\n{dump}"
+        );
+    }
+}
+
+/// A bare-identifier `assert` that does NOT name a declared property is
+/// the ordinary immediate check — v1 dispatches on the property table,
+/// not on the syntactic shape, and TB-IR must agree.
+#[test]
+fn bare_identifier_assert_without_a_property_stays_immediate() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let flag = 1
+        assert flag else fail("flag")
+    end run
+end test T"#,
+    )
+    .expect("a non-property identifier assert is an immediate check");
+    assert!(
+        prog.property_checks.is_empty(),
+        "no concurrent check should be registered"
+    );
+    assert!(
+        format!("{prog}").contains("AssertCheck"),
+        "must lower to the immediate form"
+    );
+}
+
+/// `assert property NAME` with no such declaration is a program error
+/// under every backend — v1's dispatch ignores the `property` keyword and
+/// emits the bare identifier, a name that does not exist in the generated
+/// C++ — so it surfaces as `Invalid`, NOT as an `Unsupported` that
+/// suggests `--codegen v1`.
+#[test]
+fn unknown_named_property_is_a_program_error_not_a_subset_gap() {
+    let err = lower_src(
+        r#"property p
+    dut.a
+end property p
+
+test T
+    let dut : Top
+    run
+        assert property nope
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("an undeclared property name must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("no property declaration with that name"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn implication_shapes_and_severities_match_v1() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert dut.a |=> dut.b
+        assume dut.a |-> dut.b
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("inline temporal assert/assume lower");
+    assert_eq!(prog.property_checks.len(), 2);
+    assert!(matches!(
+        prog.property_checks[0].shape,
+        ir::PropertyShape::ImpliesNext { .. }
+    ));
+    assert_eq!(prog.property_checks[0].severity, ir::PropertySeverity::Fail);
+    assert_eq!(prog.property_checks[0].label, "<inline>");
+    assert_eq!(
+        prog.property_checks[1].severity,
+        ir::PropertySeverity::AssumeFail
+    );
+
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assert dut.a |=> dut.b
+        assume dut.a |-> dut.b
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "property `<inline>` failed (|=>)")"#),
+        "the |=> failure line must match v1's; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("ASSUME-FAIL", "property `<inline>` failed (|->)")"#),
+        "a concurrent assume must log ASSUME-FAIL; got:\n{cpp}"
+    );
+    // Exactly one error bump — the assert's. The assume must not add one.
+    let bumps = cpp.matches("ctx.errors++;").count();
+    let assert_bumps = cpp
+        .lines()
+        .skip_while(|l| !l.contains("failed (|=>)"))
+        .take(2)
+        .filter(|l| l.contains("ctx.errors++"))
+        .count();
+    assert_eq!(assert_bumps, 1, "the concurrent assert bumps once");
+    let assume_bumps = cpp
+        .lines()
+        .skip_while(|l| !l.contains("failed (|->)"))
+        .take(2)
+        .filter(|l| l.contains("ctx.errors++"))
+        .count();
+    assert_eq!(
+        assume_bumps, 0,
+        "a concurrent assume must NOT bump the error counter; got {bumps} total in:\n{cpp}"
+    );
+}
+
+/// `past`/`rose`/`fell`/`stable` become latch slots: one `static`
+/// previous-value cell plus a per-cycle current-value local, written back
+/// at the end of the closure. Byte-for-byte the state machine v1 emits.
+#[test]
+fn temporal_readings_become_latch_slots() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> dut.b == past(dut.c)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("temporal readings lower");
+    let p = &prog.property_checks[0];
+    assert_eq!(p.temporals.len(), 2, "one slot per occurrence");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("rose(#0)") && dump.contains("past(#1)"),
+        "{dump}"
+    );
+
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> dut.b == past(dut.c)
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    for needle in [
+        "static int64_t _harc_ps0 = 0;",
+        "static int64_t _harc_ps1 = 0;",
+        "(!_harc_ps0 && _harc_cur0)",
+        "_harc_ps1",
+        "_harc_ps0 = _harc_cur0;",
+        "_harc_ps1 = _harc_cur1;",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+}
+
+/// A nested `past(past(x))` would need slot-of-slot accounting the model
+/// deliberately does not carry (v1's occurrence walk does not recurse into
+/// operands either), so it is rejected rather than silently aliasing.
+#[test]
+fn nested_temporal_readings_are_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert past(past(dut.a))
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("nested temporal readings must not lower");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("cannot be nested inside another temporal reading"),
+        "got: {msg}"
+    );
+}
+
+/// A temporal reading outside any concurrent check has no per-cycle latch
+/// to read. v1 emits nothing for it (its `emit_expr` has no arm outside a
+/// property check), so this is a program error, not a subset gap — the
+/// diagnostic must not send the user to `--codegen v1`.
+#[test]
+fn a_temporal_reading_outside_a_check_body_is_a_program_error() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = past(dut.a)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a bare temporal reading must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("only meaningful inside a concurrent"),
+        "got: {msg}"
+    );
+}
+
+/// A concurrent check body runs inside a per-cycle closure with no
+/// statement slot, so anything needing a statement-level step (here an
+/// inlined impure helper) must be rejected rather than mis-lowered into
+/// running once at registration.
+#[test]
+fn a_check_body_needing_a_statement_step_is_rejected() {
+    let err = lower_src(
+        r#"function settle() -> uint<8>
+    wait 1 cycle
+    return 1
+end function settle
+
+test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> settle() == 1
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a suspending helper inside a check body must not lower");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("concurrent") && msg.contains("statement-level step"),
+        "got: {msg}"
+    );
+}
+
+/// `cover` registers a witness counter and reports it at end of test. The
+/// counter is FILE-scope, unlike v1's coroutine-local `static` (which the
+/// end-of-test summary cannot see — v1's `cover` emission does not
+/// compile; see docs/tbir-mvp.md).
+#[test]
+fn cover_registers_a_witness_counter_and_reports_it() {
+    let src = r#"property hit_max
+    dut.value == 15
+end property hit_max
+
+test T
+    let dut : Top
+    run
+        cover hit_max
+        cover dut.value == 7
+        wait 2 cycles
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("cover lowers");
+    assert_eq!(prog.cover_checks.len(), 2);
+    assert_eq!(prog.cover_checks[0].label, "hit_max");
+    assert!(
+        prog.cover_checks[1].label.starts_with("cov_"),
+        "an inline cover is labelled by source span; got {}",
+        prog.cover_checks[1].label
+    );
+    assert_eq!(
+        prog.tests[0].cover_checks.len(),
+        2,
+        "both covers belong to this test's end-of-test summary"
+    );
+
+    let cpp = emit_cpp_src(src);
+    let counter = format!("_cov_{}_hits", prog.cover_checks[0].tag);
+    assert!(
+        cpp.contains(&format!("static uint64_t {counter} = 0;")),
+        "the hit counter must be declared at file scope; got:\n{cpp}"
+    );
+    // File scope means it is declared before `run_T`, not inside it.
+    let decl = cpp
+        .find(&format!("static uint64_t {counter} = 0;"))
+        .unwrap();
+    let run_fn = cpp.find("run_T(").expect("the test's run function");
+    assert!(
+        decl < run_fn,
+        "the counter must precede the run function so the summary can read it"
+    );
+    assert!(
+        cpp.contains("harc_print_cover_summary(_cov_hit, _cov_total)")
+            && cpp.contains(r#"harc_print_cover_point("hit_max""#),
+        "the end-of-test summary must report each cover point; got:\n{cpp}"
+    );
+}
+
+/// v1 does not translate temporal readings inside a `cover` body (its
+/// `emit_expr` has no arm for them, so the operand vanishes). TB-IR gives
+/// a cover body the same latch machinery as a property body.
+#[test]
+fn cover_bodies_carry_temporal_latches() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        cover fell(dut.rst)
+        wait 2 cycles
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("(_harc_ps0 && !_harc_cur0)"),
+        "`fell` in a cover body must lower to its latch reading; got:\n{cpp}"
+    );
+}
+
+/// The immediate `assume` form logs `ASSUME` and, unlike `assert`, does
+/// not bump the error counter (v1's `emit_inline_assume`).
+#[test]
+fn immediate_assume_logs_without_bumping_errors() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assume dut.rst == 0
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    let idx = cpp
+        .find(r#"sim_log_line("ASSUME", "assumption failed")"#)
+        .unwrap_or_else(|| panic!("missing the ASSUME line in:\n{cpp}"));
+    let after = &cpp[idx..idx + 200.min(cpp.len() - idx)];
+    assert!(
+        !after.lines().take(2).any(|l| l.contains("ctx.errors++")),
+        "an immediate assume must not bump the error counter; got:\n{after}"
+    );
+}
+
+/// A bare `cover` alongside a `run` block lowers now that the hit counter
+/// lives at file scope — the rejection that used to guard v1's
+/// out-of-scope-counter bug no longer applies.
+#[test]
+fn bare_cover_alongside_a_run_block_lowers() {
+    let prog = lower_fixtures(&["counter_test.harc", "counter_test_covers.harc"])
+        .expect("bare covers merged into a test with a run block lower");
+    assert_eq!(prog.cover_checks.len(), 4);
+    assert_eq!(
+        prog.tests[0].cover_checks.len(),
+        4,
+        "all four are reported by this test"
+    );
+}
+
+/// The property-demo extension fixture exercises every temporal reading
+/// and both implication shapes through the real merge path.
+#[test]
+fn the_property_demo_fixture_lowers_and_verifies() {
+    let prog = lower_fixtures(&["counter_test.harc", "counter_test_props.harc"])
+        .expect("counter property demo lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert_eq!(prog.property_checks.len(), 6);
+    let shapes: Vec<&str> = prog
+        .property_checks
+        .iter()
+        .map(|p| match p.shape {
+            ir::PropertyShape::Implies { .. } => "|->",
+            ir::PropertyShape::ImpliesNext { .. } => "|=>",
+            ir::PropertyShape::Invariant(_) => "inv",
+        })
+        .collect();
+    assert_eq!(shapes, ["inv", "|->", "|=>", "|->", "|->", "|->"]);
+}
+
+// ── Statement-position `on` handlers ─────────────────────────────────
+//
+// `on <bool-expr> ... end on` and `on <N> cycles ... end on` written
+// inside a run body arm a per-cycle `_checkers` closure at the statement's
+// position, exactly where v1's `emit_cycle_trigger` pushes it. (The
+// testbench-DECLARATION-scoped forms are a separate path — they arm during
+// test setup; see `TestbenchSchema::{periodic_services, cycle_services}`.)
+
+#[test]
+fn statement_position_on_handlers_lower_to_cycle_handlers() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            log(info, "rst high")
+        end on
+        on 3 cycles
+            log(info, "tick")
+        end on
+        wait 6 cycles
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("statement-position on handlers lower");
+    verify::verify_program(&prog).expect("verifies");
+    assert_eq!(prog.cycle_handlers.len(), 2);
+    assert!(matches!(
+        prog.cycle_handlers[0].kind,
+        ir::CycleHandlerKind::Trigger {
+            edge: ir::CycleEdge::Rising,
+            ..
+        }
+    ));
+    assert!(matches!(
+        prog.cycle_handlers[1].kind,
+        ir::CycleHandlerKind::Periodic { period: 3 }
+    ));
+    // Each body is its own zero-parameter TestHook function, so the
+    // per-cycle closure can call it without capturing a block-scoped
+    // lambda that dies with the enclosing `case`.
+    for h in &prog.cycle_handlers {
+        let f = prog.function(h.function);
+        assert_eq!(f.kind, ir::FunctionKind::TestHook);
+        assert!(f.params.is_empty());
+    }
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("CycleHandler(h0)") && dump.contains("CycleHandler(h1)"),
+        "the run body must carry both registrations; got:\n{dump}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    for needle in [
+        "static bool _onh_0_prev = false;",
+        "if (!_onh_0_prev && _onh_0_curr) {",
+        "_onh_0_prev = _onh_0_curr;",
+        "static int64_t _onh_1_last = 0;",
+        "if ((int64_t)cycle_count - _onh_1_last >= 3) {",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+    // The body lambdas must be declared before the run coroutine, not
+    // inside the switch case that registers them.
+    let lambda = cpp.find("_on_handler_0 = [&]").expect("body lambda");
+    let run_lambda = cpp.find("_run_slot_lambda = ").expect("run lambda");
+    assert!(
+        lambda < run_lambda,
+        "a body lambda declared inside the coroutine would dangle once its \
+         `case` block ended"
+    );
+}
+
+/// A `falling`/`level` edge mode selects the matching latch shape, and
+/// `phase post_eval` routes the registration to the other service vector.
+#[test]
+fn on_handler_edge_modes_and_phase_route_like_v1() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst falling
+            log(info, "fell")
+        end on
+        on dut.rst phase post_eval level
+            log(info, "held")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("if (_onh_0_prev && !_onh_0_curr) {"),
+        "a falling-edge handler must latch the inverse transition; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_post_eval_services.push_back"),
+        "`phase post_eval` must register in the post-eval vector; got:\n{cpp}"
+    );
+}
+
+/// An `on` body is its own function, so it cannot see the enclosing run
+/// function's locals — v1's shared `[&]` capture is not representable.
+/// The reference must be reported, not silently dropped.
+#[test]
+fn an_on_body_referencing_an_enclosing_local_is_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let seen = 0
+        on dut.rst == 1
+            log(info, "seen=${seen}")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("an enclosing-local reference in a handler body must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("seen"),
+        "the message must name the binding: {msg}"
+    );
+}
+
+/// The two `on` shapes that need machinery a statement position cannot
+/// provide are rejected with messages that say what to do instead.
+#[test]
+fn unsupported_on_shapes_are_rejected_precisely() {
+    let hook = lower_src(
+        r#"transactor Drv
+    dut : Top
+    when active
+        hookable send(v: uint<8>)
+            dut.a = v
+        end send
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        on drv.send post
+            log(info, "sent")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect_err("a statement-position method hook must be rejected");
+    assert!(
+        assert_unsupported(&hook).contains("pre/post` hook in statement position"),
+        "got: {}",
+        assert_unsupported(&hook)
+    );
+
+    let period = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let n = 4
+        on n cycles
+            log(info, "tick")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("a non-literal period must be rejected");
+    assert!(
+        assert_unsupported(&period).contains("non-literal period"),
+        "got: {}",
+        assert_unsupported(&period)
+    );
+}
+
+// ── Diagnostic honesty: `--codegen v1` only when v1 has it ───────────
+//
+// TB-IR's `Unsupported` diagnostic ends in "re-run with `--codegen v1`".
+// That is only useful advice when v1 implements the construct. For the
+// constructs below it does not — v1 raises its own error, or accepts the
+// source and emits something that does not compile or does not mean what
+// was written — so they carry `LowerError::NotImplemented` instead, which
+// says what v1 actually does.
+
+/// Every activity-composition operator (spec §17.1) plus the block form
+/// of `fork` and `apply`: v1 hits its "statement not supported in v0
+/// cpp_tb" fallback for each.
+#[test]
+fn statements_no_backend_implements_do_not_suggest_v1() {
+    let cases = [
+        (
+            "parallel\n            dut.a = 1\n            dut.b = 2\n        end parallel",
+            "`parallel`",
+        ),
+        (
+            "schedule\n            dut.a = 1\n            dut.b = 2\n        end schedule",
+            "`schedule`",
+        ),
+        (
+            "select\n            dut.a == 1 => dut.b = 1\n            dut.a == 0 => dut.b = 2\n        end select",
+            "`select`",
+        ),
+        (
+            "fork\n            branch\n                dut.a = 1\n            end branch\n            branch\n                dut.b = 2\n            end branch\n        join_all",
+            "block-form `fork",
+        ),
+    ];
+    for (stmt, want) in cases {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        {stmt}
+        wait 1 cycle
+    end run
+end test T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// `apply` is reached only once the enclosing `package` is accepted —
+/// which it now is, inert, exactly as v1 treats it (v1 has no
+/// `Item::Package` arm at all). The gap the user actually has is the
+/// `apply`, and that is what the diagnostic names.
+#[test]
+fn a_package_is_inert_and_apply_is_the_reported_gap() {
+    let src = r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+package Short
+    extend Txn
+        keep a < 4
+    end extend Txn
+end package Short
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+    lower_src(src).expect("an unapplied package is inert under both backends");
+
+    let applied = src.replace(
+        "        wait 1 cycle",
+        "        apply Short\n        wait 1 cycle",
+    );
+    let err = lower_src(&applied).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("`apply`"), "got: {msg}");
+    assert!(
+        msg.contains("never take effect"),
+        "the message must say the aspect does not apply: {msg}"
+    );
+}
+
+/// The value-producing `randomize` form. The STATEMENT form lowers; v1
+/// has no `emit_expr` arm for the expression form.
+#[test]
+fn randomize_in_expression_position_does_not_suggest_v1() {
+    let err = lower_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let t : Txn
+        let ok = randomize(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("expression position"), "got: {msg}");
+}
+
+/// Two constructs v1 accepts and then quietly gets wrong. Pointing a user
+/// at v1 for these is worse than a plain rejection: they would get a
+/// testbench that builds and lies.
+#[test]
+fn constructs_v1_silently_mis_lowers_are_flagged_as_such() {
+    let bind = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = bind dut.a
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&bind, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("statement position"), "got: {msg}");
+    assert!(
+        msg.contains("silently emits something else"),
+        "the message must say what v1 does: {msg}"
+    );
+
+    // v1's `RangeLit` arm emits `/* range a..b */ 0` — the range becomes
+    // zero and the test keeps running.
+    let range = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let r = 0 .. 7
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&range, lower::V1Status::SilentlyMisLowers);
+}
+
+/// Constraint-only forms written in ordinary value position. Each is
+/// lowered fine INSIDE `randomize ... with` (the typed constraint backend
+/// handles them, never `lower_expr`), so the rejection here is about
+/// position, and the message says so.
+#[test]
+fn constraint_forms_in_value_position_do_not_suggest_v1() {
+    // `soft` / `dist` / `solve_order` only PARSE inside a constraint
+    // body, so their value-position arms are unreachable from source;
+    // `inside` parses as an ordinary binary operator anywhere.
+    for (expr, want) in [("dut.a inside {1, 2}", "membership test in value position")] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+    run
+        let v = {expr}
+        wait 1 cycle
+    end run
+end test T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// The counterpart guarantee: a construct v1 DOES implement keeps the
+/// `Unsupported` shape and the `--codegen v1` suggestion, so the two
+/// classes stay meaningfully distinct.
+#[test]
+fn constructs_v1_implements_still_suggest_v1() {
+    let err = lower_src(
+        r#"transactor Drv
+    dut : Top
+    when active
+        hookable send(v: uint<8>)
+            dut.a = v
+        end send
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        on drv.send post
+            log(info, "sent")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    assert_unsupported(&err);
+}
+
+// ── Test-scope event channels (spec §3.4) ────────────────────────────
+//
+// `let e : event<T>` declares a subscriber list local to the enclosing
+// function; `on e(v) ... end on` pushes a subscriber and `emit e(x)` fans
+// out synchronously in subscription order. Same shape v1 emits — a
+// `std::vector<std::function<void(payload)>>` plus a `for` loop — with
+// the subscriber body factored into its own function.
+
+#[test]
+fn test_scope_event_channels_lower() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        on e(v)
+            log(info, "got ${v}")
+        end on
+        emit e(3)
+        wait 1 cycle
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("a test-scope event channel lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(dump.contains("EventSubscribe"), "{dump}");
+    assert!(dump.contains("EventEmit"), "{dump}");
+
+    // The subscriber body is a ONE-parameter TestHook — the payload is
+    // its parameter, so the pushed closure can forward it.
+    let handler = prog
+        .functions
+        .iter()
+        .find(|f| f.kind == ir::FunctionKind::TestHook)
+        .expect("a subscriber body function");
+    assert_eq!(handler.params.len(), 1);
+
+    let cpp = emit_cpp_src(src);
+    for needle in [
+        "std::vector<std::function<void(uint64_t)>> e;",
+        "e.push_back([&](uint64_t _p) { _on_event_0(_p); });",
+        "for (auto& _s : e) _s(3);",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+}
+
+/// A record payload carries the record struct by value, matching v1's
+/// `std::function<void(Txn)>`.
+#[test]
+fn a_record_payload_event_channel_lowers() {
+    let cpp = emit_cpp_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let e : event<Txn>
+        let t : Txn
+        on e(x)
+            log(info, "a=${x.a}")
+        end on
+        emit e(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("std::vector<std::function<void(Txn)>> e;"),
+        "a record payload is carried by value; got:\n{cpp}"
+    );
+    assert!(cpp.contains("e.push_back([&](Txn _p)"), "{cpp}");
+}
+
+/// The channel is a value, not a variable: an initializer, a wrong arity,
+/// or a non-name payload binding are program errors, not subset gaps.
+#[test]
+fn malformed_event_channel_use_is_a_program_error() {
+    for (src, want) in [
+        (
+            r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        emit e(1, 2)
+        wait 1 cycle
+    end run
+end test T"#,
+            "exactly one",
+        ),
+        (
+            r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        on e(1)
+            log(info, "x")
+        end on
+        wait 1 cycle
+    end run
+end test T"#,
+            "payload binding must be a name",
+        ),
+    ] {
+        let err = lower_src(src).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+    }
+}
+
+/// A bare `emit` with no channel and no enclosing component now names
+/// both places a channel could come from.
+#[test]
+fn emit_with_no_channel_names_both_sources() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        emit nope(1)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("test-scope event channel"),
+        "the message must mention the test-scope form too: {msg}"
+    );
+}
+
+// ── Review-gate regressions ──────────────────────────────────────────
+//
+// Each test below pins one defect found in the pre-PR review of the
+// concurrent-check / `on`-handler / event-channel work.
+
+/// A registration installs a closure that outlives the statement, so it
+/// is only sound where the statement runs exactly once. In a transactor
+/// method it would re-register on every call and its `[&]` capture would
+/// read parameters that died with the call — and v1 does exactly that,
+/// so the diagnostic must not offer v1 as an escape hatch.
+#[test]
+fn registrations_outside_the_test_body_are_rejected() {
+    let cases = [
+        ("cover dut.rst == 1", "a `cover` witness"),
+        ("assert dut.a |-> dut.b", "a concurrent `assert`"),
+        (
+            "on dut.rst == 1\n                log(info, \"x\")\n            end on",
+            "an `on ... end on` handler",
+        ),
+    ];
+    for (stmt, want) in cases {
+        let src = format!(
+            r#"transactor Drv
+    dut : Top
+    when active
+        hookable go()
+            {stmt}
+            dut.a = 1
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        drv.go()
+        wait 1 cycle
+    end run
+end impl T"#
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains(want), "expected `{want}` in: {msg}");
+        assert!(
+            msg.contains("run"),
+            "the message must say where it belongs: {msg}"
+        );
+    }
+}
+
+/// One source `cover` inlined at two call sites is TWO registrations.
+/// Keying the counter on the source span alone gave both the same
+/// file-scope static name — a C++ redefinition, and a summary that read
+/// one counter twice.
+#[test]
+fn covers_inlined_at_two_call_sites_get_distinct_counters() {
+    let src = r#"function poke(d: Top)
+    cover d.rst == 1
+    d.rst = 1
+    wait 1 cycle
+end function poke
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        poke(dut)
+        poke(dut)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("lowers");
+    assert_eq!(
+        prog.cover_checks.len(),
+        2,
+        "one registration per inline site"
+    );
+    assert_ne!(
+        prog.cover_checks[0].tag, prog.cover_checks[1].tag,
+        "two file-scope statics may not share a name"
+    );
+    let cpp = emit_cpp_src(src);
+    let decls: Vec<&str> = cpp
+        .lines()
+        .filter(|l| l.starts_with("static uint64_t _cov_"))
+        .collect();
+    assert_eq!(decls.len(), 2, "{decls:?}");
+    assert_ne!(
+        decls[0], decls[1],
+        "duplicate counter declaration: {decls:?}"
+    );
+}
+
+/// A `wait` inside a statement-position `on` body lowers to `tick()`,
+/// and `tick()` runs the checker pass that called the body — unbounded
+/// recursion once the trigger fires. v1 emits the same shape; refuse
+/// rather than reproduce it.
+#[test]
+fn a_wait_inside_an_on_handler_body_is_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait 1 cycle
+            log(info, "x")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("a suspending handler body must not lower");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("re-enters that same pass"), "got: {msg}");
+}
+
+/// A check body may legitimately read a local of the function that
+/// registered it (the emitted closure captures it by reference, exactly
+/// as v1 does). `harc dump-ir` renders check bodies outside any local
+/// table, so it must fall back rather than index one that lacks them.
+#[test]
+fn dump_ir_renders_a_check_body_that_reads_a_local() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = 3
+        cover x == 3
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("lowers");
+    let dump = format!("{prog}"); // must not panic
+    assert!(dump.contains("cover c0"), "{dump}");
+}
+
+/// Emitting a record into a scalar channel would pass a struct to a
+/// `std::function<void(uint64_t)>`. The shape check must catch it;
+/// signedness alone must NOT be rejected (both backends widen a scalar
+/// payload to a 64-bit slot).
+#[test]
+fn event_payload_shape_is_checked_but_signedness_is_not() {
+    let err = lower_src(
+        r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        let t : Txn
+        emit e(t)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a record payload into a scalar channel must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("event<uint>"), "got: {msg}");
+
+    lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let e : event<uint<8>>
+        let s : sint<8> = 0 - 1
+        emit e(s)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("a signedness difference is the benign widening v1 also performs");
+}
+
+/// A probe read that appears ONLY inside an `on <trigger>` predicate is
+/// still a program probe access: the trigger renders in the registration
+/// closure as `dut->rootp->…`, which needs the root header included.
+#[test]
+fn a_probe_read_only_in_an_on_trigger_still_pulls_the_root_header() {
+    let cpp = emit_cpp_src(
+        r#"testbench Tb
+end testbench Tb
+
+impl T for Tb
+    let dut : CpuPipe
+        probe alu_a : uint<32> at alu0.a
+    end let dut
+
+    run
+        on dut.alu_a == 7
+            log(info, "hit")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("___024root.h"),
+        "the probe accessor needs the root header; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("rootp"),
+        "the trigger must read through the probe accessor"
     );
 }

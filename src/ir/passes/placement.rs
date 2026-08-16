@@ -275,7 +275,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(e, &mut accesses, &mut transactor);
             }
-            Stmt::AssertCheck { cond, on_fail } => {
+            Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
                 host_service_only = false;
                 visit_expr(cond, &mut accesses, &mut transactor);
                 visit_fmt(on_fail, &mut accesses, &mut transactor);
@@ -343,6 +343,20 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
             }
             Stmt::CovReport(_) => {}
+            // Registering a concurrent `assert`/`assume`/`cover` installs
+            // a per-cycle observer into the framework checker pass. The
+            // block itself performs no pin access — the body runs in the
+            // checker pass, not here — but it is not a pure host-service
+            // statement either: it arms DUT observation that must survive
+            // wherever this block is placed.
+            // Fanning out to subscribers is host-side work; the
+            // subscriber bodies are their own functions.
+            Stmt::EventSubscribe { .. } | Stmt::EventEmit { .. } => {
+                host_service_only = false;
+            }
+            Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {
+                host_service_only = false;
+            }
             Stmt::ScoreboardOp { op, .. } => {
                 // Host state on the scoreboard struct — no pin access of
                 // its own; the value expression (push/scalar-write) may
@@ -528,6 +542,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::CycleCount
         | Expr::ErrorCount
         | Expr::TbField(_)
+        | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }

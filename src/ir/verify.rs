@@ -73,6 +73,15 @@ pub enum VerifyError {
         block: BlockId,
         covgroup: CovgroupId,
     },
+    /// A concurrent-check reference (`Stmt::PropertyCheck` /
+    /// `Stmt::CoverCheck`) does not resolve, or an `Expr::TemporalSlot`
+    /// appears where no latch cells exist (outside a check body) or
+    /// names a slot the check does not declare.
+    BadConcurrentCheck {
+        func: FunctionId,
+        block: BlockId,
+        detail: String,
+    },
     /// Invariant 15: Assign type matches the local's declared type
     /// (only checked when both sides are known).
     TypeMismatch {
@@ -191,6 +200,11 @@ impl std::fmt::Display for VerifyError {
                 "fn{}: b{} references missing covgroup cg{}",
                 func.0, block.0, covgroup.0
             ),
+            VerifyError::BadConcurrentCheck {
+                func,
+                block,
+                detail,
+            } => write!(f, "fn{}: b{}: {detail}", func.0, block.0),
             VerifyError::TypeMismatch {
                 func,
                 block,
@@ -271,6 +285,60 @@ impl std::fmt::Display for VerifyError {
                 func.0, block.0
             ),
         }
+    }
+}
+
+/// Walk a concurrent-check body and report every `Expr::TemporalSlot`
+/// whose index is at or beyond `n_slots`. Passing `n_slots == 0` asserts
+/// the expression carries no slot reading at all — used for latch
+/// operands, where a nested reading would need slot-of-slot accounting
+/// the model deliberately does not carry.
+fn check_temporal_slots(e: &Expr, n_slots: usize, what: &str, errs: &mut Vec<VerifyError>) {
+    match e {
+        Expr::TemporalSlot { slot, .. } => {
+            if (*slot as usize) >= n_slots {
+                errs.push(VerifyError::BadProgramRef {
+                    what: if n_slots == 0 {
+                        format!("{what} nests a temporal reading inside a latch operand")
+                    } else {
+                        format!(
+                            "{what} references temporal slot {slot} but declares only \
+                             {n_slots} latch(es)"
+                        )
+                    },
+                });
+            }
+        }
+        Expr::Binary(_, a, b) => {
+            check_temporal_slots(a, n_slots, what, errs);
+            check_temporal_slots(b, n_slots, what, errs);
+        }
+        Expr::Unary(_, a) => check_temporal_slots(a, n_slots, what, errs),
+        Expr::BitSlice { target, .. } => check_temporal_slots(target, n_slots, what, errs),
+        Expr::Ternary(c, t, f) => {
+            check_temporal_slots(c, n_slots, what, errs);
+            check_temporal_slots(t, n_slots, what, errs);
+            check_temporal_slots(f, n_slots, what, errs);
+        }
+        Expr::WidthCast { inner, .. } => check_temporal_slots(inner, n_slots, what, errs),
+        Expr::ComponentIdle { n, .. } => check_temporal_slots(n, n_slots, what, errs),
+        Expr::SeqIndex { index, .. } => check_temporal_slots(index, n_slots, what, errs),
+        Expr::Call(_, args) => {
+            for a in args {
+                check_temporal_slots(a, n_slots, what, errs);
+            }
+        }
+        Expr::RecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                check_temporal_slots(idx, n_slots, what, errs);
+            }
+            if let Some(idx) = index {
+                check_temporal_slots(idx, n_slots, what, errs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -355,6 +423,57 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         ),
                     });
                 }
+            }
+        }
+    }
+    // Concurrent-check schemas: every `Expr::TemporalSlot` in a check
+    // body must name a slot the check declares, and a latch's own
+    // operand must not itself be a slot reading (no `past(past(x))` —
+    // slot-of-slot accounting is deliberately out of the model, matching
+    // v1's non-recursing occurrence walk). Emission indexes `temporals`
+    // directly, so this is the net that keeps that sound.
+    for (pi, p) in prog.property_checks.iter().enumerate() {
+        let n = p.temporals.len();
+        let exprs: Vec<&Expr> = match &p.shape {
+            crate::ir::PropertyShape::Implies { ante, cons }
+            | crate::ir::PropertyShape::ImpliesNext { ante, cons } => vec![ante, cons],
+            crate::ir::PropertyShape::Invariant(e) => vec![e],
+        };
+        for e in exprs {
+            check_temporal_slots(e, n, &format!("property check p{pi}"), &mut errs);
+        }
+        for (si, slot) in p.temporals.iter().enumerate() {
+            check_temporal_slots(
+                &slot.inner,
+                0,
+                &format!("property check p{pi} latch operand {si}"),
+                &mut errs,
+            );
+        }
+    }
+    for (ci, c) in prog.cover_checks.iter().enumerate() {
+        check_temporal_slots(
+            &c.cond,
+            c.temporals.len(),
+            &format!("cover check c{ci}"),
+            &mut errs,
+        );
+        for (si, slot) in c.temporals.iter().enumerate() {
+            check_temporal_slots(
+                &slot.inner,
+                0,
+                &format!("cover check c{ci} latch operand {si}"),
+                &mut errs,
+            );
+        }
+    }
+    // Every test's reported cover list must resolve into the table.
+    for t in &prog.tests {
+        for c in &t.cover_checks {
+            if c.index() >= prog.cover_checks.len() {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!("test {} reports missing cover check c{}", t.name, c.0),
+                });
             }
         }
     }
@@ -788,11 +907,130 @@ impl Checker<'_> {
                     self.check_local(*dest);
                 }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
-                Stmt::AssertCheck { cond, on_fail } => {
+                Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
                     self.check_expr(cond, true, "AssertCheck cond");
                     self.check_fmt_args(on_fail);
                 }
                 Stmt::CovReport(inst) => self.check_covgroup(inst.covgroup),
+                // Registration statements carry only a table index; the
+                // bodies themselves are verified once per schema by
+                // `check_concurrent_checks` (they are not part of any
+                // function's local scope, so walking them here would
+                // report every reference as an undefined local).
+                Stmt::PropertyCheck(p) => {
+                    if p.index() >= self.prog.property_checks.len() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("references missing property check p{}", p.0),
+                        });
+                    }
+                }
+                Stmt::CoverCheck(c) => {
+                    if c.index() >= self.prog.cover_checks.len() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("references missing cover check c{}", c.0),
+                        });
+                    }
+                }
+                // The handler body is its own function (verified in its
+                // own right); here only the link is checked — the id
+                // resolves and points at a zero-parameter `TestHook`,
+                // which is what the registration closure can call.
+                // The channel local must resolve and be event-typed, and
+                // a subscriber body must be a one-parameter `TestHook`
+                // whose parameter matches the channel's payload — emission
+                // pushes it into a `std::function<void(payload)>` vector.
+                Stmt::EventSubscribe { event, handler } => {
+                    self.check_local(*event);
+                    let payload = self.event_payload(*event);
+                    if payload.is_none() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "EventSubscribe target {} is not an event channel",
+                                event.0
+                            ),
+                        });
+                    }
+                    match self.prog.functions.get(handler.index()) {
+                        Some(f) if f.kind == FunctionKind::TestHook && f.params.len() == 1 => {}
+                        Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "event subscriber fn{} is {:?} with {} param(s), not a \
+                                 one-parameter TestHook",
+                                f.id.0,
+                                f.kind,
+                                f.params.len()
+                            ),
+                        }),
+                        None => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("event subscriber references missing fn{}", handler.0),
+                        }),
+                    }
+                }
+                Stmt::EventEmit { event, args } => {
+                    self.check_local(*event);
+                    if self.event_payload(*event).is_none() {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("EventEmit target {} is not an event channel", event.0),
+                        });
+                    }
+                    if args.len() != 1 {
+                        self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "EventEmit carries {} argument(s); an event payload is exactly one",
+                                args.len()
+                            ),
+                        });
+                    }
+                    for a in args {
+                        self.check_expr(a, false, "EventEmit arg");
+                    }
+                }
+                Stmt::CycleHandler(h) => {
+                    match self.prog.cycle_handlers.get(h.index()) {
+                        None => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("references missing cycle handler h{}", h.0),
+                        }),
+                        Some(schema) => match self.prog.functions.get(schema.function.index()) {
+                            Some(f)
+                                if f.kind == FunctionKind::TestHook && f.params.is_empty() => {}
+                            Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "cycle handler h{} body fn{} is {:?} with {} param(s),                                      not a zero-parameter TestHook",
+                                    h.0,
+                                    f.id.0,
+                                    f.kind,
+                                    f.params.len()
+                                ),
+                            }),
+                            None => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "cycle handler h{} references missing fn{}",
+                                    h.0, schema.function.0
+                                ),
+                            }),
+                        },
+                    }
+                }
                 Stmt::TransactorCall { dest, call } => {
                     if let Some(d) = dest {
                         self.check_local(*d);
@@ -1179,6 +1417,15 @@ impl Checker<'_> {
         }
     }
 
+    /// The payload of an event-channel local, or `None` when the local
+    /// does not resolve or is not event-typed.
+    fn event_payload(&self, l: LocalId) -> Option<crate::ir::EventPayload> {
+        match self.func.locals.get(l.index()).map(|t| &t.ty) {
+            Some(IrType::Event(p)) => Some(*p),
+            _ => None,
+        }
+    }
+
     fn check_covgroup(&mut self, c: CovgroupId) {
         if c.index() >= self.prog.covgroups.len() {
             self.errs.push(VerifyError::BadCovgroup {
@@ -1197,6 +1444,21 @@ impl Checker<'_> {
             Expr::CycleCount | Expr::ErrorCount => {}
             Expr::Local(l) => self.check_local(*l),
             Expr::TbField(field) => self.check_tb_field(field),
+            // A temporal latch reading only has meaning inside the
+            // per-cycle closure that owns the `static` latch cells —
+            // i.e. inside a `PropertyCheckSchema`/`CoverCheckSchema`
+            // body, which is verified by `check_concurrent_checks`
+            // rather than walked as part of a function body.
+            Expr::TemporalSlot { slot, .. } => {
+                self.errs.push(VerifyError::BadConcurrentCheck {
+                    func: self.fid,
+                    block: self.bid,
+                    detail: format!(
+                        "temporal slot {slot} referenced in {context}, outside a \
+                         concurrent property/cover body"
+                    ),
+                });
+            }
             Expr::TbQueueQuery { field, query } => {
                 self.check_tb_queue(field);
                 match query {
@@ -1802,13 +2064,27 @@ fn check_def_before_use(
                         check_e(&a.expr, &defined, errs);
                     }
                 }
-                Stmt::AssertCheck { cond, on_fail } => {
+                Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
                     check_e(cond, &defined, errs);
                     for a in &on_fail.args {
                         check_e(&a.expr, &defined, errs);
                     }
                 }
                 Stmt::CovReport(_) => {}
+                // Concurrent-check bodies reference DUT ports and host
+                // state, never function locals — nothing to def-check.
+                Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {}
+                // The channel local is DEFINED by its declaration (the
+                // emitter declares the subscriber vector at the hoisted
+                // local site), so subscribing/emitting only reads it —
+                // and reading it is not an expression, so there is
+                // nothing for `check_e` to walk. The payload args are.
+                Stmt::EventSubscribe { .. } => {}
+                Stmt::EventEmit { args, .. } => {
+                    for a in args {
+                        check_e(a, &defined, errs);
+                    }
+                }
                 Stmt::ProbeRelease(_) => {}
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
@@ -1924,6 +2200,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ErrorCount
         | Expr::Port(_)
         | Expr::TbField(_)
+        | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }
