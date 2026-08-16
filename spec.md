@@ -281,8 +281,10 @@ backend-specific accept or reject rather than as a value difference.
   for its operands** folds correctly under the TB-IR backend but makes
   `--codegen v1` emit a `constexpr` initializer the C++ compiler rejects
   (`overflow in constant expression`): v1 emits the operands at their own
-  type rather than promoting to `uint64_t`. Spell the masked value
-  explicitly if you need the legacy backend.
+  type rather than promoting to `uint64_t`. Note this surfaces at BUILD
+  time, not from `harc check` or `--emit-only`, both of which succeed.
+  Spell the masked value explicitly if you need the legacy backend
+  (harc#554).
 - Inside a **`keep` constraint** the wrap is dropped by *both* backends (`+%`
   reaches the solver as plain `+`, at 64-bit rank with a separate range
   assumption). That is a shared gap in the constraint lowering rather than a

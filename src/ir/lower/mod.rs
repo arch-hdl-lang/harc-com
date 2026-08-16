@@ -270,17 +270,6 @@ fn fold_const(
                 BinaryOp::Add => arith(a.bits.wrapping_add(b.bits)),
                 BinaryOp::Sub => arith(a.bits.wrapping_sub(b.bits)),
                 BinaryOp::Mul => arith(a.bits.wrapping_mul(b.bits)),
-                // `+% -% *%` mask to max(W(a), W(b)) per spec §2.4, and
-                // the 64-bit fold domain does not model per-operand
-                // widths — folding them as plain ops would silently
-                // change their meaning. This is `Invalid`, not
-                // `Unsupported`: `Unsupported` steers users to
-                // `--codegen v1`, and a construct this backend cannot
-                // give a defined value to should be spelled out at the
-                // source instead of routed to the legacy backend. (v1
-                // does now mask these correctly in a constexpr
-                // initializer, so it computes `255 +% 1` at `uint<8>` as
-                // 0 — it accepts a const form TB-IR rejects.)
                 BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
                     // Fold at `max(W(lhs), W(rhs))` per spec §2.4. The
                     // widths come from the operand *expressions* — a

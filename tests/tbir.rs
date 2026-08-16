@@ -10262,3 +10262,27 @@ end test T"#,
         "nested wrap must fold at each step's own width"
     );
 }
+
+/// Guards the backout in `5bad8ab`. An overflow guard was briefly added to
+/// the const fold to stop TB-IR folding what v1's `constexpr` cannot
+/// compile; it modelled operand VALUES rather than the C++ types v1
+/// emits, so it rejected this — an ordinary 32-bit wrap that v1 compiles
+/// to the same 1. Re-introducing any such guard must fail here.
+#[test]
+fn ordinary_const_wraps_fold_even_when_the_unmasked_product_is_large() {
+    let prog = lower_src(
+        r#"const K : uint<32> = 0xFFFFFFFF *% 0xFFFFFFFF
+
+test T
+    let dut : Top
+    run
+        assert K == 1 else fail("k")
+    end run
+end test T"#,
+    )
+    .expect("a 32-bit wrap must fold regardless of the unmasked product");
+    assert!(
+        format!("{prog}").contains("(1 == 1)"),
+        "must fold to the masked value"
+    );
+}
