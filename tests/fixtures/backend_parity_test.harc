@@ -5,7 +5,7 @@
 // This fixture only carries shapes BOTH emitters accept, so it can be
 // registered in tests/tbir_equiv_fixtures.txt and trace-diffed. The
 // shapes only one backend accepts are pinned as unit tests instead
-// (tests/codegen.rs, `backend_subset_gaps_*`), because a fixture that one
+// (tests/codegen.rs, the `*_escape_hatch_phrase*` tests), because a fixture one
 // backend refuses to emit cannot be trace-diffed at all — which is
 // exactly why those gaps went unnoticed.
 //

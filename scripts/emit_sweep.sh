@@ -65,7 +65,9 @@ BASE_BIN="$(build_at "$BASE_REV" base)" || { echo "failed to build $BASE_REV" >&
 echo "Building ${HEAD_REV:-working tree} ..." >&2
 HEAD_BIN="$(build_at "${HEAD_REV:-WORKTREE}" head)" || { echo "failed to build head" >&2; exit 1; }
 
-FIXTURES="$(cat "$ROOT/tests/fixtures.tbl")"
+TABLE="$ROOT/tests/fixtures.tbl"
+[ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
+FIXTURES="$(cat "$TABLE")"
 exitdiff=0; textdiff=0; total=0
 while IFS='|' read -r name top svs extra ref tstruct; do
     name="$(echo "$name" | xargs)"; top="$(echo "$top" | xargs)"

@@ -48,9 +48,23 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HARC="${HARC:-./target/release/harc}"
-DUT_DIR="tests/dut"
-FIX_DIR="tests/fixtures"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Run from the repo root regardless of where we were invoked. Several
+# paths the compiler resolves (SV includes, ref sources) are relative to
+# cwd, so a run from elsewhere silently degraded into "both backends
+# reject" for much of the corpus — which this gate then scored as skips.
+# Resolve a relative $HARC against the INVOKING directory before the cd,
+# or `HARC=../target/debug/harc` from tests/ would silently mean something
+# else once cwd changes.
+_INVOKED_FROM="$PWD"
+HARC="${HARC:-$ROOT/target/release/harc}"
+case "$HARC" in /*) ;; *) HARC="$_INVOKED_FROM/$HARC" ;; esac
+cd "$ROOT" || { echo "error: cannot cd to $ROOT" >&2; exit 1; }
+# Absolute, so running from anywhere behaves the same. Relative paths made
+# every fixture unreadable from a subdirectory, which the gate then scored
+# as "both backends reject" — a green run over nothing.
+DUT_DIR="$ROOT/tests/dut"
+FIX_DIR="$ROOT/tests/fixtures"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
 if [ ! -x "$HARC" ]; then
@@ -62,11 +76,6 @@ fi
 # and all of them take the "both backends reject" path — a green run over
 # a corpus that was never compiled.
 [ -x "$HARC" ] || { echo "error: $HARC is not executable" >&2; exit 1; }
-case "$HARC" in
-    /*) ;;
-    *) HARC="$PWD/$HARC" ;;
-esac
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -233,6 +242,10 @@ RESDIR="$TMP/rows"; mkdir -p "$RESDIR"
 n=0
 while IFS= read -r row; do
     [ -z "$(echo "$row" | xargs)" ] && continue
+    # `#` comments, as in every sibling list file. Without this a comment
+    # row becomes a fixture literally named "#", which this gate scores as
+    # a skip and run_fixtures.sh scores as a failure.
+    case "$(echo "$row" | xargs)" in '#'*) continue ;; esac
     printf '%s\n' "$row" >"$RESDIR/$n.row"
     n=$((n + 1))
 done <<<"$FIXTURES"
@@ -273,4 +286,15 @@ echo "        $nostatus lost"
 # Most fixtures have no solver block, so the text half covers a minority
 # of the corpus by construction. Say so rather than letting the headline
 # number imply corpus-wide emitted-text parity.
-[ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ]
+# A run in which NOTHING was actually compared is not a pass. Dispatching
+# rows is not enough: if every row lands in SKIP — because the binary is
+# broken, the paths are wrong, or TB-IR has started rejecting the corpus
+# wholesale with a declared-gap diagnostic — the gate would otherwise
+# report success while checking nothing. That is the exact silent-green
+# failure this gate exists to remove, so it must not be one itself.
+compared=$((pass + passc))
+if [ "$compared" -eq 0 ]; then
+    echo "error: no fixture was compared — $skip skipped, $known known." >&2
+    echo "       A gate that checks nothing must not report success." >&2
+fi
+[ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ] && [ "$compared" -gt 0 ]

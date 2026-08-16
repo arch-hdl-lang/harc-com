@@ -89,8 +89,14 @@ is_wired() {
         [ "$candidate" = "$ALLOWLIST" ] && continue
         [ "$candidate" = "tests/emit_parity_known.txt" ] && continue
         [ "$candidate" = "tests/check_fixture_registration.sh" ] && continue
-        if grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null \
-            | grep -qF "$base"; then
+        # NOT a pipeline into `grep -q`: under `set -o pipefail` the
+        # downstream grep exits on first match, the upstream one dies with
+        # SIGPIPE, and pipefail turns a successful match into rc 141. The
+        # verdict would then depend on the byte offset of the match inside
+        # a 400 KB file. (run_emit_parity.sh's known_exemption had the
+        # identical bug; this copy was introduced by the same commit that
+        # removed it there.)
+        if grep -qF "$base" <(grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null); then
             return 0
         fi
     done

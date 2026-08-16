@@ -8899,6 +8899,50 @@ end test EscapeHatch"#;
     );
 }
 
+/// The SECOND phrase the gate greps, which lives in the TB-IR *emitter*
+/// rather than in `LowerError` — and which nothing pinned until now, so
+/// rewording it would have left `cargo test` green while silently
+/// reclassifying a genuine escape hatch as a divergence.
+#[test]
+fn the_wide_shift_escape_hatch_phrase_is_stable() {
+    let src = r#"test WideShiftHatch
+    let dut : Top
+    run
+        let a : uint<128> = 1
+        let b : uint<128> = a << 3
+        assert b == 8 else fail("x")
+    end run
+end test WideShiftHatch"#;
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    // v1 implements wide shifts, so v1 really is the escape hatch here.
+    assert!(
+        cpp_tb::emit(&merged).is_ok(),
+        "v1 must still implement wide shifts, or this is not an escape hatch"
+    );
+    // TB-IR refuses, and the refusal must carry the phrase the gate greps.
+    let err = match harc::ir::lower::lower_program(&merged) {
+        Err(e) => e.to_string(),
+        Ok(prog) => {
+            let opts = harc::codegen::cpp_tb::EmitOpts::default();
+            cpp_tb::emit_randomize_snippets(&merged, &opts, &prog.constraint_sites, 5)
+                .err()
+                .map(|e| e.0)
+                .unwrap_or_else(|| {
+                    harc::codegen::tbir::emit(&prog, &merged, &opts)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
+                })
+        }
+    };
+    assert!(
+        err.contains("use --codegen v1"),
+        "run_emit_parity.sh greps this exact phrase to classify the wide-shift \
+         gap as an escape hatch; got: {err}"
+    );
+}
+
 /// The other side of the same contract: a `NotImplemented` rendering must
 /// NOT look like an escape hatch. All three of its clauses mention
 /// `--codegen v1`, and two of them mean v1 accepts the construct and
