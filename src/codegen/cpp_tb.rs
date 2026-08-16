@@ -1396,11 +1396,19 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
     let mut consts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut relations: std::collections::HashMap<String, RelationDecl> =
         std::collections::HashMap::new();
+    let mut const_widths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for it in &file.items {
         match it {
             Item::Const(c) => {
                 if let ExprKind::Int(text) = &*c.value.kind {
                     consts.insert(c.name.name.clone(), text.clone());
+                    if let Some(w) =
+                        c.ty.as_ref()
+                            .and_then(crate::ir::lower::cast_relabel_width)
+                            .or_else(|| literal_operand_bit_width(text))
+                    {
+                        const_widths.insert(c.name.name.clone(), w);
+                    }
                 }
             }
             Item::Enum(e) => {
@@ -1478,6 +1486,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         enums,
         enum_variants,
         consts,
+        const_widths,
         properties: std::collections::HashMap::new(),
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
@@ -1752,11 +1761,19 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // relations (`relation A(t) = B(t) && t.x == 0`).
     let mut relations: std::collections::HashMap<String, RelationDecl> =
         std::collections::HashMap::new();
+    let mut const_widths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for it in &file.items {
         match it {
             Item::Const(c) => {
                 if let ExprKind::Int(text) = &*c.value.kind {
                     consts.insert(c.name.name.clone(), text.clone());
+                    if let Some(w) =
+                        c.ty.as_ref()
+                            .and_then(crate::ir::lower::cast_relabel_width)
+                            .or_else(|| literal_operand_bit_width(text))
+                    {
+                        const_widths.insert(c.name.name.clone(), w);
+                    }
                 }
             }
             Item::Relation(r) => {
@@ -1922,6 +1939,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         enums,
         enum_variants,
         consts,
+        const_widths,
         properties,
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
@@ -5324,16 +5342,31 @@ fn value_bit_width(v: u64) -> u32 {
 }
 
 /// Self-width of a literal operand in a constraint, for the §2.4 wrap
-/// mask. An ARCH sized literal (`8'hAB`) states its width outright and is
-/// the one shape whose width needs no inference; everything else is sized
-/// by value through the statement path's own `parse_int_literal`, so the
-/// same literal sizes identically in both positions.
+/// mask. Everything unsized is sized by value through the statement
+/// path's own `parse_int_literal`, so the same literal sizes identically
+/// in both positions.
+///
+/// An ARCH sized literal states a width, but nothing in the lexer,
+/// parser or either backend truncates its digits to it — `c_int_literal`
+/// emits `4'hFF` as `0xFF`. Taking the declared width alone would mask
+/// narrower than the value the emitter actually wrote, so the two would
+/// disagree about the same token. Take whichever is wider: for a
+/// well-formed literal that is the declared width, and for an overwide
+/// one the mask still covers what was emitted.
 fn literal_operand_bit_width(s: &str) -> Option<u32> {
-    if let Some(idx) = s.find('\'') {
-        let declared: u32 = s[..idx].replace('_', "").parse().ok()?;
-        return (declared > 0).then_some(declared);
-    }
-    crate::ir::lower::parse_int_literal(s).map(value_bit_width)
+    let Some(idx) = s.find('\'') else {
+        return crate::ir::lower::parse_int_literal(s).map(value_bit_width);
+    };
+    let declared: u32 = s[..idx].replace('_', "").parse().ok()?;
+    let tail = &s[idx + 1..];
+    let radix = match tail.chars().next()? {
+        'h' | 'H' => 16,
+        'b' | 'B' => 2,
+        _ => 10,
+    };
+    let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
+    let value = u64::from_str_radix(&digits, radix).ok()?;
+    Some(declared.max(value_bit_width(value)))
 }
 
 fn txn_field_solver_width(f: &TxnFieldInfo) -> u32 {
@@ -5920,6 +5953,12 @@ struct Emitter {
     /// File-scope integer constants. Randomize constraints may reference
     /// these by source name; emission lowers them to literal Z3 values.
     consts: std::collections::HashMap<String, String>,
+    /// Declared bit-width of a `const`, kept beside `consts` because that
+    /// map holds only the initializer text. §2.4 masks a wrap at the
+    /// operands' declared widths, so sizing a `const` by the value of its
+    /// initializer (`const BUMP : uint<16> = 10` → 4 bits) masks too
+    /// narrowly and solves to a value the source constraint rejects.
+    const_widths: std::collections::HashMap<String, u32>,
     /// Property name → body expression. Populated up-front from
     /// `Item::Property` declarations so `assert property NAME` can be
     /// resolved at the call site without a separate pass.
@@ -14909,22 +14948,38 @@ impl Emitter {
             // the randomize target (`randomize(t) with t +% 10 == 5`).
             ExprKind::Ident(id) => {
                 if let Some(info) = field_info.get(&id.name) {
-                    return (info.width != 0).then(|| txn_field_solver_width(info));
+                    return Some(txn_field_solver_width(info));
                 }
-                if let Some(text) = self.consts.get(&id.name) {
-                    return literal_operand_bit_width(text);
+                if let Some(width) = self.const_widths.get(&id.name) {
+                    return Some(*width);
                 }
                 if let Some(idx) = self.enum_variants.get(&id.name) {
-                    return Some(value_bit_width(*idx as u64));
+                    return u64::try_from(*idx).ok().map(value_bit_width);
                 }
-                blocking
-                    .then(|| self.let_widths.get(&id.name).copied())
-                    .flatten()
+                // Under `blocking` the emitter inlines any remaining
+                // in-scope C++ expression, so the oracle has to keep up
+                // with it or a constraint the emitter would emit becomes
+                // a build error.
+                blocking.then(|| self.wrap_operand_width(e)).flatten()
             }
-            ExprKind::Field { .. } => expr_field_path(e, target_root)
-                .and_then(|field| field_info.get(&field))
-                .filter(|info| info.width != 0)
-                .map(txn_field_solver_width),
+            ExprKind::Field { .. } => {
+                if let Some(info) =
+                    expr_field_path(e, target_root).and_then(|field| field_info.get(&field))
+                {
+                    return Some(txn_field_solver_width(info));
+                }
+                // Same `blocking` inlining as above, and the one that
+                // matters most in practice: a record field (`c.max`) or a
+                // DUT probe (`dut.count`) whose declared width the
+                // statement path already knows.
+                if !blocking {
+                    return None;
+                }
+                if let Some(w) = self.wrap_operand_width(e) {
+                    return Some(w);
+                }
+                self.record_field_scalar_width(e)
+            }
             // `items[i]` — a list element has the list's element width.
             // A `foreach` clause is unrolled into exactly this shape, so
             // without it every `foreach` constraint containing a wrap
@@ -14956,16 +15011,52 @@ impl Emitter {
         }
     }
 
+    /// Declared width of `local.field` where `local` is a record-typed
+    /// `let`. Under `blocking randomize` the emitter inlines such a path
+    /// straight into the constraint, so the wrap mask needs its width;
+    /// `wrap_operand_width` only knows `dut.<probe>`. Only a direct
+    /// scalar leaf resolves — a nested record path stays unknown, which
+    /// is the honest answer rather than a guessed width.
+    fn record_field_scalar_width(&self, e: &Expr) -> Option<u32> {
+        let ExprKind::Field { target, name } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(base) = &*target.kind else {
+            return None;
+        };
+        let ty = self.let_types.get(&base.name)?;
+        let field = self
+            .record_fields
+            .get(ty)?
+            .iter()
+            .find(|f| f.name.name == name.name)?;
+        if is_list_type(&field.ty) || record_type_name(&field.ty).is_some() {
+            return None;
+        }
+        let (width, _) = scalar_field_shape(&field.ty);
+        (width != 0).then_some(width)
+    }
+
     /// Signedness of a constraint expression, picking `<` vs `z3::ult`,
     /// `/` vs `z3::udiv` and `%` vs `z3::urem`.
     ///
-    /// Resolves fields exactly like `constraint_expr_width`, and for the
-    /// same reason: these are different Z3 predicates over the *same*
-    /// variable, so a wrong hit is a wrong solved value, not a cosmetic
-    /// difference. A field whose width equals `solver_width` carries no
+    /// Resolves *transaction fields* the way `constraint_expr_width` does
+    /// — dotted paths through `expr_field_path` — and for the same reason:
+    /// these are different Z3 predicates over the *same* variable, so a
+    /// wrong hit is a wrong solved value, not a cosmetic difference. A
+    /// field whose width equals `solver_width` carries no
     /// `ult(_z_x, 1<<W)` range assumption at all (that bound is only
     /// emitted when the field is narrower), so under `bvslt` the solver is
     /// free to return a value the source constraint forbids.
+    ///
+    /// It does NOT have the width oracle's `const`/enum/`let` fallback
+    /// chain. A `const` and an enum variant are always emitted as
+    /// non-negative `uint64_t`, so `false` is right for those. A signed
+    /// `let` under `blocking randomize` is a real gap — `t.x < s` on a
+    /// `sint<8>` compares unsigned — but it predates this path and the
+    /// fix needs a signedness table for locals, which was removed once
+    /// already for poisoning unrelated functions (harc#550). Tracked in
+    /// harc#563; do not paper over it with a fourth flat side table.
     fn constraint_expr_is_signed(
         &self,
         e: &Expr,
@@ -15736,8 +15827,13 @@ impl Emitter {
                             Some(w) if w == width => None,
                             // Wider than the solver bitvector: the residue is
                             // not representable, so there is no mask to
-                            // apply. Only a bit-slice can get here. Rejected
-                            // rather than silently emitted unmasked.
+                            // apply. Rejected rather than silently emitted
+                            // unmasked. Reachable two ways — a bit-slice
+                            // (`emit_constraint_bit_slice_expr` does not
+                            // bound `hi` by the field width, unlike the
+                            // bit-select path) and a sized literal that
+                            // declares more bits than the solver has
+                            // (`128'h1` where every field fits in 64).
                             Some(w) => {
                                 if w > width {
                                     self.errors.push(format!(
