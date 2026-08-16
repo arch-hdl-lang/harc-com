@@ -291,14 +291,43 @@ end test T"#,
     );
 }
 
-/// #521: the wrapping `+% -% *%` operators are outside the const
-/// subset — their §2.4 mask needs static operand widths, which the
-/// 64-bit fold does not model. Folding them as plain ops would
-/// silently change their meaning, so they reject structurally.
+/// #521 / #550: the wrapping `+% -% *%` operators DO fold in a `const`
+/// initializer, at `max(W(lhs), W(rhs))` per spec §2.4, whenever both
+/// operand widths are statically known — a literal is self-sized, an
+/// `as uint<W>` cast carries W. v1 has always emitted the mask into the
+/// `constexpr` initializer; TB-IR used to reject the form outright, so
+/// the same source compiled under one backend and not the other.
 #[test]
-fn const_wrap_operator_is_rejected_without_v1_suggestion() {
+fn const_wrap_operator_folds_at_the_operand_width() {
+    let prog = lower_src(
+        r#"const K : uint<8> = 255 +% 1
+const M : uint<8> = (200 as uint<8>) *% 3
+
+test T
+    let dut : Top
+    run
+        assert K == 0 else fail("k")
+        assert M == 88 else fail("m")
+    end run
+end test T"#,
+    )
+    .expect("literal-width const wraps fold");
+    let text = format!("{prog}");
+    assert!(
+        text.contains("(0 == 0)") && text.contains("(88 == 88)"),
+        "const wraps must fold to their masked value; got:\n{text}"
+    );
+}
+
+/// An operand whose width is not statically known still cannot be folded
+/// — the `const` table carries values, not declared types, so a
+/// reference to another `const` has no width. v1 rejects the same shape,
+/// so the two backends accept and reject the same set.
+#[test]
+fn const_wrap_operator_needs_known_operand_widths() {
     let err = lower_src(
-        r#"const BAD : uint<8> = 255 +% 1
+        r#"const W : uint<8> = 255
+const BAD : uint<8> = W +% 1
 
 test T
     let dut : Top
@@ -307,16 +336,11 @@ test T
     end run
 end test T"#,
     )
-    .expect_err("wrap-op const initializer must fail lowering");
-    // `Invalid`, not `Unsupported`: `Unsupported` steers users to
-    // `--codegen v1`, and a construct with no defined value in this
-    // backend belongs spelled out at the source. (v1 masks these
-    // correctly in a constexpr initializer now, so it accepts a const
-    // form TB-IR rejects — a residual accepted-set difference.)
+    .expect_err("unknown-width const wrap must fail lowering");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("const BAD") && msg.contains("+% -% *%"),
-        "wrap-op rejection must name the const and the operators; got: {msg}"
+        msg.contains("statically known bit-width"),
+        "must name the unknown-width operand; got: {msg}"
     );
 }
 

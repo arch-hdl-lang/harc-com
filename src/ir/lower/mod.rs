@@ -127,6 +127,26 @@ use ConstFoldErr::Invalid as FoldInvalid;
 /// logical operators. The wrapping `+% -% *%` spellings are rejected —
 /// their §2.4 mask depends on static operand widths the fold does not
 /// model.
+/// Best-effort width of a wrapping operator's operand inside a `const`
+/// initializer: a literal is self-sized to its minimum unsigned width, an
+/// `as uint<W>`-family cast carries W, parens recurse. Everything else —
+/// notably a reference to another `const`, whose declared type the fold
+/// table does not carry — is unknown.
+///
+/// Deliberately the same shape as v1's `wrap_operand_width`, so the two
+/// backends fold the same set of constant wraps.
+fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_operand_width(inner),
+        ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(&ty.clone()),
+        ExprKind::Int(s) => {
+            let v = exprs::parse_int_literal(s.as_str())?;
+            Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
+        }
+        _ => None,
+    }
+}
+
 fn fold_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
@@ -251,13 +271,57 @@ fn fold_const(
                 // initializer, so it computes `255 +% 1` at `uint<8>` as
                 // 0 — it accepts a const form TB-IR rejects.)
                 BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
-                    Err(FoldInvalid(
-                        "the wrapping `+% -% *%` operators are not evaluable in a \
-                         constant initializer (their §2.4 mask needs static operand \
-                         widths); use the plain operator and spell the intended \
-                         wrapped value or mask explicitly"
-                            .into(),
-                    ))
+                    // Fold at `max(W(lhs), W(rhs))` per spec §2.4. The
+                    // widths come from the operand *expressions* — a
+                    // literal is self-sized, an `as uint<W>` cast carries
+                    // W — which is the same best-effort rule v1 applies
+                    // when it emits the mask into the `constexpr`
+                    // initializer, so the two backends now accept and
+                    // fold the same set. An operand whose width is not
+                    // statically known (a `const` reference, whose
+                    // declared type this table does not carry) still
+                    // cannot be folded, and v1 rejects it too.
+                    let (wl, wr) = (const_operand_width(lhs), const_operand_width(rhs));
+                    let (Some(wl), Some(wr)) = (wl, wr) else {
+                        return Err(FoldInvalid(format!(
+                            "the wrapping `{}` operator needs both operands to have a \
+                             statically known bit-width so its §2.4 mask is defined \
+                             (left is {}, right is {}). Use an integer literal or an \
+                             `as uint<N>` cast for the operand(s), or spell the mask \
+                             explicitly with the plain operator.",
+                            match op {
+                                BinaryOp::SubWrap => "-%",
+                                BinaryOp::MulWrap => "*%",
+                                _ => "+%",
+                            },
+                            if wl.is_some() { "known" } else { "unknown" },
+                            if wr.is_some() { "known" } else { "unknown" },
+                        )));
+                    };
+                    let width = wl.max(wr);
+                    if width > 64 {
+                        return Err(FoldInvalid(format!(
+                            "the wrapping operators are evaluable in a constant \
+                             initializer only up to 64 bits (this one masks to \
+                             {width})"
+                        )));
+                    }
+                    let raw = match op {
+                        BinaryOp::SubWrap => a.bits.wrapping_sub(b.bits),
+                        BinaryOp::MulWrap => a.bits.wrapping_mul(b.bits),
+                        _ => a.bits.wrapping_add(b.bits),
+                    };
+                    let masked = if width == 64 {
+                        raw
+                    } else {
+                        raw & ((1u64 << width) - 1)
+                    };
+                    // The residue is unsigned (§2.4), regardless of the
+                    // operands' signedness.
+                    Ok(ConstVal {
+                        bits: masked,
+                        signed: false,
+                    })
                 }
                 BinaryOp::Div | BinaryOp::Mod => {
                     let is_div = matches!(op, BinaryOp::Div);

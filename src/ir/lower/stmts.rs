@@ -1028,14 +1028,33 @@ impl FuncBuilder<'_> {
         ) {
             return Ok(());
         }
-        let dw = match self.local_type(dest) {
-            IrType::UInt(Some(w)) | IrType::SInt(Some(w)) => *w,
+        // Signedness, not just width: invariant 15's `assign_compatible`
+        // also requires the two to agree, so `let s : sint<8> = a +% b`
+        // (a wrap's residue is unsigned per spec §2.4) reached the
+        // internal-error channel for a program `harc check` accepts.
+        let (dw, d_signed) = match self.local_type(dest) {
+            IrType::UInt(Some(w)) => (*w, false),
+            IrType::SInt(Some(w)) => (*w, true),
             _ => return Ok(()),
         };
-        let aw = match self.expr_type(e) {
-            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) => w,
+        let (aw, a_signed) = match self.expr_type(e) {
+            Some(IrType::UInt(Some(w))) => (w, false),
+            Some(IrType::SInt(Some(w))) => (w, true),
             _ => return Ok(()),
         };
+        if a_signed != d_signed {
+            let (from, to) = if a_signed {
+                ("signed", "unsigned")
+            } else {
+                ("unsigned", "signed")
+            };
+            return Err(LowerError::Invalid(format!(
+                "assignment of a {from} {aw}-bit value to `{name}`, declared \
+                 {to} {dw} bits. Signedness must match — relabel the value \
+                 explicitly with `as {}<{dw}>()`.",
+                if d_signed { "sint" } else { "uint" }
+            )));
+        }
         if aw > dw {
             return Err(LowerError::Invalid(format!(
                 "assignment of a {aw}-bit value to `{name}`, declared {dw} bits, \

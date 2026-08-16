@@ -8576,3 +8576,78 @@ end test T
         "body kind must be preserved"
     );
 }
+
+// ── #550: residual v1 / TB-IR divergences ────────────────────────────
+
+/// A wrap's residue is unsigned (spec §2.4). v1 defaulted an untyped
+/// `let` to `int64_t`, reinterpreting it as signed, so `let y = a -% 1`
+/// on a `uint<64>` made `y > 0` false under v1 and true under TB-IR.
+#[test]
+fn untyped_let_bound_to_a_wrap_is_unsigned() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<64> = 0xFFFFFFFFFFFFFFFF
+        let y = a -% 1
+        log(info, "${y}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("auto y = ((uint64_t)(") && !cpp.contains("int64_t y ="),
+        "an untyped wrap destination must deduce unsigned; got:\n{cpp}"
+    );
+}
+
+/// The wrap's residue is `max(W(lhs), W(rhs))` bits, so a narrower typed
+/// destination narrows. TB-IR rejected it; v1 stored the unmasked residue.
+#[test]
+fn narrower_destination_for_a_wrap_is_rejected() {
+    let err = v1_emit_err(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let x : uint<4> = a +% 1
+        log(info, "${x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("narrows") && err.contains(".trunc<4>()"),
+        "an 8-bit residue into a 4-bit local must be a narrowing error; got: {err}"
+    );
+}
+
+/// The residue is unsigned, so a signed destination is a signedness
+/// mismatch. TB-IR surfaced this as `internal error: TB-IR failed
+/// verification after lowering`; v1 accepted it silently. Both now give
+/// the same diagnostic.
+#[test]
+fn signed_destination_for_a_wrap_is_rejected_in_both_backends() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let a : sint<8> = 100
+        let b : sint<8> = 100
+        let s : sint<8> = a +% b
+        log(info, "${s}")
+    end run
+end test T"#;
+    let v1 = v1_emit_err(src);
+    assert!(
+        v1.contains("Signedness must match"),
+        "v1: expected a signedness diagnostic; got: {v1}"
+    );
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let tbir = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        tbir.contains("Signedness must match"),
+        "tbir: expected the same diagnostic, not an internal error; got: {tbir}"
+    );
+}
