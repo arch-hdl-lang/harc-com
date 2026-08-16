@@ -1051,7 +1051,7 @@ impl FuncBuilder<'_> {
             return Err(LowerError::Invalid(format!(
                 "assignment of a {from} {aw}-bit value to `{name}`, declared \
                  {to} {dw} bits. Signedness must match — relabel the value \
-                 explicitly with `as {}<{dw}>()`.",
+                 explicitly with `as {}<{dw}>`.",
                 if d_signed { "sint" } else { "uint" }
             )));
         }

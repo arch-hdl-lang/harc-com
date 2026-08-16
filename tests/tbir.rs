@@ -10240,3 +10240,47 @@ end impl T"#,
         "the width-64 fill must be signed in TB-IR too; got:\n{cpp}"
     );
 }
+
+/// A nested wrap composes — `(1 +% 2) +% 3` masks at each step's own
+/// operand width. v1 has always folded these; without the recursive arm
+/// TB-IR rejected chains v1 accepts.
+#[test]
+fn const_wrap_folds_through_nested_wraps() {
+    let prog = lower_src(
+        r#"const N : uint<8> = (1 +% 2) +% 3
+
+test T
+    let dut : Top
+    run
+        assert N == 2 else fail("n")
+    end run
+end test T"#,
+    )
+    .expect("nested const wraps fold");
+    assert!(
+        format!("{prog}").contains("(2 == 2)"),
+        "nested wrap must fold at each step's own width"
+    );
+}
+
+/// v1 emits the UNMASKED arithmetic into its `constexpr` initializer, so a
+/// sum that overflows signed 64-bit is a hard g++ error there. Folding it
+/// here would build under TB-IR and fail to build under v1.
+#[test]
+fn const_wrap_declines_when_v1_would_overflow_its_constexpr() {
+    let err = lower_src(
+        r#"const K : uint<64> = 9223372036854775807 +% 0xFF
+
+test T
+    let dut : Top
+    run
+        assert K == 254 else fail("k")
+    end run
+end test T"#,
+    )
+    .expect_err("must decline rather than diverge from v1");
+    assert!(
+        assert_invalid(&err).contains("overflows the signed 64-bit range"),
+        "must name the overflow"
+    );
+}
