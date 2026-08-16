@@ -133,9 +133,22 @@ pub(crate) fn lower_transactor(
                 }
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    // A whole value-record held as transactor state
+                    // (`cur : Beat`). Same schema the bound-to path
+                    // produces, and the same duplicate check the scalar
+                    // branch below makes — without it `cur : uint<32>`
+                    // plus `cur : Beat` emitted two `cur` members.
                     if record_ctx.record_ids.contains_key(simple) {
                         let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
-                        state_names.insert(fname.clone(), sf.kind.clone());
+                        if state_names
+                            .insert(sf.name.clone(), sf.kind.clone())
+                            .is_some()
+                        {
+                            return Err(LowerError::Invalid(format!(
+                                "transactor `{tname}` declares state field `{}` more than once",
+                                sf.name
+                            )));
+                        }
                         state_fields.push(sf);
                         continue;
                     }
@@ -211,13 +224,24 @@ pub(crate) fn lower_transactor(
                 }
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    // Record state is legal in BOTH declaration
+                    // positions — v1 compiles a `cur : Beat` written
+                    // inside `when active` exactly as it does one
+                    // written above it, so closing only the outer
+                    // position would leave half a feature.
                     if record_ctx.record_ids.contains_key(simple) {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor `{tname}` field `{fname}` of transaction type `{simple}`"
-                            ),
-                            "",
-                        ));
+                        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+                        if state_names
+                            .insert(sf.name.clone(), sf.kind.clone())
+                            .is_some()
+                        {
+                            return Err(LowerError::Invalid(format!(
+                                "transactor `{tname}` declares state field `{}` more than once",
+                                sf.name
+                            )));
+                        }
+                        state_fields.push(sf);
+                        continue;
                     }
                     if f.default.is_some() {
                         return Err(unsupported(

@@ -13190,14 +13190,26 @@ end impl T"#,
     assert!(cpp.contains("xt.cur.tag == 5"), "the test reads it back:\n{cpp}");
 }
 
-/// A malformed `connect` endpoint is not a v1 escape hatch. v1 does not
-/// validate the path at all — it emits it verbatim into a `push_back` or
-/// a range-for, so every one of these names a member that does not
-/// exist, calls `push_back` on something that has none, or iterates a
-/// struct.
+/// A malformed `connect` endpoint keeps its `--codegen v1` suggestion,
+/// and the reason is the whole point of the class system: what v1 does
+/// with a bad edge depends on where the edge SITS, not on how it is
+/// malformed.
+///
+///   - In an INSTANTIATED env, v1 emits the path verbatim into a
+///     `push_back` or a range-for, and the result usually does not
+///     compile.
+///   - A SINGLE-SEGMENT endpoint resolves against the owner's own
+///     hookable or `out event` and works — `E_take(_tb.top, _t)`.
+///   - In an UNINSTANTIATED env, v1 emits no wiring at all, so every
+///     malformed edge there is invisible and v1 simply succeeds. tbir
+///     resolves `connect` for every env in the merged file, so it sees
+///     edges v1 never reaches.
+///
+/// One site, three outcomes. No single `V1Status` is honest, so the
+/// suggestion stays — it is true somewhere.
 #[test]
-fn a_malformed_connect_endpoint_does_not_point_at_v1() {
-    let src = |edge: &str| {
+fn a_malformed_connect_endpoint_keeps_its_v1_suggestion() {
+    let src = |edge: &str, inst: &str| {
         format!(
             r#"transactor Src
     observed : out event<uint<8>>
@@ -13226,7 +13238,7 @@ end env E
 
 testbench Tb
     dut : Top
-    top : E
+{inst}
 end testbench Tb
 impl T for Tb
     run
@@ -13237,7 +13249,7 @@ end impl T"#
     };
 
     // The control: the well-formed edge lowers.
-    emit_cpp_src(&src("src.observed -> sink.take"));
+    emit_cpp_src(&src("src.observed -> sink.take", "    top : E"));
 
     for (edge, want) in [
         ("src.observed -> sink", "sink `sink` without a method"),
@@ -13254,18 +13266,32 @@ end impl T"#
             "src.observed -> nosuch.take",
             "path segment `nosuch` that is not a sub-component",
         ),
+        (
+            "src.observed -> sink.take",
+            "", // control; skipped by the empty `want`
+        ),
     ] {
-        let err = lower_src(&src(edge)).unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        if want.is_empty() {
+            continue;
+        }
+        let err = lower_src(&src(edge, "    top : E")).unwrap_err();
+        let msg = assert_unsupported(&err);
         assert!(msg.contains(want), "`{edge}`: {msg}");
+
+        // The SAME edge in an UNINSTANTIATED env: v1 emits no wiring
+        // there at all, so it succeeds where tbir still rejects. This
+        // is the landing that makes any `NotImplemented` claim on these
+        // sites false.
+        let err = lower_src(&src(edge, "")).unwrap_err();
+        assert_unsupported(&err);
     }
 }
 
-/// The sink SIGNATURE checks are a different class again: v1 performs
-/// them itself and raises its own error, so `--codegen v1` rejects the
-/// program rather than mis-lowering it.
+/// The sink SIGNATURE checks keep the suggestion too, for the same
+/// reason: v1 raises its own error for a bad arity or a non-void return
+/// only when the owning env is instantiated.
 #[test]
-fn a_bad_connect_sink_signature_is_rejected_by_both_backends() {
+fn a_bad_connect_sink_signature_keeps_its_v1_suggestion() {
     let src = |sink: &str, method: &str| {
         format!(
             r#"transactor Src
@@ -13306,7 +13332,7 @@ end impl T"#
         "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
     ))
     .unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    let msg = assert_unsupported(&err);
     assert!(msg.contains("with 2 parameters"), "{msg}");
 
     let err = lower_src(&src(
@@ -13314,6 +13340,139 @@ end impl T"#
         "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
     ))
     .unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    let msg = assert_unsupported(&err);
     assert!(msg.contains("that returns a value"), "{msg}");
+}
+
+/// Record state is legal in BOTH transactor declaration positions —
+/// above `when active` and inside it. v1 compiles either, so closing
+/// only the outer one would leave half a feature.
+#[test]
+fn a_record_field_lowers_in_both_transactor_positions() {
+    for decl in [
+        // Above `when active`.
+        "    cur : Beat\n\n    when active\n",
+        // Inside it.
+        "\n    when active\n        cur : Beat\n",
+    ] {
+        let cpp = emit_cpp_src(&format!(
+            r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+{decl}        hookable go()
+            cur.tag = 5
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+        assert xt.cur.tag == 5 else fail("tag")
+    end run
+end impl T"#
+        ));
+        assert!(cpp.contains("Beat cur{};"), "{cpp}");
+        assert!(cpp.contains("self_state.cur.tag = 5;"), "{cpp}");
+    }
+}
+
+/// The record branch makes the same duplicate-name check the scalar
+/// branch does. Without it, `cur : uint<32>` plus `cur : Beat` emitted
+/// TWO `cur` members into the state struct.
+#[test]
+fn a_duplicate_transactor_state_field_is_rejected() {
+    let err = lower_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : uint<32> default 0
+    cur : Beat
+
+    when active
+        hookable go()
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("declares state field `cur` more than once"),
+        "{msg}"
+    );
+}
+
+/// A record-typed field on a transactor reached through an `env` comes
+/// through the COMPONENT-field machinery, which has no record kind. It
+/// used to fall through to the DUT-handle arm and report "more than one
+/// DUT handle field (dut, cur)" — a diagnostic that names the wrong
+/// problem entirely. v1 emits a plain member here and it works, so the
+/// `--codegen v1` suggestion is honest; only the wording was wrong.
+#[test]
+fn an_env_held_transactor_record_field_names_the_real_problem() {
+    let err = lower_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : Beat
+
+    when active
+        hookable go()
+            cur.tag = 5
+        end go
+    end when
+end transactor Xt
+
+env E
+    xt : Xt active
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("a record-typed field `Xt.cur` of type `Beat`"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("DUT handle"),
+        "the old wording blamed the DUT handle: {msg}"
+    );
 }
