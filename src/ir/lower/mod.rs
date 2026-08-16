@@ -5164,7 +5164,7 @@ pub(crate) struct FuncBuilder<'a> {
     /// body becomes `Expr::TemporalSlot` instead of the usual rejection.
     /// Empty everywhere else — the exact shape of v1's `prop_subs` hook,
     /// which keys the same substitution by span during emission.
-    pub(crate) temporal_slots: HashMap<(usize, usize), (u32, ir::TemporalFn)>,
+    pub(crate) temporal_slots: HashMap<(u32, u32), (u32, ir::TemporalFn)>,
 
     /// The `RecordSeq` accumulator local of the `tseq` body currently
     /// being lowered (`Some` only inside a `FunctionKind::Tseq` body). A
