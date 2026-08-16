@@ -354,6 +354,7 @@ pub(crate) fn lower_component_schema(
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     next_fn: &mut u32,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
         &str,
@@ -457,7 +458,15 @@ pub(crate) fn lower_component_schema(
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
-                let fk = lower_field(name, f, ids, scoreboard_ids, record_ids, is_transactor)?;
+                let fk = lower_field(
+                    name,
+                    f,
+                    ids,
+                    scoreboard_ids,
+                    record_ids,
+                    is_transactor,
+                    consts,
+                )?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
                         "component `{name}` declares field `{}` more than once",
@@ -870,6 +879,7 @@ fn lower_field(
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     is_transactor: bool,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -896,17 +906,26 @@ fn lower_field(
             ..
         } => {
             if matches!(f.direction, Some(Direction::InOut)) {
-                return Err(unsupported(
+                // v1 does not read the direction at all: an `in` /
+                // `inout` event emits the same
+                // `std::vector<std::function<void(T)>>` fan-out member an
+                // `out` event does, so an input pipe silently becomes an
+                // output port.
+                return Err(not_implemented(
                     &format!("an `inout` event field `{comp}.{fname}`"),
                     "only `out event<T>` analysis ports, directionless agent \
                      self-events, and `in event<T>` transactor input pipes are lowered",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             if matches!(f.direction, Some(Direction::In)) && !is_transactor {
-                return Err(unsupported(
+                // Same rule as the `inout` arm above: the direction is
+                // dropped and the field becomes an output fan-out.
+                return Err(not_implemented(
                     &format!("an `in` event field `{comp}.{fname}`"),
                     "an `in event<T>` input pipe is only lowered on an event-driven \
                      transactor (consumer BFM); use a directionless self-event elsewhere",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
@@ -919,9 +938,10 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional queue field `{comp}.{fname}`"),
-                    "",
+                    "the direction is dropped, leaving a plain queue member",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             // The element is a scalar ≤ 64 bits or a value-record
@@ -936,9 +956,11 @@ fn lower_field(
         // AnalysisSource passive` / `sb : AnalysisSb`).
         TypeExpr::Builtin { .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional scalar field `{comp}.{fname}`"),
-                    "",
+                    "the direction is dropped, and the member is left \
+                     UNINITIALIZED (a non-directional field gets `= 0`)",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let ty = scalar_ir_type(&f.ty).ok_or_else(|| {
@@ -947,14 +969,15 @@ fn lower_field(
                     "only uint/sint/bits/bool fields up to 64 bits are lowered",
                 )
             })?;
-            let default = scalar_default(&f.default, comp, fname)?;
+            let default = scalar_default(&f.default, comp, fname, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
         }
         TypeExpr::Named { name, .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional named-type field `{comp}.{fname}`"),
-                    "",
+                    "the direction is dropped, leaving a plain member",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -2063,26 +2086,44 @@ fn scalar_width(t: &TypeExpr) -> Option<u32> {
     }
 }
 
+/// A component field's `default`, folded to the value the struct member
+/// is initialized with.
+///
+/// v1 emits the default's SOURCE TEXT into the C++ member initializer,
+/// which works for a literal (`= 7`) and for a `const` name (`= K`,
+/// since the const is emitted as a C++ constant) but silently degrades
+/// to `= 0` for anything else — a `default 1 + 1` field starts at 0
+/// there, not 2. Folding through the file's constant table covers both
+/// working shapes and every other constant expression besides, so the
+/// only remaining rejection is a default that is not constant at all.
 fn scalar_default(
     default: &Option<crate::ast::Expr>,
     comp: &str,
     fname: &str,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
-    match default {
-        None => Ok(0),
-        Some(d) => match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!("component field default `{comp}.{fname} default {s}`"),
-                    "not a plain integer literal",
-                )
-            }),
-            ExprKind::Bool(b) => Ok(*b as u64),
-            _ => Err(unsupported(
-                &format!("a non-literal default on component field `{comp}.{fname}`"),
-                "",
-            )),
-        },
+    let Some(d) = default else { return Ok(0) };
+    fold_field_default(d, consts).map_err(|detail| {
+        not_implemented(
+            &format!("a non-constant default on component field `{comp}.{fname}`"),
+            detail,
+            V1Status::SilentlyMisLowers,
+        )
+    })
+}
+
+/// Shared by the component and scoreboard field paths: fold a `default`
+/// expression to its 64-bit value, or report why it is not constant.
+pub(crate) fn fold_field_default(
+    d: &crate::ast::Expr,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<u64, String> {
+    // `""` as the self-name: a field default has no enclosing `const`
+    // to form a cycle with, so no identifier can be a self-reference.
+    match super::fold_const(d, consts, "") {
+        Ok(v) => Ok(v.bits),
+        Err(super::ConstFoldErr::Unsupported(detail))
+        | Err(super::ConstFoldErr::Invalid(detail)) => Err(detail),
     }
 }
 

@@ -35,7 +35,9 @@
 //! generics, event ports, `on` handlers, TLM target threads, watchdogs —
 //! is an explicit `Unsupported`.
 
-use super::{helpers, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
+use super::{
+    helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
+};
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
     TypeArg, TypeExpr,
@@ -159,7 +161,7 @@ pub(crate) fn lower_transactor(
                     }
                     dut = Some((fname.clone(), simple.to_string()));
                 } else {
-                    let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                    let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                     if state_names
                         .insert(sf.name.clone(), sf.kind.clone())
                         .is_some()
@@ -239,7 +241,7 @@ pub(crate) fn lower_transactor(
                     }
                     dut = Some((fname.clone(), simple.to_string()));
                 } else {
-                    let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                    let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                     if state_names
                         .insert(sf.name.clone(), sf.kind.clone())
                         .is_some()
@@ -489,7 +491,7 @@ fn lower_bound_target_transactor(
     for ci in all_items {
         match ci {
             ComponentItem::Field(f) => {
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -906,7 +908,7 @@ fn lower_bound_initiator_transactor(
                 // `bool` ≤64 bits with a plain-literal default). Reuse the
                 // bound-to target state-field lowering; reject module/
                 // transaction-typed and non-scalar fields inside it.
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -977,7 +979,7 @@ fn lower_bound_initiator_transactor(
                          with scalar state are lowered",
                     ));
                 }
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids)?;
+                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -1198,6 +1200,7 @@ fn lower_state_field(
     tname: &str,
     f: &ComponentField,
     record_ids: &std::collections::HashMap<String, crate::ir::RecordId>,
+    record_ctx: &super::LowerCtx,
 ) -> Result<StateFieldSchema, LowerError> {
     let fname = &f.name.name;
     if f.direction.is_some() {
@@ -1269,27 +1272,24 @@ fn lower_state_field(
              a whole value-record, or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
         ));
     };
+    // Same rule as the component/scoreboard field defaults: folded
+    // through the file's constant table. v1 emits the default's SOURCE
+    // TEXT into the member initializer, so a literal or a `const` name
+    // works there but anything else silently degrades to `= 0` — a
+    // `default 1 + 1` state field starts at 0, not 2.
     let default = match &f.default {
         None => 0,
-        Some(d) => match &*d.kind {
-            crate::ast::ExprKind::Int(s) => {
-                super::exprs::parse_int_literal(s).ok_or_else(|| {
-                    unsupported(
-                        &format!("bound-to transactor `{tname}` state field `{fname} default {s}`"),
-                        "default must be a plain integer literal",
-                    )
-                })?
-            }
-            crate::ast::ExprKind::Bool(bv) => *bv as u64,
-            _ => {
-                return Err(unsupported(
+        Some(d) => super::components::fold_field_default(d, &record_ctx.const_vals()).map_err(
+            |detail| {
+                not_implemented(
                     &format!(
-                        "bound-to transactor `{tname}` state field `{fname}` with a non-literal default"
+                        "a non-constant default on transactor `{tname}` state field `{fname}`"
                     ),
-                    "",
-                ));
-            }
-        },
+                    detail,
+                    V1Status::SilentlyMisLowers,
+                )
+            },
+        )?,
     };
     Ok(StateFieldSchema {
         name: fname.clone(),

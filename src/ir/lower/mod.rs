@@ -211,8 +211,8 @@ impl SideTables {
 /// `c_type_for` — the bit pattern is backend-identical and signedness
 /// only changes the value of `>>`, `/`, `%`, and ordered comparisons.
 #[derive(Clone, Copy)]
-struct ConstVal {
-    bits: u64,
+pub(crate) struct ConstVal {
+    pub(crate) bits: u64,
     signed: bool,
 }
 
@@ -234,7 +234,7 @@ impl ConstVal {
 /// width. Those are program errors under every backend (v1 would hit
 /// C++ UB or silently mis-evaluate), so they surface as
 /// `LowerError::Invalid` with a precise diagnostic instead.
-enum ConstFoldErr {
+pub(crate) enum ConstFoldErr {
     Unsupported(String),
     Invalid(String),
 }
@@ -288,7 +288,7 @@ fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
 /// logical operators, and the wrapping `+% -% *%` spellings, which fold
 /// at `max(W(lhs), W(rhs))` when both operand widths are statically
 /// known (see `const_operand_width`) and are rejected when they are not.
-fn fold_const(
+pub(crate) fn fold_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
     self_name: &str,
@@ -1067,7 +1067,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema = scoreboards::lower_scoreboard(c, &record_ids)?;
+            let schema = scoreboards::lower_scoreboard(c, &record_ids, &const_vals)?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1573,6 +1573,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &scoreboard_ids,
             &record_ids,
             &mut next_fn,
+            &const_vals,
         )?;
         prog.components.push(schema);
     }
@@ -5064,6 +5065,27 @@ pub(crate) struct LowerCtx {
     /// it is callable wherever a pure helper is. Empty when the program
     /// declares no extern fns.
     pub extern_fns: HashSet<String>,
+}
+
+impl LowerCtx {
+    /// The two constant tables recombined into the shape `fold_const`
+    /// wants. Built on demand — only the field-default paths need it,
+    /// and only when a field actually carries a `default`, so the clone
+    /// never happens on the common path.
+    pub(crate) fn const_vals(&self) -> HashMap<String, ConstVal> {
+        self.consts
+            .iter()
+            .map(|(k, &bits)| {
+                (
+                    k.clone(),
+                    ConstVal {
+                        bits,
+                        signed: self.const_signed.get(k).copied().unwrap_or(false),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on

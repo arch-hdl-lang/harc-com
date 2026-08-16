@@ -2248,6 +2248,46 @@ case and only locally-determinable `Assign` types are compared).
     unverified reclassification is the failure this method exists to
     prevent.
 
+35. **Fifth probe sweep: constant-folded field defaults (2026-08-16).**
+    The first pass over `components.rs` (73 sites) and `transactors.rs`
+    (55) — the two files earlier sweeps never touched. One gap closed
+    across three paths, six diagnostics reclassified.
+
+    - **A field `default` now folds through the file's constant table**,
+      on component, scoreboard, and transactor-state declarations alike.
+      Each path had its own hand-rolled matcher accepting an integer
+      literal and a bool and nothing else, so `n : uint<8> default K`
+      with `const K = 7` in scope was refused — while v1 emitted `= K`,
+      which compiles and works, because the const is emitted as a C++
+      constant.
+
+      Reading v1's output on the wider shape is what made this worth
+      doing: v1 emits the default's SOURCE TEXT into the member
+      initializer and silently degrades to `= 0` for anything it cannot
+      spell that way, so `default 1 + 1` starts the field at 0 rather
+      than 2 — accepted, compiled, and wrong. Routing all three paths
+      through the existing `fold_const` covers both of v1's working
+      shapes and every other constant expression besides, which puts
+      TB-IR AHEAD of v1 here rather than level with it. The only
+      remaining rejection is a default that is not constant at all
+      (`default "x"`), now a `NotImplemented` / silently-mis-lowers.
+
+    - **The directional-field family** (`in`/`inout` on an event, queue,
+      scalar, or named-type component field) is five sites with one
+      rule: v1 never reads the direction. An `in event<T>` emits the
+      same `std::vector<std::function<void(T)>>` fan-out an `out event`
+      does, so an INPUT pipe becomes an output port; a directional
+      scalar emits an UNINITIALIZED member where a non-directional one
+      gets `= 0`. All five are `NotImplemented` / silently-mis-lowers,
+      checked structurally like the probe/bind-remap family.
+
+    Left open, and worth a slice of its own: a **transaction-typed field
+    on an unbound `transactor`** (`cur : Txn`). v1 emits a real `Txn`
+    member that works, and the IR already has `StateFieldKind::Record`
+    for the bound-to path — but the unbound path reaches record fields
+    through different machinery, so this is a design step, not a missing
+    arm. It keeps its `--codegen v1` suggestion, which is honest.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
