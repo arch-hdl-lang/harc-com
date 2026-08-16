@@ -190,8 +190,9 @@ identical at every `--emit-jobs` value; only the order of the per-shard
 progress lines varies:
 
 ```
-TBIR lower+verify: 16.0s
-TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4
+TBIR parse: 6.1s | merge: 0.1s
+TBIR lower: 10.9s | verify: 0.4s
+TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4, planned in 10.8s
 TBIR shard 3/11: 32 tests, 31.7 MB, 0.6s, emitted
 TBIR shard 1/11: 32 tests, 31.7 MB, 0.7s, emitted
 TBIR split emit: 11/11 shards, 348.6 MB, 0.8s

@@ -22,7 +22,7 @@ fn fixture(name: &str) -> String {
 
 fn merged_src(src: &str) -> harc::ast::SourceFile {
     let parsed = parse_source(src).expect("source parses");
-    merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge")
+    merge::merge_for_sim(vec![parsed], None).expect("merge")
 }
 
 fn merged_fixtures(names: &[&str]) -> harc::ast::SourceFile {
@@ -30,7 +30,7 @@ fn merged_fixtures(names: &[&str]) -> harc::ast::SourceFile {
         .iter()
         .map(|n| parse_source(&fixture(n)).unwrap_or_else(|e| panic!("{n} parses: {e:?}")))
         .collect();
-    merge::merge_for_sim(&parsed, None).expect("merge")
+    merge::merge_for_sim(parsed, None).expect("merge")
 }
 
 /// Lower + verify one merged source, ready for split emission.

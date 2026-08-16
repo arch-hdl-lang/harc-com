@@ -78,7 +78,7 @@ test TraceTest
 end test TraceTest
 "#;
     let parsed = parse_source(src).unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
     assert!(cpp.contains("#include \"harc_trace_rt.h\""));
     assert!(cpp.contains("#include \"harc_log_rt.h\""));
@@ -172,7 +172,7 @@ test RuntimeProblemTableTest
 end test RuntimeProblemTableTest
 "#;
     let parsed = parse_source(src).unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     assert!(cpp.contains("#include \"harc_random_rt.h\""));
@@ -218,7 +218,7 @@ test RuntimeFastPathTest
 end test RuntimeFastPathTest
 "#;
     let parsed = parse_source(src).unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     assert!(cpp.contains(
@@ -252,7 +252,7 @@ test WaveTest
 end test WaveTest
 "#;
     let parsed = parse_source(src).unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
     // Format-selecting header includes.
     assert!(
@@ -732,7 +732,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let err = cpp_tb::emit(&merged).unwrap_err();
     assert!(
         err.0.contains("addrmap `M`")
@@ -763,7 +763,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     cpp_tb::emit(&merged).expect("non-overlapping sized instances should emit cleanly");
 }
 
@@ -786,7 +786,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let err = cpp_tb::emit(&merged).unwrap_err();
     assert!(
         err.0.contains("`b`") && err.0.contains("aliases `nonexistent`"),
@@ -815,7 +815,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let err = cpp_tb::emit(&merged).unwrap_err();
     assert!(
         err.0.contains("chained aliases"),
@@ -845,7 +845,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     cpp_tb::emit(&merged).expect("aliased instances should bypass the overlap check");
 }
 
@@ -871,7 +871,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     cpp_tb::emit(&merged).expect("instances without `size` should not trip the overlap check");
 }
 
@@ -895,7 +895,7 @@ end test B
 "#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let merged = merge::merge_for_sim(vec![f], None).expect("merge keeps both tests");
     let err = cpp_tb::emit(&merged).unwrap_err();
     assert!(
         err.0.contains("multi-DUT") && err.0.contains("`X`") && err.0.contains("`Y`"),
@@ -918,7 +918,7 @@ end test B
 "#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let merged = merge::merge_for_sim(vec![f], None).expect("merge keeps both tests");
     let cpp = cpp_tb::emit(&merged).expect("same-DUT multi-test emits cleanly");
     assert!(
         cpp.contains("int run_A(int argc"),
@@ -951,7 +951,7 @@ end test B
 "#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[f], Some("B")).expect("merge validates selected test");
+    let merged = merge::merge_for_sim(vec![f], Some("B")).expect("merge validates selected test");
     let focused =
         merge::filter_tests_for_codegen(&merged, "B").expect("selected test should filter");
     let cpp = cpp_tb::emit(&focused).expect("focused test emits cleanly");
@@ -985,7 +985,7 @@ end test B
 "#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let merged = merge::merge_for_sim(vec![f], None).expect("merge keeps both tests");
     let split = cpp_tb::emit_split_tests(&merged, cpp_tb::EmitOpts::default())
         .expect("split emit should succeed");
 
@@ -1124,7 +1124,7 @@ end test B
 "#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[f], None).expect("merge keeps both tests");
+    let merged = merge::merge_for_sim(vec![f], None).expect("merge keeps both tests");
     let grouped = cpp_tb::emit_split_tests_with_file_prefix(
         &merged,
         cpp_tb::EmitOpts::default(),
@@ -2645,7 +2645,7 @@ test ClockedPostEvalTest
     end run
 end test ClockedPostEvalTest"#;
     let parsed = parse_source(src).unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // Isolate the multi-clock scheduler body (declared `clock` => `now_ps`).
@@ -5354,7 +5354,7 @@ fn all_fixtures_emit_cleanly() {
         } else {
             vec![parsed.clone()]
         };
-        let to_emit = match merge::merge_for_sim(&parsed_units, None) {
+        let to_emit = match merge::merge_for_sim(parsed_units, None) {
             Ok(m) => m,
             Err(_) => parsed.clone(),
         };
@@ -7281,7 +7281,7 @@ fn transactor_field_forward_reference_emits_in_dependency_order() {
     // Consumer FIRST — that's the source-order trigger from the bug.
     let consumer = parse_source(&consumer_src).expect("parse consumer");
     let producer = parse_source(&producer_src).expect("parse producer");
-    let merged = merge::merge_for_sim(&[consumer, producer], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![consumer, producer], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     let producer_struct = cpp
@@ -7507,7 +7507,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // (b) file-scope decode artifacts: callback holder struct +
@@ -7581,7 +7581,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // Sanity: the callback is registered, the active write updates
@@ -7642,7 +7642,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // Depth-limit constant is emitted once per file when any
@@ -7724,7 +7724,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // (1) Comparison operator is exactly `>=`. Catches `>` (cap
@@ -7854,7 +7854,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     // All three callbacks register against the single binding.
@@ -7915,7 +7915,7 @@ test T
 end test T"#,
     )
     .unwrap();
-    let merged = merge::merge_for_sim(&[parsed], None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
     assert!(
@@ -7934,13 +7934,13 @@ end test T"#,
 
 fn v1_cpp(src: &str) -> String {
     let parsed = parse_source(src).expect("parses");
-    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     cpp_tb::emit(&merged).expect("emit")
 }
 
 fn v1_emit_err(src: &str) -> String {
     let parsed = parse_source(src).expect("parses");
-    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     match cpp_tb::emit(&merged) {
         Ok(_) => panic!("expected emission to fail"),
         Err(e) => e.0.to_string(),
@@ -8031,7 +8031,7 @@ end test T"#;
         "v1: expected the unknown-width wrap diagnostic, got: {v1_err}"
     );
     let parsed = parse_source(src).expect("parses");
-    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let tbir_err = harc::ir::lower::lower_program(&merged)
         .err()
         .map(|e| e.to_string())
@@ -8173,7 +8173,7 @@ end test T"#,
 end test T"#,
     ] {
         let parsed = parse_source(src).expect("parses");
-        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
         assert!(
             cpp_tb::emit(&merged).is_ok(),
             "v1 must accept a bare-literal initializer, as TB-IR does"
@@ -8255,7 +8255,7 @@ end test T"#;
         "v1 must reject an 80-bit literal into a uint<8>; got: {err}"
     );
     let parsed = parse_source(src).expect("parses");
-    let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let tbir = harc::ir::lower::lower_program(&merged)
         .err()
         .map(|e| e.to_string())
@@ -8359,7 +8359,7 @@ fn sized_literals_are_not_narrowing_sources() {
 end test T"#
         );
         let parsed = parse_source(&src).expect("parses");
-        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
         assert!(
             cpp_tb::emit(&merged).is_ok(),
             "v1 must still accept the sized literal `{lit}`"
@@ -8388,7 +8388,7 @@ fn wide_literal_widths_agree_between_backends() {
 end test T"#
         );
         let parsed = parse_source(&src).expect("parses");
-        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
         let v1 = match cpp_tb::emit(&merged) {
             Ok(_) => panic!("v1 must reject {lit} into uint<{decl}>"),
             Err(e) => e.0.to_string(),
@@ -8478,7 +8478,7 @@ end test T"#,
 end test T"#,
     ] {
         let parsed = parse_source(src).expect("parses");
-        let merged = merge::merge_for_sim(std::slice::from_ref(&parsed), None).expect("merge");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
         assert!(
             cpp_tb::emit(&merged).is_ok(),
             "v1 must not reject on a shadowed name's width"
@@ -8509,5 +8509,70 @@ end test T"#,
     assert!(
         err.contains("statically known bit-width"),
         "a zero-width cast operand must be unknown for wrapping, matching TB-IR; got: {err}"
+    );
+}
+
+/// A top-level non-test `extend` survives `merge_for_sim` intact.
+///
+/// `merge_for_sim` moves items out of the parsed files rather than cloning
+/// them, and the `Item::Extend` arm has to split by body kind: a
+/// `ExtendBody::Test` is folded into its base test, anything else passes
+/// through untouched. No fixture reaches that pass-through branch — the
+/// only non-test `extend` in the tree (`axi_agent.harc`) is nested inside
+/// a `package`, so it arrives as an `Item::Package` and takes the
+/// catch-all arm instead. This covers the branch directly.
+#[test]
+fn top_level_non_test_extend_passes_through_merge() {
+    let src = r#"
+transaction Txn
+    addr : uint<8>
+end transaction Txn
+
+extend Txn
+    data : uint<8>
+end extend Txn
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let parsed = parse_source(src).expect("parses");
+    let extends_before = parsed
+        .items
+        .iter()
+        .filter(|i| matches!(i, harc::ast::Item::Extend(_)))
+        .count();
+    assert_eq!(extends_before, 1, "source should declare one top-level extend");
+
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let extends_after: Vec<_> = merged
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            harc::ast::Item::Extend(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        extends_after.len(),
+        1,
+        "a non-test extend must survive the merge, not be folded or dropped"
+    );
+    assert_eq!(
+        extends_after[0]
+            .target
+            .segments
+            .last()
+            .map(|s| s.name.as_str()),
+        Some("Txn"),
+        "the pass-through must preserve the extend's target"
+    );
+    assert!(
+        !matches!(extends_after[0].body, harc::ast::ExtendBody::Test(_)),
+        "body kind must be preserved"
     );
 }

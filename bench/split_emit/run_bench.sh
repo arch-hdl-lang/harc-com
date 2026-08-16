@@ -53,9 +53,11 @@ for jobs in 1 2 4; do
       --emit-jobs "$jobs" 2>&1)
     end=$(date +%s.%N)
     total=$(echo "$end - $start" | bc)
-    lower=$(sed -n 's/^TBIR lower+verify: //p' <<<"$log")
+    parse=$(sed -n 's/^TBIR parse: \(.*\) | merge: .*/\1/p' <<<"$log")
+    lower=$(sed -n 's/^TBIR lower: \(.*\) | verify: .*/\1/p' <<<"$log")
+    plan=$(sed -n 's/^TBIR split plan: .*, planned in //p' <<<"$log")
     emit=$(sed -n 's/^TBIR split emit: .*, //p' <<<"$log")
-    echo "jobs=$jobs rep=$rep  total=${total}s  lower+verify=${lower}  emit=${emit}"
+    echo "jobs=$jobs rep=$rep  total=${total}s  parse=${parse}  lower=${lower}  plan=${plan}  emit=${emit}"
   done
 done
 

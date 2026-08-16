@@ -120,7 +120,7 @@ fn emit_fixture(path: &PathBuf, name: &str, failures: &mut Vec<String>) -> Optio
     } else {
         vec![parsed.clone()]
     };
-    let to_emit = match merge::merge_for_sim(&parsed_units, None) {
+    let to_emit = match merge::merge_for_sim(parsed_units, None) {
         Ok(merged) => merged,
         Err(_) => parsed,
     };
