@@ -2391,9 +2391,40 @@ pub(super) fn emit_method(
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            Terminator::WaitUntilTimeout {
+                preds,
+                mode,
+                cycles,
+                on_fire,
+                on_timeout,
+            } => {
+                // A method body has no scheduler to defer to, so the
+                // timed wait keeps v1's explicit polling loop (spec
+                // §7.4's "synchronous context" shape) rather than the
+                // coroutine `wait_until_timeout` awaiter: budget read
+                // once, `tick()` per cycle, bounded by elapsed cycles.
+                // The error bump rides the timeout edge, exactly as on
+                // the coroutine path, so the `on_timeout` block carries
+                // only the diagnostic text.
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                let n = expr_cpp(&cx, cycles)?;
+                writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
+                writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
+                writeln!(
+                    out,
+                    "{pad3}while (!({cond}) && ((int64_t)cycle_count - _wu_start) < _wu_budget) \
+                     tick();"
+                )
+                .ok();
+                writeln!(
+                    out,
+                    "{pad3}if ({cond}) {{ __bb = {}; }} else {{ ctx.errors++; __bb = {}; }}",
+                    on_fire.0, on_timeout.0
+                )
+                .ok();
+            }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
-            | Terminator::WaitUntilTimeout { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
                 // Fatal, never produces the terminator at all).

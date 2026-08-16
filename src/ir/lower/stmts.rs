@@ -87,9 +87,13 @@ impl FuncBuilder<'_> {
                 if self.lower_helper_return(Some(e))? {
                     return Ok(());
                 }
-                Err(unsupported(
+                // v1 emits a bare `return <expr>;` inside the run
+                // coroutine, which a C++20 coroutine cannot do (only
+                // `co_return`), so the generated TB does not compile.
+                Err(not_implemented(
                     "`return <expr>`",
                     "run/check bodies do not return a value",
+                    V1Status::EmitsUncompilable,
                 ))
             }
             StmtKind::Assert(v) => self.lower_assert(v),
@@ -2233,9 +2237,10 @@ impl FuncBuilder<'_> {
         // v1 rejects non-ident / non-record targets with the same intent;
         // mirror that as a precise lowering error.
         let ExprKind::Ident(id) = &*target.kind else {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "`randomize` of a non-identifier target",
                 "randomize a record-typed local declared with `let t : <Transaction>`",
+                V1Status::Rejects,
             ));
         };
         let Some(local) = self.lookup(&id.name) else {
@@ -2292,7 +2297,7 @@ impl FuncBuilder<'_> {
     /// `CallTarget::Tseq` edge. Args are scalar expressions, lowered (and
     /// port-hoisted) like any call argument; named args are rejected
     /// (tseq params are positional, matching v1).
-    fn lower_tseq_call(
+    pub(crate) fn lower_tseq_call(
         &mut self,
         name: &str,
         args: &[crate::ast::CallArg],
@@ -2325,10 +2330,12 @@ impl FuncBuilder<'_> {
     /// like a `let`-RHS scalar; DUT reads hoisted into the current block).
     fn lower_yield(&mut self, value: &crate::ast::Expr) -> Result<(), LowerError> {
         let Some(seq) = self.tseq_result else {
-            // Mirrors v1's "`yield` outside a `tseq` body" diagnostic.
-            return Err(unsupported(
+            // v1 raises its own "`yield` outside a `tseq` body is not
+            // supported in v0 cpp_tb" here, so it is not an escape hatch.
+            return Err(not_implemented(
                 "`yield` outside a `tseq` body",
                 "yield is only valid inside a `tseq ... end tseq` body",
+                V1Status::Rejects,
             ));
         };
         let elem = self

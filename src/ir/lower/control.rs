@@ -77,6 +77,26 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // `for t in S(...)` — the generator call written inline. v1's
+        // `for (auto& t : S())` binds the returned vector to a temporary
+        // that lives for the whole loop, so the generator runs ONCE;
+        // materializing it into a synthesized local here has the same
+        // shape and the same single evaluation.
+        if let ExprKind::Call { callee, args } = &*f.iter.kind {
+            if let ExprKind::Ident(name) = &*callee.kind {
+                if let Some(elem) = self.ctx.tseqs.get(&name.name).cloned() {
+                    let seq_ty = elem.seq_type();
+                    let call = self.lower_tseq_call(&name.name, args)?;
+                    let seq = self.fresh_temp();
+                    self.set_local_type(seq, seq_ty);
+                    self.push(Stmt::Assign(seq, call));
+                    let elem_ty = self
+                        .seq_of_local(seq)
+                        .expect("a tseq result local is seq-typed by construction");
+                    return self.lower_for_in_seq(f, seq, elem_ty);
+                }
+            }
+        }
         let ExprKind::RangeLit {
             lo: Some(lo),
             hi: Some(hi),
@@ -392,17 +412,6 @@ impl FuncBuilder<'_> {
             self.start_block(succ);
             return Ok(());
         };
-
-        // Timed waits inside transactor method bodies are out of this
-        // slice: methods run synchronously (v1's polling-loop shape,
-        // not the coroutine awaiter) and the sync timeout emission is
-        // not mirrored yet.
-        if self.in_transactor_method {
-            return Err(unsupported(
-                "`wait until ... timeout` inside a transactor method",
-                "use an untimed `wait until`, or a counting loop",
-            ));
-        }
 
         // Budget evaluated once, before the wait (v1's `_wu_budget`),
         // so the default timeout header reports the same value the
