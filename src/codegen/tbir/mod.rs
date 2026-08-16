@@ -796,6 +796,9 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Binary(_, a, b) => expr_has_probe(a) || expr_has_probe(b),
         Unary(_, a) => expr_has_probe(a),
         BitSlice { target, .. } => expr_has_probe(target),
+        BitSliceDyn { target, hi, lo } => {
+            expr_has_probe(target) || expr_has_probe(hi) || expr_has_probe(lo)
+        }
         Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
@@ -874,6 +877,13 @@ fn for_each_check_body_expr(prog: &TbProgram, mut f: impl FnMut(&ir::Expr)) {
         }
         for slot in &p.temporals {
             f(&slot.inner);
+        }
+        // The `else fail(...)` message renders inside the same closure,
+        // so its interpolation captures are real program accesses too.
+        if let Some(m) = &p.message {
+            for a in &m.args {
+                f(&a.expr);
+            }
         }
     }
     for c in &prog.cover_checks {
@@ -1161,6 +1171,11 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         }
         Unary(_, a) => for_each_port_in_expr(a, f),
         BitSlice { target, .. } => for_each_port_in_expr(target, f),
+        BitSliceDyn { target, hi, lo } => {
+            for_each_port_in_expr(target, f);
+            for_each_port_in_expr(hi, f);
+            for_each_port_in_expr(lo, f);
+        }
         Ternary(c, a, b) => {
             for_each_port_in_expr(c, f);
             for_each_port_in_expr(a, f);

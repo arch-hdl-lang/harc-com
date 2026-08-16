@@ -403,6 +403,21 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             };
             format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
         }
+        // Runtime bounds go through the same helper v1 emits. The
+        // target keeps its `harc_read` widening when it is a whole
+        // port, so a wide signal slices out of its full value rather
+        // than out of a truncated `uint64_t`.
+        Expr::BitSliceDyn { target, hi, lo } => {
+            let t = match &**target {
+                Expr::Port(p) if p.lane.is_none() => {
+                    format!("harc_rt::harc_read({})", port_signal(cx, p))
+                }
+                other => format!("(_harc_u128)({})", expr_cpp(cx, other)?),
+            };
+            let hi = expr_cpp(cx, hi)?;
+            let lo = expr_cpp(cx, lo)?;
+            format!("harc_rt::harc_bits({t}, (uint32_t)({hi}), (uint32_t)({lo}))")
+        }
         Expr::WidthCast {
             kind,
             width,

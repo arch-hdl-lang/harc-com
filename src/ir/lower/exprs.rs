@@ -336,9 +336,16 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_bus_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
-                Err(unsupported(
+                // Every field-access shape either backend implements has
+                // been tried by here. v1 has no rejection for the
+                // leftovers: it passes the access straight through as
+                // C++ member syntax, so `let y = x.foo` on a scalar
+                // local emits `int64_t y = x.foo;` — a member access on
+                // an integer, which the C++ compiler rejects.
+                Err(not_implemented(
                     &format!("field access on a non-DUT value ending in `.{}`", name.name),
                     "",
+                    V1Status::EmitsUncompilable,
                 ))
             }
             ExprKind::Paren(inner) => self.lower_expr(inner),
@@ -602,17 +609,23 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_lane_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
-                Err(unsupported(
+                // Same shape as the field-access leftovers: v1 emits the
+                // subscript verbatim, so `let b = a[0]` on a scalar
+                // local becomes `int64_t b = a[0];` — subscripting an
+                // integer, which the C++ compiler rejects.
+                Err(not_implemented(
                     "index expressions",
                     "only `dut.<port>[i]` lane accesses and \
                      `<rec>.<vecfield>[i]` element reads are lowered",
+                    V1Status::EmitsUncompilable,
                 ))
             }
             ExprKind::BitSlice { target, hi, lo } => {
                 // Constant scalar bit-slice `x[hi:lo]` with literal bounds
                 // → IR `BitSlice` (right-shift + mask), mirroring v1's
-                // scalar slice. A variable part-select (`x[s +: W]` with a
-                // non-const offset) does not fold and stays out of subset.
+                // scalar slice. Non-literal bounds (`x[i:0]`) keep the
+                // width unknown, so they take the runtime-helper form
+                // instead — the shape v1 emits for every slice.
                 match (parse_int_literal_expr(hi), parse_int_literal_expr(lo)) {
                     (Some(h), Some(l)) if h >= l => match (u32::try_from(h), u32::try_from(l)) {
                         (Ok(hi), Ok(lo)) => {
@@ -628,10 +641,28 @@ impl FuncBuilder<'_> {
                             V1Status::SilentlyMisLowers,
                         )),
                     },
-                    _ => Err(unsupported(
-                        "bit-slice expressions with non-constant or hi<lo bounds",
-                        "only literal `x[hi:lo]` bounds with hi >= lo are lowered",
-                    )),
+                    // Both bounds literal, but reversed. This is not a
+                    // missing feature in either backend: `x[0:3]` names
+                    // no bits. v1 accepts it and emits
+                    // `harc_bits(v, 0, 3)`, whose `hi < lo` guard
+                    // returns 0 — a silent always-zero read. Reject it
+                    // here as the malformed slice it is.
+                    (Some(h), Some(l)) => Err(LowerError::Invalid(format!(
+                        "bit slice `[{h}:{l}]` is reversed: a slice names bits high-to-low, \
+                         so the first bound must be >= the second (write `[{l}:{h}]` to take \
+                         those {} bits)",
+                        l - h + 1
+                    ))),
+                    // At least one bound is a runtime value. The width
+                    // is unknown at lowering, so this takes the runtime
+                    // `harc_bits` helper — which is what v1 emits for
+                    // every slice, constant bounds included.
+                    _ => {
+                        let target = Box::new(self.lower_expr(target)?);
+                        let hi = Box::new(self.lower_expr(hi)?);
+                        let lo = Box::new(self.lower_expr(lo)?);
+                        Ok(Expr::BitSliceDyn { target, hi, lo })
+                    }
                 }
             }
             // A bare string literal in expression position has no
@@ -1201,6 +1232,16 @@ impl FuncBuilder<'_> {
                     lo,
                 }
             }
+            Expr::BitSliceDyn { target, hi, lo } => {
+                let target = self.hoist_ports_with_hint(*target, None);
+                let hi = self.hoist_ports_with_hint(*hi, None);
+                let lo = self.hoist_ports_with_hint(*lo, None);
+                Expr::BitSliceDyn {
+                    target: Box::new(target),
+                    hi: Box::new(hi),
+                    lo: Box::new(lo),
+                }
+            }
             Expr::WidthCast {
                 kind,
                 width,
@@ -1335,6 +1376,11 @@ impl FuncBuilder<'_> {
             Expr::Unary(_, inner) => self.expr_type(inner),
             Expr::Ternary(_, t, e) => self.expr_type(t).or_else(|| self.expr_type(e)),
             Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
+            // Runtime bounds: the width is not known here. The helper
+            // returns `uint64_t`, so the value is unsigned of unknown
+            // width — not `None`, which would let a signed context
+            // silently claim it.
+            Expr::BitSliceDyn { .. } => Some(IrType::UInt(None)),
             Expr::WidthCast { kind, width, .. } => Some(match kind {
                 WidthCastKind::Sext => IrType::SInt(Some(*width)),
                 _ => IrType::UInt(Some(*width)),
@@ -1438,6 +1484,16 @@ impl FuncBuilder<'_> {
                     target: Box::new(target),
                     hi,
                     lo,
+                }
+            }
+            Expr::BitSliceDyn { target, hi, lo } => {
+                let target = self.hoist_transactor_calls(*target);
+                let hi = self.hoist_transactor_calls(*hi);
+                let lo = self.hoist_transactor_calls(*lo);
+                Expr::BitSliceDyn {
+                    target: Box::new(target),
+                    hi: Box::new(hi),
+                    lo: Box::new(lo),
                 }
             }
             Expr::WidthCast {
@@ -2553,12 +2609,40 @@ pub(crate) fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
         BinaryOp::BitXor => BinOp::BitXor,
         BinaryOp::Shl => BinOp::Shl,
         BinaryOp::Shr => BinOp::Shr,
-        BinaryOp::PipeImplies
-        | BinaryOp::PipeImpliesNext
-        | BinaryOp::Throughout
-        | BinaryOp::Within
-        | BinaryOp::Intersect => {
-            return Err(unsupported("temporal operators", ""));
+        // `|->` / `|=>` shape a concurrent check; `lower_property_check`
+        // destructures the top-level one into `PropertyShape` before any
+        // operand reaches here. Reaching this arm means the operator sat
+        // in a value position (`let x = a |-> b`) or nested inside
+        // another implication — neither names a value. v1 emits the C++
+        // comma operator for it (`a /* unsupported-op */ , b`), which
+        // compiles and silently evaluates to the right operand alone.
+        BinaryOp::PipeImplies | BinaryOp::PipeImpliesNext => {
+            let sym = if matches!(op, BinaryOp::PipeImpliesNext) {
+                "|=>"
+            } else {
+                "|->"
+            };
+            return Err(LowerError::Invalid(format!(
+                "`{sym}` is a concurrent-assertion operator, not a value: it is only \
+                 meaningful as the top-level operator of an `assert` / `assume`"
+            )));
+        }
+        // The SVA sequence operators (spec §5). No backend implements
+        // them: v1 emits the C++ comma operator, so
+        // `a throughout b` compiles into `b` with `a` discarded — the
+        // check passes or fails on the wrong expression entirely.
+        BinaryOp::Throughout | BinaryOp::Within | BinaryOp::Intersect => {
+            let sym = match op {
+                BinaryOp::Throughout => "throughout",
+                BinaryOp::Within => "within",
+                _ => "intersect",
+            };
+            return Err(not_implemented(
+                &format!("the `{sym}` sequence operator"),
+                "only `|->` / `|=>` implications and the `past`/`rose`/`fell`/`stable` \
+                 readings are lowered",
+                V1Status::SilentlyMisLowers,
+            ));
         }
         BinaryOp::In | BinaryOp::Inside => {
             return Err(unsupported("`in`/`inside` membership operators", ""));

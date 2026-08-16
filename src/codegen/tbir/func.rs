@@ -812,16 +812,24 @@ fn emit_property_check(
     emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
 
     // The failure arm is identical across shapes apart from the operator
-    // suffix in the message, so build it once.
-    let fail_arm = |out: &mut String, suffix: &str| {
-        writeln!(
-            out,
-            "{pad2}sim_log_line(\"{sev}\", \"property `{label}` failed{suffix}\");"
-        )
-        .ok();
+    // suffix in the generic message, so build it once. An `else fail(...)`
+    // clause replaces the generic line entirely — including the operator
+    // suffix, which only ever explained the generic wording.
+    let fail_arm = |out: &mut String, suffix: &str| -> Result<(), EmitError> {
+        match &schema.message {
+            Some(args) => emit_log_call(out, cx, sev, None, args, depth + 2)?,
+            None => {
+                writeln!(
+                    out,
+                    "{pad2}sim_log_line(\"{sev}\", \"property `{label}` failed{suffix}\");"
+                )
+                .ok();
+            }
+        }
         if schema.severity.counts_as_error() {
             writeln!(out, "{pad2}ctx.errors++;").ok();
         }
+        Ok(())
     };
 
     match &schema.shape {
@@ -834,7 +842,7 @@ fn emit_property_check(
             writeln!(out, "{pad1}bool _harc_a = (bool)({a});").ok();
             writeln!(out, "{pad1}bool _harc_b = (bool)({b});").ok();
             writeln!(out, "{pad1}if (_harc_prev && !_harc_b) {{").ok();
-            fail_arm(out, " (|=>)");
+            fail_arm(out, " (|=>)")?;
             writeln!(out, "{pad1}}}").ok();
             writeln!(out, "{pad1}_harc_prev = _harc_a;").ok();
         }
@@ -842,13 +850,13 @@ fn emit_property_check(
             let a = expr_cpp(cx, ante)?;
             let b = expr_cpp(cx, cons)?;
             writeln!(out, "{pad1}if ((bool)({a}) && !(bool)({b})) {{").ok();
-            fail_arm(out, " (|->)");
+            fail_arm(out, " (|->)")?;
             writeln!(out, "{pad1}}}").ok();
         }
         PropertyShape::Invariant(e) => {
             let c = expr_cpp(cx, e)?;
             writeln!(out, "{pad1}if (!({c})) {{").ok();
-            fail_arm(out, "");
+            fail_arm(out, "")?;
             writeln!(out, "{pad1}}}").ok();
         }
     }

@@ -315,6 +315,11 @@ fn check_temporal_slots(e: &Expr, n_slots: usize, what: &str, errs: &mut Vec<Ver
         }
         Expr::Unary(_, a) => check_temporal_slots(a, n_slots, what, errs),
         Expr::BitSlice { target, .. } => check_temporal_slots(target, n_slots, what, errs),
+        Expr::BitSliceDyn { target, hi, lo } => {
+            check_temporal_slots(target, n_slots, what, errs);
+            check_temporal_slots(hi, n_slots, what, errs);
+            check_temporal_slots(lo, n_slots, what, errs);
+        }
         Expr::Ternary(c, t, f) => {
             check_temporal_slots(c, n_slots, what, errs);
             check_temporal_slots(t, n_slots, what, errs);
@@ -441,6 +446,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         };
         for e in exprs {
             check_temporal_slots(e, n, &format!("property check p{pi}"), &mut errs);
+        }
+        // The `else fail(...)` message renders inside the same closure,
+        // so a `${past(x)}` capture indexes the same latch table.
+        for a in p.message.iter().flat_map(|m| &m.args) {
+            check_temporal_slots(
+                &a.expr,
+                n,
+                &format!("property check p{pi} message"),
+                &mut errs,
+            );
         }
         for (si, slot) in p.temporals.iter().enumerate() {
             check_temporal_slots(
@@ -1494,6 +1509,11 @@ impl Checker<'_> {
             }
             Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
             Expr::BitSlice { target, .. } => self.check_expr(target, ports_ok, context),
+            Expr::BitSliceDyn { target, hi, lo } => {
+                self.check_expr(target, ports_ok, context);
+                self.check_expr(hi, ports_ok, context);
+                self.check_expr(lo, ports_ok, context);
+            }
             Expr::Ternary(c, t, e2) => {
                 self.check_expr(c, ports_ok, context);
                 self.check_expr(t, ports_ok, context);
@@ -1791,6 +1811,10 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Local(l) => func.locals.get(l.index()).map(|t| t.ty.clone()),
         Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
+        // Runtime bounds: unsigned, width unknown until the slice runs.
+        // `UInt(None)` is invariant 15's widthless wildcard, which is
+        // what a `uint64_t` helper return is here.
+        Expr::BitSliceDyn { .. } => Some(IrType::UInt(None)),
         Expr::WidthCast { kind, width, .. } => Some(match kind {
             crate::ir::WidthCastKind::Sext => IrType::SInt(Some(*width)),
             _ => IrType::UInt(Some(*width)),
@@ -2239,6 +2263,11 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         }
         Expr::Unary(_, a) => for_each_local(a, f),
         Expr::BitSlice { target, .. } => for_each_local(target, f),
+        Expr::BitSliceDyn { target, hi, lo } => {
+            for_each_local(target, f);
+            for_each_local(hi, f);
+            for_each_local(lo, f);
+        }
         Expr::Ternary(c, t, e) => {
             for_each_local(c, f);
             for_each_local(t, f);

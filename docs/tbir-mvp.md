@@ -2064,14 +2064,68 @@ case and only locally-determinable `Assign` types are compared).
     structurally over the lowering sources and a companion test exercises
     one arm end-to-end, so the scan cannot pass over dead code.
 
-    **The counterpart matters as much.** `log(<unknown severity>, …)`
-    stayed an `Unsupported` with its `--codegen v1` suggestion intact,
-    because v1 genuinely handles it — it passes the word through as the
-    log tag (`sim_log_line("TRACE", "x")`). TB-IR's stricter check is a
-    deliberate improvement (a typo'd severity becomes an error rather
-    than a new log tag), and the suggestion is honest: v1 really will
-    compile it. The two classes only stay useful if the line between them
-    tracks what v1 actually does.
+    **A third class exists.** `log(<unknown severity>, …)` is neither a
+    TB-IR gap nor a v1 escape hatch. Spec §7.7 defines `Severity` as a
+    closed five-variant enum, so `trace` names no severity at all; v1
+    "handles" it only by uppercasing whatever ident it finds into the log
+    tag (`sim_log_line("TRACE", "x")`), which is exactly what makes a
+    typo dangerous — `log(errror, …)` prints an `ERRROR` line and never
+    bumps the failure counter, so a test that should fail passes. That
+    diagnostic is a `LowerError::Invalid` naming the five variants
+    (divergence 33), not a gap report in either direction. The three
+    classes only stay useful if the line between them tracks what v1
+    actually does *and* what the spec actually says.
+
+33. **Third probe sweep: runtime bit slices, check messages, and the
+    `Invalid` class (2026-08-16).** The sweep moved from statement- and
+    item-level constructs to ordinary *expression* surface. Two real
+    gaps closed, and the rest of the batch turned out to want a
+    diagnostic rather than an implementation.
+
+    - **Runtime-bounded bit slices** (`x[i:0]`, `x[hi:hi-3]`). TB-IR
+      folded a slice into a shift-and-mask, which needs both bounds at
+      lowering time, so anything else was refused. v1 has never folded:
+      it emits `harc_rt::harc_bits(value, hi, lo)` for *every* slice,
+      constant bounds included, and that helper takes runtime bounds and
+      guards its own range. New `Expr::BitSliceDyn` carries the two bound
+      expressions and emits that helper; the constant form keeps folding,
+      because a known width is worth having where it exists. A whole-port
+      target widens through `harc_read` before slicing (v1's shape), so a
+      wide signal is not truncated to 64 bits first. The value types as
+      `UInt(None)` — invariant 15's widthless wildcard, which is what a
+      `uint64_t` helper return is.
+    - **`else fail("…")` on a concurrent `assert` / `assume`.** v1
+      *parses* the clause and then discards it, so every concurrent
+      failure there prints the same anonymous ``property `<inline>`
+      failed`` line no matter how many checks are registered — the
+      message is written, accepted, and lost. `PropertyCheckSchema` now
+      carries an optional `FmtArgs`, lowered inside `with_check_body` so
+      it obeys the same rule as the condition (it may read locals and
+      ports; it may not push statements into the test), and the emitted
+      closure prints it in place of the generic line, suffix included.
+      The immediate `assume` path was fixed to honor the clause too, so
+      `else fail(…)` means the same thing in all four positions rather
+      than only three. `TbProgram`'s probe-detection and gated-bus walks
+      visit the message's interpolation captures, and the verifier checks
+      its temporal slots, for the same reason the trigger predicates are
+      walked (divergence 30).
+
+    Diagnostics reclassified in the same pass:
+
+    | Construct | v1 | new class |
+    |---|---|---|
+    | index expression on a non-indexable value (`a[0]` on a scalar) | emits the subscript verbatim (`int64_t b = a[0];`) | `NotImplemented` / emits-uncompilable |
+    | field access on a non-DUT value (`x.foo`) | emits the member access verbatim (`int64_t y = x.foo;`) | `NotImplemented` / emits-uncompilable |
+    | `throughout` / `within` / `intersect` | emits the C++ **comma operator** (`a /* unsupported-op */ , b`), which compiles and evaluates to the right operand alone | `NotImplemented` / silently-mis-lowers |
+    | reversed literal slice (`x[0:3]`) | emits `harc_bits(v, 0, 3)`, whose `hi < lo` guard returns 0 — a silent always-zero read | `Invalid` |
+    | `\|->` / `\|=>` in value position | same comma operator, so the antecedent is dropped | `Invalid` |
+    | `log(<unknown severity>, …)` | uppercases any ident into the log tag, so a typo'd `error` never bumps the failure counter | `Invalid` |
+
+    The last three are the point of the sweep as much as the two
+    implementations. A malformed construct is not a backend gap in
+    either direction, and calling it one — in either the
+    `Unsupported` or the `NotImplemented` sense — tells the user to go
+    looking for a workaround instead of fixing their code.
 
 ### The probe method
 
