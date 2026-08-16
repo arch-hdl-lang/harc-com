@@ -2399,11 +2399,29 @@ case and only locally-determinable `Assign` types are compared).
       flavors show the same defined-never-called lambda. Being too
       cautious is not free either — it left three sites telling users to
       re-run under a backend where their watchdog would not fire.
-    - **`connect` on a transactor** is left UNCLASSIFIED. The first
-      probe used an empty block (nothing to wire, so it proved nothing);
-      the second tripped the separate `out event`-field gate before
-      reaching the connect path. Neither is evidence, and a guess here
-      would be the same mistake in a new place.
+    - **`connect` on a transactor** was left UNCLASSIFIED at first — the
+      initial probe used an empty block (nothing to wire, so it proved
+      nothing) and the second tripped the separate `out event`-field
+      gate before reaching the path. Settled in the next pass by a
+      CONTROL DIFF rather than a grep: v1's emitted C++ is byte-identical
+      with and without the block, in every landing. It does not even
+      RESOLVE the edges — a nonsense edge naming two endpoints that do
+      not exist produces the same identical output, where a backend that
+      resolved anything would have errored. All five sites are
+      `NotImplemented` / silently-mis-lowers.
+
+      A regex-driven edit caught one neighbouring site
+      (`transactor … TLM target threads`) that had never been probed;
+      it was reverted before commit. Bulk-editing diagnostics is how an
+      unverified claim gets in without anyone deciding to make it, so
+      the per-construct count is asserted after every such pass.
+
+    The control diff generalizes the earlier lesson: to tell "v1
+    implements this" from "v1 discards it", emit the SAME program with
+    and without the construct and compare. A construct that changes
+    nothing in the output was never implemented, however cleanly it
+    parses — and that is invisible to any probe that only looks at
+    whether the compile succeeded.
 
     **The refinement this sweep adds to the probe method:** "v1 emits"
     was never the question, and neither is "v1 emits code that

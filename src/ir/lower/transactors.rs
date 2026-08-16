@@ -218,9 +218,11 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::Connect(_) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("transactor `{tname}` connect blocks"),
-                    "",
+                    "v1 parses the block and emits NOTHING for it — the edges are silently \
+                     dropped; wire the endpoints from an `env` `connect` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
@@ -326,9 +328,11 @@ pub(crate) fn lower_transactor(
                 ));
             }
             ComponentItem::Connect(_) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("transactor `{tname}` connect blocks"),
-                    "",
+                    "v1 parses the block and emits NOTHING for it — the edges are silently \
+                     dropped; wire the endpoints from an `env` `connect` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
@@ -587,9 +591,11 @@ fn lower_bound_target_transactor(
                 ));
             }
             ComponentItem::Connect(_) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` connect blocks"),
-                    "",
+                    "v1 parses the block and emits NOTHING for it — the edges are silently \
+                     dropped; wire the endpoints from an `env` `connect` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
@@ -1013,9 +1019,11 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Connect(_) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` connect blocks"),
-                    "",
+                    "v1 parses the block and emits NOTHING for it — the edges are silently \
+                     dropped; wire the endpoints from an `env` `connect` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
@@ -1088,9 +1096,11 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::Connect(_) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` connect blocks"),
-                    "",
+                    "v1 parses the block and emits NOTHING for it — the edges are silently \
+                     dropped; wire the endpoints from an `env` `connect` instead",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {

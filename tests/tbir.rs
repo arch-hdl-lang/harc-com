@@ -13616,3 +13616,65 @@ end impl T"#,
          and the diagnostic must go back to `Unsupported`; got {calls:?}"
     );
 }
+
+/// A `connect` block on a transactor is not a v1 escape hatch either,
+/// and the evidence is a CONTROL DIFF rather than a grep: v1's emitted
+/// C++ is byte-identical with and without the block. It does not even
+/// RESOLVE the edges — a nonsense edge naming two endpoints that do not
+/// exist produces the same identical output, where a backend that
+/// resolved anything would have raised an error.
+///
+/// Verified across all five sites (unbound ×2, bound-to target,
+/// initiator-side ×2) and both declaration positions.
+#[test]
+fn a_transactor_connect_block_does_not_point_at_v1() {
+    let src = |conn_outer: &str, conn_inner: &str| {
+        format!(
+            r#"transactor Xt
+    dut : Top
+    n : uint<32> default 0
+{conn_outer}
+    when active
+{conn_inner}        hookable go()
+            n = n + 1
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#
+        )
+    };
+    const OUTER: &str = "    connect\n        a.b -> c.d\n    end connect\n";
+    const INNER: &str = "        connect\n            a.b -> c.d\n        end connect\n";
+
+    for (outer, inner) in [(OUTER, ""), ("", INNER)] {
+        let err = lower_src(&src(outer, inner)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("connect blocks"), "{msg}");
+        assert!(
+            msg.contains("emits NOTHING for it"),
+            "the diagnostic must say why v1 is not a way out: {msg}"
+        );
+    }
+
+    // The control the classification rests on: v1's output does not
+    // change when the block is added, so the edges are dropped rather
+    // than wired. If this ever starts differing, v1 grew an
+    // implementation and the diagnostic must go back to `Unsupported`.
+    let with = cpp_tb::emit(&merged_src(&src(OUTER, ""))).expect("v1 emits");
+    let without = cpp_tb::emit(&merged_src(&src("", ""))).expect("v1 emits");
+    assert_eq!(
+        with, without,
+        "v1 emits identical C++ with and without a transactor `connect` block"
+    );
+}
