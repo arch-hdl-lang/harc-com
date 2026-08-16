@@ -3545,8 +3545,10 @@ test ScalarRhsTest
 end test ScalarRhsTest
 "#;
     let err = lower_src(src).expect_err("scalar RHS into whole-Vec field must be rejected");
-    // v1 emits `dst.data = 5;` against a `std::array`.
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    // Same site as the width-mismatch case above, which v1 compiles —
+    // one rejection covering landings with different v1 outcomes cannot
+    // claim `EmitsUncompilable`, even for the arm where that is true.
+    let msg = assert_unsupported(&err);
     assert!(
         msg.contains("whole-`Vec` write of record field"),
         "names the write: {msg}"
@@ -3579,9 +3581,12 @@ test MismatchTest
 end test MismatchTest
 "#;
     let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
-    // v1 emits `w.data = n.data;` between two differently-typed
-    // `std::array`s, which has no `operator=`.
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    // Keeps its `--codegen v1` suggestion: "non-matching" is a HARC
+    // judgement, and v1 collapses every scalar of 64 bits or fewer to
+    // `uint64_t`. `Vec<uint<32>, 4> = Vec<uint<16>, 4>` really does
+    // emit `std::array<uint64_t, 4> = std::array<uint64_t, 4>` there,
+    // which compiles.
+    let msg = assert_unsupported(&err);
     assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
 }
 
@@ -12702,10 +12707,13 @@ end impl T"#,
 /// emitted C++, which never compiles regardless of where it lands.
 #[test]
 fn unresolved_names_do_not_point_at_v1() {
-    let cases: [(&str, &str); 3] = [
+    // `let x` with no type is NOT in this list: v1 emits only a comment
+    // for the declaration, so whether its output compiles depends on
+    // whether the name is later used — and the rejection fires at the
+    // declaration, before that is known.
+    let cases: [(&str, &str); 2] = [
         ("let x = nosuchthing", "unresolved name `nosuchthing`"),
         ("nosuchthing = 1", "assignment to unknown name `nosuchthing`"),
-        ("let x\n        x = 1", "uninitialized `let x` without a scalar type"),
     ];
     for (stmt, want) in cases {
         let err = lower_src(&format!(
@@ -12780,6 +12788,181 @@ end impl T"#,
     let msg = assert_unsupported(&err);
     assert!(
         msg.contains("whole-`Vec` read of record field") && msg.contains("element-wise"),
+        "{msg}"
+    );
+}
+
+/// The loop-element write rejection covers every statement that names a
+/// local DESTINATION, not just `Assign`. `lower_assign` routes
+/// `x = sb.q.pop()` into `ScoreboardOp::QueuePop { dest }` and
+/// `x = xact.m(...)` into `TransactorCall { dest }`, so a check that
+/// only looked for `Assign` would pass exactly those writes through —
+/// the container never updated, silently.
+#[test]
+fn a_loop_element_write_through_a_call_destination_is_rejected() {
+    let err = lower_src(
+        r#"struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+scoreboard Sb
+    seen : queue<uint<32>>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+impl T for Tb
+    run
+        let r : Bundle
+        sb.seen.push(1)
+        for x in r.data
+            x = sb.seen.pop()
+        end for
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("a write to a `for` loop's element variable"),
+        "{msg}"
+    );
+}
+
+/// `for t in <tseq-result>` deliberately does NOT get the write
+/// rejection. Its by-copy loop variable predates this sweep, and
+/// `for t in txns … t.addr = … end for` is an idiom both backends
+/// accept today — turning it into an error would break working
+/// programs, which is not what a gap-closing change may do.
+#[test]
+fn a_tseq_loop_element_write_still_lowers() {
+    let cpp = emit_cpp_src(
+        r#"transaction Txn
+    addr : uint<32> default 0
+end transaction Txn
+
+tseq burst() -> TSeq<Txn>
+    let t : Txn
+    yield t
+end tseq burst
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        for t in burst()
+            t.addr = 5
+        end for
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("addr = 5"), "{cpp}");
+}
+
+/// A non-leaf element selector (`t.entries[k].data`) is snapshotted into
+/// a temp BEFORE the loop. v1's range-for evaluates the container
+/// expression once; a selector left inside the per-iteration bind would
+/// walk a different row each time the body changed `k`.
+#[test]
+fn a_vec_loop_snapshots_its_container_selector() {
+    let cpp = emit_cpp_src(
+        r#"struct Row
+    data : Vec<uint<32>, 3>
+end struct Row
+struct Tbl
+    entries : Vec<Row, 4>
+end struct Tbl
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let t : Tbl
+        let k = 0
+        let sum = 0
+        for x in t.entries[k].data
+            sum = sum + x
+            k = k + 1
+        end for
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        !cpp.contains("t.entries[k]"),
+        "the selector must be snapshotted, not re-read each iteration:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("t.entries[__t") && cpp.contains("k = (k + 1)"),
+        "the body still advances `k`; the loop just stops following it:\n{cpp}"
+    );
+}
+
+/// A port read in the selector hoists into a `DutRead` ahead of the
+/// loop. Left inside the bind it reached the verifier as
+/// `PortInDisallowedPosition` — an internal-bug channel, printed to the
+/// user as raw IR.
+#[test]
+fn a_port_in_a_vec_loop_selector_hoists() {
+    let cpp = emit_cpp_src(
+        r#"struct Row
+    data : Vec<uint<32>, 3>
+end struct Row
+struct Tbl
+    entries : Vec<Row, 4>
+end struct Tbl
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let t : Tbl
+        let sum = 0
+        for x in t.entries[dut.a].data
+            sum = sum + x
+        end for
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_read(dut->a)"),
+        "the port read is emitted once, ahead of the loop:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("entries[harc_rt::harc_read"),
+        "and not inside the per-iteration bind:\n{cpp}"
+    );
+}
+
+/// An uninitialized `let x` with no type keeps its `--codegen v1`
+/// suggestion. v1 emits only a comment for the declaration, so whether
+/// its output compiles depends on whether the name is later USED — and
+/// the rejection fires at the declaration, before that is known.
+#[test]
+fn an_untyped_uninitialized_let_keeps_its_v1_suggestion() {
+    let err = lower_src(
+        r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let x
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("uninitialized `let x` without a scalar type"),
         "{msg}"
     );
 }

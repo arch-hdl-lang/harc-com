@@ -913,13 +913,15 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::Assign(id, Expr::Literal { value: 0, ty }));
                 return Ok(());
             }
-            // v1 emits a COMMENT for the declaration
-            // (`// let x (no type / no value)`) and then the later
-            // `x = 1;` against a name it never declared.
-            return Err(not_implemented(
+            // Stays an `Unsupported`: v1 emits a COMMENT for the
+            // declaration (`// let x (no type / no value)`), so whether
+            // its output compiles depends on whether the name is ever
+            // USED — an unused `let x` builds fine there, a later
+            // `x = 1` does not. The rejection fires at the declaration,
+            // before that is known, so it cannot claim either outcome.
+            return Err(unsupported(
                 &format!("uninitialized `let {}` without a scalar type", l.name.name),
                 "declare it with a scalar type (`let x: uint<N>;`) or give an initializer",
-                V1Status::EmitsUncompilable,
             ));
         };
         // Explicit scalar bit-width of the declaration, tracked on
@@ -1607,18 +1609,24 @@ impl FuncBuilder<'_> {
                 // earlier.)
                 if let Some(dst_len) = chain.leaf_vec_len {
                     let dst_dotted = chain.dotted.clone();
-                    // v1 emits the member assignment verbatim
-                    // (`x.a = x.b;`), and `std::array<T, 4>` has no
-                    // `operator=` taking a `std::array<T, 8>` — nor a
-                    // scalar.
+                    // Stays an `Unsupported`: "non-matching" is a HARC
+                    // judgement, and v1 collapses every scalar of 64
+                    // bits or fewer to `uint64_t`. A length mismatch
+                    // (`Vec<T, 4> = Vec<T, 8>`) or a scalar RHS really
+                    // does fail to compile there, but an
+                    // ELEMENT-WIDTH mismatch (`Vec<uint<8>, 4> =
+                    // Vec<uint<32>, 4>`) emits
+                    // `std::array<uint64_t, 4> = std::array<uint64_t, 4>`
+                    // and compiles. One site, several outcomes — the
+                    // same reason the whole-`Vec` READ keeps its
+                    // suggestion.
                     let mismatch = || {
-                        not_implemented(
+                        unsupported(
                             &format!(
                                 "a whole-`Vec` write of record field `{dst_dotted}` \
                                  with a non-matching RHS"
                             ),
                             "assign the field element-wise (`{rec}.{field}[i] = ...`)",
-                            V1Status::EmitsUncompilable,
                         )
                     };
                     // RHS must be a whole-`Vec` field read of matching shape.

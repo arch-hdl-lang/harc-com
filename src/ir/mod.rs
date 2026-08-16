@@ -1669,7 +1669,10 @@ pub enum Stmt {
         value: Expr,
     },
     /// `let value = _tb.<field>.pop()` on a testbench-owned typed FIFO.
-    /// A discarded pop is rejected during lowering.
+    /// A bare `<field>.pop()` in statement position lowers here too,
+    /// with `dest` a synthesized temp nothing reads — the CALL is the
+    /// effect. A pass that eliminates dead stores must therefore treat
+    /// every queue pop as live regardless of its destination.
     TbQueuePop {
         field: String,
         dest: LocalId,
@@ -1714,9 +1717,9 @@ pub enum Stmt {
         value: Expr,
     },
     /// `let v = pending.pop()` — pop the state queue front into a local.
-    /// Always has a destination (a discarded pop is rejected at lowering,
-    /// matching the scoreboard/component forms). Emitted as
-    /// `<dest> = <instance>.<field>.pop();`.
+    /// Always has a destination; for a discarded `pending.pop()` that is
+    /// an unread temp, so the store is dead but the pop is not (see
+    /// `TbQueuePop`). Emitted as `<dest> = <instance>.<field>.pop();`.
     TransactorStateQueuePop {
         instance: String,
         field: String,
@@ -1876,8 +1879,9 @@ pub enum Stmt {
         value: Expr,
     },
     /// `let v = <base>.<queue>.pop()` — pop the queue front into a local.
-    /// Always has a destination (a discarded pop is rejected at lowering,
-    /// matching the scoreboard form). Emitted as `<dest> = <recv>.<queue>.pop();`.
+    /// Always has a destination; for a discarded `<queue>.pop()` that is
+    /// an unread temp, so the store is dead but the pop is not (see
+    /// `TbQueuePop`). Emitted as `<dest> = <recv>.<queue>.pop();`.
     ComponentQueuePop {
         base: ComponentBase,
         queue: String,
@@ -1974,8 +1978,8 @@ pub enum ScoreboardOp {
     /// `sb.<queue>.push(value)`. `queue` is the queue-field name.
     QueuePush { queue: String, value: Expr },
     /// `let v = sb.<queue>.pop()` — pop front into a local. Always has a
-    /// destination (a bare `sb.q.pop()` discard is rejected at lowering,
-    /// matching v1, which would warn on the unused value).
+    /// destination; for a discarded `sb.q.pop()` that is an unread temp,
+    /// so the store is dead but the pop is not (see `Stmt::TbQueuePop`).
     QueuePop { queue: String, dest: LocalId },
     /// `sb.<scalar> = value` — write a scalar counter field.
     ScalarWrite { scalar: String, value: Expr },

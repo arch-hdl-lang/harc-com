@@ -2166,12 +2166,30 @@ case and only locally-determinable `Assign` types are compared).
       v1's `auto&` is a REFERENCE; the IR has no by-reference local, so
       the loop variable is a copy. That difference is observable only
       through a WRITE to the loop variable, which
-      `lower_counted_loop_with_prologue` now rejects — for
-      `for t in <tseq-result>` as well, where the copy has always been
-      the behavior and a dropped write was always possible. The check
-      runs on the lowered CFG rather than the AST: it scans every block
-      the body opened for an `Assign`/`RecordFieldWrite` targeting the
-      bound local, skipping the element bind itself.
+      `lower_counted_loop_with_prologue` rejects for THIS form: it is
+      new here, so rejecting costs no working program, and shipping a
+      silent divergence would be worse. `for t in <tseq-result>`
+      deliberately keeps its by-copy variable and no rejection — that
+      behavior predates the sweep and `for t in txns … t.addr = … end
+      for` is an idiom both backends accept today, so turning it into an
+      error would break working programs. Giving the tseq form real
+      write-back is its own change, and follow-up.
+
+      The check runs on the lowered CFG rather than the AST, and covers
+      every statement that names a local DESTINATION, not just `Assign`:
+      `lower_assign` routes `x = sb.q.pop()` into
+      `ScoreboardOp::QueuePop { dest }` and `x = xact.m(…)` into
+      `TransactorCall { dest }`, so an `Assign`-only check would pass
+      exactly those writes through.
+
+      Non-leaf element selectors (`t.entries[k].data`) are snapshotted
+      into temps BEFORE the loop, unconditionally — a bare local is
+      precisely what the body can reassign. v1's range-for evaluates the
+      container expression once, so a selector left inside the
+      per-iteration bind would walk a different row each time the body
+      advanced `k`, and a port read there reached the verifier as
+      `PortInDisallowedPosition` — an internal-bug channel printed to
+      the user as raw IR.
 
     - **A discarded `q.pop()` in statement position** — five sites
       (testbench, scoreboard, component, bare target-responder state,
@@ -2190,26 +2208,38 @@ case and only locally-determinable `Assign` types are compared).
     |---|---|
     | an unresolved name (`let x = nope`) | `int64_t x = nope;` |
     | assignment to an unknown name (`nope = 1`) | `nope = 1;` |
-    | uninitialized `let x` with no type | a COMMENT for the declaration, then `x = 1;` against a name never declared |
     | indexing a scalar record field, read or write | the subscript verbatim against a `uint64_t` member |
     | `for x in <scalar record field>` | `for (auto& x : rec.v)` over a `uint64_t` |
-    | whole-`Vec` WRITE with a non-matching RHS | `x.a = x.b;` between differently-shaped `std::array`s, or `= 5` |
     | whole-record write with a non-matching RHS | `o.p = q;` between two unrelated structs |
     | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines |
     | a `default` on a queue field (2 sites) | `HarcQueue<uint64_t> q = 0;` — no such constructor |
 
-    **One site, several outcomes.** The whole-`Vec` READ
-    (`src/ir/lower/exprs.rs`) was reclassified and then reverted, which
-    is worth recording: what v1 does with the read depends on where it
-    LANDS. `assert r.data == r.data` emits `r.data == r.data`, which
-    compiles and works (`std::array` has `operator==`); `let d = r.data`
-    emits `int64_t d = _tb.r.data;` and `${r.data}` emits
-    `harc_printf_ll(r.data)`, neither of which does. A single rejection
-    site covering landings with different v1 outcomes cannot carry a
-    single honest `V1Status`, so it keeps the `Unsupported` label — true
-    somewhere — and leads with the detail that works everywhere. The
-    classes describe what a backend does, so a site that is not one
-    thing must not claim to be.
+    **One site, several outcomes.** Three reclassifications were made
+    and then reverted, which is the most useful thing this sweep
+    produced. A rejection site can cover landings with DIFFERENT v1
+    outcomes, and then no single `V1Status` is honest:
+
+    - whole-`Vec` READ — `assert r.data == r.data` emits
+      `r.data == r.data`, which compiles and works (`std::array` has
+      `operator==`); `let d = r.data` emits `int64_t d = _tb.r.data;`
+      and `${r.data}` emits `harc_printf_ll(r.data)`, neither of which
+      does.
+    - whole-`Vec` WRITE with a non-matching RHS — "non-matching" is a
+      HARC judgement, and v1 collapses every scalar of 64 bits or fewer
+      to `uint64_t`. A length mismatch or a scalar RHS does fail there,
+      but `Vec<uint<8>, 4> = Vec<uint<32>, 4>` emits
+      `std::array<uint64_t, 4> = std::array<uint64_t, 4>` and compiles.
+    - uninitialized `let x` with no type — v1 emits only a COMMENT for
+      the declaration, so whether its output compiles depends on
+      whether the name is later USED. The rejection fires at the
+      declaration, before that is known.
+
+    All three keep the `Unsupported` label — true somewhere — and lead
+    with the detail that works everywhere. The classes describe what a
+    backend actually does, so a site that is not one thing must not
+    claim to be. Checking a construct in ONE landing and generalizing is
+    the mistake this method is supposed to prevent, and it took a review
+    pass to catch each time.
 
     Two sites were left alone rather than guessed at: the whole-`Vec`
     read and write of a transactor *state* record field. Both sit behind

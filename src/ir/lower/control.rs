@@ -215,7 +215,7 @@ impl FuncBuilder<'_> {
                 index: Box::new(Expr::Local(counter)),
             },
         );
-        self.lower_counted_loop_with_prologue(cond, step, bind, &f.body)?;
+        self.lower_counted_loop_with_prologue(cond, step, bind, None, &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -228,6 +228,14 @@ impl FuncBuilder<'_> {
     /// loop variable is a COPY of the element (the IR has no
     /// by-reference local); `lower_counted_loop_with_prologue` rejects a
     /// write to it rather than dropping one silently.
+    ///
+    /// Non-leaf element selectors (`t.entries[k].data`) are stashed in
+    /// temps BEFORE the loop. v1's range-for evaluates the container
+    /// expression once and iterates that, so a selector left inside the
+    /// per-iteration bind would (a) re-read `k` every iteration, walking
+    /// a different row each time if the body mutates it, and (b) leave a
+    /// port read in an `Assign` value, which the verifier rejects as an
+    /// internal error rather than a user diagnostic.
     fn lower_for_in_record_vec(
         &mut self,
         f: &ForStmt,
@@ -235,6 +243,21 @@ impl FuncBuilder<'_> {
         n: usize,
     ) -> Result<(), LowerError> {
         self.push_scope();
+        // Snapshot each selector into its own temp, UNCONDITIONALLY: a
+        // bare `Expr::Local` is what `stash_if_impure` would leave in
+        // place, and a local is exactly what the body can reassign
+        // (`for x in t.entries[k].data … k = k + 1`). Copying the value
+        // once is what pins the container for the whole loop.
+        let mid_indices = chain
+            .mid_indices
+            .into_iter()
+            .map(|(pos, idx)| {
+                let idx = self.hoist_ports(idx);
+                let t = self.fresh_temp();
+                self.push(Stmt::Assign(t, idx));
+                (pos, Expr::Local(t))
+            })
+            .collect::<Vec<_>>();
         let counter = self.fresh_temp();
         self.push(Stmt::Assign(
             counter,
@@ -270,11 +293,11 @@ impl FuncBuilder<'_> {
                 local: chain.local,
                 field: chain.field,
                 path: chain.path,
-                mid_indices: chain.mid_indices,
+                mid_indices,
                 index: Some(Box::new(Expr::Local(counter))),
             },
         );
-        self.lower_counted_loop_with_prologue(cond, step, bind, &f.body)?;
+        self.lower_counted_loop_with_prologue(cond, step, bind, Some(var), &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -320,20 +343,30 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, None, body)
+        self.lower_counted_loop_impl(header_cond, latch_step, None, None, body)
     }
 
     /// `lower_counted_loop` with a prologue statement injected at the top
     /// of the body block, before the user statements (used by `for t in
     /// <seq>` to copy `seq[i]` into the loop variable each iteration).
+    /// `no_write` names a local the body may not assign. It is set only
+    /// for the `Vec`-record-field loop: that form is new here, so
+    /// rejecting the write costs no working program, and shipping a
+    /// SILENT divergence from v1's `auto&` would be worse than
+    /// rejecting. `for t in <tseq-result>` deliberately passes `None` —
+    /// its by-copy loop variable predates this sweep and `for t in txns
+    /// … t.addr = … end for` is an established idiom both backends
+    /// accept today; turning it into an error is a regression, and
+    /// giving the tseq form real write-back is its own change.
     fn lower_counted_loop_with_prologue(
         &mut self,
         header_cond: Expr,
         latch_step: Stmt,
         prologue: Stmt,
+        no_write: Option<LocalId>,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), body)
+        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), no_write, body)
     }
 
     fn lower_counted_loop_impl(
@@ -341,6 +374,7 @@ impl FuncBuilder<'_> {
         header_cond: Expr,
         latch_step: Stmt,
         prologue: Option<Stmt>,
+        no_write: Option<LocalId>,
         body: &Block,
     ) -> Result<(), LowerError> {
         let header = self.new_block();
@@ -358,20 +392,11 @@ impl FuncBuilder<'_> {
         });
         self.start_block(body_b);
         self.push_scope();
-        // Every prologue this takes is an element bind
-        // (`Assign(loop_var, <element>)`), so the loop variable is a
-        // COPY. v1 binds `auto& x`, where a write in the body lands
-        // back in the container; the IR has no by-reference local, so
-        // the same write here would be silently dropped.
-        let bound = match &prologue {
-            Some(Stmt::Assign(l, _)) => Some(*l),
-            _ => None,
-        };
         if let Some(p) = prologue {
             self.push(p);
         }
         self.lower_block_stmts(body)?;
-        if let Some(bound) = bound {
+        if let Some(bound) = no_write {
             self.reject_loop_var_write(bound, body_b)?;
         }
         self.pop_scope();
@@ -394,11 +419,12 @@ impl FuncBuilder<'_> {
     /// body (the latch and exit blocks are still empty at this point,
     /// and any block the body opened was appended after them).
     ///
-    /// Only `Assign` and `RecordFieldWrite` are checked: `x = e` and
-    /// `x.f = e` are the two forms surface syntax can aim at a
-    /// loop-bound name. The other local-writing statements
-    /// (`DutRead`, a queue `pop` destination, `RecordInit`) address
-    /// temps lowering synthesizes for itself.
+    /// EVERY statement that names a local destination is checked, not
+    /// just `Assign`: `lower_assign` routes `x = sb.q.pop()`,
+    /// `x = xact.m(…)` and `x = comp.m(…)` into `ScoreboardOp::QueuePop`
+    /// / `TransactorCall` / `ComponentCall` with the loop variable as
+    /// their `dest`, so a check that only looked for `Assign` would let
+    /// exactly those writes through.
     fn reject_loop_var_write(&self, bound: LocalId, body_b: BlockId) -> Result<(), LowerError> {
         for (bi, block) in self.blocks.iter().enumerate().skip(body_b.0 as usize) {
             for (si, s) in block.stmts.iter().enumerate() {
@@ -406,8 +432,22 @@ impl FuncBuilder<'_> {
                     continue; // the element bind itself
                 }
                 let writes = match s {
-                    Stmt::Assign(l, _) => *l == bound,
-                    Stmt::RecordFieldWrite { local, .. } => *local == bound,
+                    Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                        *l == bound
+                    }
+                    Stmt::RecordFieldWrite { local, .. } | Stmt::RecordWriteCb { local, .. } => {
+                        *local == bound
+                    }
+                    Stmt::TbQueuePop { dest, .. }
+                    | Stmt::TransactorStateQueuePop { dest, .. }
+                    | Stmt::ComponentQueuePop { dest, .. } => *dest == bound,
+                    Stmt::TransactorCall { dest, .. }
+                    | Stmt::TransactorSelfCall { dest, .. }
+                    | Stmt::ComponentCall { dest, .. } => *dest == Some(bound),
+                    Stmt::ScoreboardOp {
+                        op: crate::ir::ScoreboardOp::QueuePop { dest, .. },
+                        ..
+                    } => *dest == bound,
                     _ => false,
                 };
                 if writes {
