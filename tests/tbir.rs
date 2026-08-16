@@ -14060,3 +14060,68 @@ fn a_const_coverpoint_slice_bound_folds() {
     let k7 = emit_cpp_src(&with_const(7));
     assert_ne!(k3, k7, "a different const must produce a different mask");
 }
+
+/// A non-literal regblock offset or reset value is not a v1 escape
+/// hatch — v1 folds both to ZERO, exactly as it does an addrmap base
+/// (divergence 39).
+///
+/// The offset case is the worse of the two: the address TABLE entry
+/// becomes `{ "SRC", 0, 32 }` and the decode becomes `addr == 0`, so the
+/// register aliases whatever lives at offset 0 and its reads and writes
+/// silently hit a different register.
+///
+/// Probed by mutating `regblock_subset_test` — registered, and passing
+/// under both backends — one token at a time, so the control is
+/// known-good rather than synthetic.
+#[test]
+fn a_non_literal_regblock_offset_or_reset_does_not_point_at_v1() {
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/regblock_subset_test.harc"),
+    )
+    .expect("read the registered fixture");
+
+    // Control: the unmutated fixture lowers, so the probe reaches the
+    // regblock arms rather than tripping an earlier gate.
+    emit_cpp_src(&fixture);
+
+    let offset = |pre: &str, off: &str| {
+        format!("{pre}{}", fixture.replace(
+            "register SRC     @ 0x18 access rw",
+            &format!("register SRC     @ {off} access rw"),
+        ))
+    };
+    for (pre, off) in [("const K = 0x18\n\n", "K"), ("", "0x10 + 0x08")] {
+        let err = lower_src(&offset(pre, off)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("non-literal `@ <addr>` offset"), "`{off}`: {msg}");
+        assert!(msg.contains("aliases offset 0"), "{msg}");
+    }
+
+    let err = lower_src(&format!(
+        "const R = 7\n\n{}",
+        fixture.replace(
+            "register CTRL    @ 0x00 reset 7 access rw",
+            "register CTRL    @ 0x00 reset R access rw",
+        )
+    ))
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("non-literal reset value"), "{msg}");
+
+    // v1's evidence, with both anchors. The const offset emits the
+    // table entry a LITERAL ZERO offset would…
+    let v1 = |src: &str| cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    let folded = v1(&offset("const K = 0x18\n\n", "K"));
+    assert!(
+        folded.contains(r#"{ "SRC", 0, 32 }"#),
+        "v1 folds the const offset to 0:\n{folded}"
+    );
+    // …and NOT the one it was written as, which is what makes the fold
+    // a silent bug rather than a spelling difference.
+    let literal = v1(&fixture);
+    assert!(
+        literal.contains(r#"{ "SRC", 0x18, 32 }"#),
+        "the literal offset survives, so the value genuinely matters:\n{literal}"
+    );
+}

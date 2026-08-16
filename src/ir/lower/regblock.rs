@@ -133,11 +133,19 @@ pub(crate) fn lower_regblock(
                 })?),
                 ExprKind::Bool(b) => Some(*b as u64),
                 _ => {
-                    return Err(unsupported(
+                    // v1 folds a non-literal reset to ZERO: `reset R`
+                    // with `const R = 7` emits `uint32_t CTRL = 0;`, so
+                    // the mirror starts at the wrong value and every
+                    // readback compares against it. Verified by
+                    // mutating `regblock_subset_test` (registered,
+                    // passing under both backends) one token at a time.
+                    return Err(not_implemented(
                         &format!(
                             "a non-literal reset value on regblock `{name}` register `{rname}`"
                         ),
-                        "",
+                        "v1 folds it to 0, so the register mirror silently resets to the \
+                         wrong value",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
             },
@@ -219,9 +227,16 @@ fn fold_offset(block: &str, reg: &str, e: &crate::ast::Expr) -> Result<u64, Lowe
                 "not a plain integer literal",
             )
         }),
-        _ => Err(unsupported(
+        // Same fold-to-zero as the reset value above, and worse: the
+        // address TABLE entry becomes `{ "SRC", 0, 32 }` and the decode
+        // becomes `addr == 0`, so the register aliases whatever lives
+        // at offset 0. Reads and writes silently hit the wrong
+        // register.
+        _ => Err(not_implemented(
             &format!("a non-literal `@ <addr>` offset on regblock `{block}` register `{reg}`"),
-            "",
+            "v1 folds it to 0, so the register aliases offset 0 and the address decode \
+             sends its reads and writes to the wrong register",
+            V1Status::SilentlyMisLowers,
         )),
     }
 }
