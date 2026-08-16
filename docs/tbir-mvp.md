@@ -2005,6 +2005,53 @@ case and only locally-determinable `Assign` types are compared).
     trigger left `V<Top>___024root.h` out of the preamble while the
     trigger still emitted `dut->rootp->…`.
 
+31. **`for t in <tseq-call>` and timed waits in method bodies
+    (2026-08-16).** Two more constructs v1 implements and TB-IR refused,
+    both found by the batch probe sweep described below.
+
+    - **`for t in S()`** — the generator call written inline rather than
+      bound to a `let` first. The bound form (`let xs = S(); for t in xs`)
+      already lowered; only the inline spelling was missing. v1's
+      `for (auto& t : S())` binds the returned vector to a temporary that
+      lives for the whole loop, so the generator runs ONCE; TB-IR
+      materializes it into a synthesized local, which has the same shape
+      and the same single evaluation, then reuses the existing
+      `SeqLen`/`SeqIndex` iteration.
+    - **`wait until … timeout` inside a transactor method.** A method body
+      has no scheduler to defer to, so the timed wait takes v1's
+      SYNCHRONOUS shape (spec §7.4's "synchronous context"): budget read
+      once, predicate polled with `tick()` per cycle, bounded by elapsed
+      cycles — not the coroutine `wait_until_timeout` awaiter the run body
+      uses. The error bump rides the timeout edge exactly as on the
+      coroutine path. Only the emitter was missing; the
+      `Terminator::WaitUntilTimeout` the lowering already produced needed
+      a sync arm alongside the existing sync `WaitCycles`/`WaitUntil`
+      ones. `wait N cycles on <clock>` in a method remains out of subset.
+
+    Six more diagnostics reclassified in the same pass, each checked by
+    emitting the construct with `--codegen v1` and reading the generated
+    C++:
+
+    | Construct | v1 |
+    |---|---|
+    | `return <expr>` in a run/check body | emits `return <expr>;` inside a coroutine — only `co_return` is legal, so it does not compile |
+    | a bare DUT reference (`let x = dut`) | emits the DUT pointer into an integer slot (`int64_t x = dut;`) |
+    | `.field` shorthand | emits the shorthand verbatim (`int64_t x = .a;`) |
+    | `as` casts outside scalar uint/sint/bits | drops the cast and emits the operand alone |
+    | bit-slice bounds above 2^32 | casts the bound to `uint32_t` with no range check — silently slices the wrong bits |
+    | `yield` outside a `tseq` body, `randomize` of a non-identifier | raises its own error |
+
+### The probe method
+
+Every classification above came from the same mechanical check rather
+than from reading v1's source: emit the construct under both backends
+with `harc sim --emit-only`, and when v1 emits, READ the generated C++.
+"v1 emits" is not the same as "v1 works" — of the ten constructs the
+first sweep flagged as gaps, five turned out to be v1 emitting code that
+does not compile or silently means something else. Only the ones where
+v1's output is genuinely usable are worth mirroring; the rest want an
+honest `NotImplemented` diagnostic instead.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

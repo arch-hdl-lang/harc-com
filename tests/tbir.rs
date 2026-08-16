@@ -7121,21 +7121,60 @@ fn transactor_dut_bind_is_validated() {
     assert!(msg.contains("something other than the test DUT"), "{msg}");
 }
 
-/// Methods keep v1's synchronous hookable semantics, so the suspension
-/// forms whose sync emission is out of this slice are rejected at
-/// lowering with method-specific messages.
+/// A timed `wait until` inside a transactor method lowers to v1's
+/// SYNCHRONOUS shape (spec §7.4's "synchronous context"): a method body
+/// has no scheduler to defer to, so the budget is read once and the
+/// predicate polled with `tick()` per cycle — not the coroutine
+/// `wait_until_timeout` awaiter the run body uses.
 #[test]
-fn transactor_method_sync_only_waits() {
+fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
     let timed = XACTOR_SRC.replace(
         "wait 1 cycle\n            dut.en = 0",
         "wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
     );
-    let msg = assert_unsupported(&lower_src(&timed).unwrap_err());
+    let prog = lower_src(&timed).expect("a timed wait in a method lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let method = prog
+        .functions
+        .iter()
+        .find(|f| f.name == "Xt_pulse")
+        .expect("the method body");
     assert!(
-        msg.contains("`wait until ... timeout` inside a transactor method"),
-        "{msg}"
+        method
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, ir::Terminator::WaitUntilTimeout { .. })),
+        "the method body must carry the timeout terminator"
     );
 
+    let cpp = emit_cpp_src(&timed);
+    for needle in [
+        "int64_t _wu_budget = (int64_t)(",
+        "int64_t _wu_start = (int64_t)cycle_count;",
+        ") < _wu_budget) tick();",
+        "ctx.errors++;",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+    // The coroutine awaiter must NOT appear in the method body — a
+    // method lambda cannot `co_await`.
+    let body_start = cpp.find("Xt_pulse = [&]").expect("the method lambda");
+    let body_end = body_start
+        + cpp[body_start..]
+            .find("\n    };")
+            .expect("the method lambda closes");
+    let body = &cpp[body_start..body_end];
+    assert!(body.contains("_wu_budget"), "wrong slice: {body}");
+    assert!(
+        !body.contains("co_await"),
+        "a synchronous method body must not co_await:\n{body}"
+    );
+}
+
+/// The remaining suspension form whose sync emission is out of subset is
+/// rejected at lowering with a method-specific message.
+#[test]
+fn transactor_method_sync_only_waits() {
     let clocked = XACTOR_SRC.replace(
         "wait 1 cycle\n            dut.en = 0",
         "wait 1 cycle on clk\n            dut.en = 0",
@@ -11483,5 +11522,192 @@ end impl T"#,
     assert!(
         cpp.contains("rootp"),
         "the trigger must read through the probe accessor"
+    );
+}
+
+/// `for t in S()` — the generator call written inline, rather than bound
+/// to a `let` first. v1's `for (auto& t : S())` binds the returned vector
+/// to a temporary that lives for the whole loop, so the generator runs
+/// ONCE; TB-IR materializes it into a synthesized local, which has the
+/// same shape and the same single evaluation.
+#[test]
+fn for_over_an_inline_tseq_call_lowers() {
+    let src = r#"transaction Txn
+    a : uint<8>
+end transaction Txn
+
+tseq S -> TSeq<Txn>
+    let t : Txn
+    yield t
+end tseq S
+
+test T
+    let dut : Top
+    run
+        for t in S()
+            dut.a = t.a
+            wait 1 cycle
+        end for
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("an inline tseq call lowers as the loop's iterable");
+    verify::verify_program(&prog).expect("verifies");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("tseq:S()"),
+        "the call must be lowered: {dump}"
+    );
+    assert!(
+        dump.contains("SeqLen(") && dump.contains("SeqIndex("),
+        "iteration must go through the seq accessors: {dump}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    // The generator is called exactly once, into the materialized local —
+    // calling it in the loop header would re-run it every iteration.
+    assert_eq!(
+        cpp.matches("= S();").count(),
+        1,
+        "the generator must run once; got:\n{cpp}"
+    );
+    assert!(cpp.contains(".size()"), "{cpp}");
+
+    // Binding it to a `let` first is the same program.
+    let bound = src.replace(
+        "        for t in S()",
+        "        let xs = S()\n        for t in xs",
+    );
+    let bound_prog = lower_src(&bound).expect("the bound form still lowers");
+    assert_eq!(
+        bound_prog.functions.len(),
+        prog.functions.len(),
+        "both forms produce the same function set"
+    );
+}
+
+/// Constructs no backend implements, found by probing v1 directly. Each
+/// v1 outcome below was checked by emitting the construct with
+/// `--codegen v1` and reading the generated C++.
+#[test]
+fn more_constructs_no_backend_implements() {
+    // v1 emits `return <expr>;` inside the run COROUTINE, which only
+    // accepts `co_return` — the TB does not compile.
+    let ret = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        return 1
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&ret, lower::V1Status::EmitsUncompilable);
+
+    // v1 emits the DUT POINTER into an integer slot: `int64_t x = dut;`.
+    let bare = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = dut
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&bare, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("bare DUT reference"), "{msg}");
+
+    // v1 casts the bound to `uint32_t` with no range check, so a bound
+    // past 2^32 silently wraps and slices the wrong bits.
+    let slice = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = dut.a[5000000000:0]
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&slice, lower::V1Status::SilentlyMisLowers);
+
+    // v1 has no emission for a non-scalar cast: it drops the cast and
+    // emits the operand alone.
+    let cast = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = dut.a as Top
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&cast, lower::V1Status::SilentlyMisLowers);
+
+    // v1 raises its own "not supported in v0 cpp_tb" for a stray yield.
+    let y = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        yield 1
+    end run
+end test T"#,
+    )
+    .unwrap_err();
+    assert_not_implemented(&y, lower::V1Status::Rejects);
+}
+
+/// Review-gate regressions for the sync timed-wait emission.
+///
+/// The poll loop introduces `_wu_start` alongside `_wu_budget`; without
+/// reserving it, a user local of that name in a method body shadows the
+/// cycle-count snapshot and the elapsed-cycle bound compares the wrong
+/// value. And a component method / `on` handler is the OTHER synchronous
+/// body emitter — lowering no longer gates the terminator out of method
+/// bodies, so both emitters must render it or the second falls into an
+/// internal "lowering gate failed" error.
+#[test]
+fn sync_timed_wait_reserves_its_state_and_covers_both_body_emitters() {
+    let shadowing = XACTOR_SRC.replace(
+        "wait 1 cycle\n            dut.en = 0",
+        "let _wu_start = 7\n            wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
+    );
+    let cpp = emit_cpp_src(&shadowing);
+    assert!(
+        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;"),
+        "the snapshot must keep its own name; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("uint64_t _wu_start = 0;"),
+        "a user local must be renamed away from the reserved snapshot:\n{cpp}"
+    );
+
+    // A component method body — the second synchronous emitter.
+    let cpp = emit_cpp_src(
+        r#"scoreboard Sb
+    hits : uint<32> default 0
+    function watch()
+        wait until hits == 1 timeout 5 cycles
+        hits = hits + 1
+    end function watch
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        sb.watch()
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(
+        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;")
+            && cpp.contains(") < _wu_budget) tick();"),
+        "a component method must render the same sync poll loop; got:\n{cpp}"
     );
 }

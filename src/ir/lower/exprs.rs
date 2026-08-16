@@ -137,9 +137,12 @@ impl FuncBuilder<'_> {
                     };
                 }
                 if self.is_dut_name(&id.name) {
-                    return Err(unsupported(
+                    // v1 emits the DUT POINTER into an integer slot
+                    // (`int64_t x = dut;`), which does not compile.
+                    return Err(not_implemented(
                         "a bare DUT reference",
                         "DUT access must name a port (`dut.<port>`)",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 // File-scope `const` / enum-variant substitution
@@ -577,9 +580,13 @@ impl FuncBuilder<'_> {
                         inner: Box::new(inner),
                     });
                 }
-                Err(unsupported(
+                // v1 has no emission for a non-scalar cast: it drops
+                // the cast and emits the operand alone, so the value is
+                // silently the un-cast one.
+                Err(not_implemented(
                     "`as` casts outside scalar uint/sint/bits (≤ 64 bits)",
                     "",
+                    V1Status::SilentlyMisLowers,
                 ))
             }
             ExprKind::Index { target, index } => {
@@ -612,7 +619,14 @@ impl FuncBuilder<'_> {
                             let target = Box::new(self.lower_expr(target)?);
                             Ok(Expr::BitSlice { target, hi, lo })
                         }
-                        _ => Err(unsupported("bit-slice bounds above 2^32", "")),
+                        // v1 casts the bound to `uint32_t` with no
+                        // range check, so a bound past 2^32 silently
+                        // wraps and slices the wrong bits.
+                        _ => Err(not_implemented(
+                            "bit-slice bounds above 2^32",
+                            "",
+                            V1Status::SilentlyMisLowers,
+                        )),
                     },
                     _ => Err(unsupported(
                         "bit-slice expressions with non-constant or hi<lo bounds",
@@ -738,7 +752,13 @@ impl FuncBuilder<'_> {
                 "membership is a constraint form — it lowers inside `randomize ... with`",
                 V1Status::Rejects,
             )),
-            ExprKind::ImplicitSelf => Err(unsupported("`.field` shorthand", "")),
+            // v1 emits the shorthand verbatim (`int64_t x = .a;`),
+            // which is not valid C++.
+            ExprKind::ImplicitSelf => Err(not_implemented(
+                "`.field` shorthand",
+                "name the receiver explicitly",
+                V1Status::EmitsUncompilable,
+            )),
             ExprKind::Send { .. } => Err(not_implemented(
                 "a `<-` send in value position",
                 "`<-` is a statement form (`target <- value`)",
