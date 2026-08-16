@@ -1698,12 +1698,14 @@ where
     // The source path is `<subcomp>.<event>` (final segment is the event
     // port on the source sub-component).
     if from.len() < 2 {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!(
                 "a `connect` source `{}` without an event field",
                 from.join(".")
             ),
-            "",
+            "v1 emits `<path>.push_back(…)` against the component struct itself, \
+             which has no `push_back`",
+            V1Status::EmitsUncompilable,
         ));
     }
     let (src_path, src_event) = from.split_at(from.len() - 1);
@@ -1711,9 +1713,11 @@ where
     // The sink path is `<subcomp>.<method>` (final segment is the
     // hookable method on the sink sub-component).
     if to.len() < 2 {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!("a `connect` sink `{}` without a method", to.join(".")),
-            "",
+            "v1 emits the sink path into a range-for (`for (auto& _s : <path>) _s(_t);`), \
+             and a component struct is not a range",
+            V1Status::EmitsUncompilable,
         ));
     }
     let (sink_path, sink_name) = to.split_at(to.len() - 1);
@@ -1728,12 +1732,13 @@ where
             ..
         }) => *payload,
         _ => {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` source `{}.{src_event}` that is not an `out event` port",
                     src_path.join(".")
                 ),
-                "",
+                "v1 emits `<path>.push_back(…)` against a scalar member",
+                V1Status::EmitsUncompilable,
             ));
         }
     };
@@ -1753,22 +1758,28 @@ where
                 "analysis sinks must be declared `hookable`",
             ));
         }
+        // v1 rejects both arity and a non-void return itself
+        // ("connect: hookable sink `<x>` must take exactly one payload
+        // argument" / "must return void"), so `--codegen v1` is not an
+        // escape hatch for either.
         if sm.n_params != 1 {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` sink method `{sink_name}` with {} parameters",
                     sm.n_params
                 ),
                 "analysis sinks take exactly one payload parameter",
+                V1Status::Rejects,
             ));
         }
         if sm.has_ret {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` sink method `{}.{sink_name}` that returns a value",
                     sink_path.join(".")
                 ),
                 "analysis sinks must not return a value",
+                V1Status::Rejects,
             ));
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
@@ -1827,9 +1838,11 @@ fn resolve_testbench_path(
         return Err(unsupported("an empty testbench `connect` component path", ""));
     };
     let cid = roots.get(root).copied().ok_or_else(|| {
-        unsupported(
+        not_implemented(
             &format!("a testbench `connect` root `{root}` that is not a component field"),
-            "connect endpoints must be rooted at a testbench-owned component field",
+            "connect endpoints must be rooted at a testbench-owned component field \
+             (v1 emits the path verbatim, naming a member that does not exist)",
+            V1Status::EmitsUncompilable,
         )
     })?;
     if tail.is_empty() {
@@ -1864,9 +1877,10 @@ fn resolve_sub_path(
     let mut cid = None;
     for seg in path {
         let f = cur.field(seg).ok_or_else(|| {
-            unsupported(
+            not_implemented(
                 &format!("a `connect` path segment `{seg}` that is not a sub-component field"),
-                "",
+                "v1 emits the path verbatim, naming a member that does not exist",
+                V1Status::EmitsUncompilable,
             )
         })?;
         match &f.kind {
@@ -1875,9 +1889,11 @@ fn resolve_sub_path(
                 cur = &components[component.index()];
             }
             _ => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a `connect` path segment `{seg}` that is not a sub-component"),
-                    "",
+                    "v1 emits the path verbatim, resolving a member that is not a \
+                     component",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         }

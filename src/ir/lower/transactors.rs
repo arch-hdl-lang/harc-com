@@ -134,12 +134,10 @@ pub(crate) fn lower_transactor(
                 if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if record_ctx.record_ids.contains_key(simple) {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor `{tname}` field `{fname}` of transaction type `{simple}`"
-                            ),
-                            "",
-                        ));
+                        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+                        state_names.insert(fname.clone(), sf.kind.clone());
+                        state_fields.push(sf);
+                        continue;
                     }
                     if f.default.is_some() {
                         return Err(unsupported(

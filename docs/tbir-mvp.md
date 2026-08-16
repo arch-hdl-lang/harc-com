@@ -2303,6 +2303,50 @@ case and only locally-determinable `Assign` types are compared).
     through different machinery, so this is a design step, not a missing
     arm. It keeps its `--codegen v1` suggestion, which is honest.
 
+36. **Sixth probe sweep: `connect` endpoints and record-typed
+    transactor fields (2026-08-16).** Twelve `connect` endpoint shapes
+    plus the transaction-typed transactor field divergence 35 left open.
+    One gap closed, seven diagnostics reclassified.
+
+    - **A record-typed field on an UNBOUND `transactor`** (`cur : Beat`).
+      v1 emits a real struct member, writes it from the method body as
+      `self.cur.tag = …`, and reads it back from the test — a working
+      feature TB-IR refused outright. The unbound path now routes record
+      fields through the same `lower_state_field` the bound-to path
+      already used, which produces `StateFieldKind::Record`.
+
+      Reaching it exposed a latent emitter bug worth recording, because
+      it is what makes "close the gap" different from "delete the
+      rejection": `Stmt::TransactorStateRecordFieldWrite` interpolated
+      its `instance` RAW, while the read side and the scalar write both
+      went through `resolve_state_instance`. A transactor's own method
+      body carries an EMPTY instance for a self-reference, so the first
+      emission was `.cur.tag = 5;` — a leading-dot member access, not
+      C++. The rejection had been hiding a broken path, and lifting it
+      without compiling the result would have shipped exactly the
+      silent-mis-lowering this sweep exists to remove.
+      `transactor_record_field_test` is the equivalence fixture.
+
+    - **`connect` ENDPOINT shapes** — a sink with no method, a source
+      with no event field, a source that is not an `out event`, and a
+      path segment naming something that is not a sub-component. v1 does
+      not validate the path at all: it emits it verbatim into a
+      `push_back` or a range-for, so each of these names a member that
+      does not exist, calls `push_back` on a struct that has none, or
+      iterates a struct. Six sites, all `NotImplemented` /
+      emits-uncompilable.
+
+    - **`connect` sink SIGNATURE checks** (wrong arity, non-void return)
+      are the opposite class: v1 performs them itself and raises its own
+      error ("connect: hookable sink `<x>` must take exactly one payload
+      argument"). `V1Status::Rejects`.
+
+    The two `connect` families sitting side by side in one function are
+    the clearest illustration of why the classes are worth the trouble:
+    the same `connect` block yields a v1 that rejects, a v1 that emits
+    garbage, and a v1 that works, depending only on which part of the
+    edge is wrong.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

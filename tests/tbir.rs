@@ -13131,3 +13131,189 @@ end impl T"#,
     assert!(cpp.contains("n = 8;"), "{cpp}");
 }
 
+
+// ---------------------------------------------------------------------
+// Batch 6: record-typed fields on an unbound transactor, and the
+// `connect` endpoint diagnostics.
+// ---------------------------------------------------------------------
+
+/// A record-typed field on an UNBOUND `transactor` routes through the
+/// same `lower_state_field` the bound-to path already used. v1 emits a
+/// real struct member and it works, so this was a real gap.
+///
+/// Reaching it exposed a latent emitter bug:
+/// `Stmt::TransactorStateRecordFieldWrite` interpolated its `instance`
+/// raw, and a transactor's own method body carries an EMPTY instance for
+/// a self-reference — so the write emitted `.cur.tag = 5;`, with a
+/// leading dot, which is not C++.
+#[test]
+fn a_record_field_on_an_unbound_transactor_lowers() {
+    let cpp = emit_cpp_src(
+        r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Xt
+    dut : Top
+    cur : Beat
+
+    when active
+        hookable go()
+            cur.tag = 5
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+        assert xt.cur.tag == 5 else fail("tag")
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("Beat cur{};"), "the member is declared:\n{cpp}");
+    assert!(
+        cpp.contains("self_state.cur.tag = 5;"),
+        "the self-write resolves its receiver — a raw empty instance emitted \
+         `.cur.tag = 5;`:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains(" .cur."),
+        "no leading-dot member access survives:\n{cpp}"
+    );
+    assert!(cpp.contains("xt.cur.tag == 5"), "the test reads it back:\n{cpp}");
+}
+
+/// A malformed `connect` endpoint is not a v1 escape hatch. v1 does not
+/// validate the path at all — it emits it verbatim into a `push_back` or
+/// a range-for, so every one of these names a member that does not
+/// exist, calls `push_back` on something that has none, or iterates a
+/// struct.
+#[test]
+fn a_malformed_connect_endpoint_does_not_point_at_v1() {
+    let src = |edge: &str| {
+        format!(
+            r#"transactor Src
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+    hookable take(v: uint<8>)
+        seen = seen + 1
+    end take
+end scoreboard Sink
+
+env E
+    src  : Src passive
+    sink : Sink
+
+    connect
+        {edge}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The control: the well-formed edge lowers.
+    emit_cpp_src(&src("src.observed -> sink.take"));
+
+    for (edge, want) in [
+        ("src.observed -> sink", "sink `sink` without a method"),
+        ("src -> sink.take", "source `src` without an event field"),
+        (
+            "src.n -> sink.take",
+            "source `src.n` that is not an `out event` port",
+        ),
+        (
+            "nosuch.observed -> sink.take",
+            "path segment `nosuch` that is not a sub-component",
+        ),
+        (
+            "src.observed -> nosuch.take",
+            "path segment `nosuch` that is not a sub-component",
+        ),
+    ] {
+        let err = lower_src(&src(edge)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains(want), "`{edge}`: {msg}");
+    }
+}
+
+/// The sink SIGNATURE checks are a different class again: v1 performs
+/// them itself and raises its own error, so `--codegen v1` rejects the
+/// program rather than mis-lowering it.
+#[test]
+fn a_bad_connect_sink_signature_is_rejected_by_both_backends() {
+    let src = |sink: &str, method: &str| {
+        format!(
+            r#"transactor Src
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+{method}
+end scoreboard Sink
+
+env E
+    src  : Src passive
+    sink : Sink
+
+    connect
+        src.observed -> sink.{sink}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    let err = lower_src(&src(
+        "two",
+        "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
+    ))
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("with 2 parameters"), "{msg}");
+
+    let err = lower_src(&src(
+        "ret",
+        "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
+    ))
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("that returns a value"), "{msg}");
+}

@@ -1,0 +1,83 @@
+// A record-typed field on an UNBOUND `transactor` (`cur : Beat`).
+//
+// v1 emits a real `Beat cur;` member on the transactor struct, writes it
+// from the method body as `self.cur.tag = …`, and reads it back from the
+// test as `_tb.xt.cur.tag` — a working feature. tbir rejected the field
+// outright ("field `cur` of transaction type `Beat`"), so a transactor
+// holding a current transaction needed `--codegen v1`.
+//
+// The unbound path now routes record fields through the same
+// `lower_state_field` the bound-to path already used, which produces
+// `StateFieldKind::Record`. Reaching it exposed a latent emitter bug:
+// `Stmt::TransactorStateRecordFieldWrite` interpolated its `instance`
+// raw, and a transactor's own method body carries an EMPTY instance for
+// a self-reference — so the write emitted `.cur.tag = 5;`, with a
+// leading dot. It goes through the same receiver resolver the read side
+// and the scalar write already used.
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the
+// background while the test exercises host-side transactor state.
+// Reused only because it's already in the Verilator regression.
+
+struct Beat
+    tag  : uint<8>  default 0
+    data : uint<32> default 0
+end struct Beat
+
+transactor RecFieldXactor
+    dut  : Top
+    cur  : Beat
+    runs : uint<32> default 0
+
+    when active
+        // Writes every field of the record from inside the method body
+        // (the empty-instance self-reference path).
+        hookable stamp(t: uint<8>, d: uint<32>)
+            cur.tag = t
+            cur.data = d
+            runs = runs + 1
+            wait 1 cycle
+        end stamp
+
+        // Reads the record back inside the SAME body, so the write is
+        // observed through the method's own receiver rather than only
+        // from the test.
+        hookable double_data()
+            cur.data = cur.data + cur.data
+            wait 1 cycle
+        end double_data
+    end when
+end transactor RecFieldXactor
+
+testbench TransactorRecordFieldTb
+    dut : Top
+    xt  : RecFieldXactor active
+end testbench TransactorRecordFieldTb
+
+impl TransactorRecordFieldTest for TransactorRecordFieldTb
+    run
+        xt.dut = dut
+
+        // The record default-constructs before any write.
+        assert xt.cur.tag == 0 else fail("initial tag: ${xt.cur.tag}")
+        assert xt.cur.data == 0 else fail("initial data: ${xt.cur.data}")
+
+        xt.stamp(0x5A, 0x11112222)
+        assert xt.cur.tag == 0x5A else fail("tag after stamp: 0x${xt.cur.tag:02x}")
+        assert xt.cur.data == 0x11112222 else fail("data after stamp: 0x${xt.cur.data:08x}")
+        assert xt.runs == 1 else fail("runs after stamp: ${xt.runs}")
+
+        // A method that reads its own record state back.
+        xt.double_data()
+        assert xt.cur.data == 0x22224444 else fail("data after double: 0x${xt.cur.data:08x}")
+        assert xt.cur.tag == 0x5A else fail("tag clobbered by double: 0x${xt.cur.tag:02x}")
+
+        // State persists across calls.
+        xt.stamp(0x7E, 1)
+        assert xt.cur.tag == 0x7E else fail("tag after restamp: 0x${xt.cur.tag:02x}")
+        assert xt.cur.data == 1 else fail("data after restamp: ${xt.cur.data}")
+        assert xt.runs == 2 else fail("runs after restamp: ${xt.runs}")
+
+        log(info, "PASS: record-typed transactor field under v1 and tbir")
+    end run
+end impl TransactorRecordFieldTest
