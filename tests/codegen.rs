@@ -8842,3 +8842,65 @@ end test T"#;
         "TB-IR accepts it, so v1 must too"
     );
 }
+
+// ── #552: wrapping operators inside `keep` constraints ───────────────
+
+/// The solver variable is a 64-bit bitvector with the field's declared
+/// width carried as a separate range assumption, so a `+%` does NOT wrap
+/// on its own — the §2.4 mask has to be applied when the constraint is
+/// lowered. Both backends previously dropped it, turning
+/// `keep len +% 10 == 5` on a `uint<8>` field into `len + 10 == 5` with
+/// `len < 256`, which is unsatisfiable though `len = 251` solves it.
+#[test]
+fn wrapping_operators_are_masked_inside_keep_constraints() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% 10 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("& _ctx.bv_val((uint64_t)0xFF, 64))"),
+        "the wrap must be masked to the field's 8 bits; got:\n{cpp}"
+    );
+    // C++ binds `&` looser than `==`, so the masked value needs its own
+    // parens or `(a + b) & mask == 5` parses as `(a + b) & (mask == 5)`.
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)10, 64)) & _ctx.bv_val((uint64_t)0xFF, 64)) =="
+        ),
+        "the masked value must be parenthesised against `==`; got:\n{cpp}"
+    );
+}
+
+/// A wrap operand with no statically known width has no defined mask, and
+/// is rejected rather than silently solved unmasked — matching what both
+/// emitters already do for a wrap in statement position.
+#[test]
+fn unknown_width_wrap_operand_in_a_constraint_is_rejected() {
+    let err = v1_emit_err(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% unknown_thing == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("statically known bit-width") || err.contains("unknown_thing"),
+        "expected a diagnostic naming the unknown operand; got: {err}"
+    );
+}

@@ -1,0 +1,46 @@
+// Wrapping arithmetic inside a `keep` constraint (spec §2.4, harc#552).
+//
+// The solver variable is a 64-bit bitvector with the field's declared
+// width carried as a SEPARATE range assumption, so a wrap does not fall
+// out of the bitvector semantics — the §2.4 mask has to be applied
+// explicitly when the constraint is lowered.
+//
+// Both backends previously dropped it, lowering `len +% 10 == 5` to
+// `len + 10 == 5` at 64-bit rank. With `len < 256` that is UNSATISFIABLE,
+// so randomization failed on a constraint that has exactly one solution:
+// len = 251, because 251 + 10 = 261, and 261 masked to 8 bits is 5.
+//
+// This fixture is registered in run_fixtures.sh, so the solver actually
+// runs and the asserted value is checked at runtime — the only way to
+// verify this, since the defect is in what the solver is asked, not in
+// what it answers.
+
+transaction WrapKeep
+    len : uint<8> default 0
+    keep len +% 10 == 5
+end transaction WrapKeep
+
+transaction WrapKeepMul
+    factor : uint<8> default 0
+    keep factor *% 3 == 1
+end transaction WrapKeepMul
+
+test WrappingKeepConstraintTest
+    let dut : Top
+    run
+        // Only 251 satisfies `(len + 10) mod 256 == 5` within uint<8>.
+        let t : WrapKeep
+        randomize(t)
+        assert t.len == 251
+            else fail("wrapping keep: expected len=251, got ${t.len}")
+
+        // 3 * 171 = 513, and 513 mod 256 = 1. 171 is the only uint<8>
+        // solution (the next would be 427, outside the range).
+        let m : WrapKeepMul
+        randomize(m)
+        assert m.factor == 171
+            else fail("wrapping keep (*%): expected factor=171, got ${m.factor}")
+
+        log(info, "PASS: wrapping operators are masked inside keep constraints")
+    end run
+end test WrappingKeepConstraintTest
