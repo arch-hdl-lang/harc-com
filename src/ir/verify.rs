@@ -935,6 +935,42 @@ impl Checker<'_> {
                         });
                     }
                 }
+                // The handler body is its own function (verified in its
+                // own right); here only the link is checked — the id
+                // resolves and points at a zero-parameter `TestHook`,
+                // which is what the registration closure can call.
+                Stmt::CycleHandler(h) => {
+                    match self.prog.cycle_handlers.get(h.index()) {
+                        None => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!("references missing cycle handler h{}", h.0),
+                        }),
+                        Some(schema) => match self.prog.functions.get(schema.function.index()) {
+                            Some(f)
+                                if f.kind == FunctionKind::TestHook && f.params.is_empty() => {}
+                            Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "cycle handler h{} body fn{} is {:?} with {} param(s),                                      not a zero-parameter TestHook",
+                                    h.0,
+                                    f.id.0,
+                                    f.kind,
+                                    f.params.len()
+                                ),
+                            }),
+                            None => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "cycle handler h{} references missing fn{}",
+                                    h.0, schema.function.0
+                                ),
+                            }),
+                        },
+                    }
+                }
                 Stmt::TransactorCall { dest, call } => {
                     if let Some(d) = dest {
                         self.check_local(*d);
@@ -1968,7 +2004,7 @@ fn check_def_before_use(
                 Stmt::CovReport(_) => {}
                 // Concurrent-check bodies reference DUT ports and host
                 // state, never function locals — nothing to def-check.
-                Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) => {}
+                Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {}
                 Stmt::ProbeRelease(_) => {}
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {

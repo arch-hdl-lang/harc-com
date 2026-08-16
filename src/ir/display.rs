@@ -654,6 +654,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         }
         Stmt::PropertyCheck(p) => format!("PropertyCheck(p{})", p.0),
         Stmt::CoverCheck(c) => format!("CoverCheck(c{})", c.0),
+        Stmt::CycleHandler(h) => format!("CycleHandler(h{})", h.0),
         Stmt::TransactorCall { dest, call } => match dest {
             Some(d) => format!(
                 "TransactorCall({} = {})",

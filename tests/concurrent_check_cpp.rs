@@ -42,6 +42,26 @@ impl ChkTest for ChkTb
 end impl ChkTest
 "#;
 
+/// Statement-position `on` handlers: a rising-edge trigger and a
+/// periodic one. Both arm a `_checkers` closure at the statement
+/// position, like v1's `emit_cycle_trigger`.
+const ON_TB: &str = r#"testbench OnTb
+    dut : Top
+end testbench OnTb
+
+impl OnTest for OnTb
+    run
+        on dut.c == 1
+            log(info, "rose")
+        end on
+        on 2 cycles
+            log(info, "tick")
+        end on
+        wait 1 cycle
+    end run
+end impl OnTest
+"#;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -58,8 +78,12 @@ fn fresh_outdir(tag: &str) -> PathBuf {
 }
 
 fn emit(dir: &Path) -> String {
-    let tb = dir.join("chk_tb.harc");
-    std::fs::write(&tb, TB).expect("write TB");
+    emit_src(dir, "chk_tb", TB)
+}
+
+fn emit_src(dir: &Path, stem: &str, src: &str) -> String {
+    let tb = dir.join(format!("{stem}.harc"));
+    std::fs::write(&tb, src).expect("write TB");
     let out = Command::new(env!("CARGO_BIN_EXE_harc"))
         .arg("sim")
         .arg(&tb)
@@ -78,7 +102,7 @@ fn emit(dir: &Path) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    std::fs::read_to_string(dir.join("chk_tb.cpp")).expect("read emitted cpp")
+    std::fs::read_to_string(dir.join(format!("{stem}.cpp"))).expect("read emitted cpp")
 }
 
 /// Pull out every `_checkers.push_back([&]() { … });` registration, by
@@ -260,6 +284,129 @@ int main() {{
     assert_eq!(
         got, "3 1 1",
         "expected 3 errors / 1 ASSUME-FAIL / 1 cover hit from the emitted closures; got `{got}`"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same treatment for statement-position `on` handlers: splice the
+/// emitted `_checkers` registrations plus the body lambdas they call into
+/// a probe and drive cycles. Pins the edge latch (a rising-edge handler
+/// must fire once per 0→1 transition, not once per cycle the predicate
+/// holds) and the periodic stamp (first firing at cycle N, not cycle 0).
+#[test]
+fn emitted_on_handlers_compile_and_fire_on_the_right_cycles() {
+    let Some(cxx) = cxx() else {
+        assert!(
+            std::env::var_os("HARC_SKIP_CXX_PROBE").is_some(),
+            "no C++ compiler on PATH (tried $CXX, g++, clang++)."
+        );
+        eprintln!("SKIP emitted_on_handlers_compile_and_fire_on_the_right_cycles.");
+        return;
+    };
+
+    let dir = fresh_outdir("onprobe");
+    let cpp = emit_src(&dir, "on_tb", ON_TB);
+    let closures = checker_closures(&cpp);
+    assert_eq!(closures.len(), 2, "one closure per handler; got:\n{cpp}");
+
+    // The body lambdas are declared at test scope; lift their
+    // declarations verbatim so the probe calls the real emitted bodies.
+    // Each is `std::function<void()> _on_handler_N; _on_handler_N = [&]() -> void {…};`
+    let mut bodies = String::new();
+    for i in 0..2 {
+        let decl = format!("std::function<void()> _on_handler_{i};");
+        assert!(cpp.contains(&decl), "missing `{decl}` in:\n{cpp}");
+        let at = cpp.find(&format!("_on_handler_{i} = [&]")).expect("body");
+        let from = &cpp[at..];
+        let open = from.find('{').expect("body opens");
+        let mut depth = 0usize;
+        let mut end = 0usize;
+        for (j, ch) in from[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + j;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        bodies.push_str(&decl);
+        bodies.push('\n');
+        bodies.push_str(&from[..end + 1]);
+        bodies.push_str(";\n");
+    }
+
+    // Stimulus: c = 0,1,1,0,1 over five edges.
+    //   rising `on dut.c == 1` fires at cycles 1 and 4 → 2 firings.
+    //   `on 2 cycles` with `last = 0` fires when cycle_count - last >= 2.
+    //     The probe bumps cycle_count before running the checkers, so
+    //     cycle_count is 1..5 → fires at 2 and 4 → 2 firings.
+    let probe = dir.join("probe.cpp");
+    let body = closures.join("\n");
+    std::fs::write(
+        &probe,
+        format!(
+            r#"#include "harc_thread_rt.h"
+#include <cstdarg>
+#include <cstdio>
+#include <functional>
+#include <vector>
+
+struct Dut {{ uint64_t a = 0, b = 0, c = 0; }};
+static Dut _dut_storage;
+static Dut* dut = &_dut_storage;
+static struct {{ long errors = 0; }} ctx;
+static long long cycle_count = 0;
+static long rose_hits = 0, tick_hits = 0;
+static void sim_log_line(const char* sev, const char* fmt, ...) {{
+    (void)sev;
+    if (fmt[0] == 'r') rose_hits++; else tick_hits++;
+}}
+
+int main() {{
+    std::vector<std::function<void()>> _checkers;
+{bodies}
+{body}
+    const uint64_t stim[5] = {{0, 1, 1, 0, 1}};
+    for (int i = 0; i < 5; i++) {{
+        dut->c = stim[i];
+        cycle_count++;
+        for (auto& c : _checkers) c();
+    }}
+    printf("%ld %ld\n", rose_hits, tick_hits);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write probe");
+
+    let bin = dir.join("probe");
+    let compile = Command::new(&cxx)
+        .arg("-std=c++20")
+        .arg("-I")
+        .arg(repo_root().join("runtime"))
+        .arg(&probe)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("run the C++ compiler");
+    assert!(
+        compile.status.success(),
+        "the emitted `on` handler closures did not compile:\n{}\n--- probe ---\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        std::fs::read_to_string(&probe).unwrap_or_default(),
+    );
+    let run = Command::new(&bin).output().expect("run the probe");
+    assert!(run.status.success(), "probe crashed");
+    let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert_eq!(
+        got, "2 2",
+        "expected 2 rising-edge firings and 2 periodic firings; got `{got}`"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

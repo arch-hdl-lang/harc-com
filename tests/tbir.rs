@@ -10703,3 +10703,182 @@ fn the_property_demo_fixture_lowers_and_verifies() {
         .collect();
     assert_eq!(shapes, ["inv", "|->", "|=>", "|->", "|->", "|->"]);
 }
+
+// ── Statement-position `on` handlers ─────────────────────────────────
+//
+// `on <bool-expr> ... end on` and `on <N> cycles ... end on` written
+// inside a run body arm a per-cycle `_checkers` closure at the statement's
+// position, exactly where v1's `emit_cycle_trigger` pushes it. (The
+// testbench-DECLARATION-scoped forms are a separate path — they arm during
+// test setup; see `TestbenchSchema::{periodic_services, cycle_services}`.)
+
+#[test]
+fn statement_position_on_handlers_lower_to_cycle_handlers() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            log(info, "rst high")
+        end on
+        on 3 cycles
+            log(info, "tick")
+        end on
+        wait 6 cycles
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("statement-position on handlers lower");
+    verify::verify_program(&prog).expect("verifies");
+    assert_eq!(prog.cycle_handlers.len(), 2);
+    assert!(matches!(
+        prog.cycle_handlers[0].kind,
+        ir::CycleHandlerKind::Trigger {
+            edge: ir::CycleEdge::Rising,
+            ..
+        }
+    ));
+    assert!(matches!(
+        prog.cycle_handlers[1].kind,
+        ir::CycleHandlerKind::Periodic { period: 3 }
+    ));
+    // Each body is its own zero-parameter TestHook function, so the
+    // per-cycle closure can call it without capturing a block-scoped
+    // lambda that dies with the enclosing `case`.
+    for h in &prog.cycle_handlers {
+        let f = prog.function(h.function);
+        assert_eq!(f.kind, ir::FunctionKind::TestHook);
+        assert!(f.params.is_empty());
+    }
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("CycleHandler(h0)") && dump.contains("CycleHandler(h1)"),
+        "the run body must carry both registrations; got:\n{dump}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    for needle in [
+        "static bool _onh_0_prev = false;",
+        "if (!_onh_0_prev && _onh_0_curr) {",
+        "_onh_0_prev = _onh_0_curr;",
+        "static int64_t _onh_1_last = 0;",
+        "if ((int64_t)cycle_count - _onh_1_last >= 3) {",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+    // The body lambdas must be declared before the run coroutine, not
+    // inside the switch case that registers them.
+    let lambda = cpp.find("_on_handler_0 = [&]").expect("body lambda");
+    let run_lambda = cpp.find("_run_slot_lambda = ").expect("run lambda");
+    assert!(
+        lambda < run_lambda,
+        "a body lambda declared inside the coroutine would dangle once its \
+         `case` block ended"
+    );
+}
+
+/// A `falling`/`level` edge mode selects the matching latch shape, and
+/// `phase post_eval` routes the registration to the other service vector.
+#[test]
+fn on_handler_edge_modes_and_phase_route_like_v1() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst falling
+            log(info, "fell")
+        end on
+        on dut.rst phase post_eval level
+            log(info, "held")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("if (_onh_0_prev && !_onh_0_curr) {"),
+        "a falling-edge handler must latch the inverse transition; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_post_eval_services.push_back"),
+        "`phase post_eval` must register in the post-eval vector; got:\n{cpp}"
+    );
+}
+
+/// An `on` body is its own function, so it cannot see the enclosing run
+/// function's locals — v1's shared `[&]` capture is not representable.
+/// The reference must be reported, not silently dropped.
+#[test]
+fn an_on_body_referencing_an_enclosing_local_is_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let seen = 0
+        on dut.rst == 1
+            log(info, "seen=${seen}")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("an enclosing-local reference in a handler body must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("seen"),
+        "the message must name the binding: {msg}"
+    );
+}
+
+/// The two `on` shapes that need machinery a statement position cannot
+/// provide are rejected with messages that say what to do instead.
+#[test]
+fn unsupported_on_shapes_are_rejected_precisely() {
+    let hook = lower_src(
+        r#"transactor Drv
+    dut : Top
+    when active
+        hookable send(v: uint<8>)
+            dut.a = v
+        end send
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    run
+        on drv.send post
+            log(info, "sent")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect_err("a statement-position method hook must be rejected");
+    assert!(
+        assert_unsupported(&hook).contains("pre/post` hook in statement position"),
+        "got: {}",
+        assert_unsupported(&hook)
+    );
+
+    let period = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let n = 4
+        on n cycles
+            log(info, "tick")
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    )
+    .expect_err("a non-literal period must be rejected");
+    assert!(
+        assert_unsupported(&period).contains("non-literal period"),
+        "got: {}",
+        assert_unsupported(&period)
+    );
+}

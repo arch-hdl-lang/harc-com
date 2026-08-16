@@ -77,6 +77,11 @@ ir_id!(
     CoverCheckId
 );
 ir_id!(
+    /// Index into `TbProgram::cycle_handlers` — one statement-position
+    /// `on` handler inside a run/check body. See `CycleHandlerSchema`.
+    CycleHandlerId
+);
+ir_id!(
     /// Index into `TbProgram::constraint_sites` — the handle a
     /// `Terminator::Randomize` carries into the constraint-IR layer.
     /// See `ConstraintSite` and the `Terminator::Randomize` doc.
@@ -145,6 +150,49 @@ pub struct TbProgram {
     /// `Stmt::CoverCheck` indexes, and the source of the end-of-test
     /// cover summary. See `CoverCheckSchema`.
     pub cover_checks: Vec<CoverCheckSchema>,
+    /// Statement-position `on` handlers — the table `Stmt::CycleHandler`
+    /// indexes. One entry per `on <bool-expr>` / `on <N> cycles` handler
+    /// written inside a run or check body. See `CycleHandlerSchema`.
+    pub cycle_handlers: Vec<CycleHandlerSchema>,
+}
+
+/// One statement-position `on` handler (spec §7.10 / §7.x cycle
+/// triggers) written inside a run or check body, as opposed to the
+/// testbench-declaration-scoped forms in `TestbenchSchema::
+/// {periodic_services, cycle_services}`.
+///
+/// The difference is WHEN it arms: a testbench-scoped handler registers
+/// during test setup, while this one registers where the statement
+/// appears, so a handler written after a `wait` never observes the
+/// earlier cycles. v1 makes the same distinction — its `emit_cycle_trigger`
+/// pushes into `_checkers` inline at the statement position.
+///
+/// The body is a zero-parameter `FunctionKind::TestHook` function
+/// (emitted as a free `[&]`-capturing lambda at test scope, like every
+/// other hook body) so the per-cycle registration closure can call it
+/// without capturing anything that dies with the enclosing block.
+#[derive(Debug, Clone)]
+pub struct CycleHandlerSchema {
+    pub kind: CycleHandlerKind,
+    /// Lowered handler body (`kind: TestHook`, zero params).
+    pub function: FunctionId,
+    /// `phase` modifier (`on <expr> phase post_eval`). `Checker`
+    /// (default) registers into `_checkers`; `PostEval` into
+    /// `_post_eval_services`.
+    pub phase: HandlerPhase,
+}
+
+/// What arms a `CycleHandlerSchema`.
+#[derive(Debug, Clone)]
+pub enum CycleHandlerKind {
+    /// `on <bool-expr> ... end on` — re-evaluate the predicate every
+    /// primary-clock cycle and fire the body per `edge`.
+    Trigger { trigger: Expr, edge: CycleEdge },
+    /// `on <N> cycles ... end on` — fire once every `period` primary-clock
+    /// cycles. The period is a positive integer literal in this subset;
+    /// v1 re-reads a variable period each cycle, which needs a host-state
+    /// read the registration closure does not carry here.
+    Periodic { period: u64 },
 }
 
 /// Severity band of a concurrent property check — which log tag the
@@ -1690,6 +1738,11 @@ pub enum Stmt {
     /// discipline as `PropertyCheck`; the counter itself is a file-scope
     /// `static` so the end-of-test summary can read it.
     CoverCheck(CoverCheckId),
+    /// Arm the statement-position `on` handler at
+    /// `TbProgram::cycle_handlers` index — a `_checkers` /
+    /// `_post_eval_services` closure installed at this statement's
+    /// position, exactly where v1's `emit_cycle_trigger` pushes it.
+    CycleHandler(CycleHandlerId),
     CovReport(CovgroupInstance),
     /// A sequence→transactor method call — the Tier-1/Tier-0 placement
     /// seam. `call` is ALWAYS `Expr::Call(CallTarget::TransactorMethod

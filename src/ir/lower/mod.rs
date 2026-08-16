@@ -89,6 +89,37 @@ pub(crate) struct SideTables {
     /// One entry per lowered `cover` statement; the index is the
     /// `Stmt::CoverCheck` id.
     pub cover_checks: Vec<ir::CoverCheckSchema>,
+    /// One entry per lowered statement-position `on` handler; the index
+    /// is the `Stmt::CycleHandler` id. Each `function` field holds an
+    /// index into `pending_functions` until `lower_program` drains both.
+    pub cycle_handlers: Vec<ir::CycleHandlerSchema>,
+    /// Function bodies lowered OUT OF LINE from the statement stream —
+    /// today, statement-position `on` handler bodies. A handler is
+    /// discovered mid-body, where no `FunctionId` can be reserved (the
+    /// builder does not see `TbProgram::functions`), so the body parks
+    /// here with its slot index as a placeholder id and `lower_program`
+    /// assigns real ids once every source-order function is pushed.
+    pub pending_functions: Vec<TbFunction>,
+}
+
+impl SideTables {
+    /// Move every parked out-of-line function into `prog.functions`,
+    /// assigning dense ids, and rewrite the placeholder ids the
+    /// referencing schemas carry. Call once, after all source-order
+    /// functions are pushed.
+    fn drain_pending_functions(&mut self, prog: &mut TbProgram) {
+        let base = prog.functions.len() as u32;
+        for (i, mut f) in std::mem::take(&mut self.pending_functions)
+            .into_iter()
+            .enumerate()
+        {
+            f.id = FunctionId(base + i as u32);
+            prog.functions.push(f);
+        }
+        for h in &mut self.cycle_handlers {
+            h.function = FunctionId(base + h.function.0);
+        }
+    }
 }
 
 /// A folded file-scope constant: 64-bit two's-complement bit pattern
@@ -1281,6 +1312,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         properties: properties.clone(),
+        owner: None,
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1346,6 +1378,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: Vec::new(),
         consts: consts.clone(),
         properties: properties.clone(),
+        owner: None,
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1491,6 +1524,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         properties: properties.clone(),
+        owner: None,
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1635,10 +1669,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             "no `test` declaration found".to_string(),
         ));
     }
-    let side_tables = side_tables.into_inner();
+    let mut side_tables = side_tables.into_inner();
+    side_tables.drain_pending_functions(&mut prog);
     prog.constraint_sites = side_tables.constraint_sites;
     prog.property_checks = side_tables.property_checks;
     prog.cover_checks = side_tables.cover_checks;
+    prog.cycle_handlers = side_tables.cycle_handlers;
     reject_recursive_transactor_methods(&prog)?;
     // Resolve hook-triggered covergroups (`covergroup G @(drv.send(t) post)`)
     // now that transactor method tables exist; records the subscription
@@ -4011,6 +4047,7 @@ fn lower_test(
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
         properties: properties.clone(),
+        owner: Some(tb_id),
         const_signed: const_signed.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_queue_fields: queue_fields
@@ -4764,6 +4801,13 @@ pub(crate) struct LowerCtx {
     /// context — a property declaration is file-scope and a check can
     /// appear in a run body, a helper, or a method body alike.
     pub properties: HashMap<String, crate::ast::Expr>,
+    /// The testbench this lowering context belongs to, when there is one.
+    /// Out-of-line function bodies discovered mid-statement (a
+    /// statement-position `on` handler) need it to tag themselves with
+    /// the same owner as the enclosing function — emission filters hook
+    /// bodies by owner. `None` for file-level helper / tseq / transactor
+    /// method contexts, which have no testbench.
+    pub owner: Option<TestbenchId>,
     /// Signedness of file-scope constants, retained alongside the
     /// substituted bit patterns so TB-IR preserves signed operators at
     /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
@@ -5263,7 +5307,7 @@ fn declare_tb_record_fields(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     }
 }
 
-fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
+pub(crate) fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     for (name, _) in &ctx.tb_record_fields {
         b.reserve_local_name(name);
     }
@@ -5546,7 +5590,7 @@ impl FuncBuilder<'_> {
 
     /// Seal all blocks, prune the ones unreachable from the entry
     /// (block 0), and remap successor ids.
-    fn finish(
+    pub(crate) fn finish(
         self,
         id: FunctionId,
         name: String,
@@ -5749,6 +5793,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // per-instance method state — no transactor instance to find.
                 | ir::Stmt::PropertyCheck(_)
                 | ir::Stmt::CoverCheck(_)
+                | ir::Stmt::CycleHandler(_)
                 | ir::Stmt::ProbeRelease(_) => None,
             };
             if found.is_some() {
@@ -5939,6 +5984,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 // placeholder to fill (see the finder above).
                 | ir::Stmt::PropertyCheck(_)
                 | ir::Stmt::CoverCheck(_)
+                | ir::Stmt::CycleHandler(_)
                 | ir::Stmt::ProbeRelease(_) => {}
             }
         }
@@ -6209,7 +6255,8 @@ fn fill_initiator_bus_prefix(
                     // lowering only admits checks in test/run scope, where
                     // the binding is already concrete.
                     | Stmt::PropertyCheck(_)
-                    | Stmt::CoverCheck(_) => {}
+                    | Stmt::CoverCheck(_)
+                    | Stmt::CycleHandler(_) => {}
                 }
             }
             match &mut block.terminator {

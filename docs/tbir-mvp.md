@@ -1816,6 +1816,51 @@ case and only locally-determinable `Assign` types are compared).
     counts — a string match cannot tell a correct latch state machine
     from one that reads its own write.
 
+26. **Statement-position `on` handlers (2026-08-16).**
+    An `on <bool-expr> ... end on` or `on <N> cycles ... end on` written
+    inside a run or check body now lowers to `TbProgram::cycle_handlers`
+    plus a `Stmt::CycleHandler` registration at the statement's position,
+    emitted as the same `_checkers` / `_post_eval_services` closure v1's
+    `emit_cycle_trigger` installs — the same rising/falling edge latch,
+    the same last-fire stamp, the same phase routing. Arming at the
+    statement position (not at test setup) is v1's behavior too: a
+    handler written after a `wait` never observes the earlier cycles
+    under either backend. This is distinct from the
+    testbench-DECLARATION-scoped forms in `TestbenchSchema::
+    {periodic_services, cycle_services}`, which arm during setup.
+
+    Differences from v1, both structural to the function-per-CFG IR:
+
+    - **The body is its own `FunctionKind::TestHook` function**, emitted
+      as a free `[&]`-capturing lambda at test scope and called from the
+      registration closure. v1 inlines the body into the closure. The
+      consequence is that a handler body cannot read the enclosing run
+      function's locals — the same run/check split that forces a
+      test-scope `let` to be promoted to a `_tb` field (#444). Such a
+      reference is reported by the ordinary name-resolution path rather
+      than silently dropped. Testbench fields and DUT ports resolve
+      normally.
+    - **A periodic handler's period must be a positive integer literal.**
+      v1 re-reads a variable period every cycle so a test can override it
+      from host state; the registration closure here carries no such read.
+      A non-literal period is rejected with that explanation.
+
+    Out of subset with precise messages, because a statement position
+    cannot supply what they need: `on <obj>.<method> pre/post` (the hook
+    must be in the method's pre/post vector before any call site runs)
+    and `on <event>(arg)` (needs a subscriber list on a component field).
+
+    Handler bodies are lowered out of line, mid-statement, where no
+    `FunctionId` can be reserved — the builder does not see
+    `TbProgram::functions`. They park in `SideTables::pending_functions`
+    with their slot index as a placeholder id, and `lower_program`
+    assigns dense ids once every source-order function is pushed.
+
+    Gated by `tests/concurrent_check_cpp.rs`, which drives the emitted
+    closures against a stub DUT and checks that a rising-edge handler
+    fires once per 0→1 transition (not once per cycle the predicate
+    holds) and that a periodic handler first fires at cycle N.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

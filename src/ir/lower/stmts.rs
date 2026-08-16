@@ -155,7 +155,7 @@ impl FuncBuilder<'_> {
             StmtKind::Parallel(_) => Err(unsupported("`parallel`", "")),
             StmtKind::Schedule(_) => Err(unsupported("`schedule`", "")),
             StmtKind::Select(_) => Err(unsupported("`select`", "")),
-            StmtKind::On(_) => Err(unsupported("`on` handlers", "")),
+            StmtKind::On(h) => self.lower_on_handler(h),
             StmtKind::Emit { name, args, .. } => self.lower_emit(name, args),
             StmtKind::Yield(e) => self.lower_yield(e),
             StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
@@ -2291,6 +2291,103 @@ impl FuncBuilder<'_> {
                 "tseq accumulator has unexpected element type {other:?} (lowering bug)"
             ))),
         }
+    }
+
+    /// A statement-position `on ... end on` handler inside a run or check
+    /// body (spec §7.10 and the cycle-trigger form).
+    ///
+    /// Two shapes lower: the cycle trigger (`on <bool-expr>`, gated on the
+    /// declared edge mode) and the periodic form (`on <N> cycles`). Both
+    /// become a `_checkers` / `_post_eval_services` closure installed at
+    /// this statement's position, which is where v1's `emit_cycle_trigger`
+    /// pushes them — a handler written after a `wait` never observes the
+    /// earlier cycles under either backend.
+    ///
+    /// The remaining shapes stay out of subset with precise messages:
+    /// method hooks (`on <obj>.<m> pre/post`) need the reference-capturing
+    /// hook vectors the component path owns, and event subscriptions
+    /// (`on <ev>(arg)`) need a subscriber list on a component field.
+    fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
+        use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
+        if h.hook.is_some() {
+            return Err(unsupported(
+                "an `on <obj>.<method> pre/post` hook in statement position",
+                "declare the hook on the component or testbench instead — a hook body \
+                 must be registered in the method's pre/post vector before any call \
+                 site runs, not at a point inside the run body",
+            ));
+        }
+        // An event subscription names an `event`-typed field; those live on
+        // components, and a test-scope `on <ev>(arg)` has no owning
+        // instance to subscribe against in this subset.
+        if !h.periodic {
+            if let ExprKind::Call { .. } = &*h.event.kind {
+                return Err(unsupported(
+                    "an `on <event>(arg)` subscription in statement position",
+                    "subscribe from the component that owns the `event` field",
+                ));
+            }
+        }
+
+        let kind = if h.periodic {
+            let period = super::tb_periodic_literal(&h.event).ok_or_else(|| {
+                unsupported(
+                    "an `on <N> cycles` handler with a non-literal period",
+                    "the TB-IR backend requires a positive integer-literal cycle count \
+                     (e.g. `on 100 cycles`); a variable period is re-read every cycle \
+                     under v1, which needs host state the registration closure does not \
+                     carry here",
+                )
+            })?;
+            CycleHandlerKind::Periodic { period }
+        } else {
+            // The trigger is re-evaluated every cycle inside the
+            // registration closure, which owns no statement slot — same
+            // constraint as a concurrent check body.
+            let trigger = self.with_check_body(&[], "an `on <bool-expr>` trigger", |b| {
+                b.lower_expr(&h.event)
+            })?;
+            CycleHandlerKind::Trigger {
+                trigger,
+                edge: crate::ir::CycleEdge::from_ast(h.edge),
+            }
+        };
+
+        // The body becomes its own zero-parameter `TestHook` function.
+        // It cannot see the enclosing function's locals (run and hook are
+        // separate IR functions, so v1's shared `[&]` capture is not
+        // representable); testbench fields and DUT ports resolve as usual,
+        // and an unresolved name is reported by the ordinary lookup path.
+        let pending_id = {
+            let tables = self.side_tables.borrow();
+            crate::ir::FunctionId(tables.pending_functions.len() as u32)
+        };
+        let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
+        super::reserve_tb_record_names(&mut b, self.ctx);
+        b.lower_block_stmts(&h.body)?;
+        if !b.is_terminated() {
+            b.terminate(Terminator::Return);
+        }
+        let f = b.finish(
+            pending_id,
+            format!("_on_handler_{}", pending_id.0),
+            crate::ir::FunctionKind::TestHook,
+            self.ctx.owner,
+        )?;
+
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            tables.pending_functions.push(f);
+            let id = crate::ir::CycleHandlerId(tables.cycle_handlers.len() as u32);
+            tables.cycle_handlers.push(CycleHandlerSchema {
+                kind,
+                function: pending_id,
+                phase: crate::ir::HandlerPhase::from_ast(h.phase),
+            });
+            id
+        };
+        self.push(Stmt::CycleHandler(id));
+        Ok(())
     }
 
     /// An explicit `assert property NAME` / `assume property NAME` /

@@ -851,7 +851,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         // operand — `program_has_probes` walks `property_checks` /
         // `cover_checks` directly so a probe read inside a concurrent
         // property is still seen.
-        PropertyCheck(_) | CoverCheck(_) => false,
+        PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => false,
         RecordInit(_, _) | CovReport(_) => false,
     }
 }
@@ -1099,7 +1099,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             .for_each(|p| p.args.iter().for_each(|a| for_each_port_in_expr(a, f))),
         // Check bodies are walked at program level — see
         // `for_each_check_body_expr`.
-        PropertyCheck(_) | CoverCheck(_) => {}
+        PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => {}
         RecordInit(_, _) | CovReport(_) => {}
     }
 }

@@ -327,6 +327,7 @@ pub(crate) fn lower_transactor(
         // so no scalar fields, helper methods, or test-scope lets.
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -597,6 +598,7 @@ fn lower_bound_target_transactor(
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1076,6 +1078,7 @@ fn lower_bound_initiator_transactor(
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
+        owner: None,
         const_signed: record_ctx.const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),

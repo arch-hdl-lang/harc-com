@@ -876,6 +876,81 @@ fn emit_cover_check(
     Ok(())
 }
 
+/// Arm one statement-position `on` handler: a `_checkers` /
+/// `_post_eval_services` closure that calls the handler body's lambda
+/// when its trigger fires. Byte-for-byte the state machine v1's
+/// `emit_cycle_trigger` installs — a rising/falling edge latch or a
+/// last-fire stamp — with the body factored into a named lambda instead
+/// of inlined, because the TB-IR body is its own function.
+///
+/// The body lambda is declared at test scope (the `TestHook` emission
+/// loop in `mod::emit_test`), NOT here: a lambda declared inside the
+/// run coroutine's `switch` case would die at the end of the case block
+/// while the registered closure still referenced it.
+fn emit_cycle_handler(
+    out: &mut String,
+    cx: &ECx<'_>,
+    prog: &TbProgram,
+    id: crate::ir::CycleHandlerId,
+    schema: &crate::ir::CycleHandlerSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    use crate::ir::CycleHandlerKind;
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let lambda = &prog
+        .functions
+        .get(schema.function.index())
+        .ok_or_else(|| EmitError(format!("tbir: cycle handler h{} has no body", id.0)))?
+        .name;
+    // Per-handler tag for the `static` latch cells. Unique per closure
+    // scope already, but tagged by handler id so a debugger shows which
+    // `on` a cell belongs to.
+    let tag = format!("_onh_{}", id.0);
+    let vec = schema.phase.service_vec();
+    writeln!(out, "{pad}{vec}.push_back([&]() {{").ok();
+    match &schema.kind {
+        CycleHandlerKind::Periodic { period } => {
+            // `last = 0` means the FIRST firing is at cycle `period`, not
+            // cycle 0 — "every N cycles", not "now and every N cycles".
+            writeln!(out, "{pad1}static int64_t {tag}_last = 0;").ok();
+            writeln!(
+                out,
+                "{pad1}if ((int64_t)cycle_count - {tag}_last >= {period}) {{"
+            )
+            .ok();
+            writeln!(out, "{pad2}{tag}_last = (int64_t)cycle_count;").ok();
+            writeln!(out, "{pad2}{lambda}();").ok();
+            writeln!(out, "{pad1}}}").ok();
+        }
+        CycleHandlerKind::Trigger { trigger, edge } => {
+            let t = expr_cpp(cx, trigger)?;
+            match edge {
+                crate::ir::CycleEdge::Level => {
+                    writeln!(out, "{pad1}if ((bool)({t})) {{").ok();
+                    writeln!(out, "{pad2}{lambda}();").ok();
+                    writeln!(out, "{pad1}}}").ok();
+                }
+                crate::ir::CycleEdge::Rising | crate::ir::CycleEdge::Falling => {
+                    writeln!(out, "{pad1}static bool {tag}_prev = false;").ok();
+                    writeln!(out, "{pad1}bool {tag}_curr = (bool)({t});").ok();
+                    let cond = match edge {
+                        crate::ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
+                        _ => format!("{tag}_prev && !{tag}_curr"),
+                    };
+                    writeln!(out, "{pad1}if ({cond}) {{").ok();
+                    writeln!(out, "{pad2}{lambda}();").ok();
+                    writeln!(out, "{pad1}}}").ok();
+                    writeln!(out, "{pad1}{tag}_prev = {tag}_curr;").ok();
+                }
+            }
+        }
+    }
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
@@ -1246,6 +1321,15 @@ fn emit_stmt(
                 ))
             })?;
             emit_cover_check(out, cx, schema, depth)?;
+        }
+        Stmt::CycleHandler(h) => {
+            let schema = prog.cycle_handlers.get(h.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing cycle handler h{}",
+                    func.name, h.0
+                ))
+            })?;
+            emit_cycle_handler(out, cx, prog, *h, schema, depth)?;
         }
         Stmt::FailDiag { guard, args } => match guard {
             // Per-sub-predicate breakdown: log only if the predicate
