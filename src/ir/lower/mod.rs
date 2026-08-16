@@ -74,6 +74,23 @@ pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerEr
     }
 }
 
+/// Program-wide accumulators shared by reference across every function
+/// lowered for one program, so the handles they mint are globally-unique
+/// indices. Drained into the matching `TbProgram` fields at the end of
+/// `lower_program`.
+#[derive(Debug, Default)]
+pub(crate) struct SideTables {
+    /// One entry per lowered `randomize` site; the index is the
+    /// `Terminator::Randomize` `ConstraintRef`.
+    pub constraint_sites: Vec<ConstraintSite>,
+    /// One entry per lowered concurrent `assert`/`assume`; the index is
+    /// the `Stmt::PropertyCheck` id.
+    pub property_checks: Vec<ir::PropertyCheckSchema>,
+    /// One entry per lowered `cover` statement; the index is the
+    /// `Stmt::CoverCheck` id.
+    pub cover_checks: Vec<ir::CoverCheckSchema>,
+}
+
 /// A folded file-scope constant: 64-bit two's-complement bit pattern
 /// plus the signedness later expressions must evaluate it under. The
 /// signedness is the *declared* type's (`sint<N>` → signed), matching
@@ -680,6 +697,18 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => {}
         }
     }
+    // File-scope `property NAME ... end property` bodies (spec §5), the
+    // table a bare-identifier `assert`/`assume`/`cover` resolves against.
+    // First declaration wins on a duplicate name, matching v1's
+    // `properties` map insertion order.
+    let mut properties: HashMap<String, crate::ast::Expr> = HashMap::new();
+    for it in &file.items {
+        if let Item::Property(pd) = it {
+            properties
+                .entry(pd.name.name.clone())
+                .or_insert_with(|| pd.body.clone());
+        }
+    }
     // The lowering contexts only need the substituted bit pattern —
     // use sites emit the 64-bit literal either way.
     let consts: HashMap<String, u64> = const_vals
@@ -1174,11 +1203,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         ..TbProgram::default()
     };
 
-    // Program-wide constraint-site accumulator. Shared by reference
-    // across every function lowered below so a `Terminator::Randomize`'s
-    // `ConstraintRef` is a globally-unique index into one table. Drained
-    // into `prog.constraint_sites` once all functions are lowered.
-    let constraint_sites: RefCell<Vec<ConstraintSite>> = RefCell::new(Vec::new());
+    // Program-wide side tables. Shared by reference across every
+    // function lowered below so the handles they mint (a
+    // `Terminator::Randomize`'s `ConstraintRef`, a `Stmt::PropertyCheck`'s
+    // `PropertyCheckId`, a `Stmt::CoverCheck`'s `CoverCheckId`) are
+    // globally-unique indices into one table each. Drained into `prog`
+    // once all functions are lowered.
+    let side_tables: RefCell<SideTables> = RefCell::new(SideTables::default());
     // Typed solver problem table (constraint-IR layer) — the source of
     // the per-site `problem_id` handle. Built from the SAME desugared
     // `file` v1 uses (`cpp_tb` desugars, then builds the table), so the
@@ -1249,6 +1280,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        properties: properties.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1286,8 +1318,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             continue;
         }
         let id = FunctionId(prog.functions.len() as u32);
-        let f =
-            helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &constraint_sites)?;
+        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &side_tables)?;
         prog.functions.push(f);
     }
 
@@ -1314,6 +1345,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
+        properties: properties.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1340,14 +1372,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         let Item::Tseq(decl) = it else { continue };
         let elem = tseq_records[&decl.name.name].clone();
         let id = FunctionId(prog.functions.len() as u32);
-        let f = tseqs::lower_tseq(
-            id,
-            decl,
-            elem,
-            &tseq_ctx,
-            &helper_registry,
-            &constraint_sites,
-        )?;
+        let f = tseqs::lower_tseq(id, decl, elem, &tseq_ctx, &helper_registry, &side_tables)?;
         prog.functions.push(f);
     }
 
@@ -1370,7 +1395,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &helper_ctx,
             &buses,
             &downstream_bus_binds,
-            &constraint_sites,
+            &side_tables,
         )?;
         prog.transactors.push(schema);
         prog.functions.extend(funcs);
@@ -1465,6 +1490,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // here even though method bodies are not bound at testbench scope.
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        properties: properties.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: HashSet::new(),
         tb_queue_fields: HashMap::new(),
@@ -1528,7 +1554,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &schema,
             body_ctx,
             &helper_registry,
-            &constraint_sites,
+            &side_tables,
         )?;
         // Patch the schema's pass-1 clause placeholders with the
         // resolved period/max_idle expressions (they could only lower
@@ -1592,12 +1618,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &unresolved_use_names,
             &consts,
             &const_signed,
+            &properties,
             &extern_fns,
             &helper_registry,
             &txn_keeps,
             &randomize_problem_ids,
             &tseq_records,
-            &constraint_sites,
+            &side_tables,
             &dut_poking_bfm_names,
             &mut prog,
         )?;
@@ -1608,7 +1635,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             "no `test` declaration found".to_string(),
         ));
     }
-    prog.constraint_sites = constraint_sites.into_inner();
+    let side_tables = side_tables.into_inner();
+    prog.constraint_sites = side_tables.constraint_sites;
+    prog.property_checks = side_tables.property_checks;
+    prog.cover_checks = side_tables.cover_checks;
     reject_recursive_transactor_methods(&prog)?;
     // Resolve hook-triggered covergroups (`covergroup G @(drv.send(t) post)`)
     // now that transactor method tables exist; records the subscription
@@ -2124,12 +2154,13 @@ fn lower_test(
     unresolved_use_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
+    properties: &HashMap<String, crate::ast::Expr>,
     extern_fns: &HashSet<String>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(usize, usize), u32>,
     tseq_records: &HashMap<String, TseqElem>,
-    constraint_sites: &RefCell<Vec<ConstraintSite>>,
+    side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -3884,27 +3915,20 @@ fn lower_test(
         }
     }
     if scope.is_some() && !bare_stmts.is_empty() {
-        // A bare `cover` mixed with a `scope` block stays rejected: v1
-        // itself emits non-compiling C++ for that case (its `_cov_*_hits`
-        // counter is declared inside the per-scope cover-summary block,
-        // so a bare cover references an out-of-scope symbol). There is no
-        // correct v1 behavior to mirror, so refuse rather than emit
-        // something that diverges. General bare statements (e.g. a bare
-        // `log(...)`) are routed by item order above and are fine.
-        if bare_stmts
-            .iter()
-            .any(|s| matches!(&s.kind, StmtKind::Cover(_)))
-        {
-            return Err(unsupported(
-                "mixing a bare `cover` statement with a `scope`/`run` block in one test",
-                "move the `cover` into the scope's `check` block (a bare cover \
-                 alongside a scope has no well-defined lowering — v1 emits \
-                 non-compiling C++ for it)",
-            ));
-        }
-        // Other bare statements were already routed into the run/check
-        // lists by item order (pre-scope → run front, post-scope → check
-        // tail); nothing more to append here.
+        // Bare statements — including a bare `cover` — were already routed
+        // into the run/check lists by item order above (pre-scope → run
+        // front, post-scope → check tail); nothing more to append here.
+        //
+        // A bare `cover` alongside a `scope`/`run` block used to be
+        // rejected because v1 has no correct behavior to mirror: v1
+        // declares each `_cov_<tag>_hits` counter as a `static` LOCAL at
+        // the statement's position inside the run coroutine and then reads
+        // it from the enclosing function's end-of-test summary, so the
+        // emitted C++ does not compile. TB-IR hoists the counter to file
+        // scope (`codegen/tbir/mod.rs`), which makes the lowering
+        // well-defined wherever the statement lands — so the rejection no
+        // longer buys anything and the construct is lowered instead. See
+        // the `cover` divergence note in docs/tbir-mvp.md.
     } else {
         // No scope: every bare statement is the run body, in order.
         run_stmts.extend(bare_stmts.iter().copied());
@@ -3986,6 +4010,7 @@ fn lower_test(
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
+        properties: properties.clone(),
         const_signed: const_signed.clone(),
         tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
         tb_queue_fields: queue_fields
@@ -4034,6 +4059,11 @@ fn lower_test(
         });
     }
 
+    // Concurrent `cover` checks minted from here on belong to THIS test:
+    // the end-of-test summary reports exactly the ones its own bodies
+    // register (v1 clears its per-test `covers` list the same way).
+    let cover_base = side_tables.borrow().cover_checks.len();
+
     let run_id = FunctionId(prog.functions.len() as u32);
     let run_fn = lower_function(
         run_id,
@@ -4043,7 +4073,7 @@ fn lower_test(
         &run_stmts,
         &ctx,
         helpers,
-        constraint_sites,
+        side_tables,
     )?;
     prog.functions.push(run_fn);
 
@@ -4059,7 +4089,7 @@ fn lower_test(
             &check_stmts,
             &ctx,
             helpers,
-            constraint_sites,
+            side_tables,
         )?;
         prog.functions.push(check_fn);
         Some(check_id)
@@ -4093,7 +4123,7 @@ fn lower_test(
             &h.body,
             &ctx,
             helpers,
-            constraint_sites,
+            side_tables,
         )?;
         prog.functions.push(hook_fn);
         // Back-patch onto the method schema.
@@ -4131,7 +4161,7 @@ fn lower_test(
             &h.body,
             &ctx,
             helpers,
-            constraint_sites,
+            side_tables,
         )?;
         prog.functions.push(cb_fn);
         let tb = &mut prog.testbenches[tb_id.index()];
@@ -4184,7 +4214,7 @@ fn lower_test(
                 h,
                 &ctx,
                 helpers,
-                constraint_sites,
+                side_tables,
             )?;
             prog.functions.push(f);
             periodic_services.push(ir::TbPeriodicServiceSchema {
@@ -4219,7 +4249,7 @@ fn lower_test(
                 h,
                 &ctx,
                 helpers,
-                constraint_sites,
+                side_tables,
             )?;
             prog.functions.push(f);
             cycle_services.push(ir::TbCycleServiceSchema {
@@ -4239,6 +4269,9 @@ fn lower_test(
         check,
         clock_domain: clock_specs.first().and_then(|c| c.domain.clone()),
         clocks: clock_specs,
+        cover_checks: (cover_base..side_tables.borrow().cover_checks.len())
+            .map(|i| ir::CoverCheckId(i as u32))
+            .collect(),
     });
     Ok(())
 }
@@ -4723,6 +4756,14 @@ pub(crate) struct LowerCtx {
     /// sites; locals shadow (lookup order: local, then const — same
     /// effective shadowing as v1's C++ scoping).
     pub consts: HashMap<String, u64>,
+    /// File-scope `property NAME ... end property` declarations, name →
+    /// body expression (v1's `properties` table). A bare-identifier
+    /// `assert`/`assume`/`cover` operand that hits this map is a
+    /// CONCURRENT check over the named property's body; anything else is
+    /// the immediate point-in-time form. Same table in every lowering
+    /// context — a property declaration is file-scope and a check can
+    /// appear in a run body, a helper, or a method body alike.
+    pub properties: HashMap<String, crate::ast::Expr>,
     /// Signedness of file-scope constants, retained alongside the
     /// substituted bit patterns so TB-IR preserves signed operators at
     /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
@@ -4953,12 +4994,14 @@ pub(crate) struct FuncBuilder<'a> {
     /// relatively (`Expr::ComponentField { base: SelfField }`), and
     /// `emit <ev>(...)` resolves against the body's `out event` fields.
     pub(crate) self_component: Option<ir::ComponentId>,
-    /// Program-wide constraint-site table, shared across every function
-    /// lowered for one program so `ConstraintRef` indices are globally
-    /// unique. A `randomize` site appends here and the resulting index
-    /// becomes the terminator's `ConstraintRef`. `lower_program` drains
-    /// it into `TbProgram::constraint_sites` after all functions lower.
-    pub(crate) constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    /// Program-wide side tables, shared across every function lowered
+    /// for one program so the handles minted from them are globally
+    /// unique. A `randomize` site appends a `ConstraintSite` and the
+    /// resulting index becomes the terminator's `ConstraintRef`; a
+    /// concurrent `assert`/`assume`/`cover` appends a check schema and the
+    /// index becomes the registration statement's id. `lower_program`
+    /// drains all three into `TbProgram` after all functions lower.
+    pub(crate) side_tables: &'a RefCell<SideTables>,
     /// Payload-field bindings for `recv()`-captured locals: `let r =
     /// bus.<ch>.recv()` records `r → [(field, captured-local)]` so a
     /// later `r.<field>` read resolves to the per-field captured local
@@ -4968,6 +5011,15 @@ pub(crate) struct FuncBuilder<'a> {
     /// reads (`let v = bus.r.recv(); assert v == ...`) — so this map is
     /// consulted only for the dotted `r.<field>` form.
     pub(crate) recv_payloads: HashMap<LocalId, Vec<(String, LocalId)>>,
+    /// Active while lowering a concurrent check body (`assert`/`assume`
+    /// over a named property or temporal expression, or a `cover`
+    /// predicate): maps a temporal system-call's SOURCE SPAN to the latch
+    /// slot that reading resolves to. `lower_expr` consults it before
+    /// dispatching on the expression kind, so `past(x)` inside a check
+    /// body becomes `Expr::TemporalSlot` instead of the usual rejection.
+    /// Empty everywhere else — the exact shape of v1's `prop_subs` hook,
+    /// which keys the same substitution by span during emission.
+    pub(crate) temporal_slots: HashMap<(usize, usize), (u32, ir::TemporalFn)>,
 
     /// The `RecordSeq` accumulator local of the `tseq` body currently
     /// being lowered (`Some` only inside a `FunctionKind::Tseq` body). A
@@ -4997,9 +5049,9 @@ fn lower_function<'a>(
     stmts: &[&AstStmt],
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.in_check = kind == FunctionKind::Check;
     declare_tb_record_fields(&mut b, ctx);
     // Regblock mirror locals: declared + default-constructed (to their
@@ -5049,9 +5101,9 @@ fn lower_method_hook_body<'a>(
     body: &Block,
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     reserve_tb_record_names(&mut b, ctx);
     for p in params {
         let local = b.declare(&p.name);
@@ -5084,11 +5136,11 @@ fn lower_tb_periodic_service_body<'a>(
     h: &crate::ast::OnHandler,
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
     let mut body = h.body.clone();
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -5116,7 +5168,7 @@ fn lower_tb_cycle_service_body<'a>(
     h: &crate::ast::OnHandler,
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<(TbFunction, ir::Expr), LowerError> {
     // Rewrite the trigger predicate the same way the body is rewritten:
     // wrap it in a throwaway one-statement block so the shared
@@ -5138,7 +5190,7 @@ fn lower_tb_cycle_service_body<'a>(
 
     let mut body = h.body.clone();
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     let trigger = b.lower_expr(&trigger_expr)?;
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
@@ -5165,9 +5217,9 @@ fn lower_reg_cb_body<'a>(
     body: &Block,
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     reserve_tb_record_names(&mut b, ctx);
     // The callback param `data` — the observed write value. Declared
     // FIRST so it is param index 0.
@@ -5221,7 +5273,7 @@ impl<'a> FuncBuilder<'a> {
     pub(crate) fn new(
         ctx: &'a LowerCtx,
         helpers: &'a helpers::HelperRegistry<'a>,
-        constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+        side_tables: &'a RefCell<SideTables>,
     ) -> Self {
         FuncBuilder {
             ctx,
@@ -5250,8 +5302,9 @@ impl<'a> FuncBuilder<'a> {
             in_check: false,
             let_widths: HashMap::new(),
             self_component: None,
-            constraint_sites,
+            side_tables,
             recv_payloads: HashMap::new(),
+            temporal_slots: HashMap::new(),
             tseq_result: None,
             pending_tlm_forks: Vec::new(),
             next_tlm_fork_tag: HashMap::new(),
@@ -5485,9 +5538,9 @@ impl FuncBuilder<'_> {
     /// Append a constraint site to the program-wide table and return its
     /// `ConstraintRef` handle (the index). Used by `randomize` lowering.
     pub(crate) fn push_constraint_site(&self, site: ConstraintSite) -> ConstraintRef {
-        let mut sites = self.constraint_sites.borrow_mut();
-        let id = ConstraintRef(sites.len() as u32);
-        sites.push(site);
+        let mut tables = self.side_tables.borrow_mut();
+        let id = ConstraintRef(tables.constraint_sites.len() as u32);
+        tables.constraint_sites.push(site);
         id
     }
 
@@ -5654,7 +5707,8 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
                 | ir::Stmt::TbQueuePush { value, .. } => in_expr(value),
-                ir::Stmt::AssertCheck { cond, on_fail } => {
+                ir::Stmt::AssertCheck { cond, on_fail }
+                | ir::Stmt::AssumeCheck { cond, on_fail } => {
                     in_expr(cond).or_else(|| on_fail.args.iter().find_map(|a| in_expr(&a.expr)))
                 }
                 ir::Stmt::Log { args, .. } | ir::Stmt::FailDiag { args, .. } => {
@@ -5691,6 +5745,10 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
                 | ir::Stmt::CovReport(_)
+                // Concurrent-check bodies are program-level schemas, not
+                // per-instance method state — no transactor instance to find.
+                | ir::Stmt::PropertyCheck(_)
+                | ir::Stmt::CoverCheck(_)
                 | ir::Stmt::ProbeRelease(_) => None,
             };
             if found.is_some() {
@@ -5754,6 +5812,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             | ir::Expr::CovHookParam { index: None, .. }
             | ir::Expr::CovHookArg { .. }
             | ir::Expr::TbField(_)
+            | ir::Expr::TemporalSlot { .. }
             | ir::Expr::TbQueueQuery { .. }
             | ir::Expr::ComponentField { .. }
             | ir::Expr::ComponentValue { .. }
@@ -5826,7 +5885,8 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
                 | ir::Stmt::TbQueuePush { value, .. } => fill_expr(value, instance),
-                ir::Stmt::AssertCheck { cond, on_fail } => {
+                ir::Stmt::AssertCheck { cond, on_fail }
+                | ir::Stmt::AssumeCheck { cond, on_fail } => {
                     fill_expr(cond, instance);
                     for a in &mut on_fail.args {
                         fill_expr(&mut a.expr, instance);
@@ -5875,6 +5935,10 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
                 | ir::Stmt::CovReport(_)
+                // Concurrent-check bodies carry no transactor-state
+                // placeholder to fill (see the finder above).
+                | ir::Stmt::PropertyCheck(_)
+                | ir::Stmt::CoverCheck(_)
                 | ir::Stmt::ProbeRelease(_) => {}
             }
         }
@@ -5996,6 +6060,7 @@ fn fill_visit_expr(
         | Expr::CovHookParam { index: None, .. }
         | Expr::CovHookArg { .. }
         | Expr::TbField(_)
+        | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
         | Expr::TransactorStateRecordField { .. }
@@ -6075,7 +6140,8 @@ fn fill_initiator_bus_prefix(
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
                     }
-                    Stmt::AssertCheck { cond, on_fail } => {
+                    Stmt::AssertCheck { cond, on_fail }
+                    | Stmt::AssumeCheck { cond, on_fail } => {
                         visit_expr(cond, placeholder, binding, remap, rewrite, &mut conflict);
                         for a in &mut on_fail.args {
                             visit_expr(
@@ -6136,7 +6202,14 @@ fn fill_initiator_bus_prefix(
                             }
                         }
                     }
-                    Stmt::RecordInit(_, _) | Stmt::CovReport(_) => {}
+                    Stmt::RecordInit(_, _)
+                    | Stmt::CovReport(_)
+                    // A concurrent check registered inside an initiator
+                    // BFM body would carry the placeholder bus prefix, but
+                    // lowering only admits checks in test/run scope, where
+                    // the binding is already concrete.
+                    | Stmt::PropertyCheck(_)
+                    | Stmt::CoverCheck(_) => {}
                 }
             }
             match &mut block.terminator {

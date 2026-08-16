@@ -237,6 +237,18 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
         Expr::TbField(field) => format!("_tb.{field}"),
+        // Latch readings render against the per-closure cells the
+        // concurrent-check emitter declares (`func::emit_property_check`
+        // / `emit_cover_check`). `_harc_ps<i>` is the `static` previous
+        // value, `_harc_cur<i>` this cycle's — both scoped to the one
+        // `_checkers` closure, so plain indexed names cannot collide
+        // across checks the way v1's span-tagged names guard against.
+        Expr::TemporalSlot { slot, kind } => match kind {
+            crate::ir::TemporalFn::Past => format!("_harc_ps{slot}"),
+            crate::ir::TemporalFn::Rose => format!("(!_harc_ps{slot} && _harc_cur{slot})"),
+            crate::ir::TemporalFn::Fell => format!("(_harc_ps{slot} && !_harc_cur{slot})"),
+            crate::ir::TemporalFn::Stable => format!("(_harc_ps{slot} == _harc_cur{slot})"),
+        },
         Expr::TbQueueQuery { field, query } => match query {
             crate::ir::ScoreboardQuery::QueueSize { .. } => {
                 format!("((uint64_t)_tb.{field}.size())")

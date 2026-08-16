@@ -50,6 +50,17 @@ pub(crate) struct TransactorStateRecordChain {
 impl FuncBuilder<'_> {
     /// Lower with `Expr::Port` allowed in the result.
     pub(crate) fn lower_expr(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
+        // Inside a concurrent check body, a `past`/`rose`/`fell`/`stable`
+        // occurrence resolves to its pre-assigned latch slot rather than
+        // recursing into the operand — the operand is latched once per
+        // cycle by the check closure, not re-evaluated per reference.
+        // Mirrors v1's span-keyed `prop_subs` hook at the head of
+        // `emit_expr_with_arrow`.
+        if !self.temporal_slots.is_empty() {
+            if let Some(&(slot, kind)) = self.temporal_slots.get(&(e.span.start, e.span.end)) {
+                return Ok(Expr::TemporalSlot { slot, kind });
+            }
+        }
         match &*e.kind {
             ExprKind::Int(s) => {
                 if let Some(value) = parse_int_literal(s) {
@@ -389,6 +400,22 @@ impl FuncBuilder<'_> {
                         if self.ctx.extern_fns.contains(&id.name) {
                             return self.lower_extern_fn_call(&id.name, args);
                         }
+                        // `past(x)` / `rose(x)` / `fell(x)` / `stable(x)`
+                        // written as a plain call. Legal only inside a
+                        // concurrent check body, where the slot map
+                        // intercepts it before this arm; anywhere else it
+                        // has no per-cycle latch to read, and v1 emits
+                        // NOTHING for it (`emit_expr` has no arm outside a
+                        // property check), so there is no `--codegen v1`
+                        // escape hatch to point at.
+                        if matches!(id.name.as_str(), "past" | "rose" | "fell" | "stable") {
+                            return Err(LowerError::Invalid(format!(
+                                "`{}(...)` is a temporal reading; it is only meaningful \
+                                 inside a concurrent `assert`/`assume`/`cover` body, and \
+                                 cannot be nested inside another temporal reading",
+                                id.name
+                            )));
+                        }
                         format!("helper call `{}(...)`", id.name)
                     }
                     ExprKind::Field { target, name } => {
@@ -629,7 +656,23 @@ impl FuncBuilder<'_> {
                     ty: IrType::UInt(Some(64)),
                 })
             }
-            ExprKind::SystemCall { .. } => Err(unsupported("temporal system calls", "")),
+            // `$past(x)` and friends in system-call syntax. Same rule as
+            // the plain-call spelling above: only meaningful inside a
+            // concurrent check body, which intercepts them by span.
+            ExprKind::SystemCall { name, .. } => match name {
+                crate::ast::SystemFn::Clog2 => Err(unsupported("`clog2`", "")),
+                _ => Err(LowerError::Invalid(format!(
+                    "`{}` is a temporal reading; it is only meaningful inside a concurrent \
+                     `assert`/`assume`/`cover` body, and cannot be nested inside another \
+                     temporal reading",
+                    match name {
+                        crate::ast::SystemFn::Past => "past",
+                        crate::ast::SystemFn::Rose => "rose",
+                        crate::ast::SystemFn::Fell => "fell",
+                        _ => "stable",
+                    }
+                ))),
+            },
             ExprKind::StructLit { .. } => Err(unsupported("struct literals", "")),
             ExprKind::SetLit(_) => Err(unsupported("set literals", "")),
             ExprKind::DistLit(_) | ExprKind::DistDirective { .. } => {
@@ -1140,6 +1183,9 @@ impl FuncBuilder<'_> {
             | Expr::CovHookParam { index: None, .. }
             | Expr::CovHookArg { .. }
             | Expr::TbField(_)
+            // A temporal latch reading is resolved inside the check closure,
+            // never a DUT port read at this position.
+            | Expr::TemporalSlot { .. }
             // Transactor-instance state is host state — no DUT port inside.
             | Expr::TransactorState { .. }
             // A record-state subfield read is host state — no DUT port inside.

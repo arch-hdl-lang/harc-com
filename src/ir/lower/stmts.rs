@@ -160,8 +160,8 @@ impl FuncBuilder<'_> {
             StmtKind::Yield(e) => self.lower_yield(e),
             StmtKind::Apply(_) => Err(unsupported("`apply`", "")),
             StmtKind::Release(e) => self.lower_release(e),
-            StmtKind::Assume(_) => Err(unsupported("`assume`", "")),
-            StmtKind::Cover(_) => Err(unsupported("`cover`", "")),
+            StmtKind::Assume(v) => self.lower_assume(v),
+            StmtKind::Cover(v) => self.lower_cover(v),
             StmtKind::Expr(e) => {
                 // Statement-position `fork bus.m(...)` — issue the request
                 // now and discard the response at the next `join_all`.
@@ -2293,16 +2293,259 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// An explicit `assert property NAME` / `assume property NAME` /
+    /// `cover property NAME` whose `NAME` is not a declared property.
+    ///
+    /// The `property` keyword does not change v1's dispatch (it classifies
+    /// on the property table alone), so v1 falls through to the immediate
+    /// form and emits the bare identifier — a name that does not exist in
+    /// the generated C++. The keyword does, however, state the author's
+    /// intent unambiguously, so name it in the diagnostic instead of
+    /// letting the generic unresolved-name path report it. A program
+    /// error under every backend, hence `Invalid` — no `--codegen v1`
+    /// suggestion.
+    fn reject_unknown_named_property(
+        &self,
+        kw: &str,
+        v: &crate::ast::Verify,
+    ) -> Result<(), LowerError> {
+        if !v.property_kw {
+            return Ok(());
+        }
+        let Some(expr) = &v.expr else {
+            return Ok(());
+        };
+        if let ExprKind::Ident(id) = &*expr.kind {
+            if !self.ctx.properties.contains_key(&id.name) {
+                return Err(LowerError::Invalid(format!(
+                    "{kw} property `{}`: no property declaration with that name",
+                    id.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The check-body operand of a `assert`/`assume`/`cover`: a bare
+    /// identifier naming a declared `property` resolves to that
+    /// property's body, everything else is the written expression. Same
+    /// resolution v1 performs at the reference site.
+    fn resolve_check_body(&self, expr: &AstExpr) -> AstExpr {
+        if let ExprKind::Ident(id) = &*expr.kind {
+            if let Some(body) = self.ctx.properties.get(&id.name) {
+                return body.clone();
+            }
+        }
+        expr.clone()
+    }
+
+    /// Lower one concurrent check body (a property shape or a cover
+    /// predicate) with the temporal latch slots pre-assigned.
+    ///
+    /// A check body executes inside a per-cycle closure that owns no
+    /// statement slot, so nothing it lowers may push a statement into the
+    /// current block: a hoisted DUT read, an inlined impure helper, or a
+    /// transactor call edge would run ONCE at registration instead of
+    /// every cycle. `f` is run with `temporal_slots` installed and the
+    /// block's statement count is checked afterwards; a body that pushed
+    /// is rejected rather than silently mis-lowered.
+    fn with_check_body<T>(
+        &mut self,
+        temporals: &[crate::codegen::cpp_tb::Temporal],
+        construct: &str,
+        f: impl FnOnce(&mut Self) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        let saved = std::mem::take(&mut self.temporal_slots);
+        for (i, t) in temporals.iter().enumerate() {
+            let kind = match t.kind {
+                crate::ast::SystemFn::Past => crate::ir::TemporalFn::Past,
+                crate::ast::SystemFn::Rose => crate::ir::TemporalFn::Rose,
+                crate::ast::SystemFn::Fell => crate::ir::TemporalFn::Fell,
+                crate::ast::SystemFn::Stable => crate::ir::TemporalFn::Stable,
+                // `collect_temporal_occurrences` only yields the four
+                // temporal readings; `clog2` is filtered out upstream.
+                crate::ast::SystemFn::Clog2 => continue,
+            };
+            self.temporal_slots
+                .insert((t.call_span.start, t.call_span.end), (i as u32, kind));
+        }
+        // A body that pushes a statement, opens a block, or moves the
+        // cursor has escaped the closure: an inlined suspending helper
+        // splits the CFG, so checking the current block's length alone
+        // would miss it.
+        let before = (
+            self.current,
+            self.blocks.len(),
+            self.blocks[self.current].stmts.len(),
+        );
+        let out = f(self);
+        self.temporal_slots = saved;
+        let out = out?;
+        let after = (
+            self.current,
+            self.blocks.len(),
+            self.blocks[self.current].stmts.len(),
+        );
+        if after != before {
+            return Err(unsupported(
+                construct,
+                "the body needs a statement-level step (a hoisted DUT read, an inlined \
+                 helper, or a transactor call), which cannot run inside a per-cycle \
+                 concurrent check",
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Lower the latch operands of a check body. Each is lowered with NO
+    /// slot map installed, so a nested `past(past(x))` is rejected by the
+    /// ordinary temporal-system-call gate rather than silently aliasing a
+    /// slot (v1's occurrence walk likewise does not recurse into operands).
+    fn lower_temporal_slots(
+        &mut self,
+        temporals: &[crate::codegen::cpp_tb::Temporal],
+        construct: &str,
+    ) -> Result<Vec<crate::ir::TemporalSlot>, LowerError> {
+        let mut out = Vec::with_capacity(temporals.len());
+        for t in temporals {
+            let inner = self.with_check_body(&[], construct, |b| b.lower_expr(&t.inner))?;
+            out.push(crate::ir::TemporalSlot { inner });
+        }
+        Ok(out)
+    }
+
+    /// `assert`/`assume` whose operand names a declared property or
+    /// carries a temporal operator: a concurrent check registered here
+    /// and evaluated on every primary-clock edge from this point on.
+    fn lower_property_check(
+        &mut self,
+        severity: crate::ir::PropertySeverity,
+        v: &crate::ast::Verify,
+        raw: &AstExpr,
+    ) -> Result<(), LowerError> {
+        use crate::ast::BinaryOp;
+        use crate::ir::{PropertyCheckSchema, PropertyShape};
+
+        let construct = match severity {
+            crate::ir::PropertySeverity::Fail => "a concurrent `assert`",
+            crate::ir::PropertySeverity::AssumeFail => "a concurrent `assume`",
+        };
+        let body = self.resolve_check_body(raw);
+        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let slots = self.lower_temporal_slots(&temporals, construct)?;
+
+        let shape = match &*body.kind {
+            ExprKind::Binary {
+                op: op @ (BinaryOp::PipeImplies | BinaryOp::PipeImpliesNext),
+                lhs,
+                rhs,
+            } => {
+                let next = matches!(op, BinaryOp::PipeImpliesNext);
+                let (ante, cons) = self.with_check_body(&temporals, construct, |b| {
+                    Ok((b.lower_expr(lhs)?, b.lower_expr(rhs)?))
+                })?;
+                if next {
+                    PropertyShape::ImpliesNext { ante, cons }
+                } else {
+                    PropertyShape::Implies { ante, cons }
+                }
+            }
+            _ => PropertyShape::Invariant(
+                self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?,
+            ),
+        };
+
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            let id = crate::ir::PropertyCheckId(tables.property_checks.len() as u32);
+            tables.property_checks.push(PropertyCheckSchema {
+                tag: format!("_p_{}_{}", raw.span.start, raw.span.end),
+                label: crate::codegen::cpp_tb::property_label(v, raw),
+                severity,
+                shape,
+                temporals: slots,
+            });
+            id
+        };
+        self.push(Stmt::PropertyCheck(id));
+        Ok(())
+    }
+
+    /// `cover <expr>` (spec §5) — a flat witness counter bumped on every
+    /// primary-clock edge the predicate holds, reported at end of test.
+    pub(crate) fn lower_cover(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
+        self.reject_unknown_named_property("cover", v)?;
+        let Some(raw) = &v.expr else {
+            // v1 returns silently on a bodyless `cover`; the parser
+            // always produces one, so this is unreachable in practice.
+            return Ok(());
+        };
+        let construct = "a `cover` witness";
+        let label = match &*raw.kind {
+            ExprKind::Ident(id) => id.name.clone(),
+            _ => format!("cov_{}_{}", raw.span.start, raw.span.end),
+        };
+        let body = self.resolve_check_body(raw);
+        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let slots = self.lower_temporal_slots(&temporals, construct)?;
+        let cond = self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+
+        let id = {
+            let mut tables = self.side_tables.borrow_mut();
+            let id = crate::ir::CoverCheckId(tables.cover_checks.len() as u32);
+            tables.cover_checks.push(crate::ir::CoverCheckSchema {
+                tag: format!("c_{}_{}", raw.span.start, raw.span.end),
+                label,
+                cond,
+                temporals: slots,
+            });
+            id
+        };
+        self.push(Stmt::CoverCheck(id));
+        Ok(())
+    }
+
+    /// `assume <plain bool>` — an immediate, point-in-time assumption.
+    /// Logs `ASSUME` on violation and, unlike `assert`, does NOT bump the
+    /// error counter (v1's `emit_inline_assume`).
+    pub(crate) fn lower_assume(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
+        self.reject_unknown_named_property("assume", v)?;
+        let Some(expr) = &v.expr else {
+            return Err(LowerError::Invalid("assume without expression".to_string()));
+        };
+        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+            return self.lower_property_check(crate::ir::PropertySeverity::AssumeFail, v, expr);
+        }
+        // Ports stay inline (lazy eval, like an immediate assert); a
+        // transactor call edge hoists ahead of the check.
+        let cond = self.lower_expr(expr)?;
+        let cond = self.hoist_transactor_calls(cond);
+        let on_fail = self.lower_fmt("assumption failed")?;
+        self.push(Stmt::AssumeCheck { cond, on_fail });
+        Ok(())
+    }
+
     fn lower_assert(&mut self, v: &crate::ast::Verify) -> Result<(), LowerError> {
-        if v.named.is_some() {
-            return Err(unsupported("named property `assert`", ""));
-        }
-        if v.property_kw {
-            return Err(unsupported("`assert property`", ""));
-        }
+        self.reject_unknown_named_property("assert", v)?;
         let Some(expr) = &v.expr else {
             return Err(LowerError::Invalid("assert without expression".to_string()));
         };
+        // Spec §2 LL(1) table: a bare identifier naming a declared
+        // `property`, or any expression carrying a temporal operator, is
+        // a CONCURRENT assertion (evaluated every primary-clock edge);
+        // everything else is the immediate point-in-time check. The
+        // legacy `property` keyword still parses but no longer changes
+        // dispatch — same rule as v1's `is_concurrent_assertion`.
+        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+            if v.else_fail.is_some() {
+                return Err(unsupported(
+                    "an `else fail(...)` clause on a concurrent `assert`",
+                    "a concurrent assertion reports through its property failure line; \
+                     drop the `else fail(...)` or use an immediate `assert`",
+                ));
+            }
+            return self.lower_property_check(crate::ir::PropertySeverity::Fail, v, expr);
+        }
         // Ports stay inline (lazy assert eval), but a transactor-method
         // call edge cannot stay nested in the condition — hoist it into a
         // preceding `Stmt::TransactorCall` (the seam rule, and the call may

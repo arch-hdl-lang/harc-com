@@ -21600,7 +21600,7 @@ fn time_literal_to_ps(s: &str) -> Result<i64, String> {
 /// callee `Ident("past"|"rose"|"fell"|"stable")` (the ARCH-aligned form,
 /// what the parser produces today) or the legacy `SystemCall` AST (pre-
 /// `$past`-removal). Returns `(kind, inner_arg)` on match.
-fn match_temporal_call(e: &Expr) -> Option<(SystemFn, &Expr)> {
+pub(crate) fn match_temporal_call(e: &Expr) -> Option<(SystemFn, &Expr)> {
     match &*e.kind {
         ExprKind::SystemCall { name, args } => {
             let kind = match name {
@@ -21640,7 +21640,7 @@ fn match_temporal_call(e: &Expr) -> Option<(SystemFn, &Expr)> {
 /// `within`, `intersect`) or temporal system calls (`$past`, `$rose`,
 /// `$fell`, `$stable`), runs as a concurrent property. Everything else —
 /// plain boolean / arithmetic / comparison — is an immediate check.
-fn is_concurrent_assertion(
+pub(crate) fn is_concurrent_assertion(
     expr: &Expr,
     properties: &std::collections::HashMap<String, Expr>,
 ) -> bool {
@@ -21652,7 +21652,7 @@ fn is_concurrent_assertion(
     contains_temporal(expr)
 }
 
-fn contains_temporal(e: &Expr) -> bool {
+pub(crate) fn contains_temporal(e: &Expr) -> bool {
     if match_temporal_call(e).is_some() {
         return true;
     }
@@ -21693,19 +21693,19 @@ fn contains_temporal(e: &Expr) -> bool {
 /// One temporal SystemCall occurrence ($past/$rose/$fell/$stable) collected
 /// from a property body. The codegen allocates a static delay slot per
 /// occurrence; references to the call get substituted to the slot.
-struct Temporal {
+pub(crate) struct Temporal {
     /// Span of the SystemCall expression itself — used as the substitution
     /// key in `prop_subs`.
-    call_span: Span,
+    pub(crate) call_span: Span,
     /// Which kind of system call this is.
-    kind: SystemFn,
+    pub(crate) kind: SystemFn,
     /// The argument expression — captured each cycle into a `_curN` local.
-    inner: Expr,
+    pub(crate) inner: Expr,
 }
 
 /// Pre-walk a property body and return one `Temporal` entry per
 /// $past/$rose/$fell/$stable call. Order is left-to-right depth-first.
-fn collect_temporal_occurrences(body: &Expr) -> Vec<Temporal> {
+pub(crate) fn collect_temporal_occurrences(body: &Expr) -> Vec<Temporal> {
     fn walk(e: &Expr, out: &mut Vec<Temporal>) {
         if let Some((kind, inner)) = match_temporal_call(e) {
             out.push(Temporal {
@@ -21772,7 +21772,7 @@ fn collect_temporal_occurrences(body: &Expr) -> Vec<Temporal> {
 /// Best-effort human label for a property assertion — used in FAIL log
 /// lines so the user can identify which check tripped. Prefers the named
 /// form (`assert property foo` → "foo"), then falls back to "<inline>".
-fn property_label(v: &Verify, raw: &Expr) -> String {
+pub(crate) fn property_label(v: &Verify, raw: &Expr) -> String {
     if let Some(n) = &v.named {
         return n.name.clone();
     }

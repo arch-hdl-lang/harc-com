@@ -1765,6 +1765,57 @@ case and only locally-determinable `Assign` types are compared).
     cannot compile it). Non-separated literals (`100ns` → `100`) still
     mirror v1 exactly. See issue #451.
 
+25. **Concurrent `assert` / `assume` / `cover` (spec §5, 2026-08-16).**
+    The concurrent verification statements now lower to
+    `TbProgram::property_checks` / `TbProgram::cover_checks` plus a
+    `Stmt::PropertyCheck` / `Stmt::CoverCheck` registration at the source
+    statement's position, emitted as the same per-primary-clock-edge
+    `_checkers` closure v1 builds in `emit_property_check`. Dispatch
+    matches v1 exactly (`is_concurrent_assertion`: a bare identifier
+    naming a declared `property`, or any expression carrying a temporal
+    operator, is concurrent; everything else is the immediate
+    point-in-time check — the legacy `property` keyword does not change
+    dispatch). The three shapes (`a |-> b`, `a |=> b`, plain invariant),
+    the failure lines, and the error-counter policy (`assert` bumps,
+    `assume` does not) are v1's.
+
+    Two deliberate improvements over v1 in this area, both in cases where
+    v1 emits C++ that does not compile — so neither can change the
+    behavior of a program v1 can actually build:
+
+    - **`cover` hit counters live at file scope.** v1 declares each
+      `_cov_<tag>_hits` as a `static` LOCAL at the statement's position
+      *inside the run coroutine lambda*, then reads it from the enclosing
+      function's end-of-test summary — an out-of-scope reference. TB-IR
+      hoists the counter to file scope, which has the same lifetime and
+      compiles. This is also why the old "mixing a bare `cover` statement
+      with a `scope`/`run` block" rejection is gone: it existed only
+      because there was no correct v1 behavior to mirror.
+    - **Temporal readings work inside a `cover` body.** v1 only installs
+      its span-keyed `prop_subs` substitutions around
+      `emit_property_check`, and `emit_expr` has no arm for a temporal
+      system call, so `cover rose(dut.x)` emits a call to a nonexistent
+      `rose(...)`. TB-IR gives a cover body the same latch machinery as a
+      property body.
+
+    Carried over from v1 unchanged: `past(e, N)` ignores `N` and reads
+    the immediately previous cycle (one latch slot per occurrence). A
+    deeper history would diverge from v1, so fixing it belongs in a
+    change that moves both backends together.
+
+    Outside a concurrent check body a temporal reading has no per-cycle
+    latch to read, and v1 emits nothing for it; that is a program error
+    under every backend, so it surfaces as `LowerError::Invalid` — no
+    `--codegen v1` suggestion. Same for `assert property NAME` /
+    `assume property NAME` / `cover property NAME` naming an undeclared
+    property.
+
+    Gated by `tests/concurrent_check_cpp.rs`, which splices the emitter's
+    actual `_checkers` closures into a probe with a stub DUT, drives a
+    fixed stimulus, and checks the resulting error / ASSUME / cover-hit
+    counts — a string match cannot tell a correct latch state machine
+    from one that reads its own write.
+
 ## Negative tests: where rejection actually fires
 
 As of #372 the randomize fixtures are no longer must-reject: both

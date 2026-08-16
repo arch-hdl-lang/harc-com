@@ -960,12 +960,49 @@ pub(super) fn drive_loop(out: &mut String, clocked: bool, actor_threads: &[(Stri
 }
 
 /// Coverage reports, finalization, exit status.
-pub(super) fn run_epilogue(out: &mut String, cosim: bool) {
+///
+/// `covers` is the test's concurrent-`cover` checks in registration
+/// order; each contributes a hit/total tally and a per-point report line
+/// (v1's property-cover summary, ARCH-style: header then per-point lines
+/// with a `*NOT HIT*` marker supplied by the runtime printer).
+pub(super) fn run_epilogue(out: &mut String, cosim: bool, covers: &[&crate::ir::CoverCheckSchema]) {
     out.push_str(
         r#"
 
     for (auto& _r : _auto_cov_reports) _r();
-    dut->final();
+"#,
+    );
+    if !covers.is_empty() {
+        writeln!(out, "{INDENT}{{").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}uint64_t _cov_total = {};",
+            covers.len()
+        )
+        .ok();
+        writeln!(out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
+        for c in covers {
+            let counter = super::func::cover_counter_name(&c.tag);
+            writeln!(out, "{INDENT}{INDENT}if ({counter} > 0) _cov_hit++;").ok();
+        }
+        writeln!(
+            out,
+            "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);"
+        )
+        .ok();
+        for c in covers {
+            let counter = super::func::cover_counter_name(&c.tag);
+            writeln!(
+                out,
+                "{INDENT}{INDENT}harc_rt::log::harc_print_cover_point(\"{}\", {counter});",
+                super::expr::escape_c(&c.label)
+            )
+            .ok();
+        }
+        writeln!(out, "{INDENT}}}").ok();
+    }
+    out.push_str(
+        r#"    dut->final();
 "#,
     );
     if !cosim {

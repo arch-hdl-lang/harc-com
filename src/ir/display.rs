@@ -399,6 +399,37 @@ impl Display for TbProgram {
                 writeln!(f, "    cross {names}")?;
             }
         }
+        for (i, p) in self.property_checks.iter().enumerate() {
+            let sev = match p.severity {
+                crate::ir::PropertySeverity::Fail => "assert",
+                crate::ir::PropertySeverity::AssumeFail => "assume",
+            };
+            let body = match &p.shape {
+                crate::ir::PropertyShape::Implies { ante, cons } => {
+                    format!("{} |-> {}", check_expr_str(ante), check_expr_str(cons))
+                }
+                crate::ir::PropertyShape::ImpliesNext { ante, cons } => {
+                    format!("{} |=> {}", check_expr_str(ante), check_expr_str(cons))
+                }
+                crate::ir::PropertyShape::Invariant(e) => check_expr_str(e),
+            };
+            writeln!(f, "  property p{i} {sev} `{}` [{}] {body}", p.label, p.tag)?;
+            for (si, slot) in p.temporals.iter().enumerate() {
+                writeln!(f, "    latch #{si} <- {}", check_expr_str(&slot.inner))?;
+            }
+        }
+        for (i, c) in self.cover_checks.iter().enumerate() {
+            writeln!(
+                f,
+                "  cover c{i} `{}` [{}] {}",
+                c.label,
+                c.tag,
+                check_expr_str(&c.cond)
+            )?;
+            for (si, slot) in c.temporals.iter().enumerate() {
+                writeln!(f, "    latch #{si} <- {}", check_expr_str(&slot.inner))?;
+            }
+        }
         for func in &self.functions {
             writeln!(f)?;
             write!(f, "{func}")?;
@@ -406,6 +437,29 @@ impl Display for TbProgram {
         Ok(())
     }
 }
+
+/// Render a concurrent-check body expression. Check bodies live outside
+/// any `TbFunction`, so they carry no local table — `expr_str` needs one
+/// to name locals, and a check body has none by construction (its
+/// operands are ports, host state, constants, and latch readings).
+fn check_expr_str(e: &Expr) -> String {
+    expr_str(&EMPTY_CHECK_SCOPE, e)
+}
+
+/// An empty function used purely as the (unused) local-name scope for
+/// concurrent-check body rendering.
+static EMPTY_CHECK_SCOPE: std::sync::LazyLock<TbFunction> =
+    std::sync::LazyLock::new(|| TbFunction {
+        id: crate::ir::FunctionId(u32::MAX),
+        name: "<check>".to_string(),
+        kind: crate::ir::FunctionKind::Run,
+        owner: None,
+        params: Vec::new(),
+        locals: Vec::new(),
+        blocks: Vec::new(),
+        entry: crate::ir::BlockId(0),
+        ret: None,
+    });
 
 impl Display for TbFunction {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -585,6 +639,11 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::Log { level, args } => {
             format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
         }
+        Stmt::AssumeCheck { cond, on_fail } => format!(
+            "AssumeCheck {{ cond: {}, on_fail: {} }}",
+            expr_str(func, cond),
+            fmt_args_str(func, on_fail)
+        ),
         Stmt::AssertCheck { cond, on_fail } => format!(
             "AssertCheck {{ cond: {}, on_fail: {} }}",
             expr_str(func, cond),
@@ -593,6 +652,8 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::CovReport(inst) => {
             format!("CovReport({}.cg{})", inst.tb_field, inst.covgroup.0)
         }
+        Stmt::PropertyCheck(p) => format!("PropertyCheck(p{})", p.0),
+        Stmt::CoverCheck(c) => format!("CoverCheck(c{})", c.0),
         Stmt::TransactorCall { dest, call } => match dest {
             Some(d) => format!(
                 "TransactorCall({} = {})",
@@ -960,6 +1021,15 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             }
         }
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TemporalSlot { slot, kind } => {
+            let f = match kind {
+                crate::ir::TemporalFn::Past => "past",
+                crate::ir::TemporalFn::Rose => "rose",
+                crate::ir::TemporalFn::Fell => "fell",
+                crate::ir::TemporalFn::Stable => "stable",
+            };
+            format!("{f}(#{slot})")
+        }
         Expr::TbQueueQuery { field, query } => match query {
             crate::ir::ScoreboardQuery::QueueSize { .. } => format!("_tb.{field}.size()"),
             crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!("_tb.{field}.empty()"),

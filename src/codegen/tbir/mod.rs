@@ -253,6 +253,20 @@ fn emit_selected_tests(
         writeln!(out).ok();
     }
     crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
+    // Concurrent-`cover` hit counters. File scope so the end-of-test
+    // summary — emitted in the test's `run_*` function, outside the run
+    // coroutine that registers the witness closure — can read them.
+    if !prog.cover_checks.is_empty() {
+        for c in &prog.cover_checks {
+            writeln!(
+                &mut out,
+                "static uint64_t {} = 0;",
+                func::cover_counter_name(&c.tag)
+            )
+            .ok();
+        }
+        writeln!(out).ok();
+    }
     // Covergroup structs are leaf observables, but hook-triggered sampler
     // bodies may call pure helpers or extern reference functions, so their
     // forward declarations must be visible before the struct definition.
@@ -759,9 +773,16 @@ fn emit_split_dispatcher(test_names: &[String]) -> String {
 /// so this walks both statement-level `PortRef`s and the expression
 /// trees those statements carry.
 fn program_has_probes(prog: &TbProgram) -> bool {
-    prog.functions
+    if prog
+        .functions
         .iter()
         .any(|f| f.blocks.iter().any(|b| b.stmts.iter().any(stmt_has_probe)))
+    {
+        return true;
+    }
+    let mut found = false;
+    for_each_check_body_expr(prog, |e| found |= expr_has_probe(e));
+    found
 }
 
 fn port_is_probe(p: &ir::PortRef) -> bool {
@@ -802,7 +823,9 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
-        AssertCheck { cond, on_fail } => expr_has_probe(cond) || fmt_has_probe(on_fail),
+        AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
+            expr_has_probe(cond) || fmt_has_probe(on_fail)
+        }
         Log { args, .. } => fmt_has_probe(args),
         FailDiag { guard, args } => {
             guard.as_ref().is_some_and(expr_has_probe) || fmt_has_probe(args)
@@ -824,7 +847,38 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         }
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
+        // The check BODY is a program-level schema, not a statement
+        // operand — `program_has_probes` walks `property_checks` /
+        // `cover_checks` directly so a probe read inside a concurrent
+        // property is still seen.
+        PropertyCheck(_) | CoverCheck(_) => false,
         RecordInit(_, _) | CovReport(_) => false,
+    }
+}
+
+/// Invoke `f` on every expression that makes up a concurrent-check body
+/// (property shapes, cover predicates, and their temporal latch
+/// operands). These live on `TbProgram`, not inside any function, so the
+/// program-wide port/probe walks visit them through this helper.
+fn for_each_check_body_expr(prog: &TbProgram, mut f: impl FnMut(&ir::Expr)) {
+    for p in &prog.property_checks {
+        match &p.shape {
+            ir::PropertyShape::Implies { ante, cons }
+            | ir::PropertyShape::ImpliesNext { ante, cons } => {
+                f(ante);
+                f(cons);
+            }
+            ir::PropertyShape::Invariant(e) => f(e),
+        }
+        for slot in &p.temporals {
+            f(&slot.inner);
+        }
+    }
+    for c in &prog.cover_checks {
+        f(&c.cond);
+        for slot in &c.temporals {
+            f(&slot.inner);
+        }
     }
 }
 
@@ -929,6 +983,7 @@ fn check_gated_bus_access(
             for_each_port_in_term(&blk.terminator, &mut check);
         }
     }
+    for_each_check_body_expr(prog, |e| for_each_port_in_expr(e, &mut check));
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1012,7 +1067,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
-        AssertCheck { cond, on_fail } => {
+        AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             for_each_port_in_expr(cond, f);
             for_each_port_in_fmt(on_fail, f);
         }
@@ -1042,6 +1097,9 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         TlmJoinAll(pending) => pending
             .iter()
             .for_each(|p| p.args.iter().for_each(|a| for_each_port_in_expr(a, f))),
+        // Check bodies are walked at program level — see
+        // `for_each_check_body_expr`.
+        PropertyCheck(_) | CoverCheck(_) => {}
         RecordInit(_, _) | CovReport(_) => {}
     }
 }
@@ -2406,6 +2464,11 @@ fn emit_test(
     runtime::mt_worker_setup(out, &actor_threads);
     runtime::drive_loop(out, clocked, &actor_threads);
     runtime::mt_worker_shutdown(out, &actor_threads);
-    runtime::run_epilogue(out, cosim);
+    let covers: Vec<&ir::CoverCheckSchema> = test
+        .cover_checks
+        .iter()
+        .map(|c| &prog.cover_checks[c.index()])
+        .collect();
+    runtime::run_epilogue(out, cosim, &covers);
     Ok(())
 }

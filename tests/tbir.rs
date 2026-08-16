@@ -10286,3 +10286,420 @@ end test T"#,
         "must fold to the masked value"
     );
 }
+
+// ── Concurrent verification statements (spec §5) ─────────────────────
+//
+// `assert property NAME` / a bare-identifier `assert` naming a declared
+// property / an inline temporal `assert` all register a per-clock-edge
+// `_checkers` closure, matching v1's `emit_property_check`. `assume`
+// follows the same dispatch with the `ASSUME-FAIL` severity and no error
+// bump; `cover` registers a witness counter reported at end of test.
+
+/// The source used by most of the concurrent-check tests: one declared
+/// property plus a run body that references it.
+fn concurrent_src(body: &str) -> String {
+    format!(
+        r#"property never_x
+    dut.a |-> dut.b
+end property never_x
+
+test T
+    let dut : Top
+    run
+{body}
+        wait 2 cycles
+    end run
+end test T"#
+    )
+}
+
+#[test]
+fn named_property_assert_lowers_to_a_concurrent_check() {
+    for site in ["        assert never_x", "        assert property never_x"] {
+        let prog = lower_src(&concurrent_src(site)).expect("named property assert lowers");
+        assert_eq!(
+            prog.property_checks.len(),
+            1,
+            "one registered check for `{site}`"
+        );
+        let p = &prog.property_checks[0];
+        assert_eq!(p.label, "never_x");
+        assert_eq!(p.severity, ir::PropertySeverity::Fail);
+        assert!(
+            matches!(p.shape, ir::PropertyShape::Implies { .. }),
+            "`a |-> b` must classify as a same-cycle implication; got {:?}",
+            p.shape
+        );
+        let dump = format!("{prog}");
+        assert!(
+            dump.contains("PropertyCheck(p0)"),
+            "the run body must carry the registration statement; got:\n{dump}"
+        );
+    }
+}
+
+/// A bare-identifier `assert` that does NOT name a declared property is
+/// the ordinary immediate check — v1 dispatches on the property table,
+/// not on the syntactic shape, and TB-IR must agree.
+#[test]
+fn bare_identifier_assert_without_a_property_stays_immediate() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let flag = 1
+        assert flag else fail("flag")
+    end run
+end test T"#,
+    )
+    .expect("a non-property identifier assert is an immediate check");
+    assert!(
+        prog.property_checks.is_empty(),
+        "no concurrent check should be registered"
+    );
+    assert!(
+        format!("{prog}").contains("AssertCheck"),
+        "must lower to the immediate form"
+    );
+}
+
+/// `assert property NAME` with no such declaration is a program error
+/// under every backend — v1's dispatch ignores the `property` keyword and
+/// emits the bare identifier, a name that does not exist in the generated
+/// C++ — so it surfaces as `Invalid`, NOT as an `Unsupported` that
+/// suggests `--codegen v1`.
+#[test]
+fn unknown_named_property_is_a_program_error_not_a_subset_gap() {
+    let err = lower_src(
+        r#"property p
+    dut.a
+end property p
+
+test T
+    let dut : Top
+    run
+        assert property nope
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("an undeclared property name must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("no property declaration with that name"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn implication_shapes_and_severities_match_v1() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert dut.a |=> dut.b
+        assume dut.a |-> dut.b
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("inline temporal assert/assume lower");
+    assert_eq!(prog.property_checks.len(), 2);
+    assert!(matches!(
+        prog.property_checks[0].shape,
+        ir::PropertyShape::ImpliesNext { .. }
+    ));
+    assert_eq!(prog.property_checks[0].severity, ir::PropertySeverity::Fail);
+    assert_eq!(prog.property_checks[0].label, "<inline>");
+    assert_eq!(
+        prog.property_checks[1].severity,
+        ir::PropertySeverity::AssumeFail
+    );
+
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assert dut.a |=> dut.b
+        assume dut.a |-> dut.b
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("FAIL", "property `<inline>` failed (|=>)")"#),
+        "the |=> failure line must match v1's; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(r#"sim_log_line("ASSUME-FAIL", "property `<inline>` failed (|->)")"#),
+        "a concurrent assume must log ASSUME-FAIL; got:\n{cpp}"
+    );
+    // Exactly one error bump — the assert's. The assume must not add one.
+    let bumps = cpp.matches("ctx.errors++;").count();
+    let assert_bumps = cpp
+        .lines()
+        .skip_while(|l| !l.contains("failed (|=>)"))
+        .take(2)
+        .filter(|l| l.contains("ctx.errors++"))
+        .count();
+    assert_eq!(assert_bumps, 1, "the concurrent assert bumps once");
+    let assume_bumps = cpp
+        .lines()
+        .skip_while(|l| !l.contains("failed (|->)"))
+        .take(2)
+        .filter(|l| l.contains("ctx.errors++"))
+        .count();
+    assert_eq!(
+        assume_bumps, 0,
+        "a concurrent assume must NOT bump the error counter; got {bumps} total in:\n{cpp}"
+    );
+}
+
+/// `past`/`rose`/`fell`/`stable` become latch slots: one `static`
+/// previous-value cell plus a per-cycle current-value local, written back
+/// at the end of the closure. Byte-for-byte the state machine v1 emits.
+#[test]
+fn temporal_readings_become_latch_slots() {
+    let prog = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> dut.b == past(dut.c)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("temporal readings lower");
+    let p = &prog.property_checks[0];
+    assert_eq!(p.temporals.len(), 2, "one slot per occurrence");
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("rose(#0)") && dump.contains("past(#1)"),
+        "{dump}"
+    );
+
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> dut.b == past(dut.c)
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    for needle in [
+        "static int64_t _harc_ps0 = 0;",
+        "static int64_t _harc_ps1 = 0;",
+        "(!_harc_ps0 && _harc_cur0)",
+        "_harc_ps1",
+        "_harc_ps0 = _harc_cur0;",
+        "_harc_ps1 = _harc_cur1;",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+}
+
+/// A nested `past(past(x))` would need slot-of-slot accounting the model
+/// deliberately does not carry (v1's occurrence walk does not recurse into
+/// operands either), so it is rejected rather than silently aliasing.
+#[test]
+fn nested_temporal_readings_are_rejected() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        assert past(past(dut.a))
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("nested temporal readings must not lower");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("cannot be nested inside another temporal reading"),
+        "got: {msg}"
+    );
+}
+
+/// A temporal reading outside any concurrent check has no per-cycle latch
+/// to read. v1 emits nothing for it (its `emit_expr` has no arm outside a
+/// property check), so this is a program error, not a subset gap — the
+/// diagnostic must not send the user to `--codegen v1`.
+#[test]
+fn a_temporal_reading_outside_a_check_body_is_a_program_error() {
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x = past(dut.a)
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a bare temporal reading must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("only meaningful inside a concurrent"),
+        "got: {msg}"
+    );
+}
+
+/// A concurrent check body runs inside a per-cycle closure with no
+/// statement slot, so anything needing a statement-level step (here an
+/// inlined impure helper) must be rejected rather than mis-lowered into
+/// running once at registration.
+#[test]
+fn a_check_body_needing_a_statement_step_is_rejected() {
+    let err = lower_src(
+        r#"function settle() -> uint<8>
+    wait 1 cycle
+    return 1
+end function settle
+
+test T
+    let dut : Top
+    run
+        assert rose(dut.a) |-> settle() == 1
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect_err("a suspending helper inside a check body must not lower");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("concurrent") && msg.contains("statement-level step"),
+        "got: {msg}"
+    );
+}
+
+/// `cover` registers a witness counter and reports it at end of test. The
+/// counter is FILE-scope, unlike v1's coroutine-local `static` (which the
+/// end-of-test summary cannot see — v1's `cover` emission does not
+/// compile; see docs/tbir-mvp.md).
+#[test]
+fn cover_registers_a_witness_counter_and_reports_it() {
+    let src = r#"property hit_max
+    dut.value == 15
+end property hit_max
+
+test T
+    let dut : Top
+    run
+        cover hit_max
+        cover dut.value == 7
+        wait 2 cycles
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("cover lowers");
+    assert_eq!(prog.cover_checks.len(), 2);
+    assert_eq!(prog.cover_checks[0].label, "hit_max");
+    assert!(
+        prog.cover_checks[1].label.starts_with("cov_"),
+        "an inline cover is labelled by source span; got {}",
+        prog.cover_checks[1].label
+    );
+    assert_eq!(
+        prog.tests[0].cover_checks.len(),
+        2,
+        "both covers belong to this test's end-of-test summary"
+    );
+
+    let cpp = emit_cpp_src(src);
+    let counter = format!("_cov_{}_hits", prog.cover_checks[0].tag);
+    assert!(
+        cpp.contains(&format!("static uint64_t {counter} = 0;")),
+        "the hit counter must be declared at file scope; got:\n{cpp}"
+    );
+    // File scope means it is declared before `run_T`, not inside it.
+    let decl = cpp
+        .find(&format!("static uint64_t {counter} = 0;"))
+        .unwrap();
+    let run_fn = cpp.find("run_T(").expect("the test's run function");
+    assert!(
+        decl < run_fn,
+        "the counter must precede the run function so the summary can read it"
+    );
+    assert!(
+        cpp.contains("harc_print_cover_summary(_cov_hit, _cov_total)")
+            && cpp.contains(r#"harc_print_cover_point("hit_max""#),
+        "the end-of-test summary must report each cover point; got:\n{cpp}"
+    );
+}
+
+/// v1 does not translate temporal readings inside a `cover` body (its
+/// `emit_expr` has no arm for them, so the operand vanishes). TB-IR gives
+/// a cover body the same latch machinery as a property body.
+#[test]
+fn cover_bodies_carry_temporal_latches() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        cover fell(dut.rst)
+        wait 2 cycles
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("(_harc_ps0 && !_harc_cur0)"),
+        "`fell` in a cover body must lower to its latch reading; got:\n{cpp}"
+    );
+}
+
+/// The immediate `assume` form logs `ASSUME` and, unlike `assert`, does
+/// not bump the error counter (v1's `emit_inline_assume`).
+#[test]
+fn immediate_assume_logs_without_bumping_errors() {
+    let cpp = emit_cpp_src(
+        r#"test T
+    let dut : Top
+    run
+        assume dut.rst == 0
+        wait 1 cycle
+    end run
+end test T"#,
+    );
+    let idx = cpp
+        .find(r#"sim_log_line("ASSUME", "assumption failed")"#)
+        .unwrap_or_else(|| panic!("missing the ASSUME line in:\n{cpp}"));
+    let after = &cpp[idx..idx + 200.min(cpp.len() - idx)];
+    assert!(
+        !after.lines().take(2).any(|l| l.contains("ctx.errors++")),
+        "an immediate assume must not bump the error counter; got:\n{after}"
+    );
+}
+
+/// A bare `cover` alongside a `run` block lowers now that the hit counter
+/// lives at file scope — the rejection that used to guard v1's
+/// out-of-scope-counter bug no longer applies.
+#[test]
+fn bare_cover_alongside_a_run_block_lowers() {
+    let prog = lower_fixtures(&["counter_test.harc", "counter_test_covers.harc"])
+        .expect("bare covers merged into a test with a run block lower");
+    assert_eq!(prog.cover_checks.len(), 4);
+    assert_eq!(
+        prog.tests[0].cover_checks.len(),
+        4,
+        "all four are reported by this test"
+    );
+}
+
+/// The property-demo extension fixture exercises every temporal reading
+/// and both implication shapes through the real merge path.
+#[test]
+fn the_property_demo_fixture_lowers_and_verifies() {
+    let prog = lower_fixtures(&["counter_test.harc", "counter_test_props.harc"])
+        .expect("counter property demo lowers");
+    verify::verify_program(&prog).expect("verifies");
+    assert_eq!(prog.property_checks.len(), 6);
+    let shapes: Vec<&str> = prog
+        .property_checks
+        .iter()
+        .map(|p| match p.shape {
+            ir::PropertyShape::Implies { .. } => "|->",
+            ir::PropertyShape::ImpliesNext { .. } => "|=>",
+            ir::PropertyShape::Invariant(_) => "inv",
+        })
+        .collect();
+    assert_eq!(shapes, ["inv", "|->", "|=>", "|->", "|->", "|->"]);
+}

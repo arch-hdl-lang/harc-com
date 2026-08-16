@@ -747,6 +747,135 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
     Ok(())
 }
 
+/// C++ name of the file-scope hit counter behind one `cover` check.
+/// File scope (not a closure-local `static`) so the end-of-test summary,
+/// which lives in the test's `run_*` function rather than inside the run
+/// coroutine, can read it. v1 declares the same counter as a `static`
+/// local INSIDE the coroutine lambda and then reads it from the enclosing
+/// function — a scope error that makes v1's `cover` emission fail to
+/// compile (documented divergence; see `docs/tbir-mvp.md`).
+pub(super) fn cover_counter_name(tag: &str) -> String {
+    format!("_cov_{tag}_hits")
+}
+
+/// Declare each temporal latch's `static` previous-value cell and this
+/// cycle's value local, at the head of a concurrent-check closure.
+/// Returns nothing; the matching write-back is `emit_temporal_writeback`.
+fn emit_temporal_latches(
+    out: &mut String,
+    cx: &ECx<'_>,
+    temporals: &[crate::ir::TemporalSlot],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    for (i, _) in temporals.iter().enumerate() {
+        writeln!(out, "{pad}static int64_t _harc_ps{i} = 0;").ok();
+    }
+    for (i, slot) in temporals.iter().enumerate() {
+        let inner = expr_cpp(cx, &slot.inner)?;
+        writeln!(out, "{pad}int64_t _harc_cur{i} = (int64_t)({inner});").ok();
+    }
+    Ok(())
+}
+
+/// Copy each latch's current value into its `static` cell, so the next
+/// cycle's `past`/`rose`/`fell`/`stable` reads see it.
+fn emit_temporal_writeback(out: &mut String, n: usize, depth: usize) {
+    let pad = INDENT.repeat(depth);
+    for i in 0..n {
+        writeln!(out, "{pad}_harc_ps{i} = _harc_cur{i};").ok();
+    }
+}
+
+/// One concurrent property check: a `_checkers` closure evaluated after
+/// every primary-clock edge from this registration point onward. Mirrors
+/// v1's `emit_property_check` — same three temporal shapes, same failure
+/// lines, same error-counter policy (`assert` bumps, `assume` does not).
+fn emit_property_check(
+    out: &mut String,
+    cx: &ECx<'_>,
+    schema: &crate::ir::PropertyCheckSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    use crate::ir::PropertyShape;
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let sev = schema.severity.tag();
+    let label = escape_c(&schema.label);
+
+    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
+    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+
+    // The failure arm is identical across shapes apart from the operator
+    // suffix in the message, so build it once.
+    let fail_arm = |out: &mut String, suffix: &str| {
+        writeln!(
+            out,
+            "{pad2}sim_log_line(\"{sev}\", \"property `{label}` failed{suffix}\");"
+        )
+        .ok();
+        if schema.severity.counts_as_error() {
+            writeln!(out, "{pad2}ctx.errors++;").ok();
+        }
+    };
+
+    match &schema.shape {
+        // `a |=> b` — the antecedent is remembered for one cycle, so the
+        // check fires on the cycle AFTER `a` held.
+        PropertyShape::ImpliesNext { ante, cons } => {
+            let a = expr_cpp(cx, ante)?;
+            let b = expr_cpp(cx, cons)?;
+            writeln!(out, "{pad1}static bool _harc_prev = false;").ok();
+            writeln!(out, "{pad1}bool _harc_a = (bool)({a});").ok();
+            writeln!(out, "{pad1}bool _harc_b = (bool)({b});").ok();
+            writeln!(out, "{pad1}if (_harc_prev && !_harc_b) {{").ok();
+            fail_arm(out, " (|=>)");
+            writeln!(out, "{pad1}}}").ok();
+            writeln!(out, "{pad1}_harc_prev = _harc_a;").ok();
+        }
+        PropertyShape::Implies { ante, cons } => {
+            let a = expr_cpp(cx, ante)?;
+            let b = expr_cpp(cx, cons)?;
+            writeln!(out, "{pad1}if ((bool)({a}) && !(bool)({b})) {{").ok();
+            fail_arm(out, " (|->)");
+            writeln!(out, "{pad1}}}").ok();
+        }
+        PropertyShape::Invariant(e) => {
+            let c = expr_cpp(cx, e)?;
+            writeln!(out, "{pad1}if (!({c})) {{").ok();
+            fail_arm(out, "");
+            writeln!(out, "{pad1}}}").ok();
+        }
+    }
+
+    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
+/// One concurrent `cover` witness: a `_checkers` closure that bumps the
+/// check's file-scope hit counter on every primary-clock edge where the
+/// predicate holds. Mirrors v1's `StmtKind::Cover` emission, plus the
+/// temporal-latch machinery v1's cover path lacks.
+fn emit_cover_check(
+    out: &mut String,
+    cx: &ECx<'_>,
+    schema: &crate::ir::CoverCheckSchema,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let counter = cover_counter_name(&schema.tag);
+    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
+    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let cond = expr_cpp(cx, &schema.cond)?;
+    writeln!(out, "{pad1}if ((bool)({cond})) {counter}++;").ok();
+    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    writeln!(out, "{pad}}});").ok();
+    Ok(())
+}
+
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
@@ -1089,8 +1218,34 @@ fn emit_stmt(
             writeln!(out, "{pad}{INDENT}ctx.errors++;").ok();
             writeln!(out, "{pad}}}").ok();
         }
+        // Same guard shape as `AssertCheck`, minus the error bump — an
+        // assumption bounds the inputs, it does not fail the test.
+        Stmt::AssumeCheck { cond, on_fail } => {
+            let cond = expr_cpp(cx, cond)?;
+            writeln!(out, "{pad}if (!({cond})) {{").ok();
+            emit_log_call(out, cx, "ASSUME", None, on_fail, depth + 1)?;
+            writeln!(out, "{pad}}}").ok();
+        }
         Stmt::CovReport(inst) => {
             writeln!(out, "{pad}_tb.{}.report();", inst.tb_field).ok();
+        }
+        Stmt::PropertyCheck(p) => {
+            let schema = prog.property_checks.get(p.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing property check p{}",
+                    func.name, p.0
+                ))
+            })?;
+            emit_property_check(out, cx, schema, depth)?;
+        }
+        Stmt::CoverCheck(c) => {
+            let schema = prog.cover_checks.get(c.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} references missing cover check c{}",
+                    func.name, c.0
+                ))
+            })?;
+            emit_cover_check(out, cx, schema, depth)?;
         }
         Stmt::FailDiag { guard, args } => match guard {
             // Per-sub-predicate breakdown: log only if the predicate

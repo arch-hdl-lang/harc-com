@@ -31,14 +31,16 @@
 //! frame stack (belt and suspenders for call edges the conservative
 //! scanner might miss inside unrecognized constructs).
 
-use super::{exprs::width_cast_kind, unsupported, FuncBuilder, InlineFrame, LowerCtx, LowerError};
+use super::{
+    exprs::width_cast_kind, unsupported, FuncBuilder, InlineFrame, LowerCtx, LowerError, SideTables,
+};
 use crate::ast::{
     Block, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, FunctionDecl, Item, SourceFile,
     Stmt as AstStmt, StmtKind, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    CallTarget, ConstraintSite, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction,
-    Terminator, TypedParam,
+    CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction, Terminator,
+    TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -126,9 +128,9 @@ pub(crate) fn lower_pure_helper<'a>(
     decl: &FunctionDecl,
     helpers: &'a HelperRegistry<'a>,
     ctx: &'a LowerCtx,
-    constraint_sites: &'a RefCell<Vec<ConstraintSite>>,
+    side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
-    let mut b = FuncBuilder::new(ctx, helpers, constraint_sites);
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.in_pure_helper = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
