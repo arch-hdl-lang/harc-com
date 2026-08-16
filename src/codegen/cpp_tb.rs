@@ -10307,11 +10307,14 @@ impl Emitter {
         if is_wrap(value) {
             // Report the VALUE's width, as TB-IR does — the destination's
             // width is a different number whenever the two disagree.
-            let aw = match &*unwrap_parens(value).kind {
-                ExprKind::Binary { op, lhs, rhs } => {
-                    self.wrap_result_width(*op, lhs, rhs).unwrap_or(dw)
-                }
-                _ => dw,
+            // If the wrap itself is invalid (unknown or >64-bit operands)
+            // its own error already fires and says more; adding a
+            // signedness message with a fabricated width is just noise.
+            let Some(aw) = (match &*unwrap_parens(value).kind {
+                ExprKind::Binary { op, lhs, rhs } => self.wrap_result_width(*op, lhs, rhs).ok(),
+                _ => None,
+            }) else {
+                return;
             };
             self.errors.push(format!(
                 "assignment of an unsigned {aw}-bit value to `{name}`, declared \

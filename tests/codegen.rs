@@ -8808,3 +8808,37 @@ end test T"#,
         "must quote the value's width and the destination's separately; got: {err}"
     );
 }
+
+/// Guards the other backout in `5bad8ab`. A `let_signed_widths` table was
+/// briefly added so the assignment form `s = a +% b` would get the same
+/// signedness rejection as the initializer form. Being flat and unscoped,
+/// it was poisoned by a signed local in ANY function or tseq — those are
+/// emitted inside the per-test loop before the run body — so an unrelated
+/// same-named local made v1 reject valid source. Any table-based revival
+/// must fail here.
+#[test]
+fn a_signed_local_elsewhere_does_not_poison_an_unsigned_assignment() {
+    let src = r#"function helper() -> uint<8>
+    let s : sint<8> = 1
+    return 3
+end function
+test T
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let s : uint<8> = 0
+        s = a +% a
+        log(info, "${s}")
+    end run
+end test T"#;
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    assert!(
+        cpp_tb::emit(&merged).is_ok(),
+        "a signed local in an unrelated function must not reject an unsigned assignment"
+    );
+    assert!(
+        harc::ir::lower::lower_program(&merged).is_ok(),
+        "TB-IR accepts it, so v1 must too"
+    );
+}
