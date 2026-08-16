@@ -1459,7 +1459,6 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         probes: std::collections::HashMap::new(),
         probe_widths: std::collections::HashMap::new(),
         shadowed_lets: std::collections::HashSet::new(),
-        let_signed_widths: std::collections::HashMap::new(),
         regblocks: std::collections::HashMap::new(),
         addrmaps: std::collections::HashMap::new(),
         let_helper: std::collections::HashMap::new(),
@@ -1950,7 +1949,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         probes: std::collections::HashMap::new(),
         probe_widths: std::collections::HashMap::new(),
         shadowed_lets: std::collections::HashSet::new(),
-        let_signed_widths: std::collections::HashMap::new(),
         regblocks,
         addrmaps,
         let_helper: std::collections::HashMap::new(),
@@ -2459,7 +2457,6 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         e.probes.clear();
         e.probe_widths.clear();
         e.shadowed_lets.clear();
-        e.let_signed_widths.clear();
         e.clock_names.clear();
         e.covers.clear();
         e.actor_threads.clear();
@@ -5800,10 +5797,6 @@ struct Emitter {
     /// `let a : uint<64>` is rejected on a width `a` never had at that
     /// point. Consulted only to suppress the narrowing check.
     shadowed_lets: std::collections::HashSet<String>,
-    /// Declared width of each `let` whose type is a SIGNED scalar
-    /// (`sint<N>` / `SInt<N>`), so the assignment form `s = a +% b` gets
-    /// the same signedness rejection as the initializer form.
-    let_signed_widths: std::collections::HashMap<String, u32>,
     /// RAL regblock declarations indexed by type name. See ast.rs::
     /// `RegblockDecl`. Used to emit one POD mirror struct +
     /// `constexpr` address table per declared regblock at file scope,
@@ -10295,6 +10288,12 @@ impl Emitter {
     /// accepted it silently. Unwraps parentheses: `(a +% b)` is the same
     /// wrap, and not seeing through them left the divergence reachable.
     fn check_signed_wrap_destination(&mut self, name: &str, dw: u32, value: &Expr) {
+        fn unwrap_parens(v: &Expr) -> &Expr {
+            match &*v.kind {
+                ExprKind::Paren(inner) => unwrap_parens(inner),
+                _ => v,
+            }
+        }
         fn is_wrap(v: &Expr) -> bool {
             match &*v.kind {
                 ExprKind::Paren(inner) => is_wrap(inner),
@@ -10306,8 +10305,16 @@ impl Emitter {
             }
         }
         if is_wrap(value) {
+            // Report the VALUE's width, as TB-IR does — the destination's
+            // width is a different number whenever the two disagree.
+            let aw = match &*unwrap_parens(value).kind {
+                ExprKind::Binary { op, lhs, rhs } => {
+                    self.wrap_result_width(*op, lhs, rhs).unwrap_or(dw)
+                }
+                _ => dw,
+            };
             self.errors.push(format!(
-                "assignment of an unsigned {dw}-bit value to `{name}`, declared \
+                "assignment of an unsigned {aw}-bit value to `{name}`, declared \
                  signed {dw} bits. Signedness must match — relabel the value \
                  explicitly with `as sint<{dw}>`."
             ));
@@ -16141,9 +16148,6 @@ impl Emitter {
                 // 200-bit `b`), and TB-IR rejects both.
                 if let ExprKind::Ident(id) = &*target.kind {
                     self.check_scalar_assign_width(&id.name, value);
-                    if let Some(w) = self.let_signed_widths.get(&id.name).copied() {
-                        self.check_signed_wrap_destination(&id.name, w, value);
-                    }
                 }
                 self.pad(depth);
                 self.emit_signal_assignment(target, value, depth);
@@ -16821,11 +16825,8 @@ impl Emitter {
             // match below: that match excludes `SIntCap`, so a check nested
             // inside it could never fire for `let s : SInt<8> = …`.
             if matches!(name, BuiltinTy::SInt | BuiltinTy::SIntCap) {
-                if let Some(w) = type_arg_width(args) {
-                    self.let_signed_widths.insert(l.name.name.clone(), w);
-                    if let Some(v) = l.value.as_ref() {
-                        self.check_signed_wrap_destination(&l.name.name, w, v);
-                    }
+                if let (Some(w), Some(v)) = (type_arg_width(args), l.value.as_ref()) {
+                    self.check_signed_wrap_destination(&l.name.name, w, v);
                 }
             }
             if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
@@ -19462,7 +19463,13 @@ fn references_shadowed_let(e: &Emitter, v: &Expr) -> bool {
             references_shadowed_let(e, lhs) || references_shadowed_let(e, rhs)
         }
         ExprKind::Unary { expr, .. } => references_shadowed_let(e, expr),
-        ExprKind::Cast { expr, .. } => references_shadowed_let(e, expr),
+        // A CAST is where the recursion stops: `wrap_operand_width` takes
+        // a cast operand's width from the cast target, not from whatever
+        // is inside it, so a shadowed name under one contributes nothing
+        // to the width and must not suppress the check. Recursing here
+        // let `let b : uint<4> = (a as uint<8>) +% 1` through under v1
+        // while TB-IR rejected it.
+        ExprKind::Cast { .. } => false,
         _ => false,
     }
 }
