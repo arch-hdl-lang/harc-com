@@ -9114,16 +9114,6 @@ end test T"#,
     );
 }
 
-/// Under `blocking randomize` the emitter inlines any remaining in-scope
-/// C++ expression, so the width oracle has to keep up with it: a record
-/// field and a DUT probe both carry declared widths the statement path
-/// already knows. Rejecting them turned building testbenches into build
-/// errors, with a diagnostic telling the user to use a transaction field
-
-/// A sized literal states a width, but nothing truncates its digits to it
-/// — `c_int_literal` emits `4'hFF` as `0xFF`. The mask has to cover the
-/// value the emitter actually wrote, or oracle and emitter disagree about
-
 /// A sized literal masks at its **declared** width, the same rule a
 /// `const` follows, so the two agree about a token spellable either way.
 /// The digits are not consulted: nothing truncates an overwide literal
@@ -9278,6 +9268,171 @@ end test T"#,
         "a uint<200> const must report its declared width, not fall back to the \
          initializer's value width; got: {err}"
     );
+    // On the TB-IR path too. `const_widths` is built in both emitter
+    // constructors, and the cross-backend assertion elsewhere uses a
+    // `uint<16>` const, which `cast_relabel_width` and
+    // `declared_type_bit_width` size identically — so only an
+    // out-of-range width can see this change on the default backend.
+    let tbir = tbir_constraint_snippets(
+        r#"const K : uint<200> = 10
+transaction Txn
+    len : uint<8> default 0
+    keep len +% K == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+    end run
+end test T"#,
+    )
+    .expect_err("tbir must reject it too");
+    assert!(
+        tbir.contains("200-bit result"),
+        "the default backend must reject it identically, not diverge; got: {tbir}"
+    );
+}
+
+/// `declared_type_bit_width`'s non-parameterised arms. A `bool` const is
+/// one bit and an `int` const is 32, and each must agree with the value
+/// the emitter materialises for it.
+#[test]
+fn const_widths_follow_the_declared_type_for_unparameterised_builtins() {
+    let cpp = v1_cpp(
+        r#"const B : bool = 1
+const I : int = 5
+transaction Txn
+    len : uint<1> default 0
+    wide : uint<40> default 0
+    keep len +% B == 0
+    keep wide +% I == 7
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    // `bool` is 1 bit, and the field is 1 bit, so the wrap masks to 1.
+    assert!(
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x0000000000000001ULL, 64)) =="),
+        "a `bool` const must contribute 1 bit; got:\n{cpp}"
+    );
+    // `int` is 32 bits and the field is 40, so 40 wins — but only if the
+    // const resolved at all.
+    assert!(
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x000000ffffffffffULL, 64)) =="),
+        "an `int` const must resolve so the 40-bit field's mask applies; got:\n{cpp}"
+    );
+
+    // A width-less `uint` is 64 bits, which at a 64-bit solver width is
+    // exactly the bitvector — so the correct emission has NO mask at all.
+    // Sizing it any narrower would emit one.
+    let bare = v1_cpp(
+        r#"const U : uint = 10
+transaction Txn
+    len : uint<8> default 0
+    keep len +% U == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        bare.contains("_s.add(_z_len + _ctx.bv_val((uint64_t)10, 64) =="),
+        "a width-less `uint` const is 64 bits, so the wrap needs no mask; got:\n{bare}"
+    );
+}
+
+/// `0'h0` lexes, and a zero-bit value can only be zero — which this
+/// module sizes as one bit. Rejecting it would fail a build that
+/// succeeds on main.
+#[test]
+fn a_zero_width_sized_literal_still_resolves() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% 0'h0 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="),
+        "0'h0 must resolve as one bit so the field's 8-bit mask applies; got:\n{cpp}"
+    );
+
+    // With the literal on both sides nothing else contributes a width, so
+    // this is the only shape where 0-vs-1 is observable: a zero width
+    // would reach `solver_unsigned_mask_expr(0)`, whose mask is a bogus
+    // 32 bits of ones.
+    let both = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len == 0'h0 +% 0'h0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        both.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x0000000000000001ULL, 64))"),
+        "a wrap of two zero-width literals must mask at one bit, not zero; got:\n{both}"
+    );
+}
+
+/// A `let` under `blocking randomize` is the third shape the emitter
+/// inlines from surrounding scope, alongside a record field and a DUT
+/// probe. It has to be rejected by BOTH backends for the same reason
+/// (harc#566): the width is only reachable from per-test emitter state
+/// that the TB-IR randomize emitter never populates, so resolving it on
+/// v1 alone would make the backends disagree.
+#[test]
+fn a_blocking_let_wrap_operand_is_rejected_by_both_backends() {
+    let src = r#"transaction Txn
+    len : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let n : uint<8> = 10
+        let t : Txn
+        blocking randomize(t) with
+            t.len +% n == 5
+        end randomize
+        log(info, "${t.len}")
+    end run
+end test T"#;
+    let v1 = v1_emit_err(src);
+    assert!(
+        v1.contains("statically known bit-width"),
+        "v1 must reject a blocking `let` wrap operand; got: {v1}"
+    );
+    let tbir = tbir_constraint_snippets(src).expect_err("tbir must reject too");
+    assert!(
+        tbir.contains("statically known bit-width"),
+        "the default backend must reject it the same way, not diverge; got: {tbir}"
+    );
 }
 
 /// A sized literal can declare more bits than the solver bitvector has,
@@ -9331,9 +9486,6 @@ end test T"#,
         "a signed nested field in a range must use the signed comparison; got:\n{cpp}"
     );
 }
-
-/// The last link in that fallback chain: under `blocking randomize` the
-/// emitter inlines a `let` local straight into the constraint, so the
 
 /// `randomize(t) with t +% 10 == 5` on a transaction whose field is named
 /// after the target variable. Routing a bare ident through

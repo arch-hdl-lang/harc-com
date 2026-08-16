@@ -291,11 +291,13 @@ backend-specific accept or reject rather than as a value difference.
   initializer or a literal's digits happen to hold. These operands carry a
   width: a transaction field (including a nested `hdr.len`), a list element
   (`items[i]`, and so a `foreach` loop variable), a bit-slice or bit-select,
-  a `const` (its declared type, or its initializer's width when untyped), an
-  enum variant, a decimal/`0x`/`0b` literal, and a sized literal (`8'hAB`,
-  which masks at the declared 8 whatever its digits say). These do not, and
-  are rejected rather than solved unmasked: `sum(...)` and `.len()`, which
-  the solver represents as internal variables with no declared source width;
+  a `const` (its declared width-carrying type, or its initializer's width
+  when it has none), an enum variant, a decimal/`0x`/`0b` literal, and a
+  sized literal (`8'hAB`, which masks at the declared 8 whatever its digits
+  say — see harc#565 for why the digits are not truncated to match).
+  These do not, and are rejected rather than solved unmasked: `sum(...)`
+  and `.len()`, which the solver represents as internal variables with no
+  declared source width;
   a compound non-wrap subexpression (`(len + 1) +% 10`, `len +% (0 - 1)`); a
   cast, which constraint position rejects outright, so unlike statement
   position a cast cannot be used to supply a width here; and — under
@@ -305,10 +307,10 @@ backend-specific accept or reject rather than as a value difference.
   a genuine gap rather than a rule: the widths exist, but the default
   backend builds its randomize emitter per site with no statement scope, so
   resolving them on `--codegen v1` alone would make the two backends
-  disagree about the same source. Both reject (harc#566).
-  Also unlike statement position, a `> 64`-bit
-  operand *is* accepted — the solver bitvector is `max(field widths).max(64)`
-  wide, so the mask stays expressible. A wrap whose result would exceed that
+  disagree about the same source. Both reject (harc#566). Also unlike
+  statement position, a `> 64`-bit operand *is* accepted — the solver
+  bitvector is `max(field widths).max(64)` wide, so the mask stays
+  expressible. A wrap whose result would exceed that
   bitvector is rejected as unrepresentable: an unbounded bit-slice
   (`a[70:0]`), a sized literal (`128'h1`), or a `const` (`uint<200>`)
   declaring more bits than the solver has.
