@@ -1340,9 +1340,30 @@ pub struct Stmt {
     pub span: Span,
 }
 
+/// `Stmt` and `Expr` are the two nodes a large suite allocates millions of,
+/// so their widths are load-bearing: the 62 MB benchmark suite in
+/// `bench/split_emit/` peaks ~440 MiB lower since these were last shrunk.
+/// Both are one fat enum variant away from silently regressing — an enum is
+/// as large as its largest variant, so growing any `StmtKind`/`ExprKind` arm
+/// grows *every* statement or expression. These assertions are the tripwire;
+/// if one fires, box the variant that grew rather than raising the number.
+/// 64-bit only — the sizes are pointer-width dependent.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<Stmt>() == 120);
+    assert!(std::mem::size_of::<Expr>() == 16);
+    assert!(std::mem::size_of::<ExprKind>() == 96);
+};
+
 #[derive(Debug, Clone)]
 pub enum StmtKind {
-    Let(LetStmt),
+    /// Boxed: `LetStmt` is by far the fattest variant here (an `Ident`, an
+    /// `Option<TypeExpr>`, and two `Vec`s for probes/bind-remaps), and an
+    /// enum is as large as its largest variant. Inline, it forced every
+    /// `Stmt` — every assignment, every `wait`, every `assert` — to 240
+    /// bytes. Boxing keeps `let` at one extra indirection, which it can
+    /// afford: it is a small minority of statements in real suites.
+    Let(Box<LetStmt>),
     Assign {
         target: Expr,
         value: Expr,

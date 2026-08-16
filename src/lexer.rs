@@ -7,15 +7,45 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Byte range into a source file.
+///
+/// `u32` rather than `usize`: a `Span` is embedded in nearly every AST node —
+/// every `Ident`, every `Expr`, every `Stmt` — so its width multiplies across
+/// the whole tree. Halving it takes `Expr` from 24 bytes to 16 and `Ident`
+/// from 40 to 32.
+///
+/// The cost is a hard 4 GiB cap on a single source file. That cap is enforced
+/// where offsets enter the type — [`tokenize`] rejects an over-long source
+/// outright — rather than left to `Span::new`'s saturation, because a clamped
+/// offset is not a safe fallback: distinct positions would alias onto
+/// `u32::MAX`, and span offsets key the randomize-problem tables and appear in
+/// generated C++ identifiers. Saturating here only keeps a construction that
+/// slipped past the check from wrapping into a wildly wrong offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
 }
+
+/// Largest source file that can be spanned, in bytes. See [`Span`].
+pub const MAX_SOURCE_LEN: usize = u32::MAX as usize;
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Self {
+            start: u32::try_from(start).unwrap_or(u32::MAX),
+            end: u32::try_from(end).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Byte offset of the first character, as a slice index.
+    pub fn start_usize(self) -> usize {
+        self.start as usize
+    }
+
+    /// Byte offset one past the last character, as a slice index.
+    pub fn end_usize(self) -> usize {
+        self.end as usize
     }
 
     pub fn merge(self, other: Span) -> Span {
@@ -739,7 +769,23 @@ impl fmt::Display for TokenKind {
     }
 }
 
-pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<Span>> {
+/// Why lexing failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LexError {
+    /// One or more byte ranges the lexer could not classify.
+    InvalidTokens(Vec<Span>),
+    /// Source longer than [`MAX_SOURCE_LEN`]; see [`Span`].
+    SourceTooLarge { len: usize },
+}
+
+pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
+    // Checked before anything is spanned: past `MAX_SOURCE_LEN` every offset
+    // would clamp to the same value, aliasing distinct source positions. See
+    // `Span`.
+    if source.len() > MAX_SOURCE_LEN {
+        return Err(LexError::SourceTooLarge { len: source.len() });
+    }
+
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
     let mut lex = TokenKind::lexer(source);
@@ -756,13 +802,40 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Vec<Span>> {
     if errors.is_empty() {
         Ok(tokens)
     } else {
-        Err(errors)
+        Err(LexError::InvalidTokens(errors))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Span` stores `u32` offsets, so an offset past `MAX_SOURCE_LEN` would
+    /// alias onto `u32::MAX`. Aliased spans are not a benign fallback — they
+    /// key the randomize-problem tables and reach generated C++ identifiers —
+    /// so `Span::new` saturating is the backstop, not the policy. The policy
+    /// is that `tokenize` refuses the input; this pins both halves.
+    #[test]
+    fn span_offsets_saturate_and_oversized_sources_are_rejected() {
+        let clamped = Span::new(usize::MAX, usize::MAX);
+        assert_eq!(clamped.start, u32::MAX);
+        assert_eq!(clamped.end, u32::MAX);
+        // Saturating, not wrapping: `usize::MAX as u32` would be `u32::MAX`
+        // by luck, but `MAX_SOURCE_LEN + 1` would wrap to 0.
+        assert_eq!(
+            Span::new(MAX_SOURCE_LEN + 1, MAX_SOURCE_LEN + 2).start,
+            u32::MAX
+        );
+
+        // A span exactly at the cap is representable, so the boundary is not
+        // off by one.
+        assert_eq!(Span::new(MAX_SOURCE_LEN, MAX_SOURCE_LEN).start, u32::MAX);
+
+        // Allocating a >4 GiB string here would be hostile to CI, so the
+        // rejection itself is checked at the seam rather than end to end.
+        assert!(MAX_SOURCE_LEN == u32::MAX as usize);
+        assert_eq!(tokenize("let x = 1").is_ok(), true);
+    }
 
     #[test]
     fn keywords_lex() {

@@ -185,8 +185,8 @@ fn expected_lower_error_reason(
                     span: error_span,
                 } = &errors[0]
                 {
-                    if fixture_source.rfind("s.sample[63:32]") == Some(error_span.start)
-                        && fixture_source.get(error_span.start..error_span.end)
+                    if fixture_source.rfind("s.sample[63:32]") == Some(error_span.start_usize())
+                        && fixture_source.get(error_span.start_usize()..error_span.end_usize())
                             == Some("s.sample[63:32]")
                     {
                         return Some(
