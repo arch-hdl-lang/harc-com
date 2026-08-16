@@ -233,13 +233,17 @@ wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 
-# Added by the harc#551 coverage audit. These four run under
-# run_fixtures.sh (default backend only) but were never trace-diffed
-# across the two emitters. Two of them are solver fixtures, which is the
-# area harc#559 spent five review passes in — precisely the coverage that
-# should not have been missing.
+# Added by the harc#551 coverage audit. These ran under run_fixtures.sh
+# (default backend only) and were never trace-diffed across the two
+# emitters. Two are solver fixtures — the area harc#559 spent five review
+# passes in, and precisely the coverage that should not have been missing.
+#
+# `multi_active_instance_test` belongs here and is deliberately absent:
+# registering it turned up a v1 SIGSEGV at runtime (harc#576). Both
+# backends EMIT it, so tests/run_emit_parity.sh passes it — only the
+# trace-diff, which actually runs the binary, catches it. Re-add the row
+# when v1 is fixed, or drop the question with the backend (harc#548).
 backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
-multi_active_instance_test | Top | top_counter.sv | - | pass
 soft_constraint_randomize_test | Top | top_counter.sv | - | pass
 target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 uint64_unique_randomize_test | Top | top_counter.sv | - | pass
