@@ -1,0 +1,81 @@
+// Backend-parity fixture for the shapes harc#551 catalogued as having
+// ZERO fixture coverage — every one of them was a real defect at some
+// point, and every one was invisible to CI because nothing exercised it.
+//
+// This fixture only carries shapes BOTH emitters accept, so it can be
+// registered in tests/tbir_equiv_fixtures.txt and trace-diffed. The
+// shapes only one backend accepts are pinned as unit tests instead
+// (tests/codegen.rs, `backend_subset_gaps_*`), because a fixture that one
+// backend refuses to emit cannot be trace-diffed at all — which is
+// exactly why those gaps went unnoticed.
+//
+// Deliberately NOT covered here, and why:
+//   - ARCH sized literals (`8'hFF`) and `as` casts above 128 bits are
+//     declared TB-IR subset gaps (the diagnostic names `--codegen v1`).
+//     tests/run_emit_parity.sh classifies those automatically.
+//   - `let s : sint<8> = a +% b` is now rejected by BOTH backends with a
+//     real diagnostic, so it belongs in a negative test, not here.
+//     (harc#551 describes it as an internal error under TB-IR; that was
+//     true when the issue was filed and is no longer.)
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench BackendParityTb
+    dut : Top
+end testbench BackendParityTb
+
+impl BackendParityTest for BackendParityTb
+    clock clk = SysDomain
+
+    run
+        // ── sext on a bit-slice receiver ────────────────────────────
+        // Gave DIFFERENT VALUES under the two backends (harc#551). The
+        // slice's width, not the source's, is what sign-extends.
+        //   0xABCD >> 4 = 0xABC, & 0xFF = 0xBC — bit 7 set, so
+        //   sext<16> fills ones: 0xFFBC.
+        let w16 : uint<16> = 0xABCD
+        let slice_se = w16[11:4].sext<16>()
+        assert slice_se == 0xFFBC
+            else fail("sext<16> of w16[11:4] (0xBC): got 0x${slice_se:04x}, want 0xFFBC")
+
+        // Positive slice: bit 7 clear, so sext must NOT fill.
+        //   0xABCD >> 0 = 0xCD... use [10:4] = 0x3C, 7 bits, top bit clear.
+        let slice_pos = w16[10:4].sext<16>()
+        assert slice_pos == 0x003C
+            else fail("sext<16> of w16[10:4] (0x3C): got 0x${slice_pos:04x}, want 0x003C")
+
+        // ── probe/port read as a wrapping operand ───────────────────
+        // The probe-width lookup silently mis-masked a same-named record
+        // field and leaked widths across tests in a multi-test file
+        // (harc#551). A bare DUT port is width-erased, so it must be cast
+        // before it can be a wrap operand — that cast is the shape under
+        // test.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+
+        dut.rst = 0
+        dut.en = 1
+        for i in 1 .. 10
+            wait 1 cycle
+        end for
+        assert dut.count_out == 10
+            else fail("after 10 enabled cycles: count_out=${dut.count_out}, expected 10")
+
+        // 10 +% 250 at 8 bits = 260 & 0xFF = 4.
+        let wrapped : uint<8> = (dut.count_out as uint<8>) +% 250
+        assert wrapped == 4
+            else fail("(count_out=10 as uint<8>) +% 250 must wrap to 4, got ${wrapped}")
+
+        // The non-wrapping form on the same operand must NOT mask.
+        let widened : uint<9> = (dut.count_out as uint<9>) + 250
+        assert widened == 260
+            else fail("`+` must not wrap: got ${widened}, want 260")
+
+        log(info, "PASS: backend-parity shapes agree")
+    end run
+end impl BackendParityTest

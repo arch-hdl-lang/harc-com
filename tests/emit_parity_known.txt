@@ -1,0 +1,22 @@
+# Known v1 <-> TB-IR emitted-parity exemptions, checked by
+# tests/run_emit_parity.sh.
+#
+# An entry here is a NAMED DECISION, not a mute button. Each row must
+# carry an issue number, and the direction must be stated, so that
+# "acceptance differs" never silently becomes background noise — which is
+# how harc#551's blind spot formed in the first place.
+#
+# Row: <fixture_name> | <direction> | <issue> | <reason>
+#
+# Direction is one of:
+#   v1-only    v1 emits, TB-IR rejects. The DANGEROUS direction: TB-IR is
+#              the default backend, so this is a user-visible regression
+#              unless TB-IR's rejection is a declared subset gap (those
+#              are auto-detected by the `--codegen v1` escape hatch in the
+#              diagnostic and need no row here).
+#   tbir-only  TB-IR emits, v1 rejects. A v1 gap. Lower priority given v1
+#              retirement (harc#548), but still tracked.
+#
+# Keep this file short. A growing list means the two backends are drifting.
+
+msg_suspending_call_test | tbir-only | harc#573 | v1 cannot resolve a `tlm_method` named `read` through a bus binding; TB-IR lowers it. v1-only gap, retirement-bound.

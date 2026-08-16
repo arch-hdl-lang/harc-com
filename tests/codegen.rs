@@ -8859,6 +8859,91 @@ end test T"#;
     );
 }
 
+// ── harc#551: backend subset gaps, pinned so they stay declared ──────
+
+/// Shapes v1 emits and TB-IR refuses. Each refusal MUST name
+/// `--codegen v1`, because that escape hatch is what marks it a declared
+/// subset gap (harc#548) rather than a divergence — and
+/// `tests/run_emit_parity.sh` keys its whole acceptance check on exactly
+/// that string. A gap that silently stops naming it becomes a CI-visible
+/// backend divergence, which is the outcome that check exists to force.
+#[test]
+fn backend_subset_gaps_still_name_the_v1_escape_hatch() {
+    for (label, body) in [
+        (
+            "ARCH sized literal",
+            r#"        let a : uint<8> = 8'hFF
+        assert a == 255 else fail("x")"#,
+        ),
+        (
+            "cast above 128 bits",
+            r#"        let big : uint<200> = 1
+        let w = (big as uint<200>).zext<300>()
+        assert w == 1 else fail("x")"#,
+        ),
+    ] {
+        let src = format!(
+            r#"test SubsetGap
+    let dut : Top
+    run
+{body}
+        log(info, "x")
+    end run
+end test SubsetGap"#
+        );
+        // v1 accepts.
+        let parsed = parse_source(&src).expect("parses");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+        assert!(
+            cpp_tb::emit(&merged).is_ok(),
+            "{label}: v1 should still accept this shape"
+        );
+        // TB-IR rejects, and says how to proceed.
+        let err = harc::ir::lower::lower_program(&merged)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("--codegen v1"),
+            "{label}: TB-IR's rejection must name the v1 escape hatch, or \
+             run_emit_parity.sh will read it as a divergence; got: {err}"
+        );
+    }
+}
+
+/// `let s : sint<8> = a +% b` — harc#551 records this as an *internal
+/// error* under TB-IR, which was true when that issue was filed. Both
+/// backends now reject it with a real diagnostic. Pinned so it cannot
+/// regress back into the compiler-bug channel, and so the two backends
+/// keep agreeing.
+#[test]
+fn a_signed_wrap_destination_is_a_real_diagnostic_in_both_backends() {
+    let src = r#"test SignedWrapDest
+    let dut : Top
+    run
+        let a : uint<8> = 200
+        let s : sint<8> = a +% 1
+        log(info, "${s}")
+    end run
+end test SignedWrapDest"#;
+    let v1 = v1_emit_err(src);
+    assert!(
+        !v1.contains("internal error") && v1.contains("signed"),
+        "v1 must reject with a real diagnostic; got: {v1}"
+    );
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let tbir = harc::ir::lower::lower_program(&merged)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        !tbir.is_empty() && !tbir.contains("internal error"),
+        "TB-IR must reject with a real diagnostic, not the compiler-bug \
+         channel; got: {tbir}"
+    );
+}
+
 // ── #552: wrapping operators inside `keep` constraints ───────────────
 
 /// The solver variable is a 64-bit bitvector with the field's declared
