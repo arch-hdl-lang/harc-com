@@ -16791,6 +16791,28 @@ impl Emitter {
                     // ≤64-bit cases TB-IR rejects. Same diagnostic and same
                     // accepted set as TB-IR's `check_scalar_assign_width`.
                     let dw = w as u32;
+                    // A wrap's residue is unsigned (spec §2.4), so binding
+                    // one to a signed local is a signedness mismatch. TB-IR
+                    // rejects it; v1 accepted it silently.
+                    if matches!(name, BuiltinTy::SInt | BuiltinTy::SIntCap) {
+                        if let Some(v) = l.value.as_ref() {
+                            if matches!(
+                                &*v.kind,
+                                ExprKind::Binary {
+                                    op: BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap,
+                                    ..
+                                }
+                            ) {
+                                self.errors.push(format!(
+                                    "assignment of an unsigned {dw}-bit value to `{}`, \
+                                     declared signed {dw} bits. Signedness must match \
+                                     — relabel the value explicitly with \
+                                     `as sint<{dw}>()`.",
+                                    l.name.name
+                                ));
+                            }
+                        }
+                    }
                     let aw = l
                         .value
                         .as_ref()
@@ -19169,7 +19191,20 @@ fn extract_event_subscription(event: &Expr) -> Option<(String, String)> {
 /// against int literals). The `tseq_names` arg is kept for future use
 /// but the current decision is broader than tseq alone.
 fn rhs_wants_auto(e: &Expr, _tseq_names: &std::collections::HashSet<String>) -> bool {
-    matches!(&*e.kind, ExprKind::Call { .. })
+    match &*e.kind {
+        ExprKind::Call { .. } => true,
+        // A wrapping operator's residue is UNSIGNED (spec §2.4), and the
+        // emitted mask is already spelled `((uint64_t)(…))`. Defaulting
+        // the local to `int64_t` reinterpreted that residue as signed, so
+        // `let y = a -% 1` on a `uint<64>` gave `y > 0` false under v1 and
+        // true under TB-IR, whose local is `uint64_t`. Letting `auto`
+        // deduce from the mask puts the two backends on the same type.
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+        ),
+        _ => false,
+    }
 }
 
 /// Extract `T` from `TSeq<T>`. Returns the C++ rendering of the inner
@@ -19409,6 +19444,19 @@ fn narrowing_source_width(e: &Emitter, value: &Expr) -> Option<u32> {
         // inner scope that has already closed. Decline rather than
         // reject on a width the value may never have had.
         ExprKind::Ident(id) if e.shadowed_lets.contains(&id.name) => None,
+        // A wrap's residue is `max(W(lhs), W(rhs))` bits wide, so it is a
+        // width-carrying source: `let x : uint<4> = a +% 1` on an 8-bit
+        // `a` narrows. TB-IR sees this (the wrap's implicit mask is a
+        // `WidthCast`, which its check covers); v1 accepted it and stored
+        // the unmasked 8-bit residue in a 4-bit-declared local.
+        ExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+            ) =>
+        {
+            e.wrap_result_width(*op, lhs, rhs).ok()
+        }
         _ => e.infer_expr_width_best_effort(value),
     }
 }

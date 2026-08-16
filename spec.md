@@ -260,32 +260,22 @@ reject an unknown-width or `> 64`-bit operand: the legacy `--codegen v1`
 backend previously treated these as pass-through sugar (`+ / - / *`), which
 made the same source produce different values under the two emitters.
 
-Five caveats remain, and the accepted operand sets are close but not proven
+Both backends now fold a wrap in a `const` initializer at the same operand
+width, reject a narrower typed destination (`let x : uint<4> = a +% 1` on an
+8-bit `a` — the residue is 8 bits wide), reject a signed destination
+(`let s : sint<8> = a +% b` — the residue is unsigned; relabel explicitly),
+and give an untyped `let` the unsigned type the residue actually has.
+
+Two caveats remain, and the accepted operand sets are close but not proven
 identical in either direction — the two backends infer operand widths in
 separate code, so a shape one resolves and the other does not shows up as a
 backend-specific accept or reject rather than as a value difference.
 
-- A **`const` initializer** is the one context the backends genuinely handle
-  differently: v1 folds the masked value, the TB-IR backend rejects the form
-  outright. Spell the mask explicitly there.
-- A **`sint<N>` destination** — `let s : sint<8> = a +% b` — is refused by the
-  TB-IR backend, which types a wrap's result unsigned per the signedness rule
-  above and then will not store it in a signed local. It surfaces as an
-  `internal error` from the post-lowering verifier rather than as a source
-  diagnostic, which is a defect in its own right. v1 accepts it. Assign to a
-  `uint<N>` local and relabel.
-- A **narrower typed destination** — `let x : uint<4> = a +% 1` on an 8-bit
-  `a` — is rejected by the TB-IR backend, which treats the wrap's implicit
-  mask as a width-carrying source and sees an 8-bit value narrowing into 4
-  bits. v1 accepts it and stores the unmasked 8-bit residue. Match the
-  destination to the wrap width, or narrow explicitly with `.trunc<4>()`.
 - Inside a **`keep` constraint** the wrap is dropped by *both* backends (`+%`
-  reaches the solver as plain `+`). That is a shared gap in the constraint
-  lowering rather than a divergence, but a solved value is not masked.
-- Binding a wrap to an **untyped `let` at width 64** gives the result
-  different signedness under the two backends (v1 declares the local
-  `int64_t`, TB-IR `uint64_t`), which changes `>`, `/`, and `>>`. Annotate the
-  destination (`let y : uint<64> = …`) to pin it.
+  reaches the solver as plain `+`, at 64-bit rank with a separate range
+  assumption). That is a shared gap in the constraint lowering rather than a
+  divergence, but a solved value is not masked, and a constraint whose only
+  solutions require the wrap is reported unsatisfiable.
 - The **capitalised `UInt<N>`/`SInt<N>` spellings on a typed `let`** are
   width-erased under `--codegen v1`: it records widths only for the
   lower-case forms, so `let a : UInt<8> = 255` then `a.sext<16>()` yields 255
