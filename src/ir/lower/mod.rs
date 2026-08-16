@@ -111,6 +111,37 @@ enum ConstFoldErr {
 
 use ConstFoldErr::Invalid as FoldInvalid;
 
+/// Best-effort width of a wrapping operator's operand inside a `const`
+/// initializer: a literal is self-sized to its minimum unsigned width, an
+/// `as uint<W>`-family cast carries W, parens recurse. Everything else —
+/// notably a reference to another `const`, whose declared type the fold
+/// table does not carry — is unknown.
+///
+/// Deliberately the same shape as v1's `wrap_operand_width`, so the two
+/// backends fold the same set of constant wraps.
+fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_operand_width(inner),
+        // A nested wrap composes: `(1 +% 2) +% 3` masks at each step's own
+        // operand width. v1's `wrap_operand_width` has this arm; without
+        // it TB-IR rejected chains v1 folds.
+        ExprKind::Binary {
+            op:
+                crate::ast::BinaryOp::AddWrap
+                | crate::ast::BinaryOp::SubWrap
+                | crate::ast::BinaryOp::MulWrap,
+            lhs,
+            rhs,
+        } => Some(const_operand_width(lhs)?.max(const_operand_width(rhs)?)),
+        ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(ty),
+        ExprKind::Int(s) => {
+            let v = exprs::parse_int_literal(s.as_str())?;
+            Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
+        }
+        _ => None,
+    }
+}
+
 /// Const-fold a file-scope `const` initializer expression, resolving
 /// identifiers against `consts` (earlier `const` values and enum-
 /// variant indices, both in source order; `self_name` is the constant
@@ -124,29 +155,9 @@ use ConstFoldErr::Invalid as FoldInvalid;
 /// (const/enum names), parentheses, `as uint/sint/bits<≤64>` relabel
 /// casts, unary `-`/`~`/`!`/`not`, and the binary arithmetic
 /// (`+ - * / %`), shift (`<< >>`), bitwise (`& | ^`), comparison, and
-/// logical operators. The wrapping `+% -% *%` spellings are rejected —
-/// their §2.4 mask depends on static operand widths the fold does not
-/// model.
-/// Best-effort width of a wrapping operator's operand inside a `const`
-/// initializer: a literal is self-sized to its minimum unsigned width, an
-/// `as uint<W>`-family cast carries W, parens recurse. Everything else —
-/// notably a reference to another `const`, whose declared type the fold
-/// table does not carry — is unknown.
-///
-/// Deliberately the same shape as v1's `wrap_operand_width`, so the two
-/// backends fold the same set of constant wraps.
-fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
-    match &*e.kind {
-        ExprKind::Paren(inner) => const_operand_width(inner),
-        ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(&ty.clone()),
-        ExprKind::Int(s) => {
-            let v = exprs::parse_int_literal(s.as_str())?;
-            Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
-        }
-        _ => None,
-    }
-}
-
+/// logical operators, and the wrapping `+% -% *%` spellings, which fold
+/// at `max(W(lhs), W(rhs))` when both operand widths are statically
+/// known (see `const_operand_width`) and are rejected when they are not.
 fn fold_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
@@ -305,6 +316,32 @@ fn fold_const(
                              initializer only up to 64 bits (this one masks to \
                              {width})"
                         )));
+                    }
+                    // v1 emits the unmasked arithmetic into a `constexpr`
+                    // initializer at the operands' natural C++ type, so a
+                    // sum that overflows signed 64-bit is a hard g++ error
+                    // there ("overflow in constant expression"). Folding it
+                    // here would build under one backend and not the other.
+                    // Decline instead, keeping the two in step; the
+                    // underlying v1 emission bug is tracked separately.
+                    let signed_overflows = {
+                        let (x, y) = (a.bits as i64, b.bits as i64);
+                        x >= 0
+                            && y >= 0
+                            && match op {
+                                BinaryOp::SubWrap => false,
+                                BinaryOp::MulWrap => x.checked_mul(y).is_none(),
+                                _ => x.checked_add(y).is_none(),
+                            }
+                    };
+                    if signed_overflows {
+                        return Err(FoldInvalid(
+                            "this wrapping constant overflows the signed 64-bit \
+                             range before its mask is applied, which cannot be \
+                             expressed as a C++ `constexpr` initializer; spell the \
+                             masked value explicitly"
+                                .into(),
+                        ));
                     }
                     let raw = match op {
                         BinaryOp::SubWrap => a.bits.wrapping_sub(b.bits),

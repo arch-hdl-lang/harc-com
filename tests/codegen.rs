@@ -8651,3 +8651,119 @@ end test T"#;
         "tbir: expected the same diagnostic, not an internal error; got: {tbir}"
     );
 }
+
+/// The wrap arm of the narrowing check reads `let_widths` through
+/// `wrap_result_width`, so it must honour the shadowed-name guard too —
+/// otherwise it simply bypasses it and re-opens the false rejection the
+/// guard exists to prevent.
+#[test]
+fn a_shadowed_name_in_a_wrap_operand_does_not_trigger_the_narrowing_check() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = 1
+        if a == 1
+            let a : uint<64> = 2
+        end if
+        let b : uint<8> = a +% 1
+        log(info, "${b}")
+    end run
+end test T"#;
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    assert!(
+        cpp_tb::emit(&merged).is_ok(),
+        "v1 must not reject a wrap on a shadowed name"
+    );
+    assert!(
+        harc::ir::lower::lower_program(&merged).is_ok(),
+        "TB-IR accepts it, so v1 must too"
+    );
+}
+
+/// The signed-destination rejection must see through parentheses, cover
+/// the assignment form, and fire for the capitalised spelling — each of
+/// those escaped the first attempt while TB-IR rejected them.
+#[test]
+fn signed_wrap_destination_is_rejected_in_every_spelling() {
+    for (label, src) in [
+        (
+            "parenthesised",
+            r#"test T
+    let dut : Top
+    run
+        let a : sint<8> = 100
+        let s : sint<8> = (a +% a)
+        log(info, "${s}")
+    end run
+end test T"#,
+        ),
+        (
+            "assignment form",
+            r#"test T
+    let dut : Top
+    run
+        let a : sint<8> = 100
+        let s : sint<8> = 0
+        s = a +% a
+        log(info, "${s}")
+    end run
+end test T"#,
+        ),
+        (
+            "capitalised SInt",
+            r#"test T
+    let dut : Top
+    run
+        let a : sint<8> = 100
+        let s : SInt<8> = a +% a
+        log(info, "${s}")
+    end run
+end test T"#,
+        ),
+    ] {
+        let err = v1_emit_err(src);
+        assert!(
+            err.contains("Signedness must match"),
+            "[{label}] v1 must reject; got: {err}"
+        );
+    }
+}
+
+/// The suggested relabel must actually parse — `as sint<N>()` with
+/// parentheses is a syntax error.
+#[test]
+fn the_suggested_signedness_relabel_parses() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let a : sint<8> = 100
+        let s : sint<8> = (a +% a) as sint<8>
+        log(info, "${s}")
+    end run
+end test T"#;
+    let parsed = parse_source(src).expect("the suggested spelling must parse");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    assert!(cpp_tb::emit(&merged).is_ok(), "and must emit");
+}
+
+/// An untyped `let` bound to a *parenthesised* wrap must also deduce the
+/// unsigned type — one pair of parentheses defeated the first attempt,
+/// leaving the width-64 signedness divergence reachable.
+#[test]
+fn untyped_let_bound_to_a_parenthesised_wrap_is_unsigned() {
+    let cpp = v1_cpp(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<64> = 0xFFFFFFFFFFFFFFFF
+        let z = (a -% 1)
+        log(info, "${z}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("auto z =") && !cpp.contains("int64_t z ="),
+        "a parenthesised wrap destination must deduce unsigned; got:\n{cpp}"
+    );
+}
