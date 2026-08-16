@@ -2547,6 +2547,36 @@ case and only locally-determinable `Assign` types are compared).
     about reading v1 correctly; this one is about not writing the probe
     at all when the answer is already recorded.
 
+41. **Twelfth probe sweep: regblock offsets and resets fold to zero
+    too (2026-08-16).**
+
+    The same defect divergence 39 found in `addrmap`, in `regblock`: v1
+    folds a non-literal register `@ <addr>` offset or `reset` value to
+    ZERO. Both sites are `NotImplemented` / silently-mis-lowers.
+
+    The offset case is the worse of the two. The emitted address TABLE
+    entry becomes `{ "SRC", 0, 32 }` and the decode becomes
+    `addr == 0`, so the register aliases whatever lives at offset 0 —
+    `CTRL`, in the fixture — and its reads and writes silently hit a
+    different register. The reset case starts the mirror at 0 instead of
+    the declared value, so every readback compares against the wrong
+    baseline.
+
+    Three shapes verified — a `const` offset, an arithmetic offset, and
+    a `const` reset — each by mutating `regblock_subset_test` (in the
+    equivalence registry, passing under both backends) ONE TOKEN at a
+    time, per the rule the previous sweep added. The control lowers in
+    both backends, so the probes provably reach the regblock arms; the
+    negative anchor is a literal `0x00` offset, which changes the same
+    eight lines the fold does.
+
+    That `addrmap` and `regblock` share the defect is not a
+    coincidence — both hand-rolled a literals-only `fold_const` next to
+    a comment assuming v1 was more capable. The pattern to watch for is
+    a local constant-folder: every one found so far has been narrower
+    than the file's own comment claimed, and v1's behaviour on what it
+    rejects has been wrong rather than absent.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
