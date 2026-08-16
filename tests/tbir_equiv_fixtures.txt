@@ -134,6 +134,7 @@ wrapping_arithmetic_operator_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass
 record_let_copy_test | Top | top_counter.sv | - | pass
 record_vec_field_copy_test | Top | top_counter.sv | - | pass
+record_vec_field_iter_test | Top | top_counter.sv | - | pass
 vec_of_struct_field_test | Top | top_counter.sv | - | pass
 vec_record_field_test | Top | top_counter.sv | - | pass
 vec_record_decl_only_test | Top | top_counter.sv | - | pass

@@ -2137,9 +2137,13 @@ fn validate_testbench_component(
                 } = &f.ty
                 {
                     if f.default.is_some() {
-                        return Err(unsupported(
+                        // v1 emits the default into the member
+                        // initializer (`HarcQueue<uint64_t> q = 0;`),
+                        // and `HarcQueue` has no such constructor.
+                        return Err(not_implemented(
                             &format!("a default on testbench queue field `{}`", f.name.name),
                             "queues default-construct empty; drop the `default`",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                     components::lower_queue_elem(
@@ -3190,12 +3194,15 @@ fn lower_test(
                         } = &f.ty
                         {
                             if f.default.is_some() {
-                                return Err(unsupported(
+                                // As above: `HarcQueue<T> q = <default>;`
+                                // names a constructor that does not exist.
+                                return Err(not_implemented(
                                     &format!(
                                         "a default on testbench queue field `{}`",
                                         f.name.name
                                     ),
                                     "queues default-construct empty; drop the `default`",
+                                    V1Status::EmitsUncompilable,
                                 ));
                             }
                             let elem = components::lower_queue_elem(

@@ -2,7 +2,7 @@
 //! until` into the block shapes specified in docs/tb-ir-design.md
 //! §"Control flow".
 
-use super::{unsupported, FuncBuilder, LoopFrame, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LoopFrame, LowerError, V1Status};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
@@ -97,6 +97,26 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // `for x in <rec>.<vecfield>` — iterate a fixed-size `Vec<T, N>`
+        // record field. v1 emits `for (auto& x : _tb.cur.data)`, which
+        // walks the whole `std::array`; the length is a schema constant
+        // here, so it lowers to a counted loop over `0 … N-1` whose body
+        // binds the loop variable to `<field>[i]`.
+        if matches!(&*f.iter.kind, ExprKind::Field { .. }) {
+            if let Some(chain) = self.try_record_field_chain(&f.iter)? {
+                let Some(n) = chain.leaf_vec_len else {
+                    // A scalar leaf is not iterable in either backend:
+                    // v1 emits `for (auto& x : _tb.cur.v)` over a
+                    // `uint64_t`, which has no `begin`/`end`.
+                    return Err(not_implemented(
+                        &format!("`for x in {}` over a scalar record field", chain.dotted),
+                        "only `Vec<T, N>` record fields are iterable",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                return self.lower_for_in_record_vec(f, chain, n);
+            }
+        }
         let ExprKind::RangeLit {
             lo: Some(lo),
             hi: Some(hi),
@@ -104,7 +124,8 @@ impl FuncBuilder<'_> {
         else {
             return Err(unsupported(
                 "`for x in <sequence>`",
-                "only literal ranges `for i in lo .. hi` and `for t in <tseq-result>` are lowered",
+                "only literal ranges `for i in lo .. hi`, `for t in <tseq-result>`, and \
+                 `for x in <rec>.<vecfield>` are lowered",
             ));
         };
 
@@ -194,7 +215,89 @@ impl FuncBuilder<'_> {
                 index: Box::new(Expr::Local(counter)),
             },
         );
-        self.lower_counted_loop_with_prologue(cond, step, bind, &f.body)?;
+        self.lower_counted_loop_with_prologue(cond, step, bind, None, &f.body)?;
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for x in <rec>.<vecfield>` over a `Vec<T, N>` record field. The
+    /// length is a schema constant, so the header is a plain
+    /// `i < N` counter and the body's prologue binds `x` to
+    /// `<field>[i]` — the same `Expr::RecordField` an explicit
+    /// `<rec>.<vecfield>[i]` read lowers to. Like `for t in <seq>`, the
+    /// loop variable is a COPY of the element (the IR has no
+    /// by-reference local); `lower_counted_loop_with_prologue` rejects a
+    /// write to it rather than dropping one silently.
+    ///
+    /// Non-leaf element selectors (`t.entries[k].data`) are stashed in
+    /// temps BEFORE the loop. v1's range-for evaluates the container
+    /// expression once and iterates that, so a selector left inside the
+    /// per-iteration bind would (a) re-read `k` every iteration, walking
+    /// a different row each time if the body mutates it, and (b) leave a
+    /// port read in an `Assign` value, which the verifier rejects as an
+    /// internal error rather than a user diagnostic.
+    fn lower_for_in_record_vec(
+        &mut self,
+        f: &ForStmt,
+        chain: super::exprs::RecordFieldChain,
+        n: usize,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        // Snapshot each selector into its own temp, UNCONDITIONALLY: a
+        // bare `Expr::Local` is what `stash_if_impure` would leave in
+        // place, and a local is exactly what the body can reassign
+        // (`for x in t.entries[k].data … k = k + 1`). Copying the value
+        // once is what pins the container for the whole loop.
+        let mid_indices = chain
+            .mid_indices
+            .into_iter()
+            .map(|(pos, idx)| {
+                let idx = self.hoist_ports(idx);
+                let t = self.fresh_temp();
+                self.push(Stmt::Assign(t, idx));
+                (pos, Expr::Local(t))
+            })
+            .collect::<Vec<_>>();
+        let counter = self.fresh_temp();
+        self.push(Stmt::Assign(
+            counter,
+            Expr::Literal {
+                value: 0,
+                ty: IrType::Unknown,
+            },
+        ));
+        let cond = Expr::Binary(
+            BinOp::Lt,
+            Box::new(Expr::Local(counter)),
+            Box::new(Expr::Literal {
+                value: n as u64,
+                ty: IrType::Unknown,
+            }),
+        );
+        let step = Stmt::Assign(
+            counter,
+            Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Local(counter)),
+                Box::new(Expr::Literal {
+                    value: 1,
+                    ty: IrType::Unknown,
+                }),
+            ),
+        );
+        let var = self.declare(&f.var.name);
+        self.set_local_type(var, chain.leaf_ty);
+        let bind = Stmt::Assign(
+            var,
+            Expr::RecordField {
+                local: chain.local,
+                field: chain.field,
+                path: chain.path,
+                mid_indices,
+                index: Some(Box::new(Expr::Local(counter))),
+            },
+        );
+        self.lower_counted_loop_with_prologue(cond, step, bind, Some(var), &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -240,20 +343,30 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, None, body)
+        self.lower_counted_loop_impl(header_cond, latch_step, None, None, body)
     }
 
     /// `lower_counted_loop` with a prologue statement injected at the top
     /// of the body block, before the user statements (used by `for t in
     /// <seq>` to copy `seq[i]` into the loop variable each iteration).
+    /// `no_write` names a local the body may not assign. It is set only
+    /// for the `Vec`-record-field loop: that form is new here, so
+    /// rejecting the write costs no working program, and shipping a
+    /// SILENT divergence from v1's `auto&` would be worse than
+    /// rejecting. `for t in <tseq-result>` deliberately passes `None` —
+    /// its by-copy loop variable predates this sweep and `for t in txns
+    /// … t.addr = … end for` is an established idiom both backends
+    /// accept today; turning it into an error is a regression, and
+    /// giving the tseq form real write-back is its own change.
     fn lower_counted_loop_with_prologue(
         &mut self,
         header_cond: Expr,
         latch_step: Stmt,
         prologue: Stmt,
+        no_write: Option<LocalId>,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), body)
+        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), no_write, body)
     }
 
     fn lower_counted_loop_impl(
@@ -261,6 +374,7 @@ impl FuncBuilder<'_> {
         header_cond: Expr,
         latch_step: Stmt,
         prologue: Option<Stmt>,
+        no_write: Option<LocalId>,
         body: &Block,
     ) -> Result<(), LowerError> {
         let header = self.new_block();
@@ -282,6 +396,9 @@ impl FuncBuilder<'_> {
             self.push(p);
         }
         self.lower_block_stmts(body)?;
+        if let Some(bound) = no_write {
+            self.reject_loop_var_write(bound, body_b)?;
+        }
         self.pop_scope();
         if !self.is_terminated() {
             self.terminate(Terminator::Jump(latch));
@@ -293,6 +410,57 @@ impl FuncBuilder<'_> {
         self.terminate(Terminator::Jump(header));
 
         self.start_block(exit);
+        Ok(())
+    }
+
+    /// Reject a write to an element-bound loop variable. `body_b` is the
+    /// loop body's entry block, whose FIRST statement is the bind this
+    /// check must not count; every block from there on belongs to the
+    /// body (the latch and exit blocks are still empty at this point,
+    /// and any block the body opened was appended after them).
+    ///
+    /// EVERY statement that names a local destination is checked, not
+    /// just `Assign`: `lower_assign` routes `x = sb.q.pop()`,
+    /// `x = xact.m(…)` and `x = comp.m(…)` into `ScoreboardOp::QueuePop`
+    /// / `TransactorCall` / `ComponentCall` with the loop variable as
+    /// their `dest`, so a check that only looked for `Assign` would let
+    /// exactly those writes through.
+    fn reject_loop_var_write(&self, bound: LocalId, body_b: BlockId) -> Result<(), LowerError> {
+        for (bi, block) in self.blocks.iter().enumerate().skip(body_b.0 as usize) {
+            for (si, s) in block.stmts.iter().enumerate() {
+                if bi == body_b.0 as usize && si == 0 {
+                    continue; // the element bind itself
+                }
+                let writes = match s {
+                    Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                        *l == bound
+                    }
+                    Stmt::RecordFieldWrite { local, .. } | Stmt::RecordWriteCb { local, .. } => {
+                        *local == bound
+                    }
+                    Stmt::TbQueuePop { dest, .. }
+                    | Stmt::TransactorStateQueuePop { dest, .. }
+                    | Stmt::ComponentQueuePop { dest, .. } => *dest == bound,
+                    Stmt::TransactorCall { dest, .. }
+                    | Stmt::TransactorSelfCall { dest, .. }
+                    | Stmt::ComponentCall { dest, .. } => *dest == Some(bound),
+                    Stmt::ScoreboardOp {
+                        op: crate::ir::ScoreboardOp::QueuePop { dest, .. },
+                        ..
+                    } => *dest == bound,
+                    _ => false,
+                };
+                if writes {
+                    return Err(not_implemented(
+                        "a write to a `for` loop's element variable",
+                        "the loop variable is a copy of the element, so the write would \
+                         not reach the container — index the container directly \
+                         (`xs[i] = …` over `for i in 0 .. N-1`)",
+                        V1Status::SilentlyMisLowers,
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
