@@ -87,6 +87,7 @@ wide_cast_test          | Top            | top_counter.sv         |
 bitslice_uninit_test    | Top            | top_counter.sv         |
 record_let_copy_test    | Top            | top_counter.sv         |
 record_vec_field_copy_test | Top         | top_counter.sv         |
+record_vec_field_iter_test | Top         | top_counter.sv         |
 vec_of_struct_field_test | Top           | top_counter.sv         |
 vec_record_field_test   | Top            | top_counter.sv         |
 vec_record_decl_only_test | Top          | top_counter.sv         |

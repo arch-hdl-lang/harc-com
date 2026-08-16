@@ -2148,6 +2148,76 @@ case and only locally-determinable `Assign` types are compared).
     value-position spelling rather than in the `Invalid` block with the
     reversed slice.
 
+34. **Fourth probe sweep: `Vec`-field iteration, discarded pops, and a
+    landing-dependent site (2026-08-16).** Twenty-five constructs across
+    queues, `Vec` record fields, and name resolution. Two gaps closed;
+    twelve diagnostics reclassified.
+
+    - **`for x in <rec>.<vecfield>`** — iterating a `Vec<T, N>` record
+      field. v1 emits `for (auto& x : rec.data)` over the `std::array`,
+      which works; TB-IR refused the form entirely, so a loop this plain
+      needed `--codegen v1`. The length is a schema constant, so it
+      lowers to a counted loop over `0 … N-1` whose body binds the loop
+      variable to the same `Expr::RecordField` an explicit
+      `<rec>.<vecfield>[i]` read produces. Nested paths
+      (`a.b.<vecfield>`) reach it too. `record_vec_field_iter_test` is
+      the equivalence fixture.
+
+      v1's `auto&` is a REFERENCE; the IR has no by-reference local, so
+      the loop variable is a copy. That difference is observable only
+      through a WRITE to the loop variable, which
+      `lower_counted_loop_with_prologue` now rejects — for
+      `for t in <tseq-result>` as well, where the copy has always been
+      the behavior and a dropped write was always possible. The check
+      runs on the lowered CFG rather than the AST: it scans every block
+      the body opened for an `Assign`/`RecordFieldWrite` targeting the
+      bound local, skipping the element bind itself.
+
+    - **A discarded `q.pop()` in statement position** — five sites
+      (testbench, scoreboard, component, bare target-responder state,
+      instance-qualified target state), each of which told the user to
+      "bind the popped value". `pop` mutates the queue, so the statement
+      has a point even with the value thrown away, and v1 emits exactly
+      that (`_tb.q.pop();`). Every IR pop carries a destination, so the
+      value now lands in a temp nothing reads (`discard_slot`), typed
+      from the queue element so a record pop keeps its struct slot. The
+      family is checked structurally, like the probe/bind-remap family
+      in divergence 32.
+
+    Diagnostics reclassified, all `NotImplemented` / emits-uncompilable:
+
+    | Construct | what v1 emits |
+    |---|---|
+    | an unresolved name (`let x = nope`) | `int64_t x = nope;` |
+    | assignment to an unknown name (`nope = 1`) | `nope = 1;` |
+    | uninitialized `let x` with no type | a COMMENT for the declaration, then `x = 1;` against a name never declared |
+    | indexing a scalar record field, read or write | the subscript verbatim against a `uint64_t` member |
+    | `for x in <scalar record field>` | `for (auto& x : rec.v)` over a `uint64_t` |
+    | whole-`Vec` WRITE with a non-matching RHS | `x.a = x.b;` between differently-shaped `std::array`s, or `= 5` |
+    | whole-record write with a non-matching RHS | `o.p = q;` between two unrelated structs |
+    | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines |
+    | a `default` on a queue field (2 sites) | `HarcQueue<uint64_t> q = 0;` — no such constructor |
+
+    **One site, several outcomes.** The whole-`Vec` READ
+    (`src/ir/lower/exprs.rs`) was reclassified and then reverted, which
+    is worth recording: what v1 does with the read depends on where it
+    LANDS. `assert r.data == r.data` emits `r.data == r.data`, which
+    compiles and works (`std::array` has `operator==`); `let d = r.data`
+    emits `int64_t d = _tb.r.data;` and `${r.data}` emits
+    `harc_printf_ll(r.data)`, neither of which does. A single rejection
+    site covering landings with different v1 outcomes cannot carry a
+    single honest `V1Status`, so it keeps the `Unsupported` label — true
+    somewhere — and leads with the detail that works everywhere. The
+    classes describe what a backend does, so a site that is not one
+    thing must not claim to be.
+
+    Two sites were left alone rather than guessed at: the whole-`Vec`
+    read and write of a transactor *state* record field. Both sit behind
+    an earlier gate (record-typed transactor fields), so no fixture
+    built for this sweep reached them and no v1 output was observed. An
+    unverified reclassification is the failure this method exists to
+    prevent.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

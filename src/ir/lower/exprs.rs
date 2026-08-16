@@ -184,9 +184,13 @@ impl FuncBuilder<'_> {
                          not representable",
                     ));
                 }
-                Err(unsupported(
+                // v1 has no rejection for an unresolved name: it emits
+                // the identifier verbatim (`int64_t x = nosuchthing;`),
+                // which the C++ compiler rejects as undeclared.
+                Err(not_implemented(
                     &format!("the unresolved name `{}`", id.name),
                     "",
+                    V1Status::EmitsUncompilable,
                 ))
             }
             ExprKind::Field { target, name } => {
@@ -319,6 +323,16 @@ impl FuncBuilder<'_> {
                     // leaf read (`let d = s.inner`) IS allowed — it yields
                     // the nested struct value (emitted as `local.field.p…`).
                     if chain.leaf_vec_len.is_some() {
+                        // Stays an `Unsupported`: what v1 does with the
+                        // read depends on where it LANDS. `assert r.data
+                        // == r.data` emits `r.data == r.data`, which
+                        // compiles and works (`std::array` has
+                        // `operator==`); `let d = r.data` emits
+                        // `int64_t d = _tb.r.data;` and `${r.data}` emits
+                        // `harc_printf_ll(r.data)`, neither of which
+                        // does. One site, several outcomes — so the
+                        // suggestion stays, and the detail leads with the
+                        // fix that works everywhere.
                         return Err(unsupported(
                             &format!("a whole-`Vec` read of record field `{}`", chain.dotted),
                             "index the field element-wise (`{rec}.{field}[i]`)",
@@ -1153,9 +1167,12 @@ impl FuncBuilder<'_> {
             return Ok(None);
         };
         if chain.leaf_vec_len.is_none() {
-            return Err(unsupported(
+            // v1 emits the subscript verbatim (`_tb.cur.v[1]`), which
+            // subscripts a `uint64_t`.
+            return Err(not_implemented(
                 &format!("indexing the scalar record field `{}`", chain.dotted),
                 "only `Vec<T, N>` record fields are indexable",
+                V1Status::EmitsUncompilable,
             ));
         }
         let idx = self.lower_expr(index)?;
@@ -1569,9 +1586,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("scoreboard queue method `{field}.{queue}.{other}(...)`"),
                     "only `push`/`pop`/`size`/`empty` are lowered",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         };
@@ -1619,9 +1637,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("testbench queue method `{field}.{other}(...)`"),
                     "only `push`/`pop`/`size`/`empty` are lowered",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         };
@@ -1655,9 +1674,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("component queue method `{queue}.{other}(...)`"),
                     "only `push`/`pop`/`size`/`empty` are lowered",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         };
@@ -1714,9 +1734,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("target-state queue method `{field}.{other}(...)`"),
                     "only `push`/`pop`/`size`/`empty` are lowered",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         };
@@ -2124,9 +2145,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("target-state queue method `{instance}.{field}.{other}(...)`"),
                     "only `push`/`pop`/`size`/`empty` are lowered",
+                    V1Status::EmitsUncompilable,
                 ));
             }
         };

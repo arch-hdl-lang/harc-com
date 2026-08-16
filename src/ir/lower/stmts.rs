@@ -248,14 +248,15 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
-                            return Err(unsupported(
-                                &format!("a discarded testbench queue `{field}.pop()`"),
-                                "bind the popped value: `let v = <queue>.pop()`",
-                            ));
+                            let elem = self.tb_queue_elem(&field)?;
+                            let dest = self.discard_slot(elem);
+                            self.push(Stmt::TbQueuePop { field, dest });
+                            return Ok(());
                         }
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!("testbench queue method `{field}.{method}(...)` in statement position"),
                             "only `push`/`pop`/`size`/`empty` are lowered",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                 }
@@ -278,8 +279,9 @@ impl FuncBuilder<'_> {
                     }
                 }
                 // Statement-position scoreboard queue op:
-                // `sb.expected.push(x)`. `.pop()` in statement position is
-                // rejected below (its value must be bound).
+                // `sb.expected.push(x)` / `sb.expected.pop()`. A bare pop
+                // discards its value into an unread temp — the mutation is
+                // the point of writing it that way.
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let Some((sb, field, queue, method, nested_path)) =
                         self.as_scoreboard_queue_call(callee)
@@ -305,10 +307,15 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
-                            return Err(unsupported(
-                                &format!("a discarded `{field}.{queue}.pop()`"),
-                                "bind the popped value: `let v = {field}.{queue}.pop()`",
-                            ));
+                            let elem = self.scoreboard_queue_elem(sb, &queue)?;
+                            let dest = self.discard_slot(elem);
+                            self.push(Stmt::ScoreboardOp {
+                                sb,
+                                field,
+                                op: crate::ir::ScoreboardOp::QueuePop { queue, dest },
+                                nested_path,
+                            });
+                            return Ok(());
                         }
                         return Err(unsupported(
                             &format!(
@@ -321,8 +328,8 @@ impl FuncBuilder<'_> {
                 }
                 // Statement-position component-queue op:
                 // `errors.push(e)` (self) / `checker.sb.errors.push(e)`
-                // (path). `.pop()` in statement position is rejected (its
-                // value must be bound), mirroring the scoreboard form.
+                // (path), and the discarding `errors.pop()`, mirroring the
+                // scoreboard form.
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let Some((base, queue, method)) = self.as_component_queue_call(callee)? {
                         if method == "push" {
@@ -336,10 +343,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
-                            return Err(unsupported(
-                                &format!("a discarded `{queue}.pop()`"),
-                                "bind the popped value: `let v = <recv>.{queue}.pop()`",
-                            ));
+                            let elem = self.component_queue_elem(&base, &queue)?;
+                            let dest = self.discard_slot(elem);
+                            self.push(Stmt::ComponentQueuePop { base, queue, dest });
+                            return Ok(());
                         }
                         return Err(unsupported(
                             &format!(
@@ -351,9 +358,8 @@ impl FuncBuilder<'_> {
                     }
                 }
                 // Statement-position bound-to target-responder queue
-                // state-field op: `pending.push(x)` (bare field name).
-                // `.pop()` in statement position is rejected (its value
-                // must be bound), mirroring the component form.
+                // state-field op: `pending.push(x)` / `pending.pop()`
+                // (bare field name), mirroring the component form.
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let Some((field, method)) = self.as_state_queue_call(callee) {
                         if method == "push" {
@@ -372,23 +378,32 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
-                            return Err(unsupported(
-                                &format!("a discarded target-state `{field}.pop()`"),
-                                "bind the popped value: `let v = {field}.pop()`",
-                            ));
+                            let crate::ir::StateFieldKind::Queue { elem } =
+                                self.target_state_fields[&field].clone()
+                            else {
+                                unreachable!("as_state_queue_call gated on the Queue kind");
+                            };
+                            let dest = self.discard_slot(elem);
+                            self.push(Stmt::TransactorStateQueuePop {
+                                instance: String::new(),
+                                field,
+                                dest,
+                            });
+                            return Ok(());
                         }
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
                                 "target-state queue method `{field}.{method}(...)` in statement \
                                  position"
                             ),
                             "only `push`/`pop`/`size`/`empty` are lowered",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                 }
                 // Statement-position TEST-SCOPE target-responder queue
-                // state op: `target.pending.push(x)` (fully resolved
-                // instance). `.pop()` in statement position is rejected.
+                // state op: `target.pending.push(x)` /
+                // `target.pending.pop()` (fully resolved instance).
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let ExprKind::Field { target, name } = &*callee.kind {
                         if let Some((instance, field, kind)) = self.as_transactor_state_any(target)
@@ -411,19 +426,24 @@ impl FuncBuilder<'_> {
                                     return Ok(());
                                 }
                                 if method == "pop" {
-                                    return Err(unsupported(
-                                        &format!(
-                                            "a discarded target-state `{instance}.{field}.pop()`"
-                                        ),
-                                        "bind the popped value: `let v = {field}.pop()`",
-                                    ));
+                                    let crate::ir::StateFieldKind::Queue { elem } = kind else {
+                                        unreachable!("the enclosing `matches!` gated on Queue");
+                                    };
+                                    let dest = self.discard_slot(elem);
+                                    self.push(Stmt::TransactorStateQueuePop {
+                                        instance,
+                                        field,
+                                        dest,
+                                    });
+                                    return Ok(());
                                 }
-                                return Err(unsupported(
+                                return Err(not_implemented(
                                     &format!(
                                         "target-state queue method `{instance}.{field}.{method}\
                                          (...)` in statement position"
                                     ),
                                     "only `push`/`pop`/`size`/`empty` are lowered",
+                                    V1Status::EmitsUncompilable,
                                 ));
                             }
                         }
@@ -893,9 +913,13 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::Assign(id, Expr::Literal { value: 0, ty }));
                 return Ok(());
             }
-            return Err(unsupported(
+            // v1 emits a COMMENT for the declaration
+            // (`// let x (no type / no value)`) and then the later
+            // `x = 1;` against a name it never declared.
+            return Err(not_implemented(
                 &format!("uninitialized `let {}` without a scalar type", l.name.name),
                 "declare it with a scalar type (`let x: uint<N>;`) or give an initializer",
+                V1Status::EmitsUncompilable,
             ));
         };
         // Explicit scalar bit-width of the declaration, tracked on
@@ -1503,9 +1527,12 @@ impl FuncBuilder<'_> {
                      not representable",
                 ));
             }
-            return Err(unsupported(
+            // Same as the read side: v1 emits `nosuchthing = 1;`
+            // against an undeclared name.
+            return Err(not_implemented(
                 &format!("assignment to unknown name `{}`", id.name),
                 "",
+                V1Status::EmitsUncompilable,
             ));
         }
         // `t.field[i] = value` on a `Vec<T, N>` record field, at any nesting
@@ -1514,9 +1541,12 @@ impl FuncBuilder<'_> {
         if let ExprKind::Index { target: it, index } = &*target.kind {
             if let Some(chain) = self.try_record_field_chain(it)? {
                 if chain.leaf_vec_len.is_none() {
-                    return Err(unsupported(
+                    // v1 emits `b.v[1] = 3;` — a subscript on a
+                    // `uint64_t` member.
+                    return Err(not_implemented(
                         &format!("indexing the scalar record field `{}`", chain.dotted),
                         "only `Vec<T, N>` record fields are indexable",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 let idx = self.lower_expr_no_ports(index)?;
@@ -1577,13 +1607,18 @@ impl FuncBuilder<'_> {
                 // earlier.)
                 if let Some(dst_len) = chain.leaf_vec_len {
                     let dst_dotted = chain.dotted.clone();
+                    // v1 emits the member assignment verbatim
+                    // (`x.a = x.b;`), and `std::array<T, 4>` has no
+                    // `operator=` taking a `std::array<T, 8>` — nor a
+                    // scalar.
                     let mismatch = || {
-                        unsupported(
+                        not_implemented(
                             &format!(
                                 "a whole-`Vec` write of record field `{dst_dotted}` \
                                  with a non-matching RHS"
                             ),
                             "assign the field element-wise (`{rec}.{field}[i] = ...`)",
+                            V1Status::EmitsUncompilable,
                         )
                     };
                     // RHS must be a whole-`Vec` field read of matching shape.
@@ -1619,13 +1654,16 @@ impl FuncBuilder<'_> {
                 if let IrType::Record(dst_rid) = chain.leaf_ty {
                     let rhs = self.lower_expr_no_ports(value)?;
                     if self.record_id_of_expr(&rhs) != Some(dst_rid) {
-                        return Err(unsupported(
+                        // v1 emits `o.p = q;` between two unrelated
+                        // structs, which has no conversion.
+                        return Err(not_implemented(
                             &format!(
                                 "a whole-record write of field `{}` with a non-matching RHS",
                                 chain.dotted
                             ),
                             "assign a value of the same record type, or set the nested \
                              fields individually",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                     self.push(Stmt::RecordFieldWrite {
@@ -2900,6 +2938,25 @@ impl FuncBuilder<'_> {
         let on_fail = self.lower_fmt(&msg)?;
         self.push(Stmt::AssumeCheck { cond, on_fail });
         Ok(())
+    }
+
+    /// A destination for a queue `pop` whose value is discarded
+    /// (`q.pop()` in statement position). The pop still has to run —
+    /// `pop` mutates the queue, which is the whole point of writing it
+    /// bare — and every IR pop carries a destination, so the value
+    /// lands in a temp nothing reads. v1 emits the same call and drops
+    /// the return value.
+    ///
+    /// Typed from the queue's element so a record-element pop declares a
+    /// struct slot rather than a scalar one; a scalar element leaves the
+    /// temp at the default u64, exactly as a `let` with no annotation
+    /// does on the bound path.
+    fn discard_slot(&mut self, elem: crate::ir::QueueElem) -> crate::ir::LocalId {
+        let dest = self.fresh_temp();
+        if let crate::ir::QueueElem::Record(rid) = elem {
+            self.set_local_type(dest, IrType::Record(rid));
+        }
+        dest
     }
 
     /// The string literal in an `else fail("...")` clause. A non-literal

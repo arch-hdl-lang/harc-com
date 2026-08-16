@@ -1,0 +1,103 @@
+// `for x in <rec>.<vecfield>` — iterating a `Vec<T, N>` record field.
+// v1 emits `for (auto& x : rec.data)` over the `std::array`; tbir
+// previously rejected the form entirely ("only literal ranges ... and
+// `for t in <tseq-result>` are lowered"), so a loop this plain needed
+// `--codegen v1`. This fixture proves the iteration lowers and is
+// trace-equivalent under `--codegen v1` and `--codegen tbir`.
+//
+// tbir lowers it to a counted loop over the schema-constant length with
+// the loop variable bound to `<field>[i]` each iteration. That is a
+// COPY, where v1's `auto&` is a reference — a difference only a WRITE to
+// the loop variable can observe, and lowering rejects that write rather
+// than dropping it silently (see docs/tbir-mvp.md divergence 34). Every
+// read below is therefore identical under both backends.
+//
+// The DUT (`Top`, the counter) is irrelevant — it ticks in the
+// background while the test exercises host-side record array iteration.
+// Reused only because it's already in the Verilator regression.
+
+struct Bundle
+    tag  : uint<8> default 0
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+struct Nested
+    inner : Bundle
+end struct Nested
+
+testbench RecordVecFieldIterTb
+    dut : Top
+end testbench RecordVecFieldIterTb
+
+impl RecordVecFieldIterTest for RecordVecFieldIterTb
+    run
+        let src : Bundle
+        src.tag = 0x5A
+        src.data[0] = 1
+        src.data[1] = 2
+        src.data[2] = 4
+        src.data[3] = 8
+
+        // ── the whole field, in declaration order ──────────────────
+        let sum = 0
+        for x in src.data
+            sum = sum + x
+        end for
+        assert sum == 15 else fail("sum over src.data: ${sum}")
+
+        // Order matters, not just membership: fold left-to-right into a
+        // value that differs for any other visit order.
+        let acc = 0
+        for x in src.data
+            acc = acc * 10 + x
+        end for
+        assert acc == 1248 else fail("ordered fold over src.data: ${acc}")
+
+        // ── the loop runs exactly N times, N from the schema ───────
+        let n = 0
+        for x in src.data
+            n = n + 1
+        end for
+        assert n == 4 else fail("iteration count: ${n}")
+
+        // ── `break` / `continue` reach the right blocks ────────────
+        let seen = 0
+        for x in src.data
+            if x == 2
+                continue
+            end if
+            if x == 4
+                break
+            end if
+            seen = seen + x
+        end for
+        assert seen == 1 else fail("break/continue fold: ${seen}")
+
+        // ── nested record path (`a.b.<vecfield>`) ──────────────────
+        let nest : Nested
+        nest.inner.data[0] = 100
+        nest.inner.data[1] = 200
+        nest.inner.data[2] = 300
+        nest.inner.data[3] = 400
+        let deep = 0
+        for y in nest.inner.data
+            deep = deep + y
+        end for
+        assert deep == 1000 else fail("sum over nest.inner.data: ${deep}")
+
+        // ── iterating does not disturb the container ───────────────
+        assert src.data[0] == 1 else fail("src.data[0] after iteration: ${src.data[0]}")
+        assert src.data[3] == 8 else fail("src.data[3] after iteration: ${src.data[3]}")
+        assert src.tag == 0x5A else fail("src.tag after iteration: 0x${src.tag:02x}")
+
+        // ── the loop variable is scoped to the loop ────────────────
+        // A same-named local after the loop is a fresh binding, not the
+        // last element left behind.
+        let x = 99
+        assert x == 99 else fail("post-loop `x`: ${x}")
+
+        wait 1 cycle
+
+        log(info, "PASS: `for x in <rec>.<vecfield>` iterates under v1 and tbir")
+    end run
+end impl RecordVecFieldIterTest

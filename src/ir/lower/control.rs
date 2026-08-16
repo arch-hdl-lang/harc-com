@@ -2,7 +2,7 @@
 //! until` into the block shapes specified in docs/tb-ir-design.md
 //! §"Control flow".
 
-use super::{unsupported, FuncBuilder, LoopFrame, LowerError};
+use super::{not_implemented, unsupported, FuncBuilder, LoopFrame, LowerError, V1Status};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
@@ -97,6 +97,26 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // `for x in <rec>.<vecfield>` — iterate a fixed-size `Vec<T, N>`
+        // record field. v1 emits `for (auto& x : _tb.cur.data)`, which
+        // walks the whole `std::array`; the length is a schema constant
+        // here, so it lowers to a counted loop over `0 … N-1` whose body
+        // binds the loop variable to `<field>[i]`.
+        if matches!(&*f.iter.kind, ExprKind::Field { .. }) {
+            if let Some(chain) = self.try_record_field_chain(&f.iter)? {
+                let Some(n) = chain.leaf_vec_len else {
+                    // A scalar leaf is not iterable in either backend:
+                    // v1 emits `for (auto& x : _tb.cur.v)` over a
+                    // `uint64_t`, which has no `begin`/`end`.
+                    return Err(not_implemented(
+                        &format!("`for x in {}` over a scalar record field", chain.dotted),
+                        "only `Vec<T, N>` record fields are iterable",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                return self.lower_for_in_record_vec(f, chain, n);
+            }
+        }
         let ExprKind::RangeLit {
             lo: Some(lo),
             hi: Some(hi),
@@ -104,7 +124,8 @@ impl FuncBuilder<'_> {
         else {
             return Err(unsupported(
                 "`for x in <sequence>`",
-                "only literal ranges `for i in lo .. hi` and `for t in <tseq-result>` are lowered",
+                "only literal ranges `for i in lo .. hi`, `for t in <tseq-result>`, and \
+                 `for x in <rec>.<vecfield>` are lowered",
             ));
         };
 
@@ -199,6 +220,65 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    /// `for x in <rec>.<vecfield>` over a `Vec<T, N>` record field. The
+    /// length is a schema constant, so the header is a plain
+    /// `i < N` counter and the body's prologue binds `x` to
+    /// `<field>[i]` — the same `Expr::RecordField` an explicit
+    /// `<rec>.<vecfield>[i]` read lowers to. Like `for t in <seq>`, the
+    /// loop variable is a COPY of the element (the IR has no
+    /// by-reference local); `lower_counted_loop_with_prologue` rejects a
+    /// write to it rather than dropping one silently.
+    fn lower_for_in_record_vec(
+        &mut self,
+        f: &ForStmt,
+        chain: super::exprs::RecordFieldChain,
+        n: usize,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let counter = self.fresh_temp();
+        self.push(Stmt::Assign(
+            counter,
+            Expr::Literal {
+                value: 0,
+                ty: IrType::Unknown,
+            },
+        ));
+        let cond = Expr::Binary(
+            BinOp::Lt,
+            Box::new(Expr::Local(counter)),
+            Box::new(Expr::Literal {
+                value: n as u64,
+                ty: IrType::Unknown,
+            }),
+        );
+        let step = Stmt::Assign(
+            counter,
+            Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Local(counter)),
+                Box::new(Expr::Literal {
+                    value: 1,
+                    ty: IrType::Unknown,
+                }),
+            ),
+        );
+        let var = self.declare(&f.var.name);
+        self.set_local_type(var, chain.leaf_ty);
+        let bind = Stmt::Assign(
+            var,
+            Expr::RecordField {
+                local: chain.local,
+                field: chain.field,
+                path: chain.path,
+                mid_indices: chain.mid_indices,
+                index: Some(Box::new(Expr::Local(counter))),
+            },
+        );
+        self.lower_counted_loop_with_prologue(cond, step, bind, &f.body)?;
+        self.pop_scope();
+        Ok(())
+    }
+
     pub(crate) fn lower_repeat(&mut self, r: &RepeatStmt) -> Result<(), LowerError> {
         self.push_scope();
         let var = self.fresh_temp();
@@ -278,10 +358,22 @@ impl FuncBuilder<'_> {
         });
         self.start_block(body_b);
         self.push_scope();
+        // Every prologue this takes is an element bind
+        // (`Assign(loop_var, <element>)`), so the loop variable is a
+        // COPY. v1 binds `auto& x`, where a write in the body lands
+        // back in the container; the IR has no by-reference local, so
+        // the same write here would be silently dropped.
+        let bound = match &prologue {
+            Some(Stmt::Assign(l, _)) => Some(*l),
+            _ => None,
+        };
         if let Some(p) = prologue {
             self.push(p);
         }
         self.lower_block_stmts(body)?;
+        if let Some(bound) = bound {
+            self.reject_loop_var_write(bound, body_b)?;
+        }
         self.pop_scope();
         if !self.is_terminated() {
             self.terminate(Terminator::Jump(latch));
@@ -293,6 +385,42 @@ impl FuncBuilder<'_> {
         self.terminate(Terminator::Jump(header));
 
         self.start_block(exit);
+        Ok(())
+    }
+
+    /// Reject a write to an element-bound loop variable. `body_b` is the
+    /// loop body's entry block, whose FIRST statement is the bind this
+    /// check must not count; every block from there on belongs to the
+    /// body (the latch and exit blocks are still empty at this point,
+    /// and any block the body opened was appended after them).
+    ///
+    /// Only `Assign` and `RecordFieldWrite` are checked: `x = e` and
+    /// `x.f = e` are the two forms surface syntax can aim at a
+    /// loop-bound name. The other local-writing statements
+    /// (`DutRead`, a queue `pop` destination, `RecordInit`) address
+    /// temps lowering synthesizes for itself.
+    fn reject_loop_var_write(&self, bound: LocalId, body_b: BlockId) -> Result<(), LowerError> {
+        for (bi, block) in self.blocks.iter().enumerate().skip(body_b.0 as usize) {
+            for (si, s) in block.stmts.iter().enumerate() {
+                if bi == body_b.0 as usize && si == 0 {
+                    continue; // the element bind itself
+                }
+                let writes = match s {
+                    Stmt::Assign(l, _) => *l == bound,
+                    Stmt::RecordFieldWrite { local, .. } => *local == bound,
+                    _ => false,
+                };
+                if writes {
+                    return Err(not_implemented(
+                        "a write to a `for` loop's element variable",
+                        "the loop variable is a copy of the element, so the write would \
+                         not reach the container — index the container directly \
+                         (`xs[i] = …` over `for i in 0 .. N-1`)",
+                        V1Status::SilentlyMisLowers,
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
