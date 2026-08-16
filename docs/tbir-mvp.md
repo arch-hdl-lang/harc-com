@@ -2248,6 +2248,61 @@ case and only locally-determinable `Assign` types are compared).
     unverified reclassification is the failure this method exists to
     prevent.
 
+35. **Fifth probe sweep: constant-folded field defaults (2026-08-16).**
+    The first pass over `components.rs` (73 sites) and `transactors.rs`
+    (55) — the two files earlier sweeps never touched. One gap closed
+    across three paths, six diagnostics reclassified.
+
+    - **A field `default` now folds through the file's constant table**,
+      on component, scoreboard, and transactor-state declarations alike.
+      Each path had its own hand-rolled matcher accepting an integer
+      literal and a bool and nothing else, so `n : uint<8> default K`
+      with `const K = 7` in scope was refused — while v1 emitted `= K`,
+      which compiles and works, because the const is emitted as a C++
+      constant.
+
+      Reading v1's output on the wider shape is what made this worth
+      doing: v1 emits the default's SOURCE TEXT into the member
+      initializer and silently degrades to `= 0` for anything it cannot
+      spell that way, so `default 1 + 1` starts the field at 0 rather
+      than 2 — accepted, compiled, and wrong. Routing all three paths
+      through the existing `fold_const` covers both of v1's working
+      shapes and every other constant expression besides, which puts
+      TB-IR AHEAD of v1 here rather than level with it. The only
+      remaining rejection is a default that is not constant at all
+      (`default "x"`), now a `NotImplemented` / silently-mis-lowers.
+
+    The fold reaches component, scoreboard, transactor-state AND
+    testbench fields, so `default K` means the same thing everywhere in
+    one source file. Range checking rides along: the folded value goes
+    through the same `check_const_decl_type` a `const` declaration gets,
+    so `uint<8> default -1` and `default 300` are rejected here rather
+    than emitted as a 64-bit bit pattern. The three error classes stay
+    distinct — a non-constant expression is a `NotImplemented`, while an
+    illegal evaluation (division by zero, a value that does not fit) is
+    a `LowerError::Invalid`, matching what a `const` declaration reports
+    for the same expression.
+
+    **A reclassification that did not survive review.** The five
+    directional-component-field rejections (`in`/`inout` on an event,
+    queue, scalar, or named-type field) were reclassified on the premise
+    that v1 "never reads the direction" — and that premise is false. v1
+    emits byte-identical, WORKING C++ for `event`, `in event`, and
+    `inout event` on an agent, and honors defaults on directional
+    scalars just as it does on plain ones. `--codegen v1` is an honest
+    escape hatch for all five, so all five keep `Unsupported`. This is
+    the third sweep in a row where a plausible reading of one emission
+    turned out not to generalize; the rule that keeps surviving is that
+    a `V1Status` claim needs v1's output for the shape being claimed, not
+    for a neighbouring one.
+
+    Left open, and worth a slice of its own: a **transaction-typed field
+    on an unbound `transactor`** (`cur : Txn`). v1 emits a real `Txn`
+    member that works, and the IR already has `StateFieldKind::Record`
+    for the bound-to path — but the unbound path reaches record fields
+    through different machinery, so this is a design step, not a missing
+    arm. It keeps its `--codegen v1` suggestion, which is honest.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

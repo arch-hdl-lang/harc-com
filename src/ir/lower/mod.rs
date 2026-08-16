@@ -211,8 +211,8 @@ impl SideTables {
 /// `c_type_for` — the bit pattern is backend-identical and signedness
 /// only changes the value of `>>`, `/`, `%`, and ordered comparisons.
 #[derive(Clone, Copy)]
-struct ConstVal {
-    bits: u64,
+pub(crate) struct ConstVal {
+    pub(crate) bits: u64,
     signed: bool,
 }
 
@@ -234,7 +234,7 @@ impl ConstVal {
 /// width. Those are program errors under every backend (v1 would hit
 /// C++ UB or silently mis-evaluate), so they surface as
 /// `LowerError::Invalid` with a precise diagnostic instead.
-enum ConstFoldErr {
+pub(crate) enum ConstFoldErr {
     Unsupported(String),
     Invalid(String),
 }
@@ -288,7 +288,7 @@ fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
 /// logical operators, and the wrapping `+% -% *%` spellings, which fold
 /// at `max(W(lhs), W(rhs))` when both operand widths are statically
 /// known (see `const_operand_width`) and are rejected when they are not.
-fn fold_const(
+pub(crate) fn fold_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
     self_name: &str,
@@ -553,7 +553,7 @@ fn fold_const(
 /// compile-time error instead. Widths ≥ 64 (and missing/unknown
 /// types) pass through unchecked — the 64-bit fold domain cannot
 /// overflow them.
-fn check_const_decl_type(
+pub(crate) fn check_const_decl_type(
     ty: Option<&crate::ast::TypeExpr>,
     v: ConstVal,
 ) -> Result<ConstVal, String> {
@@ -1067,7 +1067,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema = scoreboards::lower_scoreboard(c, &record_ids)?;
+            let schema = scoreboards::lower_scoreboard(c, &record_ids, &const_vals)?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1573,6 +1573,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &scoreboard_ids,
             &record_ids,
             &mut next_fn,
+            &const_vals,
         )?;
         prog.components.push(schema);
     }
@@ -3218,31 +3219,20 @@ fn lower_test(
                             queue_fields.push(queue.clone());
                             state_fields.push(ir::TbStateFieldSchema::Queue(queue));
                         } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
+                            // Same rule as the component / scoreboard /
+                            // transactor-state field defaults: folded
+                            // through the file's constant table, so
+                            // `default K` means the same thing on a
+                            // testbench field as on an `env` field in
+                            // the same source.
                             let default = match &f.default {
                                 None => 0,
-                                Some(d) => match &*d.kind {
-                                    ExprKind::Int(s) => {
-                                        exprs::parse_int_literal(s).ok_or_else(|| {
-                                            unsupported(
-                                                &format!(
-                                                    "testbench field default `{} default {s}`",
-                                                    f.name.name
-                                                ),
-                                                "not a plain integer literal",
-                                            )
-                                        })?
-                                    }
-                                    ExprKind::Bool(b) => *b as u64,
-                                    _ => {
-                                        return Err(unsupported(
-                                            &format!(
-                                                "a non-literal default on testbench field `{}`",
-                                                f.name.name
-                                            ),
-                                            "",
-                                        ));
-                                    }
-                                },
+                                Some(d) => components::fold_field_default(
+                                    d,
+                                    Some(&f.ty),
+                                    &const_vals_from(consts, const_signed),
+                                    &format!("testbench field `{}`", f.name.name),
+                                )?,
                             };
                             let scalar = ir::TbScalarFieldSchema {
                                 name: f.name.name.clone(),
@@ -5064,6 +5054,38 @@ pub(crate) struct LowerCtx {
     /// it is callable wherever a pure helper is. Empty when the program
     /// declares no extern fns.
     pub extern_fns: HashSet<String>,
+}
+
+impl LowerCtx {
+    /// See `const_vals_from`. Built on demand rather than stored, and
+    /// only ever reached from a field default that is not a plain
+    /// literal — `fold_field_default` answers the common shapes without
+    /// consulting the table at all.
+    pub(crate) fn const_vals(&self) -> HashMap<String, ConstVal> {
+        const_vals_from(&self.consts, &self.const_signed)
+    }
+}
+
+/// Recombine the two split constant tables (`consts` bit patterns +
+/// `const_signed` signedness) into the single map `fold_const` wants.
+/// The split exists because use-site substitution needs the two
+/// separately; constant FOLDING needs them together.
+pub(crate) fn const_vals_from(
+    consts: &HashMap<String, u64>,
+    const_signed: &HashMap<String, bool>,
+) -> HashMap<String, ConstVal> {
+    consts
+        .iter()
+        .map(|(k, &bits)| {
+            (
+                k.clone(),
+                ConstVal {
+                    bits,
+                    signed: const_signed.get(k).copied().unwrap_or(false),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on

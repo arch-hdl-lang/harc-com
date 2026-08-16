@@ -29,6 +29,7 @@ use std::collections::HashMap;
 pub(crate) fn lower_scoreboard(
     c: &ComponentDecl,
     record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
     if !c.params.is_empty() {
@@ -65,7 +66,7 @@ pub(crate) fn lower_scoreboard(
                 let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids)?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
-                        let default = scalar_default(&f.default, sb, fname)?;
+                        let default = scalar_default(&f.default, sb, fname, &f.ty, consts)?;
                         ScoreboardFieldKind::Scalar { ty, default }
                     }
                     other => {
@@ -178,25 +179,22 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
+/// A scoreboard field's `default` — same rule as the component form
+/// (`components::scalar_default`): folded through the file's constant
+/// table, because v1 emits the source text and silently degrades to
+/// `= 0` for anything it cannot spell as a C++ initializer.
 fn scalar_default(
     default: &Option<crate::ast::Expr>,
     sb: &str,
     fname: &str,
+    ty: &crate::ast::TypeExpr,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
-    match default {
-        None => Ok(0),
-        Some(d) => match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!("scoreboard field default `{sb}.{fname} default {s}`"),
-                    "not a plain integer literal",
-                )
-            }),
-            ExprKind::Bool(b) => Ok(*b as u64),
-            _ => Err(unsupported(
-                &format!("a non-literal default on scoreboard field `{sb}.{fname}`"),
-                "",
-            )),
-        },
-    }
+    let Some(d) = default else { return Ok(0) };
+    super::components::fold_field_default(
+        d,
+        Some(ty),
+        consts,
+        &format!("scoreboard field `{sb}.{fname}`"),
+    )
 }

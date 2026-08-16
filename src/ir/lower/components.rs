@@ -354,6 +354,7 @@ pub(crate) fn lower_component_schema(
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     next_fn: &mut u32,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
         &str,
@@ -457,7 +458,15 @@ pub(crate) fn lower_component_schema(
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
-                let fk = lower_field(name, f, ids, scoreboard_ids, record_ids, is_transactor)?;
+                let fk = lower_field(
+                    name,
+                    f,
+                    ids,
+                    scoreboard_ids,
+                    record_ids,
+                    is_transactor,
+                    consts,
+                )?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
                         "component `{name}` declares field `{}` more than once",
@@ -870,6 +879,7 @@ fn lower_field(
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
     is_transactor: bool,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -947,7 +957,7 @@ fn lower_field(
                     "only uint/sint/bits/bool fields up to 64 bits are lowered",
                 )
             })?;
-            let default = scalar_default(&f.default, comp, fname)?;
+            let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
         }
         TypeExpr::Named { name, .. } => {
@@ -2063,27 +2073,78 @@ fn scalar_width(t: &TypeExpr) -> Option<u32> {
     }
 }
 
+/// A component field's `default`, folded to the value the struct member
+/// is initialized with.
+///
+/// v1 emits the default's SOURCE TEXT into the C++ member initializer,
+/// which works for a literal (`= 7`) and for a `const` name (`= K`,
+/// since the const is emitted as a C++ constant) but silently degrades
+/// to `= 0` for anything else — a `default 1 + 1` field starts at 0
+/// there, not 2. Folding through the file's constant table covers both
+/// working shapes and every other constant expression besides, so the
+/// only remaining rejection is a default that is not constant at all.
 fn scalar_default(
     default: &Option<crate::ast::Expr>,
     comp: &str,
     fname: &str,
+    ty: &TypeExpr,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
-    match default {
-        None => Ok(0),
-        Some(d) => match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!("component field default `{comp}.{fname} default {s}`"),
-                    "not a plain integer literal",
-                )
-            }),
-            ExprKind::Bool(b) => Ok(*b as u64),
-            _ => Err(unsupported(
-                &format!("a non-literal default on component field `{comp}.{fname}`"),
-                "",
-            )),
-        },
-    }
+    let Some(d) = default else { return Ok(0) };
+    fold_field_default(d, Some(ty), consts, &format!("component field `{comp}.{fname}`"))
+}
+
+/// Shared by the component, scoreboard and transactor-state field
+/// paths: fold a `default` to the value its member is initialized with.
+///
+/// `ty` is the field's declared type, run through the SAME
+/// `check_const_decl_type` a `const` declaration gets — so a negative
+/// value in an unsigned field, or one wider than the field, is rejected
+/// here rather than emitted as a 64-bit bit pattern. `what` names the
+/// field for the diagnostic.
+///
+/// The three error classes stay distinct: a non-constant expression is
+/// a `NotImplemented` (v1 accepts it and silently emits `= 0`), while an
+/// illegal evaluation — division by zero, an out-of-range shift, a value
+/// that does not fit the field — is a `LowerError::Invalid`, matching
+/// what a `const` declaration reports for the same expression.
+pub(crate) fn fold_field_default(
+    d: &crate::ast::Expr,
+    ty: Option<&crate::ast::TypeExpr>,
+    consts: &HashMap<String, super::ConstVal>,
+    what: &str,
+) -> Result<u64, LowerError> {
+    // Fast path: a plain literal or bool needs no constant table, and is
+    // what almost every `default` actually is.
+    let folded = match &*d.kind {
+        ExprKind::Int(lit) => super::exprs::parse_int_literal(lit).map(|bits| super::ConstVal {
+            bits,
+            signed: bits <= i64::MAX as u64,
+        }),
+        ExprKind::Bool(b) => Some(super::ConstVal {
+            bits: *b as u64,
+            signed: true,
+        }),
+        _ => None,
+    };
+    // `""` as the self-name: a field default has no enclosing `const` to
+    // form a cycle with, so no identifier can be a self-reference.
+    let v = match folded {
+        Some(v) => v,
+        None => super::fold_const(d, consts, "").map_err(|e| match e {
+            super::ConstFoldErr::Unsupported(detail) => not_implemented(
+                &format!("a non-constant default on {what}"),
+                detail,
+                V1Status::SilentlyMisLowers,
+            ),
+            super::ConstFoldErr::Invalid(detail) => {
+                LowerError::Invalid(format!("the default on {what}: {detail}"))
+            }
+        })?,
+    };
+    super::check_const_decl_type(ty, v)
+        .map(|v| v.bits)
+        .map_err(|detail| LowerError::Invalid(format!("the default on {what}: {detail}")))
 }
 
 // --- access resolution on FuncBuilder (test-body + method-body) ---

@@ -2358,8 +2358,14 @@ end impl QueueOwnerTest
     let tb = prog.testbench(prog.tests[0].testbench);
     assert_eq!(tb.queue_fields.len(), 2, "both queue fields are retained");
     let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("queues emit");
-    assert!(cpp.contains("harc_rt::HarcQueue<uint64_t> pending;"), "{cpp}");
-    assert!(cpp.contains("harc_rt::HarcQueue<PendingItem> records;"), "{cpp}");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<uint64_t> pending;"),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<PendingItem> records;"),
+        "{cpp}"
+    );
     assert!(cpp.contains("_tb.pending.push"), "{cpp}");
     assert!(cpp.contains("_tb.pending.pop()"), "{cpp}");
 }
@@ -3328,10 +3334,7 @@ end impl VecTbFieldTest
 fn literal_out_of_range_vec_index_is_rejected() {
     let cases = [
         // Leaf read on a scalar-element Vec.
-        (
-            "let v = tbl.entries[0].data[2]",
-            "EntryTable.entries.data",
-        ),
+        ("let v = tbl.entries[0].data[2]", "EntryTable.entries.data"),
         // Leaf write on a scalar-element Vec.
         ("tbl.entries[0].data[9] = 1", "EntryTable.entries.data"),
         // Mid-chain selection on the record-element Vec.
@@ -7655,11 +7658,7 @@ fn target_record_state_lowers() {
 
 /// True when any expression reachable from `block` is a
 /// `TransactorStateRecordField` read on `<instance>.<field>`.
-fn block_has_state_record_field_read(
-    block: &ir::BasicBlock,
-    instance: &str,
-    field: &str,
-) -> bool {
+fn block_has_state_record_field_read(block: &ir::BasicBlock, instance: &str, field: &str) -> bool {
     fn in_expr(e: &ir::Expr, instance: &str, field: &str) -> bool {
         match e {
             ir::Expr::TransactorStateRecordField {
@@ -7667,9 +7666,7 @@ fn block_has_state_record_field_read(
                 field: f,
                 ..
             } => i == instance && f == field,
-            ir::Expr::Binary(_, a, b) => {
-                in_expr(a, instance, field) || in_expr(b, instance, field)
-            }
+            ir::Expr::Binary(_, a, b) => in_expr(a, instance, field) || in_expr(b, instance, field),
             ir::Expr::Unary(_, a)
             | ir::Expr::WidthCast { inner: a, .. }
             | ir::Expr::BitSlice { target: a, .. } => in_expr(a, instance, field),
@@ -7691,7 +7688,10 @@ fn block_has_state_record_field_read(
         | ir::Stmt::TransactorStateRecordFieldWrite { value: e, .. } => in_expr(e, instance, field),
         ir::Stmt::AssertCheck { cond, on_fail } => {
             in_expr(cond, instance, field)
-                || on_fail.args.iter().any(|a| in_expr(&a.expr, instance, field))
+                || on_fail
+                    .args
+                    .iter()
+                    .any(|a| in_expr(&a.expr, instance, field))
         }
         _ => false,
     })
@@ -12074,7 +12074,10 @@ end impl T"#
         ))
         .unwrap_err();
         let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(msg.contains(&format!("the `{name}` sequence operator")), "{msg}");
+        assert!(
+            msg.contains(&format!("the `{name}` sequence operator")),
+            "{msg}"
+        );
     }
 }
 
@@ -12410,7 +12413,9 @@ impl T for Tb
 end impl T"#,
     );
     assert!(
-        cpp.contains(r#"sim_log_line("FAIL", "b=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->b)))"#),
+        cpp.contains(
+            r#"sim_log_line("FAIL", "b=%lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->b)))"#
+        ),
         "{cpp}"
     );
 }
@@ -12447,7 +12452,10 @@ impl T for Tb
 end impl T"#,
     );
     // The bound is the schema length, not a runtime `size()` call.
-    assert!(cpp.contains("< 4)"), "header counts to the Vec length:\n{cpp}");
+    assert!(
+        cpp.contains("< 4)"),
+        "header counts to the Vec length:\n{cpp}"
+    );
     assert!(
         cpp.contains("x = r.data[") && cpp.contains("sum = (sum + x)"),
         "each iteration binds the element, then runs the body:\n{cpp}"
@@ -12699,7 +12707,10 @@ end impl T"#,
     )
     .unwrap_err();
     let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("default on testbench queue field `q`"), "{msg}");
+    assert!(
+        msg.contains("default on testbench queue field `q`"),
+        "{msg}"
+    );
 }
 
 /// Names that resolve to nothing, and slots that were never declared,
@@ -12713,7 +12724,10 @@ fn unresolved_names_do_not_point_at_v1() {
     // declaration, before that is known.
     let cases: [(&str, &str); 2] = [
         ("let x = nosuchthing", "unresolved name `nosuchthing`"),
-        ("nosuchthing = 1", "assignment to unknown name `nosuchthing`"),
+        (
+            "nosuchthing = 1",
+            "assignment to unknown name `nosuchthing`",
+        ),
     ];
     for (stmt, want) in cases {
         let err = lower_src(&format!(
@@ -12756,7 +12770,10 @@ end impl T"#
         ))
         .unwrap_err();
         let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-        assert!(msg.contains("indexing the scalar record field `B.v`"), "{msg}");
+        assert!(
+            msg.contains("indexing the scalar record field `B.v`"),
+            "{msg}"
+        );
     }
 }
 
@@ -12966,3 +12983,151 @@ end impl T"#,
         "{msg}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Batch 5: constant-folded field defaults, and the directional-field
+// family.
+// ---------------------------------------------------------------------
+
+/// A field `default` folds through the file's constant table, on every
+/// declaration that has one. v1 emits the default's SOURCE TEXT into the
+/// C++ member initializer: a literal (`= 7`) and a `const` name (`= K`)
+/// work there, but ANY other expression silently degrades to `= 0`, so a
+/// `default 1 + 1` field starts at 0 rather than 2.
+#[test]
+fn a_field_default_folds_through_the_constant_table() {
+    for (decl, field) in [
+        // Component (env) field.
+        (
+            "env E\n    n : uint<8> default {}\nend env E\n\ntestbench Tb\n    dut : Top\n    top : E\nend testbench Tb",
+            "n",
+        ),
+        // Scoreboard field.
+        (
+            "scoreboard E\n    n : uint<32> default {}\nend scoreboard E\n\ntestbench Tb\n    dut : Top\n    top : E\nend testbench Tb",
+            "n",
+        ),
+    ] {
+        for init in ["7", "K", "K + 2", "1 + 1", "K * 2 - 5"] {
+            let cpp = emit_cpp_src(&format!(
+                "const K = 7\n\n{}\nimpl T for Tb\n    run\n        wait 1 cycle\n    end run\nend impl T",
+                decl.replace("{}", init)
+            ));
+            let want = match init {
+                "7" | "K" => "= 7;",
+                "K + 2" => "= 9;",
+                "1 + 1" => "= 2;",
+                _ => "= 9;",
+            };
+            assert!(
+                cpp.contains(&format!("{field} {want}")),
+                "`default {init}` must fold to `{want}`:\n{cpp}"
+            );
+        }
+    }
+}
+
+/// The same on a transactor state field, which took a separate path.
+#[test]
+fn a_transactor_state_field_default_folds() {
+    let cpp = emit_cpp_src(
+        r#"const K = 9
+
+transactor Xt
+    dut : Top
+    count : uint<8> default K + 1
+
+    when active
+        hookable go()
+            wait 1 cycle
+        end go
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt  : Xt active
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        xt.go()
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("count = 10;"), "{cpp}");
+}
+
+/// A default that is not constant at all is not a v1 escape hatch: v1
+/// emits `= 0` and runs, so the field silently holds the wrong value.
+/// An ILLEGAL constant evaluation is a different class again — it gets
+/// the `LowerError::Invalid` a `const` declaration would get for the
+/// same expression, including the field's own range check.
+#[test]
+fn a_bad_field_default_is_classified_by_why_it_is_bad() {
+    let src = |init: &str| {
+        format!(
+            r#"const K = 7
+
+env E
+    n : uint<8> default {init}
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+
+    // Not constant at all → a backend-gap report, and NOT a pointer at
+    // v1, which accepts it and emits `= 0`.
+    let err = lower_src(&src(r#""x""#)).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("non-constant default on component field `E.n`"),
+        "{msg}"
+    );
+
+    // Constant, but illegal — the same three shapes a `const`
+    // declaration rejects, reported the same way.
+    for (init, want) in [
+        ("1 / 0", "division by zero"),
+        ("-1", "negative values cannot initialize an unsigned constant"),
+        ("300", "does not fit `uint<8>` (max 255)"),
+    ] {
+        let err = lower_src(&src(init)).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(msg.contains(want), "`default {init}`: {msg}");
+        assert!(
+            msg.contains("component field `E.n`"),
+            "the diagnostic names the field: {msg}"
+        );
+    }
+}
+
+/// The fold reaches testbench fields too, so `default K` means the same
+/// thing on a testbench field as on an `env` field in the same source.
+#[test]
+fn a_testbench_field_default_folds_like_a_component_one() {
+    let cpp = emit_cpp_src(
+        r#"const K = 7
+
+testbench Tb
+    dut : Top
+    n : uint<8> default K + 1
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+    );
+    assert!(cpp.contains("n = 8;"), "{cpp}");
+}
+
