@@ -11,6 +11,7 @@ use harc::codegen::{cpp_tb, merge, tbir};
 use harc::ir::{self, lower, verify};
 use harc::parser::parse_source;
 use std::path::Path;
+use std::sync::Mutex;
 
 fn fixture(name: &str) -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -116,12 +117,15 @@ fn emit_shards_sorted(
     plan: &tbir::SplitCppPlan,
     jobs: usize,
 ) -> Vec<(usize, String, String)> {
-    let mut got: Vec<(usize, String, String)> = Vec::new();
+    // `on_shard` may run on a worker thread, so it must be `Fn + Sync`;
+    // collect through a mutex rather than a captured `&mut`.
+    let got: Mutex<Vec<(usize, String, String)>> = Mutex::new(Vec::new());
     tbir::emit_split_shards(prog, file, opts, plan, jobs, |shard, cpp, _| {
-        got.push((shard.index, shard.filename.clone(), cpp));
+        got.lock().unwrap().push((shard.index, shard.filename.clone(), cpp));
         Ok(())
     })
     .expect("shards emit");
+    let mut got = got.into_inner().unwrap();
     got.sort_by_key(|(i, _, _)| *i);
     got
 }
@@ -406,6 +410,126 @@ fn repeated_parallel_emission_is_stable() {
     }
 }
 
+/// `on_shard` runs on the worker that produced the shard, not on the
+/// calling thread.
+///
+/// This is what keeps shard I/O off the critical path: a driver's
+/// `write_if_changed` re-reads the existing file and writes the new one,
+/// and doing that on a single receiving thread serialized it behind every
+/// shard and capped `--emit-jobs` (harc#546). A refactor that quietly
+/// moved delivery back onto the caller would restore the ceiling while
+/// every other test kept passing.
+///
+/// Deterministic, not probabilistic: at `jobs > 1` every shard is emitted
+/// on a spawned worker, so no call can land on the calling thread — this
+/// does not depend on how work happens to be distributed.
+#[test]
+fn shards_are_delivered_off_the_calling_thread() {
+    let merged = merged_src(&wide_suite(8));
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts::default();
+    let plan = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    let caller = std::thread::current().id();
+
+    let off_thread = Mutex::new(0usize);
+    tbir::emit_split_shards(&prog, &merged, &opts, &plan, 4, |_, _, _| {
+        if std::thread::current().id() != caller {
+            *off_thread.lock().unwrap() += 1;
+        }
+        Ok(())
+    })
+    .expect("shards emit");
+    assert_eq!(
+        off_thread.into_inner().unwrap(),
+        plan.shards.len(),
+        "every shard must be delivered on a worker thread at jobs > 1"
+    );
+
+    // At jobs == 1 there are no workers, so delivery is on the caller:
+    // the serial path spawns nothing and takes no locks.
+    let on_thread = Mutex::new(0usize);
+    tbir::emit_split_shards(&prog, &merged, &opts, &plan, 1, |_, _, _| {
+        if std::thread::current().id() == caller {
+            *on_thread.lock().unwrap() += 1;
+        }
+        Ok(())
+    })
+    .expect("shards emit");
+    assert_eq!(
+        on_thread.into_inner().unwrap(),
+        plan.shards.len(),
+        "the serial path must stay on the calling thread"
+    );
+}
+
+/// A panic out of `on_shard` stops the emit and keeps its payload.
+///
+/// This is not hypothetical: the per-shard progress line is an
+/// `eprintln!`, so piping `harc sim … | head` closes stderr and panics
+/// inside the callback. When delivery moved onto the workers, nothing
+/// cancelled on panic — the remaining workers happily emitted and wrote
+/// every leftover shard behind a caller that had already died, and
+/// `thread::scope` replaced the payload with its own message.
+#[test]
+fn panicking_callback_stops_the_emit_and_keeps_its_payload() {
+    let merged = merged_src(&wide_suite(16));
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts::default();
+    let plan = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    assert_eq!(plan.shards.len(), 16);
+
+    // Silence the panic hook for the duration. This is not cosmetic: the
+    // default hook formats a message and a backtrace to stderr from inside
+    // the panicking worker, and under `cargo test`'s own parallelism that
+    // was measured taking up to ~190 ms — long enough for the other worker
+    // to deliver the whole plan before the panic was ever recorded, which
+    // made the assertion below fail about one run in six. With the hook
+    // silenced the round trip is ~3 us. Restored before returning.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    for jobs in [2usize, 4] {
+        let calls = Mutex::new(Vec::<usize>::new());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+                calls.lock().unwrap().push(shard.index);
+                if shard.index == 1 {
+                    panic!("callback exploded");
+                }
+                // Stand in for the real callback's file I/O. Without it
+                // these toy shards deliver in microseconds and the whole
+                // plan is consumed before the panic can be observed, which
+                // measures scheduling luck rather than the brake.
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                Ok(())
+            });
+        }));
+
+        let payload = caught.expect_err("the panic must reach the caller");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("callback exploded"),
+            "jobs={jobs}: the original payload must survive, not be replaced \
+             by thread::scope's own message"
+        );
+
+        // The panic must brake the run, not merely be reported at the end.
+        // Shards already in flight can still land, so the bound is the
+        // worker count rather than an exact figure — but it must not be
+        // the whole plan, which is exactly what the unbraked version did.
+        let calls = calls.into_inner().unwrap();
+        assert!(
+            calls.len() < plan.shards.len(),
+            "jobs={jobs}: emit ran to completion after a panic ({} of {} shards \
+             delivered)",
+            calls.len(),
+            plan.shards.len()
+        );
+    }
+
+    std::panic::set_hook(previous_hook);
+}
+
 #[test]
 fn emission_inputs_are_shareable_across_threads() {
     // A future `Rc`/`RefCell` field on any of these would otherwise fail
@@ -637,10 +761,10 @@ fn failed_emit_delivers_each_shard_at_most_once() {
 
     for jobs in [1usize, 2, 4, 8] {
         for _ in 0..10 {
-            let mut delivered: Vec<usize> = Vec::new();
+            let delivered: Mutex<Vec<usize>> = Mutex::new(Vec::new());
             let err =
                 tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
-                    delivered.push(shard.index);
+                    delivered.lock().unwrap().push(shard.index);
                     if shard.index == 5 {
                         Err(cpp_tb::EmitError("boom".into()))
                     } else {
@@ -650,6 +774,7 @@ fn failed_emit_delivers_each_shard_at_most_once() {
                 .expect_err("shard 5 fails");
             assert_eq!(err.to_string(), "boom", "jobs={jobs}");
 
+            let delivered = delivered.into_inner().unwrap();
             let mut unique = delivered.clone();
             unique.sort_unstable();
             unique.dedup();
@@ -681,12 +806,29 @@ fn every_shard_is_offered_exactly_once() {
     assert_eq!(plan.shards.len(), 9);
 
     for jobs in [1usize, 2, 4, 16] {
-        let mut seen: Vec<usize> = Vec::new();
-        tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
-            seen.push(shard.index);
+        let seen_cb: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let returned = tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+            seen_cb.lock().unwrap().push(shard.index);
             Ok(())
         })
         .expect("shards emit");
+        // The returned indices must agree with what the callback saw, and
+        // must come back ascending so a driver can build an ordered file
+        // list without sorting.
+        assert!(
+            returned.windows(2).all(|w| w[0] < w[1]),
+            "jobs={jobs}: returned indices must be ascending: {returned:?}"
+        );
+        let mut seen = seen_cb.into_inner().unwrap();
+        assert_eq!(
+            returned,
+            {
+                let mut s = seen.clone();
+                s.sort_unstable();
+                s
+            },
+            "jobs={jobs}: returned indices must match delivered shards"
+        );
         seen.sort_unstable();
         assert_eq!(
             seen,

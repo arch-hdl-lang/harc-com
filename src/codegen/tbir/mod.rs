@@ -22,7 +22,7 @@ use crate::ir::{self, TbProgram};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const INDENT: &str = "    ";
@@ -396,6 +396,22 @@ pub fn plan_split_tests(
         })
         .collect();
 
+    // Shards are written concurrently, one worker per shard, so two shards
+    // sharing a filename would be two workers writing one path. Distinct
+    // names hold today (duplicate test names are rejected upstream, and
+    // `sanitize_file_component` is the identity on HARC identifiers), but
+    // it is a precondition of `emit_split_shards` now, not a nicety.
+    debug_assert!(
+        {
+            let mut names: Vec<&str> = shards.iter().map(|s| s.filename.as_str()).collect();
+            names.sort_unstable();
+            let before = names.len();
+            names.dedup();
+            names.len() == before
+        },
+        "split plan produced two shards with the same filename"
+    );
+
     Ok(SplitCppPlan {
         dispatcher: GeneratedCppFile {
             filename: format!("{file_prefix}main.cpp"),
@@ -444,7 +460,9 @@ fn finish_shard(mut cpp: String) -> String {
 ///
 /// `0` means automatic; the cap of 4 is deliberate — each in-flight shard
 /// holds a whole generated translation unit in memory (~100 MB on large
-/// suites), so the worker count is a memory knob as much as a speed one.
+/// suites), plus whatever the caller's delivery callback allocates per
+/// shard, which for a compare-then-write is another copy of the same size.
+/// The worker count is a memory knob as much as a speed one.
 pub fn resolve_emit_jobs(requested: usize, shard_count: usize) -> usize {
     let shard_count = shard_count.max(1);
     match requested {
@@ -459,17 +477,40 @@ pub fn resolve_emit_jobs(requested: usize, shard_count: usize) -> usize {
 }
 
 /// Emit every shard in `plan`, handing each finished translation unit to
-/// `on_shard` **on the calling thread** so the caller can write it and drop
-/// it immediately.
+/// `on_shard` **on the worker thread that produced it**, so the caller can
+/// consume and drop it immediately.
 ///
-/// Peak retained generated C++ is bounded by `jobs`, not by shard count:
-/// the result channel is bounded, so a worker that finishes while the
-/// caller is still writing blocks instead of piling up more shards.
+/// Running `on_shard` on the worker is what keeps shard I/O off the
+/// critical path: a driver's `write_if_changed` both re-reads the existing
+/// file to compare and writes the new one, and on a large suite that is
+/// hundreds of MB each way. Doing it on a single receiving thread
+/// serialized it behind every shard and put a hard Amdahl ceiling on
+/// `--emit-jobs` (harc#546). Each shard has its own path, taken from the
+/// plan, so concurrent calls never touch the same file.
 ///
-/// Determinism, on success: shard bytes are independent of `jobs`, and
-/// every shard is handed to `on_shard` exactly once. Only the *order* of
-/// those calls varies — it is completion order, which is index order at
-/// `jobs == 1`.
+/// The cost is that `on_shard` must be `Sync` and do its own
+/// synchronization for anything shared. To keep that burden small, the
+/// per-shard bookkeeping a driver actually needs — which shards were
+/// delivered, in what order — comes back as the return value instead:
+/// **positions into `plan.shards` for every shard handed to `on_shard`,
+/// ascending**, so a caller can build an ordered file list by indexing
+/// `plan.shards` directly, with no mutex of its own. (They coincide with
+/// `SplitShardPlan::index` for plans this module builds; the return value
+/// is defined as the position so indexing stays correct regardless.)
+///
+/// Peak retained generated C++ stays bounded by `jobs`: a worker holds one
+/// shard at a time and drops it before claiming the next.
+///
+/// Note the *driver's* peak is higher than that figure alone suggests. A
+/// `write_if_changed`-style callback also reads the existing file back to
+/// compare, and that buffer is now live on every worker at once rather
+/// than once on a receiver — budget roughly 2x shard size per worker, not
+/// 1x. On the benchmark suite that is about +100 MB at `--emit-jobs 4`.
+///
+/// Determinism, on success: shard bytes are independent of `jobs`, every
+/// shard is handed to `on_shard` exactly once, and the returned indices are
+/// sorted. Only the *order of the calls* varies — completion order, which
+/// is index order at `jobs == 1`.
 ///
 /// Determinism, on failure: the returned error is the lowest-indexed
 /// failure, whether it came from emission or from `on_shard`, so the
@@ -482,10 +523,10 @@ pub fn emit_split_shards<F>(
     opts: &EmitOpts,
     plan: &SplitCppPlan,
     jobs: usize,
-    mut on_shard: F,
-) -> Result<(), EmitError>
+    on_shard: F,
+) -> Result<Vec<usize>, EmitError>
 where
-    F: FnMut(&SplitShardPlan, String, Duration) -> Result<(), EmitError>,
+    F: Fn(&SplitShardPlan, String, Duration) -> Result<(), EmitError> + Sync,
 {
     debug_assert!(
         plan.shards
@@ -494,12 +535,14 @@ where
         "split plan was built for a different program than the one being emitted"
     );
     if jobs <= 1 || plan.shards.len() <= 1 {
-        for shard in &plan.shards {
+        let mut delivered = Vec::with_capacity(plan.shards.len());
+        for (pos, shard) in plan.shards.iter().enumerate() {
             let started = Instant::now();
             let cpp = emit_split_shard(prog, file, opts, plan, shard)?;
             on_shard(shard, cpp, started.elapsed())?;
+            delivered.push(pos);
         }
-        return Ok(());
+        return Ok(delivered);
     }
 
     let cursor = AtomicUsize::new(0);
@@ -509,31 +552,44 @@ where
     // index wins" hold at any job count. A blanket cancel flag would let a
     // higher shard's error be reported instead, depending on scheduling.
     let fail_limit = AtomicUsize::new(usize::MAX);
-    // Bounded by the worker count: every worker may hand off one finished
-    // shard and pick up the next while the caller writes, but nothing
-    // further queues up. Peak retained shards therefore stays proportional
-    // to `jobs` and independent of the shard count — the memory bound is
-    // the point of `--emit-jobs`, not a side effect. An unbounded channel
-    // would let a slow writer accumulate every shard in memory, which is
-    // exactly the behavior this replaced.
-    let (tx, rx) = mpsc::sync_channel::<(usize, Result<String, EmitError>, Duration)>(jobs);
-
     // Lowest-indexed failure seen so far, whichever side it came from.
     // Keyed by index so the reported error does not depend on which thread
-    // finished first.
-    let mut first_err: Option<(usize, EmitError)> = None;
-    let record_err = |i: usize, e: EmitError, first_err: &mut Option<(usize, EmitError)>| {
+    // finished first. Contended only on the error path.
+    let first_err: Mutex<Option<(usize, EmitError)>> = Mutex::new(None);
+    // A panic out of `on_shard`, kept separately so the original payload
+    // survives to be re-raised on the caller. `thread::scope` would
+    // otherwise replace it with its own "a scoped thread panicked".
+    type Payload = Box<dyn std::any::Any + Send + 'static>;
+    let first_panic: Mutex<Option<(usize, Payload)>> = Mutex::new(None);
+    // One lock acquisition per delivered shard, taken after the shard's I/O
+    // rather than around it.
+    let delivered: Mutex<Vec<usize>> = Mutex::new(Vec::with_capacity(plan.shards.len()));
+
+    let record_err = |i: usize, e: EmitError| {
         fail_limit.fetch_min(i, Ordering::Relaxed);
-        if first_err.as_ref().is_none_or(|(j, _)| i < *j) {
-            *first_err = Some((i, e));
+        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, e));
+        }
+    };
+    let record_panic = |i: usize, payload: Payload| {
+        // Treat it exactly like a failure for scheduling purposes, so the
+        // remaining workers stop claiming instead of emitting and writing
+        // every leftover shard behind a caller that has already died.
+        fail_limit.fetch_min(i, Ordering::Relaxed);
+        let mut slot = first_panic.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, payload));
         }
     };
 
     std::thread::scope(|scope| {
         for _ in 0..jobs {
-            let tx = tx.clone();
             let cursor = &cursor;
             let fail_limit = &fail_limit;
+            let record_err = &record_err;
+            let on_shard = &on_shard;
+            let delivered = &delivered;
             // Worker threads default to a 2 MiB stack where the main thread
             // gets ~8 MiB, and emission recurses over expression, record,
             // and component trees with no depth guard. Since `--emit-jobs`
@@ -550,59 +606,81 @@ where
                         continue;
                     }
                     let started = Instant::now();
-                    let result = emit_split_shard(prog, file, opts, plan, &plan.shards[i]);
-                    if result.is_err() {
-                        fail_limit.fetch_min(i, Ordering::Relaxed);
+                    let cpp = match emit_split_shard(prog, file, opts, plan, &plan.shards[i]) {
+                        Ok(cpp) => cpp,
+                        Err(e) => {
+                            record_err(i, e);
+                            continue;
+                        }
+                    };
+                    // Re-check before handing the shard over: another worker
+                    // may have failed a lower index while this one emitted.
+                    //
+                    // Skipping at or above a known failure keeps a failed
+                    // build from writing shards the serial path would never
+                    // have reached. The converse does NOT hold — a shard
+                    // above the failing index that finished before the
+                    // failure was observed has already been written, so a
+                    // failed parallel emit can leave a different set of files
+                    // than a failed serial one, and a different set run to
+                    // run. That is accepted: the next run recomputes every
+                    // shard and `write_if_changed` reuses whatever matches,
+                    // and the command still exits non-zero without building.
+                    if i > fail_limit.load(Ordering::Relaxed) {
+                        continue;
                     }
-                    if tx.send((i, result, started.elapsed())).is_err() {
-                        break;
+                    // `on_shard` is caller code doing I/O, and it can panic
+                    // on something as ordinary as `harc … | head`: the
+                    // per-shard progress line then hits EPIPE and `eprintln!`
+                    // panics. Catching it here keeps a panic behaving like
+                    // the failure it is — remaining workers stop claiming
+                    // rather than writing every leftover shard behind a
+                    // caller that has already died — and preserves the
+                    // payload, which `thread::scope` would otherwise replace
+                    // with its own message. It is re-raised on the caller
+                    // once the scope joins.
+                    let handed =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            on_shard(&plan.shards[i], cpp, started.elapsed())
+                        }));
+                    match handed {
+                        Ok(Ok(())) => delivered
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(i),
+                        // Also bounds the damage: workers stop claiming
+                        // higher shards instead of emitting hundreds of MB
+                        // that can no longer be written anywhere. The bound
+                        // is looser than it was when a bounded channel also
+                        // throttled how far a worker could run ahead of the
+                        // caller — a shard already in flight when the
+                        // failure lands is still delivered.
+                        Ok(Err(e)) => record_err(i, e),
+                        Err(payload) => record_panic(i, payload),
                     }
                 });
             if let Err(e) = spawned {
                 record_err(
                     usize::MAX,
                     EmitError(format!("could not spawn shard emission worker: {e}")),
-                    &mut first_err,
                 );
                 break;
             }
         }
-        // The loop below ends only once every sender is gone.
-        drop(tx);
-
-        for (i, result, elapsed) in rx {
-            match result {
-                Err(e) => record_err(i, e, &mut first_err),
-                Ok(cpp) => {
-                    // Skip anything at or above a known failure: those are
-                    // shards the serial path would never have reached.
-                    //
-                    // The converse does NOT hold. A shard above the failing
-                    // index that completed before the failure was observed
-                    // has already been handed out, so a failed parallel emit
-                    // can leave a different set of files on disk than a
-                    // failed serial one — and a different set run to run.
-                    // That is accepted: every shard is recomputed on the next
-                    // run and `write_if_changed` reuses whatever matches, and
-                    // the command still exits non-zero without building.
-                    if i > fail_limit.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    if let Err(e) = on_shard(&plan.shards[i], cpp, elapsed) {
-                        // Also bounds the damage: workers stop claiming
-                        // higher shards instead of emitting hundreds of MB
-                        // that can no longer be written anywhere.
-                        record_err(i, e, &mut first_err);
-                    }
-                }
-            }
-        }
     });
 
-    match first_err {
-        Some((_, e)) => Err(e),
-        None => Ok(()),
+    // A panic outranks a returned error, matching what happened before
+    // delivery moved onto the workers: a panic in `on_shard` then unwound
+    // the caller immediately, so no `Err` could overtake it.
+    if let Some((_, payload)) = first_panic.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        std::panic::resume_unwind(payload);
     }
+    if let Some((_, e)) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    let mut delivered = delivered.into_inner().unwrap_or_else(|p| p.into_inner());
+    delivered.sort_unstable();
+    Ok(delivered)
 }
 
 /// Emit a whole split build at once. Retains every shard until the last one
@@ -621,13 +699,21 @@ pub fn emit_split_tests_with_file_prefix(
         filename: plan.dispatcher.filename.clone(),
         contents: plan.dispatcher.contents.clone(),
     });
+    // `on_shard` is `Fn + Sync` because it may run on a worker; this call
+    // is serial (`jobs = 1`) so the mutex is never contended. Collecting
+    // into it keeps the batch shape's original file order.
+    let collected: Mutex<Vec<GeneratedCppFile>> = Mutex::new(Vec::with_capacity(plan.shards.len()));
     emit_split_shards(prog, file, &opts, &plan, 1, |shard, cpp, _| {
-        files.push(GeneratedCppFile {
-            filename: shard.filename.clone(),
-            contents: cpp,
-        });
+        collected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(GeneratedCppFile {
+                filename: shard.filename.clone(),
+                contents: cpp,
+            });
         Ok(())
     })?;
+    files.extend(collected.into_inner().unwrap_or_else(|p| p.into_inner()));
     Ok(SplitCppOutput {
         files,
         test_names: plan.test_names,
