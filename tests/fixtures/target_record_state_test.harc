@@ -23,10 +23,11 @@
 // per-instance value-record state struct is shared between the responder
 // body and the test, exactly like the scalar / queue bound-target forms.
 //
-// This feature is tbir-only: `--codegen v1` MISCOMPILES it (emits
-// `error: unknown type name 'VBeat'`), so it is verified here under the
-// default tbir backend via run_fixtures.sh, NOT the v1 equivalence
-// harness (tbir_equiv_fixtures.txt).
+// This was tbir-only when written: `--codegen v1` miscompiled it, emitting
+// `error: unknown type name 'VBeat'`. v1 now emits the defined `Beat`
+// struct instead, so the fixture is registered in tbir_equiv_fixtures.txt
+// as well and both emitters are trace-diffed against each other (added by
+// the harc#551 coverage audit).
 
 struct Beat
     addr : uint<8>

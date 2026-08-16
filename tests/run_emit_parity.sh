@@ -58,12 +58,40 @@ trap 'rm -rf "$TMP"' EXIT
 
 # Shared with run_fixtures.sh — one source of truth for what exists and
 # how to invoke it. Row: <name> | <top> | <sv> | <extra harc> | <ref_src> | <test_struct>
-FIXTURES="$(cat "$SCRIPT_DIR/fixtures.tbl")"
+TABLE="$SCRIPT_DIR/fixtures.tbl"
+# Fail CLOSED. Before the table was extracted it was a heredoc and could
+# not go missing; now a bad path would make this gate report success over
+# an empty corpus.
+[ -s "$TABLE" ] || { echo "error: $TABLE missing or empty" >&2; exit 1; }
+FIXTURES="$(cat "$TABLE")"
 
-# A TB-IR rejection that names `--codegen v1` is a declared subset gap,
-# not a divergence. Everything else is.
+# Flatten a miette-rendered diagnostic to one line: strip the box-drawing
+# continuation gutter and collapse whitespace. miette hard-wraps at 80
+# columns when stdout is not a TTY, so a phrase we need to match can be
+# split across lines depending on how long the construct name happens to
+# be. Matching the flattened form removes that dependency.
+flatten_log() {
+    printf '%s' "$1" | tr '\n' ' ' | sed 's/[│┌└─╭╰]/ /g' | tr -s ' '
+}
+
+# Is a TB-IR rejection a DECLARED subset gap, i.e. one where `--codegen
+# v1` is a real escape hatch?
+#
+# It is NOT enough to look for the flag. `LowerError` deliberately
+# distinguishes four cases and all four name it (src/ir/lower/mod.rs):
+#
+#   Unsupported                        "; re-run with `--codegen v1`"
+#   NotImplemented/Rejects             "`--codegen v1` does not implement it either"
+#   NotImplemented/EmitsUncompilable   "`--codegen v1` accepts it but emits C++ that does not compile"
+#   NotImplemented/SilentlyMisLowers   "`--codegen v1` accepts it but silently emits something else"
+#
+# Only the first is an escape hatch. The last two mean v1 is BROKEN on
+# the construct — v1 emits, TB-IR refuses, and v1's output is known bad.
+# That is the single most dangerous shape this gate exists to surface, so
+# matching the bare flag would auto-exempt exactly the wrong class. Match
+# the escape-hatch phrase itself.
 is_subset_gap() {
-    printf '%s' "$1" | grep -q -- '--codegen v1'
+    flatten_log "$1" | grep -q -- 're-run with `--codegen v1`'
 }
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
@@ -128,10 +156,18 @@ run_one() { # run_one <outdir> <row>
         return 0
     fi
 
-    # 2. Constraint-text parity.
+    # 2. Constraint-text parity. Ordered, and including push/pop: Z3's
+    # returned model depends on assertion order, and an `_s.add` that
+    # moves across a `push` boundary changes which assertions survive the
+    # matching `pop`. Sorting would call both of those identical.
+    if ! ls "${dirs[0]}"/*.cpp >/dev/null 2>&1 || ! ls "${dirs[1]}"/*.cpp >/dev/null 2>&1; then
+        echo "  FAIL  $name  (emitted no .cpp despite exit 0)"
+        echo "__STATUS__ FAIL $name"
+        return 0
+    fi
     local a b
-    a="$(grep -ho '_s\.add(.*' "${dirs[0]}"/*.cpp 2>/dev/null | sort)"
-    b="$(grep -ho '_s\.add(.*' "${dirs[1]}"/*.cpp 2>/dev/null | sort)"
+    a="$(cat "${dirs[0]}"/*.cpp | grep -oE '_s\.(add|push|pop)\(.*')"
+    b="$(cat "${dirs[1]}"/*.cpp | grep -oE '_s\.(add|push|pop)\(.*')"
     if [ "$a" != "$b" ]; then
         echo "  FAIL  $name  (solver constraint text differs between backends)"
         diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -12 | sed 's/^/    /'
@@ -139,8 +175,16 @@ run_one() { # run_one <outdir> <row>
         return 0
     fi
 
-    echo "  PASS  $name"
-    echo "__STATUS__ PASS $name"
+    # Report whether the text half actually compared anything. Most
+    # fixtures have no solver block at all, so a bare "PASS" would
+    # overstate what was checked.
+    if [ -n "$a" ]; then
+        echo "  PASS  $name  (acceptance + $(printf '%s\n' "$a" | wc -l | xargs) solver lines)"
+        echo "__STATUS__ PASSC $name"
+    else
+        echo "  PASS  $name  (acceptance)"
+        echo "__STATUS__ PASS $name"
+    fi
 }
 
 if [ "${1:-}" = "--worker" ]; then
@@ -168,18 +212,29 @@ while [ "$i" -lt "$n" ]; do
     wait
 done
 
-pass=0; fail=0; skip=0; known=0
+pass=0; fail=0; skip=0; known=0; passc=0; nostatus=0
 for j in $(seq 0 $((n - 1))); do
-    [ -f "$TMP/o$j.out" ] || continue
+    if [ ! -f "$TMP/o$j.out" ]; then
+        echo "  LOST  worker $j produced no output"
+        nostatus=$((nostatus + 1)); continue
+    fi
     grep -v '^__STATUS__' "$TMP/o$j.out"
     case "$(grep '^__STATUS__' "$TMP/o$j.out" | awk '{print $2}')" in
+        PASSC) passc=$((passc + 1)) ;;
         PASS) pass=$((pass + 1)) ;;
         FAIL) fail=$((fail + 1)) ;;
         SKIP) skip=$((skip + 1)) ;;
         KNOWN) known=$((known + 1)) ;;
+        *) echo "  LOST  worker $j produced no status line"
+           nostatus=$((nostatus + 1)) ;;
     esac
 done
 
 echo
-echo "Result: $pass parity, $fail divergent, $known known-exempt, $skip skipped (subset gap or both-reject)"
-[ "$fail" -eq 0 ]
+echo "Result: $((pass + passc)) acceptance-parity (of which $passc also compared solver text),"
+echo "        $fail divergent, $known known-exempt, $skip skipped (subset gap or both-reject),"
+echo "        $nostatus lost"
+# Most fixtures have no solver block, so the text half covers a minority
+# of the corpus by construction. Say so rather than letting the headline
+# number imply corpus-wide emitted-text parity.
+[ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ]

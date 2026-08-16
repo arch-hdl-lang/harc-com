@@ -66,16 +66,20 @@ is_allowed() {
 # Is the fixture reachable from anything that actually executes it?
 is_wired() {
     local base="$1"
-    # A registry row or any other field (extra harc files, --test structs) in
-    # run_fixtures.sh. Pipe/space delimited, so match on field boundaries.
-    if grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)" tests/run_fixtures.sh 2>/dev/null; then
+    # A registry row or any other field (extra harc files, --test structs)
+    # in the shared fixture table. Pipe/space delimited, so match on field
+    # boundaries. The table used to be a heredoc inside run_fixtures.sh;
+    # it moved to fixtures.tbl so run_fixtures.sh and run_emit_parity.sh
+    # share one source of truth, and this check has to follow it or every
+    # correctly-registered fixture looks unwired.
+    if grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)" tests/fixtures.tbl 2>/dev/null; then
         return 0
     fi
     # Any other shell runner, Rust test, or fixture list. The allowlist is
     # excluded: it names unwired fixtures, so counting it would make every
     # allowlisted entry look wired (and then stale).
     local candidate
-    for candidate in tests/*.sh tests/*.rs tests/*.txt; do
+    for candidate in tests/*.sh tests/*.rs tests/*.txt tests/*.tbl; do
         [ -e "$candidate" ] || continue
         [ "$candidate" = "$ALLOWLIST" ] && continue
         [ "$candidate" = "tests/check_fixture_registration.sh" ] && continue
@@ -122,7 +126,7 @@ for base in "${unwired[@]:-}"; do
     dut="$(grep -oE "let[[:space:]]+dut[[:space:]]*:[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" \
         "$FIX_DIR/$base.harc" | head -1 | awk '{print $NF}')"
     echo "::error file=$FIX_DIR/$base.harc::fixture declares a DUT (${dut:-?}) but no runner references it — it will never execute"
-    echo "  fix: add a row to tests/run_fixtures.sh, e.g."
+    echo "  fix: add a row to tests/fixtures.tbl, e.g."
     echo "      $base | ${dut:-TopModule} | ${dut:-top_module}.sv |"
     echo "  or, if it is intentionally not sim-run, add it to $ALLOWLIST with a reason."
 done

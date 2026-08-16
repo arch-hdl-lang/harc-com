@@ -17,9 +17,11 @@
 # Usage:
 #     scripts/emit_sweep.sh [BASE_REV] [HEAD_REV]
 #
-# BASE_REV defaults to origin/main, HEAD_REV to the working tree (built
-# in place). Both revisions are built into separate target dirs, so this
-# does not disturb your working tree or its build cache.
+# BASE_REV defaults to origin/main, HEAD_REV to the working tree. A named
+# revision is checked out into a temporary worktree and built into its own
+# CARGO_TARGET_DIR. The default HEAD (working tree) case builds in place,
+# in YOUR target dir — that is the one thing here that touches your normal
+# build cache. Pass an explicit HEAD_REV to avoid it entirely.
 set -uo pipefail
 
 BASE_REV="${1:-origin/main}"
@@ -29,19 +31,32 @@ FIX_DIR="tests/fixtures"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP="$(mktemp -d)"
-WT=""
-trap 'rm -rf "$TMP"; [ -n "$WT" ] && git -C "$ROOT" worktree remove --force "$WT" >/dev/null 2>&1; git -C "$ROOT" worktree prune >/dev/null 2>&1' EXIT
+cleanup() {
+    for wt in "$TMP"/wt_*; do
+        [ -d "$wt" ] && git -C "$ROOT" worktree remove --force "$wt" >/dev/null 2>&1
+    done
+    rm -rf "$TMP"
+    git -C "$ROOT" worktree prune >/dev/null 2>&1
+}
+trap cleanup EXIT
 
+# NOTE: called via $( ), so this runs in a SUBSHELL — anything it assigns
+# to a parent variable is lost. The worktree path is therefore derived
+# from <label> by both this function and the trap, rather than passed
+# back through a variable, which is how an earlier version left the
+# trap's cleanup clause permanently dead.
 build_at() { # build_at <rev|WORKTREE> <label> -> echoes binary path
     local rev="$1" label="$2"
     if [ "$rev" = "WORKTREE" ]; then
         (cd "$ROOT" && cargo build -q --bin harc) || return 1
         echo "$ROOT/target/debug/harc"; return 0
     fi
-    WT="$TMP/wt_$label"
-    git -C "$ROOT" worktree add -q --detach "$WT" "$rev" || return 1
-    (cd "$WT" && cargo build -q --bin harc) || return 1
-    echo "$WT/target/debug/harc"
+    local wt="$TMP/wt_$label"
+    git -C "$ROOT" worktree add -q --detach "$wt" "$rev" || return 1
+    # Share the parent's build cache so a sweep does not rebuild every
+    # dependency from scratch.
+    (cd "$wt" && CARGO_TARGET_DIR="$TMP/target_$label" cargo build -q --bin harc) || return 1
+    echo "$TMP/target_$label/debug/harc"
 }
 
 echo "Building $BASE_REV ..." >&2
