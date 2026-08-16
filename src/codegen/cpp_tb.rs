@@ -14937,10 +14937,7 @@ impl Emitter {
     /// mask. `None` when no operand carries a width — the same "wrap width
     /// undefined" condition both emitters reject at the statement level.
     ///
-    /// Each arm mirrors the shape the *emitter* resolves at that position,
-    /// including the `Ident` fallback chain (field, then `const`, then enum
-    /// variant, then a blocking `let`). Two ways to get this wrong, both
-    /// found in review:
+    /// Two ways to get this wrong, both found in review:
     ///
     /// - Resolving a `Field` by its leaf `name` finds an unrelated
     ///   top-level field of the same name, so `hdr.len : uint<16>` next to
@@ -14951,10 +14948,22 @@ impl Emitter {
     /// - Resolving *less* than the emitter turns a constraint the emitter
     ///   would have emitted into a hard build error.
     ///
-    /// `sum(...)` and `.len()` are deliberately absent: the emitter turns
-    /// them into solver-internal variables with no declared source width,
-    /// so there is no honest mask to apply and rejecting is the only
-    /// correct answer.
+    /// The second is why this reads only state BOTH emitter constructors
+    /// populate: `field_info`, `const_widths`, `enum_variants`, and pure
+    /// syntax. **Do not add a fallback that reads `let_types`,
+    /// `let_widths` or `probe_widths` to close it.** Those are empty in
+    /// `build_randomize_emitter`, which emits per constraint site and
+    /// never walks statements, so such a fallback resolves on
+    /// `--codegen v1` alone and makes the two backends disagree about the
+    /// same source — a worse failure than the build error, and the reason
+    /// the `blocking` operand fallback added here was backed out again.
+    /// `let_types` is also unscoped (`emit_let` inserts with no block
+    /// restore), so a dead inner shadow supplies a wrong width. Both the
+    /// blocking gap and its scoping prerequisite are tracked in harc#566.
+    ///
+    /// `sum(...)` and `.len()` are deliberately absent for a different
+    /// reason: the emitter turns them into solver-internal variables with
+    /// no declared source width, so there is no honest mask to apply.
     fn constraint_expr_width(
         &self,
         e: &Expr,
@@ -15025,14 +15034,17 @@ impl Emitter {
     /// emitted when the field is narrower), so under `bvslt` the solver is
     /// free to return a value the source constraint forbids.
     ///
-    /// It does NOT have the width oracle's `const`/enum/`let` fallback
-    /// chain. A `const` and an enum variant are always emitted as
-    /// non-negative `uint64_t`, so `false` is right for those. A signed
-    /// `let` under `blocking randomize` is a real gap — `t.x < s` on a
-    /// `sint<8>` compares unsigned — but it predates this path and the
-    /// fix needs a signedness table for locals, which was removed once
-    /// already for poisoning unrelated functions (harc#550). Tracked in
-    /// harc#563; do not paper over it with a fourth flat side table.
+    /// It does NOT have the width oracle's `const`/enum fallbacks, and
+    /// that is correct: both are emitted as non-negative `uint64_t`, so
+    /// `false` is the right answer for them. A signed `let` under
+    /// `blocking randomize` really is a gap — `t.x < s` on a `sint<8>`
+    /// compares unsigned — but it predates this path, and like the width
+    /// oracle's blocking gap (harc#566) it cannot be closed by reading
+    /// per-test emitter state, which the TB-IR randomize emitter does not
+    /// have. It also needs a signedness table for locals, and the flat
+    /// one was removed once already for poisoning unrelated functions
+    /// (harc#550). Tracked in harc#563; do not paper over it with another
+    /// flat side table.
     fn constraint_expr_is_signed(
         &self,
         e: &Expr,
