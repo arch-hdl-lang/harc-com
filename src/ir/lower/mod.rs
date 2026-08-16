@@ -918,8 +918,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
     for it in record_order {
         let schema = match it {
-            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids)?,
-            Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids)?,
+            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?,
+            Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids, &const_vals)?,
             _ => unreachable!("record_order holds only transactions and structs"),
         };
         record_schemas.push(schema);

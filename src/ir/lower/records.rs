@@ -36,6 +36,7 @@ pub(crate) fn lower_transaction(
     t: &TransactionDecl,
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<RecordSchema, LowerError> {
     let txn = &t.name.name;
     if !t.params.is_empty() {
@@ -49,7 +50,15 @@ pub(crate) fn lower_transaction(
     for item in &t.body {
         match item {
             TxnBodyItem::Field(f) => {
-                lower_record_field("transaction", txn, f, enum_names, record_ids, &mut fields)?;
+                lower_record_field(
+                    "transaction",
+                    txn,
+                    f,
+                    enum_names,
+                    record_ids,
+                    &mut fields,
+                    consts,
+                )?;
             }
             TxnBodyItem::Keep(k) => {
                 keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
@@ -87,6 +96,7 @@ pub(crate) fn lower_struct(
     s: &StructDecl,
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<RecordSchema, LowerError> {
     let sname = &s.name.name;
     let mut fields: Vec<RecordFieldSchema> = Vec::new();
@@ -97,7 +107,15 @@ pub(crate) fn lower_struct(
     // scanned solely to reject the non-field items a struct must not
     // carry in this subset.
     for f in &s.fields {
-        lower_record_field("struct", sname, f, enum_names, record_ids, &mut fields)?;
+        lower_record_field(
+            "struct",
+            sname,
+            f,
+            enum_names,
+            record_ids,
+            &mut fields,
+            consts,
+        )?;
     }
     for item in &s.body {
         match item {
@@ -135,6 +153,7 @@ fn lower_record_field(
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
     fields: &mut Vec<RecordFieldSchema>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<(), LowerError> {
     let fname = &f.name.name;
     if fields.iter().any(|x| x.name == *fname) {
@@ -207,6 +226,13 @@ fn lower_record_field(
             "Vec record fields default to a zero-filled array",
         ));
     }
+    // Folded through the file's constant table, like the component /
+    // scoreboard / transactor-state field defaults (divergence 35). v1
+    // emits a `const` default as `uint64_t a = K;` against its own
+    // `static constexpr K` — correct, unlike the addrmap and regblock
+    // offsets, which fold to ZERO (divergences 39 and 41). Same local
+    // literals-only folder in all four places; different v1 behaviour
+    // behind each, which is why each was probed separately.
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
@@ -217,12 +243,12 @@ fn lower_record_field(
                 )
             })?,
             ExprKind::Bool(b) => *b as u64,
-            _ => {
-                return Err(unsupported(
-                    &format!("a non-literal default on {kind} field `{owner}.{fname}`"),
-                    "",
-                ));
-            }
+            _ => super::components::fold_field_default(
+                d,
+                Some(&f.ty),
+                consts,
+                &format!("{kind} field `{owner}.{fname}`"),
+            )?,
         }),
     };
     let mut attr_src = Vec::with_capacity(f.attrs.len());
