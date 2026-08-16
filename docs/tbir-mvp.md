@@ -2518,6 +2518,35 @@ case and only locally-determinable `Assign` types are compared).
       control compared one bin against two, so the diff was not
       measuring the bin spec at all.
 
+40. **Eleventh probe sweep: a const coverpoint slice bound, and a
+    withdrawn claim (2026-08-16).**
+
+    - **A file-scope `const` as a coverpoint slice bound**
+      (`cover dut.count_out[K:0]`) now folds. v1 emits one as
+      `(uint32_t)(K)` against its own `static constexpr K` — identical
+      semantics to the literal — while TB-IR accepted only a plain
+      integer. Same shape as the field-default fold in divergence 35,
+      through the constant table this file already carried.
+
+    - **The claim that v1 drops every coverpoint slice is WITHDRAWN.**
+      It came from two synthetic covergroup fixtures whose diffs showed
+      byte-identical output — because a covergroup that is never
+      INSTANTIATED emits no sampling logic at all, so both files were
+      being compared on scaffolding. `cov_expr_targets_test` covers
+      `dut.count_out[3:0]`, `[0:0]`, `[3:0].sext<8>()` and
+      `[3:0].trunc<2>()`, is in the equivalence registry, and passes
+      under both backends. Constant coverpoint slices were never broken.
+
+    **The check this sweep adds, and it would have saved two batches:
+    look in the equivalence registry BEFORE writing a probe.** A
+    registry row is stronger evidence than any synthetic fixture — it
+    says both backends emit AND that the traces match. And when a probe
+    is needed, mutating a registered fixture one token at a time gives a
+    control that is known-good in both backends, which is exactly what
+    the synthetic attempts lacked. Three of this session's rules are
+    about reading v1 correctly; this one is about not writing the probe
+    at all when the answer is already recorded.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
