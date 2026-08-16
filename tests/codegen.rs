@@ -8986,7 +8986,35 @@ fn non_decimal_literal_wrap_operands_size_in_constraints() {
     let cpp = v1_cpp(
         r#"transaction Txn
     len : uint<8> default 0
-    keep len +% 0b1010 == 5
+    keep len +% 0b100000000 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    // 0b100000000 is 256 — nine bits, wider than the field, so the mask
+    // proves the literal's own width was computed, not merely that it
+    // failed to defeat the field's.
+    assert!(
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000001ffULL, 64)) =="),
+        "a 0b literal operand must size to its own width; got:\n{cpp}"
+    );
+}
+
+/// An ARCH sized literal states its width outright, so it is the one
+/// operand shape needing no inference at all — but `parse_int_literal`
+/// refuses it, so a dedicated arm has to read the declared width.
+#[test]
+fn sized_literal_wrap_operands_use_their_declared_width() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+    keep len +% 16'hAB == 5
 end transaction Txn
 test T
     let dut : Top
@@ -8998,8 +9026,191 @@ test T
 end test T"#,
     );
     assert!(
-        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="),
-        "a 0b literal operand must not defeat the width inference; got:\n{cpp}"
+        cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)) =="),
+        "16'hAB declares 16 bits, so the wrap masks to 16 not to the field's 8; got:\n{cpp}"
+    );
+}
+
+/// The emitter's `Ident` arm falls back from field to `const` to enum
+/// variant to a blocking `let`. The width oracle has to resolve every one
+/// of those, or a constraint the emitter would have emitted becomes a hard
+/// build error instead.
+#[test]
+fn const_and_enum_variant_wrap_operands_carry_a_width() {
+    let cpp = v1_cpp(
+        r#"enum Color { RED, GREEN, BLUE }
+const BUMP : uint<8> = 10
+transaction Txn
+    len : uint<8> default 0
+    keep len +% BUMP == 5
+    keep len +% BLUE == 4
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)10, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "a `const` operand must resolve a width; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)2, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "an enum-variant operand must resolve a width; got:\n{cpp}"
+    );
+}
+
+/// The last link in that fallback chain: under `blocking randomize` the
+/// emitter inlines a `let` local straight into the constraint, so the
+/// width oracle has to read `let_widths` too.
+#[test]
+fn blocking_let_wrap_operands_carry_a_width() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    len : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let n : uint<8> = 10
+        let t : Txn
+        blocking randomize(t) with
+            t.len +% n == 5
+        end randomize
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_len + _ctx.bv_val((uint64_t)(n), 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "a blocking `let` operand must resolve a width; got:\n{cpp}"
+    );
+}
+
+/// `randomize(t) with t +% 10 == 5` on a transaction whose field is named
+/// after the target variable. Routing a bare ident through
+/// `expr_field_path` strips the target root off the single-element path
+/// and resolves nothing, so this has to resolve the way the emitter's own
+/// `Ident` arm does — by name.
+#[test]
+fn bare_ident_named_after_the_randomize_target_still_resolves() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    t : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t) with
+            t +% 10 == 5
+        end randomize
+        log(info, "${t.t}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "((_z_t + _ctx.bv_val((uint64_t)10, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
+        ),
+        "a field named after the randomize target must still carry its width; got:\n{cpp}"
+    );
+}
+
+/// A bit-slice operand's width is the slice, not the field it came from.
+#[test]
+fn bit_slice_wrap_operands_mask_to_the_slice_width() {
+    let cpp = v1_cpp(
+        r#"transaction Txn
+    a : uint<8> default 0
+    keep a[3:0] +% 8 == 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.a}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains(
+            "+ _ctx.bv_val((uint64_t)8, 64)) \
+                      & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000000fULL, 64)) =="
+        ),
+        "a [3:0] slice wraps at 4 bits, not the field's 8; got:\n{cpp}"
+    );
+}
+
+/// `emit_constraint_bit_slice_expr` does not bound `hi` by the field's
+/// width (unlike the bit-select path), so a slice can claim a width above
+/// the solver bitvector. That residue is not representable, so there is no
+/// mask to apply and it must be rejected rather than emitted unmasked.
+#[test]
+fn a_wrap_wider_than_the_solver_bitvector_is_rejected() {
+    let err = v1_emit_err(
+        r#"transaction Txn
+    a : uint<8> default 0
+    keep a[70:0] +% 1 == 5
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+    end run
+end test T"#,
+    );
+    assert!(
+        err.contains("wider than the 64-bit solver bitvector"),
+        "expected the unrepresentable-residue diagnostic; got: {err}"
+    );
+}
+
+/// `<` vs `z3::ult` (and `/` vs `udiv`, `%` vs `urem`) are different Z3
+/// predicates over the same variable, so resolving a nested field by its
+/// leaf name is a wrong solved value, not a cosmetic difference. A field
+/// as wide as `solver_width` carries no range assumption at all, so under
+/// `bvslt` the solver may return a value the source constraint forbids.
+#[test]
+fn nested_field_signedness_is_not_taken_from_a_same_named_top_level_field() {
+    let cpp = v1_cpp(
+        r#"struct Hdr
+    v : uint<64>
+end struct Hdr
+transaction Txn
+    v : sint<64> default 0
+    hdr : Hdr
+    keep hdr.v < 100
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.v}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("z3::ult(_z_hdr_v, _ctx.bv_val((uint64_t)100, 64))"),
+        "`hdr.v` is unsigned and must compare with ult, not inherit the top-level \
+         `v : sint<64>`'s signedness; got:\n{cpp}"
     );
 }
 

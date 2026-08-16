@@ -5314,6 +5314,28 @@ fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     values
 }
 
+/// Bits needed to hold `v` — a literal is self-sized, and `0` is one bit.
+fn value_bit_width(v: u64) -> u32 {
+    if v == 0 {
+        1
+    } else {
+        64 - v.leading_zeros()
+    }
+}
+
+/// Self-width of a literal operand in a constraint, for the §2.4 wrap
+/// mask. An ARCH sized literal (`8'hAB`) states its width outright and is
+/// the one shape whose width needs no inference; everything else is sized
+/// by value through the statement path's own `parse_int_literal`, so the
+/// same literal sizes identically in both positions.
+fn literal_operand_bit_width(s: &str) -> Option<u32> {
+    if let Some(idx) = s.find('\'') {
+        let declared: u32 = s[..idx].replace('_', "").parse().ok()?;
+        return (declared > 0).then_some(declared);
+    }
+    crate::ir::lower::parse_int_literal(s).map(value_bit_width)
+}
+
 fn txn_field_solver_width(f: &TxnFieldInfo) -> u32 {
     f.list
         .as_ref()
@@ -14851,27 +14873,57 @@ impl Emitter {
     }
 
     /// Operand bit-width of a constraint expression, for the `+% -% *%`
-    /// mask. A transaction field carries its declared width, a literal is
-    /// self-sized, parens and nested wraps compose. `None` when no operand
-    /// carries a width — the same "wrap width undefined" condition both
-    /// emitters reject at the statement level.
+    /// mask. `None` when no operand carries a width — the same "wrap width
+    /// undefined" condition both emitters reject at the statement level.
     ///
-    /// Every field-shaped arm resolves through `expr_field_path` exactly
-    /// the way the emitter does, so the width we mask with belongs to the
-    /// same field the emitter turned into a `_z_` variable. Keying on the
-    /// leaf `name` instead (as `constraint_expr_is_signed` does, where it
-    /// only picks `<` vs `ult`) would hand `hdr.len` the width of an
-    /// unrelated top-level `len`, and a too-narrow mask silently solves to
-    /// a value that does not satisfy the source constraint.
+    /// Each arm mirrors the shape the *emitter* resolves at that position,
+    /// including the `Ident` fallback chain (field, then `const`, then enum
+    /// variant, then a blocking `let`). Two ways to get this wrong, both
+    /// found in review:
+    ///
+    /// - Resolving a `Field` by its leaf `name` finds an unrelated
+    ///   top-level field of the same name, so `hdr.len : uint<16>` next to
+    ///   a `len : uint<8>` masks to 8 bits. The solver then returns a value
+    ///   that does not satisfy the source constraint — silent, and worse
+    ///   than the unsatisfiable report this mask exists to prevent. Dotted
+    ///   paths go through `expr_field_path`, exactly as the emitter does.
+    /// - Resolving *less* than the emitter turns a constraint the emitter
+    ///   would have emitted into a hard build error.
+    ///
+    /// `sum(...)` and `.len()` are deliberately absent: the emitter turns
+    /// them into solver-internal variables with no declared source width,
+    /// so there is no honest mask to apply and rejecting is the only
+    /// correct answer.
     fn constraint_expr_width(
         &self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
         target_root: Option<&str>,
+        blocking: bool,
     ) -> Option<u32> {
+        let recur = |inner| self.constraint_expr_width(inner, field_info, target_root, blocking);
         match &*e.kind {
-            ExprKind::Ident(_) | ExprKind::Field { .. } => expr_field_path(e, target_root)
+            // A bare ident is its own whole path — resolve it the way the
+            // emitter's `Ident` arm does, NOT through `expr_field_path`,
+            // whose `target_root` strip would erase a field named after
+            // the randomize target (`randomize(t) with t +% 10 == 5`).
+            ExprKind::Ident(id) => {
+                if let Some(info) = field_info.get(&id.name) {
+                    return (info.width != 0).then(|| txn_field_solver_width(info));
+                }
+                if let Some(text) = self.consts.get(&id.name) {
+                    return literal_operand_bit_width(text);
+                }
+                if let Some(idx) = self.enum_variants.get(&id.name) {
+                    return Some(value_bit_width(*idx as u64));
+                }
+                blocking
+                    .then(|| self.let_widths.get(&id.name).copied())
+                    .flatten()
+            }
+            ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))
+                .filter(|info| info.width != 0)
                 .map(txn_field_solver_width),
             // `items[i]` — a list element has the list's element width.
             // A `foreach` clause is unrolled into exactly this shape, so
@@ -14892,48 +14944,44 @@ impl Emitter {
                 let lo = const_usize_expr(lo)?;
                 (hi >= lo).then(|| (hi - lo + 1) as u32)
             }
-            ExprKind::Paren(inner) => self.constraint_expr_width(inner, field_info, target_root),
+            ExprKind::Paren(inner) => recur(inner),
             ExprKind::Cast { ty, .. } => crate::ir::lower::cast_relabel_width(ty),
-            // Shared with the statement path's `parse_int_literal`, so a
-            // `0b`/`0o` literal sizes the same in both positions.
-            ExprKind::Int(s) => {
-                let v = crate::ir::lower::parse_int_literal(s)?;
-                Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
-            }
+            ExprKind::Int(s) => literal_operand_bit_width(s),
             ExprKind::Binary {
                 op: BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap,
                 lhs,
                 rhs,
-            } => Some(
-                self.constraint_expr_width(lhs, field_info, target_root)?
-                    .max(self.constraint_expr_width(rhs, field_info, target_root)?),
-            ),
+            } => Some(recur(lhs)?.max(recur(rhs)?)),
             _ => None,
         }
     }
 
+    /// Signedness of a constraint expression, picking `<` vs `z3::ult`,
+    /// `/` vs `z3::udiv` and `%` vs `z3::urem`.
+    ///
+    /// Resolves fields exactly like `constraint_expr_width`, and for the
+    /// same reason: these are different Z3 predicates over the *same*
+    /// variable, so a wrong hit is a wrong solved value, not a cosmetic
+    /// difference. A field whose width equals `solver_width` carries no
+    /// `ult(_z_x, 1<<W)` range assumption at all (that bound is only
+    /// emitted when the field is narrower), so under `bvslt` the solver is
+    /// free to return a value the source constraint forbids.
     fn constraint_expr_is_signed(
         &self,
         e: &Expr,
         field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
     ) -> bool {
+        let recur = |inner| self.constraint_expr_is_signed(inner, field_info, target_root);
         match &*e.kind {
             ExprKind::Ident(id) => field_info.get(&id.name).map(|f| f.signed).unwrap_or(false),
-            ExprKind::Field { target, name } => {
-                matches!(&*target.kind, ExprKind::Ident(_))
-                    && field_info
-                        .get(&name.name)
-                        .map(|f| f.signed)
-                        .unwrap_or(false)
-            }
-            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
-                self.constraint_expr_is_signed(inner, field_info)
-            }
-            ExprKind::Binary { lhs, rhs, .. } => {
-                self.constraint_expr_is_signed(lhs, field_info)
-                    || self.constraint_expr_is_signed(rhs, field_info)
-            }
-            ExprKind::Membership { expr, .. } => self.constraint_expr_is_signed(expr, field_info),
+            ExprKind::Field { .. } => expr_field_path(e, target_root)
+                .and_then(|field| field_info.get(&field))
+                .map(|f| f.signed)
+                .unwrap_or(false),
+            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => recur(inner),
+            ExprKind::Binary { lhs, rhs, .. } => recur(lhs) || recur(rhs),
+            ExprKind::Membership { expr, .. } => recur(expr),
             _ => false,
         }
     }
@@ -15660,8 +15708,8 @@ impl Emitter {
                 // C++ has no `%%` infix — the old `" %% "` mapping was
                 // a half-finished placeholder. Equality (`==`, `!=`),
                 // logical / bitwise / shift use the natural overloads.
-                let signed = self.constraint_expr_is_signed(lhs, field_info)
-                    || self.constraint_expr_is_signed(rhs, field_info);
+                let signed = self.constraint_expr_is_signed(lhs, field_info, target_root)
+                    || self.constraint_expr_is_signed(rhs, field_info, target_root);
                 // `+% -% *%` mask the result to `max(W(lhs), W(rhs))`
                 // (spec §2.4). The solver variable is a 64-bit bitvector
                 // with the field's width carried as a separate range
@@ -15672,27 +15720,44 @@ impl Emitter {
                 // unsatisfiable where `len = 251` is a solution.
                 let wrap_mask = match op {
                     AddWrap | SubWrap | MulWrap => {
-                        match self.constraint_expr_width(e, field_info, target_root) {
-                            // A wrap as wide as the solver bitvector needs
-                            // no mask. That bitvector is `solver_width` —
-                            // `max(field widths).max(64)`, so it is >= 64,
+                        let spelling = match op {
+                            SubWrap => "-%",
+                            MulWrap => "*%",
+                            _ => "+%",
+                        };
+                        match self.constraint_expr_width(e, field_info, target_root, blocking) {
+                            // A wrap exactly as wide as the solver bitvector
+                            // needs no mask. That bitvector is `solver_width`
+                            // — `max(field widths).max(64)`, so it is >= 64,
                             // NOT always 64: a transaction with any field
                             // wider than 64 bits solves every constraint at
                             // that wider rank, and a 32-bit wrap there still
                             // needs its mask.
-                            Some(w) if w >= width => None,
-                            Some(w) => Some(solver_unsigned_mask_expr(w)),
+                            Some(w) if w == width => None,
+                            // Wider than the solver bitvector: the residue is
+                            // not representable, so there is no mask to
+                            // apply. Only a bit-slice can get here. Rejected
+                            // rather than silently emitted unmasked.
+                            Some(w) => {
+                                if w > width {
+                                    self.errors.push(format!(
+                                        "wrapping operator `{spelling}` in a constraint has a \
+                                         {w}-bit result, wider than the {width}-bit solver \
+                                         bitvector, so the §2.4 mask is not representable"
+                                    ));
+                                    None
+                                } else {
+                                    Some(solver_unsigned_mask_expr(w))
+                                }
+                            }
                             None => {
                                 self.errors.push(format!(
-                                    "wrapping operator `{}` in a constraint needs both \
-                                     operands to have a statically known bit-width so \
-                                     the §2.4 mask is defined; give the operand(s) a \
-                                     transaction field type",
-                                    match op {
-                                        SubWrap => "-%",
-                                        MulWrap => "*%",
-                                        _ => "+%",
-                                    }
+                                    "wrapping operator `{spelling}` in a constraint needs both \
+                                     operands to have a statically known bit-width so the §2.4 \
+                                     mask is defined; use a transaction field, a `const`, an \
+                                     enum variant, a sized literal (`8'hAB`) or a plain integer \
+                                     literal. `sum(...)` and `.len()` have no declared width \
+                                     and are not accepted here"
                                 ));
                                 None
                             }
@@ -15861,7 +15926,7 @@ impl Emitter {
             ExprKind::RangeLit { lo, hi } => {
                 write!(self.out, "(").ok();
                 let mut has_any = false;
-                let signed = self.constraint_expr_is_signed(lhs, field_info);
+                let signed = self.constraint_expr_is_signed(lhs, field_info, target_root);
                 if let Some(l) = lo {
                     if signed {
                         self.emit_constraint_expr_w(
