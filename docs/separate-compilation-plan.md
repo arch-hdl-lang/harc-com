@@ -82,11 +82,23 @@ identical across shards. `tests/tbir_split.rs` pins this by re-deriving
 the pre-refactor pipeline from the public `tbir::emit` and comparing bytes.
 
 Measured on a synthetic 352-test / 11-shard suite (`bench/split_emit/`):
-roughly 2× total wall time from the clone removal and the hoist alone, and
-a further ~1.8× on the emit phase at `--emit-jobs 4` on a 4-core host. The
-emit phase is now floored by `write_if_changed` I/O serialized on the
-receiving thread; past that, parse + lower dominates. See the benchmark
-README for the numbers and the contention analysis.
+roughly 2× total wall time from the clone removal and the hoist alone,
+before any parallelism.
+
+Shard I/O runs on the worker that produced the shard. It first ran on the
+single receiving thread, which serialized every `write_if_changed` — the
+compare-read as well as the write — and put an Amdahl ceiling on
+`--emit-jobs` (harc#546): an unchanged rerun, which writes nothing, ran
+the phase in roughly half the time of a clean one. Moving the callback
+onto the worker took `--emit-jobs 4` from ~1.2 s to ~0.7 s on that suite,
+and the speedup over serial from ~1.7× to ~2.7×. Each shard has its own path,
+taken from the plan, so concurrent calls never touch the same file; the
+cost is that the callback must be `Sync`, which is why `emit_split_shards`
+returns the delivered shard indices (ascending) rather than making every
+driver synchronize its own ordered file list.
+
+Past that, parse + lower dominates the frontend. See the benchmark README
+for the numbers.
 
 The common-object architecture (`common.hpp` / `common.cpp` compiled once
 rather than copied into every translation unit) remains the durable fix

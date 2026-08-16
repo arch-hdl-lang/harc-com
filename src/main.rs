@@ -3,6 +3,7 @@ use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 mod trace_merge;
@@ -2545,15 +2546,12 @@ fn cmd_sim(
                 cpp_paths.push(dispatcher_path);
 
                 let emit_started = Instant::now();
-                let mut total_bytes = 0usize;
-                let mut done = 0usize;
-                // Shards complete out of order under `--emit-jobs > 1`;
-                // sort before extending `cpp_paths` so the Verilator
-                // command line stays byte-stable run to run (its own
-                // incremental build keys on that).
-                let mut shard_paths: Vec<(usize, PathBuf)> = Vec::with_capacity(shard_count);
+                // Each shard's write happens on the worker that produced
+                // it, so this is only a running total, not shared state
+                // guarding a critical section.
+                let total_bytes = AtomicUsize::new(0);
 
-                harc::codegen::tbir::emit_split_shards(
+                let delivered = harc::codegen::tbir::emit_split_shards(
                     &prog,
                     &codegen_source,
                     &emit_opts,
@@ -2563,11 +2561,15 @@ fn cmd_sim(
                         let path = outdir.join(&shard.filename);
                         let bytes = cpp.len();
                         // `cpp` is dropped when this closure returns, so
-                        // peak retained generated C++ stays bounded.
+                        // peak retained generated C++ stays bounded by the
+                        // worker count.
                         match write_if_changed(&path, cpp.as_bytes()) {
                             Ok(changed) => {
-                                done += 1;
-                                total_bytes += bytes;
+                                total_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+                                // One `eprintln!` per shard: it locks
+                                // stderr internally, so concurrent workers
+                                // interleave whole lines, never partial
+                                // ones. Order is completion order.
                                 eprintln!(
                                     "TBIR shard {}/{shard_count}: {} tests, {}, {}, {}",
                                     shard.index + 1,
@@ -2576,7 +2578,6 @@ fn cmd_sim(
                                     fmt_secs(elapsed),
                                     if changed { "emitted" } else { "reused" },
                                 );
-                                shard_paths.push((shard.index, path));
                                 Ok(())
                             }
                             // Carry the OS reason into the emitter's error
@@ -2593,12 +2594,19 @@ fn cmd_sim(
                 .map_err(|e| miette::miette!("{}", e))?;
 
                 eprintln!(
-                    "TBIR split emit: {done}/{shard_count} shards, {}, {}",
-                    fmt_bytes(total_bytes),
+                    "TBIR split emit: {}/{shard_count} shards, {}, {}",
+                    delivered.len(),
+                    fmt_bytes(total_bytes.load(AtomicOrdering::Relaxed)),
                     fmt_secs(emit_started.elapsed()),
                 );
-                shard_paths.sort_by_key(|(i, _)| *i);
-                cpp_paths.extend(shard_paths.into_iter().map(|(_, p)| p));
+                // `delivered` is ascending, so the Verilator command line
+                // stays byte-stable run to run even though shards complete
+                // out of order (its own incremental build keys on that).
+                cpp_paths.extend(
+                    delivered
+                        .into_iter()
+                        .map(|i| outdir.join(&plan.shards[i].filename)),
+                );
             }
         },
     }

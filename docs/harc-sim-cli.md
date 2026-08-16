@@ -194,11 +194,14 @@ TBIR lower+verify: 16.0s
 TBIR split plan: 352 tests, 11 shards, group size 32, emit jobs 4
 TBIR shard 3/11: 32 tests, 31.7 MB, 0.6s, emitted
 TBIR shard 1/11: 32 tests, 31.7 MB, 0.7s, emitted
-TBIR split emit: 11/11 shards, 348.6 MB, 1.5s
+TBIR split emit: 11/11 shards, 348.6 MB, 0.8s
 ```
 
 Note shard 3 is reported before shard 1 — under `--emit-jobs > 1` the
-progress lines come in completion order, not index order.
+progress lines come in completion order, not index order. Each shard is
+written by the worker that produced it, so writes overlap with emission
+rather than queueing behind a single thread; the file each worker touches
+comes from the split plan, so two workers never write the same path.
 
 If a shard fails, the command exits non-zero and Verilator is never
 invoked. The reported diagnostic is always the lowest-indexed failure, so
