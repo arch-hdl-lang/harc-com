@@ -3130,23 +3130,52 @@ impl FuncBuilder<'_> {
         // it is what makes `log(error, ...)` trustworthy" — and a named
         // severity walked straight past it.
         //
-        // Gated on what the name HIDES, not on named-ness. A named
-        // argument wrapping anything else is invisible to both
-        // extractors and harmless: `log(fatal, "BOOM", extra = 1)` emits
-        // the same `FATAL`/`BOOM` line under both backends, so refusing
-        // it would be refusing a correct program.
+        // Gated on what the name HIDES **and on the slot being empty**.
+        // The extractors take the FIRST positional match, so a named
+        // argument only costs the user something when there is no
+        // positional candidate at all — then the severity falls back to
+        // `info` and the message to `""`. If a positional one exists it
+        // wins under both backends and the named argument is inert:
+        // `log(fatal, "BOOM", extra = "note")` and
+        // `log(fatal, "BOOM", lvl = warn)` both emit the correct
+        // `FATAL`/`BOOM` line, and `logf(p = "a.log", "t.log", error,
+        // "BOOM")` still logs `BOOM`. An earlier version of this gate
+        // keyed on the named value alone and refused all three —
+        // correct programs, refused with a false explanation, which is
+        // the batch-23 mistake repeated one construct later.
+        let has_positional_sev = args
+            .iter()
+            .any(|a| matches!(a, CallArg::Expr(e) if matches!(&*e.kind, ExprKind::Ident(_))));
+        let has_positional_msg = args.iter().any(|a| match a {
+            CallArg::Expr(e) => match &*e.kind {
+                ExprKind::String(s) => file.as_deref() != Some(s.as_str()),
+                _ => false,
+            },
+            _ => false,
+        });
+        let what = if file.is_some() { "logf" } else { "log" };
         for a in args {
             let CallArg::Named { name, value } = a else {
                 continue;
             };
             let hidden = match &*value.kind {
-                ExprKind::Ident(_) => "a severity",
-                ExprKind::String(s) if file.as_deref() != Some(s.as_str()) => "the message",
+                ExprKind::Ident(_) if !has_positional_sev => "a severity",
+                ExprKind::String(s)
+                    if !has_positional_msg && file.as_deref() != Some(s.as_str()) =>
+                {
+                    "the message"
+                }
                 _ => continue,
             };
             return Err(not_implemented(
-                &format!("a named argument `{}` carrying {hidden} in `log`", name.name),
-                "both backends read the severity and message positionally and skip named                  arguments entirely, so this silently drops what the name wraps — a named                  `fatal` becomes `info`, which bumps no failure counter",
+                &format!(
+                    "a named argument `{}` carrying {hidden} in `{what}`",
+                    name.name
+                ),
+                "both backends read the severity and message positionally and skip named \
+                 arguments entirely, so with no positional one to fall back on this drops \
+                 what the name wraps — a named `fatal` becomes `info`, which bumps no \
+                 failure counter",
                 V1Status::SilentlyMisLowers,
             ));
         }

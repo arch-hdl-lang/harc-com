@@ -17459,19 +17459,46 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
         "v1 silently empties the message"
     );
 
-    // A named argument the extractors would never look at is HARMLESS,
-    // and must keep working — this is the half a blanket rejection
-    // would have broken.
-    for args in [
-        r#"fatal, "BOOM", extra = 1"#,
-        r#"nosuch = 1, fatal, "BOOM""#,
+    // A named argument whose positional slot is already FILLED is
+    // inert — the extractors take the first positional match, so the
+    // name costs the user nothing and both backends emit the right
+    // line. This is the half two successive versions of the gate got
+    // wrong: first by ignoring named-ness entirely, then by keying on
+    // the named VALUE while ignoring whether the slot was taken.
+    for (args, expected) in [
+        (
+            r#"fatal, "BOOM", extra = 1"#,
+            r#"sim_log_line("FATAL", "BOOM");"#,
+        ),
+        (
+            r#"nosuch = 1, fatal, "BOOM""#,
+            r#"sim_log_line("FATAL", "BOOM");"#,
+        ),
+        // A named string alongside a positional message.
+        (
+            r#"fatal, "BOOM", extra = "note""#,
+            r#"sim_log_line("FATAL", "BOOM");"#,
+        ),
+        // A named severity alongside a positional one.
+        (
+            r#"fatal, "BOOM", lvl = warn"#,
+            r#"sim_log_line("FATAL", "BOOM");"#,
+        ),
+        // Named severity FIRST — the POSITIONAL one still wins, under
+        // both backends, so the program is accepted and emits `ERROR`.
+        // Ambiguous source, but not something either backend gets wrong
+        // relative to the other, which is what this sweep classifies.
+        (
+            r#"level = fatal, error, "BOOM""#,
+            r#"sim_log_line("ERROR", "BOOM");"#,
+        ),
     ] {
         lower_src(&log(args)).unwrap_or_else(|e| panic!("`log({args})` must lower: {e:?}"));
         assert!(
             cpp_tb::emit(&merged_src(&log(args)))
                 .expect("v1 emits")
-                .contains(r#"sim_log_line("FATAL", "BOOM");"#),
-            "`log({args})` emits the correct line under v1 too"
+                .contains(expected),
+            "`log({args})` must emit `{expected}` under v1 too"
         );
     }
 
@@ -17484,4 +17511,18 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
         lower::V1Status::SilentlyMisLowers,
     );
     assert!(msg.contains("carrying a severity"), "{msg}");
+    // …and names the construct the user actually wrote.
+    assert!(msg.contains("in `logf`"), "{msg}");
+
+    // A named argument ahead of the logf PATH is still inert, because
+    // the positional message slot is filled.
+    lower_src(&logf(r#"p = "a.log", "t.log", error, "BOOM""#))
+        .expect("a named arg beside a filled message slot must lower");
+
+    // The detail must not carry the runs of literal spaces a hard-wrapped
+    // string literal without `\` continuation produces.
+    assert!(
+        !msg.contains("  "),
+        "detail has collapsed whitespace: {msg}"
+    );
 }

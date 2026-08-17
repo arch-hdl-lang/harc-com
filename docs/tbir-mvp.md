@@ -3862,37 +3862,58 @@ case and only locally-determinable `Assign` types are compared).
     the guard fails it, and widening it to reject every named argument
     fails it too.
 
-57. **A guard written where the arity check does not fire (2026-08-17).**
+57. **A control that could not tell "did not fire" from "fired and was
+    thrown away" (2026-08-17).**
 
     Relation calls in `randomize ... with` bind by position and drop the
     name, so `Between(r, hi = 131072, lo = 65536)` inlines
     `addr >= 131072 && addr <= 65536` — unsatisfiable, silently, from a
-    program written to mean the opposite. Measured through TB-IR's own
-    emitter.
+    program written to mean the opposite.
 
-    The obvious home for a check was `expand_top_level_relation_call` in
-    `constraints/typed_lower.rs`, which has the params in hand and an
-    error path already in use one statement above. A check was written
-    there, and it **did not fire**. The control that showed why: the
-    EXISTING arity check beside it does not fire either —
-    `Between(r, 65536)` on a three-parameter relation lowers clean. That
-    function is not on the path this program takes.
+    A check was written in `expand_top_level_relation_call`
+    (`constraints/typed_lower.rs`), and the swap still lowered. The
+    control run to explain that: the EXISTING arity check beside it,
+    given `Between(r, 65536)` on a three-parameter relation. That
+    program lowered clean too, and the conclusion drawn was "the
+    function is not on this path". **The conclusion was wrong and the
+    control is why.** It measured whether the PROGRAM lowers, which
+    cannot distinguish a check that never ran from a check that ran and
+    whose error was discarded.
 
-    The substitution that actually runs is `cpp_tb.rs`'s
-    `try_expand_top_level_call`, reached through the randomize seam that
-    both backends share, so TB-IR cannot emit different Z3 without
-    changing v1. A TB-IR-side refusal belongs in `lower_randomize`,
-    which has `with_body` and a `LowerError` return — but no relations
-    table in `LowerCtx`, so it needs one threaded through. That is a
-    scoped change, not a drive-by, and it is the next batch's first item.
+    Inspecting the table directly instead of the program shows the
+    truth: `build_typed_solver_problem_table` really does emit
+    `LowerError([RelationArityMismatch { expected: 3, found: 2 }])`. The
+    check fires. The loop in `mod.rs` that consumes the table then reads
+    only `TypedSolverProblemBuild::Z3` entries and `continue`s past
+    everything else, so every constraint-lowering error is dropped on the
+    floor before it can reach a user.
 
-    The guard was **reverted rather than shipped**. It compiled, it
-    read correctly, and it would have sat in the tree looking like
-    coverage. *A guard you cannot demonstrate firing is not a
-    conservative addition; it is a claim.* The cheap control — run the
-    check that is already there and see whether IT fires — cost one
-    probe and would have been worth running before writing the code
-    rather than after.
+    So the reverted guard was in the right place after all, and the
+    prescription that went with it — "thread a relations table into
+    `LowerCtx`" — was also wrong, since `lower_program` already builds
+    that table. **Ask the instrument, not the outcome**: one call to the
+    table builder answered in a line what a program-level control could
+    not answer at all.
+
+    The real gap is the discarded `LowerError` entries, and it is NOT
+    closed here. Surfacing them would start reporting every constraint
+    error currently swallowed — arity mismatches, unknown relations,
+    recursive expansions — against a corpus that has never had them
+    reported. That is a blast radius that needs its own probe over the
+    fixture set, and it is the next batch's first item.
+
+58. **`logf` finds its path by VALUE, not position (2026-08-17).**
+
+    `lower_log` skips the logf path by comparing each string literal
+    against the path string, so a message that happens to equal the path
+    is skipped as though it were the path. `logf("t.log", "t.log", error,
+    "BOOM")` gives TB-IR the message `"BOOM"` where v1 emits `"t.log"`,
+    and `logf("t.log", error, "t.log")` gives TB-IR `""` where v1 emits
+    `"t.log"`. Both backends accept both programs, so this is a live
+    silent DIVERGENCE rather than a shared mis-lowering — the only one
+    found in this batch. v1 takes the path positionally; matching that is
+    the fix, and it is recorded rather than made here because it changes
+    an extractor the equivalence corpus exercises heavily.
 
 ### The probe method
 
