@@ -654,6 +654,97 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
     }
 }
 
+/// The constraint lowerer's diagnostics for one randomize site, turned
+/// into a `LowerError` — or `None` when nothing in `errs` is worth
+/// surfacing.
+///
+/// Every non-Z3 entry used to be skipped, which threw away these
+/// diagnostics entirely: a `randomize ... with NoSuchRelation(r)`
+/// lowered clean under TB-IR while v1 refused it outright.
+///
+/// Only the RELATION errors surface. Three of them are program errors
+/// under any backend: a relation that does not exist, one called with
+/// the wrong arity, and one that expands into itself. Measured against
+/// v1: it rejects the first two ("constraint function call not
+/// supported in v0 solver path") and STACK-OVERFLOWS on the third, so
+/// none of them is an escape hatch and `Invalid` is the honest verdict.
+///
+/// The other variants stay discarded ON PURPOSE. They are capability
+/// gaps in the constraint IR, not bad programs:
+/// `DisallowedInConstraint` fires on `s.sample[63:32] != 0` in
+/// `uint64_unique_randomize_test`, a REGISTERED fixture that v1 lowers
+/// and that passes trace equivalence today. Surfacing them would
+/// reject working programs. That is not a guess — all 190 files in
+/// `tests/fixtures` were run through both table builders (184 merge);
+/// two produce non-relation `LowerError`s (`uint64_unique_randomize_
+/// test` and `axi_agent`, the latter `UnresolvedIdent`/`WidthMismatch`/
+/// `BvLitOutOfRange`) and none produces a relation one.
+fn surface_constraint_lower_error(
+    errs: &[crate::constraints::typed_lower::LowerError],
+) -> Option<LowerError> {
+    for e in errs {
+        use crate::constraints::typed_lower::LowerError as CErr;
+        let detail = match e {
+            CErr::UnknownRelation { name, .. } => {
+                format!("`{name}` names no `relation` declared in this file")
+            }
+            CErr::RelationArityMismatch {
+                name,
+                expected,
+                found,
+                ..
+            } => {
+                format!("`{name}` takes {expected} argument(s) but was called with {found}")
+            }
+            CErr::RecursiveRelation { name, .. } => {
+                format!("`{name}` expands into itself, so the constraint has no finite form")
+            }
+            // NOT `Invalid`, unlike its three siblings. v1 ACCEPTS a
+            // misplaced name — it emits working C++ with the arguments
+            // silently swapped — so "a program error under every
+            // backend" is literally false here. This is the sweep's
+            // ordinary `SilentlyMisLowers` shape and gets that verdict,
+            // which also keeps the diagnostic from naming v1 as a way
+            // out.
+            CErr::RelationNamedArgMisplaced {
+                name,
+                arg,
+                expected,
+                found,
+                ..
+            } => {
+                let detail = match expected {
+                    Some(e) => format!(
+                        "`{name}` binds arguments by position, and `{arg}` is parameter {} \
+                         but was written in position {}; v1 substitutes it positionally \
+                         anyway, silently swapping the values",
+                        e + 1,
+                        found + 1
+                    ),
+                    None => format!(
+                        "`{arg}` names no parameter of `{name}`; v1 substitutes it \
+                         positionally anyway"
+                    ),
+                };
+                return Some(not_implemented(
+                    "a misplaced named argument in a relation call",
+                    detail,
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            _ => continue,
+        };
+        // Not "`randomize ... with`": a relation call also appears in a
+        // transaction-level `keep` (spec §4), and naming a `with` clause
+        // that is not in the file sends the reader looking for the
+        // wrong line.
+        return Some(LowerError::Invalid(format!(
+            "in a randomize constraint: {detail}"
+        )));
+    }
+    None
+}
+
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
@@ -1366,93 +1457,35 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } => {
                 randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
             }
-            // Every non-Z3 entry used to be skipped, which threw away
-            // the constraint lowerer's diagnostics entirely — a
-            // `randomize ... with NoSuchRelation(r)` lowered clean under
-            // TB-IR while v1 refused it outright.
-            //
-            // Only the RELATION errors surface. They are program errors
-            // under any backend: a relation that does not exist, one
-            // called with the wrong arity, and one that expands into
-            // itself. Measured against v1: it rejects the first two
-            // ("constraint function call not supported in v0 solver
-            // path") and STACK-OVERFLOWS on the third, so none of them
-            // is an escape hatch and `Invalid` is the honest verdict.
-            //
-            // The other variants stay discarded ON PURPOSE. They are
-            // capability gaps in the constraint IR, not bad programs:
-            // `DisallowedInConstraint` fires on `s.sample[63:32] != 0`
-            // in `uint64_unique_randomize_test`, a REGISTERED fixture
-            // that v1 lowers and that passes trace equivalence today.
-            // Surfacing them would reject working programs. That is not
-            // a guess — all 173 registry fixtures were run through the
-            // table builder, and exactly one produces a non-relation
-            // `LowerError`.
             crate::solver::problem_table::TypedSolverProblemBuild::LowerError(errs) => {
-                for e in errs {
-                    use crate::constraints::typed_lower::LowerError as CErr;
-                    let detail = match e {
-                        CErr::UnknownRelation { name, .. } => {
-                            format!("`{name}` names no `relation` declared in this file")
-                        }
-                        CErr::RelationArityMismatch {
-                            name,
-                            expected,
-                            found,
-                            ..
-                        } => format!(
-                            "`{name}` takes {expected} argument(s) but was called with {found}"
-                        ),
-                        CErr::RecursiveRelation { name, .. } => format!(
-                            "`{name}` expands into itself, so the constraint has no finite form"
-                        ),
-                        // NOT `Invalid`, unlike its three siblings. v1
-                        // ACCEPTS a misplaced name — it emits working
-                        // C++ with the arguments silently swapped — so
-                        // "a program error under every backend" is
-                        // literally false here. This is the sweep's
-                        // ordinary `SilentlyMisLowers` shape and gets
-                        // that verdict, which also keeps the diagnostic
-                        // from naming v1 as a way out.
-                        CErr::RelationNamedArgMisplaced {
-                            name,
-                            arg,
-                            expected,
-                            found,
-                            ..
-                        } => {
-                            let detail = match expected {
-                                Some(e) => format!(
-                                    "`{name}` binds arguments by position, and `{arg}` is \
-                                     parameter {} but was written in position {}; v1 \
-                                     substitutes it positionally anyway, silently swapping \
-                                     the values",
-                                    e + 1,
-                                    found + 1
-                                ),
-                                None => format!(
-                                    "`{arg}` names no parameter of `{name}`; v1 substitutes \
-                                     it positionally anyway"
-                                ),
-                            };
-                            return Err(not_implemented(
-                                "a misplaced named argument in a relation call",
-                                detail,
-                                V1Status::SilentlyMisLowers,
-                            ));
-                        }
-                        _ => continue,
-                    };
-                    // Not "`randomize ... with`": a relation call also
-                    // appears in a transaction-level `keep` (spec §4),
-                    // and naming a `with` clause that is not in the file
-                    // sends the reader looking for the wrong line.
-                    return Err(LowerError::Invalid(format!(
-                        "in a randomize constraint: {detail}"
-                    )));
+                if let Some(err) = surface_constraint_lower_error(errs) {
+                    return Err(err);
                 }
             }
             _ => {}
+        }
+    }
+
+    // The table above only collects randomize sites in `test` and
+    // `tseq` bodies, so the check just above never saw a
+    // `randomize ... with` written inside a component method body, an
+    // `on` handler, a lifecycle phase, a transactor body or a free
+    // function. Those sites are not skipped at EMISSION — both
+    // backends route them through `cpp_tb::emit_randomize_for_site`,
+    // which lowers the constraint itself — so the identical
+    // `Band(r, hi = 2000, lo = 1000)` that a test body now refuses was
+    // reaching C++ with the bounds swapped, from TB-IR as much as from
+    // v1. `build_component_scope_problem_table` covers exactly the
+    // bodies the emission table leaves out; it is read for its
+    // diagnostics and nothing else, so no `problem_id` from it is ever
+    // observable.
+    for entry in &crate::solver::problem_table::build_component_scope_problem_table(&file).entries {
+        if let crate::solver::problem_table::TypedSolverProblemBuild::LowerError(errs) =
+            &entry.build
+        {
+            if let Some(err) = surface_constraint_lower_error(errs) {
+                return Err(err);
+            }
         }
     }
 

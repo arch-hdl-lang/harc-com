@@ -17694,3 +17694,164 @@ fn a_misplaced_relation_argument_name_is_refused() {
         "{msg}"
     );
 }
+
+/// A `randomize ... with` written inside a component method body is
+/// refused for the same reasons a test-body one is.
+///
+/// The check above it reads the solver problem table, and that table
+/// only ever collected `test` and `tseq` sites — so the identical
+/// swapped call inside an agent's `on` handler lowered clean and
+/// reached C++ with the bounds reversed. The sites are not skipped at
+/// EMISSION: both backends emit them through
+/// `cpp_tb::emit_randomize_for_site`, which lowers the constraint
+/// itself, so this was TB-IR silently mis-lowering, not just v1.
+#[test]
+fn a_component_scope_relation_argument_swap_is_refused() {
+    let fixture = fixture("component_method_randomize_test.harc");
+    const BODY: &str =
+        "            r.value > 1000\n            r.value < 2000\n            r.addr == 24";
+    assert!(fixture.contains(BODY), "fixture shape changed");
+    // The randomize this rewrites lives in `agent Randomizer`'s
+    // `on in_ev(t)` handler — a component method body, not a test body.
+    let with = |call: &str| {
+        fixture
+            .replacen(
+                "agent Randomizer",
+                "relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi\n\
+                 \n\
+                 agent Randomizer",
+                1,
+            )
+            .replacen(
+                BODY,
+                &format!("            {call}\n            r.addr == 24"),
+                1,
+            )
+    };
+
+    // Controls: the positional form and the in-order named form both
+    // still lower, and both emit the bounds the source asked for.
+    for call in ["Band(r, 1000, 2000)", "Band(r, lo = 1000, hi = 2000)"] {
+        let program = lower_src(&with(call)).unwrap_or_else(|e| panic!("`{call}` lowers: {e}"));
+        let emitted = tbir::emit(
+            &program,
+            &merged_src(&with(call)),
+            &cpp_tb::EmitOpts::default(),
+        )
+        .expect("emits");
+        assert!(
+            emitted.contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)1000, 64))"),
+            "`{call}` binds lo := 1000"
+        );
+    }
+
+    let msg = assert_not_implemented(
+        &lower_src(&with("Band(r, hi = 2000, lo = 1000)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`hi` is parameter 3 but was written in position 2"),
+        "{msg}"
+    );
+
+    // What made it worth refusing: v1 emits the swapped bounds, and so
+    // did TB-IR before this check existed — `value > 2000 && value <
+    // 1000` has no solution.
+    assert!(
+        cpp_tb::emit(&merged_src(&with("Band(r, hi = 2000, lo = 1000)")))
+            .expect("v1 emits")
+            .contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))"),
+        "v1 binds lo := 2000"
+    );
+
+    // The `Invalid` half of the same check reaches component scope too.
+    let err = lower_src(&with("NoSuchRel(r)")).unwrap_err();
+    assert!(
+        format!("{err}").contains("`NoSuchRel` names no `relation` declared in this file"),
+        "{err}"
+    );
+}
+
+/// Every body shape that can host a `randomize` is walked, not just the
+/// `on` handler the bug was found in.
+///
+/// Each arm of `collect_component_randomize_sites` is a separate claim
+/// about where a randomize can be written; deleting any one of them
+/// must fail this test. It probes the collector rather than
+/// `lower_program`, because most of these shapes are refused earlier by
+/// unrelated gates (an unbound `testbench` is not lowered at all), and
+/// a refusal from one of those gates would prove nothing about whether
+/// the site was collected. The end-to-end refusal is pinned by
+/// `a_component_scope_relation_argument_swap_is_refused` above.
+#[test]
+fn every_component_body_that_can_host_a_randomize_is_walked() {
+    const PRELUDE: &str = "\
+bus B
+    tlm_method go(addr: uint<32>): blocking;
+end bus B
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
+";
+    // The swapped call, written once and dropped into each body shape.
+    const RZ: &str = "        let r : RegOp\n\
+                      \x20       randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+
+    let shapes: [(&str, String); 7] = [
+        (
+            "an `on` handler",
+            format!("agent A\n    in_ev : event<uint<8>>\n    on in_ev(t)\n{RZ}    end on\nend agent A\n"),
+        ),
+        (
+            "a hookable method",
+            format!("agent A\n    hookable go()\n{RZ}    end go\nend agent A\n"),
+        ),
+        (
+            "a testbench `function`",
+            format!("testbench Tb\n    dut : Top\n    function go()\n{RZ}    end function go\nend testbench Tb\n"),
+        ),
+        (
+            "a testbench lifecycle phase",
+            format!("testbench Tb\n    dut : Top\n    setup\n{RZ}    end setup\nend testbench Tb\n"),
+        ),
+        (
+            "a file-scope `function`",
+            format!("function go()\n{RZ}end function go\n"),
+        ),
+        (
+            "a transactor TLM target thread",
+            format!("transactor X bound to B\n    thread bus.go(addr: uint<32>)\n{RZ}    end thread\nend transactor X\n"),
+        ),
+        (
+            "a transactor `when active` method",
+            format!(
+                "transactor X bound to B\n    when active\n        hookable go()\n{RZ}        end go\n    end when\nend transactor X\n"
+            ),
+        ),
+    ];
+
+    for (what, body) in &shapes {
+        let src = format!("{PRELUDE}\n{body}");
+        let parsed = harc::parser::parse_source(&src).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let table = harc::solver::problem_table::build_component_scope_problem_table(&parsed);
+        let msgs: Vec<String> = table
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => {
+                    Some(format!("{v:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(table.entries.len(), 1, "{what}: site not collected");
+        assert!(
+            msgs.iter().any(|m| m.contains("RelationNamedArgMisplaced")),
+            "{what}: {msgs:?}"
+        );
+    }
+}

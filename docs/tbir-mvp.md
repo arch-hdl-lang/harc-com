@@ -4006,11 +4006,8 @@ case and only locally-determinable `Assign` types are compared).
     Three limits are known and NOT closed here, recorded so the next
     batch takes them deliberately:
 
-    * **Only Test and Tseq randomize sites are collected.** A
-      `randomize(r) with Band(r, hi = 2000, lo = 1000)` inside an agent's
-      `on` handler still lowers clean and still emits the swapped,
-      unsatisfiable constraint — the same call in a test body is refused.
-      The gate is `collect_randomize_sites`, not the check.
+    * **Only Test and Tseq randomize sites are collected.** Closed in
+      divergence 60 below.
     * **`MAX_ERRORS = 5` can disable the refusal.** Five preceding
       discarded errors (`r.addr == r.len` trips `WidthMismatch`, which is
       deliberately not surfaced) hit `at_error_cap()` before the relation
@@ -4020,6 +4017,58 @@ case and only locally-determinable `Assign` types are compared).
       call**, so a v1-supported `sum(...)` records `UnknownRelation`.
       Masked today only because TB-IR rejects `list<T>` fields earlier;
       it becomes a false `Invalid` the moment list fields lower.
+
+60. **A constraint written in a component body reached C++ unchecked
+    (2026-08-17).**
+
+    Divergence 59 recorded this as a known limit; this closes it.
+    `collect_randomize_sites` walks `Item::Test` and `Item::Tseq` and
+    nothing else, so the solver problem table had no entry for a
+    `randomize ... with` written in an agent's `on` handler, a component
+    method, a `testbench` lifecycle phase, a transactor TLM target
+    thread or a file-scope `function`. The refusal from divergence 59
+    reads that table, so it never saw those sites.
+
+    They are not skipped at EMISSION. Both backends emit them through
+    `cpp_tb::emit_randomize_for_site`, which lowers the constraint
+    itself. Measured on `component_method_randomize_test` with a
+    two-parameter relation added and called from the agent handler,
+    `Band(r, hi = 2000, lo = 1000)` emitted
+
+    ```cpp
+    _s.add(z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))
+        && z3::ult(_z_value, _ctx.bv_val((uint64_t)1000, 64)));
+    ```
+
+    byte-identically under **both** codegens — an unsatisfiable
+    constraint, silently. So this was TB-IR mis-lowering, not a v1 gap
+    TB-IR happened to inherit, and `SilentlyMisLowers` is the verdict on
+    both sides of the split (the `Invalid` relation errors reach these
+    sites too).
+
+    The fix is a **separate, validation-only** table
+    (`build_component_scope_problem_table`) rather than more arms in
+    `collect_randomize_sites`. Entry order in the main table assigns the
+    `problem_id`s both backends bake into emitted symbol names, so
+    widening it would renumber every site that follows a component-scope
+    one and churn emitted output for reasons unrelated to the check. The
+    new table is read for its `LowerError`s and never reaches emission.
+
+    Blast radius, measured before the change: of the 190 `.harc` files in
+    `tests/fixtures` (184 merge), exactly **one** contains a
+    component-scope randomize site, and it builds clean — zero new
+    refusals across the corpus.
+
+    Each of the seven body shapes is a separate claim about where a
+    randomize can be written, so each is pinned by mutation: deleting any
+    one arm of the collector fails
+    `every_component_body_that_can_host_a_randomize_is_walked`, and
+    deleting the new consuming loop in `lower_program` fails
+    `a_component_scope_relation_argument_swap_is_refused`. That test
+    probes the collector rather than `lower_program`, because most of
+    these shapes are refused earlier by unrelated gates — an unbound
+    `testbench` is not lowered at all — and a refusal from one of those
+    gates would prove nothing about whether the site was collected.
 
 ### The probe method
 

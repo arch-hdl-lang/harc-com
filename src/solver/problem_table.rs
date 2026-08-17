@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Block, CallArg, Expr, ExprKind, Item, SourceFile, Stmt, StmtKind, TestDecl, TestItem, TseqDecl,
-    TypeExpr,
+    Block, CallArg, ComponentItem, Expr, ExprKind, Item, SourceFile, Stmt, StmtKind, TestDecl,
+    TestItem, TseqDecl, TypeExpr,
 };
 use crate::constraints::elaborate_constraints;
 use crate::constraints::typed::{CTypedProblem, ConstraintProblemId};
@@ -119,7 +119,51 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
         next_problem_id += 1;
     }
 
-    for site in collect_randomize_sites(file) {
+    push_site_entries(
+        &elab,
+        &backend,
+        collect_randomize_sites(file),
+        &mut entries,
+        &mut next_problem_id,
+    );
+
+    TypedSolverProblemTable { entries }
+}
+
+/// A table over the randomize sites `build_typed_solver_problem_table`
+/// does **not** collect: those in component method bodies, `on`
+/// handlers, lifecycle phases, transactor bodies and free functions.
+///
+/// This is a **validation-only** table and deliberately a separate
+/// function rather than more arms in `collect_randomize_sites`. The
+/// main table's entry order assigns `problem_id`s that both backends
+/// bake into emitted symbol names, so widening it would renumber
+/// existing sites; these entries are built purely to be read for their
+/// `LowerError`s and never reach emission. Problem ids therefore
+/// restart at 1 and mean nothing outside this table.
+pub fn build_component_scope_problem_table(file: &SourceFile) -> TypedSolverProblemTable {
+    let elab = elaborate_constraints(file);
+    let backend = Z3Backend;
+    let mut entries = Vec::new();
+    let mut next_problem_id = 1u32;
+    push_site_entries(
+        &elab,
+        &backend,
+        collect_component_randomize_sites(file),
+        &mut entries,
+        &mut next_problem_id,
+    );
+    TypedSolverProblemTable { entries }
+}
+
+fn push_site_entries(
+    elab: &crate::constraints::ConstraintElaboration,
+    backend: &Z3Backend,
+    sites: Vec<RandomizeSite>,
+    entries: &mut Vec<TypedSolverProblemEntry>,
+    next_problem_id: &mut u32,
+) {
+    for site in sites {
         let Some(txn) = elab.transaction(&site.txn_name).cloned() else {
             continue;
         };
@@ -132,11 +176,11 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
             span: site.span,
         };
         let build = match lower_problem(
-            &elab,
+            elab,
             &txn,
             Some(&site.with_body),
             site.span,
-            ConstraintProblemId(next_problem_id),
+            ConstraintProblemId(*next_problem_id),
         ) {
             Ok(problem) => match backend.build(&problem) {
                 Ok(z3) => TypedSolverProblemBuild::Z3 {
@@ -148,10 +192,67 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
             Err(errors) => TypedSolverProblemBuild::LowerError(errors),
         };
         entries.push(TypedSolverProblemEntry { source, build });
-        next_problem_id += 1;
+        *next_problem_id += 1;
     }
+}
 
-    TypedSolverProblemTable { entries }
+/// Randomize sites in the bodies `collect_randomize_sites` skips. Both
+/// backends emit these through `cpp_tb::emit_randomize_for_site`, which
+/// does its own constraint lowering, so a bad constraint here reaches
+/// C++ under *both* codegens with no diagnostic from either.
+fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
+                collect_component_items(&c.items, &c.name.name, &mut out);
+            }
+            Item::Transactor(t) => {
+                collect_component_items(&t.items, &t.name.name, &mut out);
+                if let Some(active) = &t.when_active {
+                    collect_component_items(active, &t.name.name, &mut out);
+                }
+            }
+            Item::Function(f) => {
+                let mut env = BTreeMap::new();
+                collect_block(
+                    &f.body,
+                    &mut env,
+                    &format!("function {}", f.name.name),
+                    &mut out,
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn collect_component_items(items: &[ComponentItem], owner: &str, out: &mut Vec<RandomizeSite>) {
+    for item in items {
+        // Every arm gets a fresh `env`: a component body has no
+        // statement-position `let`s shared between its methods, so
+        // there is nothing to thread across them.
+        let mut env = BTreeMap::new();
+        match item {
+            ComponentItem::OnHandler(h) => {
+                collect_block(&h.body, &mut env, owner, out);
+            }
+            ComponentItem::Hookable(h) => {
+                collect_block(&h.body, &mut env, owner, out);
+            }
+            ComponentItem::TargetTlmThread(t) => {
+                collect_block(&t.body, &mut env, owner, out);
+            }
+            ComponentItem::Lifecycle(_, block) => {
+                collect_block(block, &mut env, owner, out);
+            }
+            ComponentItem::Field(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::Apply(_)
+            | ComponentItem::Watchdog(_) => {}
+        }
+    }
 }
 
 fn collect_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
