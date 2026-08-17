@@ -3667,15 +3667,25 @@ case and only locally-determinable `Assign` types are compared).
     entry already carried a rule about reading the generated C++, which
     is not the same as reading two lines out of it.
 
-    A fifth, adjacent landing is left UNCLASSIFIED on purpose:
-    `records.rs`'s `parameters on transaction`. Three reference positions
-    were probed — a field default, a `range(0, N)` attribute and a `keep`
-    constraint — and all three emit ahead of v1's consts or (for `keep`)
-    only into a log string, so nothing silent turned up. That is evidence
-    about three positions, not about the space, and the scoreboard arm in
-    this same entry is what a fourth unenumerated position costs. It
-    stays `Unsupported` until someone enumerates transaction item kinds
-    the way the scoreboard gate had to be.
+    A FIFTH landing, `records.rs`'s `parameters on transaction`, agrees
+    too, and its silent position is the worst of the set. A `keep`
+    constraint referencing the parameter does not emit the name at all:
+    the constraint IR CONST-FOLDS it against a same-named file-scope
+    `const`, so v1 emits
+    `_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))` and records
+    `(tag:u8 < 5:u8)` in the runtime problem table. The randomizer runs
+    against the const's bound with no `N` left anywhere to notice. Strip
+    the FAIL log line, which echoes source text verbatim, and
+    `keep tag < N` and `keep tag < 5` are the same program.
+
+    This arm was left UNCLASSIFIED for one commit on the grounds that
+    three probed positions — field default, `range(0, N)`, and the
+    `keep` — all emitted ahead of the consts or, for the `keep`, "only
+    into a log string". The log line is real. It also sits thirty lines
+    BELOW the solver line that does the folding, and reading down to it
+    meant reading past the answer. The caution attached to that note
+    ("evidence about three positions, not about the space") was right,
+    and the position it was worried about was one already looked at.
 
     Both anchors were needed here and both were nearly skipped. Byte
     identity means nothing unless the component contributes at all, and
@@ -3684,10 +3694,10 @@ case and only locally-determinable `Assign` types are compared).
     any identity. This is divergence 51's lesson applied before being
     caught by it rather than after.
 
-    Probed at all FOUR landings rather than one, because divergence
+    Probed at all FIVE landings rather than one, because divergence
     47's tseq pair sat four lines apart and classified differently. They
     all agree on `SilentlyMisLowers` — a result, not a reason to have
-    assumed it.
+    assumed it, and it took two wrong labels along the way to establish.
 
     The fourth landing, `scoreboards.rs`, was first labelled
     `EmitsUncompilable` on a structural argument: a data-only scoreboard

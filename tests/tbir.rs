@@ -16439,9 +16439,9 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
 
 /// Named arguments in a component method call. No CODEGEN site in v1
 /// reads an argument NAME: of the 30 `CallArg::Named` matches in
-/// `cpp_tb.rs`, 26 destructure `{ value, .. }` and the 4 that bind
-/// `name` are AST-rewrite passes that reconstruct the node. Binding is
-/// by position everywhere.
+/// `cpp_tb.rs`, 25 are `{ value, .. }` and one is `{ value: e, .. }` —
+/// all 26 drop the name — and the 4 that bind `name` are AST-rewrite
+/// passes that reconstruct the node. Binding is by position everywhere.
 ///
 /// With two arguments that is a silent swap: the user writes the names
 /// precisely so the order does not matter, and v1 does the one thing
@@ -16952,4 +16952,116 @@ end impl ParamTest
             "{kind}: `#(N: int = 3)` and `#(4)` are both invisible in the output"
         );
     }
+}
+
+/// The FIFTH landing of the component-parameter construct, on
+/// `transaction`. It agrees with the other four, and its silent position
+/// is silent in a worse way: a `keep` constraint does not emit the
+/// parameter's name at all, it CONST-FOLDS it against a same-named
+/// file-scope `const` and bakes that value into the Z3 call.
+///
+/// This arm was left unclassified for one commit on the grounds that
+/// three probed positions all emitted ahead of v1's consts, with the
+/// `keep` reaching "only a log string". The log line is real and thirty
+/// lines BELOW the solver line that does the folding.
+#[test]
+fn a_transaction_parameter_is_const_folded_to_the_wrong_bound() {
+    const SRC: &str = r#"const N = 5
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxnDECL
+    tag : uint<8> DEFAULT
+
+    keep tag < KEEP
+end transaction TinyTxn
+
+testbench RecTb
+    dut : Top
+end testbench RecTb
+
+impl RecTest for RecTb
+    clock clk = SysDomain
+    run
+        let t : TinyTxn
+        randomize(t)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl RecTest
+"#;
+    let mk = |decl: &str, default: &str, keep: &str| {
+        SRC.replace("TinyTxnDECL", decl)
+            .replace(" DEFAULT", default)
+            .replace("KEEP", keep)
+    };
+    let line_of = |out: &str, needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` missing from v1's output"))
+    };
+
+    // The silent position: `keep tag < N` folds to the CONST's 5.
+    let folded = mk("TinyTxn #(N: int = 3)", "", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&folded).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on transaction"), "{msg}");
+    let v1_folded = cpp_tb::emit(&merged_src(&folded)).expect("v1 emits");
+    assert!(
+        v1_folded.contains("_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))"),
+        "the solver gets the const's 5"
+    );
+    // Not the parameter's own default, and no `N` survives to notice.
+    assert!(
+        !v1_folded.contains("_ctx.bv_val((uint64_t)3, 64)"),
+        "the parameter's default 3 reaches the solver nowhere"
+    );
+    // The recorded problem descriptor carries the folded value too, so
+    // the constraint the runtime reports is `tag < 5`, not `tag < N`.
+    assert!(
+        v1_folded.contains("(tag:u8 < 5:u8):bool"),
+        "the problem table records the folded bound"
+    );
+    // `keep tag < N` and `keep tag < 5` differ ONLY in the FAIL log
+    // line, which echoes the source text verbatim. Everything the
+    // program actually executes is identical.
+    let literal =
+        cpp_tb::emit(&merged_src(&mk("TinyTxn #(N: int = 3)", "", "5"))).expect("v1 emits");
+    let strip_log = |o: &str| {
+        o.lines()
+            .filter(|l| !l.contains("participated in the solve"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_log(&v1_folded),
+        strip_log(&literal),
+        "outside the echoed log text, `keep tag < N` IS `keep tag < 5`"
+    );
+    // The log line that hid this: it is BELOW the solver line.
+    assert!(
+        line_of(
+            &v1_folded,
+            "_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))"
+        ) < line_of(&v1_folded, "participated in the solve"),
+        "reading the log line alone misses the fold above it"
+    );
+
+    // The uncompilable position, for contrast: a field default emits the
+    // name verbatim, inside the struct and ahead of the const.
+    let by_default = mk("TinyTxn #(N: int = 3)", " default N", "7");
+    assert_not_implemented(
+        &lower_src(&by_default).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    assert!(
+        line_of(&v1_default, "uint64_t tag = N;")
+            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+        "the field initializer precedes the const, so that position does not compile"
+    );
 }

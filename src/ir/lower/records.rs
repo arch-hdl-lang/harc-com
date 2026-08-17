@@ -25,7 +25,7 @@
 //! Enum-typed fields lower as scalar variant indices (v1's `int64_t`
 //! member shape).
 
-use super::{unsupported, LowerError};
+use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, ExprKind, Field, StructDecl, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr,
 };
@@ -40,9 +40,34 @@ pub(crate) fn lower_transaction(
 ) -> Result<RecordSchema, LowerError> {
     let txn = &t.name.name;
     if !t.params.is_empty() {
-        return Err(unsupported(
+        // The fifth landing of the component-parameter construct, and it
+        // agrees with the other four. v1 never reads a `#(...)` list, and
+        // a transaction gives it three ways to matter:
+        //
+        //   * unused — a no-op.
+        //   * a field default (`tag : uint<8> default N`) — emitted
+        //     verbatim inside the struct, ahead of every file-scope
+        //     `const`, so `N` is undeclared and it does not compile.
+        //   * a `keep` constraint (`keep tag < N`) — this is the silent
+        //     one, and it is silent in a worse way than the component
+        //     arms. The constraint IR CONST-FOLDS `N` against a
+        //     same-named file-scope `const`, so v1 emits
+        //     `_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))`
+        //     with the const's 5 baked in — not the parameter's default,
+        //     not any `#(...)` argument, and with no `N` left in the
+        //     output to notice. It compiles and randomizes to the wrong
+        //     bound.
+        //
+        // The `keep` position was missed on the first pass by reading
+        // the FAIL log line it also emits (`constraint \`tag < N\`
+        // participated in the solve`) and concluding the reference only
+        // reached a string. The solver line sits thirty lines above it.
+        return Err(not_implemented(
             &format!("parameters on transaction `{txn}`"),
-            "",
+            "v1 drops the parameter list entirely: a field default referencing one emits \
+             an undeclared name, and a `keep` constraint const-folds it against a \
+             same-named file-scope `const`, randomizing to that bound instead",
+            V1Status::SilentlyMisLowers,
         ));
     }
     let mut fields: Vec<RecordFieldSchema> = Vec::new();
