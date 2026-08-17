@@ -5569,6 +5569,45 @@ fn randomize_target_ident(target: &Expr) -> Option<&str> {
     }
 }
 
+/// Element signedness of `sum(<list>[lo..hi])`, or `false` for any other
+/// call.
+///
+/// Recognition mirrors `try_emit_constraint_list_call`'s `sum` arm — same
+/// callee name, same single `CallArg::Expr`, same `Index` target resolved
+/// through `list_field_name_from_expr`. The two must agree about what
+/// counts as a `sum` over a list: if this one is narrower the comparison
+/// goes back to unsigned (harc#598), and if it is wider it claims
+/// signedness for something the emitter lowers some other way. Deliberately
+/// does NOT require the index to be a `RangeLit` — the emitter diagnoses a
+/// non-range index itself, and a signedness answer for an expression that
+/// is about to be rejected is irrelevant either way.
+fn sum_call_elem_signed(
+    e: &Expr,
+    field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+    target_root: Option<&str>,
+) -> bool {
+    let ExprKind::Call { callee, args } = &*e.kind else {
+        return false;
+    };
+    let ExprKind::Ident(name) = &*callee.kind else {
+        return false;
+    };
+    if name.name != "sum" || args.len() != 1 {
+        return false;
+    }
+    let CallArg::Expr(arg) = &args[0] else {
+        return false;
+    };
+    let ExprKind::Index { target, .. } = &*arg.kind else {
+        return false;
+    };
+    list_field_name_from_expr(target, field_info, target_root)
+        .and_then(|field| field_info.get(&field))
+        .and_then(|f| f.list.as_ref())
+        .map(|l| l.elem_signed)
+        .unwrap_or(false)
+}
+
 fn list_field_name_from_expr(
     e: &Expr,
     field_info: &std::collections::HashMap<String, TxnFieldInfo>,
@@ -15187,6 +15226,15 @@ impl Emitter {
                     .map(|l| l.elem_signed)
                     .unwrap_or(false)
             }
+            // `sum(vals[0..vals.len()])` over a signed list. This was the
+            // OTHER way a signed list element reaches a constraint, and
+            // fixing only the `Index` arm left it emitting
+            // `z3::ult(<sum>, 0)` — false for every value, where the source
+            // is satisfied by any negative element (harc#598).
+            //
+            // A `.len()` call is unsigned and must keep answering `false`,
+            // which it does: only `sum` is matched here.
+            ExprKind::Call { .. } => sum_call_elem_signed(e, field_info, target_root),
             ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => recur(inner),
             ExprKind::Binary { lhs, rhs, .. } => recur(lhs) || recur(rhs),
             ExprKind::Membership { expr, .. } => recur(expr),

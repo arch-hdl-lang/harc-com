@@ -24,6 +24,7 @@ transaction Req
     addr  : uint<32>
     color : Color
     ready : uint<1>
+    hi    : uint<1>
 
     // Range membership: 1..16 inclusive.
     keep len in [1..16]
@@ -39,6 +40,11 @@ transaction Req
     // rejected it outright, which is what kept this line out of the corpus
     // until harc#596.
     keep ready
+    // The same coercion in a NESTED Bool position. The typed constraint IR
+    // coerced only a clause ROOT until harc#599, so `!hi` lowered as an
+    // error there while both emitters compiled it — which is why no fixture
+    // could carry this shape either.
+    keep !hi
 end transaction Req
 
 testbench KeepConstraintsTb
@@ -75,6 +81,9 @@ impl KeepConstraintsTest for KeepConstraintsTb
             // satisfying value is 1.
             assert t.ready == 1
                 else fail("iter ${i}: ready=${t.ready} violates bare `keep ready`")
+            // `!hi` on one bit coerces to `!(hi != 0)`, so hi must be 0.
+            assert t.hi == 0
+                else fail("iter ${i}: hi=${t.hi} violates `keep !hi`")
         end for
 
         log(info, "PASS: 30 randomize(t) calls satisfied every keep constraint")
