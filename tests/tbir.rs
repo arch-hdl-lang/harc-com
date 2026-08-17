@@ -13895,55 +13895,151 @@ end impl T"#
 }
 
 
-/// A non-literal `@ <base>` or `size` on an addrmap instance is not a
-/// v1 escape hatch. The comment in `addrmap.rs` used to claim v1
-/// "const-folds arbitrary expressions" — it does not: `@ 0x50 + 0x10`
-/// folds to ZERO there, and v1 emits a register write against base 0
-/// instead of 0x60. The testbench pokes the wrong address and reports
-/// nothing.
+/// An addrmap instance `@ <base>` / `size` now FOLDS through the file
+/// constant table, so `@ BASE + 0x10` means what it says. This is one of
+/// the places TB-IR is ahead of v1 rather than catching up: v1's own
+/// fold accepts any expression and yields ZERO, emitting a register
+/// write against base 0. The testbench pokes the wrong address and
+/// reports nothing.
 ///
-/// Both anchors are in the assertions below: v1's output for the
-/// expression matches the LITERAL ZERO base (positive — it really folded
-/// to 0) and differs from the literal 0x60 base (negative — the base
-/// genuinely affects the emitted address, so byte-equality is not a
-/// property of the fixture).
+/// Because the two backends disagree here — one of them is wrong — a
+/// program using this is deliberately absent from
+/// `tests/tbir_equiv_fixtures.txt`, and v1's behaviour is pinned below
+/// so a future change to it is caught rather than assumed.
 #[test]
-fn a_non_literal_addrmap_base_does_not_point_at_v1() {
-    let err = lower_src(&addrmap_src("@ 0x50 + 0x10 size 0x30")).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("non-literal `@ <base>`"), "{msg}");
-    assert!(msg.contains("folds it to ZERO"), "{msg}");
+fn a_const_addrmap_base_or_size_folds() {
+    // Control: the unmutated shape lowers, so the assertions below are
+    // reaching the addrmap arm rather than tripping an earlier gate.
+    let zero = emit_cpp_src(&addrmap_src("@ 0x00 size 0x30"));
 
-    let err = lower_src(&addrmap_src("@ 0x00 size 0x18 + 0x18")).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("non-literal `size`"), "{msg}");
+    // The fold gives byte-identical output to the literal it computes…
+    let literal = emit_cpp_src(&addrmap_src("@ 0x60 size 0x30"));
+    for spelling in [
+        "@ 0x50 + 0x10 size 0x30",
+        "@ B size 0x30",
+        "@ B size S",
+        "@ 0x60 size S",
+    ] {
+        let src = format!(
+            "const B = 0x60\nconst S = 0x30\n\n{}",
+            addrmap_src(spelling)
+        );
+        assert_eq!(
+            emit_cpp_src(&src),
+            literal,
+            "`{spelling}` must lower exactly like `@ 0x60 size 0x30`"
+        );
+    }
+    // …and the base VALUE is genuinely used, so that equality is the
+    // fold working rather than the base being dropped.
+    assert_ne!(zero, literal, "a different base must change the output");
 
-    // The control lowers, so the probe is reaching the addrmap arm
-    // rather than tripping an earlier gate.
-    emit_cpp_src(&addrmap_src("@ 0x00 size 0x30"));
+    // The folded base reaches the emitted ADDRESS, pre-shifted: the SA
+    // register sits at offset 0x18, so base 0x60 puts it at 0x78 = 120.
+    assert!(
+        literal.contains("AxilHelper_write(120,"),
+        "the folded base is pre-shifted into the register address:\n{literal}"
+    );
 
-    // v1's evidence, pinned on the emitted ADDRESS rather than whole
-    // files — `0` and `0x00` are the same value spelled two ways, and
-    // the claim is about the value.
-    let addr_of = |inst: &str| {
-        let cpp = cpp_tb::emit(&merged_src(&addrmap_src(inst))).expect("v1 emits");
+    // A `size` that folds still feeds the overlap check, so the check
+    // that exists to catch a bad map has not been quietly disabled.
+    // `S = 0x80` runs the first instance's window over the second's base
+    // at 0x30 — a size folding to 0 would collapse the window and let
+    // this through silently, which is exactly what v1 does.
+    let err = lower_src(&format!(
+        "const S = 0x80\n\n{}",
+        addrmap_src("@ 0x00 size S")
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("overlap"),
+        "a folded size must still overlap-check: {err:?}"
+    );
+
+    // v1's side, pinned on the emitted address rather than whole files
+    // — `0` and `0x00` are the same value spelled two ways, and the
+    // claim is about the value.
+    let v1_addr_of = |inst: &str, pre: &str| {
+        let cpp =
+            cpp_tb::emit(&merged_src(&format!("{pre}{}", addrmap_src(inst)))).expect("v1 emits");
         let at = cpp
             .find("AxilHelper_write(helper, (")
             .unwrap_or_else(|| panic!("no addrmap write in v1 output:\n{cpp}"));
         let rest = &cpp[at + "AxilHelper_write(helper, (".len()..];
-        rest[..rest.find(")").expect("the address expression closes")].to_string()
+        rest[..rest.find(')').expect("the address expression closes")].to_string()
     };
-
-    // The expression base folds to ZERO — the write lands at 0x18…
-    assert_eq!(
-        addr_of("@ 0x50 + 0x10 size 0x30").replace("0x00", "0"),
-        "0 + 0x18",
-        "v1 folds a non-literal addrmap base to 0"
-    );
-    // …where the base it was WRITTEN as would have put it at 0x78. That
-    // contrast is what makes the fold a silent bug rather than a
+    // Both spellings TB-IR now folds to 0x60 land at 0 under v1…
+    for (inst, pre) in [
+        ("@ 0x50 + 0x10 size 0x30", ""),
+        ("@ B size 0x30", "const B = 0x60\n\n"),
+    ] {
+        assert_eq!(
+            v1_addr_of(inst, pre).replace("0x00", "0"),
+            "0 + 0x18",
+            "v1 folds `{inst}` to 0"
+        );
+    }
+    // …where the base they compute would have put the write at 0x78.
+    // That contrast is what makes v1's fold a silent bug rather than a
     // harmless spelling difference.
-    assert_eq!(addr_of("@ 0x60 size 0x30"), "0x60 + 0x18");
+    assert_eq!(v1_addr_of("@ 0x60 size 0x30", ""), "0x60 + 0x18");
+}
+
+/// The folds above accept constant expressions, not arbitrary ones —
+/// and the three ways one can fail to be usable are three different
+/// error kinds, because they are three different problems.
+#[test]
+fn an_unfoldable_or_negative_addrmap_base_is_still_rejected() {
+    // Control: the unmutated shape lowers.
+    emit_cpp_src(&addrmap_src("@ 0x00 size 0x30"));
+
+    // Not a constant at all: v1 emits base 0, so this must not point at
+    // it.
+    let err = lower_src(&addrmap_src("@ dut.count_out size 0x30")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("non-constant `@ <base>`"), "{msg}");
+
+    // Foldable but negative — a program error, not a backend gap.
+    let err = lower_src(&format!(
+        "const B = 0 - 8\n\n{}",
+        addrmap_src("@ B size 0x30")
+    ))
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("must not be negative"), "{msg}");
+
+    // Base + size must stay inside the 64-bit address space. Both
+    // operands fold now, so their sum can leave it; an unchecked add
+    // would panic in debug and WRAP in release, silently defeating the
+    // overlap check the sum exists for.
+    let err = lower_src(&format!(
+        "const B : uint<64> = 0xFFFFFFFFFFFFFF00\n\n{}",
+        addrmap_src("@ B size 0x1000")
+    ))
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("window 0x"),
+        "the WINDOW add is the one checked: {msg}"
+    );
+    assert!(msg.contains("overflows a 64-bit address"), "{msg}");
+
+    // Same for base + register offset — the add that actually reaches
+    // the emitted bus address. Spelled with NO `size`, so the window
+    // check above skips this instance and cannot stand in for the one
+    // being exercised; the assertion names the register to keep the two
+    // apart, since both messages end the same way.
+    let err = lower_src(&format!(
+        "const B : uint<64> = 0xFFFFFFFFFFFFFFFF\n\n{}",
+        addrmap_src("@ B")
+    ))
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("register `SA` offset 0x18"),
+        "the REGISTER pre-shift add is the one checked: {msg}"
+    );
+    assert!(msg.contains("overflows a 64-bit address"), "{msg}");
 }
 
 fn addrmap_src(inst: &str) -> String {
@@ -14063,61 +14159,92 @@ fn a_const_coverpoint_slice_bound_folds() {
     assert_ne!(k3, k7, "a different const must produce a different mask");
 }
 
-/// A non-literal regblock offset or reset value is not a v1 escape
-/// hatch — v1 folds both to ZERO, exactly as it does an addrmap base
-/// (divergence 39).
-///
-/// The offset case is the worse of the two: the address TABLE entry
-/// becomes `{ "SRC", 0, 32 }` and the decode becomes `addr == 0`, so the
-/// register aliases whatever lives at offset 0 and its reads and writes
-/// silently hit a different register.
+/// A regblock register `@ <addr>` offset and `reset` value now FOLD,
+/// through the same helper as the addrmap base and size. Like those,
+/// this puts TB-IR ahead of v1 rather than level with it: v1 folds both
+/// to ZERO. The offset case is the worse of the two — the address TABLE
+/// entry becomes `{ "SRC", 0, 32 }` and the decode becomes `addr == 0`,
+/// so the register aliases whatever lives at offset 0 and its reads and
+/// writes silently hit a different register.
 ///
 /// Probed by mutating `regblock_subset_test` — registered, and passing
 /// under both backends — one token at a time, so the control is
 /// known-good rather than synthetic.
 #[test]
-fn a_non_literal_regblock_offset_or_reset_does_not_point_at_v1() {
+fn a_const_regblock_offset_or_reset_folds() {
     let fixture = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/regblock_subset_test.harc"),
     )
     .expect("read the registered fixture");
 
-    // Control: the unmutated fixture lowers, so the probe reaches the
-    // regblock arms rather than tripping an earlier gate.
-    emit_cpp_src(&fixture);
+    // Control: the unmutated fixture lowers, so the mutations below
+    // reach the regblock arms rather than tripping an earlier gate.
+    let literal = emit_cpp_src(&fixture);
 
     let offset = |pre: &str, off: &str| {
-        format!("{pre}{}", fixture.replace(
-            "register SRC     @ 0x18 access rw",
-            &format!("register SRC     @ {off} access rw"),
-        ))
-    };
-    for (pre, off) in [("const K = 0x18\n\n", "K"), ("", "0x10 + 0x08")] {
-        let err = lower_src(&offset(pre, off)).unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(msg.contains("non-literal `@ <addr>` offset"), "`{off}`: {msg}");
-        assert!(msg.contains("aliases offset 0"), "{msg}");
-    }
-
-    let err = lower_src(&format!(
-        "const R = 7\n\n{}",
-        fixture.replace(
-            "register CTRL    @ 0x00 reset 7 access rw",
-            "register CTRL    @ 0x00 reset R access rw",
+        format!(
+            "{pre}{}",
+            fixture.replace(
+                "register SRC     @ 0x18 access rw",
+                &format!("register SRC     @ {off} access rw"),
+            )
         )
-    ))
-    .unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("non-literal reset value"), "{msg}");
+    };
+    let reset = |pre: &str, rv: &str| {
+        format!(
+            "{pre}{}",
+            fixture.replace(
+                "register CTRL    @ 0x00 reset 7 access rw",
+                &format!("register CTRL    @ 0x00 reset {rv} access rw"),
+            )
+        )
+    };
 
-    // v1's evidence, with both anchors. The const offset emits the
-    // table entry a LITERAL ZERO offset would…
+    // Every folding spelling of the offset lowers exactly like the
+    // literal it computes…
+    for (pre, off) in [
+        ("const K = 0x18\n\n", "K"),
+        ("", "0x10 + 0x08"),
+        ("const K = 0x08\n\n", "0x10 + K"),
+    ] {
+        assert_eq!(
+            emit_cpp_src(&offset(pre, off)),
+            literal,
+            "`@ {off}` must lower exactly like `@ 0x18`"
+        );
+    }
+    // …and so does the reset value.
+    assert_eq!(
+        emit_cpp_src(&reset("const R = 7\n\n", "R")),
+        literal,
+        "`reset R` with `const R = 7` must lower exactly like `reset 7`"
+    );
+
+    // Both values genuinely matter, so the equalities above are the
+    // folds working rather than the values being dropped.
+    assert_ne!(
+        emit_cpp_src(&offset("const K = 0x1c\n\n", "K")),
+        literal,
+        "a different offset must change the output"
+    );
+    assert_ne!(
+        emit_cpp_src(&reset("const R = 9\n\n", "R")),
+        literal,
+        "a different reset must change the output"
+    );
+
+    // v1's side, with both anchors. The const offset emits the table
+    // entry a LITERAL ZERO offset would…
     let v1 = |src: &str| cpp_tb::emit(&merged_src(src)).expect("v1 emits");
     let folded = v1(&offset("const K = 0x18\n\n", "K"));
     assert!(
         folded.contains(r#"{ "SRC", 0, 32 }"#),
         "v1 folds the const offset to 0:\n{folded}"
+    );
+    assert!(
+        v1(&reset("const R = 7\n\n", "R")).contains("uint32_t CTRL = 0;"),
+        "v1 folds the const reset to 0"
     );
     // …and NOT the one it was written as, which is what makes the fold
     // a silent bug rather than a spelling difference.
@@ -14126,6 +14253,117 @@ fn a_non_literal_regblock_offset_or_reset_does_not_point_at_v1() {
         literal.contains(r#"{ "SRC", 0x18, 32 }"#),
         "the literal offset survives, so the value genuinely matters:\n{literal}"
     );
+}
+
+/// The regblock folds accept CONSTANT expressions, not arbitrary ones,
+/// and the values they do accept are still checked. The three outcomes
+/// are deliberately different error kinds, because they are three
+/// different problems.
+#[test]
+fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/regblock_subset_test.harc"),
+    )
+    .expect("read the registered fixture");
+    emit_cpp_src(&fixture);
+
+    let offset = |pre: &str, off: &str| {
+        format!(
+            "{pre}{}",
+            fixture.replace(
+                "register SRC     @ 0x18 access rw",
+                &format!("register SRC     @ {off} access rw"),
+            )
+        )
+    };
+
+    // Not a constant at all. v1 takes it and emits offset 0, so this
+    // stays SilentlyMisLowers rather than pointing at v1.
+    let err = lower_src(&offset("", "dut.count_out")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("non-constant `@ <addr>` offset"), "{msg}");
+
+    // A BARE Verilog-sized literal is the one shape here v1 gets right,
+    // and TB-IR lowers sized literals nowhere — `let z = 32'h18` is
+    // refused the same way. So it stays `Unsupported`, pointing at v1,
+    // and must not be swept in with the fold-to-zero shapes around it.
+    let err = lower_src(&offset("", "32'h18")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("is a Verilog-sized literal"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&offset("", "32'h18")))
+            .expect("v1 emits a sized literal")
+            .contains(r#"{ "SRC", 0x18, 32 }"#),
+        "v1 lowers a bare sized literal to the right offset, which is why this points at it"
+    );
+
+    // …but ONLY the bare SIZED form, and the arm narrows twice for two
+    // different reasons. v1's `c_int_literal_from` matches
+    // `ExprKind::Int` and nothing else, so a sized literal inside an
+    // expression — or merely parenthesised — hits its `"0"` arm; and an
+    // over-wide literal, unreadable by the same parser, becomes a
+    // `_harc_u128` composite that truncates into the 64-bit table
+    // field, which is offset 0 again. Pointing at v1 for any of these
+    // would be a false promise.
+    for off in ["32'h10 + 0x08", "(32'h18)", "0x10000000000000000"] {
+        let err = lower_src(&offset("", off)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("non-constant `@ <addr>` offset"),
+            "`{off}`: {msg}"
+        );
+        let v1_out = cpp_tb::emit(&merged_src(&offset("", off))).expect("v1 emits");
+        let entry = v1_out
+            .lines()
+            .find(|l| l.contains(r#""SRC""#))
+            .unwrap_or_else(|| panic!("no SRC table entry:\n{v1_out}"));
+        assert!(
+            !entry.contains("0x18"),
+            "v1 does not produce offset 0x18 for `{off}`, which is why this must NOT \
+             point at it: {entry}"
+        );
+    }
+
+    // Foldable but negative: an address cannot be, under any backend.
+    let err = lower_src(&offset("const K = 0 - 8\n\n", "K")).unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("must not be negative"), "{msg}");
+
+    // An untyped `const` folds SIGNED, so a value at or above 2^63
+    // lands in that same arm. The message names the escape hatch, and
+    // the escape hatch works.
+    let err = lower_src(&offset("const K = 0x8000000000000000\n\n", "K")).unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("`const NAME : uint<64> = ...`"), "{msg}");
+    lower_src(&offset("const K : uint<64> = 0x8000000000000000\n\n", "K"))
+        .expect("a uint<64> const spells a >=2^63 address");
+
+    // A FORWARD reference folds: regblocks lower after the whole
+    // constant table is built, so the declaration-order caveat that
+    // applies inside a `const` initializer must not be repeated here.
+    lower_src(&format!("{}\nconst K = 0x18\n", offset("", "K")))
+        .expect("a forward const reference folds at an address site");
+    let err = lower_src(&offset("", "NOPE")).unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        !msg.contains("declaration order"),
+        "the unknown-name message must not blame ordering here: {msg}"
+    );
+
+    // Foldable but wider than the register. A literal past the width was
+    // previously caught by C++ narrowing; folding makes it reachable
+    // with a `const`, so lowering checks it.
+    let err = lower_src(&format!(
+        "const R = 4294967296\n\n{}",
+        fixture.replace(
+            "register CTRL    @ 0x00 reset 7 access rw",
+            "register CTRL    @ 0x00 reset R access rw",
+        )
+    ))
+    .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("does not fit its 32-bit width"), "{msg}");
 }
 
 /// A `const` default on a `transaction` / `struct` field now folds. v1

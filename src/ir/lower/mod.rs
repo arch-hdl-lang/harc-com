@@ -319,6 +319,18 @@ pub(crate) fn fold_const(
             None if id.name == self_name => Err(FoldInvalid(format!(
                 "references itself — `const {self_name}` is a dependency cycle",
             ))),
+            // The declaration-order caveat applies only when folding a
+            // `const` INITIALIZER (`self_name` names it): those fold in
+            // file order against a table still being built. Every other
+            // caller — field defaults, addrmap/regblock addresses —
+            // folds against the COMPLETE table, where a forward
+            // reference resolves fine and an unknown name is simply
+            // unknown. Saying otherwise sent users looking for an
+            // ordering problem they did not have.
+            None if self_name.is_empty() => Err(FoldInvalid(format!(
+                "references `{}`, which is not a `const` or enum variant",
+                id.name
+            ))),
             None => Err(FoldInvalid(format!(
                 "references `{}`, which is not an earlier `const` or enum variant \
                  (constants resolve in declaration order, so forward or cyclic \
@@ -534,12 +546,14 @@ pub(crate) fn fold_const(
                 ))),
             }
         }
-        _ => Err(ConstFoldErr::Unsupported(
+        // Same `self_name` split as the unknown-name arm above: only a
+        // `const` initializer is restricted to EARLIER names.
+        _ => Err(ConstFoldErr::Unsupported(format!(
             "does not fold to a compile-time integer constant (only integer \
-             literals, earlier `const`/enum-variant names, `as` relabel casts, \
-             and the arithmetic/bitwise/shift operators are supported)"
-            .into(),
-        )),
+             literals, {}`const`/enum-variant names, `as` relabel casts, \
+             and the arithmetic/bitwise/shift operators are supported)",
+            if self_name.is_empty() { "" } else { "earlier " }
+        ))),
     }
 }
 
@@ -946,7 +960,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 )));
             }
             let rec_id = RecordId(record_schemas.len() as u32);
-            let (rec, schema) = regblock::lower_regblock(r, rec_id)?;
+            let (rec, schema) = regblock::lower_regblock(r, rec_id, &const_vals)?;
             record_ids.insert(name.clone(), rec_id);
             record_schemas.push(rec);
             regblock_ids.insert(name.clone(), RegblockId(regblock_schemas.len() as u32));
@@ -3600,6 +3614,9 @@ fn lower_test(
         .iter()
         .map(|(n, rbid)| (n.clone(), prog.regblocks[rbid.index()].registers.clone()))
         .collect();
+    // Hoisted: every binding folds against the same table, and
+    // rebuilding it per binding is pure waste.
+    let addrmap_consts = const_vals_from(consts, const_signed);
     for (binding, amap_name, helper_field) in &addrmap_binds {
         if regblock_bindings_map.contains_key(binding) || addrmap_bindings_map.contains_key(binding)
         {
@@ -3653,6 +3670,7 @@ fn lower_test(
             helper_field,
             &regblock_record_of,
             &regblock_registers,
+            &addrmap_consts,
         )?;
         for (key, rec) in &actx.mirror_inits {
             addrmap_init_order.push((key.clone(), *rec));
@@ -5086,6 +5104,107 @@ pub(crate) fn const_vals_from(
             )
         })
         .collect()
+}
+
+/// Fold an ADDRESS-like constant expression — an addrmap instance base
+/// or window size, a regblock register offset or reset value. These have
+/// no declared type to range-check against, only the standing
+/// requirement that the value is not negative.
+///
+/// This is the counterpart to `components::fold_field_default`, and the
+/// two differ in exactly the way their call sites do: a field default
+/// carries a `TypeExpr` and is checked against it, an address does not
+/// and is checked against zero instead.
+///
+/// The error mapping is deliberately NOT the field-default one, and it
+/// splits two ways:
+///
+///   * a **sized literal** (`32'h18`) is `Unsupported`. TB-IR does not
+///     lower Verilog-sized literals ANYWHERE (`let z = 32'h18` is
+///     rejected the same way), while v1's `c_int_literal` handles them
+///     correctly — `{ "SRC", 0x18, 32 }`. Pointing at `--codegen v1` is
+///     accurate here, so this arm must not be swept in with the one
+///     below;
+///   * anything else that will not fold is `SilentlyMisLowers`, because
+///     v1 accepts it and yields ZERO. Pointing a user at v1 for
+///     `@ dut.count_out` would hand them a register at address 0.
+pub(crate) fn fold_addr_const(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    what: &str,
+) -> Result<u64, LowerError> {
+    // Fast path: a plain literal, which is what almost every address is.
+    if let crate::ast::ExprKind::Int(lit) = &*e.kind {
+        if let Some(bits) = exprs::parse_int_literal(lit) {
+            return Ok(bits);
+        }
+    }
+    if let Some(lit) = unlowerable_int_literal(e) {
+        return Err(unsupported(
+            &format!("the {what}"),
+            format!(
+                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower anywhere yet \
+                 (`let z = {lit}` is refused the same way); v1 lowers a bare one correctly"
+            ),
+        ));
+    }
+    // `""` as the self-name: an address has no enclosing `const` to form
+    // a cycle with, so no identifier here can be a self-reference — and
+    // it also selects the unknown-name message that does NOT blame
+    // declaration order, since this table is complete.
+    let v = fold_const(e, consts, "").map_err(|err| match err {
+        ConstFoldErr::Unsupported(detail) => not_implemented(
+            &format!("a non-constant {what}"),
+            detail,
+            V1Status::SilentlyMisLowers,
+        ),
+        ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("the {what}: {detail}")),
+    })?;
+    // An untyped `const` is stored SIGNED (`check_const_decl_type`), so
+    // this rejects a value at or above 2^63 reached through one, not
+    // only a genuinely negative fold. That is the intended trade: it
+    // catches `@ 0 - 8`, and an address that large is spelled
+    // `const B : uint<64> = ...`, which folds unsigned and passes. The
+    // message says so rather than leaving the user to discover it.
+    if v.is_negative() {
+        return Err(LowerError::Invalid(format!(
+            "the {what} folds to {}, and must not be negative. (An untyped `const` folds \
+             SIGNED, so a value at or above 2^63 lands here too; declare it as \
+             `const NAME : uint<64> = ...` to spell one.)",
+            v.as_i64()
+        )));
+    }
+    Ok(v.bits)
+}
+
+/// `Some(lit)` when `e` is a BARE Verilog-sized integer literal
+/// (`32'h18`) — the one non-folding shape at an address site that v1
+/// gets RIGHT, so the one that should point at it.
+///
+/// Two narrowings, each because v1's behaviour splits there and only the
+/// half that works may point at v1:
+///
+///   * **Top-level only**, not a walk over the expression tree. v1's
+///     `c_int_literal_from` matches `ExprKind::Int` and nothing else, so
+///     `32'h18` lowers correctly there while `32'h10 + 0x08` — and even
+///     `(32'h18)` — falls to its `"0"` arm.
+///   * **Sized only**, not every literal `parse_int_literal` rejects.
+///     An over-wide literal (`0x10000000000000000`) is also unreadable
+///     by that parser, but v1 emits it as a `_harc_u128` composite that
+///     truncates into the 64-bit table field — `{ "SRC", (((_harc_u128)
+///     0x1ULL << 64) | ...), 32 }`, i.e. offset 0 again.
+///
+/// Everything else falls through to the `SilentlyMisLowers` mapping,
+/// with the rest of the shapes v1 quietly turns into address 0.
+fn unlowerable_int_literal(e: &crate::ast::Expr) -> Option<String> {
+    match &*e.kind {
+        crate::ast::ExprKind::Int(lit)
+            if lit.contains('\'') && exprs::parse_int_literal(lit).is_none() =>
+        {
+            Some(lit.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on
