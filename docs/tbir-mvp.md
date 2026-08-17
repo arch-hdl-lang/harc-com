@@ -3934,8 +3934,7 @@ case and only locally-determinable `Assign` types are compared).
     `"t.log"`. Both backends accept both programs, so this is a live
     silent DIVERGENCE rather than a shared mis-lowering — the only one
     found in this batch. v1 takes the path positionally; matching that is
-    the fix, and it is recorded rather than made here because it changes
-    an extractor the equivalence corpus exercises heavily.
+    the fix. **Closed in divergence 64.**
 
 59. **Every constraint diagnostic was thrown away, and v1 crashes on
     one of them (2026-08-17).**
@@ -4295,6 +4294,44 @@ case and only locally-determinable `Assign` types are compared).
     as much a claim as narrowing one: emptying the builtin list makes
     `sum` a relation error again, and dropping the NAME check so any
     one-argument call counts makes `NoSuchRel(p)` stop being one.
+
+64. **`logf`'s message is positional, and now TB-IR agrees
+    (2026-08-17).**
+
+    Divergence 58 measured this and deferred it because it changes an
+    extractor the equivalence corpus exercises heavily. This closes it.
+
+    v1 **consumes** the path: `StmtKind::LogF` splits the first
+    positional string out of the argument list and hands `emit_log` what
+    is left, so the message is simply the next positional string.
+    TB-IR's `lower_log` instead searched for the first string whose
+    VALUE differs from the path — the same answer only while the message
+    happens not to equal the path. The fix is one line: take the first
+    positional string for `log`, the second for `logf`.
+
+    Measured on the two divergence-58 cases, comparing the emitted call
+    from both backends:
+
+    | source | v1 | TB-IR before | after |
+    |---|---|---|---|
+    | `logf("t.log", "t.log", error, "BOOM")` | `"t.log"` | `"BOOM"` | `"t.log"` |
+    | `logf("t.log", error, "t.log")` | `"t.log"` | `""` | `"t.log"` |
+
+    Five control shapes that already agreed still agree, `log`'s own
+    first-string rule included — the same line has to get both right,
+    which is why the plain-`log` controls are in the test rather than
+    assumed. Full suite green, the equivalence registry included.
+
+    Both directions are pinned by mutation: restoring the value
+    comparison fails the message-equals-path case, and dropping the
+    path-consumption so the first string is always taken fails the
+    ordinary-`logf` case.
+
+    One thing deliberately NOT moved: the named-argument guard above
+    still runs on the FULL argument list, before the path is consumed.
+    It exists to catch a named argument that leaves a positional slot
+    empty, and counting a list the path has already been removed from
+    would tell it there was one fewer slot to fill.
 
 ### The probe method
 

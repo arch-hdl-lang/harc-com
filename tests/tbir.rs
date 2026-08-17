@@ -18297,3 +18297,89 @@ fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
         );
     }
 }
+
+/// `logf` finds its message positionally, the way v1 does.
+///
+/// v1 CONSUMES the path — `StmtKind::LogF` splits the first positional
+/// string out of the argument list and hands `emit_log` what is left —
+/// so its rule is positional. TB-IR compared each string's VALUE
+/// against the path instead, which gives the same answer only while the
+/// message happens to differ from the path.
+///
+/// This was divergence 58: a live silent DIVERGENCE, not a shared
+/// mis-lowering. Both backends accept both programs below and emitted
+/// different text.
+#[test]
+fn logf_takes_its_path_by_position_not_by_value() {
+    let src = |stmt: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n\
+             \x20       {stmt}\n        wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+    // The emitted log call, for whichever backend. The `seed=` line is
+    // the harness preamble every test emits, not the statement under
+    // test — dropping it by name rather than by position so a change in
+    // preamble ordering fails loudly instead of silently selecting the
+    // wrong line.
+    let line = |out: &str| -> String {
+        out.lines()
+            .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
+            .filter(|l| !l.contains("seed="))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+
+    for (what, stmt, expected) in [
+        // Divergence 58's two cases. The message EQUALS the path, so a
+        // value comparison skips it and lands on the next string.
+        (
+            "a message equal to the path",
+            r#"logf("t.log", "t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        (
+            "the path repeated as the message",
+            r#"logf("t.log", error, "t.log")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        // Controls: the shapes that already agreed must keep agreeing.
+        (
+            "an ordinary logf",
+            r#"logf("t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a severity written after the message",
+            r#"logf("t.log", "BOOM", error)"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a third string, which is ignored",
+            r#"logf("t.log", "A", "B")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "INFO", "A");"#,
+        ),
+        // Plain `log` consumes no path, so its message is the FIRST
+        // string — the same code now has to get both cases right.
+        (
+            "a plain log",
+            r#"log(error, "BOOM")"#,
+            r#"sim_log_line("ERROR", "BOOM");"#,
+        ),
+        (
+            "a plain log with a second string",
+            r#"log(error, "A", "B")"#,
+            r#"sim_log_line("ERROR", "A");"#,
+        ),
+    ] {
+        let merged = merged_src(&src(stmt));
+        let v1 = cpp_tb::emit(&merged).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        let program = lower_src(&src(stmt)).unwrap_or_else(|e| panic!("{what}: lowers: {e}"));
+        let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("{what}: tbir emits: {e}"));
+        assert_eq!(line(&v1), expected, "{what}: v1's own output moved");
+        assert_eq!(line(&tb), line(&v1), "{what}: backends disagree");
+    }
+}
