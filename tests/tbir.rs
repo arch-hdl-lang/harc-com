@@ -16403,7 +16403,15 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
             &lower_src(&hooked).unwrap_err(),
             lower::V1Status::SilentlyMisLowers,
         );
-        assert!(msg.contains("on scoreboard `Board`"), "{msg}");
+        // Needle the HOOK, not the shared `on scoreboard \`Board\``
+        // suffix: since the unhooked arm below carries the same status
+        // and the same suffix, matching the suffix would let this test
+        // stay green with the hooked arm deleted — the input would
+        // simply fall through to the unhooked arm.
+        assert!(
+            msg.contains("hook on an `on` handler on scoreboard `Board`"),
+            "{msg}"
+        );
         assert_eq!(
             cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
             v1_ctl,
@@ -16430,11 +16438,18 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
 ///   * transactor field — v1 emits output byte-identical to the same
 ///     program with the wiring DELETED, so it silently drops it;
 ///   * testbench field — `connect` emits an uncompilable `.push_back`
-///     on a `uint32_t`, while `on` emits a working checker.
+///     on a scalar (`uint64_t`: `cpp_uint_for_width` widens every
+///     scalar ≤ 64 bits, whatever the source declares), while `on`
+///     emits a working checker.
 ///
 /// An arm's status is the worst thing v1 does anywhere under it, and a
 /// silent drop is the worst of the three. Hence one
 /// `SilentlyMisLowers`, not one `Unsupported`.
+///
+/// This test covers the TESTBENCH container only — `Board` lands as a
+/// field of `testbench HookTb`. The transactor container, which is
+/// what makes the status `SilentlyMisLowers` at all, is pinned
+/// separately below.
 #[test]
 fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
     let scoreboard = |body: &str| {
@@ -16490,6 +16505,71 @@ fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
         !expr.contains("_tb.w.seen"),
         "v1 does not qualify it, so there is no `w` in the checker lambda's scope"
     );
+}
+
+/// The TRANSACTOR container — the row that alone justifies
+/// `SilentlyMisLowers`, and the one the two tests above never reach,
+/// because both instantiate `Board` as a field of `testbench HookTb`.
+///
+/// Held instead as a field of `transactor Sender`, v1's output for a
+/// scoreboard carrying `on` wiring, or `connect` wiring, is BYTE-
+/// IDENTICAL to the same program whose scoreboard body is empty. The
+/// wiring contributes nothing: the scoreboard observes no traffic, and
+/// a check that should catch a mismatch passes green.
+///
+/// This is the whole basis for the arm's status, so it is pinned
+/// directly rather than inferred from the testbench rows — and it
+/// covers `connect`, which neither sibling exercises at all even though
+/// the arm's user-facing detail makes a claim about it.
+#[test]
+fn a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            // The container under test: a TRANSACTOR field, not the
+            // testbench field the sibling tests use.
+            .replace(
+                "transactor Sender\n    dut : Top\n",
+                "transactor Sender\n    dut : Top\n    b   : Board\n",
+            )
+    };
+
+    // Anti-vacuity: the scoreboard is really materialized inside the
+    // transactor, so "identical" below is not two copies of a program
+    // that dropped the whole field.
+    let empty = cpp_tb::emit(&merged_src(&scoreboard(""))).expect("v1 emits");
+    assert!(
+        empty.contains("struct Board {") && empty.contains("    Board b;"),
+        "the transactor must actually hold the scoreboard"
+    );
+
+    for wiring in [
+        "    on hits > 0\n        log(info, \"p\")\n    end on\n",
+        "    connect\n        hits -> ev2\n    end connect\n",
+    ] {
+        let src = scoreboard(wiring);
+        // TB-IR refuses, and says so without offering v1.
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("event wiring"), "{msg}");
+
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            empty,
+            "v1 drops transactor-held wiring: `{wiring}`"
+        );
+    }
 }
 
 /// A period does not change what v1 does with a hooked method path: its

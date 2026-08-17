@@ -3422,15 +3422,22 @@ case and only locally-determinable `Assign` types are compared).
     | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
     | statement position (`stmts.rs`) → `phase post_eval` | rejects | `Unsupported` | `Rejects` |
     | …→ non-path trigger | rejects | `Unsupported` | `Rejects` |
-    | …→ method path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | …→ method path that RESOLVES to a hookable | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | …→ method path that does not resolve | rejects | `Unsupported` | `Rejects` (entry 69) |
     | test-scope target resolution (`mod.rs`) → non-path trigger | rejects | `Unsupported` | `Rejects` |
     | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
     | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
     | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
     | …→ bare field, no method | rejects | `Invalid` | `Invalid` (message fixed) |
     | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | …→ unhooked `on` | mixed, not by syntax — see below | `Unsupported` | `Unsupported` (kept) |
-    | …→ `connect` | **unprobed** | `Unsupported` | `Unsupported` (kept) |
+    | …→ unhooked `on` | drops it in a transactor container | `Unsupported` | `SilentlyMisLowers` (entry 70) |
+    | …→ `connect` | drops it in a transactor container | `Unsupported` | `SilentlyMisLowers` (entry 70) |
+
+    The "now" column is kept CURRENT, not frozen at the batch that
+    wrote the table — three rows above carry a later entry number
+    because a later batch re-measured them. A ledger whose only job is
+    to be the one consolidated view is worth less than nothing when it
+    disagrees with the code.
 
     Two of these are worth reading closely.
 
@@ -4653,26 +4660,50 @@ case and only locally-determinable `Assign` types are compared).
     | testbench field | `on hits > 0` | emits a working checker |
     | testbench field | `on dut.rst` | emits a working checker |
 
-    The transactor-field row is byte-measured: 608 emitted lines with
-    the wiring and 608 without, differing only in a source OFFSET baked
-    into `_solver_site_<N>` names and in an auto-coverage plan literal.
-    Nothing in the output observes the event. A scoreboard that should
-    catch a mismatch sees no traffic and the test passes green.
+    The transactor-field row is byte-measured, and on a program built
+    to isolate it — a `Board` held by `transactor Sender` — the output
+    with `on` wiring and with `connect` wiring is byte-identical to the
+    same program whose scoreboard body is empty, with no residue at
+    all. Nothing in the output observes the event. A scoreboard that
+    should catch a mismatch sees no traffic and the test passes green.
+    This is the row the whole status rests on, and it is now pinned by
+    `a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1`,
+    anti-vacuity anchor included.
 
-    The testbench-field `connect` row is compiler-measured, not read
-    off the text: v1 emits `_tb.b.hits.push_back(...)` where `hits` is
-    a `uint32_t` field, and g++ says "request for member 'push_back'
-    ... which is of non-class type 'uint32_t'".
+    The testbench-field `connect` row is compiler-measured: v1 emits
+    `_tb.b.hits.push_back(...)`, and g++ says "request for member
+    'push_back' in '_tb.Tb::b.Board::hits', which is of non-class type
+    **'uint64_t'**".
+
+    That type is worth its own line, because the first version of this
+    entry said `uint32_t` — read off the `hits : uint<32>` in the HARC
+    source rather than off the compiler, in the very paragraph claiming
+    the opposite. `cpp_uint_for_width` widens every scalar ≤ 64 bits to
+    `uint64_t`, so v1 cannot emit `uint32_t` for any scoreboard scalar;
+    `scoreboards.rs`'s own module header says as much. The verdict for
+    the row was unaffected, the evidence for it was fabricated, and
+    "compiler-measured" is exactly the phrase that has to be earned.
 
     So `--codegen v1` genuinely IS a way to run a testbench-field `on`,
-    and this seam cannot offer it — it lowers a declaration, and the
-    instantiation is elsewhere. An arm's status is the worst thing v1
-    does anywhere under it, and a silent drop is the worst of the
-    three, so the whole arm is now `SilentlyMisLowers`. That is a
-    strictly better answer than the old `Unsupported` for the two rows
-    where v1 is not an escape hatch, and a worse-than-necessary one for
-    the two where it is; splitting it correctly needs the
-    instantiation, not another shape test.
+    and this seam does not offer it. It lowers a declaration and is not
+    given the container — though the caller COULD supply one:
+    `lower_program` already builds `env_held_type_names` and threads it
+    into `transactor_is_component` for the same kind of question. "Does
+    not", then, rather than "cannot".
+
+    An arm's status is the worst thing v1 does anywhere under it, and a
+    silent drop is the worst of the three, so the whole arm is now
+    `SilentlyMisLowers` — strictly better than the old `Unsupported`
+    for the rows where v1 is no escape hatch, worse than necessary for
+    the one row where it is.
+
+    Splitting on the container alone would not recover that row. A
+    container-split testbench arm still spans `connect` and
+    `on w.seen > 0`, both uncompilable, so worst-under-arm lands it on
+    `EmitsUncompilable` — not `Unsupported`. Getting the suggestion
+    back where it belongs needs the container AND the per-trigger scope
+    analysis this arm has wanted since the reverted syntactic split:
+    both, not either.
 
 ### The probe method
 

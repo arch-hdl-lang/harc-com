@@ -9,17 +9,20 @@
 //! through `Stmt::ScoreboardOp` (push/pop/scalar-write) and
 //! `Expr::ScoreboardQuery` (size/empty/scalar-read).
 //!
-//! Out-of-scope shapes are explicit `Unsupported` rejections, never
-//! silent drops:
+//! Out-of-scope shapes are explicit rejections, never silent drops.
+//! `Unsupported` (v1 runs the program):
 //!   - scoreboard `hookable`/`function` methods (need per-instance state
 //!     materialization — rejected at the call site, but the declaration
 //!     itself is also rejected here so an unreferenced method-bearing
 //!     scoreboard does not lower to a struct missing its methods);
-//!   - `connect` / `on` event wiring (gates on the agent/env/event
-//!     slices);
 //!   - queue element types that are not scalars ≤ 64 bits (e.g.
 //!     `queue<SomeStruct>` — needs the record-payload-in-queue seam);
 //!   - non-scalar / >64-bit scalar fields.
+//!
+//! `NotImplemented { v1: SilentlyMisLowers }` (v1 is not a way out):
+//!   - component `parameters`, which v1 drops entirely;
+//!   - `connect` / `on` event wiring, which v1 drops in a transactor
+//!     container. See the measurement at each arm.
 
 use super::{unsupported, LowerError};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
@@ -159,7 +162,7 @@ pub(crate) fn lower_scoreboard(
             // needs the scope analysis, not another shape test.
             // MEASURED across both containers a data-only scoreboard
             // can sit in, because what v1 does depends on the container
-            // and not on the syntax — which is why the syntactic split
+            // as well — which is the second reason the syntactic split
             // recorded above failed.
             //
             // As a TRANSACTOR field, v1 emits output byte-identical to
@@ -173,21 +176,37 @@ pub(crate) fn lower_scoreboard(
             // As a TESTBENCH field the same three inputs diverge three
             // ways:
             //   * `connect` emits `_tb.b.hits.push_back(...)` against a
-            //     `uint32_t` member — g++: "request for member
-            //     'push_back' ... which is of non-class type
-            //     'uint32_t'". Uncompilable.
+            //     scalar member — g++: "request for member 'push_back'
+            //     in '_tb.Tb::b.Board::hits', which is of non-class
+            //     type 'uint64_t'". Uncompilable. (`uint64_t`, not the
+            //     `uint<32>` the source declares: `cpp_uint_for_width`
+            //     widens every scalar ≤ 64 bits, as the module header
+            //     above already says.)
             //   * `on hits > 0` emits a `_checkers` closure around
             //     `(bool)(_tb.b.hits > 0)`, which compiles and works.
             //   * `on dut.rst` emits `(bool)(harc_rt::harc_read(
             //     dut->rst))`, which also compiles and works.
             //
             // So `--codegen v1` IS a real escape hatch for a
-            // testbench-field `on` — and this seam cannot offer it.
-            // `lower_scoreboard` lowers a DECLARATION; the same type can
-            // be instantiated in either container, so the container is
-            // not knowable here. An arm's status is the worst thing v1
-            // does anywhere under it, and a silent drop is the worst of
-            // the three.
+            // testbench-field `on`, and this seam does not offer it.
+            // `lower_scoreboard` lowers a DECLARATION and does not
+            // receive the container; the caller COULD supply it —
+            // `lower_program` already builds `env_held_type_names` and
+            // threads it into `transactor_is_component` for exactly
+            // this kind of question — so this is a "does not", not a
+            // "cannot".
+            //
+            // It is also not the whole fix. A container-split testbench
+            // arm still spans `connect` (uncompilable) and
+            // `on w.seen > 0` (uncompilable), so by the worst-under-arm
+            // rule it would reach `EmitsUncompilable`, not
+            // `Unsupported`. Recovering the suggestion for the rows
+            // that deserve it needs the container AND the per-trigger
+            // scope analysis named above — both, not either.
+            //
+            // Until then: an arm's status is the worst thing v1 does
+            // anywhere under it, and a silent drop is the worst of the
+            // three.
             ComponentItem::Connect(_) | ComponentItem::OnHandler(_) => {
                 return Err(super::not_implemented(
                     &format!("event wiring (`connect`/`on`) on scoreboard `{sb}`"),
