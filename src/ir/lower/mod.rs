@@ -2242,13 +2242,33 @@ fn validate_testbench_component(
             // their exact kind so the diagnostic points at the real gap.
             ComponentItem::OnHandler(h) => {
                 if h.hook.is_some() {
-                    return Err(unsupported(
+                    // Same two-input shape as `components.rs`'s
+                    // cycle-trigger hook arm, and the same verdict. v1
+                    // drops the hook side and lowers the trigger as an
+                    // ordinary testbench-scope cycle trigger:
+                    //
+                    //   * `on <bool-expr> pre` — byte-identical to the
+                    //     same handler written without the hook, so the
+                    //     ordering is silently lost. (Anchored: deleting
+                    //     the handler does change v1's output.)
+                    //   * `on <obj>.<method> pre` — v1 emits
+                    //     `(bool)(_tb.s.send)` against a `struct Sender`
+                    //     whose members are `dut`, `_last_in_cycle` and
+                    //     `_last_out_cycle`, which does not compile.
+                    //
+                    // `SilentlyMisLowers` is the worse of the two and so
+                    // the arm's label. The construct name says "handler
+                    // hook" rather than "`<obj>.<method>` method hook"
+                    // because the bool-expr input has no method in it.
+                    return Err(not_implemented(
                         &format!(
-                            "a testbench-scoped `on <obj>.<method>` pre/post method hook in `{}`",
+                            "a testbench-scoped `pre`/`post` hook on an `on` handler in `{}`",
                             c.name.name
                         ),
                         "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
-                         handlers are lowered at testbench scope",
+                         handlers are lowered at testbench scope; v1 accepts a hook side, \
+                         drops it and lowers the trigger as a plain cycle trigger",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 // An event-subscription / handshake-monitor form (`on
@@ -3907,10 +3927,49 @@ fn lower_test(
                 "the hook target must resolve to a method on a transactor testbench field",
             )
         })?;
+        // Not a transactor field. Two very different programs land here
+        // and v1 separates them exactly, so this must not answer with
+        // one verdict:
+        //
+        //   * `on w.note pre` where `w : Watcher` is an agent / env /
+        //     method-bearing scoreboard field declaring `hookable note`.
+        //     v1 emits a real `Watcher_note_pre.push_back` and the hook
+        //     fires. Calling that program Invalid accuses the user of a
+        //     bug that only TB-IR has; `--codegen v1` is a genuine
+        //     escape hatch, so say so.
+        //   * an undeclared field, the DUT handle, or a `function`
+        //     (non-`hookable`) method. v1 refuses these itself
+        //     ("obj.method must resolve to a `hookable` on a known
+        //     component type"), so they really are program errors and
+        //     `Invalid` is right.
+        //
+        // The gate below is v1's own condition, and it is checked in the
+        // recoverable direction: a miss in `component_field_map` falls
+        // back to `Invalid`, which is what the site said before, while a
+        // hit only ever downgrades a hard error to a suggestion.
         let xid = transactor_field_map.get(&xfield).copied().ok_or_else(|| {
-            LowerError::Invalid(format!(
-                "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench field"
-            ))
+            let v1_wires_it = component_field_map.get(&xfield).is_some_and(|cid| {
+                prog.components[cid.index()]
+                    .methods
+                    .iter()
+                    .any(|m| m.name == method && m.hookable)
+            });
+            if v1_wires_it {
+                unsupported(
+                    &format!(
+                        "an `on {xfield}.{method} pre/post` hook on a non-transactor \
+                         component field"
+                    ),
+                    "test-scope method hooks resolve only against a transactor testbench \
+                     field in this subset",
+                )
+            } else {
+                LowerError::Invalid(format!(
+                    "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench \
+                     field, and no component field of that name declares a `hookable` \
+                     named `{method}`"
+                ))
+            }
         })?;
         let xschema = prog.transactor(xid);
         if xschema.method(&method).is_none() {

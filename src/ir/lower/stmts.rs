@@ -2620,11 +2620,24 @@ impl FuncBuilder<'_> {
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
+            // v1 IS an escape hatch here: it emits the same
+            // `<Type>_<method>_pre.push_back` registration a test-scope
+            // hook gets, byte-identically, so the suggestion is honest.
+            //
+            // The destination named below used to be "the component or
+            // testbench", and BOTH of those fail — a hook in a component
+            // body hits `components::validate_cycle_handler` and one in
+            // a `testbench` declaration hits the testbench-scope arm in
+            // this file. The destination that works is the test / `impl
+            // ... for` body, against a DIRECT transactor field, which is
+            // what `axilite_hooks_test` exercises in the equivalence
+            // registry.
             return Err(unsupported(
                 "an `on <obj>.<method> pre/post` hook in statement position",
-                "declare the hook on the component or testbench instead — a hook body \
-                 must be registered in the method's pre/post vector before any call \
-                 site runs, not at a point inside the run body",
+                "declare the hook at test scope (`impl ... for <Tb>` / `test` body), on a \
+                 transactor testbench field — a hook body must be registered in the \
+                 method's pre/post vector before any call site runs, not at a point \
+                 inside the run body",
             ));
         }
         // `on e(v) ... end on` — an event subscription. A test-scope

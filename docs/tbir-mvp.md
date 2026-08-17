@@ -3389,17 +3389,65 @@ case and only locally-determinable `Assign` types are compared).
     the DETAIL claimed byte-identity, which is true of one input and
     false of the other, so it was reworded to describe what v1 actually
     does to both — drop the hook and lower the trigger as a plain cycle
-    trigger — plus the hint that a §7.3 hook belongs at test scope, where
-    tbir does lower it (`axilite_hooks_test` is in the equivalence
-    registry, so that destination is checked, not guessed).
+    trigger.
 
-    A third hook arm was found in the same pass, on the event-
-    subscription path (`on ev(t) pre`). It probes identically to the
-    periodic one — byte-identical to the hook-free handler, with the
-    anchor holding — and was still returning `Unsupported`. Reclassified.
-    **The family was described as "three arms, two behaviours" while it
-    was four arms**: the write-up counted the arms the probe had touched,
-    not the arms that share the construct.
+    A first attempt at that rewording also added "a §7.3 method hook
+    belongs at test scope, where it is lowered". It was removed on
+    review. The claim is true for a hook on a DIRECT transactor testbench
+    field (`axilite_hooks_test`, in the equivalence registry), and false
+    for the nested target a component body implies: `on e.s.send pre` at
+    test scope is refused by `resolve_method_hook_target`. Being right
+    about the destination in general is not the same as being right about
+    where THIS arm's user would land, and **a hint naming a destination
+    that also fails is worse than no hint** — which is divergence 51's
+    lesson, reintroduced two entries after writing it down.
+
+54. **The `on <obj>.<method> pre/post` hook spans four positions and
+    three verdicts (2026-08-17).**
+
+    Divergences 52 and 53 treated "the hook family" as the arms inside
+    `components.rs`. It is not a file-local construct. A user writes the
+    same source in four places, and grouping by construct rather than by
+    file turns up three more sites, each classified wrong:
+
+    | position | v1 | was | now |
+    |---|---|---|---|
+    | component body (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | event subscription (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | `testbench` declaration (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | statement position (`stmts.rs`) | **implements it** | `Unsupported` | `Unsupported` |
+    | non-transactor field (`mod.rs`) | **implements it** | `Invalid` | `Unsupported` |
+
+    Two of these are worth reading closely.
+
+    The **statement-position** arm was classified correctly — v1 emits
+    the same `Sender_send_pre.push_back` registration a test-scope hook
+    gets — but its detail said "declare the hook on the component or
+    testbench instead", and BOTH of those placements are themselves
+    rejected, by the two rows above it. The suggestion sent the user in a
+    circle around the same table. It now names the test / `impl ... for`
+    body against a direct transactor field, the one placement that
+    lowers. A classification can be right while the sentence attached to
+    it is the most expensive thing on the page.
+
+    The **non-transactor field** arm answered `Invalid` — "a program
+    error under every backend" — for `on w.note pre` where `w` is an
+    agent, env or method-bearing scoreboard field. v1 emits a working
+    `Watcher_note_pre.push_back`. That is not a broken program; it is a
+    TB-IR subset gap wearing a hard error, and `Invalid` gives the user
+    nothing to re-run. The site now applies v1's own condition (the field
+    binds to a component type declaring a `hookable` of that name) and
+    keeps `Invalid` only for the half v1 also refuses: an undeclared
+    field, the DUT handle, a `function` rather than `hookable` method, or
+    a transactor missing the method. Each of those four was probed, and
+    v1 rejects each with its own message.
+
+    The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
+    `components.rs` by "what a user would have to write to reach the
+    site" — and then applied that grouping only inside one file. The
+    construct does not respect the file boundary, and three of the five
+    sites above were invisible from inside `components.rs`. **Group by
+    construct, then find every file that implements it.**
 
 ### The probe method
 

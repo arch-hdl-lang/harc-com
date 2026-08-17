@@ -15885,3 +15885,226 @@ end test MethodHookTest
         "no `send` member, so `(bool)(e.s.send)` cannot compile: {sender_struct}"
     );
 }
+
+/// The rest of the `on <obj>.<method> pre/post` hook family, which
+/// spans four positions rather than the one `components.rs` owns. A
+/// user writes the same construct in each; v1 does three different
+/// things, so the three surviving sites classify three ways.
+///
+/// `HOOK` marks the testbench declaration, `IMPL` the test body and
+/// `BODY` a statement position inside `run` — the three placements a
+/// user would try after a component body rejects the hook.
+const HOOK_POSITIONS_SRC: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RegOp
+    addr  : uint<8>
+end transaction RegOp
+
+transactor Sender
+    dut : Top
+    when active
+        hookable send(t: RegOp)
+            dut.en = 1
+        end send
+    end when
+end transactor Sender
+
+agent Watcher
+    seen : uint<32> default 0
+    hookable note(t: RegOp)
+        seen = seen + 1
+    end note
+    function plain(t: RegOp)
+        seen = seen + 1
+    end plain
+end agent Watcher
+
+testbench HookTb
+    dut : Top
+    s   : Sender active
+    w   : Watcher
+HOOK
+end testbench HookTb
+
+impl HookTest for HookTb
+    clock clk = SysDomain
+IMPL
+    run
+        s.dut = dut
+BODY
+        wait 2 cycles
+    end run
+end impl HookTest
+"#;
+
+/// Fill the three placeholders, dropping the ones left empty.
+fn hook_positions(tb: &str, imp: &str, body: &str) -> String {
+    let fill = |s: &str, key: &str, v: &str| {
+        if v.is_empty() {
+            s.replace(&format!("{key}\n"), "")
+        } else {
+            s.replace(key, v)
+        }
+    };
+    let s = fill(HOOK_POSITIONS_SRC, "HOOK", tb);
+    let s = fill(&s, "IMPL", imp);
+    fill(&s, "BODY", body)
+}
+
+fn pre_hook_on(target: &str, indent: &str) -> String {
+    format!("{indent}on {target} pre\n{indent}    log(info, \"prehook\")\n{indent}end on")
+}
+
+/// A hook written in the `testbench` DECLARATION, which is the position
+/// a user lands in after `impl` scope rejects a nested target. Same
+/// two-input shape as the component-body arm and the same verdict:
+/// v1 drops the hook and lowers the trigger as a plain cycle trigger,
+/// byte-identically for a bool expression and uncompilably for a
+/// method path.
+#[test]
+fn a_testbench_scoped_handler_hook_is_dropped_by_v1() {
+    let none = hook_positions("", "", "");
+    let v1_none = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
+
+    // Input 1: a stray `pre` on a genuine cycle trigger, against a
+    // one-token control that is itself anchored against no handler.
+    let ctl = hook_positions(
+        "    on dut.en > 0\n        log(info, \"prehook\")\n    end on",
+        "",
+        "",
+    );
+    let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+    assert_ne!(
+        v1_ctl, v1_none,
+        "the handler must contribute, or the identity below is vacuous"
+    );
+    let bool_hook = hook_positions(&pre_hook_on("dut.en > 0", "    "), "", "");
+    let msg = assert_not_implemented(
+        &lower_src(&bool_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("testbench-scoped"), "{msg}");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&bool_hook)).expect("v1 emits"),
+        v1_ctl,
+        "v1 drops the hook and emits the bare cycle trigger"
+    );
+
+    // Input 2: a method path. Same arm, but v1 edge-detects on a member
+    // the emitted struct does not have.
+    let path_hook = hook_positions(&pre_hook_on("s.send", "    "), "", "");
+    assert_not_implemented(
+        &lower_src(&path_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_path = cpp_tb::emit(&merged_src(&path_hook)).expect("v1 emits");
+    assert!(
+        v1_path.contains("(bool)(_tb.s.send)"),
+        "v1 lowers the method path as a cycle trigger"
+    );
+    assert!(
+        !v1_path.contains("Sender_send_pre.push_back"),
+        "and registers no hook, so the ordering is lost either way"
+    );
+}
+
+/// A hook in STATEMENT position, by contrast, v1 really does implement:
+/// it emits the same `Sender_send_pre.push_back` registration the
+/// working test-scope placement gets. So this one keeps `Unsupported` —
+/// and its suggestion must name a destination that works, which the two
+/// obvious readings of "the component or testbench" do not.
+#[test]
+fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination() {
+    let stmt = hook_positions("", "", &pre_hook_on("s.send", "        "));
+    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
+    assert!(msg.contains("statement position"), "{msg}");
+
+    // v1 is a real escape hatch: it emits the same registration the
+    // test-scope placement gets, which tbir itself lowers. Not
+    // byte-identical — a statement-position hook registers at its own
+    // point in the run body rather than ahead of the setup assignments,
+    // which is the whole reason the two placements are distinguishable —
+    // so the claim is about the registration, not the file.
+    let test_scope = hook_positions("", &pre_hook_on("s.send", "    "), "");
+    lower_src(&test_scope).expect("the test-scope placement lowers under tbir");
+    let v1_none = cpp_tb::emit(&merged_src(&hook_positions("", "", ""))).expect("v1 emits");
+    let v1_stmt = cpp_tb::emit(&merged_src(&stmt)).expect("v1 emits");
+    assert!(
+        !v1_none.contains("Sender_send_pre.push_back"),
+        "the anchor: no hook, no registration"
+    );
+    for (label, out) in [
+        ("statement position", &v1_stmt),
+        (
+            "test scope",
+            &cpp_tb::emit(&merged_src(&test_scope)).expect("v1 emits"),
+        ),
+    ] {
+        assert!(
+            out.contains("Sender_send_pre.push_back"),
+            "v1 registers the {label} hook, so `--codegen v1` is honest"
+        );
+    }
+
+    // The destination the message names must be the one that works. It
+    // used to say "the component or testbench"; a hook in a component
+    // body and a hook in a `testbench` declaration BOTH fail.
+    assert!(
+        msg.contains("test scope") && msg.contains("transactor"),
+        "the suggestion must name the placement that actually lowers: {msg}"
+    );
+    for (label, bad) in [
+        ("testbench declaration", hook_positions(&pre_hook_on("s.send", "    "), "", "")),
+        (
+            "component body",
+            hook_positions("", "", "").replace(
+                "    hookable note(t: RegOp)",
+                "    on s.send pre\n        log(info, \"p\")\n    end on\n    hookable note(t: RegOp)",
+            ),
+        ),
+    ] {
+        assert!(
+            lower_src(&bad).is_err(),
+            "the {label} placement must not be a destination worth naming"
+        );
+    }
+}
+
+/// The hook-target resolver used to answer every non-transactor field
+/// with `Invalid` — "your program is broken under every backend". That
+/// is false for an agent / env / method-bearing scoreboard field, which
+/// v1 wires into a working `<Type>_<method>_pre` vector. The site now
+/// splits on v1's own condition, and only the half v1 also refuses
+/// stays `Invalid`.
+#[test]
+fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
+    let hook = |target: &str| hook_positions("", &pre_hook_on(target, "    "), "");
+
+    // v1 wires these, so they are subset gaps and `--codegen v1` is honest.
+    for (target, vector) in [
+        ("w.note", "Watcher_note_pre.push_back"),
+        ("s.send", "Sender_send_pre.push_back"),
+    ] {
+        let src = hook(target);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(vector), "v1 must register `{target}`");
+    }
+    let msg = assert_unsupported(&lower_src(&hook("w.note")).unwrap_err());
+    assert!(msg.contains("non-transactor component field"), "{msg}");
+    // The transactor case is the control: it is not a gap at all.
+    lower_src(&hook("s.send")).expect("a transactor field lowers");
+
+    // v1 refuses these itself, so they really are program errors.
+    for target in ["w.plain", "nosuch.send", "dut.send", "s.nosuch"] {
+        let src = hook(target);
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `{target}`, or `Invalid` over-claims"
+        );
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains(target.split('.').next().unwrap()), "{msg}");
+    }
+}

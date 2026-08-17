@@ -874,11 +874,17 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
         // Both are `NotImplemented`: v1 is not an escape hatch for
         // either. The detail below is worded to stay true of both
         // rather than describing only the byte-identical one.
+        //
+        // It deliberately does NOT say "write the hook at test scope".
+        // That reads as a fix and is one only for a hook on a DIRECT
+        // transactor testbench field; the nested path a component body
+        // implies (`on e.s.send pre`) is rejected at test scope too, by
+        // `resolve_method_hook_target`. A hint naming a destination that
+        // also fails is worse than no hint.
         return Err(not_implemented(
             &format!("a `pre`/`post` hook on a cycle-trigger `on` handler on `{comp}`"),
             "cycle-trigger handlers take no hook side; v1 accepts one, drops the hook and \
-             lowers the trigger as a plain cycle trigger, so the requested ordering is lost. \
-             (A spec §7.3 method hook belongs at test scope, where it is lowered.)",
+             lowers the trigger as a plain cycle trigger, so the requested ordering is lost",
             V1Status::SilentlyMisLowers,
         ));
     }
