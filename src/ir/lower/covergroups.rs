@@ -712,14 +712,32 @@ fn classify_out_of_subset_target(
         }
 
         // A literal `parse_int_literal` cannot read — a Verilog-sized
-        // literal (`32'h18`) or one over 64 bits. TB-IR lowers sized
-        // literals nowhere, while v1's `c_int_literal` handles a BARE
-        // one correctly, so this is the one arm here where `--codegen
-        // v1` is a real escape hatch. Same split, and the same reason,
-        // as the addrmap/regblock address folds (divergence 44).
-        ExprKind::Int(lit) => unsupported(
-            &format!("{what} sampling the integer literal `{lit}`"),
-            "a sized or over-wide literal; TB-IR does not lower these anywhere yet",
+        // literal (`32'h18`) or one over 64 bits. TB-IR does not lower
+        // either in a coverpoint, while v1's `c_int_literal` handles a
+        // BARE sized one correctly, so this is the one arm here where
+        // `--codegen v1` is a real escape hatch. Same split, and the
+        // same reason, as the addrmap/regblock address folds
+        // (divergence 44).
+        //
+        // The escape hatch is for the SIZED case only, so the arm splits
+        // on the same `'` the address site uses. An over-wide literal
+        // reaches here too and v1 does the opposite with it: a
+        // `_harc_u128` composite that narrows — `0x10000000000000000`
+        // samples 0 — so pointing there would hand the user a coverpoint
+        // that reads zero forever.
+        //
+        // The previous version documented this split in a comment and
+        // still returned one classification for both.
+        ExprKind::Int(lit) if lit.contains('\'') => unsupported(
+            &format!("{what} sampling the sized literal `{lit}`"),
+            "TB-IR does not lower sized literals in a coverpoint yet; v1 lowers a bare one \
+             correctly here",
+        ),
+        ExprKind::Int(lit) => not_implemented(
+            &format!("{what} sampling the over-wide integer literal `{lit}`"),
+            "a coverpoint samples 64 bits; v1 emits a `_harc_u128` composite that narrows, so \
+             the point would sample a truncated value with no diagnostic",
+            V1Status::SilentlyMisLowers,
         ),
 
         // ── v1 compiles it and SAMPLES THE WRONG THING ───────────────

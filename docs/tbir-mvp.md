@@ -2737,9 +2737,11 @@ case and only locally-determinable `Assign` types are compared).
 
     **One shape here is the exception, and rule 6 caught it twice.**
     A Verilog-sized literal (`@ 32'h18`) is `Unsupported` — pointing at
-    v1 — because TB-IR lowers sized literals NOWHERE (`let z = 32'h18`
-    is refused the same way) while v1's `c_int_literal` emits
-    `{ "SRC", 0x18, 32 }`, correctly. Sweeping it into the
+    v1 — because TB-IR does not lower one at an address site while v1's
+    `c_int_literal` emits `{ "SRC", 0x18, 32 }`, correctly. (The scope of
+    that claim was later narrowed: TB-IR *does* lower sized literals in
+    `keep` constraints. See divergence 49 — the arm's classification is
+    unaffected, since it is about this site.) Sweeping it into the
     `SilentlyMisLowers` mapping with everything else that will not fold
     would have replaced a correct diagnostic with a false claim about
     v1. That was the first catch.
@@ -3099,6 +3101,146 @@ case and only locally-determinable `Assign` types are compared).
     inherits every check that gate was silently performing, and they are
     only visible by enumerating what the OLD arm used to reject** — not
     by testing what the new one now accepts.
+
+49. **Correction: TB-IR does lower sized literals — in `keep`
+    constraints (2026-08-17).**
+
+    Divergences 44 and 46, and the diagnostics they shipped, asserted
+    that TB-IR "does not lower sized literals ANYWHERE yet". That is
+    **false**, and it reached users: the messages in `fold_addr_const`
+    and the coverpoint classifier both said it.
+
+    ```
+    transaction Req
+        a : uint<8>
+        keep a == 8'h0F
+    end transaction Req
+    ```
+
+    lowers under **both** backends today. The gap is specific to
+    STATEMENT position (`let z = 32'h18`) and to the address/coverpoint
+    sites; the constraint path has always handled these.
+
+    Caught by PR #591 (a different session, fixing sized-literal width
+    semantics), whose author found the same false claim in the spec and
+    corrected it there. Re-verified here directly rather than taken on
+    report, then fixed in all four places — two shipped diagnostics, one
+    test comment, and divergence 44's own wording.
+
+    The lesson is about how the claim was formed. It came from a probe
+    that hit five sites — statement position, regblock offsets, regblock
+    resets, coverpoint targets, addrmap bases — and generalized from
+    "rejected at every site I tried" to "rejected everywhere". Five
+    agreeing observations felt like enough. But they were five instances
+    of *one* code path — `exprs.rs`'s `parse_int_literal`, which every
+    lowering entry point reaches and which does not strip the `N'r`
+    prefix. Constraints never route a sized literal through it: they have
+    their own prefix-stripping parser in
+    `src/constraints/typed_lower.rs`. **A sample that is large but not
+    diverse measures one thing repeatedly.**
+
+    Stated that precisely on the second attempt. The first draft of this
+    entry said "the constraint path never goes through
+    `parse_int_literal`" — which is false, since `cpp_tb.rs`'s wrap-mask
+    width oracle calls it directly; it just short-circuits on the `'`
+    first. A structural argument is only worth more than a count if it
+    is checked as carefully as one, and the version that survives a grep
+    is the one to write down.
+
+    That is the same error as divergence 48's unreachability claim, at a
+    different scale: N misses is evidence about the N routes tried, not
+    about the space. The fix in both cases is the same — a structural
+    argument, or a grep for the construct across the corpus, rather than
+    an accumulating count.
+
+    Practical consequence: **sized-literal lowering is no longer a
+    candidate for this sweep.** #591 owns that surface, and the honest
+    remaining gap is narrower than the "five sites" this file previously
+    recorded.
+
+    Re-verified after #591 merged, since it changes sized-literal
+    PARSING and could have invalidated any of this: `keep a == 8'h0F`
+    still lowers under both backends, `register SRC @ 32'h18` still
+    rejects under TB-IR while v1 still emits `{ "SRC", 0x18, 32 }`, and
+    the coverpoint control still lowers. The corrections above survive
+    the merge. Worth doing rather than assuming — a claim about another
+    change's blast radius is exactly the kind that reads as obviously
+    fine and is cheap to check.
+
+50. **`components.rs`: a wide surface, and the first family probed
+    (2026-08-17).**
+
+    72 sites but **62 distinct messages** — the opposite shape from the
+    coverpoint gate (divergence 46: one arm, four landings). Almost every
+    site here is its own construct, so no single split clears a large
+    fraction, and file order would be arbitrary. Grouped instead by what
+    a user would have to WRITE to reach them, so one fixture serves a
+    family: field declarations, paths/connects, handlers, method calls,
+    plus one genuine catch-all.
+
+    **Family A (field declarations) — the uniformity hypothesis was
+    wrong, which is why it was tested.** Several of these sites share a
+    `lower_*_field` helper, so v1's behaviour looked likely to be uniform
+    across them. Three probes, three different behaviours:
+
+    | field | v1 emits | compiles? |
+    |---|---|---|
+    | `event<Vec<uint<8>, 4>>` | `std::vector<std::function<void(std::array<uint64_t,4>)>>` | **yes** |
+    | `queue<Vec<uint<8>, 4>>` | `harc_rt::HarcQueue<std::array<uint64_t,4>>` | **yes** |
+    | `weird : NoSuchThing` | `VNoSuchThing* weird = nullptr;` | no — undeclared |
+
+    The first two are genuine escape hatches and keep `Unsupported`. The
+    third is the sub-component catch-all, and it splits again on its own
+    input space: a name declared NOWHERE is a typo (v1 invents a
+    Verilated handle type), while a DECLARED type that merely is not a
+    supported sub-component kind — a `covergroup` — v1 handles
+    **correctly**, emitting `ExtraCov weird;` and wiring
+    `env.weird.cp.b0++`.
+
+    So the arm now splits: undeclared → `Invalid` (a program error under
+    every backend), declared-but-unsupported → `Unsupported` (v1 works).
+    Distinguishing them needed the set of declared type names threaded
+    into `lower_field`, which had component/scoreboard/record tables but
+    no covergroup or regblock names.
+
+    Two method notes from this batch:
+
+    * A probe aimed at the "scalar field of an unsupported type" site
+      (`odd : float`) landed in the sub-component arm instead — `float`
+      parses as a Named type, not a builtin. Rule 4 again, and again the
+      tell was the message rather than the exit status.
+    * The compile probe for `HarcQueue` first reported "not a member of
+      `harc_rt`" because the probe included `harc_thread_rt.h` but not
+      `harc_queue_rt.h`, which the emitted file does include. Including
+      *the real header* is not enough — it has to be the same SET the
+      generated translation unit uses.
+
+    **Review then found the fix repeating the bug it fixed.** The
+    declared-type set was written as a whitelist of the item kinds that
+    seemed relevant, and it omitted `enum` — so `weird : Mode` against a
+    declared `enum Mode { A, B }` began hard-failing with "not declared
+    anywhere in the file", while v1 emits a working `Mode weird;`. A
+    declared-but-unsupported kind swept into the typo bucket: exactly the
+    defect the split existed to remove, inverted.
+
+    The repair is not "add `enum`" but noticing the failure modes are
+    **asymmetric**. A name missing from the set is a false hard error on
+    a valid program; a spurious extra name merely routes back to the
+    honest `Unsupported` the arm gave before. So the set is now
+    deliberately over-inclusive — every item that carries a name goes in,
+    whether or not it can currently appear in field position.
+
+    Worth stating generally: **when a lookup drives a claim, work out
+    which direction of error is recoverable and bias the lookup that
+    way.** A whitelist assembled from "what seems relevant" fails toward
+    the unrecoverable side by construction, and no amount of care in
+    assembling it changes that.
+
+    The same review found the batch's other arm documented but not
+    fixed: the coverpoint `ExprKind::Int` arm had a comment explaining
+    that sized and over-wide literals need opposite classifications, and
+    still returned one for both. Split now, on the same `'` the address
+    site uses.
 
 ### The probe method
 

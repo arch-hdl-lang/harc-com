@@ -1580,6 +1580,55 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Pass 1: schemas. FunctionIds count up from the current function
     // count (after pure helpers + transactor methods).
     let mut next_fn = prog.functions.len() as u32;
+    // Every type NAME the file declares, in one set. `lower_field` uses it
+    // for exactly one decision — telling a typo (`weird : NoSuchThing`,
+    // which v1 turns into an undeclared `VNoSuchThing*`) from a declared
+    // type that simply is not a supported sub-component kind (a
+    // `covergroup`, which v1 handles correctly). Those had shared an arm.
+    // Every type NAME the file declares, in one set. `lower_field` uses it
+    // for exactly one decision — telling a typo (`weird : NoSuchThing`,
+    // which v1 turns into an undeclared `VNoSuchThing*`) from a declared
+    // type that simply is not a supported sub-component kind (a
+    // `covergroup`, which v1 handles correctly).
+    //
+    // DELIBERATELY OVER-INCLUSIVE. The only consumer asks "is this name
+    // declared?", and the two ways to be wrong are not symmetric: a name
+    // missing from this set produces a false "not declared anywhere"
+    // hard error on a valid program, while a spurious extra name merely
+    // routes back to the honest `Unsupported` this arm used to give. So
+    // every item that carries a name goes in, whether or not it can
+    // currently appear in field position — the first draft whitelisted
+    // the kinds that seemed relevant and omitted `enum`, which broke
+    // exactly the case it was meant to protect.
+    let declared_types: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Env(c) => Some(c.name.name.clone()),
+            Item::Agent(c) => Some(c.name.name.clone()),
+            Item::Sequencer(c) => Some(c.name.name.clone()),
+            Item::Scoreboard(c) => Some(c.name.name.clone()),
+            Item::Transactor(t) => Some(t.name.name.clone()),
+            Item::Transaction(r) => Some(r.name.name.clone()),
+            Item::Struct(r) => Some(r.name.name.clone()),
+            Item::Enum(e) => Some(e.name.name.clone()),
+            Item::Covergroup(g) => Some(g.name.name.clone()),
+            Item::Regblock(r) => Some(r.name.name.clone()),
+            Item::Bus(b) => Some(b.name.name.clone()),
+            Item::Addrmap(a) => Some(a.name.name.clone()),
+            Item::Tseq(t) => Some(t.name.name.clone()),
+            Item::Pseq(p) => Some(p.name.name.clone()),
+            Item::CoverSequence(c) => Some(c.name.name.clone()),
+            Item::Relation(r) => Some(r.name.name.clone()),
+            Item::Property(p) => Some(p.name.name.clone()),
+            Item::Domain(d) => Some(d.name.name.clone()),
+            Item::Package(p) => Some(p.name.name.clone()),
+            Item::ExternalModule(m) => Some(m.name.name.clone()),
+            // Not type names under any spelling: consts, functions,
+            // extern fns, tests, `use`, `apply`, `extend`.
+            _ => None,
+        })
+        .collect();
     for src in &comp_sources {
         let schema = components::lower_component_schema(
             src,
@@ -1588,6 +1637,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &record_ids,
             &mut next_fn,
             &const_vals,
+            &declared_types,
         )?;
         prog.components.push(schema);
     }
@@ -5120,11 +5170,13 @@ pub(crate) fn const_vals_from(
 /// splits two ways:
 ///
 ///   * a **sized literal** (`32'h18`) is `Unsupported`. TB-IR does not
-///     lower Verilog-sized literals ANYWHERE (`let z = 32'h18` is
-///     rejected the same way), while v1's `c_int_literal` handles them
-///     correctly — `{ "SRC", 0x18, 32 }`. Pointing at `--codegen v1` is
-///     accurate here, so this arm must not be swept in with the one
-///     below;
+///     lower one HERE, while v1's `c_int_literal` handles a bare one
+///     correctly — `{ "SRC", 0x18, 32 }` — so pointing at `--codegen v1`
+///     is accurate and this arm must not be swept in with the one below.
+///     Note the scope: TB-IR DOES lower sized literals inside a `keep`
+///     constraint (`src/constraints/typed_lower.rs` has its own
+///     prefix-stripping parser), so the claim is about this site and the
+///     statement position, not about the language (divergence 49);
 ///   * anything else that will not fold is `SilentlyMisLowers`, because
 ///     v1 accepts it and yields ZERO. Pointing a user at v1 for
 ///     `@ dut.count_out` would hand them a register at address 0.
@@ -5143,8 +5195,8 @@ pub(crate) fn fold_addr_const(
         return Err(unsupported(
             &format!("the {what}"),
             format!(
-                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower anywhere yet \
-                 (`let z = {lit}` is refused the same way); v1 lowers a bare one correctly"
+                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower at an address \
+                 site yet; v1 lowers a bare one correctly here"
             ),
         ));
     }

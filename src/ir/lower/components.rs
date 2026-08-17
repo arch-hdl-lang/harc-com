@@ -355,6 +355,7 @@ pub(crate) fn lower_component_schema(
     record_ids: &HashMap<String, RecordId>,
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
+    declared_types: &std::collections::HashSet<String>,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
         &str,
@@ -466,6 +467,7 @@ pub(crate) fn lower_component_schema(
                     record_ids,
                     is_transactor,
                     consts,
+                    declared_types,
                 )?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
@@ -872,6 +874,7 @@ fn resolve_on_handler_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_field(
     comp: &str,
     f: &ComponentField,
@@ -880,6 +883,11 @@ fn lower_field(
     record_ids: &HashMap<String, RecordId>,
     is_transactor: bool,
     consts: &HashMap<String, super::ConstVal>,
+    // Every type NAME declared anywhere in the file. Used only to tell a
+    // typo from a declared-but-unsupported sub-component kind — v1 does
+    // very different things to the two, and the site had been treating
+    // them alike.
+    declared_types: &std::collections::HashSet<String>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -1007,6 +1015,27 @@ fn lower_field(
                 return Ok(ComponentFieldKind::Dut {
                     dut_type: simple.to_string(),
                 });
+            }
+            // Two very different inputs used to share this arm, and v1
+            // treats them oppositely:
+            //
+            //   * a DECLARED type that is not a supported sub-component
+            //     kind (a `covergroup`, say) — v1 emits
+            //     `AnalysisCovCollector2 weird;` and wires its sampling
+            //     (`env.weird.cp.b0++`). That is a working feature, so
+            //     `--codegen v1` is a real escape hatch and the
+            //     classification stays `Unsupported`.
+            //
+            //   * a name that is declared NOWHERE — v1 assumes a
+            //     Verilated DUT handle and emits
+            //     `VNoSuchThing* weird = nullptr;`, naming a type that
+            //     does not exist. That is a typo, and a program error
+            //     under every backend rather than a subset gap.
+            if !declared_types.contains(simple) {
+                return Err(LowerError::Invalid(format!(
+                    "component `{comp}` field `{fname}` has type `{simple}`, which is not \
+                     declared anywhere in the file"
+                )));
             }
             Err(unsupported(
                 &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
