@@ -36,7 +36,7 @@
 #      scaffolding is legitimately different — roughly 200 lines per file
 #      — so comparing whole files would be pure noise.
 #
-#      Scope honestly: only ~15 of the ~148 rows emit any solver text at
+#      Scope honestly: only ~15 of the ~149 rows emit any solver text at
 #      all. For the rest this half compares nothing and the run reports
 #      acceptance parity only. The summary line prints both counts.
 #
@@ -143,33 +143,59 @@ is_subset_gap() {
 # guts a floor. Bounding the UNCHECKED count instead is independent of
 # corpus size, so adding or removing fixtures needs no edit here.
 #
-# `n` is the exception and DOES get a floor. Rows only disappear from the
-# shared table by a deliberate edit to it — never because a fixture became
-# a subset gap or gained an exemption — so flooring it cannot reintroduce
-# the escape-valve problem above. Without it, deleting the table down to
-# ten rows is a fully green run: `unchecked` and `n` shrink together, so
-# capping the ratio's numerator alone sees nothing.
+# The table row count is the exception and DOES get a floor. Rows only
+# disappear from the shared table by a deliberate edit to it — never
+# because a fixture became a subset gap or gained an exemption — so
+# flooring it cannot reintroduce the escape-valve problem above. Without
+# it, deleting the table down to ten rows is a fully green run:
+# `unchecked` and the row count shrink together, so capping the ratio's
+# numerator alone sees nothing.
+#
+# It floors DISTINCT fixture names, not raw rows. A raw count is satisfied
+# by 149 copies of one row, and no sibling gate catches that either:
+# check_fixture_registration.sh only asserts each fixture is named
+# somewhere under tests/, which other list files already do.
+#
+# MIN_SOLVER is deliberately slack. `passc` is a "compared" quantity in
+# exactly the sense that got MIN_COMPARED deleted — a solver fixture
+# becoming a subset gap or gaining an exemption drops it — so its floor
+# has to absorb every sanctioned drop MAX_UNCHECKED already tolerates:
+# 15 solver fixtures minus 10 permitted unchecked is 5. That still catches
+# what this floor is for, which is the constraint-text half collapsing to
+# nothing, and never fires on a path the gate itself sanctions. A tighter
+# value red-lights legitimate edits and leaves lowering the floor as the
+# only way out — the reflex this comment block exists to prevent.
 #
 # Current values: 149 rows, 1 unchecked (one known exemption), 15 with
 # solver text. Headroom is for a few legitimate changes, not a third of
 # the corpus.
 MIN_ROWS="${MIN_ROWS:-140}"
 MAX_UNCHECKED="${MAX_UNCHECKED:-10}"
-MIN_SOLVER="${MIN_SOLVER:-13}"
-for _v in MIN_ROWS MAX_UNCHECKED MIN_SOLVER; do
+MIN_SOLVER="${MIN_SOLVER:-5}"
+# JOBS belongs in this loop too: it is fed to `[ -lt ]` like the rest, and
+# JOBS=0 or JOBS=abc makes the dispatch loop spin forever rather than
+# fail — CI hangs instead of going red.
+for _v in MIN_ROWS MAX_UNCHECKED MIN_SOLVER JOBS; do
     # Shape AND range. Digit-shape alone was not enough: a value above
     # 2^63-1 is all digits, makes `[ -lt ]` error out, and left the gate
     # reporting success — the same fail-open the validation was added for.
+    # (The '' arm is reachable only if someone changes a `:-` default to
+    # `-`, which would let an explicitly empty value through.)
     case "${!_v}" in
         *[!0-9]*|'')
             echo "error: $_v must be a non-negative integer, got '${!_v}'" >&2
             exit 1 ;;
     esac
-    if [ "${#_v}" -gt 0 ] && [ "$(printf '%s' "${!_v}" | wc -c)" -gt 7 ]; then
+    # `printf '%s'` emits no trailing newline, so this is the digit count.
+    if [ "$(printf '%s' "${!_v}" | wc -c)" -gt 7 ]; then
         echo "error: $_v is implausibly large ('${!_v}'); refusing to run" >&2
         exit 1
     fi
 done
+if [ "$JOBS" -lt 1 ]; then
+    echo "error: JOBS must be at least 1, got '$JOBS'" >&2
+    exit 1
+fi
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
 
@@ -291,8 +317,13 @@ while IFS= read -r row; do
     # a skip and run_fixtures.sh scores as a failure.
     case "$(echo "$row" | xargs)" in '#'*) continue ;; esac
     printf '%s\n' "$row" >"$RESDIR/$n.row"
+    printf '%s\n' "$(echo "$row" | cut -d'|' -f1 | xargs)" >>"$TMP/names"
     n=$((n + 1))
 done <<<"$FIXTURES"
+# Distinct names, not rows: see the MIN_ROWS comment. `sort -u | wc -l`
+# is safe under pipefail — wc reads to EOF, so sort is never SIGPIPEd.
+n_unique=0
+[ -s "$TMP/names" ] && n_unique="$(sort -u "$TMP/names" | wc -l | tr -d ' ')"
 
 i=0
 while [ "$i" -lt "$n" ]; do
@@ -341,11 +372,14 @@ echo "        $nostatus lost"
 compared=$((pass + passc))
 unchecked=$((skip + known))
 floors_ok=1
-if [ "$n" -lt "$MIN_ROWS" ]; then
-    echo "error: only $n rows in the shared fixture table (min $MIN_ROWS)." >&2
-    echo "       The table shrank — a bad merge or an over-eager edit drops" >&2
+if [ "$n_unique" -lt "$MIN_ROWS" ]; then
+    echo "error: only $n_unique distinct fixtures in the shared table (min $MIN_ROWS)." >&2
+    [ "$n_unique" -ne "$n" ] && \
+        echo "       ($n rows, so $((n - n_unique)) are duplicates.)" >&2
+    echo "       The corpus shrank — a bad merge or an over-eager edit drops" >&2
     echo "       fixtures from every consumer at once, and the remaining rows" >&2
-    echo "       still pass. If the shrink was deliberate, lower MIN_ROWS." >&2
+    echo "       still pass. If fixtures were removed on purpose, update" >&2
+    echo "       MIN_ROWS in the same commit, naming the ones that left." >&2
     floors_ok=0
 fi
 if [ "$unchecked" -gt "$MAX_UNCHECKED" ]; then
@@ -358,9 +392,12 @@ if [ "$unchecked" -gt "$MAX_UNCHECKED" ]; then
 fi
 if [ "$passc" -lt "$MIN_SOLVER" ]; then
     echo "error: only $passc fixtures had their solver text compared (min $MIN_SOLVER)." >&2
-    echo "       The constraint-text half of this gate checked almost nothing —" >&2
-    echo "       most likely the randomize lowering stopped emitting solver" >&2
-    echo "       calls, not that solver fixtures were removed." >&2
+    echo "       The constraint-text half of this gate checked almost nothing." >&2
+    echo "       Either the randomize lowering stopped emitting solver calls," >&2
+    echo "       or the solver fixtures left the table / became subset gaps —" >&2
+    echo "       the skip list above distinguishes the two. This floor already" >&2
+    echo "       absorbs every drop MAX_UNCHECKED tolerates, so reaching it" >&2
+    echo "       means something beyond a sanctioned change." >&2
     floors_ok=0
 fi
 [ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ] && [ "$floors_ok" -eq 1 ]
