@@ -72,14 +72,15 @@ is_wired() {
     # it moved to fixtures.tbl so run_fixtures.sh and run_emit_parity.sh
     # share one source of truth, and this check has to follow it or every
     # correctly-registered fixture looks unwired.
-    # Comment rows are stripped here for the same reason as in the loop
-    # below: a commented-out registry row means the fixture is NOT run, so
-    # reading it as wiring reinstates the exact silent-never-executes hole
-    # this script exists to catch (harc#514).
-    if grep -vE '^[[:space:]]*#' tests/fixtures.tbl 2>/dev/null \
-        | grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)"; then
-        return 0
-    fi
+    # NOTE: there is deliberately no special-cased grep of fixtures.tbl
+    # here. The loop below already globs tests/*.tbl, strips comment rows
+    # the same way, and does it with process substitution rather than a
+    # pipeline. A separate `grep -vE ... | grep -q ...` here was dead code
+    # carrying a racy SIGPIPE-under-pipefail bug: the downstream grep exits
+    # on first match, the upstream one dies with 141, and pipefail turns a
+    # successful match into "not wired" once the table outgrows the pipe
+    # buffer. That bug has now been written three times in this codebase;
+    # do not add a fourth.
     # Any other shell runner, Rust test, or fixture list. Two kinds of
     # file are excluded because naming a fixture in them means the
     # OPPOSITE of "wired":

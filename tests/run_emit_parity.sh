@@ -131,9 +131,29 @@ is_subset_gap() {
     return 1
 }
 
-# Minimum work this gate must actually do. See the floor check at the end.
-MIN_COMPARED="${MIN_COMPARED:-148}"
-MIN_SOLVER="${MIN_SOLVER:-15}"
+# Bounds on how much of the corpus may go unchecked. These exist to catch
+# COLLAPSE — a regression that makes the gate stop examining things —
+# not to detect single-fixture changes.
+#
+# Deliberately NOT a floor on "how many fixtures were compared": that
+# number legitimately moves when a fixture becomes a declared subset gap,
+# gains a row in emit_parity_known.txt, or is removed. Pinning it made the
+# gate red-light its own sanctioned escape valves and print "lower the
+# floor" next to every genuine failure — training exactly the reflex that
+# guts a floor. Bounding the UNCHECKED count instead is independent of
+# corpus size, so adding or removing fixtures needs no edit here.
+#
+# Current values: 1 unchecked (one known exemption), 15 with solver text.
+# The headroom is for a few more legitimate gaps before this complains.
+MAX_UNCHECKED="${MAX_UNCHECKED:-10}"
+MIN_SOLVER="${MIN_SOLVER:-10}"
+for _v in MAX_UNCHECKED MIN_SOLVER; do
+    case "${!_v}" in
+        ''|*[!0-9]*)
+            echo "error: $_v must be a non-negative integer, got '${!_v}'" >&2
+            exit 1 ;;
+    esac
+done
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
 
@@ -263,7 +283,7 @@ while [ "$i" -lt "$n" ]; do
     running=0
     while [ "$i" -lt "$n" ] && [ "$running" -lt "$JOBS" ]; do
         mkdir -p "$TMP/o$i"
-        "$SELF" --worker "$TMP/o$i" "$RESDIR/$i.row" >"$TMP/o$i.out" 2>&1 &
+        bash "$SELF" --worker "$TMP/o$i" "$RESDIR/$i.row" >"$TMP/o$i.out" 2>&1 &
         i=$((i + 1)); running=$((running + 1))
     done
     wait
@@ -300,23 +320,24 @@ echo "        $nostatus lost"
 # wholesale with a declared-gap diagnostic — the gate would otherwise
 # report success while checking nothing. That is the exact silent-green
 # failure this gate exists to remove, so it must not be one itself.
-# Floors, not a floor of one. `compared > 0` would let 148 of 149 rows
-# silently stop being checked — which is the same corpus-wide-regression
-# shape this gate exists to catch, merely with one survivor. The corpus is
-# a checked-in table, so the expected counts are knowable and pinned:
-# growing them is fine, shrinking them has to be a deliberate edit here.
+# Did this run actually examine the corpus? `compared > 0` was not enough:
+# 148 of 149 rows could silently stop being checked and still pass.
 compared=$((pass + passc))
+unchecked=$((skip + known))
 floors_ok=1
-if [ "$compared" -lt "$MIN_COMPARED" ]; then
-    echo "error: only $compared fixtures were compared, expected >= $MIN_COMPARED" >&2
-    echo "       ($skip skipped, $known known-exempt, $fail divergent)." >&2
-    echo "       If the corpus legitimately shrank, lower MIN_COMPARED." >&2
+if [ "$unchecked" -gt "$MAX_UNCHECKED" ]; then
+    echo "error: $unchecked of $n fixtures went unchecked (max $MAX_UNCHECKED):" >&2
+    echo "       $skip skipped, $known known-exempt, $compared compared." >&2
+    echo "       A handful of declared subset gaps is normal; this many means" >&2
+    echo "       something is rejecting the corpus wholesale. Investigate the" >&2
+    echo "       skips before raising MAX_UNCHECKED." >&2
     floors_ok=0
 fi
 if [ "$passc" -lt "$MIN_SOLVER" ]; then
-    echo "error: only $passc fixtures had their solver text compared, expected >= $MIN_SOLVER" >&2
-    echo "       The constraint-text half of this gate checked almost nothing." >&2
-    echo "       If that is intended, lower MIN_SOLVER." >&2
+    echo "error: only $passc fixtures had their solver text compared (min $MIN_SOLVER)." >&2
+    echo "       The constraint-text half of this gate checked almost nothing —" >&2
+    echo "       most likely the randomize lowering stopped emitting solver" >&2
+    echo "       calls, not that solver fixtures were removed." >&2
     floors_ok=0
 fi
 [ "$fail" -eq 0 ] && [ "$nostatus" -eq 0 ] && [ "$n" -gt 0 ] && [ "$floors_ok" -eq 1 ]
