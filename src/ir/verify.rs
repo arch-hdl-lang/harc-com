@@ -636,7 +636,7 @@ fn verify_testbench_connect(
             let Some(m) = sink.method(method) else {
                 return Err(format!("sink method `{method}` does not resolve"));
             };
-            if !m.hookable || m.n_params != 1 || m.has_ret || m.param_tys.len() != 1 {
+            if !m.hookable || m.param_names.len() != 1 || m.has_ret || m.param_tys.len() != 1 {
                 return Err(format!("sink method `{method}` is not a one-argument void hookable"));
             }
             if !event_payload_matches_type(payload, &m.param_tys[0]) {
@@ -1711,11 +1711,11 @@ impl Checker<'_> {
             )));
             return;
         };
-        if args.len() != m.n_params {
+        if args.len() != m.param_names.len() {
             self.errs.push(bad(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",
                 schema.name,
-                m.n_params,
+                m.param_names.len(),
                 args.len()
             )));
         }

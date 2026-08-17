@@ -456,7 +456,10 @@ impl FuncBuilder<'_> {
                     if let Some((base, component, method)) =
                         self.as_component_method_call(callee)?
                     {
-                        let lowered = self.lower_component_call_args(args)?;
+                        let declared = self.ctx.components[component.index()]
+                            .method(&method)
+                            .map(|m| m.param_names.clone());
+                        let lowered = self.lower_component_call_args(args, declared.as_deref())?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -826,7 +829,8 @@ impl FuncBuilder<'_> {
                                 &method,
                                 &l.name.name,
                             )?;
-                            let lowered = self.lower_component_call_args(args)?;
+                            let declared = m.param_names.clone();
+                            let lowered = self.lower_component_call_args(args, Some(&declared))?;
                             let id = self.declare(&l.name.name);
                             self.set_local_type(id, IrType::Record(rid));
                             self.push(Stmt::ComponentCall {
@@ -1028,7 +1032,8 @@ impl FuncBuilder<'_> {
                         &l.name.name,
                     )?;
                 }
-                let lowered = self.lower_component_call_args(args)?;
+                let declared = m.param_names.clone();
+                let lowered = self.lower_component_call_args(args, Some(&declared))?;
                 let id = self.declare(&l.name.name);
                 if let Some(w) = declared_width {
                     self.let_widths.insert(id, w);
@@ -1439,7 +1444,8 @@ impl FuncBuilder<'_> {
                         self.check_component_method_result_assignable(
                             m, expected, &method, &id.name,
                         )?;
-                        let lowered = self.lower_component_call_args(args)?;
+                        let declared = m.param_names.clone();
+                        let lowered = self.lower_component_call_args(args, Some(&declared))?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -2077,11 +2083,11 @@ impl FuncBuilder<'_> {
                  should exist on passive instances"
             )));
         }
-        if args.len() != m.n_params {
+        if args.len() != m.param_names.len() {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",
                 schema.name,
-                m.n_params,
+                m.param_names.len(),
                 args.len()
             )));
         }
@@ -2091,20 +2097,22 @@ impl FuncBuilder<'_> {
                 schema.name
             )));
         }
+        // v1 drops argument names and binds by position, so a name in
+        // its own position is inert and only a reordered one swaps the
+        // values (measured: `axil_write(data = t.value, addr = t.addr)`
+        // emits `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)`).
+        // The names come from `TransactorMethodSchema::param_names`,
+        // which used to be a bare `n_params` count — the seam had
+        // nothing to check against, which is why this arm refused every
+        // named argument including the working form.
+        super::reject_misplaced_named_args(
+            args,
+            &m.param_names,
+            &format!("transactor method call `{tb_field}.{method}(...)`"),
+        )?;
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let e = match a {
-                CallArg::Expr(e) => e,
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!(
-                            "named arguments in transactor method call \
-                             `{tb_field}.{method}(...)`"
-                        ),
-                        "",
-                    ));
-                }
-            };
+            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Some(Expr::Call(
@@ -2132,10 +2140,12 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some(&(n_params, has_ret, callee_active_only)) = self.self_transactor_methods.get(name)
+        let Some((param_names, has_ret, callee_active_only)) =
+            self.self_transactor_methods.get(name).cloned()
         else {
             return Ok(None);
         };
+        let n_params = param_names.len();
         if self.in_fmt_args {
             return Err(unsupported(
                 &format!("transactor sibling method call `{name}(...)` inside a message"),
@@ -2169,20 +2179,15 @@ impl FuncBuilder<'_> {
                 ),
             ));
         }
+        // Same as the bound-instance arm above.
+        super::reject_misplaced_named_args(
+            args,
+            &param_names,
+            &format!("transactor sibling method call `{transactor}.{name}(...)`"),
+        )?;
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let e = match a {
-                CallArg::Expr(e) => e,
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!(
-                            "named arguments in transactor sibling method call \
-                             `{transactor}.{name}(...)`"
-                        ),
-                        "",
-                    ));
-                }
-            };
+            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Some(Expr::Call(

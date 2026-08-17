@@ -4432,9 +4432,9 @@ case and only locally-determinable `Assign` types are compared).
     `SilentlyMisLowers`, name matching no parameter is `Invalid`. Each
     parameter list is read off the DECLARATION the call resolves to.
 
-    **Three are NOT converted, and the reason is the same in each: the
-    seam has no parameter names to check against.** Saying so beats
-    inventing a list, which is what `record_write` once did.
+    **Three were not converted at first, for the same reason in each:
+    the seam had no parameter names to check against.** Divergence 67
+    supplies them and closes all three.
 
     * The transactor-method sites in `stmts.rs` lower under a schema
       SNAPSHOT. `TransactorMethodSchema` carries `n_params` and not the
@@ -4450,7 +4450,8 @@ case and only locally-determinable `Assign` types are compared).
       plumbing is missing.
     * The covergroup helper target is reached from the covergroup
       lowering path, which resolves helpers through a different
-      registry.
+      registry. Closed in divergence 68 — that registry turned out to
+      carry the declaration too.
 
     That leaves the component-method arm still refusing an in-order
     named argument v1 emits identically — a known, measured, un-closed
@@ -4465,6 +4466,92 @@ case and only locally-determinable `Assign` types are compared).
     class as the `reg` one from divergence 65: `seq` cannot name a
     `tseq` and `reg` cannot name a variable, so an example using either
     measures the parser rather than the thing under test.
+
+67. **Carrying a count where the names were needed (2026-08-17).**
+
+    Divergence 66 converted three call families and left three, each
+    blocked on the same thing: the seam had a parameter COUNT and not
+    the parameter NAMES, so it could not tell an inert named argument
+    from a reordered one and refused both. The names were available at
+    every construction site and thrown away.
+
+    * `TransactorMethodSchema::n_params` → `param_names`. Built from
+      `f.params`, which has the names.
+    * `self_transactor_methods`, the sibling-call map, carried
+      `(usize, bool, bool)` → `(Vec<String>, bool, bool)`. The same
+      information was dropped twice, in two places, for the same reason.
+    * `ComponentMethodSchema::n_params` → `param_names`.
+    * `lower_component_call_args` takes `Option<&[String]>`: the four
+      method callers pass the callee's names, the three
+      `emit <ev>(...)` payload callers pass `None`, because an event
+      payload genuinely has no declared name to check against and
+      inventing one is the `record_write` mistake.
+
+    Replacing the counts rather than adding a field beside them is
+    deliberate — arity is now `param_names.len()`, so the two cannot
+    disagree.
+
+    **Two defects this introduced, both caught by running it.**
+
+    The first: the new path lowered arguments with `lower_expr` where
+    the positional path uses `lower_expr_no_ports`. Four snapshot tests
+    failed with `PortInDisallowedPosition` on a `ComponentCall arg`. A
+    named argument has to lower through the SAME seam as a positional
+    one, or "the name is inert" stops being true. The line had been
+    copied from a grep of the new code and assumed to match the old.
+
+    The second is subtler and is the one worth remembering. With the
+    names in hand, `axil_write(data = t.value)` on a TWO-parameter
+    method reported a misplaced argument — "`data` is parameter 2 but
+    was written in position 1 … this silently swaps them". Nothing is
+    swapped. The call is UNDER-SUPPLIED, v1 emits the same
+    under-supplied call the positional `axil_write(t.value)` emits, and
+    TB-IR lowers that one. The guard was describing a pre-existing arity
+    gap as a swap — a false explanation, the exact failure mode it had
+    been rewritten to stop producing. `reject_misplaced_named_args` now
+    claims a swap only when `args.len() == declared.len()`, because that
+    is the only case where the positions correspond at all.
+
+    Three tests that pinned the old blanket refusals were rewritten
+    rather than deleted, and each now asserts v1's behaviour FIRST — the
+    in-order form byte-identical to positional, the reordered one
+    different — so the classification rests on a measurement instead of
+    the arm agreeing with itself. One of them,
+    `transactor_sibling_call_named_argument_is_rejected`, had pinned a
+    refusal of `inner(n = 5)`: a name in its own position, the inert
+    form. It was asserting that a working program was rejected.
+
+68. **The last named-argument family (2026-08-17).**
+
+    The covergroup helper call was the one site divergence 66 left and
+    divergence 67 did not reach. It was assumed to need a fourth
+    enabling change; it needed none. Both registries the site already
+    takes as parameters carry the declaration — `HelperRegistry` for a
+    file-level `function` (via `HelperEntry::decl`) and the extern map
+    for an `extern function` — so the parameter names were in scope the
+    whole time. *Checking beat assuming, again.*
+
+    Measured for this family specifically rather than inherited from its
+    five siblings, because variants sharing a shape do not share a
+    verdict. In a coverpoint target:
+
+    | call | v1 emits |
+    |---|---|
+    | `pick(<slice>, 1)` | `pick(<slice>, 1)` |
+    | `pick(a = <slice>, b = 1)` | `pick(<slice>, 1)` |
+    | `pick(b = 1, a = <slice>)` | `pick(1, <slice>)` |
+
+    The swap lands inside the sampler that decides which bin gets hit,
+    so a covergroup would report coverage against the wrong values with
+    nothing to show for it.
+
+    When NEITHER registry resolves the callee there is no parameter list
+    to check a written name against, and the call keeps its blanket
+    refusal — the same rule as the `emit <ev>(...)` payload callers.
+    Refusing beats guessing a list.
+
+    That makes all six families measured and five converted; the sixth
+    (`emit <ev>(...)`) has no declaration to convert against.
 
 ### The probe method
 

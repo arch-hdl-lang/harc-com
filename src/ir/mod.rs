@@ -532,10 +532,19 @@ pub struct TransactorMethodSchema {
     /// mirror the method's declared parameters and its `ret` is the
     /// return-value slot for `-> T` methods.
     pub function: FunctionId,
-    /// Declared parameter count — duplicated from the function so call
-    /// sites (which lower under a schema snapshot, without the
-    /// functions table) can check arity.
-    pub n_params: usize,
+    /// Declared parameter NAMES, in order — duplicated from the
+    /// function so call sites (which lower under a schema snapshot,
+    /// without the functions table) can both check arity (`.len()`) and
+    /// check a named argument against the declaration.
+    ///
+    /// This was `n_params: usize` and the names were dropped on the
+    /// floor at construction, where `f.params` has them. That left the
+    /// transactor-method call sites with nothing to validate a named
+    /// argument against, so they refused every named argument —
+    /// including the in-order form v1 emits byte-identically. Carrying
+    /// the names rather than a second count also means arity and names
+    /// cannot disagree.
+    pub param_names: Vec<String>,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
     /// True when this method is declared inside the transactor's `when
@@ -1009,7 +1018,13 @@ pub struct ComponentMethodSchema {
     /// this surface before method bodies exist to validate the single
     /// analysis payload accepted by a hookable sink.
     pub param_tys: Vec<IrType>,
-    pub n_params: usize,
+    /// Declared parameter NAMES, in order. Same reason as
+    /// `TransactorMethodSchema::param_names`: a call site that only has
+    /// this schema needs them to tell an inert named argument (name in
+    /// its own position, which v1 emits identically) from a reordered
+    /// one (which v1 silently swaps). Replaces a separate `n_params`
+    /// count so arity and names cannot disagree.
+    pub param_names: Vec<String>,
     pub has_ret: bool,
     /// Declared return type after lowering, when present.
     pub ret_ty: Option<IrType>,
