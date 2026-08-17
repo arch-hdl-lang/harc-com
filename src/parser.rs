@@ -4384,10 +4384,13 @@ impl Parser {
                 self.advance();
                 Ok(Expr::new(ExprKind::Int(s), span0))
             }
-            Some(TokenKind::HexLiteral(s))
-            | Some(TokenKind::BinLiteral(s))
-            | Some(TokenKind::SizedLiteral(s)) => {
+            Some(TokenKind::HexLiteral(s)) | Some(TokenKind::BinLiteral(s)) => {
                 self.advance();
+                Ok(Expr::new(ExprKind::Int(s), span0))
+            }
+            Some(TokenKind::SizedLiteral(s)) => {
+                self.advance();
+                check_sized_literal(&s, span0)?;
                 Ok(Expr::new(ExprKind::Int(s), span0))
             }
             Some(TokenKind::FloatLiteral(s)) => {
@@ -4592,6 +4595,147 @@ impl Parser {
 }
 
 // ── Helpers outside impl ──────────────────────────────────────────────────────
+
+/// Reject a sized literal (`8'hAB`) whose digits do not agree with the
+/// width it declares. The lexer's rule is `[0-9]+'[bhd][0-9a-fA-F_]+`,
+/// which validates neither the digits against the radix nor the value
+/// against the width, and nothing downstream did either (harc#565):
+///
+///   - `4'hFF` emitted `0xFF` — 255 from a token declaring 4 bits, with
+///     the declared width and the emitted value simply disagreeing.
+///   - `8'dFF` emitted `uint64_t a = FF;` and `4'b1012` emitted
+///     `0b1012` — neither is valid C++, so the mismatch surfaced as a
+///     compiler error in generated code rather than a HARC diagnostic.
+///   - `0'h0` declared zero bits and lowered as a normal value.
+///
+/// Rejecting is what makes the declared width trustworthy, which is what
+/// the §2.4 wrap mask reads: `keep len +% 4'hFF == 15` masking at 4 is
+/// only correct once `4'hFF` cannot mean 255. Truncating instead would
+/// keep both spellings legal and silently discard written digits.
+fn check_sized_literal(text: &str, span: Span) -> Result<(), CompileError> {
+    let Some(tick) = text.find('\'') else {
+        return Ok(());
+    };
+    let (width_txt, rest) = (&text[..tick], &text[tick + 1..]);
+    let Some(radix_ch) = rest.chars().next() else {
+        return Ok(()); // not reachable via the lexer's rule
+    };
+    let radix: u32 = match radix_ch.to_ascii_lowercase() {
+        'b' => 2,
+        'd' => 10,
+        'h' => 16,
+        _ => return Ok(()),
+    };
+    let digits: String = rest[radix_ch.len_utf8()..]
+        .chars()
+        .filter(|c| *c != '_')
+        .collect();
+
+    let Ok(width) = width_txt.parse::<u32>() else {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` declares a width that is too large"),
+            "the declared width must fit in 32 bits",
+            span,
+        ));
+    };
+    if width == 0 {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` declares a width of 0"),
+            "a sized literal must declare at least 1 bit",
+            span,
+        ));
+    }
+    if digits.is_empty() {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` has no digits"),
+            &format!("write a value after `'{radix_ch}`, as in `{width}'{radix_ch}0`"),
+            span,
+        ));
+    }
+    if let Some(bad) = digits.chars().find(|c| c.to_digit(radix).is_none()) {
+        // Name only the radices the author did NOT write — repeating
+        // theirs back reads as a non-answer.
+        let (name, valid, others) = match radix {
+            2 => (
+                "binary",
+                "0 and 1",
+                "`'h` for hexadecimal or `'d` for decimal",
+            ),
+            10 => ("decimal", "0-9", "`'h` for hexadecimal or `'b` for binary"),
+            _ => (
+                "hexadecimal",
+                "0-9, a-f and A-F",
+                "`'d` for decimal or `'b` for binary",
+            ),
+        };
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` has digit `{bad}`, which is not {name}"),
+            &format!("valid {name} digits are {valid}; use {others}"),
+            span,
+        ));
+    }
+
+    let bits = significant_bits(&digits, radix);
+    if bits > u64::from(width) {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` needs {bits} bits, but declares {width}"),
+            &format!(
+                "widen the literal to `{bits}'{radix_ch}{digits}`, or write a \
+                 value that fits in {width} bits"
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+/// Bit length of `digits` in `radix`, i.e. the smallest width that can
+/// hold the value. Zero (however spelled) is 0 bits, so it fits any
+/// declared width.
+///
+/// Binary and hex are structural — no parsing, so an arbitrarily long
+/// literal costs nothing. Decimal takes a `u128` fast path and falls
+/// back to repeated halving, which is exact for any length; estimating
+/// with `log2(10)` instead would leave a corner where an overwide
+/// literal is accepted because the check could not prove it too wide.
+fn significant_bits(digits: &str, radix: u32) -> u64 {
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let len = trimmed.len() as u64;
+    match radix {
+        2 => len,
+        16 => {
+            let first = trimmed
+                .chars()
+                .next()
+                .and_then(|c| c.to_digit(16))
+                .unwrap_or(0);
+            (len - 1) * 4 + u64::from(32 - first.leading_zeros())
+        }
+        _ => {
+            if let Ok(v) = trimmed.parse::<u128>() {
+                return u64::from(128 - v.leading_zeros());
+            }
+            let mut d: Vec<u8> = trimmed.bytes().map(|b| b - b'0').collect();
+            let mut bits = 0u64;
+            loop {
+                match d.iter().position(|&x| x != 0) {
+                    None => return bits,
+                    Some(i) => d.drain(..i),
+                };
+                let mut carry = 0u8;
+                for x in d.iter_mut() {
+                    let cur = carry * 10 + *x;
+                    *x = cur / 2;
+                    carry = cur % 2;
+                }
+                bits += 1;
+            }
+        }
+    }
+}
 
 /// Extract the `---` … `---` YAML frontmatter sub-block from an
 /// inner-doc string (the line-joined post-prefix-stripped text of a

@@ -9274,16 +9274,20 @@ end test T"#,
 
 /// A sized literal masks at its **declared** width, the same rule a
 /// `const` follows, so the two agree about a token spellable either way.
-/// The digits are not consulted: nothing truncates an overwide literal
-/// (`4'hFF` emits as `0xFF`, harc#565), and widening the mask to cover
-/// the digits turns this constraint from solvable into unsatisfiable —
-/// `(len + 255) & 0xF == 15` solves at `len = 0`, while
-/// `(len + 255) & 0xFF == 15` needs `len = 16`, outside a `uint<4>`.
+/// The digits are not consulted, and `8'h0F` is where that is
+/// observable: the value needs 4 bits, the token declares 8, and the
+/// mask must follow the 8.
+///
+/// This used to be written with `4'hFF` — declared 4, digits needing 8 —
+/// to pin which of the two the mask read. That token is now a parse
+/// error (harc#565), which is the better answer: the mask no longer has
+/// to choose between two readings of the same literal, because a literal
+/// can no longer have two.
 #[test]
 fn a_sized_literal_masks_at_its_declared_width() {
     let src = r#"transaction Txn
     len : uint<4> default 0
-    keep len +% 4'hFF == 15
+    keep len +% 8'h0F == 15
 end transaction Txn
 test T
     let dut : Top
@@ -9296,14 +9300,14 @@ end test T"#;
     let cpp = v1_cpp(src);
     assert!(
         cpp.contains(
-            "((_z_len + _ctx.bv_val((uint64_t)0xFF, 64)) \
-             & harc_z3_bv_value(_ctx, (uint64_t)0x000000000000000fULL, 64)) =="
+            "((_z_len + _ctx.bv_val((uint64_t)0x0F, 64)) \
+             & harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="
         ),
-        "4'hFF must mask at its declared 4 bits; got:\n{cpp}"
+        "8'h0F must mask at its declared 8 bits, not the 4 its value needs; got:\n{cpp}"
     );
     let tbir = tbir_constraint_snippets(src).expect("tbir lowers");
     assert!(
-        tbir.contains("harc_z3_bv_value(_ctx, (uint64_t)0x000000000000000fULL, 64)"),
+        tbir.contains("harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)"),
         "the default backend must mask identically; got:\n{tbir}"
     );
 }
@@ -9511,15 +9515,21 @@ end test T"#,
     );
 }
 
-/// `0'h0` lexes, and a zero-bit value can only be zero — which this
-/// module sizes as one bit. Rejecting it would fail a build that
-/// succeeds on main.
+/// `0'h0` used to lex and resolve, sized as one bit by a `.max(1)` clamp
+/// in `literal_operand_bit_width` — without which it would have reached
+/// `solver_unsigned_mask_expr(0)` and produced a bogus 32-bits-of-ones
+/// mask. harc#565 rejects the token at parse time instead, so both the
+/// clamp and the shape it protected are gone; the rejection is pinned by
+/// `a_zero_width_sized_literal_is_rejected`.
+///
+/// What remains worth checking is the coupling that clamp hid: no width
+/// reaching the mask may be zero.
 #[test]
-fn a_zero_width_sized_literal_still_resolves() {
+fn a_wrap_operand_width_is_never_zero() {
     let cpp = v1_cpp(
         r#"transaction Txn
     len : uint<8> default 0
-    keep len +% 0'h0 == 5
+    keep len +% 1'b0 == 5
 end transaction Txn
 test T
     let dut : Top
@@ -9532,17 +9542,15 @@ end test T"#,
     );
     assert!(
         cpp.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64)) =="),
-        "0'h0 must resolve as one bit so the field's 8-bit mask applies; got:\n{cpp}"
+        "the field's 8 bits must win over the literal's 1; got:\n{cpp}"
     );
 
-    // With the literal on both sides nothing else contributes a width, so
-    // this is the only shape where 0-vs-1 is observable: a zero width
-    // would reach `solver_unsigned_mask_expr(0)`, whose mask is a bogus
-    // 32 bits of ones.
+    // Both operands one bit wide: the narrowest mask the emitter can be
+    // asked for, and the shape that would expose a zero.
     let both = v1_cpp(
         r#"transaction Txn
     len : uint<8> default 0
-    keep len == 0'h0 +% 0'h0
+    keep len == 1'b1 +% 1'b1
 end transaction Txn
 test T
     let dut : Top
@@ -9555,7 +9563,7 @@ end test T"#,
     );
     assert!(
         both.contains("& harc_z3_bv_value(_ctx, (uint64_t)0x0000000000000001ULL, 64))"),
-        "a wrap of two zero-width literals must mask at one bit, not zero; got:\n{both}"
+        "a wrap of two one-bit literals must mask at one bit; got:\n{both}"
     );
 }
 
@@ -9614,6 +9622,211 @@ end test T"#,
     assert!(
         err.contains("wider than the 64-bit solver bitvector"),
         "expected the unrepresentable-residue diagnostic; got: {err}"
+    );
+}
+
+/// Parse a statement body carrying `lit` and return the diagnostic,
+/// asserting the parse failed. These rejections land at parse level, so
+/// `v1_emit_err` — which `expect("parses")` — cannot express them.
+fn parse_err_with_literal(lit: &str) -> String {
+    match parse_source(&literal_src(lit)) {
+        Ok(_) => panic!("expected `{lit}` to be rejected, but it parsed"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn literal_parses(lit: &str) -> bool {
+    parse_source(&literal_src(lit)).is_ok()
+}
+
+fn literal_src(lit: &str) -> String {
+    format!(
+        r#"test T
+    let dut : Top
+    run
+        let a : uint<8> = {lit}
+        log(info, "a=${{a}}")
+    end run
+end test T"#
+    )
+}
+
+/// harc#565. `4'hFF` used to lower to `0xFF` — 255 out of a token that
+/// declares four bits. The declared width is what the §2.4 wrap mask
+/// reads, so a literal whose digits outrun it made that mask a guess
+/// between two readings, each wrong for a different program.
+#[test]
+fn a_sized_literal_wider_than_its_declared_width_is_rejected() {
+    let err = parse_err_with_literal("4'hFF");
+    assert!(
+        err.contains("needs 8 bits") && err.contains("declares 4"),
+        "the diagnostic must name both widths so the fix is obvious; got: {err}"
+    );
+}
+
+/// The same defect in decimal, the spelling easiest to write by accident.
+#[test]
+fn an_overwide_sized_decimal_literal_is_rejected() {
+    let err = parse_err_with_literal("8'd300");
+    assert!(
+        err.contains("needs 9 bits") && err.contains("declares 8"),
+        "got: {err}"
+    );
+}
+
+/// The boundary, in both directions. Off by one either way would still
+/// pass a test that only checked a value far from the edge.
+#[test]
+fn the_declared_width_boundary_is_exact() {
+    assert!(
+        literal_parses("16'd65535"),
+        "65535 fits in 16 bits and must be accepted"
+    );
+    assert!(
+        literal_parses("8'hFF") && literal_parses("1'b1") && literal_parses("4'hF"),
+        "a value that exactly fills its declared width must be accepted"
+    );
+    let err = parse_err_with_literal("16'd65536");
+    assert!(
+        err.contains("needs 17 bits"),
+        "65536 needs 17 bits; got: {err}"
+    );
+
+    // A hex literal is sized as 4 bits per digit EXCEPT the leading one,
+    // which contributes only its significant bits. `1F` is 5, not 8 —
+    // rounding the first digit up to 4 would reject this correct program
+    // and every test above would still pass, since their leading digit
+    // is `F` or the value is decimal.
+    assert!(literal_parses("5'h1F"), "0x1F is 5 bits, not 8");
+    let err = parse_err_with_literal("4'h1F");
+    assert!(err.contains("needs 5 bits"), "got: {err}");
+}
+
+/// Leading zeros are padding, not significant bits — rejecting `8'h0F`
+/// would break correct programs, which is the failure mode that makes a
+/// new static error worse than the bug it replaces.
+#[test]
+fn leading_zeros_do_not_count_toward_the_width() {
+    assert!(literal_parses("8'h0F"), "`8'h0F` is 15 in 8 bits");
+    assert!(literal_parses("8'h00FF"), "`8'h00FF` is 255 in 8 bits");
+    assert!(literal_parses("4'b0000_0001"), "`4'b0000_0001` is 1");
+    assert!(literal_parses("8'd000255"), "`8'd000255` is 255");
+}
+
+/// A value too large for `u128` takes a different path — repeated
+/// halving — than the common one, and that path has to be EXACT. The
+/// obvious shortcut is `digits * log2(10)`, which over-counts whenever
+/// the leading digit is small, and over-counting rejects a correct
+/// program.
+///
+/// 10^39 is the discriminating case: 40 digits, exactly 130 bits, but
+/// `40 * 3.3219 = 132`. 2^128 alone does NOT discriminate — it is 39
+/// digits and the estimate lands on 129, the right answer — so a test
+/// using only that value passes with the shortcut in place.
+#[test]
+fn a_decimal_literal_too_large_for_u128_is_still_sized_exactly() {
+    // 2^128, one past `u128::MAX`: the boundary where the fast path ends.
+    assert!(
+        literal_parses("129'd340282366920938463463374607431768211456"),
+        "2^128 fits in 129 bits"
+    );
+    let err = parse_err_with_literal("128'd340282366920938463463374607431768211456");
+    assert!(
+        err.contains("needs 129 bits") && err.contains("declares 128"),
+        "got: {err}"
+    );
+
+    // 10^39: exactly 130 bits, which an estimate puts at 132.
+    let e39 = "1000000000000000000000000000000000000000";
+    assert!(
+        literal_parses(&format!("130'd{e39}")),
+        "10^39 is 130 bits and must be accepted; an over-counting estimate rejects it"
+    );
+    let err = parse_err_with_literal(&format!("129'd{e39}"));
+    assert!(
+        err.contains("needs 130 bits") && err.contains("declares 129"),
+        "the >u128 path must be exact, not an estimate; got: {err}"
+    );
+}
+
+/// `8'dFF` and `4'b1012` lexed, then emitted `uint64_t a = FF;` and
+/// `0b1012` — neither is valid C++. The mismatch surfaced as a C++
+/// compiler error on generated code instead of a HARC diagnostic.
+#[test]
+fn digits_outside_the_declared_radix_are_rejected() {
+    let err = parse_err_with_literal("8'dFF");
+    assert!(
+        err.contains("digit `F`") && err.contains("not decimal"),
+        "got: {err}"
+    );
+    let err = parse_err_with_literal("4'b1012");
+    assert!(
+        err.contains("digit `2`") && err.contains("not binary"),
+        "got: {err}"
+    );
+}
+
+/// `0'h0` declared zero bits and lowered as an ordinary value. Removing
+/// it is what lets `literal_operand_bit_width` drop its `.max(1)` clamp.
+#[test]
+fn a_zero_width_sized_literal_is_rejected() {
+    let err = parse_err_with_literal("0'h0");
+    assert!(err.contains("width of 0"), "got: {err}");
+}
+
+/// `8'h_` matches the lexer's `[0-9a-fA-F_]+` tail but has no digits
+/// once underscores are stripped.
+#[test]
+fn a_sized_literal_with_no_digits_is_rejected() {
+    let err = parse_err_with_literal("8'h_");
+    assert!(err.contains("no digits"), "got: {err}");
+}
+
+/// The point of rejecting rather than choosing. harc#565's table had two
+/// programs that the same mask rule could not both satisfy while `4'hFF`
+/// was legal: masking at the declared 4 made `keep (len +% 4'hFF) ==
+/// 4'hFF` unsatisfiable, masking at the value's 8 did the same to `keep
+/// len +% 4'hFF == 15`. Write the literal so its digits fit — `8'hFF` —
+/// and the two spellings now agree, because one width describes both.
+#[test]
+fn a_sized_literal_masks_the_same_inside_and_outside_the_wrap() {
+    let mask8 = "& harc_z3_bv_value(_ctx, (uint64_t)0x00000000000000ffULL, 64))";
+    let outside = v1_cpp(
+        r#"transaction Txn
+    len : uint<4> default 0
+    keep len +% 8'hFF == 15
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        outside.contains(mask8),
+        "`len +% 8'hFF == 15` must mask at 8; got:\n{outside}"
+    );
+
+    let inside = v1_cpp(
+        r#"transaction Txn
+    len : uint<4> default 0
+    keep (len +% 8'hFF) == 8'hFF
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.len}")
+    end run
+end test T"#,
+    );
+    assert!(
+        inside.contains(mask8),
+        "the same token inside and outside the wrap must mask identically; got:\n{inside}"
     );
 }
 

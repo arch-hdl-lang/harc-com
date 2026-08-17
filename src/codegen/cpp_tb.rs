@@ -5402,22 +5402,33 @@ fn value_bit_width(v: u64) -> u32 {
 /// An ARCH sized literal states its width outright, and that width is
 /// what §2.4 masks at — the same declared-width rule a `const` follows,
 /// so the two agree about a token like `8'd300` that can be spelled
-/// either way. The digits are deliberately NOT consulted: nothing in the
-/// lexer, parser or either backend truncates an overwide literal
-/// (`c_int_literal` emits `4'hFF` as `0xFF`, harc#565), and letting the
-/// digits widen the mask turned `keep len +% 4'hFF == 15` on a `uint<4>`
-/// field from solvable into unsatisfiable. Not parsing them also keeps a
-/// literal whose value overflows `u64` (`128'hFFFF...`) resolvable, where
-/// its declared width is all the mask ever needed.
+/// either way. The digits are not consulted, and since harc#565 they no
+/// longer can disagree: the parser rejects a literal whose value does
+/// not fit the width it declares, so the declared width IS the value's
+/// width. Before that fix this function had to choose between the two,
+/// and either choice was wrong somewhere — masking at the declared width
+/// turned `keep (len +% 4'hFF) == 4'hFF` on a `uint<4>` field from
+/// solvable into unsatisfiable, and masking at the value's width did the
+/// same to `keep len +% 4'hFF == 15`.
+///
+/// Not parsing the digits also keeps a literal whose value overflows
+/// `u64` (`128'hFFFF...`) resolvable, where its declared width is all
+/// the mask ever needed.
 fn literal_operand_bit_width(s: &str) -> Option<u32> {
     let Some(idx) = s.find('\'') else {
         return crate::ir::lower::parse_int_literal(s).map(value_bit_width);
     };
+    // A zero declared width no longer parses (harc#565), so the old
+    // `.max(1)` clamp is gone. It was load-bearing, not cosmetic: a zero
+    // reaching `solver_unsigned_mask_expr` yields a bogus 32-bits-of-ones
+    // mask. Assert the coupling rather than leaving a dead clamp that
+    // hides it.
     let declared: u32 = s[..idx].replace('_', "").parse().ok()?;
-    // `0'h0` lexes. A zero-bit value can only be zero, which this
-    // module sizes as one bit; rejecting it instead would fail a build
-    // that succeeds today.
-    Some(declared.max(1))
+    debug_assert!(
+        declared > 0,
+        "a zero-width sized literal must be rejected by the parser (harc#565)"
+    );
+    Some(declared)
 }
 
 /// Raw declared width of a width-carrying builtin type, for a `const`'s
