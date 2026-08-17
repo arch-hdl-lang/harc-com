@@ -456,6 +456,12 @@ pub(crate) fn lower_component_schema(
     // pointer rather than an unknown sub-component. Only transactors host
     // a DUT field — env/scoreboard/agent/sequencer never do.
     let is_transactor = matches!(src, CompSource::Transactor(_));
+    // A transactor with a `bound to <bus>` clause. `transactor_is_component`
+    // routes one here when it has a non-periodic `on` handler, so a
+    // `thread` item below can be sitting on exactly the construct that
+    // serves it — v1 emits the target actor for that shape, and the
+    // component arms must not claim otherwise.
+    let is_bound_transactor = matches!(src, CompSource::Transactor(t) if t.bound_to.is_some());
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
@@ -527,9 +533,65 @@ pub(crate) fn lower_component_schema(
                 watchdog_ast = Some(w);
             }
 
-            ComponentItem::TargetTlmThread(_) | ComponentItem::Apply(_) => {
+            // Two variants shared one message and one classification.
+            // Only the first is probed at THIS landing, so only the first
+            // is reclassified — the second keeps what it had rather than
+            // inheriting a verdict it did not earn.
+            // A `thread` on a BOUND transactor is the construct working
+            // as designed — `emit_bound_tlm_target_actors` emits the
+            // target actor for it, and this component path is reached
+            // only because the transactor also has a non-periodic `on`
+            // handler. v1 is a real escape hatch, so it keeps
+            // `Unsupported` and the `--codegen v1` pointer with it.
+            //
+            // The first version of this split reclassified the whole arm
+            // from a probe that only ever put a `thread` on an env.
+            ComponentItem::TargetTlmThread(_) if is_bound_transactor => {
                 return Err(unsupported(
-                    &format!("an unsupported item in component `{name}`"),
+                    &format!(
+                        "a `thread` item on bound transactor `{name}` reached through the \
+                         component path"
+                    ),
+                    "the target actor lowers on the transactor path; this component path is \
+                     taken because the transactor also has a non-periodic `on` handler",
+                ));
+            }
+            ComponentItem::TargetTlmThread(_) => {
+                // v1 accepts a `thread` on an env/agent/scoreboard and
+                // emits the component struct WITHOUT it: no
+                // `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no
+                // serving coroutine. The target never serves, silently.
+                //
+                // Anchored in both directions, because "v1's output did
+                // not change" is not by itself evidence of dropping —
+                // an unbound `thread` emits nothing under v1 wherever it
+                // sits, so the first probe proved nothing. Against
+                // `tlm_target_thread_test`, where the transactor IS
+                // bus-bound, removing the thread DOES change v1's output
+                // (it loses the ThreadSlot and the coroutine); moving
+                // that same thread into an `env` adds only an empty
+                // `struct WrapEnv { ... }`.
+                return Err(not_implemented(
+                    &format!("a `thread` item in component `{name}`"),
+                    "a target-serving `thread` belongs on a `transactor ... bound to <bus>`; on \
+                     an env/agent/scoreboard v1 emits the component without it, so the target \
+                     silently never serves",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            // NOT probed at this landing. v1's handling of `apply`
+            // differs by position and by whether the named package is
+            // declared — in a test body a declared package is rejected
+            // while an undeclared name is accepted — so the component
+            // landing needs its own anchored probe before any claim
+            // about v1 is made here.
+            ComponentItem::Apply(_) => {
+                // Detail deliberately says nothing about WHERE to put it:
+                // test scope rejects `apply` too (`TestItem::Apply` in
+                // `mod.rs`), so naming that scope would send the user
+                // somewhere that also fails.
+                return Err(unsupported(
+                    &format!("an `apply` item in component `{name}`"),
                     "",
                 ));
             }
@@ -789,12 +851,53 @@ fn edge_to_ir(e: crate::ast::EdgeMode) -> crate::ir::CycleEdge {
 /// handled elsewhere; only the checker phase is lowered here.
 fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // v1 drops the hook side and lowers the trigger as an ordinary
+        // cycle trigger. TWO user-visible shapes reach here and v1 fails
+        // each differently, so the label is the worse of the two:
+        //
+        //   * `on <bool-expr> pre` — a stray modifier on a genuine
+        //     cycle trigger. v1's output is BYTE-IDENTICAL to the same
+        //     handler written without the hook, so the requested
+        //     ordering is silently ignored. (Anchored: removing the
+        //     handler entirely does change v1's output, so the identity
+        //     is the modifier being dropped, not the handler being
+        //     inert.) `SilentlyMisLowers`, and the worst of the two.
+        //
+        //   * `on <sub>.<method> pre` — a spec §7.3 method hook written
+        //     in a component body instead of at test scope. Not an
+        //     event subscription and not a handshake monitor, so it
+        //     lands here too. v1 drops the hook AND edge-detects on
+        //     `(bool)(e.s.send)`, a member that the emitted struct does
+        //     not have, so the C++ does not compile. `EmitsUncompilable`
+        //     on its own, and subsumed by the arm's label.
+        //
+        // Both are `NotImplemented`: v1 is not an escape hatch for
+        // either. The detail below is worded to stay true of both
+        // rather than describing only the byte-identical one.
+        //
+        // It deliberately does NOT say "write the hook at test scope".
+        // That reads as a fix and is one only for a hook on a DIRECT
+        // transactor testbench field; the nested path a component body
+        // implies (`on e.s.send pre`) is rejected at test scope too, by
+        // `resolve_method_hook_target`. A hint naming a destination that
+        // also fails is worse than no hint.
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook on a cycle-trigger `on` handler on `{comp}`"),
-            "cycle-trigger handlers take no hook side",
+            "cycle-trigger handlers take no hook side; v1 accepts one, drops the hook and \
+             lowers the trigger as a plain cycle trigger, so the requested ordering is lost",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if !matches!(h.phase, crate::ast::OnPhase::Checker) {
+        // NOT the same: v1 implements this one. `phase post_eval` emits
+        // `_post_eval_services.push_back` where the default emits
+        // `_checkers.push_back` — the phase selects the dispatch vector
+        // and it works, so `--codegen v1` is a real escape hatch.
+        //
+        // The two arms sit four lines apart and looked interchangeable.
+        // They were probed with a shared control that changed the
+        // trigger AND the modifier at once, which made both read as
+        // "differs"; against a one-token control they split.
         return Err(unsupported(
             &format!("a non-default-phase cycle-trigger `on` handler on `{comp}`"),
             "only the default (checker) phase is lowered for cycle-trigger handlers",
@@ -809,9 +912,14 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
 /// `_checkers` vs `_post_eval_services`).
 fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // Same as the cycle-trigger hook above: v1 emits the periodic
+        // handler with the hook side discarded, byte-identically to the
+        // same handler written without it.
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook on an `on <N> cycles` handler on `{comp}`"),
-            "periodic handlers take no hook side",
+            "periodic handlers take no hook side; v1 accepts one and emits the handler \
+             without it, so the requested ordering is silently ignored",
+            V1Status::SilentlyMisLowers,
         ));
     }
     Ok(())
@@ -827,9 +935,20 @@ fn resolve_on_handler_event(
     fields: &[ComponentFieldSchema],
 ) -> Result<(String, EventPayload), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // The third member of the hook family, and it probes exactly
+        // like the periodic one: v1 emits the subscription handler with
+        // the hook side discarded, byte-identically to the same handler
+        // written without it. (Anchored: removing the handler changes
+        // v1's output.) Nothing here needs the method-hook caveat that
+        // `validate_cycle_handler` carries — the trigger is already
+        // known to be a self `event<...>` subscription, so there is only
+        // one shape.
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook `on` handler on `{comp}`"),
-            "only bare `on <event>(arg)` self-subscriptions are lowered",
+            "only bare `on <event>(arg)` self-subscriptions are lowered; v1 accepts a hook \
+             side and emits the handler without it, so the requested ordering is silently \
+             ignored",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if h.periodic {
@@ -1726,6 +1845,15 @@ where
 {
     // `source.observed -> sb.write_obs`: both sides are dotted paths
     // rooted at an env sub-component field.
+    // NOT reclassified, and the reason is `connect`'s standing one: what
+    // v1 does with a bad edge depends on WHERE THE EDGE SITS. In an
+    // instantiated env v1 reaches its own endpoint check and refuses;
+    // in an UNINSTANTIATED one it emits no wiring at all and succeeds,
+    // so the same malformed edge is invisible there. tbir resolves
+    // `connect` for every env in the merged file, so it sees edges v1
+    // never reaches. No single `V1Status` is honest, so the suggestion
+    // stays, being true somewhere. The regression test is
+    // `a_malformed_connect_endpoint_keeps_its_v1_suggestion`.
     let from = dotted_path(&edge.from).ok_or_else(|| {
         unsupported(
             &format!("a non-path `connect` source in `{}`", owner.name.name),
@@ -1919,6 +2047,10 @@ fn resolve_sub_path(
     let mut cid = None;
     for seg in path {
         let f = cur.field(seg).ok_or_else(|| {
+            // Same position-dependence as the endpoint arms above: v1
+            // prints the path verbatim in an instantiated env (a member
+            // access that does not compile) and emits nothing at all in
+            // an uninstantiated one.
             unsupported(
                 &format!("a `connect` path segment `{seg}` that is not a sub-component field"),
                 "",

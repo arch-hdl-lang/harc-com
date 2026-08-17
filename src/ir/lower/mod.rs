@@ -2242,13 +2242,38 @@ fn validate_testbench_component(
             // their exact kind so the diagnostic points at the real gap.
             ComponentItem::OnHandler(h) => {
                 if h.hook.is_some() {
-                    return Err(unsupported(
+                    // Same two-input shape as `components.rs`'s
+                    // cycle-trigger hook arm, and the same verdict. v1
+                    // drops the hook side and lowers the trigger as an
+                    // ordinary testbench-scope cycle trigger:
+                    //
+                    //   * `on <bool-expr> pre` and `on <N> cycles pre` —
+                    //     byte-identical to the same handler written
+                    //     without the hook, so the ordering is silently
+                    //     lost. (Anchored: deleting the handler does
+                    //     change v1's output.) Note the periodic form
+                    //     stays a PERIODIC handler under v1, not a cycle
+                    //     trigger — the detail below says "a plain
+                    //     handler of the same kind" for that reason.
+                    //   * `on <obj>.<method> pre` — v1 emits
+                    //     `(bool)(_tb.s.send)` against a `struct Sender`
+                    //     whose members are `dut`, `_last_in_cycle` and
+                    //     `_last_out_cycle`, which does not compile.
+                    //
+                    // `SilentlyMisLowers` is the worse of these and so
+                    // the arm's label. The construct name says "handler
+                    // hook" rather than "`<obj>.<method>` method hook"
+                    // because two of the three inputs have no method in
+                    // them.
+                    return Err(not_implemented(
                         &format!(
-                            "a testbench-scoped `on <obj>.<method>` pre/post method hook in `{}`",
+                            "a testbench-scoped `pre`/`post` hook on an `on` handler in `{}`",
                             c.name.name
                         ),
                         "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
-                         handlers are lowered at testbench scope",
+                         handlers are lowered at testbench scope; v1 accepts a hook side, \
+                         drops it and lowers the trigger as a plain handler of the same kind",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 // An event-subscription / handshake-monitor form (`on
@@ -3068,9 +3093,21 @@ fn lower_test(
                 if let StmtKind::On(h) = &s.kind {
                     if let Some(side) = h.hook {
                         if h.phase == OnPhase::PostEval {
-                            return Err(unsupported(
+                            // v1 refuses this by name ("`on
+                            // <obj>.<method> phase post_eval` is not
+                            // supported; use `pre`/`post` method hooks
+                            // or a cycle-trigger `on <expr> phase
+                            // post_eval`"), so it is not an escape
+                            // hatch. Same construct as the hook sites in
+                            // `components.rs` and `stmts.rs`; a phase
+                            // modifier is the one axis that turns a
+                            // wired hook into a refused one.
+                            return Err(not_implemented(
                                 "a test-scope `on <obj>.<method> phase post_eval` hook",
-                                "only `pre`/`post` method hooks are lowered",
+                                "only `pre`/`post` method hooks are lowered; v1 refuses a \
+                                 phase modifier on a method hook and suggests a cycle-trigger \
+                                 `on <expr> phase post_eval` instead",
+                                V1Status::Rejects,
                             ));
                         }
                         method_hook_asts.push((side, h));
@@ -3901,16 +3938,102 @@ fn lower_test(
     let mut promoted_lets: HashSet<String> = HashSet::new();
     for (side, h) in &method_hook_asts {
         let (xfield, method) = resolve_method_hook_target(&h.event).ok_or_else(|| {
-            unsupported(
-                "an `on <obj>.<method> pre/post` hook whose `<obj>.<method>` is not \
-                 a `<transactor-field>.<method>` access",
-                "the hook target must resolve to a method on a transactor testbench field",
-            )
+            // Two shapes miss, and v1 separates them the same way the
+            // statement-position arm in `stmts.rs` does.
+            //
+            //   * A DEEPER path (`on e.inner.note pre`, an env's
+            //     sub-component). The resolver here accepts only
+            //     `<field>.<method>` / `_tb.<field>.<method>`; v1 walks
+            //     the whole path and emits a working
+            //     `Watcher_note_pre.push_back`, so `--codegen v1` is a
+            //     real escape hatch.
+            //   * A trigger that is not a path at all — `on <bool-expr>
+            //     pre`, `on <N> cycles pre`, `on ev(x) pre`. v1 refuses
+            //     these outright; naming it would send the user to a
+            //     second error.
+            if is_v1_method_hook_shape(h) {
+                unsupported(
+                    "an `on <obj>.<method> pre/post` hook on a nested component path",
+                    "the hook target must resolve to a method on a DIRECT transactor \
+                     testbench field in this subset",
+                )
+            } else {
+                not_implemented(
+                    "a `pre`/`post` hook on a non-method-path `on` handler at test scope",
+                    "a hook side names a method to wrap; v1 routes every hooked `on` through \
+                     its method-hook resolver and refuses a trigger that is not an \
+                     `<obj>.<method>` path",
+                    V1Status::Rejects,
+                )
+            }
         })?;
+        // Not a transactor field. Two very different programs land here
+        // and v1 separates them exactly, so this must not answer with
+        // one verdict:
+        //
+        //   * `on w.note pre` where `w : Watcher` is an agent / env /
+        //     method-bearing scoreboard field declaring `hookable note`.
+        //     v1 emits a real `Watcher_note_pre.push_back` and the hook
+        //     fires. Calling that program Invalid accuses the user of a
+        //     bug that only TB-IR has; `--codegen v1` is a genuine
+        //     escape hatch, so say so.
+        //   * an undeclared field, the DUT handle, or a `function`
+        //     (non-`hookable`) method. v1 refuses these itself
+        //     ("obj.method must resolve to a `hookable` on a known
+        //     component type"), so they really are program errors and
+        //     `Invalid` is right.
+        //
+        // The gate below is v1's own condition, and it is checked in the
+        // recoverable direction: a miss in `component_field_map` falls
+        // back to `Invalid`, which is what the site said before, while a
+        // hit only ever downgrades a hard error to a suggestion.
         let xid = transactor_field_map.get(&xfield).copied().ok_or_else(|| {
-            LowerError::Invalid(format!(
-                "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench field"
-            ))
+            let v1_wires_it = component_field_map.get(&xfield).is_some_and(|cid| {
+                prog.components[cid.index()]
+                    .methods
+                    .iter()
+                    .any(|m| m.name == method && m.hookable)
+            });
+            if v1_wires_it {
+                unsupported(
+                    &format!(
+                        "an `on {xfield}.{method} pre/post` hook on a non-transactor \
+                         component field"
+                    ),
+                    "test-scope method hooks resolve only against a transactor testbench \
+                     field in this subset",
+                )
+            } else {
+                // `xfield` can be the desugarer's synthetic `_tb` root
+                // when the user wrote a bare `on <field> pre` with no
+                // method — quoting it back would name something they
+                // never typed, so that shape gets its own sentence.
+                //
+                // A source `_tb` is indistinguishable from the synthetic
+                // one here (both arrive as `_tb.<name>`), so the wording
+                // covers BOTH readings rather than asserting which one
+                // happened. A real transactor field named `_tb` never
+                // reaches this branch — it resolves in
+                // `transactor_field_map` above — and a real component
+                // field named `_tb` declaring the hookable is caught by
+                // `v1_wires_it`, so the only reachable source `_tb` is
+                // one v1 refuses too.
+                if xfield == "_tb" {
+                    LowerError::Invalid(format!(
+                        "`on {method}` hook: a `pre`/`post` hook names a method to wrap \
+                         (`on <field>.<method> pre`), and `{method}` does not resolve to a \
+                         `hookable` on a testbench field. (If you wrote `_tb.{method}` \
+                         literally, `_tb` is neither a transactor field nor a component \
+                         field declaring a `hookable` `{method}`.)"
+                    ))
+                } else {
+                    LowerError::Invalid(format!(
+                        "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench \
+                         field, and no component field of that name declares a `hookable` \
+                         named `{method}`"
+                    ))
+                }
+            }
         })?;
         let xschema = prog.transactor(xid);
         if xschema.method(&method).is_none() {
@@ -4582,6 +4705,68 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
         }
         out.push(s);
     }
+}
+
+/// True when a hooked `on` handler has the shape v1's method-hook
+/// resolver accepts: a bare `<obj>.<method>` dotted path, the default
+/// phase, and no periodic trigger.
+///
+/// v1 routes EVERY hooked `on` through that resolver and refuses
+/// anything else outright — "obj.method must resolve to a `hookable` on
+/// a known component type", or "`on <obj>.<method> phase post_eval` is
+/// not supported". So this is the line between a TB-IR subset gap
+/// (`Unsupported`, and `--codegen v1` is a real escape hatch) and
+/// `NotImplemented { Rejects }`.
+///
+/// Deliberately structural, and it does its OWN walk rather than
+/// delegating to `components::dotted_path`. Two predicates were tried
+/// first and both leaked into the `--codegen v1` branch for programs v1
+/// refuses:
+///
+///   * `dotted_path` alone — it returns `Some` for a bare identifier
+///     (`on ok pre`) and unwraps `Paren` (`on (s.send) pre`).
+///   * a top-level `ExprKind::Field` guard PLUS `dotted_path` — the
+///     guard fixes the outermost node and `dotted_path` still unwraps
+///     `Paren` one segment inward, so `on (s).send pre` and
+///     `on (e.inner).note pre` leaked too.
+///
+/// v1 pattern-matches `Field`/`Ident` at every level with no `Paren`
+/// arm, so the walk below has none either. `dotted_path` exists to parse
+/// `connect` endpoints, where a parenthesised path is fine — borrowing
+/// it here was borrowing a different question's answer.
+///
+/// Note there is no `!h.periodic` clause: a period makes the trigger an
+/// integer rather than a path, so the walk already rejects it, and v1's
+/// hook branch does not consult `h.periodic` either. Adding the clause
+/// made `on s.send cycles pre` disagree with v1 (and with the test-scope
+/// arm, which lowers it).
+pub(crate) fn is_v1_method_hook_shape(h: &crate::ast::OnHandler) -> bool {
+    /// `<ident>(.<ident>)*` with no parens, indexing or calls anywhere.
+    fn strict_path(e: &crate::ast::Expr) -> Option<Vec<&str>> {
+        match &*e.kind {
+            ExprKind::Ident(id) => Some(vec![id.name.as_str()]),
+            ExprKind::Field { target, name } => {
+                let mut p = strict_path(target)?;
+                p.push(name.name.as_str());
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+    if h.phase == OnPhase::PostEval {
+        return false;
+    }
+    let Some(p) = strict_path(&h.event) else {
+        return false;
+    };
+    // The impl-for desugarer rewrites a bare testbench field to
+    // `_tb.<field>`, so a length test alone counts the synthetic root as
+    // a real segment and lets `on w pre` — one identifier, no method —
+    // through as if it were `<obj>.<method>`. v1 refuses that. Mirror
+    // `resolve_method_hook_target`'s two accepted forms exactly:
+    // `<field>.<method>` and `_tb.<field>.<method>`.
+    let min = if p.first() == Some(&"_tb") { 3 } else { 2 };
+    p.len() >= min
 }
 
 /// Resolve an `on <obj>.<method> pre/post` hook target expression to

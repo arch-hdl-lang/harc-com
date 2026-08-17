@@ -96,6 +96,38 @@ pub(crate) fn lower_scoreboard(
                      mutate scoreboard fields directly from the test body instead",
                 ));
             }
+            // A hooked `on` in a scoreboard body is the same construct as
+            // the hook arms in `components.rs`, and v1 does the same
+            // thing to it: drops the hook and lowers the trigger alone,
+            // byte-identically to the handler written without a hook
+            // side. (Anchored: deleting the handler does change v1's
+            // output, at both trigger shapes below.) So the requested
+            // ordering is silently lost and `--codegen v1` is not an
+            // escape hatch.
+            ComponentItem::OnHandler(h) if h.hook.is_some() => {
+                return Err(super::not_implemented(
+                    &format!("a `pre`/`post` hook on an `on` handler on scoreboard `{sb}`"),
+                    "scoreboards take no method hooks; v1 accepts a hook side, drops it and \
+                     lowers the trigger as a plain handler",
+                    super::V1Status::SilentlyMisLowers,
+                ));
+            }
+            // The UNHOOKED half is left whole, and that is a decision
+            // rather than an omission. It is mixed — `on w.note` makes
+            // v1 emit `(bool)(w.note)` against a `struct Watcher` with
+            // no `note` member, while `on hits > 0` makes it emit
+            // `(bool)(_tb.b.hits > 0)`, which compiles and works — but
+            // what separates them is NAME RESOLUTION in the emitted C++,
+            // not the syntax of the trigger. `on dut.en` is a two-
+            // segment path and compiles (`harc_read(dut->en)`);
+            // `on w.seen > 0` is a bool expression and does NOT (no `w`
+            // in the checker lambda's scope). A syntactic split was
+            // written here on `is_v1_method_hook_shape` and reverted:
+            // it called `on dut.en` uncompilable and let `on (w.note)`,
+            // `on w.note cycles` and `on w.note phase post_eval`
+            // through, because that predicate answers the hook
+            // resolver's question, not this one. Classifying this arm
+            // needs the scope analysis, not another shape test.
             ComponentItem::Connect(_) | ComponentItem::OnHandler(_) => {
                 return Err(unsupported(
                     &format!("event wiring (`connect`/`on`) on scoreboard `{sb}`"),

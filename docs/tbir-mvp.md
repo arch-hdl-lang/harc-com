@@ -3242,6 +3242,356 @@ case and only locally-determinable `Assign` types are compared).
     still returned one for both. Split now, on the same `'` the address
     site uses.
 
+51. **`components.rs` family E: the catch-all, and a probe that
+    measured nothing twice (2026-08-17).**
+
+    `ComponentItem::TargetTlmThread | Apply` shared one arm and one
+    message. The variant list is the whole input space — enumerable, so
+    this is a structural argument rather than a count.
+
+    **`thread` on an env/agent is `SilentlyMisLowers`.** v1 accepts it,
+    emits the component struct, and drops the thread: no
+    `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no serving
+    coroutine. A user writes a target-serving thread and the target
+    never serves, with no diagnostic.
+
+    Getting there took three probes, and the first two measured nothing:
+
+    * Adding a `thread` to the `analysis_sink_connect_test` env left
+      v1's output byte-identical, which reads as "v1 drops it".
+    * So did adding the same thread to a TRANSACTOR in that fixture —
+      where the construct is supposed to be supported. That is the
+      tell: an **unbound** thread emits nothing under v1 wherever it
+      sits, so neither comparison had any signal in it. Rule 2, and the
+      only reason it surfaced was checking the anchor rather than
+      banking the first agreeing result.
+    * Against `tlm_target_thread_test`, where the transactor is
+      bus-bound, removing the thread DOES change v1's output. With that
+      anchor established, moving the same thread into an `env` adds only
+      an empty `struct WrapEnv { … }` — and the conclusion is finally
+      supported.
+
+    The test carries both anchors, and counts `ThreadSlot` occurrences
+    rather than testing presence: other machinery emits them too, so a
+    `contains` check passes on those and measures nothing. That is the
+    same class of error as the byte-identity above, one level down.
+
+    **`apply` in a component was NOT reclassified.** It shares the arm,
+    and the obvious move is to give it the verdict the thread earned.
+    But v1's handling of `apply` varies by position and by whether the
+    named package is declared — in a test body a declared package is
+    rejected while an undeclared name is accepted — so the component
+    landing needs its own anchored probe. It keeps `Unsupported` and the
+    site says why. **Splitting an arm is also permission to leave half
+    of it alone.**
+
+    **Review then found the reclassification too broad, in the direction
+    that costs the most.** `transactor_is_component` routes a `bound to
+    <bus>` transactor down this same component path when it also has a
+    non-periodic `on` handler — so the arm catches a `thread` sitting on
+    exactly the construct that serves it. There v1 emits the target
+    actor normally (6 `ThreadSlot`s against the control's 4;
+    `emit_bound_tlm_target_actors` is not gated on `on` handlers), so
+    the shipped `SilentlyMisLowers` was false for that input, the hint
+    told the user to move the thread somewhere it already was, and
+    `not_implemented` suppressed the `--codegen v1` pointer that had
+    been correct. A regression, from a probe that only ever put a
+    `thread` on an env.
+
+    No fixture in the corpus has that shape, which is why it went
+    unprobed: the arm is reachable from a construct combination the
+    whole test suite never writes. Building it took adding a
+    `handshake_channel` to a bus that had only a `tlm_method`.
+
+    Two smaller findings from the same review, both about *pointing*
+    rather than classifying: the `apply` detail said "aspects apply at
+    test scope", but test scope rejects `apply` too — a hint that names
+    a destination which also fails is worse than the empty detail it
+    replaced. And the negative anchor declared `env WrapEnv` without
+    instantiating it; v1 registers scheduler slots at the `let` site, so
+    the `ThreadSlot` count equality held trivially. **The test written
+    to avoid measuring nothing was measuring nothing.**
+
+52. **`components.rs` families C and B: one lands, one is reverted by a
+    test written three batches earlier (2026-08-17).**
+
+    **Family C (handlers) — three arms, two behaviours.** A `pre`/`post`
+    hook on a cycle-trigger or periodic `on` handler is
+    `SilentlyMisLowers`: v1 emits the handler with the hook side
+    DISCARDED, byte-identical to the same handler written without it, so
+    the requested ordering is silently ignored. A non-default PHASE is
+    NOT the same — v1 implements it, emitting
+    `_post_eval_services.push_back` where the default emits
+    `_checkers.push_back`, so that arm keeps `Unsupported`.
+
+    The two sit four lines apart and were first probed with a shared
+    control that changed the trigger kind AND the modifier at once. Both
+    then read as "differs", and the split was invisible. Against a
+    one-token control they separate immediately. Rule 3, and the cost of
+    breaking it is not a wrong answer but a *missing* one.
+
+    **Family B (connect endpoints) — probed, reclassified, reverted.**
+    Three arms; the probe said non-path endpoints are `Rejects` (v1
+    refuses with its own message) and an unresolvable path segment is
+    `EmitsUncompilable` (v1 prints `env.source.nope.observed.push_back`
+    verbatim). Both readings were correct for the fixture used, and both
+    are wrong as classifications.
+
+    `cargo test` failed on
+    `a_malformed_connect_endpoint_keeps_its_v1_suggestion`, written
+    three batches earlier, whose doc comment already records why: **what
+    v1 does with a bad edge depends on WHERE THE EDGE SITS.** In an
+    instantiated env it reaches its endpoint check and refuses; in an
+    UNINSTANTIATED env it emits no wiring at all and simply succeeds —
+    and tbir resolves `connect` for every env in the merged file, so it
+    sees edges v1 never reaches. Re-probed to confirm rather than taken
+    on the test's word: an uninstantiated env accepts the non-path
+    endpoint under v1. One site, three outcomes; no single `V1Status` is
+    honest, so the suggestion stays.
+
+    This is the second time the `connect` sites have been reclassified
+    and reverted — divergence 40 reverted eight of them for the same
+    reason. Both times the probe was correct about the fixture in front
+    of it. **Position-dependence is invisible to a single-fixture probe
+    by construction**, and the only defence that has actually worked is
+    the regression suite: grep it for the site's own message before
+    touching an arm, because a previous batch may already have paid for
+    the answer.
+
+    Family C was re-run in the uninstantiated position too, and that
+    re-run **proved nothing** — a mistake worth recording, because it
+    was made while writing up the family-B lesson about positions. With
+    `Ticker` uninstantiated, v1 emits nothing for the agent at all:
+    hook-vs-control is byte-identical, but so is handler-vs-no-handler.
+    The second position cannot distinguish "the hook was dropped" from
+    "the handler was inert" — the exact anchorless reading divergence 51
+    records — so citing it as corroboration was divergence 51 repeated
+    one entry later. The verdict stands on the instantiated probe, which
+    carries a real anchor; the second position is silent, not agreeing.
+    **A control that is vacuously equal agrees with every hypothesis.**
+
+53. **The cycle-trigger hook arm has a second input, and v1 fails it
+    differently (2026-08-17).**
+
+    The arm above was probed only with a stray modifier on a genuine
+    cycle trigger (`on beats > 0 pre`). It also catches a **spec §7.3
+    method hook written in a component body** (`on s.send pre`) — not an
+    event subscription, not a handshake monitor, so it falls through to
+    the same place. For that input v1 does not silently drop the hook and
+    stop: it drops the hook and then lowers `s.send` as a cycle trigger,
+    emitting `(bool)(e.s.send)` against a `struct Sender` whose only
+    members are `dut`, `_last_in_cycle` and `_last_out_cycle`. That does
+    not compile.
+
+    Two consequences, and only the second changed any code. The verdict
+    is unchanged: `SilentlyMisLowers` is the worse of the two outcomes
+    and an arm's status is the worst thing v1 does anywhere under it. But
+    the DETAIL claimed byte-identity, which is true of one input and
+    false of the other, so it was reworded to describe what v1 actually
+    does to both — drop the hook and lower the trigger as a plain cycle
+    trigger.
+
+    A first attempt at that rewording also added "a §7.3 method hook
+    belongs at test scope, where it is lowered". It was removed on
+    review. The claim is true for a hook on a DIRECT transactor testbench
+    field (`axilite_hooks_test`, in the equivalence registry), and false
+    for the nested target a component body implies: `on e.s.send pre` at
+    test scope is refused by `resolve_method_hook_target`. Being right
+    about the destination in general is not the same as being right about
+    where THIS arm's user would land, and **a hint naming a destination
+    that also fails is worse than no hint** — which is divergence 51's
+    lesson, reintroduced two entries after writing it down.
+
+54. **The `on <obj>.<method> pre/post` hook spans nine sites across
+    four files, and four verdicts (2026-08-17).**
+
+    Divergences 52 and 53 treated "the hook family" as the arms inside
+    `components.rs`. It is not a file-local construct. A user writes the
+    same source in four different places, and grouping by construct
+    rather than by file turns up NINE existing sites across four files —
+    three in `components.rs` and six that were invisible from inside it.
+    Every one carried at least one wrong verdict, and four were
+    mixed-verdict and had to be split, leaving fifteen arms:
+
+    | site (→ arms after splitting) | v1 | was | now |
+    |---|---|---|---|
+    | component body cycle-trigger hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | component body periodic hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | component body event-subscription hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | `testbench` declaration hook (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
+    | statement position (`stmts.rs`) → `phase post_eval` | rejects | `Unsupported` | `Rejects` |
+    | …→ non-path trigger | rejects | `Unsupported` | `Rejects` |
+    | …→ method path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | test-scope target resolution (`mod.rs`) → non-path trigger | rejects | `Unsupported` | `Rejects` |
+    | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
+    | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
+    | …→ bare field, no method | rejects | `Invalid` | `Invalid` (message fixed) |
+    | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | …→ unhooked `on` | mixed, not by syntax — see below | `Unsupported` | `Unsupported` (kept) |
+    | …→ `connect` | **unprobed** | `Unsupported` | `Unsupported` (kept) |
+
+    Two of these are worth reading closely.
+
+    The **statement-position** arm was classified correctly — v1 emits
+    the same `Sender_send_pre.push_back` registration a test-scope hook
+    gets — but its detail said "declare the hook on the component or
+    testbench instead", and BOTH of those placements are themselves
+    rejected, by the two rows above it. The suggestion sent the user in a
+    circle around the same table. It now names the test / `impl ... for`
+    body against a direct transactor field, the one placement that
+    lowers. A classification can be right while the sentence attached to
+    it is the most expensive thing on the page.
+
+    The **non-transactor field** arm answered `Invalid` — "a program
+    error under every backend" — for `on w.note pre` where `w` is an
+    agent, env or method-bearing scoreboard field. v1 emits a working
+    `Watcher_note_pre.push_back`. That is not a broken program; it is a
+    TB-IR subset gap wearing a hard error, and `Invalid` gives the user
+    nothing to re-run. The site now applies v1's own condition (the field
+    binds to a component type declaring a `hookable` of that name) and
+    keeps `Invalid` only for the half v1 also refuses: an undeclared
+    field, the DUT handle, a `function` rather than `hookable` method, or
+    a transactor missing the method. Each of those four was probed and v1
+    refuses each — with the SAME message in all four cases ("obj.method
+    must resolve to a `hookable` on a known component type"), not four
+    distinct ones. That is enough to keep them `Invalid` but not enough
+    to claim v1 diagnoses them individually.
+
+    Two more sites turned up on the next pass, both mixed-verdict, and
+    both were split on the same predicate rather than given one label.
+    v1 routes EVERY hooked `on` through its method-hook resolver, which
+    accepts an `<obj>.<method>` path and refuses anything else outright.
+    So at both the statement position and the test-scope target
+    resolution, a path trigger keeps `Unsupported` (v1 wires it) and a
+    non-path trigger — `on <bool-expr> pre`, `on <N> cycles pre`,
+    `on ev(x) pre` — becomes `NotImplemented { Rejects }`.
+
+    The first predicate tried was `dotted_path`, and it LEAKED TWICE. It
+    returns `Some` for a bare identifier and it unwraps `Paren`, so
+    `on ok pre` and `on (s.send) pre` both slid into the `--codegen v1`
+    branch for programs v1 refuses — and the paren case is one character
+    away from a program that works, which is the worst kind of wrong
+    suggestion to hand someone. v1 matches `ExprKind::Field` directly, so
+    `is_v1_method_hook_shape` now checks the top-level shape directly
+    too. **Reaching for the nearest existing helper is not the same as
+    writing the predicate you meant**; `dotted_path` exists to parse
+    `connect` endpoints, where a parenthesised path is fine.
+
+    A `phase post_eval` modifier flips the verdict without touching the
+    trigger, but only where v1 routes the handler through its method-hook
+    resolver — the statement position and test scope, where it refuses
+    the modifier by name. At the component-body and testbench-declaration
+    positions v1 still emits, with hook AND phase dropped, so those keep
+    `SilentlyMisLowers`. (An earlier draft of this entry said v1 "refuses
+    it by name at every position that carries a hook", which is the same
+    over-generalisation from two positions to all of them that the entry
+    above it is about.) The modifier gets its own message rather than
+    being blamed on the path shape, and it turned up a fifth site, the
+    test-scope `phase post_eval` pre-check, which was `Unsupported` for
+    an input v1 names in its own refusal.
+
+    A ninth site sat in a fourth file: `scoreboards.rs` answered every
+    `connect`/`on` in a scoreboard body with one `Unsupported`. Its
+    HOOKED half is uniform and was reclassified — v1 drops the hook
+    byte-identically at both trigger shapes, anchored.
+
+    Its UNHOOKED half was split too, and the split was **reverted**,
+    which is the most useful thing in this entry. The arm is genuinely
+    mixed: `on w.note` makes v1 emit `(bool)(w.note)` against a
+    `struct Watcher` with no `note` member, while `on hits > 0` makes it
+    emit `(bool)(_tb.b.hits > 0)`, which compiles. Reading that as
+    "method path bad, expression good" and reusing
+    `is_v1_method_hook_shape` was wrong in both directions at once:
+    `on dut.en` is a two-segment path that COMPILES
+    (`harc_read(dut->en)`), and `on w.seen > 0` is an expression that
+    does NOT (no `w` in the checker lambda's scope). What separates the
+    inputs is name resolution in the emitted C++, not the syntax of the
+    trigger. The split also leaked `on (w.note)`, `on w.note cycles` and
+    `on w.note phase post_eval` — the predicate's `Paren`, periodic and
+    phase strictness are right for the hook resolver's question and
+    meaningless for this one.
+
+    **Borrowing a predicate borrows its question.** That is the same
+    mistake as the `dotted_path` one above, made one commit later, on
+    the predicate written to fix it. Classifying this arm needs the
+    scope analysis; the site now says so instead of guessing, and
+    `an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space`
+    pins the revert. The `connect` half of the same arm is untouched and
+    was never probed at all.
+
+    That test was first justified as "without it, re-applying the split
+    leaves the suite green", and that was **wrong** — the sibling hooked
+    test's own `on w.note` control already fails when the split comes
+    back. The test still earns its place, because it pins `dut.en`,
+    `(w.note)`, `w.note cycles` and `w.note phase post_eval`, which the
+    sibling does not, and because it asserts the two rows the split got
+    backwards (`on dut.en` compiles, `on w.seen > 0` does not) rather
+    than just a verdict. But the justification was written from one
+    run of one test rather than from removing the test and running the
+    suite — **checking that a new test fails is not the same as checking
+    that nothing else already did.**
+
+    A tenth candidate in `transactors.rs` (a hooked `on` on a `bound to`
+    transactor) is NOT classified here. Every well-formed bound
+    transactor routes its handlers through the `components.rs` arms
+    above — verified against `axilite_bound_mon_test`, where hook and
+    control differ only in source-offset-derived symbol names
+    (`_solver_site_2233` vs `_2237`), so the hook is dropped there too.
+    The `transactors.rs` arm was only reachable in probes whose
+    instantiation v1 rejects for an unrelated reason, which measures
+    nothing. Recorded as unprobed rather than classified on that.
+
+    The residual is bounded and stated: a path that is well-formed but
+    does not resolve to a `hookable` still gets the suggestion, and the
+    user lands on v1's own message rather than on silence. That covers
+    more inputs than it may read as — `e.inner.plain` (a `function`, not
+    a `hookable`), `e.nosuch.note`, `s.send.x`, `dut.en.x` are all
+    well-formed paths that v1 refuses, and `e.inner.note` is the only
+    nested path in that set v1 actually wires. Closing the residual means
+    resolving the path against the component tree, which is the same
+    scope analysis the scoreboard arm below is waiting on.
+
+    The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
+    `components.rs` by "what a user would have to write to reach the
+    site" — and then applied that grouping only inside one file. The
+    construct does not respect the file boundary: it has at least NINE
+    sites across four files, and six of them were invisible from inside
+    `components.rs`. **Group by construct, then find every file that
+    implements it.** Note also that this entry's own table was written
+    saying "four positions" and had to be corrected twice as further
+    positions appeared, a third time when the phase modifier turned up
+    two more, and a fourth when `scoreboards.rs` turned up — a count of
+    sites is a claim like any other, and it needs a search, not a
+    recollection. It now says "at least nine". Six review rounds on one
+    construct, each finding real leaks the previous round's probe had
+    not sampled, is the honest cost of a WIDE surface: the input space,
+    not the arm, is the unit of work.
+
+    The predicate itself took three attempts, and the failure mode was
+    the same each time — reaching for an existing helper instead of
+    writing the question. `dotted_path` accepts a bare identifier and
+    unwraps `Paren` at every level, because `connect` endpoints allow
+    both; guarding only the top-level node moved the leak one segment
+    inward (`on (s).send pre`). `is_v1_method_hook_shape` now does its
+    own walk with no `Paren` arm, matching v1's own pattern match. It
+    also carries no `!h.periodic` clause: `on s.send cycles pre` is a
+    path with a period, v1's hook branch ignores `h.periodic` and wires
+    it, and the clause made the statement position disagree with v1 AND
+    with the sibling arm that shares the predicate. **A conjunct that is
+    redundant on the inputs you sampled is not free — it is an untested
+    claim.**
+
+    A fourth leak closed the same way: the impl-for desugarer rewrites a
+    bare testbench field to `_tb.<field>`, so a plain length test counts
+    the synthetic root as a real segment and read `on s pre` — one
+    identifier, no method — as `<obj>.<method>`. The walk now mirrors
+    `resolve_method_hook_target`'s two accepted forms exactly
+    (`<field>.<method>`, `_tb.<field>.<method>`). The same synthetic root
+    was leaking into a user-facing message, quoting back a `_tb` nobody
+    typed; that shape now gets its own sentence.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

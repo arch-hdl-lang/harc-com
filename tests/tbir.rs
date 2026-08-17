@@ -15537,3 +15537,902 @@ env AnalysisEnv"#;
     );
     assert!(v1.contains("env.weird.cp.b0++"), "v1 wires the sampling");
 }
+
+/// A target-serving `thread` written on an env/agent instead of a
+/// bus-bound transactor. v1 accepts it and emits the component WITHOUT
+/// it — no `ThreadSlot`, no scheduler registration, no coroutine — so
+/// the target silently never serves.
+///
+/// The first probe of this "proved" it by showing v1's output was
+/// byte-identical with and without the thread. That proved nothing: an
+/// UNBOUND thread emits nothing under v1 wherever it sits, so the
+/// comparison had no signal in it. Both anchors below exist because of
+/// that.
+#[test]
+fn a_thread_in_a_component_is_silently_dropped_by_v1() {
+    let bound = fixture("tlm_target_thread_test.harc");
+    let thread_start = bound
+        .find("    thread bus.read(addr: uint<8>)")
+        .expect("fixture shape changed");
+    let thread_end = bound[thread_start..]
+        .find("end thread")
+        .map(|i| thread_start + i + "end thread\n".len())
+        .expect("fixture shape changed");
+    let thread_src = &bound[thread_start..thread_end];
+
+    // Control: the registered fixture emits under both backends.
+    emit_cpp_src(&bound);
+    let v1_bound = cpp_tb::emit(&merged_src(&bound)).expect("v1 emits the control");
+
+    // POSITIVE anchor: where the construct IS supported, it genuinely
+    // contributes — removing it costs the ThreadSlot and the coroutine.
+    // Without this, "no diff" below would be unreadable.
+    let without = format!("{}{}", &bound[..thread_start], &bound[thread_end..]);
+    let v1_without = cpp_tb::emit(&merged_src(&without)).expect("v1 emits");
+    // Counted, not just present: other machinery emits ThreadSlots too,
+    // so `contains` would be satisfied by those and measure nothing.
+    assert!(
+        v1_bound.matches("harc_rt::ThreadSlot").count()
+            > v1_without.matches("harc_rt::ThreadSlot").count(),
+        "a bus-bound thread adds a ThreadSlot; removing it takes one away"
+    );
+
+    // NEGATIVE anchor: the same thread moved into an `env` adds only the
+    // empty component struct. No ThreadSlot, no serving logic.
+    // INSTANTIATED. v1 registers scheduler slots at the `let` site, so an
+    // env that is declared but never bound contributes nothing whether or
+    // not the thread inside it works — the count equality would hold
+    // trivially and measure exactly nothing, which is the failure this
+    // test exists to avoid.
+    let in_env = bound
+        .replacen(
+            "testbench TlmTargetThreadTb",
+            &format!("env WrapEnv\n{thread_src}end env WrapEnv\n\ntestbench TlmTargetThreadTb"),
+            1,
+        )
+        .replacen(
+            "    let target : TlmMemTarget passive = bind mem",
+            "    let target : TlmMemTarget passive = bind mem\n    let wrap : WrapEnv",
+            1,
+        );
+    assert!(
+        in_env.contains("let wrap : WrapEnv"),
+        "the env is instantiated"
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&in_env).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`thread` item in component"), "{msg}");
+
+    let v1_env = cpp_tb::emit(&merged_src(&in_env)).expect("v1 accepts a thread on an env");
+    assert!(
+        v1_env.contains("struct WrapEnv"),
+        "v1 emits the component struct"
+    );
+    // The count is what matters: the env's thread adds no NEW slot.
+    assert_eq!(
+        v1_env.matches("harc_rt::ThreadSlot").count(),
+        v1_bound.matches("harc_rt::ThreadSlot").count(),
+        "the env-held thread contributes no ThreadSlot — it silently never serves"
+    );
+}
+
+/// The same arm also catches a `thread` on a transactor that IS
+/// bus-bound: `transactor_is_component` routes one down the component
+/// path when it additionally has a non-periodic `on` handler.
+///
+/// There the construct works — `emit_bound_tlm_target_actors` emits the
+/// target actor regardless of the `on` handler — so v1 is a genuine
+/// escape hatch and the arm keeps `Unsupported`. The first version of
+/// the split reclassified the whole arm from a probe that only ever put
+/// a `thread` on an env.
+#[test]
+fn a_thread_on_a_bound_transactor_still_points_at_v1() {
+    let bound = fixture("tlm_target_thread_test.harc");
+    emit_cpp_src(&bound);
+
+    // Add a non-periodic `on` handler, which is what routes this
+    // transactor down the component path.
+    // `bus.read` is a tlm_method, so the `on` handler needs a real
+    // handshake channel — the bus is given one here. No fixture in the
+    // corpus has this shape (bound transactor + `on` + `thread`), which
+    // is why it went unprobed the first time.
+    let via_component = bound
+        .replacen(
+            "    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+            r#"    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    handshake_channel obs: receive kind: valid_ready
+        data: UInt<8>;
+    end handshake_channel obs"#,
+            1,
+        )
+        .replacen(
+            "transactor TlmMemTarget bound to TlmMemBus",
+            "transactor TlmMemTarget bound to TlmMemBus\n    sink : uint<8> default 0",
+            1,
+        )
+        .replacen(
+            "    thread bus.read(addr: uint<8>)",
+            "    on bus.obs.handshake(v)\n        sink = v\n    end on\n\n    thread bus.read(addr: uint<8>)",
+            1,
+        );
+    let err = lower_src(&via_component).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("bound transactor"), "{msg}");
+
+    // v1's evidence: the target actor is still emitted, so pointing the
+    // user at v1 is accurate rather than a dead end.
+    let v1 = cpp_tb::emit(&merged_src(&via_component)).expect("v1 emits");
+    assert!(
+        v1.matches("harc_rt::ThreadSlot").count()
+            > cpp_tb::emit(&merged_src(&bound))
+                .expect("v1 emits")
+                .matches("harc_rt::ThreadSlot")
+                .count(),
+        "the `on` handler adds slots and the thread's actor survives"
+    );
+}
+
+/// The `components.rs` handler-validator family: THREE hook arms and one
+/// phase arm, and the hook arms and the phase arm classify opposite ways
+/// despite sitting four lines apart.
+///
+/// A `pre`/`post` hook on a cycle-trigger, periodic, or event-
+/// subscription handler is `SilentlyMisLowers`: v1 emits the handler
+/// with the hook side DISCARDED, byte-identically to the same handler
+/// written without it. The user asks for pre/post ordering and gets the
+/// default.
+///
+/// A non-default PHASE is not the same. v1 implements it —
+/// `phase post_eval` emits `_post_eval_services.push_back` where the
+/// default emits `_checkers.push_back` — so v1 is a real escape hatch
+/// and that arm keeps `Unsupported`.
+///
+/// Every byte-identity below is paired with its OWN anchor (the same
+/// mutation with the handler removed rather than the hook added). A
+/// shared anchor would not do: it holds for one trigger kind and says
+/// nothing about the others, and in an uninstantiated component it is
+/// vacuously true for all of them.
+#[test]
+fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
+    let fixture = fixture("agent_periodic_test.harc");
+    const PERIODIC: &str = "    on 10 cycles";
+
+    // Replace the handler's TRIGGER line, and separately produce the
+    // same source with the whole handler deleted — the anchor that
+    // makes a later byte-identity mean "the modifier was dropped"
+    // rather than "the handler was inert".
+    let start = fixture.find(PERIODIC).expect("fixture shape changed");
+    let end = fixture[start..]
+        .find("end on")
+        .map(|i| start + i + "end on\n".len())
+        .expect("fixture shape changed");
+    let without = format!("{}{}", &fixture[..start], &fixture[end..]);
+    let v1_without = cpp_tb::emit(&merged_src(&without)).expect("v1 emits");
+
+    // Assert `hook` is dropped relative to `ctl`, with `ctl` itself
+    // anchored against the handler-free source. Both mutations differ
+    // from `ctl` in exactly one token.
+    let check_dropped = |ctl_trigger: &str, hook_trigger: &str, construct: &str| {
+        let ctl = fixture.replacen(PERIODIC, ctl_trigger, 1);
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+        assert_ne!(
+            v1_ctl, v1_without,
+            "`{ctl_trigger}` must genuinely contribute, or the identity below is vacuous"
+        );
+        let hooked = fixture.replacen(PERIODIC, hook_trigger, 1);
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains(construct), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 emits `{hook_trigger}` with the hook discarded"
+        );
+        v1_ctl
+    };
+
+    check_dropped(PERIODIC, "    on 10 cycles pre", "`on <N> cycles` handler");
+    // The CYCLE-TRIGGER control carries its own anchor. Reusing the
+    // periodic one would change the trigger kind AND the modifier at
+    // once, which made both arms read as "differs" and hid the split.
+    let v1_c_ctl = check_dropped(
+        "    on beats > 0",
+        "    on beats > 0 pre",
+        "cycle-trigger `on` handler",
+    );
+
+    // The PHASE, by contrast, v1 implements.
+    let c_phase = fixture.replacen(PERIODIC, "    on beats > 0 phase post_eval", 1);
+    let msg = assert_unsupported(&lower_src(&c_phase).unwrap_err());
+    assert!(msg.contains("non-default-phase"), "{msg}");
+    let v1_phase = cpp_tb::emit(&merged_src(&c_phase)).expect("v1 emits");
+    assert!(
+        v1_phase.contains("_post_eval_services.push_back"),
+        "`phase post_eval` selects the post-eval dispatch vector"
+    );
+    assert!(
+        v1_c_ctl.contains("_checkers.push_back")
+            && !v1_c_ctl.contains("_post_eval_services.push_back"),
+        "and the default registers into `_checkers` only, so the phase is not a no-op"
+    );
+}
+
+/// The third hook arm, on the event-subscription path: `on ev(t) pre`.
+/// Probes identically to the other two — v1 emits the subscription with
+/// the hook side discarded — so it carries the same `SilentlyMisLowers`
+/// verdict rather than the `--codegen v1` suggestion it used to.
+#[test]
+fn an_event_subscription_hook_is_dropped_by_v1_too() {
+    let fixture = fixture("heartbeat_idle_test.harc");
+    const SUB: &str = "    on in_ev(t)";
+
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    let start = fixture.find(SUB).expect("fixture shape changed");
+    let end = fixture[start..]
+        .find("end on")
+        .map(|i| start + i + "end on\n".len())
+        .expect("fixture shape changed");
+    let without = format!("{}{}", &fixture[..start], &fixture[end..]);
+    assert_ne!(
+        cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
+        v1_ctl,
+        "the subscription genuinely contributes, so the identities below mean something"
+    );
+
+    for hook in ["pre", "post"] {
+        let hooked = fixture.replacen(SUB, &format!("    on in_ev(t) {hook}"), 1);
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("`pre`/`post` hook `on` handler"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 emits the subscription with the `{hook}` hook discarded"
+        );
+    }
+}
+
+/// The cycle-trigger hook arm's OTHER input: a spec §7.3 method hook
+/// written in a component body instead of at test scope. It is not an
+/// event subscription and not a handshake monitor, so it lands in the
+/// same arm as a stray `pre` on a bool expression — but v1 fails it
+/// differently, dropping the hook AND edge-detecting on a struct member
+/// that does not exist.
+///
+/// That makes the arm's input space non-uniform. `SilentlyMisLowers` is
+/// still the honest label (it is the worse of the two outcomes), but the
+/// message must not claim byte-identity, which holds only for the other
+/// shape.
+#[test]
+fn a_method_hook_in_a_component_body_reaches_the_cycle_trigger_arm() {
+    const BASE: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RegOp
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegOp
+
+transactor Sender
+    dut : Top
+
+    when active
+        hookable send(t: RegOp)
+            dut.en = 1
+        end send
+    end when
+end transactor Sender
+
+env HookEnv
+    s : Sender active
+HOOK
+end env HookEnv
+
+test MethodHookTest
+    let dut : Top
+    let e : HookEnv
+
+    clock clk = SysDomain
+
+    run
+        e.s.dut = dut
+        wait 2 cycles
+    end run
+end test MethodHookTest
+"#;
+    let ctl = BASE.replace("HOOK\n", "");
+    let hooked = BASE.replace(
+        "HOOK",
+        "    on s.send pre\n        log(info, \"prehook\")\n    end on",
+    );
+
+    // The arm it lands in, and the message it must NOT make.
+    let msg = assert_not_implemented(
+        &lower_src(&hooked).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cycle-trigger `on` handler"), "{msg}");
+
+    // v1 does NOT drop the hook silently here: the output differs from
+    // the control, and what it adds is a cycle trigger reading
+    // `e.s.send` — a member the emitted `struct Sender` does not have,
+    // so the C++ does not compile.
+    let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+    let v1_hooked = cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits");
+    assert_ne!(
+        v1_ctl, v1_hooked,
+        "the byte-identity that holds for a stray `pre` does not hold here"
+    );
+    assert!(
+        v1_hooked.contains("(bool)(e.s.send)"),
+        "v1 lowers the method hook as a cycle trigger on the method path"
+    );
+    let sender_struct = v1_hooked
+        .split_once("struct Sender {")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(body, _)| body.to_string())
+        .expect("v1 emits a `Sender` struct");
+    assert!(
+        !sender_struct.contains("send"),
+        "no `send` member, so `(bool)(e.s.send)` cannot compile: {sender_struct}"
+    );
+}
+
+/// The rest of the `on <obj>.<method> pre/post` hook family, which
+/// spans four positions rather than the one `components.rs` owns. A
+/// user writes the same construct in each; v1 does three different
+/// things, so the three surviving sites classify three ways.
+///
+/// `HOOK` marks the testbench declaration, `IMPL` the test body and
+/// `BODY` a statement position inside `run` — the three placements a
+/// user would try after a component body rejects the hook.
+const HOOK_POSITIONS_SRC: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RegOp
+    addr  : uint<8>
+end transaction RegOp
+
+transactor Sender
+    dut : Top
+    when active
+        hookable send(t: RegOp)
+            dut.en = 1
+        end send
+    end when
+end transactor Sender
+
+agent Watcher
+    seen : uint<32> default 0
+    ev   : event<RegOp>
+    hookable note(t: RegOp)
+        seen = seen + 1
+    end note
+    function plain(t: RegOp)
+        seen = seen + 1
+    end plain
+end agent Watcher
+
+env Holder
+    inner : Watcher
+end env Holder
+
+testbench HookTb
+    dut : Top
+    s   : Sender active
+    w   : Watcher
+    e   : Holder
+HOOK
+end testbench HookTb
+
+impl HookTest for HookTb
+    clock clk = SysDomain
+    let ok : uint<32> = 0
+IMPL
+    run
+        s.dut = dut
+BODY
+        wait 2 cycles
+    end run
+end impl HookTest
+"#;
+
+/// Fill the three placeholders, dropping the ones left empty.
+fn hook_positions(tb: &str, imp: &str, body: &str) -> String {
+    let fill = |s: &str, key: &str, v: &str| {
+        if v.is_empty() {
+            s.replace(&format!("{key}\n"), "")
+        } else {
+            s.replace(key, v)
+        }
+    };
+    let s = fill(HOOK_POSITIONS_SRC, "HOOK", tb);
+    let s = fill(&s, "IMPL", imp);
+    fill(&s, "BODY", body)
+}
+
+fn pre_hook_on(target: &str, indent: &str) -> String {
+    format!("{indent}on {target} pre\n{indent}    log(info, \"prehook\")\n{indent}end on")
+}
+
+/// A hook written in the `testbench` DECLARATION, which is the position
+/// a user lands in after `impl` scope rejects a nested target. Same
+/// two-input shape as the component-body arm and the same verdict:
+/// v1 drops the hook and lowers the trigger as a plain cycle trigger,
+/// byte-identically for a bool expression and uncompilably for a
+/// method path.
+#[test]
+fn a_testbench_scoped_handler_hook_is_dropped_by_v1() {
+    let none = hook_positions("", "", "");
+    let v1_none = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
+
+    // Input 1: a stray `pre` on a genuine cycle trigger, against a
+    // one-token control that is itself anchored against no handler.
+    let ctl = hook_positions(
+        "    on dut.en > 0\n        log(info, \"prehook\")\n    end on",
+        "",
+        "",
+    );
+    let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+    assert_ne!(
+        v1_ctl, v1_none,
+        "the handler must contribute, or the identity below is vacuous"
+    );
+    let bool_hook = hook_positions(&pre_hook_on("dut.en > 0", "    "), "", "");
+    let msg = assert_not_implemented(
+        &lower_src(&bool_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("testbench-scoped"), "{msg}");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&bool_hook)).expect("v1 emits"),
+        v1_ctl,
+        "v1 drops the hook and emits the bare cycle trigger"
+    );
+
+    // Input 2: a method path. Same arm, but v1 edge-detects on a member
+    // the emitted struct does not have.
+    let path_hook = hook_positions(&pre_hook_on("s.send", "    "), "", "");
+    assert_not_implemented(
+        &lower_src(&path_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_path = cpp_tb::emit(&merged_src(&path_hook)).expect("v1 emits");
+    assert!(
+        v1_path.contains("(bool)(_tb.s.send)"),
+        "v1 lowers the method path as a cycle trigger"
+    );
+    assert!(
+        !v1_path.contains("Sender_send_pre.push_back"),
+        "and registers no hook, so the ordering is lost either way"
+    );
+}
+
+/// A hook in STATEMENT position, by contrast, v1 really does implement:
+/// it emits the same `Sender_send_pre.push_back` registration the
+/// working test-scope placement gets. So this one keeps `Unsupported` —
+/// and its suggestion must name a destination that works, which the two
+/// obvious readings of "the component or testbench" do not.
+#[test]
+fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination() {
+    let stmt = hook_positions("", "", &pre_hook_on("s.send", "        "));
+    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
+    assert!(msg.contains("statement position"), "{msg}");
+
+    // v1 is a real escape hatch: it emits the same registration the
+    // test-scope placement gets, which tbir itself lowers. Not
+    // byte-identical — a statement-position hook registers at its own
+    // point in the run body rather than ahead of the setup assignments,
+    // which is the whole reason the two placements are distinguishable —
+    // so the claim is about the registration, not the file.
+    let test_scope = hook_positions("", &pre_hook_on("s.send", "    "), "");
+    lower_src(&test_scope).expect("the test-scope placement lowers under tbir");
+    let v1_none = cpp_tb::emit(&merged_src(&hook_positions("", "", ""))).expect("v1 emits");
+    let v1_stmt = cpp_tb::emit(&merged_src(&stmt)).expect("v1 emits");
+    assert!(
+        !v1_none.contains("Sender_send_pre.push_back"),
+        "the anchor: no hook, no registration"
+    );
+    for (label, out) in [
+        ("statement position", &v1_stmt),
+        (
+            "test scope",
+            &cpp_tb::emit(&merged_src(&test_scope)).expect("v1 emits"),
+        ),
+    ] {
+        assert!(
+            out.contains("Sender_send_pre.push_back"),
+            "v1 registers the {label} hook, so `--codegen v1` is honest"
+        );
+    }
+
+    // The destination the message names must be the one that works. It
+    // used to say "the component or testbench"; a hook in a component
+    // body and a hook in a `testbench` declaration BOTH fail.
+    assert!(
+        msg.contains("test scope") && msg.contains("transactor"),
+        "the suggestion must name the placement that actually lowers: {msg}"
+    );
+    // Each rejected placement is checked against ITS OWN hook-free
+    // control. Asserting only `is_err()` would pass on a source that
+    // fails for an unrelated reason, which is how a placement gets
+    // recommended by accident.
+    let component_body = |hook: &str| {
+        hook_positions("", "", "").replace(
+            "    hookable note(t: RegOp)",
+            &format!("{hook}    hookable note(t: RegOp)"),
+        )
+    };
+    for (label, bad, control) in [
+        (
+            "testbench declaration",
+            hook_positions(&pre_hook_on("s.send", "    "), "", ""),
+            hook_positions("", "", ""),
+        ),
+        (
+            "component body",
+            component_body("    on s.send pre\n        log(info, \"p\")\n    end on\n"),
+            component_body(""),
+        ),
+    ] {
+        lower_src(&control).unwrap_or_else(|e| {
+            panic!("the {label} control must lower, or its rejection proves nothing: {e:?}")
+        });
+        let err = lower_src(&bad)
+            .err()
+            .unwrap_or_else(|| panic!("the {label} placement must not be a working destination"));
+        assert!(
+            err.to_string().contains("hook"),
+            "and it must be the HOOK that is rejected there, not something else: {err:?}"
+        );
+    }
+}
+
+/// The statement-position arm is mixed, because v1's method-hook
+/// resolver is what every hooked `on` goes through. A path trigger it
+/// wires; anything else it refuses outright, so pointing those at
+/// `--codegen v1` would hand the user a second error.
+///
+/// The last four triggers are why the predicate is a hand-written walk
+/// rather than `components::dotted_path`, which leaked twice: it returns
+/// `Some` for a bare identifier, and it unwraps `Paren` at EVERY level,
+/// so guarding the top-level node only moved the leak one segment
+/// inward. `on (s.send) pre` and `on (s).send pre` are each one
+/// character from a program that works, and v1 refuses both.
+#[test]
+fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
+    for trigger in [
+        "dut.en > 0",
+        "5 cycles",
+        "w.ev(x)",
+        "ok",
+        "(s.send)",
+        "(s).send",
+        "(e.inner).note",
+        // A bare identifier that IS a testbench field. The impl-for
+        // desugarer rewrites it to `_tb.s`, so a plain length test
+        // counts the synthetic root and reads it as `<obj>.<method>`.
+        "s",
+    ] {
+        let src = hook_positions("", "", &pre_hook_on(trigger, "        "));
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-method-path"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `on {trigger} pre`, or `Rejects` is wrong"
+        );
+        // The anchor: the SAME trigger without a hook side is fine, so
+        // the rejection is about the hook and not about the trigger.
+        // Anchored where the hook-free form lowers, which is what
+        // makes the rejection above about the HOOK rather than about
+        // the trigger. Skipped for `"s"` (a bare field reference) and
+        // for the parenthesised and call forms, none of which lower on
+        // their own — an anchor there would measure nothing. That
+        // leaves `dut.en > 0`, `5 cycles` and `ok` carrying it.
+        if trigger != "s" && !trigger.contains('(') {
+            let ctl = hook_positions(
+                "",
+                "",
+                &format!("        on {trigger}\n            log(info, \"p\")\n        end on"),
+            );
+            lower_src(&ctl).unwrap_or_else(|e| panic!("`on {trigger}` alone must lower: {e:?}"));
+        }
+    }
+}
+
+/// A `phase post_eval` modifier turns a wired hook into a refused one,
+/// at every position that carries a hook. It is the one axis that flips
+/// the verdict without touching the trigger, so it is called out with
+/// its own message rather than blamed on the path shape.
+#[test]
+fn a_phase_modifier_on_a_method_hook_is_refused_by_v1() {
+    let phase_hook = |ind: &str| {
+        format!("{ind}on s.send pre phase post_eval\n{ind}    log(info, \"p\")\n{ind}end on")
+    };
+    for (label, src) in [
+        (
+            "statement position",
+            hook_positions("", "", &phase_hook("        ")),
+        ),
+        ("test scope", hook_positions("", &phase_hook("    "), "")),
+    ] {
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("phase post_eval"), "{label}: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse the phase modifier at the {label}, or `Rejects` is wrong"
+        );
+    }
+    // The anchor: the same hook WITHOUT the modifier is wired by v1 at
+    // both positions, so it is the phase that is being refused.
+    for src in [
+        hook_positions("", "", &pre_hook_on("s.send", "        ")),
+        hook_positions("", &pre_hook_on("s.send", "    "), ""),
+    ] {
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains("Sender_send_pre.push_back"),
+            "the hook-free-of-phase control must be wired"
+        );
+    }
+}
+
+/// The same split at test scope, where the target resolver takes only
+/// `<field>.<method>`. A DEEPER path is a subset gap — v1 walks the
+/// whole path and wires it — while a non-path trigger is refused by v1.
+#[test]
+fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
+    let nested = hook_positions("", &pre_hook_on("e.inner.note", "    "), "");
+    let msg = assert_unsupported(&lower_src(&nested).unwrap_err());
+    assert!(msg.contains("nested component path"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&nested))
+            .expect("v1 emits")
+            .contains("Watcher_note_pre.push_back"),
+        "v1 walks the nested path, so the `--codegen v1` suggestion is honest"
+    );
+
+    for trigger in [
+        "dut.en > 0",
+        "5 cycles",
+        "w.ev(x)",
+        "ok",
+        "(s.send)",
+        "(s).send",
+        "(e.inner).note",
+        // No `"s"` here: at test scope the desugarer rewrites it to
+        // `_tb.s`, which `resolve_method_hook_target` ACCEPTS as
+        // `<field>.<method>`, so it lands in the target-lookup arm and
+        // is answered `Invalid` — correctly, since v1 refuses it too.
+        // Only the statement position reaches this split with it.
+    ] {
+        let src = hook_positions("", &pre_hook_on(trigger, "    "), "");
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-method-path"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `on {trigger} pre` at test scope, or `Rejects` is wrong"
+        );
+    }
+}
+
+/// The hook-target resolver used to answer every non-transactor field
+/// with `Invalid` — "your program is broken under every backend". That
+/// is false for an agent / env / method-bearing scoreboard field, which
+/// v1 wires into a working `<Type>_<method>_pre` vector. The site now
+/// splits on v1's own condition, and only the half v1 also refuses
+/// stays `Invalid`.
+#[test]
+fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
+    let hook = |target: &str| hook_positions("", &pre_hook_on(target, "    "), "");
+
+    // v1 wires these, so they are subset gaps and `--codegen v1` is honest.
+    for (target, vector) in [
+        ("w.note", "Watcher_note_pre.push_back"),
+        ("s.send", "Sender_send_pre.push_back"),
+    ] {
+        let src = hook(target);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(vector), "v1 must register `{target}`");
+    }
+    let msg = assert_unsupported(&lower_src(&hook("w.note")).unwrap_err());
+    assert!(msg.contains("non-transactor component field"), "{msg}");
+    // The transactor case is the control: it is not a gap at all.
+    lower_src(&hook("s.send")).expect("a transactor field lowers");
+
+    // A bare field with no method: the desugarer rewrites it to
+    // `_tb.s`, so the resolver accepts the SHAPE and the lookup then
+    // fails on the synthetic root. v1 refuses it, so `Invalid` is
+    // right — but the message must not quote back a `_tb` the user
+    // never typed.
+    let bare = hook_positions("", &pre_hook_on("s", "    "), "");
+    assert!(
+        cpp_tb::emit(&merged_src(&bare)).is_err(),
+        "v1 must refuse a hook with no method"
+    );
+    let msg = assert_invalid(&lower_src(&bare).unwrap_err());
+    // It must lead with what the user WROTE, not with the desugared
+    // form. `_tb` may still appear later, in the parenthetical that
+    // covers a literal source `_tb` — the two are indistinguishable by
+    // the time the lookup fails, so the message covers both rather
+    // than asserting which happened.
+    assert!(
+        msg.starts_with("`on s` hook:"),
+        "must quote the source text, not `_tb.s`: {msg}"
+    );
+    assert!(msg.contains("names a method to wrap"), "{msg}");
+
+    // v1 refuses these itself, so they really are program errors.
+    for target in ["w.plain", "nosuch.send", "dut.send", "s.nosuch"] {
+        let src = hook(target);
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `{target}`, or `Invalid` over-claims"
+        );
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        // Name the whole target, not just its head — `s.nosuch` and
+        // `w.plain` would otherwise match on a one-character needle.
+        assert!(msg.contains(&format!("`on {target}`")), "{msg}");
+    }
+}
+
+/// The ninth site, in `scoreboards.rs`, which answers every
+/// `connect`/`on` in a scoreboard body with one `Unsupported`. The
+/// HOOKED half of it is uniform and reclassified: v1 drops the hook,
+/// byte-identically to the same handler without one, at both trigger
+/// shapes.
+///
+/// The unhooked half is deliberately left whole. It is mixed, but what
+/// separates its inputs is name resolution in the emitted C++, not
+/// syntax — `on dut.en` compiles and `on w.seen > 0` does not, despite
+/// being a path and an expression respectively. A syntactic split was
+/// written and reverted; see the comment at the site.
+#[test]
+fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            .replace("    e   : Holder", "    e   : Holder\n    b   : Board")
+    };
+    let handler = |trigger: &str, hook: &str| {
+        format!("    on {trigger}{hook}\n        log(info, \"p\")\n    end on\n")
+    };
+
+    // The anchor for every byte-identity below: the scoreboard with no
+    // handler at all differs from each control.
+    let v1_none = cpp_tb::emit(&merged_src(&scoreboard(""))).expect("v1 emits");
+
+    for trigger in ["hits > 0", "w.note"] {
+        let ctl = scoreboard(&handler(trigger, ""));
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+        assert_ne!(
+            v1_ctl, v1_none,
+            "`on {trigger}` must contribute, or the identity below is vacuous"
+        );
+        // The control itself is still a subset gap, which is what makes
+        // the hook the only thing under test here.
+        assert_unsupported(&lower_src(&ctl).unwrap_err());
+
+        let hooked = scoreboard(&handler(trigger, " pre"));
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("on scoreboard `Board`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 drops the hook on `on {trigger} pre`"
+        );
+    }
+}
+
+/// Pins the REVERT. The unhooked `connect`/`on` arm in a scoreboard
+/// body answers one `Unsupported` for its whole input space, and it
+/// must keep doing so until someone classifies it with the scope
+/// analysis it actually needs.
+///
+/// A syntactic split was written here and undone. The sibling hooked
+/// test's `on w.note` control already fails if it comes back, so this
+/// is not the only guard — it is the one that pins `dut.en`,
+/// `(w.note)`, `w.note cycles` and `w.note phase post_eval`, and that
+/// asserts the two rows the split got BACKWARDS: `on dut.en` is a
+/// two-segment PATH that v1 compiles, and `on w.seen > 0` is an
+/// EXPRESSION that v1 does not. No predicate over trigger syntax can
+/// separate this arm.
+#[test]
+fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            .replace("    e   : Holder", "    e   : Holder\n    b   : Board")
+    };
+    let handler =
+        |trigger: &str| format!("    on {trigger}\n        log(info, \"p\")\n    end on\n");
+
+    for trigger in [
+        "hits > 0",
+        "w.seen > 0",
+        "dut.en",
+        "w.note",
+        "(w.note)",
+        "w.note cycles",
+        "w.note phase post_eval",
+    ] {
+        let msg = assert_unsupported(&lower_src(&scoreboard(&handler(trigger))).unwrap_err());
+        assert!(
+            msg.contains("event wiring"),
+            "`on {trigger}` must still reach the one generic arm: {msg}"
+        );
+    }
+
+    // And the reason a syntactic split cannot work: the path compiles
+    // and the expression does not, which is the opposite of what
+    // trigger shape would predict.
+    let path = cpp_tb::emit(&merged_src(&scoreboard(&handler("dut.en")))).expect("v1 emits");
+    assert!(
+        path.contains("(bool)(harc_rt::harc_read(dut->en))"),
+        "a two-segment path that resolves against the DUT and compiles"
+    );
+    let expr = cpp_tb::emit(&merged_src(&scoreboard(&handler("w.seen > 0")))).expect("v1 emits");
+    assert!(
+        expr.contains("(bool)(w.seen > 0)"),
+        "an expression naming a SIBLING testbench field, unqualified"
+    );
+    assert!(
+        !expr.contains("_tb.w.seen"),
+        "v1 does not qualify it, so there is no `w` in the checker lambda's scope"
+    );
+}
+
+/// A period does not change what v1 does with a hooked method path: its
+/// hook branch never consults `h.periodic`. An earlier `!h.periodic`
+/// conjunct in the predicate made `on s.send cycles pre` `Rejects` in
+/// statement position while the test-scope arm lowered the same source.
+#[test]
+fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
+    let stmt = hook_positions("", "", &pre_hook_on("s.send cycles", "        "));
+    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
+    assert!(msg.contains("statement position"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&stmt))
+            .expect("v1 emits")
+            .contains("Sender_send_pre.push_back"),
+        "v1 wires it, so the suggestion is honest"
+    );
+    lower_src(&hook_positions(
+        "",
+        &pre_hook_on("s.send cycles", "    "),
+        "",
+    ))
+    .expect("and the test-scope arm lowers the same source");
+}
