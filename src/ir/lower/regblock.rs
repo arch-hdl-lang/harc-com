@@ -844,6 +844,21 @@ impl super::FuncBuilder<'_> {
                 args.len()
             )));
         }
+        // `(addr, data)` — the same names the `Invalid` message three
+        // lines above quotes, and the ones `docs/ral-support.md` and
+        // every fixture use. An earlier version invented
+        // `["reg", "value"]`, which refused the documented
+        // `record_write(addr = .., data = ..)` outright — and since `reg`
+        // is a lexer keyword, position 1 could never match any parseable
+        // program, so the site silently degenerated into "refuse every
+        // named first argument". A builtin has no declaration node to
+        // read, which is exactly why its list has to be checked against
+        // the diagnostic and the docs rather than recalled.
+        super::reject_misplaced_named_args(
+            args,
+            &["addr".to_string(), "data".to_string()],
+            "a `record_write(...)` call",
+        )?;
         let reg = self.resolve_record_api_reg(&binding, "record_write", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(

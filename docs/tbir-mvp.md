@@ -3592,6 +3592,249 @@ case and only locally-determinable `Assign` types are compared).
     was leaking into a user-facing message, quoting back a `_tb` nobody
     typed; that shape now gets its own sentence.
 
+55. **Named arguments are decoration to v1, and `#(...)` parameters do
+    not exist to it (2026-08-17).**
+
+    Two `components.rs` families that share a shape: the user writes
+    something to make their intent explicit, and v1 throws that
+    something away.
+
+    **Named arguments — and TB-IR was doing it too.** The named-argument
+    construct turned out to have the same shape as the parameter one:
+    arms that REPORT it, and sites that silently DO it. `bus.rs` and
+    `regblock.rs` each carried a private `call_arg` helper that took
+    `value` and dropped `name`, so TB-IR itself bound reordered named
+    arguments by position — `bus.w.send(strb = 15, data = t.value)`
+    emitted `axil_w_data = 15` and `axil_w_strb = t.value`, swapped, with
+    no diagnostic from either backend.
+
+    That is the same class as the seventh parameter landing and was found
+    the same way: by looking for the BEHAVIOUR outside the file the first
+    fix was written in.
+
+    The guard took two tries. The first keyed on ARITY alone — reject any
+    multi-argument call carrying a name — and so refused
+    `bus.w.send(data = t.value, strb = 15)`, names in declaration order,
+    which both backends lower correctly, while telling the user v1
+    "silently emits something else". That sentence was false for the
+    program in front of it. **Refusing a correct program with a false
+    explanation is not the safe side of a classification**, and the
+    excuse for the shortcut did not even apply: unlike
+    `lower_component_call_args`, which sees only `&[CallArg]`, the three
+    bus callers have the declaration in hand — from the channel payload
+    or `m.args`. The guard now compares each name against the parameter
+    at its position and says which parameter was written where.
+
+    `record_write` is the exception that proves the rule: it is a builtin
+    with no declaration node, so its list was written from memory as
+    `["reg", "value"]`. The real signature is `(addr, data)` — the
+    compiler's own `Invalid` message three lines above the guard says so,
+    and so do the docs and every fixture. The consequence was the very
+    thing the rewrite was for: `record_write(addr = .., data = ..)`, the
+    documented form, refused as a silent mis-lowering. Worse, `reg` is a
+    lexer keyword and does not parse as an argument name at all, so
+    position 1 could never match and the site degenerated into "refuse
+    every named first argument" — the arity behaviour, reintroduced by
+    accident behind a check that looked precise.
+
+    Three of the four guard CALL SITES could be deleted with the suite
+    still green, which is how that shipped. **A test that pins a
+    predicate does not pin the places it is called from.** Each site now
+    has its own assertion, and each was verified by deleting the call.
+
+    An unknown parameter name is now `Invalid` rather than
+    `SilentlyMisLowers`: no backend can honour a name that matches no
+    parameter, and for a typo sitting in a valid position v1 emits
+    exactly the right code — so claiming a silent mis-lowering there was
+    the same false explanation one layer down.
+
+    Sites that remain UNFIXED, recorded rather than guessed at. The
+    first is the most serious thing left in this construct:
+
+    * **`log`/`logf` downgrade the SEVERITY.** `log(level = fatal,
+      "BOOM")` emits `sim_log_line("INFO", "BOOM")` under BOTH backends —
+      measured. Not "swallows the message": the message survives and the
+      severity does not, so there is no `ctx.errors++` and no `_fatal`,
+      and a test that should abort passes green. This is a live silent
+      mis-lowering in the DEFAULT backend and should be first in the next
+      batch.
+    * Relation calls in `randomize ... with` (`typed_lower.rs`) drop the
+      name and bind by position.
+    * `record_read` and the other one-argument regblock builtins accept
+      an unknown name silently, which is now inconsistent with the
+      guarded one-argument `fork` site that refuses it.
+    * Six arms still answer `Unsupported` for calls v1 swaps — helper,
+      extern-fn, testbench-method, two transactor-method sites and the
+      covergroup helper target.
+
+    One classification is also left open rather than settled. The guard
+    reports an unknown parameter name as `Invalid`, and a review pass
+    showed that is not quite right in either direction: for a typo in a
+    VALID position v1 emits byte-identical correct code, so `Invalid`
+    over-claims and `--codegen v1` does in fact work; while
+    `record_write(nosuch = 0x18, addr = 305419896)` really is swapped by
+    v1, and returning on the first bad argument hides it. Settling it
+    means scanning every argument and reporting the worst rather than the
+    first, which is a change with its own input space and belongs to its
+    own batch.
+
+    No CODEGEN site in v1 reads an argument name:
+    of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
+    `{ value, .. }` and one is `{ value: e, .. }` — all 26 drop the name
+    — and the 4 that bind `name` are AST-rewrite passes that reconstruct
+    the node and pass it along. (The first draft said "all 30 destructure
+    `{ value, .. }`", the second "26 destructure `{ value, .. }`". The
+    conclusion survived both corrections; the sentence was a count that
+    had not been counted, twice.) Binding is by position everywhere, and that was
+    measured, not only read:
+    `axil_write(data = t.value, addr = t.addr)` emits
+    `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` — the two
+    arguments SWAPPED, in code that compiles and runs. A name matching
+    no parameter draws no diagnostic at all. Reordering is the entire
+    point of naming arguments, so this is `SilentlyMisLowers` and v1 is
+    the last place to send the user.
+
+    Split on the ARGUMENT count, because a single argument cannot be
+    reordered — there is no other position for it to land in, so v1
+    emits exactly the positional call. There v1 really is an escape
+    hatch, and the same reasoning keeps the two one-argument predicates
+    (`idle_in`/`idle_out`, `quiesced`) on `Unsupported` rather than
+    sweeping them up with the general call. Arity ≥ 2 is not split
+    further: same-order names emit correctly too, but telling that apart
+    needs the callee's parameter list, which the seam does not have, and
+    an arm's status is the worst thing under it.
+
+    The first wording of that arm said "with a single PARAMETER that is
+    the same thing", which the seam cannot know and does not check. A
+    one-argument call to a two-parameter method emits an uncompilable
+    call under v1 — but so does the positional `axil_write(t.value)`,
+    which tbir lowers and verifies clean today. The arity gap is real
+    and pre-existing; naming the argument did not cause it, and the
+    message no longer implies the call is well-formed. **Splitting on a
+    quantity you have is not the same as splitting on the quantity your
+    sentence is about.**
+
+    **`#(...)` parameters on a component.** v1 drops the list, and three
+    things follow. Declared but unused, v1's output is BYTE-IDENTICAL to
+    the same component written without the parameter, and a `#(4)`
+    argument at the instantiation vanishes with it — nothing is
+    mis-lowered, the knob simply did nothing. Referenced with no name to
+    fall back on, `limit : uint<32> default N` emits `uint64_t limit = N;`
+    with `N` declared nowhere, which does not compile. Referenced from a
+    HANDLER BODY while a file-scope `const N = 9` exists, the reference
+    resolves to the const: that file compiles, and the component runs
+    with 9 instead of the 4 that was passed.
+
+    Only the third case earns `SilentlyMisLowers`, and it took two tries
+    to record one that does. The first version asserted the label off the
+    first two cases, where the honest reading is `EmitsUncompilable` for
+    one and "correct" for the other. The second version added a
+    shadowing case — the FIELD DEFAULT one — and asserted it compiles on
+    two `contains` checks that never looked at order. It does not: v1
+    emits the const at namespace scope AFTER the component struct, so
+    `uint64_t limit = N;` inside the struct is still a
+    use-before-declaration. Spliced into g++ with the generated file's
+    own header set, against a control that moves only the const, it fails
+    with `'N' was not declared in this scope`; the handler-body use,
+    emitted a hundred lines later, compiles clean.
+
+    Twice in a row the LABEL was right and the evidence recorded for it
+    was not, which is a correct answer with a wrong proof and reads
+    exactly like a correct one. **"It compiles" is a claim that requires
+    a compiler.** Two `contains` checks on the same file establish that
+    two strings exist, never that one may refer to the other — and this
+    entry already carried a rule about reading the generated C++, which
+    is not the same as reading two lines out of it.
+
+    A fifth landing, `records.rs`'s `parameters on transaction`, agrees
+    too, and its silent position is the worst of the set. A `keep`
+    constraint referencing the parameter does not emit the name at all:
+    the constraint IR CONST-FOLDS it against a same-named file-scope
+    `const`, so v1 emits
+    `_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))` and records
+    `(tag:u8 < 5:u8)` in the runtime problem table. The randomizer runs
+    against the const's bound with no `N` left anywhere to notice. Strip
+    the FAIL log line, which echoes source text verbatim, and
+    `keep tag < N` and `keep tag < 5` are the same program.
+
+    This arm was left UNCLASSIFIED for one commit on the grounds that
+    three probed positions — field default, `range(0, N)`, and the
+    `keep` — all emitted ahead of the consts or, for the `keep`, "only
+    into a log string". The log line is real. It also sits thirty lines
+    BELOW the solver line that does the folding, and reading down to it
+    meant reading past the answer. The caution attached to that note
+    ("evidence about three positions, not about the space") was right,
+    and the position it was worried about was one already looked at.
+
+    Both anchors were needed here and both were nearly skipped. Byte
+    identity means nothing unless the component contributes at all, and
+    unless something the component carries is VISIBLE in the output — so
+    the probe pins `uint64_t limit = 7;` in the control before trusting
+    any identity. This is divergence 51's lesson applied before being
+    caught by it rather than after.
+
+    Probed at all SEVEN landings rather than one, because divergence
+    47's tseq pair sat four lines apart and classified differently. They
+    all agree on `SilentlyMisLowers` — a result, not a reason to have
+    assumed it, and it took two wrong labels and six review rounds to
+    establish, with the set of landings growing at four of them (2 → 4 →
+    5 → 6 → 7).
+
+    The sixth, `mod.rs`'s `test parameters`, is the only one whose
+    surface syntax is paren params (`test T(N: int = 3)`) rather than
+    `#(...)`, which is why searching for the `#(...)` spelling missed it
+    five rounds running. **Grouping by construct means grouping by what
+    the construct DOES, not by how it is spelled.** The search that
+    finally found the last two was over the thirteen `params: Vec<Param>`
+    fields in `ast.rs` — the declaration sites — rather than over any
+    spelling.
+
+    The seventh is different in kind and is the most serious thing in
+    this entry. `testbench Tb #(N: int = 3)` was not misclassified; it
+    was **not rejected at all**. `ComponentDecl` carries a `Testbench`
+    kind, and `comp_sources` admits `Item::Env` only when the kind is
+    `Env`, so a testbench reaches no parameter check anywhere. With a
+    file-scope `const N = 9` to shadow, TB-IR lowered it, VERIFIED it and
+    emitted `harc_assign(dut->rst, ((int64_t)(9)))` — byte-identical to
+    the same source with the parameter list deleted. That is precisely
+    what `SilentlyMisLowers` is documented as ("the worst outcome, and
+    the reason TB-IR refuses rather than matching it"), and TB-IR was
+    matching it.
+
+    Only half the shape leaked: with nothing to shadow, the
+    unresolved-name path already caught it. A probe that used a fresh
+    parameter name would have reported the hole closed. **The shadowing
+    case is not an exotic corner of this construct — it is the only case
+    that distinguishes a dropped parameter from a rejected one**, and six
+    of the seven landings needed it to classify at all.
+
+    The fourth landing, `scoreboards.rs`, was first labelled
+    `EmitsUncompilable` on a structural argument: a data-only scoreboard
+    has only fields, so its only way to name a parameter is a field
+    default or width, both emitted inside the struct ahead of every
+    `const`, so no silent case is reachable. **The argument is wrong at
+    its first step.** `scoreboard_is_component` routes a scoreboard to
+    the composite table on `Hookable` ALONE, so one carrying fields plus
+    an `on` handler stays data-only and reaches the arm — and the
+    parameter check runs before the `on` rejection further down. v1 emits
+    that handler's trigger into a checker lambda ~110 lines after the
+    const, so `on hits > N` becomes `(bool)(_tb.b.hits > N)` resolving to
+    a file-scope `const N = 5`: it compiles, and the scoreboard runs with
+    5. `#(7)` and `#(8)` emit byte-identically, so the argument is
+    provably invisible.
+
+    "Its only items are fields" was read off the ARMS in `scoreboards.rs`,
+    which reject methods and `on` handlers, without checking the GATE
+    that decides which file gets the declaration in the first place. A
+    structural argument is only worth more than a count if it is checked
+    as carefully as one, and this one was checked one level too shallow —
+    two entries after that rule was written down.
+
+    The first version of this entry also claimed the two `components.rs`
+    arms "sit four lines apart". They are 41 lines apart in the base and
+    82 after this change — a detail invented to decorate a point that
+    stood without it.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

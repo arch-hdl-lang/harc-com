@@ -33,7 +33,36 @@ pub(crate) fn lower_scoreboard(
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
     if !c.params.is_empty() {
-        return Err(unsupported(&format!("parameters on scoreboard `{sb}`"), ""));
+        // The fourth landing of the component-parameter construct, and
+        // it agrees with the other three.
+        //
+        // A first pass labelled this arm `EmitsUncompilable` on the
+        // argument that a data-only scoreboard has no emission position
+        // after v1's file-scope consts — only fields, whose defaults and
+        // widths are emitted inside the struct, ahead of every const.
+        // The argument is wrong at its first step. `scoreboard_is_
+        // component` routes to the composite table on `Hookable` ALONE,
+        // so a scoreboard carrying fields plus an `on` handler stays
+        // data-only and reaches here — and this check runs before the
+        // `on` rejection further down. v1 emits that handler's trigger
+        // into a checker lambda ~110 lines AFTER the const, so
+        // `on hits > N` becomes `(bool)(_tb.b.hits > N)` resolving to a
+        // file-scope `const N = 5`: it compiles and the scoreboard runs
+        // with 5. `#(7)` and `#(8)` emit byte-identically, so the
+        // argument is provably invisible.
+        //
+        // The lesson is not about scoreboards. The claim "its only items
+        // are fields" was read off the arms in THIS file, which reject
+        // methods and `on` handlers, without checking the gate that
+        // decides which file gets the declaration at all.
+        return Err(super::not_implemented(
+            &format!("parameters on scoreboard `{sb}`"),
+            "v1 drops the parameter list entirely: an unused parameter vanishes along \
+             with any `#(...)` argument at the instantiation, and a reference to one \
+             either fails to resolve or silently picks up a same-named file-scope \
+             `const`, depending on where in the emitted file the reference lands",
+            super::V1Status::SilentlyMisLowers,
+        ));
     }
     if c.bound_to.is_some() {
         return Err(unsupported(

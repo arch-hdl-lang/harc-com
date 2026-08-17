@@ -383,9 +383,50 @@ pub(crate) fn lower_component_schema(
     let mut bound_bus: Option<String> = None;
     if let CompSource::Transactor(t) = src {
         if !t.params.is_empty() {
-            return Err(unsupported(
+            // Same three outcomes as the env/agent/scoreboard/sequencer
+            // arm below, probed separately rather than assumed from it.
+            // v1 never reads a component's `#(...)` parameter list:
+            //
+            //   * declared but unused — output is BYTE-IDENTICAL to the
+            //     same declaration without the parameter, and passing
+            //     `#(4)` at the instantiation changes nothing. Nothing
+            //     is mis-lowered; the parameter simply did nothing.
+            //     (Anchored: the component contributes, and a field
+            //     `default` is visible in the output, so the identity is
+            //     the parameter being dropped rather than the component
+            //     being inert.)
+            //   * referenced with no name to fall back on — e.g.
+            //     `limit : uint<32> default N` emits `uint64_t limit = N;`
+            //     with `N` declared nowhere. `EmitsUncompilable`.
+            //   * referenced from a HANDLER BODY while a file-scope
+            //     `const N = 9` exists — v1 emits
+            //     `static constexpr int64_t N = 9;` at namespace scope
+            //     and the use lands well after it, so the file COMPILES
+            //     and the component silently uses 9 instead of the `#(4)`
+            //     the instantiation passed. `SilentlyMisLowers`, and the
+            //     only case that earns the arm's label.
+            //
+            // The POSITION of the reference decides which of the last two
+            // applies, and it is not intuition: v1 emits the const AFTER
+            // the component struct, so a field default (`limit = N`,
+            // inside the struct) still fails to compile even with the
+            // const present, while a handler-body use (emitted much
+            // later) resolves. Both were checked by splicing the emitted
+            // region into g++ with the generated file's own header set,
+            // against a control that moves the const and changes nothing
+            // else.
+            //
+            // The first version of this classification named the
+            // field-default case as the compiling one, on two `contains`
+            // checks that never looked at order. Same label, and the
+            // evidence for it was wrong twice running.
+            return Err(not_implemented(
                 &format!("generic parameters on analysis-source `{name}`"),
-                "",
+                "v1 drops the parameter list entirely: an unused parameter vanishes along \
+                 with any `#(...)` argument at the instantiation, and a reference to one \
+                 either fails to resolve or silently picks up a same-named file-scope \
+                 `const`, depending on where in the emitted file the reference lands",
+                V1Status::SilentlyMisLowers,
             ));
         }
         if let Some(bt) = t.bound_to.as_ref() {
@@ -424,7 +465,16 @@ pub(crate) fn lower_component_schema(
     | CompSource::Sequencer(c) = src
     {
         if !c.params.is_empty() {
-            return Err(unsupported(&format!("parameters on `{name}`"), ""));
+            // See the analysis-source arm above for the three outcomes
+            // and which one earns the label.
+            return Err(not_implemented(
+                &format!("parameters on `{name}`"),
+                "v1 drops the parameter list entirely: an unused parameter vanishes along \
+                 with any `#(...)` argument at the instantiation, and a reference to one \
+                 either fails to resolve or silently picks up a same-named file-scope \
+                 `const`, depending on where in the emitted file the reference lands",
+                V1Status::SilentlyMisLowers,
+            ));
         }
         if c.bound_to.is_some() {
             return Err(unsupported(&format!("a `bound to` clause on `{name}`"), ""));
@@ -2996,9 +3046,59 @@ impl super::FuncBuilder<'_> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             let CallArg::Expr(e) = a else {
-                return Err(unsupported(
+                // No CODEGEN site in v1 reads an argument name: of the
+                // 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
+                // `{ value, .. }` and one is `{ value: e, .. }` — all 26
+                // drop the name — and the 4 that bind `name` are
+                // AST-rewrite passes that reconstruct the node and pass
+                // it along. So binding is by position everywhere.
+                // Measured, not just read:
+                // `axil_write(data = t.value, addr = t.addr)` emits
+                // `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` —
+                // the two arguments SWAPPED, silently, in code that
+                // compiles and runs. A misspelled name is accepted with no
+                // diagnostic at all.
+                //
+                // Reordering is the entire point of naming arguments, so
+                // this is the worst outcome the sweep classifies and
+                // `--codegen v1` is the last place to send the user.
+                //
+                // Split on the ARGUMENT count, because a single argument
+                // cannot be reordered: there is no other position for it
+                // to land in, so v1 emits exactly the call the positional
+                // form emits (verified against `axil_read(addr = ..)` and
+                // `axil_write(data = ..)` in `axilite_env_test`). The
+                // named-ness contributes nothing there, which is what
+                // makes `--codegen v1` honest.
+                //
+                // Deliberately NOT a claim about the callee's parameter
+                // count, which this seam does not know. A one-argument
+                // call to a two-parameter method emits an uncompilable
+                // call under v1 — but so does the positional
+                // `axil_write(t.value)`, which tbir lowers and verifies
+                // clean. That arity gap is real and pre-existing; it is
+                // not something naming the argument caused, and the
+                // wording below does not pretend the call is well-formed.
+                //
+                // Arity ≥ 2 is NOT split further — same-order names emit
+                // correctly too, but telling the two apart needs the
+                // callee's parameter list, and an arm's status is the
+                // worst thing under it.
+                if args.len() == 1 {
+                    // Not "method call": this helper also lowers the
+                    // payload of `emit <ev>(...)`, so the construct name
+                    // covers both callers rather than naming one of them.
+                    return Err(unsupported(
+                        "a named argument in a single-argument component call",
+                        "v1 ignores the name and binds by position; with one argument there \
+                         is no other position, so it emits exactly the positional form",
+                    ));
+                }
+                return Err(not_implemented(
                     "named arguments in a component method call",
-                    "",
+                    "v1 ignores argument names and binds strictly by position, so names \
+                     written out of declaration order silently SWAP the values",
+                    V1Status::SilentlyMisLowers,
                 ));
             };
             out.push(self.lower_expr_no_ports(e)?);
@@ -3182,9 +3282,16 @@ impl super::FuncBuilder<'_> {
             ));
         }
         let CallArg::Expr(n_expr) = &args[0] else {
+            // Stays `Unsupported`, unlike the general component-method
+            // arm above. The arity check three lines up has already
+            // established exactly one argument, so v1's name-dropping
+            // positional binding lands the value in the only slot there
+            // is and emits code identical to the positional form. No
+            // reordering hazard exists here.
             return Err(unsupported(
                 &format!("a named argument to `{}`", name.name),
-                "",
+                "v1 ignores the name and binds by position; with one parameter that is \
+                 the same thing, so it emits the predicate correctly",
             ));
         };
         let n = self.lower_expr_no_ports(n_expr)?;
@@ -3232,7 +3339,13 @@ impl super::FuncBuilder<'_> {
             ));
         }
         let CallArg::Expr(n_expr) = &args[0] else {
-            return Err(unsupported("a named argument to `quiesced`", ""));
+            // Same as the idle predicates: one argument, so v1's
+            // positional binding is correct and the name is decoration.
+            return Err(unsupported(
+                "a named argument to `quiesced`",
+                "v1 ignores the name and binds by position; with one parameter that is \
+                 the same thing, so it emits the predicate correctly",
+            ));
         };
         let n = self.lower_expr_no_ports(n_expr)?;
 

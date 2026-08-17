@@ -2009,6 +2009,32 @@ fn validate_testbench_component(
     function_library_names: &HashSet<String>,
     passive_helper_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
+    // The SEVENTH landing of the dropped-parameter-list construct, and
+    // the only one that was not a mislabelled diagnostic but a hole:
+    // nothing rejected it, so TB-IR silently mis-lowered it too.
+    //
+    // `ComponentDecl` has a `Testbench` kind, and it escapes every other
+    // parameter check — `comp_sources` admits `Item::Env` only when the
+    // kind is `Env`, so a testbench never reaches the composite arm in
+    // `components.rs`. With a file-scope `const N = 9` in scope,
+    // `testbench Tb #(N: int = 3)` lowered, VERIFIED and emitted, with
+    // the reference bound to the const's 9 and byte-identical to the
+    // same source with the parameter list deleted. (Without a const to
+    // shadow, the unresolved-name path already caught it, which is why
+    // only half the shape leaked.)
+    //
+    // That is the exact behaviour `V1Status::SilentlyMisLowers` is
+    // documented as "the worst outcome, and the reason TB-IR refuses
+    // rather than matching it" — and TB-IR was matching it.
+    if !c.params.is_empty() {
+        return Err(not_implemented(
+            &format!("parameters on testbench `{}`", c.name.name),
+            "v1 drops the parameter list entirely: a reference to one either fails to \
+             resolve or silently picks up a same-named file-scope `const`, and the \
+             parameter's own default is never used",
+            V1Status::SilentlyMisLowers,
+        ));
+    }
     for ci in &c.items {
         match ci {
             ComponentItem::Field(f) => {
@@ -2386,7 +2412,26 @@ fn lower_test(
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
-        return Err(unsupported("test parameters", ""));
+        // The SIXTH landing of the dropped-parameter-list construct, and
+        // the only one whose surface syntax is paren params
+        // (`test T(N: int = 3)`) rather than `#(...)` — `parse_test`
+        // accepts them, so this is reachable, while `impl X for Tb`
+        // hard-codes an empty list.
+        //
+        // v1 behaves exactly as it does at the other five: with a
+        // file-scope `const N = 9` in scope, the emitted C++ is
+        // BYTE-IDENTICAL to the same test with the parameter list
+        // deleted — `harc_assign(dut->rst, N)` binds to the const's 9
+        // and the parameter's own default 3 appears nowhere. Rename the
+        // parameter so nothing shadows it and v1 emits
+        // `harc_assign(dut->rst, WIDE)` with `WIDE` declared on no line.
+        return Err(not_implemented(
+            "test parameters",
+            "v1 drops the parameter list entirely: a reference to one either fails to \
+             resolve or silently picks up a same-named file-scope `const`, and the \
+             parameter's own default is never used",
+            V1Status::SilentlyMisLowers,
+        ));
     }
 
     let mut dut_type: Option<String> = None;
@@ -4705,6 +4750,80 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
         }
         out.push(s);
     }
+}
+
+/// Reject named arguments that would be bound BY POSITION to the wrong
+/// parameter.
+///
+/// Every `CallArg::Named` consumer that simply takes `value` and drops
+/// `name` is silently reordering: `bus.w.send(strb = 15, data = t.value)`
+/// emitted `axil_w_data = 15` / `axil_w_strb = t.value` under TB-IR
+/// itself until this guard existed — the same silent swap v1 performs,
+/// which is exactly what `SilentlyMisLowers` documents TB-IR as refusing
+/// rather than matching.
+///
+/// Takes the DECLARED parameter names and refuses only when a name does
+/// not match the position it sits in. That matters: the first version of
+/// this guard keyed on arity alone, and so refused
+/// `bus.w.send(data = t.value, strb = 15)` — names in declaration order,
+/// which both backends lower correctly — with a message asserting v1
+/// "silently emits something else". **Refusing a correct program with a
+/// false explanation is not the safe side of a classification.**
+///
+/// The three bus callers read `declared` from the channel payload or
+/// `m.args`. `record_write` is a BUILTIN with no declaration node, and
+/// its list was consequently written from memory as `["reg", "value"]`
+/// when the real signature is `(addr, data)` — refusing the documented
+/// named form, and unmatchable at position 1 besides, since `reg` is a
+/// lexer keyword. A caller without a declaration to read has to check
+/// its list against the diagnostic and the docs; do not assume every
+/// caller here has one.
+pub(crate) fn reject_misplaced_named_args(
+    args: &[crate::ast::CallArg],
+    declared: &[String],
+    construct: &str,
+) -> Result<(), LowerError> {
+    for (i, a) in args.iter().enumerate() {
+        let crate::ast::CallArg::Named { name, .. } = a else {
+            continue;
+        };
+        // A name that matches its own position binds where the user
+        // meant, so the dropped name changes nothing.
+        if declared.get(i).is_some_and(|d| *d == name.name) {
+            continue;
+        }
+        // A name that matches NO parameter is a program error, not a
+        // subset gap: there is no backend that could honour it, and the
+        // value simply lands wherever it was written. Calling it
+        // `SilentlyMisLowers` would claim v1 emits something else, and
+        // for a typo sitting in a valid position v1 emits exactly the
+        // right code — the same false-explanation class this guard was
+        // rewritten to stop producing.
+        if !declared.contains(&name.name) {
+            return Err(LowerError::Invalid(format!(
+                "`{}` names no parameter of {construct} (expected {})",
+                name.name,
+                declared
+                    .iter()
+                    .map(|d| format!("`{d}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        return Err(not_implemented(
+            &format!("a misplaced named argument in {construct}"),
+            format!(
+                "`{}` is parameter {} here but was written in position {}; argument names \
+                 are dropped and the values bound strictly by position, so this silently \
+                 swaps them",
+                name.name,
+                declared.iter().position(|d| *d == name.name).unwrap() + 1,
+                i + 1,
+            ),
+            V1Status::SilentlyMisLowers,
+        ));
+    }
+    Ok(())
 }
 
 /// True when a hooked `on` handler has the shape v1's method-hook

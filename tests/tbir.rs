@@ -16436,3 +16436,967 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     ))
     .expect("and the test-scope arm lowers the same source");
 }
+
+/// Named arguments in a component method call. No CODEGEN site in v1
+/// reads an argument NAME: of the 30 `CallArg::Named` matches in
+/// `cpp_tb.rs`, 25 are `{ value, .. }` and one is `{ value: e, .. }` —
+/// all 26 drop the name — and the 4 that bind `name` are AST-rewrite
+/// passes that reconstruct the node. Binding is by position everywhere.
+///
+/// With two arguments that is a silent swap: the user writes the names
+/// precisely so the order does not matter, and v1 does the one thing
+/// that makes the order matter. It compiles and it runs.
+///
+/// With ONE argument there is no other position for the value to land
+/// in, so v1 emits exactly the positional call and that arm keeps its
+/// `--codegen v1` suggestion. That is a claim about the call, not about
+/// the callee — see the under-supply case at the end.
+#[test]
+fn named_arguments_are_bound_by_position_by_v1() {
+    let fixture = fixture("axilite_env_test.harc");
+    const CALL: &str = "env.drv.axil_write(t.addr, t.value)";
+    let call = |args: &str| fixture.replacen(CALL, &format!("env.drv.axil_write({args})"), 1);
+
+    // The control, and the shape of the emitted call it produces.
+    lower_src(&fixture).expect("the positional form lowers");
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits");
+    assert!(
+        v1_ctl.contains("AxilXactor_axil_write(_tb.env.drv, t.addr, t.value)"),
+        "control binds addr then value"
+    );
+
+    // Same order: v1 happens to be right, which is what makes the
+    // reversed case below dangerous rather than merely broken.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&call("addr = t.addr, data = t.value"))).expect("v1 emits"),
+        v1_ctl,
+        "names in declaration order emit the same call"
+    );
+
+    // Reversed: the values SWAP, silently.
+    let v1_rev =
+        cpp_tb::emit(&merged_src(&call("data = t.value, addr = t.addr"))).expect("v1 emits");
+    assert!(
+        v1_rev.contains("AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)"),
+        "v1 binds by position, so `data = ..` lands in `addr` and vice versa"
+    );
+
+    // A name that matches no parameter is accepted without a word.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&call("nosuch = t.addr, data = t.value"))).expect("v1 emits"),
+        v1_ctl,
+        "a misspelled parameter name produces no diagnostic at all"
+    );
+
+    for args in [
+        "addr = t.addr, data = t.value",
+        "data = t.value, addr = t.addr",
+        "nosuch = t.addr, data = t.value",
+        "t.addr, data = t.value",
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&call(args)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("named arguments"), "{msg}");
+    }
+
+    // Arity 1: no slot to swap with, so v1 is a real escape hatch.
+    // `axil_read(addr)` lives in the same fixture.
+    let one = |arg: &str| {
+        fixture.replacen(
+            CALL,
+            &format!("{CALL}\n            let _rb = env.drv.axil_read({arg})"),
+            1,
+        )
+    };
+    let v1_one_ctl = cpp_tb::emit(&merged_src(&one("t.addr"))).expect("v1 emits");
+    // The anchor: the injected call reaches v1's output, so a byte
+    // identity below is the NAME being ignored rather than both sides
+    // dropping the call together.
+    assert_eq!(
+        v1_one_ctl
+            .matches("AxilXactor_axil_read(_tb.env.drv, t.addr)")
+            .count(),
+        v1_ctl
+            .matches("AxilXactor_axil_read(_tb.env.drv, t.addr)")
+            .count()
+            + 1,
+        "the injected `axil_read` call must add a call site"
+    );
+    for arg in ["addr = t.addr", "nosuch = t.addr"] {
+        let msg = assert_unsupported(&lower_src(&one(arg)).unwrap_err());
+        assert!(msg.contains("single-argument component call"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&one(arg))).expect("v1 emits"),
+            v1_one_ctl,
+            "`axil_read({arg})` emits exactly the positional call"
+        );
+    }
+
+    // The split keys on the ARGUMENT count, not the callee's parameter
+    // count, and the message must not be read as a claim about the
+    // latter. A single named argument to the TWO-parameter method emits
+    // exactly what the equivalent positional call emits — both are
+    // under-supplied and neither compiles, but that is a pre-existing
+    // arity gap (tbir lowers `axil_write(t.value)` too) rather than
+    // something naming the argument caused.
+    let msg = assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
+    assert!(msg.contains("single-argument component call"), "{msg}");
+    lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
+    let v1_named_short = cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits");
+    // Anchor first: the under-supplied call really is in v1's output,
+    // so the identity below is not two absences matching.
+    assert!(
+        v1_named_short.contains("AxilXactor_axil_write(_tb.env.drv, t.value)"),
+        "the under-supplied call reaches v1's output"
+    );
+    assert_eq!(
+        v1_named_short,
+        cpp_tb::emit(&merged_src(&call("t.value"))).expect("v1 emits"),
+        "the name changes nothing about what v1 emits"
+    );
+}
+
+/// The single-argument heartbeat and quiesce predicates share the
+/// named-argument construct but not its hazard, for the same reason the
+/// one-argument method call does not have it. They keep `Unsupported`.
+#[test]
+fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
+    let fixture = fixture("agent_on_handler_test.harc");
+    const IDLE: &str = "assert tagger.idle_in(4)\n";
+    assert!(fixture.contains(IDLE), "fixture shape changed");
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits");
+    // The anchor: the predicate's argument is visible in the output, so
+    // a later byte-identity is the NAME being ignored rather than the
+    // call vanishing.
+    assert!(
+        v1_ctl.contains("tagger._last_in_cycle) >= (uint64_t)(4)"),
+        "the cycle count reaches the emitted predicate"
+    );
+
+    for arg in ["n = 4", "nosuch = 4"] {
+        let src = fixture.replacen(IDLE, &format!("assert tagger.idle_in({arg})\n"), 1);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("a named argument to `idle_in`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            v1_ctl,
+            "v1 drops the name and emits the same predicate"
+        );
+    }
+
+    // `quiesced` is a separate arm with its own message, and the
+    // doc comment claimed it without exercising it.
+    let quiesce = |arg: &str| {
+        fixture.replacen(
+            IDLE,
+            &format!("assert tagger.idle_in(4)\n        assert tagger.quiesced({arg})\n"),
+            1,
+        )
+    };
+    let v1_q_ctl = cpp_tb::emit(&merged_src(&quiesce("4"))).expect("v1 emits");
+    lower_src(&quiesce("4")).expect("the positional quiesce form lowers");
+    // The same anchor its sibling uses: the ARGUMENT is visible in the
+    // emitted predicate. `assert_ne!` against the control would be
+    // satisfied by any added line at all.
+    assert!(
+        v1_q_ctl.contains("_last_out_cycle) >= (uint64_t)(4)")
+            || v1_q_ctl.contains("_last_in_cycle) >= (uint64_t)(4)"),
+        "the quiesce cycle count reaches the emitted predicate"
+    );
+    for arg in ["n = 4", "nosuch = 4"] {
+        let msg = assert_unsupported(&lower_src(&quiesce(arg)).unwrap_err());
+        assert!(msg.contains("a named argument to `quiesced`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&quiesce(arg))).expect("v1 emits"),
+            v1_q_ctl,
+            "v1 drops the name and emits the same quiesce predicate"
+        );
+    }
+}
+
+/// The component-parameter construct has FOUR landings and they all
+/// agree: v1 drops the list, and a reference emitted after its
+/// file-scope consts silently picks one up.
+///
+/// The scoreboard arm was briefly labelled a rung lower, on the argument
+/// that a data-only scoreboard has only fields and so no emission
+/// position after the consts. `scoreboard_is_component` routes on
+/// `Hookable` alone, so a scoreboard with an `on` handler stays
+/// data-only and has one. Both positions are pinned below — a test that
+/// exercised only the field default is what let the wrong label pass.
+#[test]
+fn the_other_two_component_parameter_landings_do_not_agree() {
+    // ── `transactors.rs`: an ordinary DUT-poking transactor.
+    let f = fixture("axilite_hooks_test.harc");
+    const TX: &str = "transactor HookXactor";
+    const STRB: &str = "dut.axil_w_strb = 15";
+    assert!(f.contains(TX) && f.contains(STRB), "fixture shape changed");
+
+    let with_param = format!(
+        "const N = 15\n\n{}",
+        f.replacen(TX, "transactor HookXactor #(N: int = 3)", 1)
+            .replacen(STRB, "dut.axil_w_strb = N", 1)
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&with_param).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("generic parameters"), "{msg}");
+
+    let v1_param = cpp_tb::emit(&merged_src(&with_param)).expect("v1 emits");
+    let line_of = |out: &str, needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` missing from v1's output"))
+    };
+    // The const precedes the method-body use, so this one compiles.
+    assert!(
+        line_of(&v1_param, "static constexpr int64_t N = 15;")
+            < line_of(&v1_param, "axil_w_strb, N)"),
+        "the const precedes the use"
+    );
+    // And `#(N: int = 3)` is invisible: the same source with no
+    // parameter at all emits byte-identically.
+    let const_only = format!(
+        "const N = 15\n\n{}",
+        f.replacen(STRB, "dut.axil_w_strb = N", 1)
+    );
+    lower_src(&const_only).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&const_only)).expect("v1 emits"),
+        v1_param,
+        "the parameter changes nothing, so the transactor runs with 15"
+    );
+
+    // ── `scoreboards.rs`: agrees, and the position that decides it is
+    //    NOT the field default. A first pass labelled this arm
+    //    `EmitsUncompilable` because a data-only scoreboard "only has
+    //    fields", whose defaults are emitted inside the struct ahead of
+    //    every const. But `scoreboard_is_component` routes to the
+    //    composite table on `Hookable` ALONE, so a scoreboard with
+    //    fields plus an `on` handler stays data-only and reaches this
+    //    arm — and v1 emits that handler's trigger long AFTER the const.
+    //
+    //    Both positions are asserted, because pinning only the field
+    //    default is what let the wrong label pass.
+    const SB_SRC: &str = r#"const N = 5
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard BoardDECL
+    hits : uint<32> default HITS
+ONHANDLER
+end scoreboard Board
+
+testbench SbTb
+    dut : Top
+    b   : BoardINST
+end testbench SbTb
+
+impl SbTest for SbTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl SbTest
+"#;
+    let sb = |decl: &str, inst: &str, hits: &str, on: &str| {
+        let s = SB_SRC
+            .replace("BoardDECL", decl)
+            .replace("BoardINST", inst)
+            .replace("HITS", hits);
+        if on.is_empty() {
+            s.replace("ONHANDLER\n", "")
+        } else {
+            s.replace("ONHANDLER", on)
+        }
+    };
+    const ON_N: &str = "    on hits > N\n        hits = hits + 1\n    end on";
+
+    // The handler-trigger position: emitted after the const, so it
+    // compiles and the scoreboard silently runs with the const's 5.
+    let silent = sb("Board #(N: int = 3)", "Board #(7)", "0", ON_N);
+    let msg = assert_not_implemented(
+        &lower_src(&silent).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on scoreboard"), "{msg}");
+    let v1_silent = cpp_tb::emit(&merged_src(&silent)).expect("v1 emits");
+    assert!(
+        line_of(&v1_silent, "static constexpr int64_t N = 5;")
+            < line_of(&v1_silent, "_tb.b.hits > N"),
+        "the const precedes the handler trigger, so this compiles"
+    );
+    // Equal-length arguments, so source offsets do not shift and the
+    // identity is the ARGUMENT being invisible rather than noise.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&sb(
+            "Board #(N: int = 3)",
+            "Board #(8)",
+            "0",
+            ON_N
+        )))
+        .expect("v1 emits"),
+        v1_silent,
+        "`#(7)` and `#(8)` emit identically, so the argument does nothing"
+    );
+
+    // The field-default position, which is where the wrong label came
+    // from: emitted inside the struct, ahead of the const.
+    let by_default = sb("Board #(N: int = 3)", "Board #(7)", "N", "");
+    assert_not_implemented(
+        &lower_src(&by_default).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    assert!(
+        line_of(&v1_default, "uint64_t hits = N;")
+            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+        "the field initializer precedes the const, so that position does not compile"
+    );
+}
+
+/// `#(...)` parameters on a component. v1 never reads the list, and
+/// THREE things follow, only the last of which earns the label.
+///
+/// Declared but unused, v1's output is byte-identical to the same
+/// component written without the parameter — and a `#(4)` argument at
+/// the instantiation vanishes with it, so the knob the user added does
+/// nothing. Referenced with no name to fall back on, `default N` emits
+/// `uint64_t limit = N;` with `N` declared nowhere. Referenced from a
+/// HANDLER BODY while a file-scope `const N` exists, the reference
+/// silently resolves to the const and the program runs with the wrong
+/// value.
+///
+/// The position of the reference is what separates the last two, and it
+/// is not intuition: v1 emits the const AFTER the component struct, so a
+/// field default still fails to compile even with the const present.
+/// Both were checked by splicing the emitted region into g++ with the
+/// generated file's header set, against a control that moves only the
+/// const.
+///
+/// Probed at both `components.rs` landings — the analysis-source
+/// (transactor) arm and the env/agent/sequencer composite arm. The other
+/// two, in `transactors.rs` and `scoreboards.rs`, have their own test.
+#[test]
+fn component_parameters_are_dropped_by_v1() {
+    const SRC: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+KINDWORD TaggerDECL
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+    limit : uint<32> default LIMIT
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+end KINDWORD Tagger
+
+testbench ParamTb
+    dut  : Top
+    tg   : TaggerINST MODE
+end testbench ParamTb
+
+impl ParamTest for ParamTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl ParamTest
+"#;
+    // One shape, two landings: `agent` reaches the composite-component
+    // arm and `transactor ... active` the analysis-source one.
+    for (kind, mode, construct) in [
+        ("agent", "", "parameters on `Tagger`"),
+        (
+            "transactor",
+            "active",
+            "generic parameters on analysis-source `Tagger`",
+        ),
+    ] {
+        let mk = |decl: &str, inst: &str, limit: &str| {
+            SRC.replace("KINDWORD", kind)
+                .replace("TaggerDECL", decl)
+                .replace("TaggerINST MODE", &format!("{inst} {mode}"))
+                .replace("LIMIT", limit)
+        };
+        let ctl = mk("Tagger", "Tagger", "7");
+        lower_src(&ctl).unwrap_or_else(|e| panic!("{kind} control lowers: {e:?}"));
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+
+        // Two anchors. The component contributes at all, and the field
+        // `default` it carries is visible in the output — so a byte
+        // identity below is the PARAMETER being dropped rather than the
+        // whole component being inert.
+        let without = ctl.replace(&format!("    tg   : Tagger {mode}\n"), "");
+        assert_ne!(
+            cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
+            v1_ctl,
+            "{kind}: the component must contribute"
+        );
+        assert!(
+            v1_ctl.contains("uint64_t limit = 7;"),
+            "{kind}: the field default reaches the output"
+        );
+
+        // Unused parameter: dropped, and so is the instantiation arg.
+        for (decl, inst) in [
+            ("Tagger #(N: int)", "Tagger"),
+            ("Tagger #(N: int)", "Tagger #(4)"),
+            ("Tagger #(N: int = 3)", "Tagger"),
+        ] {
+            let src = mk(decl, inst, "7");
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::SilentlyMisLowers,
+            );
+            assert!(msg.contains(construct), "{msg}");
+            assert_eq!(
+                cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+                v1_ctl,
+                "{kind}: `{decl}` / `{inst}` emits as if the parameter were not there"
+            );
+        }
+
+        // Referenced parameter: an undeclared name in the output.
+        let used = mk("Tagger #(N: int = 3)", "Tagger", "N");
+        assert_not_implemented(
+            &lower_src(&used).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_used = cpp_tb::emit(&merged_src(&used)).expect("v1 emits");
+        assert!(
+            v1_used.contains("uint64_t limit = N;"),
+            "{kind}: the parameter name survives into the initializer"
+        );
+        assert!(
+            !v1_used
+                .lines()
+                .any(|l| !l.trim_start().starts_with("//") && l.contains("int64_t N")),
+            "{kind}: and `N` is declared nowhere, so it does not compile"
+        );
+
+        // The case that EARNS `SilentlyMisLowers` rather than
+        // `EmitsUncompilable`, and it is NOT the field default. v1 emits
+        // the file-scope const AFTER the component struct, so a
+        // `default N` initializer is still a use-before-declaration even
+        // when the const exists. A HANDLER-BODY reference is emitted far
+        // later and resolves — that file compiles, and the component
+        // runs with 9 instead of the 4 the instantiation passed.
+        //
+        // Both orderings are asserted below, because the first version
+        // of this test checked only that the two strings were PRESENT
+        // and concluded the wrong one compiles.
+        let shadow = |limit: &str, body: &str| {
+            format!(
+                "const N = 9\n{}",
+                mk("Tagger #(N: int = 3)", "Tagger #(4)", limit)
+                    .replace("seen = seen + 1", &format!("seen = seen + {body}"))
+            )
+        };
+        let line_of = |out: &str, needle: &str| {
+            out.lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{kind}: `{needle}` missing from v1's output"))
+        };
+
+        // Field default: const lands after the struct, so it does not help.
+        let by_default = shadow("N", "1");
+        assert_not_implemented(
+            &lower_src(&by_default).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+        assert!(
+            line_of(&v1_default, "uint64_t limit = N;")
+                < line_of(&v1_default, "static constexpr int64_t N = 9;"),
+            "{kind}: the initializer precedes the const, so it cannot compile"
+        );
+
+        // Handler body: emitted after the const, so it resolves.
+        let by_body = shadow("7", "N");
+        assert_not_implemented(
+            &lower_src(&by_body).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_body = cpp_tb::emit(&merged_src(&by_body)).expect("v1 emits");
+        assert!(
+            line_of(&v1_body, "static constexpr int64_t N = 9;") < line_of(&v1_body, "seen + N"),
+            "{kind}: the const precedes the use, so this one compiles"
+        );
+        // And the anchor that makes it a MIS-lowering rather than a
+        // coincidence: the same source with no parameter at all emits the
+        // identical use, so `#(4)` changed nothing about the value used.
+        let no_param = format!(
+            "const N = 9\n{}",
+            mk("Tagger", "Tagger", "7").replace("seen = seen + 1", "seen = seen + N")
+        );
+        lower_src(&no_param)
+            .unwrap_or_else(|e| panic!("{kind}: the const-only form lowers: {e:?}"));
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+            v1_body,
+            "{kind}: `#(N: int = 3)` and `#(4)` are both invisible in the output"
+        );
+    }
+}
+
+/// The FIFTH landing of the component-parameter construct, on
+/// `transaction`. It agrees with the other four, and its silent position
+/// is silent in a worse way: a `keep` constraint does not emit the
+/// parameter's name at all, it CONST-FOLDS it against a same-named
+/// file-scope `const` and bakes that value into the Z3 call.
+///
+/// This arm was left unclassified for one commit on the grounds that
+/// three probed positions all emitted ahead of v1's consts, with the
+/// `keep` reaching "only a log string". The log line is real and thirty
+/// lines BELOW the solver line that does the folding.
+#[test]
+fn a_transaction_parameter_is_const_folded_to_the_wrong_bound() {
+    const SRC: &str = r#"const N = 5
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxnDECL
+    tag : uint<8> DEFAULT
+
+    keep tag < KEEP
+end transaction TinyTxn
+
+testbench RecTb
+    dut : Top
+end testbench RecTb
+
+impl RecTest for RecTb
+    clock clk = SysDomain
+    run
+        let t : TinyTxn
+        randomize(t)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl RecTest
+"#;
+    let mk = |decl: &str, default: &str, keep: &str| {
+        SRC.replace("TinyTxnDECL", decl)
+            .replace(" DEFAULT", default)
+            .replace("KEEP", keep)
+    };
+    let line_of = |out: &str, needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` missing from v1's output"))
+    };
+
+    // The silent position: `keep tag < N` folds to the CONST's 5.
+    let folded = mk("TinyTxn #(N: int = 3)", "", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&folded).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on transaction"), "{msg}");
+    let v1_folded = cpp_tb::emit(&merged_src(&folded)).expect("v1 emits");
+    assert!(
+        v1_folded.contains("_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))"),
+        "the solver gets the const's 5"
+    );
+    // Not the parameter's own default, and no `N` survives to notice.
+    assert!(
+        !v1_folded.contains("_ctx.bv_val((uint64_t)3, 64)"),
+        "the parameter's default 3 reaches the solver nowhere"
+    );
+    // The recorded problem descriptor carries the folded value too, so
+    // the constraint the runtime reports is `tag < 5`, not `tag < N`.
+    assert!(
+        v1_folded.contains("(tag:u8 < 5:u8):bool"),
+        "the problem table records the folded bound"
+    );
+    // `keep tag < N` and `keep tag < 5` differ ONLY in the FAIL log
+    // line, which echoes the source text verbatim. Everything the
+    // program actually executes is identical.
+    let literal =
+        cpp_tb::emit(&merged_src(&mk("TinyTxn #(N: int = 3)", "", "5"))).expect("v1 emits");
+    let strip_log = |o: &str| {
+        o.lines()
+            .filter(|l| !l.contains("participated in the solve"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_log(&v1_folded),
+        strip_log(&literal),
+        "outside the echoed log text, `keep tag < N` IS `keep tag < 5`"
+    );
+    // The log line that hid this: it is BELOW the solver line.
+    assert!(
+        line_of(
+            &v1_folded,
+            "_s.add(z3::ult(_z_tag, _ctx.bv_val((uint64_t)5, 64)))"
+        ) < line_of(&v1_folded, "participated in the solve"),
+        "reading the log line alone misses the fold above it"
+    );
+
+    // The uncompilable position, for contrast: a field default emits the
+    // name verbatim, inside the struct and ahead of the const.
+    let by_default = mk("TinyTxn #(N: int = 3)", " default N", "7");
+    assert_not_implemented(
+        &lower_src(&by_default).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    assert!(
+        line_of(&v1_default, "uint64_t tag = N;")
+            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+        "the field initializer precedes the const, so that position does not compile"
+    );
+}
+
+/// The SIXTH landing, and the only one whose surface syntax is paren
+/// params (`test T(N: int = 3)`) rather than `#(...)`. `parse_test`
+/// accepts them, so it is reachable; `impl X for Tb` hard-codes an
+/// empty list.
+#[test]
+fn a_test_parameter_is_dropped_by_v1_like_every_other_parameter_list() {
+    const SRC: &str = r#"CONST
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test ParamTestDECL
+    let dut : Top
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = USE
+        wait 2 cycles
+    end run
+end test ParamTest
+"#;
+    let mk = |cst: &str, decl: &str, use_: &str| {
+        SRC.replace("CONST\n", cst)
+            .replace("ParamTestDECL", decl)
+            .replace("USE", use_)
+    };
+
+    // Shadowed: the reference binds to the const, and the parameter's
+    // own default 3 reaches nothing.
+    let shadowed = mk("const N = 9\n\n", "ParamTest(N: int = 3)", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&shadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("test parameters"), "{msg}");
+
+    let v1_shadowed = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    assert!(
+        v1_shadowed.contains("static constexpr int64_t N = 9;")
+            && v1_shadowed.contains("harc_rt::harc_assign(dut->rst, N);"),
+        "the const is emitted and the reference binds to it"
+    );
+    // The anchor: the same test with NO parameter list emits
+    // identically, so the parameter is provably invisible.
+    let no_param = mk("const N = 9\n\n", "ParamTest", "N");
+    lower_src(&no_param).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+        v1_shadowed,
+        "`(N: int = 3)` changes nothing, so the test runs with the const's 9"
+    );
+
+    // Unshadowed: nothing to bind to, so the reference is undeclared.
+    let unshadowed = mk("", "ParamTest(WIDE: int = 3)", "WIDE");
+    assert_not_implemented(
+        &lower_src(&unshadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_unshadowed = cpp_tb::emit(&merged_src(&unshadowed)).expect("v1 emits");
+    assert!(
+        v1_unshadowed.contains("harc_rt::harc_assign(dut->rst, WIDE);"),
+        "the parameter name survives into the assignment"
+    );
+    assert!(
+        !v1_unshadowed
+            .lines()
+            .any(|l| !l.trim_start().starts_with("//") && l.contains("int64_t WIDE")),
+        "and `WIDE` is declared nowhere, so it does not compile"
+    );
+
+    // And the control: without a parameter, the same test lowers.
+    lower_src(&mk("", "ParamTest", "1")).expect("the unparameterized test lowers");
+}
+
+/// The SEVENTH landing, and the only one that was a hole rather than a
+/// mislabel: nothing rejected `testbench Tb #(N: int = 3)` at all, so
+/// TB-IR silently mis-lowered it exactly as v1 does.
+///
+/// `ComponentDecl` has a `Testbench` kind, and it escapes every other
+/// parameter check — `comp_sources` admits `Item::Env` only when the
+/// kind is `Env`, so a testbench never reaches the composite arm. With
+/// a file-scope `const` to shadow, the reference bound to the const and
+/// the whole program lowered, verified AND emitted. Without one, the
+/// unresolved-name path already caught it, which is why only half the
+/// shape leaked and why probing only the unshadowed form would have
+/// found nothing.
+#[test]
+fn a_testbench_parameter_was_silently_mis_lowered_by_tbir_too() {
+    const SRC: &str = r#"CONST
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TbDECL
+    dut : Top
+end testbench Tb
+
+impl TbTest for Tb
+    clock clk = SysDomain
+    run
+        dut.rst = USE
+        wait 2 cycles
+    end run
+end impl TbTest
+"#;
+    let mk = |cst: &str, decl: &str, use_: &str| {
+        SRC.replace("CONST\n", cst)
+            .replace("TbDECL", decl)
+            .replace("USE", use_)
+    };
+
+    // The shape that leaked: shadowed by a file-scope const.
+    let shadowed = mk("const N = 9\n\n", "Tb #(N: int = 3)", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&shadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on testbench `Tb`"), "{msg}");
+
+    // v1 binds it to the const, and the parameter's own default 3
+    // reaches nothing — the same shape as the other six landings.
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    assert!(
+        v1.contains("static constexpr int64_t N = 9;")
+            && v1.contains("harc_rt::harc_assign(dut->rst, N);"),
+        "v1 binds the reference to the const"
+    );
+    let no_param = mk("const N = 9\n\n", "Tb", "N");
+    lower_src(&no_param).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+        v1,
+        "`#(N: int = 3)` changes nothing under v1 either"
+    );
+
+    // The half that never leaked: with nothing to shadow, the
+    // unresolved-name path catches it before this arm can.
+    let unshadowed = mk("", "Tb #(WIDE: int = 3)", "WIDE");
+    let msg = assert_not_implemented(
+        &lower_src(&unshadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on testbench `Tb`"), "{msg}");
+
+    // And the control: without a parameter list, the testbench lowers.
+    lower_src(&mk("", "Tb", "1")).expect("the unparameterized testbench lowers");
+}
+
+/// The named-argument construct has the same shape as the parameter one:
+/// arms that report it, and sites that silently DO it. `bus.rs` and
+/// `regblock.rs` each carried a `call_arg` helper that took `value` and
+/// dropped `name`, so TB-IR itself bound reordered named arguments by
+/// position — `bus.w.send(strb = 15, data = t.value)` emitted
+/// `axil_w_data = 15` and `axil_w_strb = t.value`.
+///
+/// The guard checks names against the DECLARATION rather than counting
+/// arguments. Its first version keyed on arity alone and so refused
+/// `bus.w.send(data = t.value, strb = 15)` — names in declaration order,
+/// which both backends lower correctly — while telling the user v1
+/// "silently emits something else". Every caller here has the declared
+/// names in hand, so both halves are pinned below.
+#[test]
+fn tbir_binds_named_arguments_by_name_or_refuses_to_bind_them() {
+    let fixture = fixture("axilite_bound_mon_test.harc");
+    const CALL: &str = "bus.w.send(t.value, 15)";
+    assert!(fixture.contains(CALL), "fixture shape changed");
+    let call = |args: &str| fixture.replacen(CALL, &format!("bus.w.send({args})"), 1);
+
+    let with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
+        )
+        .expect("stdlib bus readable");
+        let b = parse_source(&bus_src).expect("bus parses");
+        merge::merge_for_sim(vec![f, b], None).expect("merge")
+    };
+    let emit_tbir = |src: &str| {
+        let m = with_bus(src);
+        let p = lower::lower_program(&m)?;
+        verify::verify_program(&p).expect("verifies");
+        Ok::<_, lower::LowerError>(tbir::emit(&p, &m, &cpp_tb::EmitOpts::default()).expect("emits"))
+    };
+
+    // The control binds in declaration order.
+    let ctl = emit_tbir(&fixture).expect("the positional form lowers");
+    assert!(
+        ctl.contains("harc_rt::harc_assign(dut->axil_w_data, t.value);")
+            && ctl.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "control binds data then strb"
+    );
+
+    // Names in DECLARATION ORDER still lower, and bind exactly as the
+    // positional form does — this is the half the arity-only guard
+    // broke. (Not a whole-file identity: adding `data = ` shifts source
+    // offsets, which appear in generated symbol names.)
+    let in_order = emit_tbir(&call("data = t.value, strb = 15")).expect("in-order names lower");
+    assert!(
+        in_order.contains("harc_rt::harc_assign(dut->axil_w_data, t.value);")
+            && in_order.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "names written where they belong bind where they belong"
+    );
+
+    // REORDERED names are refused, and the message says which parameter
+    // was written where rather than just that names were used.
+    let err = emit_tbir(&call("strb = 15, data = t.value"))
+        .err()
+        .expect("a reordered call must not lower silently");
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("`bus.w.send(...)` payload"), "{msg}");
+    assert!(
+        msg.contains("`strb` is parameter 2 here but was written in position 1"),
+        "the message must name the misplacement: {msg}"
+    );
+
+    // Mixed positional/named is checked by position too: `strb` sits in
+    // position 2, where it belongs, so this lowers.
+    let mixed = emit_tbir(&call("t.value, strb = 15")).expect("a correctly-placed name lowers");
+    assert!(
+        mixed.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "and binds where the name says"
+    );
+
+    // A name matching NO parameter is `Invalid`, not a subset gap: no
+    // backend can honour it, and for a typo in a valid position v1 emits
+    // exactly the right code, so claiming it mis-lowers would be the
+    // same false explanation this guard was rewritten to stop making.
+    let msg = assert_invalid(
+        &emit_tbir(&call("nosuch = t.value, strb = 15"))
+            .err()
+            .expect("an unknown parameter name must not lower silently"),
+    );
+    assert!(
+        msg.contains("names no parameter") && msg.contains("`data`"),
+        "the message must list the real parameter names: {msg}"
+    );
+
+    // (A single argument cannot be MISPLACED, so the swap half of the
+    // guard is a no-op there — but its unknown-name half still fires,
+    // which `every_named_argument_call_site_is_guarded` exercises on
+    // `fork mem.read(nosuch = 5)`. The one-argument swap surface cannot
+    // be reached on this channel at all: an arity check above rejects a
+    // one-argument `bus.w.send` outright.)
+}
+
+/// Per-site pins for the other three `reject_misplaced_named_args`
+/// callers. The guard's comparison logic was already pinned by
+/// `tbir_binds_named_arguments_by_name_or_refuses_to_bind_them`, but its
+/// CALL SITES were not: three of four could be deleted with the suite
+/// still green, which is how `record_write` shipped with an invented
+/// parameter list (`["reg","value"]` for a builtin whose real signature
+/// is `(addr, data)` — and since `reg` is a lexer keyword, position 1
+/// could never match, so the site degenerated into "refuse every named
+/// first argument", including the documented form).
+#[test]
+fn every_named_argument_call_site_is_guarded() {
+    // ── `record_write(addr, data)`: the documented named form must
+    //    lower, and only a genuine swap may be refused.
+    let regs = fixture("regblock_record_api_test.harc");
+    const WRITE: &str = "regs.record_write(0x18, 305419896)";
+    assert!(regs.contains(WRITE), "fixture shape changed");
+    // This fixture `use`s a stdlib bus, which the unit-test harness does
+    // not resolve on its own.
+    let lower_with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
+        )
+        .expect("stdlib bus readable");
+        let b = parse_source(&bus_src).expect("bus parses");
+        lower::lower_program(&merge::merge_for_sim(vec![f, b], None).expect("merge"))
+    };
+    let w = |args: &str| regs.replacen(WRITE, &format!("regs.record_write({args})"), 1);
+
+    lower_with_bus(&regs).expect("the fixture itself lowers");
+    lower_with_bus(&w("addr = 0x18, data = 305419896"))
+        .expect("the documented named form must lower");
+    let msg = assert_not_implemented(
+        &lower_with_bus(&w("data = 305419896, addr = 0x18")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`record_write(...)` call"), "{msg}");
+    assert!(
+        msg.contains("`data` is parameter 2 here but was written in position 1"),
+        "the message must use the REAL parameter names: {msg}"
+    );
+    // And an invented name is reported against the real list. Note the
+    // invented list could never have matched position 1 at all: `reg` is
+    // a lexer keyword and does not even parse as an argument name, so the
+    // site silently degenerated into "refuse every named first
+    // argument" — including the documented form asserted above.
+    assert!(
+        parse_source(&w("reg = 0x18, value = 3")).is_err(),
+        "`reg` is a keyword, so the invented list was unmatchable"
+    );
+    let msg = assert_invalid(&lower_with_bus(&w("nosuch = 0x18, data = 3")).unwrap_err());
+    assert!(
+        msg.contains("`addr`") && msg.contains("`data`"),
+        "the diagnostic must quote the real signature: {msg}"
+    );
+
+    // ── The BLOCKING `tlm_method` site, whose declared names come from
+    //    `m.args` rather than a channel payload.
+    let mem = fixture("msg_suspending_call_test.harc");
+    const POKE: &str = "mem.poke(8, 264)";
+    assert!(mem.contains(POKE), "poke fixture shape changed");
+    let p = |args: &str| mem.replacen(POKE, &format!("mem.poke({args})"), 1);
+
+    lower_src(&mem).expect("the poke fixture lowers");
+    lower_src(&p("addr = 8, data = 264")).expect("the in-order named form must lower");
+    let msg = assert_not_implemented(
+        &lower_src(&p("data = 264, addr = 8")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`bus.poke(...)` call"), "{msg}");
+    assert!(
+        msg.contains("`data` is parameter 2 here but was written in position 1"),
+        "the message must use the declared names: {msg}"
+    );
+
+    // The FORKED `tlm_method` site shares `m.args` but is a separate
+    // call, so it gets its own pin. `fork` needs a returning method.
+    let forked = fixture("tlm_method_blocking_fork_bus_test.harc");
+    const FORK: &str = "fork mem.read(5)";
+    assert!(forked.contains(FORK), "fork fixture shape changed");
+    lower_src(&forked).expect("the fork fixture lowers");
+    // One argument cannot be misplaced, so name it wrongly to reach the
+    // guard at all.
+    let msg = assert_invalid(
+        &lower_src(&forked.replacen(FORK, "fork mem.read(nosuch = 5)", 1)).unwrap_err(),
+    );
+    assert!(msg.contains("names no parameter"), "{msg}");
+}

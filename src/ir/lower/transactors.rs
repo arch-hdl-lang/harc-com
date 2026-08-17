@@ -67,9 +67,32 @@ pub(crate) fn lower_transactor(
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     if !t.params.is_empty() {
-        return Err(unsupported(
+        // The THIRD landing of the component-parameter construct, after
+        // the analysis-source and composite arms in `components.rs`, and
+        // it behaves the same. v1 never reads a `#(...)` list:
+        //
+        //   * unused — output is byte-identical to the same transactor
+        //     without the parameter (offsets normalized; the only
+        //     residue is a source position inside a string literal).
+        //   * referenced from a METHOD BODY while a file-scope `const N`
+        //     exists — v1 emits the const at namespace scope and the use
+        //     lands ~90 lines later, so it COMPILES and the transactor
+        //     silently uses the const instead of the `#(...)` argument.
+        //     Byte-identical to the const-only source with no parameter
+        //     at all, which is what makes the argument provably
+        //     invisible rather than merely undetected.
+        //   * referenced with no const to fall back on, or from a field
+        //     default (emitted INSIDE the struct, ahead of the const) —
+        //     an undeclared name, so it does not compile.
+        //
+        // `SilentlyMisLowers` is the worst of these and so the label.
+        return Err(not_implemented(
             &format!("transactor `{tname}` with generic parameters"),
-            "",
+            "v1 drops the parameter list entirely: an unused parameter vanishes along \
+             with any `#(...)` argument at the instantiation, and a reference to one \
+             either fails to resolve or silently picks up a same-named file-scope \
+             `const`, depending on where in the emitted file the reference lands",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if t.bound_to.is_some() {
