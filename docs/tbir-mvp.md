@@ -2577,6 +2577,37 @@ case and only locally-determinable `Assign` types are compared).
     than the file's own comment claimed, and v1's behaviour on what it
     rejects has been wrong rather than absent.
 
+42. **Thirteenth probe sweep: the local-folder lead, and what it did
+    NOT predict (2026-08-16).**
+
+    Divergence 41 flagged a grep-able pattern: a hand-rolled
+    literals-only `fold_const` sitting next to a comment that assumed v1
+    was more capable. Grepping the lowering for it found a fourth
+    instance, in `records.rs`, on `transaction` / `struct` field
+    defaults.
+
+    **A `const` default on a record field now folds**, through the same
+    shared table the component / scoreboard / transactor-state defaults
+    use (divergence 35).
+
+    The lead was worth following and its prediction was wrong, which is
+    the point worth recording. One code pattern, four sites, THREE
+    different v1 behaviours behind them:
+
+    | site | what v1 does with a non-literal |
+    |---|---|
+    | component / scoreboard / transactor-state default | emits `= K` against its own `static constexpr` — correct (closed, divergence 35) |
+    | record / struct field default | same — correct (closed here) |
+    | addrmap `@ <base>` / `size` | folds to ZERO — silently wrong (divergence 39) |
+    | regblock `@ <addr>` / `reset` | folds to ZERO — silently wrong (divergence 41) |
+
+    So the pattern is a good way to FIND candidates and no way at all to
+    classify them. Had the records site been reclassified by analogy
+    with the two nearest neighbours, it would have been labelled
+    silently-mis-lowers and left rejected, when v1 handles it correctly
+    and the right move was to close the gap. Every instance still needs
+    its own probe; what the lead buys is knowing where to point one.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

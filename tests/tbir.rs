@@ -14125,3 +14125,39 @@ fn a_non_literal_regblock_offset_or_reset_does_not_point_at_v1() {
         "the literal offset survives, so the value genuinely matters:\n{literal}"
     );
 }
+
+/// A `const` default on a `transaction` / `struct` field now folds. v1
+/// emits one as `uint64_t a = K;` against its own `static constexpr K`,
+/// which is CORRECT — unlike the addrmap and regblock offsets, where the
+/// same literals-only local folder sits in front of a v1 that folds to
+/// ZERO. Four instances of one code pattern, three different v1
+/// behaviours behind it, which is why each was probed separately rather
+/// than classified by analogy.
+#[test]
+fn a_const_record_field_default_folds() {
+    let fixture = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/record_let_copy_test.harc"),
+    )
+    .expect("read the registered fixture");
+    const OLD: &str = "a : uint<8>  default 0";
+
+    let with = |decl: &str, pre: &str| {
+        format!("{pre}{}", fixture.replace(OLD, decl))
+    };
+
+    // Control: the unmutated registered fixture lowers.
+    emit_cpp_src(&fixture);
+
+    let literal = emit_cpp_src(&with("a : uint<8>  default 9", ""));
+    let k9 = emit_cpp_src(&with("a : uint<8>  default K", "const K = 9\n\n"));
+    assert_eq!(
+        literal, k9,
+        "`default K` with `const K = 9` must lower exactly like `default 9`"
+    );
+
+    // The value is genuinely used, so the equality is the fold working
+    // rather than the default being dropped.
+    let k3 = emit_cpp_src(&with("a : uint<8>  default K", "const K = 3\n\n"));
+    assert_ne!(k9, k3, "a different const must change the emitted default");
+}
