@@ -19046,19 +19046,18 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     ] {
         let msg = assert_not_implemented(
             &lower_src(&src).unwrap_err(),
-            lower::V1Status::EmitsUncompilable,
+            lower::V1Status::SilentlyMisLowers,
         );
         assert!(
             msg.contains("periodic `on <N> cycles` handlers"),
             "{what}: {msg}"
         );
 
-        // The arm is `EmitsUncompilable` because of the period
-        // EXPRESSION, not the handler, so the literal case must still
-        // be shown to work — otherwise the status is unearned in the
-        // other direction. v1 registers a cycle-stamped closure that
-        // fires the body every N cycles against the instance's state
-        // struct.
+        // The status comes from the period EXPRESSION, not the
+        // handler, so the literal case must still be shown to work —
+        // otherwise it is unearned in the other direction. v1
+        // registers a cycle-stamped closure that fires the body every
+        // N cycles against the instance's state struct.
         let v1 =
             cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
         assert!(
@@ -19066,9 +19065,9 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
             "{what}: v1 must emit the periodic body"
         );
 
-        // And the row that sets the status: a period naming an
-        // impl-scope `let`. v1 emits it into the same closure, which
-        // is registered BEFORE that `let` exists.
+        // A period naming an impl-scope `let`. v1 emits it into the
+        // same closure, which is registered BEFORE that `let` exists,
+        // so the emitted C++ does not compile.
         let named = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
             "    run\n",
             "    let limit = 5\n\n    run\n",
@@ -19085,6 +19084,30 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         assert!(
             declared > used,
             "{what}: the `let` must be emitted AFTER the use, or the C++ compiles"
+        );
+
+        // And the row that SETS the status, which is worse than that
+        // one: add a file-scope `const` of the same name. Now the
+        // closure resolves — to the `constexpr` at namespace scope —
+        // so v1's output compiles and the handler runs at 7 where the
+        // program says 5. Built and run outside the suite: twice in 21
+        // cycles instead of four.
+        let shadowed = format!("const limit = 7\n\n{named}");
+        let v1 = cpp_tb::emit(&merged_src(&shadowed))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the shadowed period: {e}"));
+        let konst = v1
+            .find("static constexpr int64_t limit = 7;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the const"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let lt = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            konst < used && used < lt,
+            "{what}: the const must precede the use and the `let` follow it, \
+             or the value the handler picks up is not the wrong one"
         );
     }
 

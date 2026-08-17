@@ -4747,18 +4747,36 @@ case and only locally-determinable `Assign` types are compared).
     | `NPER`, a file-scope `const` | `(int64_t)(NPER)`, declared at namespace scope ~80 lines earlier | yes |
     | `read_count`, a state field | `(int64_t)(target.read_count)`, instance declared 3 lines earlier | yes |
     | `limit`, an impl-scope `let` | `(int64_t)(limit)`, declared **64 lines later** | **no** |
+    | `limit`, with a file-scope `const limit = 7` as well | same, and it RESOLVES — to the const | yes, **and runs at the wrong rate** |
 
-    The last row is compiler-measured, not read off the text: g++ on
+    The fourth row is compiler-measured, not read off the text: g++ on
     the spliced closure says "'limit' was not declared in this scope".
     It reaches the arm because the name resolver does not visit a
     bound-to transactor's `on` trigger at all — `on some_undefined_name
     cycles` also passes `harc check`.
 
-    So the discriminator is again name resolution in the emitted C++
-    rather than the shape of the trigger, exactly as on the scoreboard
-    wiring arm, and there is no predicate over the trigger to split on.
-    Worst-under-arm makes all three `EmitsUncompilable`. The literal
+    The fifth is the one that sets the status, and it was BUILT AND
+    RUN, not just compiled: with `const limit = 7` at file scope and
+    `let limit = 5` in the impl, the closure resolves to the
+    `constexpr` at namespace scope while the rest of the run body sees
+    the `let` that shadows it. The handler fires twice in 21 cycles
+    instead of four. It runs at a rate the program never asks for, and
+    nothing says so.
+
+    That is the same silent const-capture the transactor-parameter arm
+    at the top of the same file already reports, and it means the
+    discriminator is once more name resolution in the emitted C++
+    rather than the shape of the trigger — exactly as on the scoreboard
+    wiring arm, with no predicate over the trigger to split on.
+    Worst-under-arm makes all three `SilentlyMisLowers`. The literal
     case pays for that by losing a suggestion it would have deserved.
+
+    A first pass at this entry stopped at the fourth row and labelled
+    the arms `EmitsUncompilable`. The fifth row was found by asking the
+    next question rather than the obvious one — not "does it compile?"
+    but "is there a program where it compiles and is still wrong?" —
+    and every arm whose input space is an EXPRESSION has that question
+    waiting in it.
 
     One row needed care in the other direction. A `when active`
     periodic handler on a `passive` instance produces v1 output

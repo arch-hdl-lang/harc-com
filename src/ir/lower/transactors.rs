@@ -653,13 +653,26 @@ fn lower_bound_target_transactor(
                 //     expression per spec §7.10, and the name resolver
                 //     does not visit a bound-to transactor's `on`
                 //     trigger, so this reaches here and type-checks.
+                //   * `on limit cycles` again, with a file-scope
+                //     `const limit` ALSO in the program — the worst
+                //     one, and why this arm is not merely
+                //     uncompilable. The closure resolves to the
+                //     `constexpr` at namespace scope, so it COMPILES;
+                //     the rest of the run body sees the `let` that
+                //     shadows it. Built and RUN: `const limit = 7`
+                //     with `let limit = 5` fires the handler twice in
+                //     21 cycles instead of four. The handler runs at a
+                //     rate the program never asks for, and nothing
+                //     says so.
                 //
                 // So the discriminator is name resolution in the
                 // emitted C++, not the shape of the trigger — the same
                 // thing that defeated a syntactic split on the
-                // scoreboard wiring arm. An arm's status is the worst
+                // scoreboard wiring arm, and the same silent
+                // const-capture the transactor-parameter arm at the top
+                // of this file reports. An arm's status is the worst
                 // thing v1 does anywhere under it, so the whole arm is
-                // `EmitsUncompilable`, and the literal case pays for it
+                // `SilentlyMisLowers`, and the literal case pays for it
                 // by losing a suggestion it would have deserved.
                 //
                 // Separately measured and not a gap: on a `passive`
@@ -669,9 +682,10 @@ fn lower_bound_target_transactor(
                 return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` periodic `on <N> cycles` handlers"),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those does not \
-                     compile; a non-periodic `on` never reaches this path",
-                    V1Status::EmitsUncompilable,
+                     test's own `let` bindings, so a period naming one of those either fails \
+                     to compile or silently picks up a same-named file-scope `const` and runs \
+                     at the wrong rate; a non-periodic `on` never reaches this path",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1106,16 +1120,17 @@ fn lower_bound_initiator_transactor(
                 // cycle-stamped `_checkers` closure either way, and
                 // registers it in the same place, so it inherits the
                 // same period-expression scoping problem. See the
-                // target-side arm for the four measured rows.
+                // target-side arm for the five measured rows.
                 return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` periodic \
                          `on <N> cycles` handlers"
                     ),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those does not \
-                     compile; a non-periodic `on` never reaches this path",
-                    V1Status::EmitsUncompilable,
+                     test's own `let` bindings, so a period naming one of those either fails \
+                     to compile or silently picks up a same-named file-scope `const` and runs \
+                     at the wrong rate; a non-periodic `on` never reaches this path",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1199,16 +1214,17 @@ fn lower_bound_initiator_transactor(
                 // cycle-stamped `_checkers` closure either way, and
                 // registers it in the same place, so it inherits the
                 // same period-expression scoping problem. See the
-                // target-side arm for the four measured rows.
+                // target-side arm for the five measured rows.
                 return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` periodic \
                          `on <N> cycles` handlers"
                     ),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those does not \
-                     compile; a non-periodic `on` never reaches this path",
-                    V1Status::EmitsUncompilable,
+                     test's own `let` bindings, so a period naming one of those either fails \
+                     to compile or silently picks up a same-named file-scope `const` and runs \
+                     at the wrong rate; a non-periodic `on` never reaches this path",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Watchdog(_) => {
