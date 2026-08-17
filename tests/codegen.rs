@@ -10469,14 +10469,19 @@ end test T"#
 /// constraint, and fixing only the `Index` arm left it comparing unsigned:
 /// `z3::ult(<sum>, 0)` is false for every value, where the source is
 /// satisfied by any negative element.
+/// BOTH argument shapes, because the emitter accepts both and the oracle
+/// has to agree with it about each. Covering only the sliced form left
+/// `sum(vals)` still emitting `z3::ult` over a signed list — harc#598
+/// unfixed in its sibling syntax, and a brute force over a two-element list
+/// put 65664 solutions in the emitted constraint that the source forbids.
 #[test]
 fn a_sum_over_a_signed_list_compares_signed() {
-    let src = |elem: &str| {
+    let src = |elem: &str, arg: &str| {
         format!(
             r#"transaction Txn
     vals : list<{elem}>
     keep vals.len() <= 2
-    keep sum(vals[0..vals.len()]) < 0
+    keep sum({arg}) < 0
 end transaction Txn
 test T
     let dut : Top
@@ -10488,23 +10493,25 @@ test T
 end test T"#
         )
     };
-    let signed = v1_cpp(&src("sint<8>"));
-    assert!(
-        signed.contains(") < _ctx.bv_val((uint64_t)0, 64))")
-            && !signed.contains("z3::ult((z3::ite"),
-        "a sum over a signed list must use the signed predicate; got:\n{signed}"
-    );
-    let unsigned = v1_cpp(&src("uint<8>"));
-    assert!(
-        unsigned.contains("z3::ult((z3::ite"),
-        "a sum over an unsigned list must stay unsigned; got:\n{unsigned}"
-    );
-    // A `.len()` call is unsigned and must not be dragged along by the new
-    // `Call` arm — it shares the arm and differs only in callee name.
-    assert!(
-        signed.contains("z3::ule(_z_vals_len"),
-        "`.len()` must stay unsigned; got:\n{signed}"
-    );
+    for arg in ["vals[0..vals.len()]", "vals"] {
+        let signed = v1_cpp(&src("sint<8>", arg));
+        assert!(
+            signed.contains(") < _ctx.bv_val((uint64_t)0, 64))")
+                && !signed.contains("z3::ult((z3::ite"),
+            "`sum({arg})` over a signed list must use the signed predicate; got:\n{signed}"
+        );
+        let unsigned = v1_cpp(&src("uint<8>", arg));
+        assert!(
+            unsigned.contains("z3::ult((z3::ite"),
+            "`sum({arg})` over an unsigned list must stay unsigned; got:\n{unsigned}"
+        );
+        // A `.len()` call is unsigned and must not be dragged along by the
+        // new `Call` arm — it shares the arm and differs only by callee.
+        assert!(
+            signed.contains("z3::ule(_z_vals_len"),
+            "`.len()` must stay unsigned; got:\n{signed}"
+        );
+    }
 }
 
 /// The membership call site passes `target_root` too — a nested signed

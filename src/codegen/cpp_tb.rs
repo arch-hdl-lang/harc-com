@@ -5598,10 +5598,16 @@ fn sum_call_elem_signed(
     let CallArg::Expr(arg) = &args[0] else {
         return false;
     };
-    let ExprKind::Index { target, .. } = &*arg.kind else {
-        return false;
+    // BOTH argument shapes the emitter accepts. It takes `sum(vals[lo..hi])`
+    // through an `Index` and `sum(vals)` through a bare fall-through, and
+    // handling only the first left `sum(vals)` over a signed list still
+    // emitting `z3::ult` — harc#598 unfixed in its sibling syntax, which is
+    // exactly the drift the doc above warns about.
+    let list_expr = match &*arg.kind {
+        ExprKind::Index { target, .. } => target,
+        _ => arg,
     };
-    list_field_name_from_expr(target, field_info, target_root)
+    list_field_name_from_expr(list_expr, field_info, target_root)
         .and_then(|field| field_info.get(&field))
         .and_then(|f| f.list.as_ref())
         .map(|l| l.elem_signed)
