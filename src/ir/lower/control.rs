@@ -84,7 +84,7 @@ impl FuncBuilder<'_> {
         // shape and the same single evaluation.
         if let ExprKind::Call { callee, args } = &*f.iter.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some(elem) = self.ctx.tseqs.get(&name.name).cloned() {
+                if let Some((elem, _)) = self.ctx.tseqs.get(&name.name).cloned() {
                     let seq_ty = elem.seq_type();
                     let call = self.lower_tseq_call(&name.name, args)?;
                     let seq = self.fresh_temp();

@@ -564,11 +564,18 @@ fn lower_point_target(
                                 args.len()
                             )));
                         }
+                        let declared: Vec<String> = entry
+                            .decl
+                            .params
+                            .iter()
+                            .map(|p| p.name.name.clone())
+                            .collect();
                         let args = lower_point_call_args(
                             group,
                             point,
                             &id.name,
                             args,
+                            &declared,
                             hook_params,
                             helpers,
                             extern_fns,
@@ -585,11 +592,14 @@ fn lower_point_target(
                                 args.len()
                             )));
                         }
+                        let declared: Vec<String> =
+                            decl.params.iter().map(|p| p.name.name.clone()).collect();
                         let args = lower_point_call_args(
                             group,
                             point,
                             &id.name,
                             args,
+                            &declared,
                             hook_params,
                             helpers,
                             extern_fns,
@@ -891,49 +901,38 @@ fn lower_point_call_args(
     point: &str,
     name: &str,
     args: &[crate::ast::CallArg],
+    declared: &[String],
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
     consts: &HashMap<String, u64>,
 ) -> Result<Vec<Expr>, LowerError> {
-    // The callee is a file-level `function` or an `extern function`;
-    // both registries here carry the declaration, so the parameter
-    // names come from it rather than from anywhere else. Measured for
-    // this family specifically rather than assumed from its siblings:
-    // in a coverpoint target, `pick(a = .., b = 1)` emits the same
+    // `declared` is the callee's parameter names, passed in by the
+    // caller that already resolved the declaration and checked arity.
+    //
+    // An earlier version re-queried the two registries here and fell
+    // back to refusing every named argument when neither resolved. That
+    // fallback was DEAD: both call sites are inside `if let Some(...)`
+    // on those same registries, so the lookup could not fail. Taking
+    // the names as an argument makes that structural rather than
+    // accidental, and deletes an arm that documented a behaviour it did
+    // not implement. (A callee in neither registry is refused earlier,
+    // by the coverpoint call classifier.)
+    //
+    // v1 drops argument names and binds by position. Measured in a
+    // coverpoint target: `pick(a = .., b = 1)` emits the same
     // `pick(<slice>, 1)` v1 emits positionally, and
     // `pick(b = 1, a = ..)` emits `pick(1, <slice>)` — the values
-    // swapped, silently, inside the sampler.
-    let declared: Option<Vec<String>> = helpers
-        .get(name)
-        .map(|e| e.decl.params.iter().map(|p| p.name.name.clone()).collect())
-        .or_else(|| {
-            extern_fns
-                .get(name)
-                .map(|d| d.params.iter().map(|p| p.name.name.clone()).collect())
-        });
-    if let Some(declared) = &declared {
-        super::reject_misplaced_named_args(
-            args,
-            declared,
-            &format!("covergroup helper call `{name}(...)`"),
-        )?;
-    }
+    // swapped, silently, inside the sampler that decides which bin gets
+    // hit.
+    super::reject_misplaced_named_args(
+        args,
+        declared,
+        &format!("covergroup helper call `{name}(...)`"),
+    )?;
     let mut lowered = Vec::with_capacity(args.len());
     for arg in args {
-        let e = match arg {
-            crate::ast::CallArg::Expr(e) => e,
-            // A name is only usable when a declaration resolved above.
-            // With no parameter list there is nothing to check it
-            // against, and refusing beats guessing.
-            crate::ast::CallArg::Named { value, .. } if declared.is_some() => value,
-            crate::ast::CallArg::Named { .. } => {
-                return Err(unsupported(
-                    &format!("named arguments in covergroup helper call `{name}(...)`"),
-                    "",
-                ))
-            }
-        };
+        let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = arg;
         lowered.push(lower_point_target(
             group,
             point,
