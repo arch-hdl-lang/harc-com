@@ -1,0 +1,91 @@
+// Covergroup bins whose EXACT VALUES are runtime expressions — the
+// companion to cov_runtime_bound_test.harc, which covers runtime range
+// BOUNDS.
+//
+// Ranges got runtime bounds first (`[dut.en .. 7]`); exact values were
+// left folding-only, so `{dut.en}` was rejected while `[dut.en .. 7]`
+// worked in the same bins block. v1 never had that split — it renders
+// both with the same `emit_expr`, emitting `_v == harc_rt::harc_read(
+// dut->en)` per sample — so this file now passes under BOTH backends
+// and the equivalence harness trace-diffs the two.
+//
+// `cp_count` mixes the shapes an exact value can take:
+//   - eq_en    = {dut.en}          — bare DUT port
+//   - eq_expr  = {dut.en + 4}      — binary expression over a port
+//   - eq_const = {12}              — plain literal (unchanged fast path)
+//   - mixed    = {dut.en + 1, 15}  — set mixing a runtime value + literal
+//
+// Fully deterministic (no randomize): the counter walks 0->15 with `en`
+// toggled off at both ends. `dut.en` is 0 or 1, so:
+//   - eq_en    catches count == en  — hit at count 0 while en=0 (reset)
+//                                     and at count 1 while en=1
+//   - eq_expr  catches count == en+4 — hit at count 5 while en=1
+//   - eq_const catches count == 12   — hit during the sweep
+//   - mixed    catches count == en+1 or == 15 — both hit
+// Every bin is a guaranteed hit; the check phase asserts each is nonzero,
+// so a bin that silently stopped matching fails the run rather than
+// passing with a zero count.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup RtValueCov @(posedge dut.clk)
+    cp_count : cover dut.count_out
+        bins
+            eq_en    = {dut.en}
+            eq_expr  = {dut.en + 4}
+            eq_const = {12}
+            mixed    = {dut.en + 1, 15}
+        end bins
+    cp_en : cover dut.en
+        bins
+            en0 = {0}
+            en1 = {1}
+        end bins
+end covergroup RtValueCov
+
+testbench RtValueTb
+    dut : Top
+    cov : RtValueCov
+end testbench RtValueTb
+
+impl CovRuntimeBinValueTest for RtValueTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        // Reset, then idle two cycles with en=0 — samples count==0 while
+        // en==0, which is `eq_en`'s hit.
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        assert dut.count_out == 0
+            else fail("after reset: count_out=${dut.count_out}, expected 0")
+        dut.rst = 0
+        wait 2 cycles
+
+        // Count 0->15 with en=1 -> samples every cp_count bin.
+        dut.en = 1
+        wait until dut.count_out == 15 timeout 100 cycles
+            fail("count never reached 15")
+        assert dut.count_out == 15
+            else fail("after wait: count_out=${dut.count_out}, expected 15")
+
+        // Hold at 15 with en=0 -> samples the top bins with en=0.
+        dut.en = 0
+        wait 2 cycles
+        log(info, "PASS: walked 0..15, en toggled at both ends")
+    end run
+
+    check
+        cov.report()
+
+        assert cov.cp_count.eq_en    > 0 else fail("eq_en runtime-value bin hole")
+        assert cov.cp_count.eq_expr  > 0 else fail("eq_expr runtime-value bin hole")
+        assert cov.cp_count.eq_const > 0 else fail("eq_const literal bin hole")
+        assert cov.cp_count.mixed    > 0 else fail("mixed runtime+literal bin hole")
+        assert cov.cp_en.en0 > 0 else fail("en=0 bin hole")
+        assert cov.cp_en.en1 > 0 else fail("en=1 bin hole")
+        log(info, "ALL TESTS PASSED")
+    end check
+end impl CovRuntimeBinValueTest

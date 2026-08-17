@@ -2611,13 +2611,17 @@ pub struct CoverBinSchema {
 /// `{[1..3], 7}` lowers to `[Range{1,3}, Eq(7)]`. Range bounds are
 /// inclusive on both ends — v1's hit test is `_v >= lo && _v <= hi`.
 ///
-/// A range bound is a [`CovBinBound`]: either a folded compile-time
-/// constant (`[1..3]`, `[LO..HI]` const names) or a genuine runtime
-/// expression (`[dut.en..7]`), matching v1, which emits the raw bound
-/// expression per-sample rather than requiring a constant.
+/// BOTH forms carry a [`CovBinBound`]: either a folded compile-time
+/// constant (`{3}`, `[1..3]`, `[LO..HI]` const names) or a genuine
+/// runtime expression (`{dut.en}`, `[dut.en..7]`), matching v1, which
+/// emits the raw expression per-sample rather than requiring a
+/// constant. The exact-value form carried a bare `u64` until the runtime
+/// case was implemented; ranges got runtime bounds first, and there was
+/// never a reason for the two to differ — v1 renders both with the same
+/// `emit_expr`.
 #[derive(Debug, Clone)]
 pub enum CovBinValue {
-    Eq(u64),
+    Eq(CovBinBound),
     Range {
         lo: Option<CovBinBound>,
         hi: Option<CovBinBound>,

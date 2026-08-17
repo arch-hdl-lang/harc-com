@@ -203,6 +203,38 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
                     type_name(prog, &ty)
                 )));
             }
+            // Bin members and range bounds need the same check as the
+            // target, and for the same reason: a bin compares `_v`
+            // against the bound, so a record-typed hook param
+            // (`one = {cmd}`) emits `_v == cmd` — `uint64_t` against a
+            // struct, which g++ rejects. v1 emits exactly the same
+            // thing, so this is a malformed program under BOTH backends
+            // (`Invalid`, not a subset gap), and pointing at
+            // `--codegen v1` would be a false promise.
+            //
+            // Bins reached this only after exact values were allowed to
+            // be runtime expressions; before that a bare non-const name
+            // was rejected in lowering, which caught it by accident.
+            for bin in &point.bins {
+                for bound in bin.values.iter().flat_map(bin_bounds) {
+                    let ty =
+                        coverpoint_expr_type(prog, &hook_param_types, bound).map_err(|msg| {
+                            LowerError::Invalid(format!(
+                                "covergroup `{cg_name}` point `{}` bin `{}` hook type error: {msg}",
+                                point.name, bin.name
+                            ))
+                        })?;
+                    if !is_scalar(&ty) {
+                        return Err(LowerError::Invalid(format!(
+                            "covergroup `{cg_name}` point `{}` bin `{}` must compare against a \
+                             scalar, got {}",
+                            point.name,
+                            bin.name,
+                            type_name(prog, &ty)
+                        )));
+                    }
+                }
+            }
         }
         match target {
             HookTarget::Transactor { xid, midx, .. } => prog.transactors[xid.index()].methods[midx]
@@ -214,6 +246,28 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
         }
     }
     Ok(())
+}
+
+/// Every RUNTIME expression inside one bin member — the member itself
+/// for an exact value, or the present ends of a range. Constant bounds
+/// are skipped: they folded to a `u64` and carry no type to check.
+fn bin_bounds(v: &crate::ir::CovBinValue) -> Vec<&Expr> {
+    use crate::ir::{CovBinBound, CovBinValue};
+    fn runtime(b: &CovBinBound) -> Option<&Expr> {
+        match b {
+            CovBinBound::Runtime(e) => Some(e),
+            CovBinBound::Const(_) => None,
+        }
+    }
+    match v {
+        CovBinValue::Eq(b) => runtime(b).into_iter().collect(),
+        CovBinValue::Range { lo, hi } => lo
+            .as_ref()
+            .and_then(runtime)
+            .into_iter()
+            .chain(hi.as_ref().and_then(runtime))
+            .collect(),
+    }
 }
 
 fn coverpoint_expr_type(
