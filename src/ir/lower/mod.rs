@@ -4008,11 +4008,23 @@ fn lower_test(
                 // when the user wrote a bare `on <field> pre` with no
                 // method — quoting it back would name something they
                 // never typed, so that shape gets its own sentence.
+                //
+                // A source `_tb` is indistinguishable from the synthetic
+                // one here (both arrive as `_tb.<name>`), so the wording
+                // covers BOTH readings rather than asserting which one
+                // happened. A real transactor field named `_tb` never
+                // reaches this branch — it resolves in
+                // `transactor_field_map` above — and a real component
+                // field named `_tb` declaring the hookable is caught by
+                // `v1_wires_it`, so the only reachable source `_tb` is
+                // one v1 refuses too.
                 if xfield == "_tb" {
                     LowerError::Invalid(format!(
                         "`on {method}` hook: a `pre`/`post` hook names a method to wrap \
-                         (`on <field>.<method> pre`), and `{method}` is a field, not a \
-                         `<field>.<method>` path"
+                         (`on <field>.<method> pre`), and `{method}` resolves to a field \
+                         rather than a method on one. (If you wrote `_tb.{method}` \
+                         literally, `_tb` is neither a transactor field nor a component \
+                         field declaring a `hookable` `{method}`.)"
                     ))
                 } else {
                     LowerError::Invalid(format!(

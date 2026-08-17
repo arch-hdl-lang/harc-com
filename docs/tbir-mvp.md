@@ -3427,9 +3427,10 @@ case and only locally-determinable `Assign` types are compared).
     | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
     | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
     | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
-    | test-scope bare field, no method (`mod.rs`) | rejects | `Invalid` | `Invalid` (message fixed) |
+    | …→ bare field, no method | rejects | `Invalid` | `Invalid` (message fixed) |
     | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | …→ unhooked `on` / `connect` | mixed, see below | `Unsupported` | `Unsupported` (kept) |
+    | …→ unhooked `on` | mixed, not by syntax — see below | `Unsupported` | `Unsupported` (kept) |
+    | …→ `connect` | **unprobed** | `Unsupported` | `Unsupported` (kept) |
 
     Two of these are worth reading closely.
 
@@ -3515,7 +3516,16 @@ case and only locally-determinable `Assign` types are compared).
     **Borrowing a predicate borrows its question.** That is the same
     mistake as the `dotted_path` one above, made one commit later, on
     the predicate written to fix it. Classifying this arm needs the
-    scope analysis; the site now says so instead of guessing.
+    scope analysis; the site now says so instead of guessing, and
+    `an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space`
+    pins the revert — without it, re-applying the split leaves the suite
+    green, which is how an undone mistake comes back. The `connect` half
+    of the same arm is untouched and was never probed at all.
+
+    A revert needs a test as much as a change does. This one asserts the
+    two rows the split got backwards (`on dut.en` compiles, `on w.seen >
+    0` does not) rather than just the verdict, so it fails for the right
+    reason.
 
     A tenth candidate in `transactors.rs` (a hooked `on` on a `bound to`
     transactor) is NOT classified here. Every well-formed bound

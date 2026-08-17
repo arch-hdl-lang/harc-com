@@ -16133,10 +16133,12 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         );
         // The anchor: the SAME trigger without a hook side is fine, so
         // the rejection is about the hook and not about the trigger.
-        // Only these two have a hook-free form that lowers; the rest
-        // fail for their own reasons, so an anchor there would measure
-        // nothing.
-        if matches!(trigger, "dut.en > 0" | "5 cycles") {
+        // `"s"` is the exception: its hook-free form is a bare field
+        // reference, which fails for its own reasons, so an anchor
+        // there would measure nothing. Every other trigger here lowers
+        // without the hook side, which is what makes the rejection
+        // above about the hook.
+        if trigger != "s" && !trigger.contains('(') {
             let ctl = hook_positions(
                 "",
                 "",
@@ -16259,9 +16261,14 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
         "v1 must refuse a hook with no method"
     );
     let msg = assert_invalid(&lower_src(&bare).unwrap_err());
+    // It must lead with what the user WROTE, not with the desugared
+    // form. `_tb` may still appear later, in the parenthetical that
+    // covers a literal source `_tb` — the two are indistinguishable by
+    // the time the lookup fails, so the message covers both rather
+    // than asserting which happened.
     assert!(
-        !msg.contains("_tb"),
-        "must not name the desugarer's root: {msg}"
+        msg.starts_with("`on s` hook:"),
+        "must quote the source text, not `_tb.s`: {msg}"
     );
     assert!(msg.contains("names a method to wrap"), "{msg}");
 
@@ -16337,6 +16344,70 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
             "v1 drops the hook on `on {trigger} pre`"
         );
     }
+}
+
+/// Pins the REVERT. The unhooked `connect`/`on` arm in a scoreboard
+/// body answers one `Unsupported` for its whole input space, and it
+/// must keep doing so until someone classifies it with the scope
+/// analysis it actually needs.
+///
+/// A syntactic split was written here and undone; without this test,
+/// re-applying it is green. The two rows that matter are the two the
+/// split got backwards: `on dut.en` is a two-segment PATH that v1
+/// compiles, and `on w.seen > 0` is an EXPRESSION that v1 does not —
+/// so no predicate over trigger syntax can separate this arm.
+#[test]
+fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            .replace("    e   : Holder", "    e   : Holder\n    b   : Board")
+    };
+    let handler =
+        |trigger: &str| format!("    on {trigger}\n        log(info, \"p\")\n    end on\n");
+
+    for trigger in [
+        "hits > 0",
+        "w.seen > 0",
+        "dut.en",
+        "w.note",
+        "(w.note)",
+        "w.note cycles",
+        "w.note phase post_eval",
+    ] {
+        let msg = assert_unsupported(&lower_src(&scoreboard(&handler(trigger))).unwrap_err());
+        assert!(
+            msg.contains("event wiring"),
+            "`on {trigger}` must still reach the one generic arm: {msg}"
+        );
+    }
+
+    // And the reason a syntactic split cannot work: the path compiles
+    // and the expression does not, which is the opposite of what
+    // trigger shape would predict.
+    let path = cpp_tb::emit(&merged_src(&scoreboard(&handler("dut.en")))).expect("v1 emits");
+    assert!(
+        path.contains("(bool)(harc_rt::harc_read(dut->en))"),
+        "a two-segment path that resolves against the DUT and compiles"
+    );
+    let expr = cpp_tb::emit(&merged_src(&scoreboard(&handler("w.seen > 0")))).expect("v1 emits");
+    assert!(
+        expr.contains("(bool)(w.seen > 0)"),
+        "an expression naming a SIBLING testbench field, unqualified"
+    );
+    assert!(
+        !expr.contains("_tb.w.seen"),
+        "v1 does not qualify it, so there is no `w` in the checker lambda's scope"
+    );
 }
 
 /// A period does not change what v1 does with a hooked method path: its
