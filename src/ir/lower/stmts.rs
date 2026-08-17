@@ -3115,6 +3115,87 @@ impl FuncBuilder<'_> {
     }
 
     fn lower_log(&mut self, args: &[CallArg], file: Option<String>) -> Result<(), LowerError> {
+        // Both extractors below match `CallArg::Expr` only, so a NAMED
+        // argument hides whatever it wraps — and v1's do the same, so
+        // this is a silent mis-lowering under both backends rather than
+        // a divergence:
+        //
+        //   `log(level = fatal, "BOOM")`  -> `sim_log_line("INFO", "BOOM")`
+        //   `log(fatal, msg = "BOOM")`    -> `sim_log_line("FATAL", "")`
+        //
+        // The first is the dangerous one. A `fatal` silently becomes an
+        // `info`: no `ctx.errors++`, no `_fatal`, and a test that should
+        // abort passes green. The severity guard further down rejects a
+        // TYPO (`log(errror, ...)`) for exactly this reason — "rejecting
+        // it is what makes `log(error, ...)` trustworthy" — and a named
+        // severity walked straight past it.
+        //
+        // Gated on what the name HIDES **and on the slot being empty**.
+        // The extractors take positional matches only, so a named
+        // argument costs the user something exactly when a slot it could
+        // have filled is left unfilled:
+        //
+        //   * `log` needs ONE string (the message).
+        //   * `logf` needs TWO — the path is the first, the message the
+        //     next. A named path with only one positional string left
+        //     promotes the message to filename:
+        //     `logf(path = "t.log", error, "BOOM", "EXTRA")` writes to a
+        //     file called `BOOM`. Modelling only the message slot missed
+        //     that; this counts strings instead of comparing them, which
+        //     also retires a `file`-equality test nothing pinned.
+        //   * a severity slot is filled by any positional bare ident.
+        //
+        // With a slot filled positionally the named argument is inert
+        // under both backends and must lower: `log(fatal, "BOOM", lvl =
+        // warn)` emits `FATAL`, `log(level = fatal, error, "BOOM")`
+        // emits `ERROR`, and `logf(p = "a.log", "t.log", error, "BOOM")`
+        // logs `BOOM`. Refusing those would be refusing correct
+        // programs, which two earlier versions of this gate did.
+        let positional_strings = args
+            .iter()
+            .filter(|a| matches!(a, CallArg::Expr(e) if matches!(&*e.kind, ExprKind::String(_))))
+            .count();
+        let strings_needed = if file.is_some() { 2 } else { 1 };
+        let has_positional_sev = args
+            .iter()
+            .any(|a| matches!(a, CallArg::Expr(e) if matches!(&*e.kind, ExprKind::Ident(_))));
+        let what = if file.is_some() { "logf" } else { "log" };
+        for a in args {
+            let CallArg::Named { name, value } = a else {
+                continue;
+            };
+            let hidden = match &*value.kind {
+                // Only a REAL severity can be hidden. `who = nosuch` was
+                // never going to become one — positionally it would have
+                // been rejected by the severity guard below, not
+                // silently used — so refusing it claims a loss that
+                // cannot happen.
+                ExprKind::Ident(id)
+                    if !has_positional_sev && is_log_severity(&id.name.to_lowercase()) =>
+                {
+                    "a severity"
+                }
+                ExprKind::String(_) if positional_strings < strings_needed => {
+                    if file.is_some() {
+                        "a path or message"
+                    } else {
+                        "the message"
+                    }
+                }
+                _ => continue,
+            };
+            return Err(not_implemented(
+                &format!(
+                    "a named argument `{}` carrying {hidden} in `{what}`",
+                    name.name
+                ),
+                "both backends read the severity, path and message positionally and skip \
+                 named arguments entirely, so with no positional one to fall back on this \
+                 drops what the name wraps — a named `fatal` becomes `info`, which bumps \
+                 no failure counter",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
         // Mirror v1's extraction rules: first bare ident is the
         // severity (default info); first string literal that isn't the
         // logf path is the message.
@@ -3554,4 +3635,12 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
         (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
         _ => false,
     }
+}
+
+/// The closed `Severity` set (spec §7.7). Shared by `lower_log`'s
+/// named-argument gate and its severity guard, so "is this a severity"
+/// is answered the same way in both — the gate must not claim a name
+/// hides a severity that the guard would have rejected outright.
+fn is_log_severity(s: &str) -> bool {
+    matches!(s, "debug" | "info" | "warn" | "error" | "fatal")
 }
