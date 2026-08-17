@@ -4705,6 +4705,45 @@ case and only locally-determinable `Assign` types are compared).
     analysis this arm has wanted since the reverted syntactic split:
     both, not either.
 
+71. **Three arms named a construct no program reaching them can
+    contain (2026-08-17).**
+
+    The `on`-handler arms on the two bound-to transactor paths —
+    `lower_bound_target_transactor`, plus the always-on and `when
+    active` loops of `lower_bound_initiator_transactor` — all reported
+    "event-driven transactors await the event slice".
+
+    No program that reaches them is event-driven. The routing gate is
+    `components::transactor_is_component`, which for a `bound to`
+    transactor returns `has_on_handler`, and that flag is set by
+    NON-periodic handlers alone. An event subscriber, a
+    `bus.<ch>.handshake` monitor and a cycle-trigger therefore all go to
+    the composite table; `on <N> cycles` is the only shape that falls
+    through. A user who lands here wrote a periodic handler and was told
+    to wait for a slice that will never cover it.
+
+    The verdict itself is right, and now measured. v1 emits a
+    `_checkers` closure holding a `static ..._last` stamp and the
+    period, firing the body every N cycles against the instance's state
+    struct — spliced into g++ with the emitted state struct and
+    verified compilable, at all three positions. The handler is not
+    merely present but load-bearing: removing any one arm makes TB-IR
+    lower the program SILENTLY with the periodic handler dropped from
+    the IR, which is what the arms are holding back.
+
+    One row needed care. A `when active` periodic handler on a
+    `passive` instance produces v1 output byte-identical to the same
+    program with the handler deleted — which reads like a silent drop
+    and is not: it is v1 obeying `when active`. The first version of
+    the test asserted emission on the fixture's own `passive` binding
+    and failed for exactly that reason. Both halves are pinned now, the
+    `active` binding for emission and the `passive` one for the
+    scoping.
+
+    The general shape here is the same one that has bitten this sweep
+    repeatedly: the arms in a file do not tell you what reaches the
+    file. Only the gate does.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

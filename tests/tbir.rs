@@ -18974,3 +18974,124 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         assert!(msg.contains("names no `hookable`"), "{what}: {msg}");
     }
 }
+
+/// The three `on`-handler arms on the two bound-to transactor paths
+/// (`lower_bound_target_transactor`, and the always-on and `when
+/// active` loops of `lower_bound_initiator_transactor`) all said
+/// "event-driven transactors await the event slice".
+///
+/// No program that reaches them contains an event-driven handler. The
+/// gate is `components::transactor_is_component`, which for a bound-to
+/// transactor returns `has_on_handler` — a flag set by NON-periodic
+/// handlers alone. So every event subscriber, `bus.<ch>.handshake`
+/// monitor and cycle-trigger routes to the composite table, and `on <N>
+/// cycles` is the sole shape that falls through to these arms.
+///
+/// This pins both halves: the three positions that DO arrive, and two
+/// non-periodic shapes that provably do not. The verdict stays
+/// `Unsupported` because v1 really does implement it — measured below
+/// rather than assumed.
+#[test]
+fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
+    let base = fixture("tlm_target_thread_if_test.harc");
+    const THREAD: &str = "    thread bus.read(addr: uint<8>)";
+    assert!(base.contains(THREAD), "fixture shape changed");
+    let hookable = "    hookable ping(v: uint<8>)\n        prep_acc = prep_acc + v\n    end ping\n";
+    let periodic = "    on 5 cycles\n        prep_acc = prep_acc + 1\n    end on\n";
+
+    // The initiator form needs the target thread GONE: a transactor
+    // carrying both is caught by the mixing check ahead of these arms.
+    let no_thread = {
+        let i = base.find(THREAD).expect("thread present");
+        let j = base.find("    end thread").expect("thread ends") + "    end thread\n".len();
+        format!("{}{}", &base[..i], &base[j..])
+    };
+    let initiator = |items: &str| {
+        no_thread.replacen(
+            "    prep_acc : uint<32> default 0\n",
+            &format!("    prep_acc : uint<32> default 0\n\n{hookable}\n{items}"),
+            1,
+        )
+    };
+
+    // The fixture binds the instance `passive`, which is what a
+    // `when active` handler is scoped OUT of. That row needs an
+    // `active` instance for v1's emission to be observable at all.
+    const PASSIVE: &str = "let target : TlmMemTarget passive = bind mem";
+    assert!(base.contains(PASSIVE), "fixture binding changed");
+    let active = |src: String| src.replacen(PASSIVE, &PASSIVE.replace("passive", "active"), 1);
+
+    // Every position that reaches one of the three arms.
+    for (what, src) in [
+        // target-side: no `hookable`, so the thread stays.
+        (
+            "target",
+            base.replacen(THREAD, &format!("{periodic}\n{THREAD}"), 1),
+        ),
+        // initiator-side, always-on items.
+        ("initiator items", initiator(periodic)),
+        // initiator-side, inside `when active`.
+        (
+            "initiator when active",
+            active(initiator(&format!(
+                "    when active\n{periodic}    end when\n"
+            ))),
+        ),
+    ] {
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("periodic `on <N> cycles` handlers"),
+            "{what}: {msg}"
+        );
+
+        // `Unsupported` promises v1 runs the program, so v1 must emit —
+        // and the handler must CONTRIBUTE, or the promise is about
+        // nothing. v1 registers a cycle-stamped closure that fires the
+        // body every N cycles against the instance's state struct.
+        let v1 =
+            cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        assert!(
+            v1.contains("_period = (int64_t)(5);") && v1.contains("prep_acc + 1;"),
+            "{what}: v1 must emit the periodic body"
+        );
+    }
+
+    // And the negative half: a NON-periodic `on` never arrives. Both
+    // shapes below are routed to the composite table by the gate, and
+    // fail there — on the target thread the component path does not
+    // lower — with a message that names neither of these arms.
+    // The `when active` row above needed an `active` instance, and
+    // this is why: bound `passive`, v1 SCOPES THE HANDLER OUT — its
+    // output is byte-identical to the same program with the handler
+    // deleted. That is v1 obeying `when active`, not dropping the
+    // construct, so it does not weaken the `Unsupported` above.
+    let when_active = initiator(&format!("    when active\n{periodic}    end when\n"));
+    assert!(
+        when_active.contains(PASSIVE),
+        "the passive binding survives"
+    );
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&when_active)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&initiator(""))).expect("v1 emits"),
+        "v1 scopes a `when active` periodic handler out of a passive instance"
+    );
+
+    let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
+    for (what, src) in [
+        (
+            "target",
+            base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
+        ),
+        (
+            "initiator",
+            base.replacen(THREAD, &format!("{hookable}{non_periodic}\n{THREAD}"), 1),
+        ),
+    ] {
+        let msg = format!("{}", lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("reached through the component path"),
+            "{what}: a non-periodic `on` must route to the composite table: {msg}"
+        );
+        assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
+    }
+}

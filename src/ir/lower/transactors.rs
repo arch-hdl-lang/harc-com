@@ -621,9 +621,30 @@ fn lower_bound_target_transactor(
                 ));
             }
             ComponentItem::OnHandler(_) => {
+                // Reachable ONLY for a PERIODIC handler. `transactor_is_
+                // component` returns `has_on_handler` for every bound-to
+                // transactor, and that flag is set by NON-periodic
+                // handlers alone — so an event subscriber, a
+                // `bus.<ch>.handshake` monitor and a cycle-trigger all
+                // route to the composite table and never arrive here.
+                // `on <N> cycles` is the one shape that falls through.
+                //
+                // Which is why the old detail — "event-driven
+                // transactors await the event slice" — named a
+                // construct no program reaching this arm can contain.
+                //
+                // `Unsupported` is right, and measured rather than
+                // assumed: v1 emits a `_checkers` closure holding a
+                // `static ..._last` stamp and the period, firing the
+                // body every N cycles against the instance's state
+                // struct (verified compilable). On a `passive`
+                // instance a `when active`-scoped periodic handler is
+                // correctly dropped — output byte-identical to the same
+                // program without it.
                 return Err(unsupported(
-                    &format!("bound-to transactor `{tname}` `on` handlers"),
-                    "event-driven transactors await the event slice",
+                    &format!("bound-to transactor `{tname}` periodic `on <N> cycles` handlers"),
+                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
+                     never reaches this path",
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1049,9 +1070,20 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::OnHandler(_) => {
+                // Periodic-only, for the same reason as the target-side
+                // arm: `transactor_is_component` routes every
+                // non-periodic `on` on a bound-to transactor to the
+                // composite table, so `on <N> cycles` is the sole shape
+                // that arrives. Measured at both positions (always-on
+                // items and `when active`) — v1 emits the same
+                // cycle-stamped `_checkers` closure either way.
                 return Err(unsupported(
-                    &format!("initiator-side bound-to transactor `{tname}` `on` handlers"),
-                    "event-driven transactors await the event slice",
+                    &format!(
+                        "initiator-side bound-to transactor `{tname}` periodic \
+                         `on <N> cycles` handlers"
+                    ),
+                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
+                     never reaches this path",
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1126,9 +1158,20 @@ fn lower_bound_initiator_transactor(
                 ));
             }
             ComponentItem::OnHandler(_) => {
+                // Periodic-only, for the same reason as the target-side
+                // arm: `transactor_is_component` routes every
+                // non-periodic `on` on a bound-to transactor to the
+                // composite table, so `on <N> cycles` is the sole shape
+                // that arrives. Measured at both positions (always-on
+                // items and `when active`) — v1 emits the same
+                // cycle-stamped `_checkers` closure either way.
                 return Err(unsupported(
-                    &format!("initiator-side bound-to transactor `{tname}` `on` handlers"),
-                    "event-driven transactors await the event slice",
+                    &format!(
+                        "initiator-side bound-to transactor `{tname}` periodic \
+                         `on <N> cycles` handlers"
+                    ),
+                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
+                     never reaches this path",
                 ));
             }
             ComponentItem::Watchdog(_) => {
