@@ -962,7 +962,18 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
-    let extern_fns: HashSet<String> = extern_fn_decls.keys().cloned().collect();
+    // Name -> declared parameter names. The names are carried (not just
+    // membership) so `lower_extern_fn_call` can check a named argument
+    // against the DECLARATION rather than against an invented list.
+    let extern_fns: HashMap<String, Vec<String>> = extern_fn_decls
+        .iter()
+        .map(|(k, d)| {
+            (
+                k.clone(),
+                d.params.iter().map(|p| p.name.name.clone()).collect(),
+            )
+        })
+        .collect();
 
     // Enum names, so transaction fields of enum type lower as scalars
     // (v1 flattens them to `int64_t` members with index values).
@@ -2538,7 +2549,7 @@ fn lower_test(
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
-    extern_fns: &HashSet<String>,
+    extern_fns: &HashMap<String, Vec<String>>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
@@ -5578,7 +5589,7 @@ pub(crate) struct LowerCtx {
     /// helpers, methods) — an extern fn is a pure scalar C function, so
     /// it is callable wherever a pure helper is. Empty when the program
     /// declares no extern fns.
-    pub extern_fns: HashSet<String>,
+    pub extern_fns: HashMap<String, Vec<String>>,
 }
 
 impl LowerCtx {

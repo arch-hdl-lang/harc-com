@@ -188,18 +188,23 @@ impl FuncBuilder<'_> {
                 args.len()
             )));
         }
-        let mut arg_exprs = Vec::with_capacity(args.len());
-        for a in args {
-            match a {
-                CallArg::Expr(e) => arg_exprs.push(e),
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!("named arguments in helper call `{name}(...)`"),
-                        "",
-                    ));
-                }
-            }
-        }
+        // v1 drops argument names and binds strictly by position, so a
+        // name written in its own position is inert (measured:
+        // `hlp(a = 111, b = 222)` emits `hlp(111, 222)`, byte-identical
+        // to the positional form) and one written elsewhere silently
+        // SWAPS the values (`hlp(b = 222, a = 111)` emits
+        // `hlp(222, 111)`). Refusing the whole construct refused the
+        // inert form too; the shared guard splits the three cases and
+        // reads the parameter names off the declaration, so nothing is
+        // invented.
+        let declared: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();
+        super::reject_misplaced_named_args(args, &declared, &format!("helper call `{name}(...)`"))?;
+        let arg_exprs: Vec<&crate::ast::Expr> = args
+            .iter()
+            .map(|a| match a {
+                CallArg::Expr(e) | CallArg::Named { value: e, .. } => e,
+            })
+            .collect();
 
         if entry.pure {
             let mut lowered = Vec::with_capacity(arg_exprs.len());
@@ -315,15 +320,21 @@ impl FuncBuilder<'_> {
         name: &str,
         args: &[CallArg],
     ) -> Result<Expr, LowerError> {
+        // Same measurement as the helper arm above:
+        // `ref_add(b = 222, a = 111)` emits `ref_add(222, 111)` under
+        // v1, and the in-order form emits the positional one unchanged.
+        if let Some(declared) = self.ctx.extern_fns.get(name) {
+            super::reject_misplaced_named_args(
+                args,
+                declared,
+                &format!("extern fn call `{name}(...)`"),
+            )?;
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
             match a {
-                CallArg::Expr(e) => lowered.push(self.lower_expr_no_ports(e)?),
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!("named arguments in extern fn call `{name}(...)`"),
-                        "",
-                    ));
+                CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
+                    lowered.push(self.lower_expr_no_ports(e)?)
                 }
             }
         }
@@ -390,18 +401,22 @@ impl FuncBuilder<'_> {
             ));
         }
 
-        let mut arg_exprs = Vec::with_capacity(args.len());
-        for a in args {
-            match a {
-                CallArg::Expr(e) => arg_exprs.push(e),
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!("named arguments in testbench method call `{name}(...)`"),
-                        "",
-                    ));
-                }
-            }
-        }
+        // Same measurement as the helper and extern-fn arms:
+        // `hlp(b = 222, a = 111)` emits `Tb_hlp(_tb, 222, 111)` under
+        // v1 — silently swapped — while the in-order form emits the
+        // positional one unchanged.
+        let declared: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();
+        super::reject_misplaced_named_args(
+            args,
+            &declared,
+            &format!("testbench method call `{name}(...)`"),
+        )?;
+        let arg_exprs: Vec<&crate::ast::Expr> = args
+            .iter()
+            .map(|a| match a {
+                CallArg::Expr(e) | CallArg::Named { value: e, .. } => e,
+            })
+            .collect();
         enum Bound {
             Dut,
             Val(Expr),

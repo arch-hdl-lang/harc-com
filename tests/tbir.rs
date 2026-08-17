@@ -18550,3 +18550,109 @@ fn the_record_api_guard_reports_the_worst_argument_not_the_first() {
     )))
     .expect("v1 accepts both named arguments");
 }
+
+/// A named argument written in its own position is inert, and three
+/// call families now say so instead of refusing the whole construct.
+///
+/// v1 drops argument names and binds strictly by position. Measured for
+/// each family below, comparing emitted C++:
+///
+/// | call | v1 emits |
+/// |---|---|
+/// | `hlp(111, 222)` | `hlp(111, 222)` |
+/// | `hlp(a = 111, b = 222)` | `hlp(111, 222)` |
+/// | `hlp(b = 222, a = 111)` | `hlp(222, 111)` |
+///
+/// So the in-order form is byte-identical to the positional one — v1
+/// contributes nothing by dropping the name — and only the reordered
+/// form silently swaps the values. Refusing every named argument
+/// refused the inert form too.
+///
+/// Each parameter list is read off the DECLARATION the call resolves
+/// to, never written from memory: `record_write` was once given an
+/// invented `["reg", "value"]` and refused the documented form outright.
+#[test]
+fn a_named_argument_in_its_own_position_lowers_for_the_families_that_know_their_parameters() {
+    const D: &str = "domain D\n  freq_mhz: 100\nend domain D\n\n";
+    // (family, source template with {call}, the emitted text to match)
+    let helper = |call: &str| {
+        format!(
+            "{D}function hlp(a: uint<32>, b: uint<32>)\n    log(info, \"h ${{a}} ${{b}}\")\n\
+             end function hlp\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n        {call}\n\
+             \x20       wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+    let tb_method = |call: &str| {
+        format!(
+            "{D}testbench Tb\n    dut : Top\n    function hlp(a: uint<32>, b: uint<32>)\n\
+             \x20       log(info, \"h ${{a}} ${{b}}\")\n    end function hlp\nend testbench Tb\n\n\
+             impl T for Tb\n    run\n        {call}\n        wait 1 cycle\n    end run\nend impl T\n"
+        )
+    };
+    let extern_fn = |call: &str| {
+        format!(
+            "{D}extern function ref_add(a: uint<32>, b: uint<32>) -> uint<32>\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n        let v = {call}\n\
+             \x20       log(info, \"v ${{v}}\")\n        wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+
+    for (family, src, callee, needle) in [
+        (
+            "a helper",
+            &helper as &dyn Fn(&str) -> String,
+            "hlp",
+            "hlp(",
+        ),
+        ("a testbench method", &tb_method, "hlp", "Tb_hlp(_tb, "),
+        ("an extern fn", &extern_fn, "ref_add", "ref_add("),
+    ] {
+        let emitted = |call: &str| -> String {
+            cpp_tb::emit(&merged_src(&src(call)))
+                .unwrap_or_else(|e| panic!("{family}: v1 emits `{call}`: {e}"))
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(|l| l.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(" ;; ")
+        };
+
+        // v1's own behaviour, which is what the classification rests on.
+        let positional = emitted(&format!("{callee}(111, 222)"));
+        assert_eq!(
+            emitted(&format!("{callee}(a = 111, b = 222)")),
+            positional,
+            "{family}: the in-order form must be byte-identical to positional"
+        );
+        assert_ne!(
+            emitted(&format!("{callee}(b = 222, a = 111)")),
+            positional,
+            "{family}: the reordered form must differ — that is the swap"
+        );
+
+        // TB-IR: positional and in-order lower; only the swap is refused.
+        lower_src(&src(&format!("{callee}(111, 222)")))
+            .unwrap_or_else(|e| panic!("{family}: positional lowers: {e}"));
+        lower_src(&src(&format!("{callee}(a = 111, b = 222)")))
+            .unwrap_or_else(|e| panic!("{family}: an in-order name lowers: {e}"));
+        let msg = assert_not_implemented(
+            &lower_src(&src(&format!("{callee}(b = 222, a = 111)"))).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("`b` is parameter 2 here but was written in position 1"),
+            "{family}: {msg}"
+        );
+
+        // A name matching no parameter is `Invalid`: v1 binds by
+        // position and emits the right code, so it is a program error,
+        // not a mis-lowering.
+        let msg =
+            assert_invalid(&lower_src(&src(&format!("{callee}(nosuch = 111, 222)"))).unwrap_err());
+        assert!(
+            msg.contains("`nosuch` names no parameter of"),
+            "{family}: {msg}"
+        );
+    }
+}
