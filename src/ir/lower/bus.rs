@@ -19,7 +19,7 @@
 //!   Run/Check functions only). Backends expand the edge themselves;
 //!   the tbir backend mirrors v1's req/rsp wire protocol.
 
-use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
+use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BusDecl, CallArg, Expr as AstExpr, ExprKind, HandshakeChannel, LetStmt, TlmMethod, TypeExpr,
 };
@@ -114,9 +114,22 @@ pub(super) fn lower_bus_binding(
     match l.value.as_ref().map(|v| &*v.kind) {
         Some(ExprKind::Ident(id)) if id.name == "dut" => {}
         _ => {
-            return Err(unsupported(
+            // v1 does not resolve the bind target: it substitutes the
+            // bind EXPRESSION where the DUT pointer goes and dereferences
+            // it. Neither shape compiles, for two different reasons —
+            // `= bind nope` emits `nope->mem_read_addr` against a symbol
+            // v1 never declares, and `= bind dut.core` emits
+            // `harc_rt::harc_read(dut->core)->mem_read_addr`, applying
+            // `operator->` to the VALUE `harc_read` returns. Both probed
+            // by mutating `tlm_method_blocking_bus_test` (registered,
+            // passing under both backends) one token; the bare-ident case
+            // changes 72 lines, every one of them a `dut->` access.
+            return Err(not_implemented(
                 &format!("bus binding `{bind}` to a non-DUT target"),
-                "only `= bind dut` is lowered",
+                "only `= bind dut` is lowered; v1 substitutes the bind expression for \
+                 the DUT pointer and dereferences it, which resolves to no symbol at \
+                 all for a bare name and to a non-pointer value for a field path",
+                V1Status::EmitsUncompilable,
             ));
         }
     }
@@ -332,9 +345,23 @@ impl FuncBuilder<'_> {
                             self.lower_handshake_recv(&bind, &h, args, dest)?;
                             Ok(true)
                         }
-                        other => Err(unsupported(
+                        // v1 splits on whether the method name happens to
+                        // be a channel SIGNAL. `strm.s.poke()` is not, so
+                        // it reports "channel `s` has no signal `poke`" —
+                        // but `strm.s.data()` IS, and v1 emits it as a
+                        // signal read with the call parens left on:
+                        // `auto d = harc_rt::harc_read(dut->strm_s_data)();`.
+                        // `harc_read` returns a VALUE (`_harc_u128` /
+                        // `HarcWide<N>`), so that is "expression cannot be
+                        // used as a function" — the worse of the two
+                        // outcomes, and the one that sets the status.
+                        // Probed by adding a channel call to
+                        // `stream_burst_mon_test`; `.recv()` is itself a
+                        // control (both backends emit).
+                        other => Err(not_implemented(
                             &format!("bus channel method `.{other}(...)`"),
                             "supported: send, recv",
+                            V1Status::EmitsUncompilable,
                         )),
                     };
                 }
@@ -490,13 +517,22 @@ impl FuncBuilder<'_> {
         args: &[CallArg],
         dest: BusCallDest<'_>,
     ) -> Result<(), LowerError> {
+        // The parser admits only `blocking` and `out_of_order tags N`, so
+        // this arm is reachable exactly for a *direct* (non-`fork`) call on
+        // an `out_of_order` method. v1 rejects that shape as well: "HARC
+        // direct-Verilator lowering currently supports only `blocking`
+        // tlm_method calls; `out_of_order` is parsed for ARCH compatibility
+        // but not lowered here". Verified by mutating `tlm_method_bus_test`
+        // one token (dropping `fork` from `let forked0 = fork
+        // mem.read_ooo(9)`); the control lowers in both backends.
         if m.mode.name != "blocking" {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!("`{}` tlm_method calls", m.mode.name),
                 format!(
                     "`{bind}.{}` — only `blocking` methods are lowered",
                     m.name.name
                 ),
+                V1Status::Rejects,
             ));
         }
         if args.len() != m.args.len() {
@@ -586,10 +622,18 @@ impl FuncBuilder<'_> {
         let ExprKind::ForkCall { call } = &*e.kind else {
             return Ok(false);
         };
+        // The next three arms mirror v1's `try_emit_bus_tlm_fork` shape
+        // checks one-for-one, and v1 rejects each of them: `fork 9` and
+        // `fork read_ooo(9)` both give "`fork` RHS currently requires a
+        // direct bus tlm_method call", `fork mem.inner.read_ooo(9)` gives
+        // "`fork` RHS currently requires `bus.method(args)`". Verified by
+        // mutating `tlm_method_bus_test` one token at a time; the control
+        // lowers in both backends.
         let ExprKind::Call { callee, args } = &*call.kind else {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "`fork` RHS that is not a direct bus tlm_method call",
                 "only `fork <bus>.<method>(args)` is lowered",
+                V1Status::Rejects,
             ));
         };
         let ExprKind::Field {
@@ -597,15 +641,17 @@ impl FuncBuilder<'_> {
             name: method,
         } = &*callee.kind
         else {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "`fork` RHS that is not `<bus>.<method>(args)`",
                 "",
+                V1Status::Rejects,
             ));
         };
         let ExprKind::Ident(id) = &*target.kind else {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "`fork` RHS that is not rooted at a bus binding",
                 "",
+                V1Status::Rejects,
             ));
         };
         let Some(bus) = self.ctx.bus_bindings.get(&id.name) else {
@@ -634,10 +680,19 @@ impl FuncBuilder<'_> {
                 *next += 1;
                 Some(tag)
             }
+            // Unreachable today: `parse_tlm_method_decl` admits only
+            // `blocking` and `out_of_order`, and both are handled above.
+            // Kept as a defensive arm, classified to match v1 — its
+            // `try_emit_bus_tlm_fork` carries the identical unreachable
+            // arm and pushes an error ("HARC RHS-fork lowering supports
+            // `blocking` and `out_of_order tags N`, not `{mode}`"), so a
+            // third mode added to the shared parser would be rejected by
+            // both backends.
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("`fork {bind}.{}` on a `{other}` tlm_method", m.name.name),
                     "fork supports `blocking` and `out_of_order tags N` methods",
+                    V1Status::Rejects,
                 ));
             }
         };
