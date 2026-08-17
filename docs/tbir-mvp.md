@@ -3961,9 +3961,13 @@ case and only locally-determinable `Assign` types are compared).
     registry is not measuring the corpus* — the registry is what runs
     under equivalence, not what exists.
 
-    Those two are capability gaps in the constraint IR, not bad programs;
-    v1 lowers both. Surfacing every variant would have rejected working
-    fixtures. Three of the four that do surface are program errors under
+    Only the first of those two actually supports the discard decision:
+    `uint64_unique_randomize_test` is lowered by BOTH backends and passes
+    trace equivalence, so surfacing `DisallowedInConstraint` would reject
+    a working fixture. `axi_agent` is rejected by both backends anyway,
+    for an unrelated covergroup reason — an earlier draft of this entry
+    said "v1 lowers both", which was false and would have counted a
+    rejected fixture as evidence. Three of the four that do surface are program errors under
     any backend — a relation that does not exist, one called with the
     wrong arity, and one that expands into itself — so they are `Invalid`
     and name no escape hatch.

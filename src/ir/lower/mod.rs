@@ -1436,16 +1436,19 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                                 ),
                             };
                             return Err(not_implemented(
-                                "a misplaced named argument in a `randomize ... with` \
-                                 relation call",
+                                "a misplaced named argument in a relation call",
                                 detail,
                                 V1Status::SilentlyMisLowers,
                             ));
                         }
                         _ => continue,
                     };
+                    // Not "`randomize ... with`": a relation call also
+                    // appears in a transaction-level `keep` (spec §4),
+                    // and naming a `with` clause that is not in the file
+                    // sends the reader looking for the wrong line.
                     return Err(LowerError::Invalid(format!(
-                        "`randomize ... with`: {detail}"
+                        "in a randomize constraint: {detail}"
                     )));
                 }
             }

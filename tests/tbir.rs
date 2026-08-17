@@ -17561,12 +17561,19 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
 /// while v1 refused it outright.
 ///
 /// Only the RELATION errors surface, and that split was measured rather
-/// than reasoned: all 173 registry fixtures were run through the table
-/// builder, and exactly ONE produces a non-relation `LowerError` —
-/// `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
-/// `DisallowedInConstraint`. That is a capability gap in the constraint
-/// IR, not a bad program: v1 lowers it and the fixture passes trace
-/// equivalence. Surfacing every variant would have rejected it.
+/// than reasoned: all 190 `.harc` files in `tests/fixtures` were run
+/// through the table builder (184 merge). Two produce a non-relation
+/// `LowerError` and ZERO produce a relation one — so the surfaced arms
+/// break nothing in the corpus, while surfacing every variant would
+/// reject `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0`
+/// trips `DisallowedInConstraint`. That is a capability gap in the
+/// constraint IR, not a bad program: both backends lower it and it
+/// passes trace equivalence.
+///
+/// (The other non-relation fixture, `axi_agent`, is rejected by BOTH
+/// backends for an unrelated covergroup reason, so only the first
+/// actually supports the discard decision. An earlier write-up said "v1
+/// lowers both", which was false.)
 #[test]
 fn relation_errors_in_randomize_with_now_reach_the_user() {
     let src = fixture("relation_inlining_test.harc");
