@@ -3203,6 +3203,14 @@ impl super::FuncBuilder<'_> {
                 // uncompilable under both. So no backend runs the
                 // program as written, and `Invalid` is the verdict the
                 // sibling branch already gives it.
+                //
+                // `Invalid` refuses outright, so the arity rule was
+                // checked against v1 rather than read off the spec.
+                // Both `in_ev : event` (no type argument) and
+                // `in_ev : event<uint<8>, uint<8>>` pass `harc check`,
+                // and v1 emits `std::function<void(uint64_t)>` for
+                // both: one payload slot however the field is spelled.
+                // There is no other arity to be right about.
                 if args.len() != 1 {
                     return Err(LowerError::Invalid(format!(
                         "`emit {}` carries {} argument(s); an event payload is exactly one",

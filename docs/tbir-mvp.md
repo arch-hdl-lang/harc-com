@@ -4860,6 +4860,25 @@ case and only locally-determinable `Assign` types are compared).
     tagger.in_ev(i + 1, 2)` ran green under v1 with the second payload
     thrown away.
 
+    `Invalid` refuses programs outright, so the obvious way to get this
+    wrong is a legal spelling where the arity is NOT one. Two candidates
+    exist and both pass `harc check`: a bare `in_ev : event` with no
+    type argument, and `in_ev : event<uint<8>, uint<8>>` with two. So
+    the rule was checked against v1 rather than read off spec §17.2,
+    and it holds for a reason stronger than the spec:
+
+      * bare `event` — v1 emits the channel as
+        `std::vector<std::function<void(uint64_t)>>` anyway and
+        registers `on in_ev()`'s handler as a ONE-parameter lambda,
+        then emits `_s()` at the emit site. g++: "no match for call to
+        '(std::function<void(long unsigned int)>) ()'".
+      * `event<A, B>` — same `void(uint64_t)` channel, and the emit
+        drops the second payload silently.
+
+    v1 has exactly one payload slot however the field is spelled, so
+    there is no arity but one to be right about, and neither
+    alternative spelling is an escape hatch.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

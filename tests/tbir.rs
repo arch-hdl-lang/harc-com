@@ -19315,4 +19315,40 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
             }
         }
     }
+
+    // `Invalid` refuses programs outright, so the way to get this wrong
+    // is a legal spelling whose arity is not one. Two exist and BOTH
+    // pass `harc check`. Neither is an escape hatch: v1 emits a
+    // one-payload channel however the field is written.
+    let agent = fixture("agent_on_handler_test.harc");
+    const FIELD: &str = "in_ev : event<uint<8>>";
+    assert!(agent.contains(FIELD), "fixture shape changed");
+
+    // No type argument at all, emitted and handled with no payload.
+    let bare = agent
+        .replacen(FIELD, "in_ev : event", 1)
+        .replacen("emit tagger.in_ev(i + 1)", "emit tagger.in_ev()", 1)
+        .replacen("on in_ev(t)", "on in_ev()", 1)
+        .replacen("        last = t\n", "", 1);
+    assert_invalid(&lower_src(&bare).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&bare)).expect("v1 emits");
+    assert!(
+        v1.contains("std::vector<std::function<void(uint64_t)>> in_ev;") && v1.contains(") _s();"),
+        "v1 keeps a one-payload channel and calls it with none"
+    );
+
+    // Two type arguments, emitted with two payloads.
+    let two = agent
+        .replacen(FIELD, "in_ev : event<uint<8>, uint<8>>", 1)
+        .replacen("emit tagger.in_ev(i + 1)", "emit tagger.in_ev(i + 1, 2)", 1);
+    assert_invalid(&lower_src(&two).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&two)).expect("v1 emits");
+    assert!(
+        v1.contains("std::vector<std::function<void(uint64_t)>> in_ev;"),
+        "v1 keeps a one-payload channel"
+    );
+    assert!(
+        !v1.contains(", 2);"),
+        "and drops the second payload rather than carrying it"
+    );
 }
