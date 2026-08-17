@@ -18383,3 +18383,109 @@ fn logf_takes_its_path_by_position_not_by_value() {
         assert_eq!(line(&tb), line(&v1), "{what}: backends disagree");
     }
 }
+
+/// The one-argument record API is guarded like every other, and the
+/// guard reports the WORST argument rather than the first.
+///
+/// `record_read` was the only record-API site that accepted an unknown
+/// parameter name silently. One argument does not make the check
+/// pointless: a name matching nothing is still a program error no
+/// backend can honour, and `record_read(reg = 4)` reads like it names
+/// something.
+///
+/// The worst-argument half is a separate claim. The two verdicts are
+/// not equally bad and the arguments are not examined in order of
+/// badness, so returning on the first one found let an unknown name
+/// hide a genuine swap behind it — the silent mis-lowering being the
+/// graver of the two.
+#[test]
+fn the_record_api_guard_reports_the_worst_argument_not_the_first() {
+    const READ: &str = "let sa  = regs.record_read(0x18)";
+    const WRITE: &str = "regs.record_write(0x18, 305419896)";
+    let fixture_src = fixture("regblock_record_api_test.harc");
+    assert!(
+        fixture_src.contains(READ) && fixture_src.contains(WRITE),
+        "fixture shape changed"
+    );
+    // The fixture `use`s a stdlib bus, so it only lowers alongside the
+    // bus declaration — same as the CLI's `resolve_use_imports`.
+    let bus_src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch"),
+    )
+    .expect("read stdlib bus");
+    let merge_with_bus = |src: &str| {
+        merge::merge_for_sim(
+            vec![
+                parse_source(src).expect("fixture parses"),
+                parse_source(&bus_src).expect("stdlib bus parses"),
+            ],
+            None,
+        )
+        .expect("merge")
+    };
+    let lower_it = |src: &str| lower::lower_program(&merge_with_bus(src));
+    let with = |old: &str, new: &str| fixture_src.replacen(old, new, 1);
+
+    // The fixture is a working program under both backends: the control
+    // that keeps every assertion below from passing for the wrong
+    // reason.
+    lower_it(&fixture_src).expect("the unmodified fixture lowers");
+
+    // `record_read`, one argument, name in its own position: inert, and
+    // must still lower.
+    lower_it(&with(READ, "let sa  = regs.record_read(addr = 0x18)"))
+        .expect("a correctly-named single argument lowers");
+
+    // A name matching no parameter is `Invalid` — v1 binds by position
+    // and emits exactly the right code, so claiming it mis-lowers would
+    // be a false explanation.
+    // NOT `reg = 0x18`: `reg` is a lexer keyword, so that program does
+    // not parse and the assertion would be measuring the parser. The
+    // same trap already cost this guard once, when `record_write` was
+    // given an invented `["reg", "value"]` list whose first entry could
+    // never match a parseable program.
+    assert!(
+        parse_source(&with(READ, "let sa  = regs.record_read(reg = 0x18)")).is_err(),
+        "`reg` is a keyword; if this starts parsing, the example below can use it"
+    );
+    let msg = assert_invalid(
+        &lower_it(&with(READ, "let sa  = regs.record_read(nosuch = 0x18)")).unwrap_err(),
+    );
+    assert!(
+        msg.contains("`nosuch` names no parameter of a `record_read(...)` call")
+            && msg.contains("expected `addr`"),
+        "{msg}"
+    );
+
+    // The worst-argument case, on the two-argument sibling: an unknown
+    // name FIRST and a genuine swap SECOND. The swap must win.
+    let msg = assert_not_implemented(
+        &lower_it(&with(
+            WRITE,
+            "regs.record_write(nosuch = 0x18, addr = 305419896)",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`addr` is parameter 1 here but was written in position 2"),
+        "the swap must outrank the unknown name: {msg}"
+    );
+
+    // With no swap present the unknown name is still reported, so
+    // preferring the swap did not silence it.
+    let msg = assert_invalid(
+        &lower_it(&with(WRITE, "regs.record_write(nosuch = 0x18, 305419896)")).unwrap_err(),
+    );
+    assert!(msg.contains("`nosuch` names no parameter"), "{msg}");
+
+    // And v1 accepts both named arguments and binds them by position,
+    // which is what makes the swap the graver verdict of the two.
+    cpp_tb::emit(&merge_with_bus(&with(
+        WRITE,
+        "regs.record_write(nosuch = 0x18, addr = 305419896)",
+    )))
+    .expect("v1 accepts both named arguments");
+}

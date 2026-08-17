@@ -926,6 +926,25 @@ impl super::FuncBuilder<'_> {
                 args.len()
             )));
         }
+        // `(addr)` — the name the `Invalid` message three lines above
+        // quotes, and the one `docs/ral-support.md` §"Passive
+        // record_write(addr,data) / record_read(addr)" uses. Same list
+        // discipline as `record_write` below: a builtin has no
+        // declaration node to read, so the name is checked against the
+        // compiler's own diagnostic and the docs rather than recalled.
+        //
+        // One argument does not make the check pointless. A name that
+        // matches nothing is still a program error no backend can
+        // honour — `record_read(nosuch = 4)` reads like it names
+        // something and names nothing — and leaving it unguarded made
+        // this the only record-API site that accepted one silently.
+        // (Not `reg = 4` as an example: `reg` is a lexer keyword, so
+        // that program does not parse at all.)
+        super::reject_misplaced_named_args(
+            args,
+            &["addr".to_string()],
+            "a `record_read(...)` call",
+        )?;
         let reg = self.resolve_record_api_reg(&binding, "record_read", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(

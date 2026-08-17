@@ -4333,6 +4333,51 @@ case and only locally-determinable `Assign` types are compared).
     empty, and counting a list the path has already been removed from
     would tell it there was one fewer slot to fill.
 
+65. **The worst argument, not the first (2026-08-17).**
+
+    Two loose ends on `reject_misplaced_named_args`, closed together
+    because they are the same function.
+
+    **`record_read` was unguarded.** It was the only record-API site
+    that accepted an unknown parameter name silently. One argument does
+    not make the check pointless: a name matching nothing is still a
+    program error no backend can honour. Its parameter list — `addr` —
+    comes from the compiler's own `Invalid` message two lines above the
+    guard and from `docs/ral-support.md`, not from memory, which is the
+    discipline `record_write` earned the hard way when it was given an
+    invented `["reg", "value"]`.
+
+    That lesson bit again while writing the test. The natural example
+    for an unknown name is `record_read(reg = 4)` — and `reg` is a lexer
+    keyword, so that program does not parse, and the assertion would
+    have been measuring the parser rather than the guard. The test now
+    asserts that it does not parse, and uses `nosuch` for the real case.
+    *The same trap, at the same site, caught twice.*
+
+    **The guard reported the first bad argument, not the worst.** Its
+    two verdicts are not equally bad — an unknown name is `Invalid` (v1
+    binds by position and emits exactly the right code), a misplaced
+    known name is `SilentlyMisLowers` (v1 emits working C++ with the
+    values swapped) — and the arguments are not examined in order of
+    badness. So in `record_write(nosuch = 0x18, addr = 305419896)` the
+    unknown name came first, its `Invalid` was returned, and the genuine
+    swap behind it was never reported. Fixing the typo would then
+    reveal a second error: exactly the experience a diagnostic should
+    not give. The unknown-name verdict is now held rather than returned,
+    so a swap anywhere in the list outranks it, and with no swap present
+    it is still reported.
+
+    Both are pinned by mutation: deleting the `record_read` call site
+    fails the guard test, and restoring first-wins ordering fails the
+    worst-argument case.
+
+    Not guarded, and deliberately: `bitbash(regs)`. Its single argument
+    has no declared parameter name anywhere — the compiler's message
+    calls it "the regblock binding" and the docs write `bitbash(regs)`,
+    where `regs` is the user's binding, not a parameter. Guarding it
+    would mean inventing a name to check against, which is the mistake
+    `record_write` already made once.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

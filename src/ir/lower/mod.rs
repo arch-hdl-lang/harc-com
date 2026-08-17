@@ -4919,6 +4919,16 @@ pub(crate) fn reject_misplaced_named_args(
     declared: &[String],
     construct: &str,
 ) -> Result<(), LowerError> {
+    // Report the WORST argument, not the first. The two classes below
+    // are not equally bad and the arguments are not examined in order
+    // of badness, so returning on the first one found let the milder
+    // verdict hide the graver one: in
+    // `f(nosuch = 1, hi = 2, lo = 3)` the unknown name comes first and
+    // its `Invalid` was returned, so the genuine swap behind it — a
+    // SILENT mis-lowering, the thing this guard exists to catch — was
+    // never reported. Fixing the typo then revealed a second error,
+    // which is precisely the experience a diagnostic should not give.
+    let mut unknown: Option<LowerError> = None;
     for (i, a) in args.iter().enumerate() {
         let crate::ast::CallArg::Named { name, .. } = a else {
             continue;
@@ -4934,17 +4944,21 @@ pub(crate) fn reject_misplaced_named_args(
         // `SilentlyMisLowers` would claim v1 emits something else, and
         // for a typo sitting in a valid position v1 emits exactly the
         // right code — the same false-explanation class this guard was
-        // rewritten to stop producing.
+        // rewritten to stop producing. Held, not returned, so a swap
+        // later in the list still wins.
         if !declared.contains(&name.name) {
-            return Err(LowerError::Invalid(format!(
-                "`{}` names no parameter of {construct} (expected {})",
-                name.name,
-                declared
-                    .iter()
-                    .map(|d| format!("`{d}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )));
+            unknown.get_or_insert_with(|| {
+                LowerError::Invalid(format!(
+                    "`{}` names no parameter of {construct} (expected {})",
+                    name.name,
+                    declared
+                        .iter()
+                        .map(|d| format!("`{d}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            });
+            continue;
         }
         return Err(not_implemented(
             &format!("a misplaced named argument in {construct}"),
@@ -4959,7 +4973,10 @@ pub(crate) fn reject_misplaced_named_args(
             V1Status::SilentlyMisLowers,
         ));
     }
-    Ok(())
+    match unknown {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// True when a hooked `on` handler has the shape v1's method-hook
