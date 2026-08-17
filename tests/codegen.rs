@@ -9842,6 +9842,136 @@ fn a_sized_literal_in_plain_string_text_is_left_alone() {
     );
 }
 
+/// harc#593. A `${...}` capture was never validated, and `parse_expr_fragment`
+/// does not require the fragment to be consumed — so a PARTIAL parse was
+/// silently truncated by both backends. `${1 2}` printed `1`. Because the two
+/// emitters agreed, no parity check could see it, and because the output was a
+/// plausible number rather than a failure, nothing else would either.
+#[test]
+fn a_partially_parsing_interpolation_capture_is_rejected() {
+    let bad = |body: &str| {
+        let src =
+            format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T");
+        match parse_source(&src) {
+            Ok(_) => panic!("expected rejection of: {body}"),
+            Err(e) => e.to_string(),
+        }
+    };
+    // Truncation: each of these used to print the leading fragment.
+    for c in ["1 2", "x + 1 total_garbage", "x 999"] {
+        let err = bad(&format!(r#"log(info, "v=${{{c}}}")"#));
+        assert!(
+            err.contains("is not an expression"),
+            "`${{{c}}}` must be rejected, not truncated; got: {err}"
+        );
+    }
+    // Outright unparseable: these used to be pasted into the C++ verbatim
+    // by v1, and reported as an unimplemented subset gap by TB-IR.
+    for c in ["1 +", "dut.", "@@@"] {
+        let err = bad(&format!(r#"log(info, "v=${{{c}}}")"#));
+        assert!(
+            err.contains("is not an expression"),
+            "`${{{c}}}` must be rejected; got: {err}"
+        );
+    }
+}
+
+/// The ternary is the one shape whose rejection the author cannot explain
+/// from the text: a capture is split on its LAST `:`, so `${a ? b : c}`
+/// hands `a ? b` to the parser. It emitted uncompilable C++ before, so this
+/// is not a regression — but the diagnostic has to say why, and name the
+/// spelling that works.
+#[test]
+fn the_ternary_interpolation_collision_is_explained() {
+    let src = |body: &str| {
+        format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T")
+    };
+    let err = parse_source(&src(r#"log(info, "v=${x > 3 ? 1 : 0}")"#))
+        .expect_err("a bare ternary capture cannot work with the last-`:` split")
+        .to_string();
+    // The explanation is in the MESSAGE, not the `help`: an integration test
+    // sees only `Display`, and a claim a test cannot read is a claim that
+    // rots. The suggested spelling stays in `help`.
+    assert!(
+        err.contains("split on its LAST `:`") && err.contains("ternary"),
+        "the diagnostic must explain the collision; got: {err}"
+    );
+    // With an explicit format spec the split point moves and it parses.
+    parse_source(&src(r#"log(info, "v=${x > 3 ? 1 : 0:d}")"#))
+        .expect("an explicit format spec moves the split and makes a ternary work");
+}
+
+/// An EMPTY capture is not an expression either, and `parse_expr_fragment("")`
+/// fails — so exempting it from the check let `harc check` accept a program
+/// both backends then rejected. That is the check-versus-backend split
+/// harc#593 is about, reproduced by the first version of the fix for it.
+///
+/// The point of validating in the parser is that one place answers for
+/// `harc check` and both backends, so this asserts the three agree.
+#[test]
+fn an_empty_interpolation_capture_is_rejected_by_the_parser() {
+    for c in ["", ":04x", ":"] {
+        let src = format!(
+            "test T\n    let dut : Top\n    run\n        log(info, \"v=${{{c}}}\")\n    end run\nend test T"
+        );
+        let err = parse_source(&src)
+            .expect_err(&format!("`${{{c}}}` must be rejected at parse time"))
+            .to_string();
+        assert!(err.contains("is not an expression"), "got: {err}");
+    }
+}
+
+/// A bit-slice carries the ternary's exact root cause — its own `:` collides
+/// with the last-`:` format-spec split — and has the exact same fix, so it
+/// must get the same explanation rather than "you did not write an
+/// expression", which is false: the author wrote one.
+#[test]
+fn the_bit_slice_interpolation_collision_is_explained_too() {
+    let src = |body: &str| {
+        format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T")
+    };
+    let err = parse_source(&src(r#"log(info, "v=${a[1:0]}")"#))
+        .expect_err("a bare bit-slice capture collides with the spec split")
+        .to_string();
+    assert!(
+        err.contains("split on its LAST `:`") && err.contains("bit-slice"),
+        "the diagnostic must name the bit-slice collision; got: {err}"
+    );
+    parse_source(&src(r#"log(info, "v=${a[1:0]:02x}")"#))
+        .expect("an explicit format spec moves the split and makes a bit-slice work");
+}
+
+/// Captures that ARE expressions must still parse, including the format-spec
+/// form — the whole risk of validating here is rejecting working programs.
+#[test]
+fn legal_interpolation_captures_still_parse() {
+    let ok = |body: &str| {
+        let src =
+            format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T");
+        parse_source(&src).is_ok()
+    };
+    for c in [
+        "x",
+        "x + 1",
+        "x:04x",
+        "x + 1:08x",
+        "dut.count_out",
+        "cycle_count",
+        "t.vals[0]",
+        "(x + 1) * 2",
+    ] {
+        assert!(
+            ok(&format!(r#"log(info, "v=${{{c}}}")"#)),
+            "`${{{c}}}` must still parse"
+        );
+    }
+    // Text outside `${...}` is prose and is not touched.
+    assert!(
+        ok(r#"log(info, "1 + and dut. and @@@ are fine in prose")"#),
+        "prose must not be parsed as an expression"
+    );
+}
+
 /// Sizing a decimal literal above `u128` is quadratic in the digit count,
 /// and it runs in the parser on whatever the source says: 100 000 digits
 /// took ~10s, and `MAX_SOURCE_LEN` is `u32::MAX`. Capped, with hex and
@@ -10178,6 +10308,160 @@ fn a_scalar_membership_lowering_parenthesises_its_substituted_operator() {
     assert!(
         cpp.contains("_s.add((_z_len == _ctx.bv_val((uint64_t)3, 64)))"),
         "the substituted `==` must be parenthesised; got:\n{cpp}"
+    );
+}
+
+/// harc#563, part 1. A signed `let` inlined into a `blocking randomize`
+/// constraint compared UNSIGNED, because the signedness oracle resolved
+/// only `field_info`. `(uint64_t)(int8_t)-1` is `0xFFFF...FF`, so
+/// `z3::ult(_z_x, that)` is true for every `x` — the solver returned a
+/// value the source `x < -1` forbids outright.
+///
+/// The declared signedness rides on the existing `let_widths` entry rather
+/// than a table of its own; harc#550 removed a flat `let_signed_widths`
+/// because a signed local in one function poisoned the name for all others.
+#[test]
+fn a_signed_local_compares_signed_in_a_blocking_constraint() {
+    let src = |ty: &str, init: &str| {
+        format!(
+            r#"transaction Txn
+    x : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let s : {ty} = {init}
+        let t : Txn
+        blocking randomize(t) with
+            t.x < s
+        end randomize
+        log(info, "${{t.x}}")
+    end run
+end test T"#
+        )
+    };
+    let signed = v1_cpp(&src("sint<8>", "0 - 1"));
+    assert!(
+        signed.contains("_s.add(_z_x < _ctx.bv_val((uint64_t)(s), 64))"),
+        "a signed local must use the signed predicate; got:\n{signed}"
+    );
+    assert!(
+        !signed.contains("z3::ult(_z_x, _ctx.bv_val((uint64_t)(s)"),
+        "and must not use `ult`; got:\n{signed}"
+    );
+    // The other direction matters as much: an unsigned local must NOT be
+    // dragged onto the signed predicate by the same lookup.
+    let unsigned = v1_cpp(&src("uint<8>", "7"));
+    assert!(
+        unsigned.contains("z3::ult(_z_x, _ctx.bv_val((uint64_t)(s), 64))"),
+        "an unsigned local must stay unsigned; got:\n{unsigned}"
+    );
+}
+
+/// `let_widths` is keyed by bare name with NO scoping, so a shadowed name's
+/// entry belongs to whichever `let` was seen last rather than the one in
+/// scope. Signedness cannot ride that out the way a width check can:
+/// reading the wrong entry flips `udiv` to `/`, changing the solved value.
+///
+/// The first version of the harc#563 fix ignored the `shadowed_lets` guard
+/// the width oracle already consults, so an inner-block `let m : sint<64>`
+/// made an OUTER `uint<64>` `m` divide signed — a regression in a
+/// constraint that mentions neither block. A shadowed name now answers
+/// unsigned: under-reporting, i.e. the pre-harc#563 answer, rather than a
+/// new wrong predicate.
+#[test]
+fn a_shadowed_local_does_not_flip_the_predicate() {
+    let shadowed = v1_cpp(
+        r#"transaction Txn
+    u : uint<64> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let m : uint<64> = 10000000000000000000
+        if dut.en == 1
+            let m : sint<64> = 0 - 1
+            log(info, "inner=${m}")
+        end if
+        let t : Txn
+        blocking randomize(t) with
+            t.u == m / 2
+        end randomize
+        log(info, "${t.u}")
+    end run
+end test T"#,
+    );
+    assert!(
+        shadowed.contains("z3::udiv(_ctx.bv_val((uint64_t)(m), 64)"),
+        "the outer `m` is unsigned; an inner shadow must not make it divide \
+         signed; got:\n{shadowed}"
+    );
+    // And the guard must not swallow the fix for an UNSHADOWED local.
+    let plain = v1_cpp(
+        r#"transaction Txn
+    x : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let s : sint<8> = 0 - 1
+        let t : Txn
+        blocking randomize(t) with
+            t.x < s
+        end randomize
+        log(info, "${t.x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        plain.contains("_s.add(_z_x < _ctx.bv_val((uint64_t)(s), 64))"),
+        "an unshadowed signed local must still compare signed; got:\n{plain}"
+    );
+}
+
+/// harc#563, part 2. The oracle had no `Index` arm, so an element of a
+/// signed list compared unsigned: `v < 0` over a `list<sint<8>>` emitted
+/// `z3::ult(_z_vals_0, 0)`, which no value satisfies, where the source is
+/// satisfied by any negative element.
+///
+/// The element's signedness lives on `ListFieldInfo::elem_signed`, not on
+/// the field's own `signed` — which is false for `list<sint<8>>`, and
+/// reading it kept the bug alive through the first attempt at this fix.
+#[test]
+fn a_signed_list_element_compares_signed() {
+    let src = |elem: &str| {
+        format!(
+            r#"transaction Txn
+    vals : list<{elem}>
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t) with
+            t.vals.len() == 2
+            for v in t.vals
+                v < 0
+            end for
+        end randomize
+        log(info, "${{t.vals[0]}}")
+    end run
+end test T"#
+        )
+    };
+    let signed = v1_cpp(&src("sint<8>"));
+    assert!(
+        signed.contains("|| (_z_vals_0 < _ctx.bv_val((uint64_t)0, 64))"),
+        "a signed list element must use the signed predicate; got:\n{signed}"
+    );
+    assert!(
+        !signed.contains("z3::ult(_z_vals_0"),
+        "and must not use `ult`; got:\n{signed}"
+    );
+    let unsigned = v1_cpp(&src("uint<8>"));
+    assert!(
+        unsigned.contains("|| (z3::ult(_z_vals_0, _ctx.bv_val((uint64_t)0, 64)))"),
+        "an unsigned list element must stay unsigned; got:\n{unsigned}"
     );
 }
 

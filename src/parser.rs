@@ -41,6 +41,32 @@ pub fn parse_expr_fragment(source: &str) -> Result<Expr, CompileError> {
     p.parse_expr()
 }
 
+/// `parse_expr_fragment`, but the fragment must be consumed ENTIRELY.
+///
+/// The lenient version stops as soon as it has an expression and ignores
+/// whatever follows, which is fine for a caller that controls the input and
+/// disastrous for one that does not: `${1 2}` parsed as `1`, and both
+/// backends then printed `1` with no diagnostic anywhere (harc#593).
+/// `${x + 1 total_garbage}` printed `x + 1`. Silent truncation of something
+/// the author wrote, agreed on by both emitters, so no parity check could
+/// see it either.
+pub fn parse_expr_fragment_complete(source: &str) -> Result<Expr, CompileError> {
+    let tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
+    let mut p = Parser::new(tokens, source);
+    let e = p.parse_expr()?;
+    match p.peek_kind() {
+        None => Ok(e),
+        Some(k) => {
+            let found = k.to_string();
+            Err(CompileError::unexpected_token(
+                "end of expression",
+                &found,
+                p.peek_span(),
+            ))
+        }
+    }
+}
+
 /// Parse a standalone type-expression fragment (e.g. `BusAxi4<WRITE=0>` or
 /// `Vec<BusRw<READ=1>, 4>`). Used to ingest the bus-port override carried on a
 /// DUT module's port declaration in its `.arch`/`.archi` interface, reusing the
@@ -4653,6 +4679,65 @@ fn check_interpolated_sized_literals(s: &str, span: Span) -> Result<(), CompileE
         };
         for lit in sized_literals_in(expr_src) {
             check_sized_literal(&lit, span)?;
+        }
+        // And the capture as a whole has to be an expression, completely.
+        // Nothing validated this before: each backend re-parsed the capture
+        // later and mishandled failure in its own way — v1 wrote the raw
+        // HARC text into the C++ (`harc_printf_ll(1 +)`, which does not
+        // compile), TB-IR called it an unimplemented subset gap and pointed
+        // at v1. Worse, a PARTIAL parse was silently truncated by both:
+        // `${1 2}` printed `1`. Validating here covers `harc check` and both
+        // backends at once, which is the only place that does (harc#593).
+        // No `is_empty()` exemption. `${}` and `${:04x}` leave nothing
+        // before the last `:`, and `parse_expr_fragment("")` FAILS — so
+        // exempting them here let `harc check` accept a program both
+        // backends then rejected, which is the check-versus-backend split
+        // harc#593 is about, reproduced by the fix for it.
+        {
+            crate::parser::parse_expr_fragment_complete(expr_src).map_err(|_| {
+                // A ternary is the one shape that fails here for a reason
+                // the author cannot guess from the text: the capture is
+                // split on its LAST `:`, so `${a ? b : c}` hands `a ? b` to
+                // the parser and keeps `c` as a format spec. Adding an
+                // explicit spec moves the split point and makes it work.
+                // Two constructs carry a `:` of their own inside an
+                // expression — a ternary and a bit-slice — and both collide
+                // with the last-`:` split that separates off the format
+                // spec. They fail for a reason the author cannot read off
+                // the text, and both have the same fix, so say so instead
+                // of claiming they did not write an expression.
+                //
+                // Those two are the complete set: named call arguments use
+                // `=`, so no other expression form contains a `:`.
+                let colon_construct = if inner.contains('?') {
+                    Some("ternary")
+                } else if inner.contains('[') && inner.contains(':') {
+                    Some("bit-slice")
+                } else {
+                    None
+                };
+                let (why, help) = match colon_construct {
+                    Some(what) => (
+                        format!(
+                            ": a capture is split on its LAST `:`, which collides with the \
+                             {what}'s own"
+                        ),
+                        "add an explicit format spec to move the split point — \
+                         `${a ? b : c:d}`, `${x[7:0]:02x}` — or assign the value to a \
+                         `let` first",
+                    ),
+                    None => (
+                        String::new(),
+                        "an interpolation holds one complete expression, optionally \
+                         followed by `:` and a format spec",
+                    ),
+                };
+                CompileError::invalid_literal(
+                    &format!("`${{{inner}}}` is not an expression{why}"),
+                    help,
+                    span,
+                )
+            })?;
         }
         i = j + 1;
     }

@@ -23,6 +23,7 @@ transaction Req
     len   : uint<8>
     addr  : uint<32>
     color : Color
+    ready : uint<1>
 
     // Range membership: 1..16 inclusive.
     keep len in [1..16]
@@ -30,6 +31,14 @@ transaction Req
     keep addr % 4 == 0
     // Enum exclusion: NEVER produce RED (index 0).
     keep color != RED
+    // A bare one-bit unsigned field IS a condition — `keep ready` means
+    // `ready != 0`. It is the only constraint shape that is not already a
+    // comparison, and it used to be emitted as a raw bitvector handed to
+    // `z3::solver::add`, which takes a Bool: it built and then died as a
+    // Z3 sort error at runtime (harc#560). The typed constraint IR
+    // rejected it outright, which is what kept this line out of the corpus
+    // until harc#596.
+    keep ready
 end transaction Req
 
 testbench KeepConstraintsTb
@@ -62,6 +71,10 @@ impl KeepConstraintsTest for KeepConstraintsTb
             // `color != RED` to `_z_color != bv_val(0)`.
             assert t.color != 0
                 else fail("iter ${i}: color=RED violates `keep color != RED`")
+            // `keep ready` coerces to `ready != 0`, so on one bit the only
+            // satisfying value is 1.
+            assert t.ready == 1
+                else fail("iter ${i}: ready=${t.ready} violates bare `keep ready`")
         end for
 
         log(info, "PASS: 30 randomize(t) calls satisfied every keep constraint")

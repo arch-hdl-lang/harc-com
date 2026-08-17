@@ -446,6 +446,30 @@ fn build_enum_variant_lookup(
 
 fn lower_top_clause(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
     let lowered = lower_expr(ctx, expr);
+    // A ONE-BIT clause is a flag, and reads as `<expr> != 0`. Both C++
+    // emitters have always coerced it that way — `keep ready` on a
+    // `uint<1>` field emits `_s.add(_z_ready != bv_val(0))`, under v1 and
+    // TB-IR alike — while this path rejected it as non-Bool, so a program
+    // both backends compile and solve failed to lower here (harc#596).
+    //
+    // One bit only, and unsigned only, matching the emitters exactly: a
+    // wider field has no reading that is obviously `!= 0` rather than a
+    // typo for a comparison, and harc#560 made the emitters reject it with
+    // a diagnostic — which is what this function's own
+    // `rejects_clause_that_is_not_bool` test has always asserted.
+    if let Some((1, Sign::Unsigned)) = lowered.ty.as_bv() {
+        let span = lowered.span;
+        let zero = CTypedExpr::new(CExprKind::BvLit { value: 0 }, lowered.ty.clone(), span);
+        return CTypedExpr::new(
+            CExprKind::Binary {
+                op: CBinaryOp::Ne,
+                lhs: Box::new(lowered),
+                rhs: Box::new(zero),
+            },
+            CType::Bool,
+            span,
+        );
+    }
     // Clauses must be Bool.
     if !lowered.ty.is_bool() && !lowered.ty.is_bottom() {
         ctx.record_error(LowerError::NonBoolLogical {
@@ -2142,6 +2166,41 @@ end transaction X
         );
     }
 
+    /// harc#596. A one-bit unsigned clause is a flag and coerces to
+    /// `!= 0`, which is what both C++ emitters have always done. This path
+    /// rejected it, so `keep ready` on a `uint<1>` field lowered here as an
+    /// error while both backends compiled and solved it — and that
+    /// disagreement is what kept the shape out of the fixture corpus.
+    #[test]
+    fn coerces_a_one_bit_clause_to_a_comparison() {
+        let src = r#"
+transaction X
+  ready : uint<1>
+end transaction X
+"#;
+        let prob = lower_with_body(src, &["ready"]).expect("a one-bit clause is a flag");
+        let clause = prob.constraints.first().expect("one clause").expr.clone();
+        assert!(
+            clause.ty.is_bool(),
+            "the coerced clause must be Bool; got {:?}",
+            clause.ty
+        );
+        assert!(
+            matches!(
+                clause.kind,
+                CExprKind::Binary {
+                    op: CBinaryOp::Ne,
+                    ..
+                }
+            ),
+            "it must coerce to `!= 0`, not merely be relabelled Bool; got {:?}",
+            clause.kind
+        );
+    }
+
+    /// The width above is load-bearing: one bit reads as a flag, anything
+    /// wider does not, and harc#560 made the emitters reject the wider case
+    /// with a diagnostic rather than guess. The two paths agree on that.
     #[test]
     fn rejects_clause_that_is_not_bool() {
         // A bare field expression as a clause is not Bool — should

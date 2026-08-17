@@ -3223,11 +3223,20 @@ impl FuncBuilder<'_> {
         let (fmt, caps) = crate::codegen::cpp_tb::process_interp(msg);
         let mut args = Vec::with_capacity(caps.len());
         for c in caps {
+            // `Invalid`, not `Unsupported`. A capture that does not parse is
+            // a static error in the program, not a gap in this backend —
+            // string interpolation is supported — and the old `Unsupported`
+            // mapping offered `--codegen v1` as the way out, which was the
+            // backend that wrote the raw HARC text into its C++ for the same
+            // input (harc#593). The parser now rejects such a capture up
+            // front, so this should be unreachable; it stays as a
+            // fail-closed backstop rather than a claim about v1.
             let mut parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
-                unsupported(
-                    "string interpolation",
-                    format!("`${{{}}}` does not parse as an expression", c.expr),
-                )
+                LowerError::Invalid(format!(
+                    "`${{{}}}` is not an expression; an interpolation holds one \
+                     complete expression, optionally followed by `:` and a format spec",
+                    c.expr
+                ))
             })?;
             // A message interpolation lowers lazily (the captured expr is
             // re-evaluated at the log/failure site), so a CFG-inlined call
