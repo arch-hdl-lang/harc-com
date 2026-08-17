@@ -144,17 +144,80 @@ struct LowerCtx<'a> {
     next_clause_seq: u32,
     next_local_id: u32,
     locals: BTreeMap<String, (LocalId, CType)>,
+    /// Set by `record_error` when a relation-class error lands. See
+    /// `should_stop`.
+    saw_relation_error: bool,
+}
+
+impl LowerError {
+    /// The four variants `lower_program` acts on.
+    ///
+    /// `surface_constraint_lower_error` matches these variants by hand
+    /// to word each diagnostic, so the list really is written twice.
+    /// What keeps the copies honest is a `debug_assert!` on that
+    /// function's skip arm: a variant that answers `true` here and is
+    /// not handled there trips it under `cargo test`. Silent drift
+    /// would reintroduce exactly the bug this predicate was added to
+    /// fix — the walk stopping on an error nobody acts on, or not
+    /// stopping on one that matters.
+    pub fn is_relation_error(&self) -> bool {
+        matches!(
+            self,
+            LowerError::UnknownRelation { .. }
+                | LowerError::RelationArityMismatch { .. }
+                | LowerError::RecursiveRelation { .. }
+                | LowerError::RelationNamedArgMisplaced { .. }
+        )
+    }
 }
 
 impl<'a> LowerCtx<'a> {
     fn record_error(&mut self, e: LowerError) {
-        if self.errors.len() < MAX_ERRORS {
+        // The FIRST relation error is kept, cap or no cap. It is the
+        // one class the caller acts on — `lower_program` refuses the
+        // program for it — so dropping it as the sixth error would
+        // silently convert a refusal into a mis-lowering. Later ones
+        // are dropped rather than also exempted: only the first is ever
+        // reported, and exempting all of them made the vector
+        // unbounded (a depth-8 relation fan-out over unknown relations
+        // produced 256 errors, depth 20 about a million). The bound is
+        // `MAX_ERRORS + 1`.
+        if e.is_relation_error() {
+            if !self.saw_relation_error {
+                self.saw_relation_error = true;
+                self.errors.push(e);
+            }
+            return;
+        }
+        if !self.at_error_cap() {
             self.errors.push(e);
         }
     }
 
     fn at_error_cap(&self) -> bool {
         self.errors.len() >= MAX_ERRORS
+    }
+
+    /// Whether there is anything left to learn by lowering more
+    /// clauses.
+    ///
+    /// `at_error_cap` used to be this condition, which made
+    /// `MAX_ERRORS` — a diagnostics-VOLUME guard — load-bearing for
+    /// correctness. Five clauses that trip a deliberately-discarded
+    /// error (`t.addr == t.value` trips `WidthMismatch`) stopped the
+    /// walk before a later `Band(t, hi = 2000, lo = 1000)` was ever
+    /// expanded, so the program lowered and both backends emitted the
+    /// swapped, unsatisfiable constraint. Measured: it refused at four
+    /// such clauses and lowered at five.
+    ///
+    /// `MAX_ERRORS` is out of this decision entirely now. The walk
+    /// stops exactly when a relation error is in hand, because that is
+    /// the only class a caller acts on and only the first one is ever
+    /// reported. A program with no relation error is walked to the end
+    /// and its diagnostics are capped by `record_error` alone, which is
+    /// what the cap was for.
+    fn should_stop(&self) -> bool {
+        self.saw_relation_error
     }
 
     fn bottom(&self, span: Span, kind: CExprKind) -> CTypedExpr {
@@ -185,6 +248,7 @@ pub fn lower_problem(
         next_clause_seq: 0,
         next_local_id: 0,
         locals: BTreeMap::new(),
+        saw_relation_error: false,
     };
 
     // Re-bind `env.enums` after the variant lookup is built — both use
@@ -197,13 +261,13 @@ pub fn lower_problem(
 
     // 1. Transaction-level `keep` clauses.
     for keep in &target.keeps {
-        if ctx.at_error_cap() {
+        if ctx.should_stop() {
             break;
         }
         for (origin, expr_ast) in
             expand_top_level_clause(&mut ctx, &keep.expr, keep.origin.clone(), &mut Vec::new())
         {
-            if ctx.at_error_cap() {
+            if ctx.should_stop() {
                 break;
             }
             let expr = lower_top_clause(&mut ctx, &expr_ast);
@@ -219,7 +283,7 @@ pub fn lower_problem(
     // 2. `randomize-with` body (if present).
     if let Some(body) = randomize_with_body {
         for expr in body {
-            if ctx.at_error_cap() {
+            if ctx.should_stop() {
                 break;
             }
             if let ExprKind::SolveOrder { args } = &*expr.kind {
@@ -237,7 +301,7 @@ pub fn lower_problem(
                     },
                     &mut Vec::new(),
                 ) {
-                    if ctx.at_error_cap() {
+                    if ctx.should_stop() {
                         break;
                     }
                     let lowered = lower_top_clause(&mut ctx, &expr_ast);
@@ -257,7 +321,7 @@ pub fn lower_problem(
                 ConstraintOrigin::RandomizeWith { span: expr.span },
                 &mut Vec::new(),
             ) {
-                if ctx.at_error_cap() {
+                if ctx.should_stop() {
                     break;
                 }
                 let lowered = lower_top_clause(&mut ctx, &expr_ast);
@@ -275,11 +339,11 @@ pub fn lower_problem(
     //    solver-visible; `[dist]`, `[unique]`, and policy attributes
     //    remain metadata for later runtime/sampling phases.
     for field in &target.fields {
-        if ctx.at_error_cap() {
+        if ctx.should_stop() {
             break;
         }
         for clause in lower_field_attr_constraints(&mut ctx, field, None) {
-            if ctx.at_error_cap() {
+            if ctx.should_stop() {
                 break;
             }
             clauses.push(clause);
@@ -1092,7 +1156,7 @@ fn lower_when_subtypes(
     clauses: &mut Vec<CTypedClause>,
 ) {
     for subtype in subtypes {
-        if ctx.at_error_cap() {
+        if ctx.should_stop() {
             break;
         }
         let disc = lower_top_clause(ctx, &subtype.discriminant);
@@ -1102,13 +1166,13 @@ fn lower_when_subtypes(
         };
 
         for keep in &subtype.keeps {
-            if ctx.at_error_cap() {
+            if ctx.should_stop() {
                 break;
             }
             for (origin, expr_ast) in
                 expand_top_level_clause(ctx, &keep.expr, keep.origin.clone(), &mut Vec::new())
             {
-                if ctx.at_error_cap() {
+                if ctx.should_stop() {
                     break;
                 }
                 let expr = lower_top_clause(ctx, &expr_ast);
@@ -1123,7 +1187,7 @@ fn lower_when_subtypes(
         }
 
         for field in &subtype.fields {
-            if ctx.at_error_cap() {
+            if ctx.should_stop() {
                 break;
             }
             clauses.extend(lower_field_attr_constraints(ctx, field, Some(&guard)));

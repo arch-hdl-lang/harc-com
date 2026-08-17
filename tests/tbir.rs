@@ -17985,3 +17985,75 @@ relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
         "a typed `let` shadowing a non-transaction field resolves"
     );
 }
+
+/// Five discarded errors used to disable the refusal entirely.
+///
+/// `MAX_ERRORS` is a diagnostics-VOLUME guard, and it was doubling as
+/// the stop condition for the whole constraint walk. Five clauses that
+/// trip a deliberately-discarded error — `t.addr == t.value` trips
+/// `WidthMismatch`, which divergence 59 records as a capability gap, not
+/// a bad program — filled the error vector, and the walk stopped before
+/// the `Band(t, hi = 2000, lo = 1000)` on the next line was ever
+/// expanded. TB-IR lowered, and both backends emitted the swapped,
+/// unsatisfiable constraint.
+///
+/// The cap now bounds only how many errors are STORED: a relation error
+/// is always kept, and scanning stops once one is in hand.
+#[test]
+fn a_run_of_discarded_errors_no_longer_hides_a_relation_error() {
+    let src = |pad: usize| {
+        let noise: String = (0..pad)
+            .map(|_| "            t.addr == t.value\n".to_string())
+            .collect();
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr  : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n\
+             relation Band(r: Req, lo: int, hi: int) = r.value > lo && r.value < hi\n\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n{noise}            Band(t, hi = 2000, lo = 1000)\n\
+             \x20       end randomize\n    end run\nend test T\n"
+        )
+    };
+
+    // Four noise clauses was under the cap and already refused; five was
+    // the exact point the refusal used to vanish. Both refuse now, and
+    // so does a run well past the cap.
+    for pad in [0usize, 4, 5, 9] {
+        let msg = assert_not_implemented(
+            &lower_src(&src(pad)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("misplaced named argument in a relation call"),
+            "{pad} noise clauses: {msg}"
+        );
+        // What the refusal is worth: v1 emits the swapped bounds at
+        // every one of these, and TB-IR did too at pad >= 5.
+        assert!(
+            cpp_tb::emit(&merged_src(&src(pad)))
+                .expect("v1 emits")
+                .contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))"),
+            "{pad} noise clauses: v1 binds lo := 2000"
+        );
+    }
+
+    // The cap still caps: the discarded errors are not multiplied by
+    // the longer walk, so a user does not get a wall of diagnostics for
+    // a class this backend deliberately stays quiet about.
+    let table = harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&src(9)));
+    let errs: Vec<usize> = table
+        .entries
+        .iter()
+        .filter_map(|e| match &e.build {
+            harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => {
+                Some(v.iter().filter(|x| !x.is_relation_error()).count())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        errs.iter().all(|n| *n <= 5),
+        "non-relation errors stay capped at MAX_ERRORS: {errs:?}"
+    );
+}

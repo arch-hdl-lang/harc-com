@@ -732,7 +732,17 @@ fn surface_constraint_lower_error(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            _ => continue,
+            // Must stay in step with `LowerError::is_relation_error`,
+            // which decides when the constraint walk may stop. A
+            // relation variant that reaches here unhandled would be
+            // dropped silently, so it trips under `cargo test` instead.
+            _ => {
+                debug_assert!(
+                    !e.is_relation_error(),
+                    "relation error not handled by surface_constraint_lower_error: {e:?}"
+                );
+                continue;
+            }
         };
         // Not "`randomize ... with`": a relation call also appears in a
         // transaction-level `keep` (spec §4), and naming a `with` clause
