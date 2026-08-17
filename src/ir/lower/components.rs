@@ -851,12 +851,29 @@ fn edge_to_ir(e: crate::ast::EdgeMode) -> crate::ir::CycleEdge {
 /// handled elsewhere; only the checker phase is lowered here.
 fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // v1 emits the handler with the hook side DISCARDED — byte-
+        // identical to the same handler written without it. The user
+        // asks for pre/post ordering and gets the default, silently.
+        // (Anchored: removing the handler entirely does change v1's
+        // output, so the byte-identity is the modifier being dropped
+        // rather than the handler being inert.)
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook on a cycle-trigger `on` handler on `{comp}`"),
-            "cycle-trigger handlers take no hook side",
+            "cycle-trigger handlers take no hook side; v1 accepts one and emits the handler \
+             without it, so the requested ordering is silently ignored",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if !matches!(h.phase, crate::ast::OnPhase::Checker) {
+        // NOT the same: v1 implements this one. `phase post_eval` emits
+        // `_post_eval_services.push_back` where the default emits
+        // `_checkers.push_back` — the phase selects the dispatch vector
+        // and it works, so `--codegen v1` is a real escape hatch.
+        //
+        // The two arms sit four lines apart and looked interchangeable.
+        // They were probed with a shared control that changed the
+        // trigger AND the modifier at once, which made both read as
+        // "differs"; against a one-token control they split.
         return Err(unsupported(
             &format!("a non-default-phase cycle-trigger `on` handler on `{comp}`"),
             "only the default (checker) phase is lowered for cycle-trigger handlers",
@@ -871,9 +888,14 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
 /// `_checkers` vs `_post_eval_services`).
 fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // Same as the cycle-trigger hook above: v1 emits the periodic
+        // handler with the hook side discarded, byte-identically to the
+        // same handler written without it.
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook on an `on <N> cycles` handler on `{comp}`"),
-            "periodic handlers take no hook side",
+            "periodic handlers take no hook side; v1 accepts one and emits the handler \
+             without it, so the requested ordering is silently ignored",
+            V1Status::SilentlyMisLowers,
         ));
     }
     Ok(())
@@ -1788,6 +1810,15 @@ where
 {
     // `source.observed -> sb.write_obs`: both sides are dotted paths
     // rooted at an env sub-component field.
+    // NOT reclassified, and the reason is `connect`'s standing one: what
+    // v1 does with a bad edge depends on WHERE THE EDGE SITS. In an
+    // instantiated env v1 reaches its own endpoint check and refuses;
+    // in an UNINSTANTIATED one it emits no wiring at all and succeeds,
+    // so the same malformed edge is invisible there. tbir resolves
+    // `connect` for every env in the merged file, so it sees edges v1
+    // never reaches. No single `V1Status` is honest, so the suggestion
+    // stays, being true somewhere. The regression test is
+    // `a_malformed_connect_endpoint_keeps_its_v1_suggestion`.
     let from = dotted_path(&edge.from).ok_or_else(|| {
         unsupported(
             &format!("a non-path `connect` source in `{}`", owner.name.name),
@@ -1981,6 +2012,10 @@ fn resolve_sub_path(
     let mut cid = None;
     for seg in path {
         let f = cur.field(seg).ok_or_else(|| {
+            // Same position-dependence as the endpoint arms above: v1
+            // prints the path verbatim in an instantiated env (a member
+            // access that does not compile) and emits nothing at all in
+            // an uninstantiated one.
             unsupported(
                 &format!("a `connect` path segment `{seg}` that is not a sub-component field"),
                 "",

@@ -15673,3 +15673,80 @@ fn a_thread_on_a_bound_transactor_still_points_at_v1() {
         "the `on` handler adds slots and the thread's actor survives"
     );
 }
+
+/// Three handler-validator arms in `components.rs`, two of which sit
+/// four lines apart and looked interchangeable.
+///
+/// A `pre`/`post` hook on a cycle-trigger or periodic handler is
+/// `SilentlyMisLowers`: v1 emits the handler with the hook side
+/// DISCARDED, byte-identically to the same handler written without it.
+/// The user asks for pre/post ordering and gets the default.
+///
+/// A non-default PHASE is not the same. v1 implements it —
+/// `phase post_eval` emits `_post_eval_services.push_back` where the
+/// default emits `_checkers.push_back` — so v1 is a real escape hatch
+/// and that arm keeps `Unsupported`.
+#[test]
+fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
+    let fixture = fixture("agent_periodic_test.harc");
+    const PERIODIC: &str = "    on 10 cycles";
+
+    // Control, and the ANCHOR: removing the handler entirely changes
+    // v1's output, so a later byte-identity is the MODIFIER being
+    // dropped rather than the handler being inert.
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    let start = fixture.find(PERIODIC).expect("fixture shape changed");
+    let end = fixture[start..]
+        .find("end on")
+        .map(|i| start + i + "end on\n".len())
+        .expect("fixture shape changed");
+    let without = format!("{}{}", &fixture[..start], &fixture[end..]);
+    assert_ne!(
+        cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
+        v1_ctl,
+        "the handler genuinely contributes, so byte-identity below means something"
+    );
+
+    // A hook on the PERIODIC form: dropped.
+    let p_hook = fixture.replacen(PERIODIC, "    on 10 cycles pre", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&p_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`on <N> cycles` handler"), "{msg}");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&p_hook)).expect("v1 emits"),
+        v1_ctl,
+        "v1 emits the periodic handler with the hook discarded"
+    );
+
+    // The CYCLE-TRIGGER control differs from its mutations in exactly
+    // one token. Reusing the periodic control would change the trigger
+    // kind AND the modifier, which made both arms below read as
+    // "differs" and hid the split.
+    let c_ctl = fixture.replacen(PERIODIC, "    on beats > 0", 1);
+    let v1_c_ctl = cpp_tb::emit(&merged_src(&c_ctl)).expect("v1 emits");
+
+    let c_hook = fixture.replacen(PERIODIC, "    on beats > 0 pre", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&c_hook).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cycle-trigger `on` handler"), "{msg}");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&c_hook)).expect("v1 emits"),
+        v1_c_ctl,
+        "v1 emits the cycle-trigger handler with the hook discarded"
+    );
+
+    // The PHASE, by contrast, v1 implements.
+    let c_phase = fixture.replacen(PERIODIC, "    on beats > 0 phase post_eval", 1);
+    let msg = assert_unsupported(&lower_src(&c_phase).unwrap_err());
+    assert!(msg.contains("non-default-phase"), "{msg}");
+    let v1_phase = cpp_tb::emit(&merged_src(&c_phase)).expect("v1 emits");
+    assert!(
+        v1_phase.contains("_post_eval_services.push_back")
+            && v1_c_ctl.contains("_checkers.push_back"),
+        "the phase selects the dispatch vector, so v1 is a real escape hatch"
+    );
+}

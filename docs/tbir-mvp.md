@@ -3312,6 +3312,56 @@ case and only locally-determinable `Assign` types are compared).
     the `ThreadSlot` count equality held trivially. **The test written
     to avoid measuring nothing was measuring nothing.**
 
+52. **`components.rs` families C and B: one lands, one is reverted by a
+    test written three batches earlier (2026-08-17).**
+
+    **Family C (handlers) — three arms, two behaviours.** A `pre`/`post`
+    hook on a cycle-trigger or periodic `on` handler is
+    `SilentlyMisLowers`: v1 emits the handler with the hook side
+    DISCARDED, byte-identical to the same handler written without it, so
+    the requested ordering is silently ignored. A non-default PHASE is
+    NOT the same — v1 implements it, emitting
+    `_post_eval_services.push_back` where the default emits
+    `_checkers.push_back`, so that arm keeps `Unsupported`.
+
+    The two sit four lines apart and were first probed with a shared
+    control that changed the trigger kind AND the modifier at once. Both
+    then read as "differs", and the split was invisible. Against a
+    one-token control they separate immediately. Rule 3, and the cost of
+    breaking it is not a wrong answer but a *missing* one.
+
+    **Family B (connect endpoints) — probed, reclassified, reverted.**
+    Three arms; the probe said non-path endpoints are `Rejects` (v1
+    refuses with its own message) and an unresolvable path segment is
+    `EmitsUncompilable` (v1 prints `env.source.nope.observed.push_back`
+    verbatim). Both readings were correct for the fixture used, and both
+    are wrong as classifications.
+
+    `cargo test` failed on
+    `a_malformed_connect_endpoint_keeps_its_v1_suggestion`, written
+    three batches earlier, whose doc comment already records why: **what
+    v1 does with a bad edge depends on WHERE THE EDGE SITS.** In an
+    instantiated env it reaches its endpoint check and refuses; in an
+    UNINSTANTIATED env it emits no wiring at all and simply succeeds —
+    and tbir resolves `connect` for every env in the merged file, so it
+    sees edges v1 never reaches. Re-probed to confirm rather than taken
+    on the test's word: an uninstantiated env accepts the non-path
+    endpoint under v1. One site, three outcomes; no single `V1Status` is
+    honest, so the suggestion stays.
+
+    This is the second time the `connect` sites have been reclassified
+    and reverted — divergence 40 reverted eight of them for the same
+    reason. Both times the probe was correct about the fixture in front
+    of it. **Position-dependence is invisible to a single-fixture probe
+    by construction**, and the only defence that has actually worked is
+    the regression suite: grep it for the site's own message before
+    touching an arm, because a previous batch may already have paid for
+    the answer.
+
+    Family C was re-run in both positions before being trusted. The
+    hook is dropped whether or not the agent is instantiated, so the
+    verdict holds.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
