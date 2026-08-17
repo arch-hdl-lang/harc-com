@@ -3158,6 +3158,15 @@ case and only locally-determinable `Assign` types are compared).
     remaining gap is narrower than the "five sites" this file previously
     recorded.
 
+    Re-verified after #591 merged, since it changes sized-literal
+    PARSING and could have invalidated any of this: `keep a == 8'h0F`
+    still lowers under both backends, `register SRC @ 32'h18` still
+    rejects under TB-IR while v1 still emits `{ "SRC", 0x18, 32 }`, and
+    the coverpoint control still lowers. The corrections above survive
+    the merge. Worth doing rather than assuming — a claim about another
+    change's blast radius is exactly the kind that reads as obviously
+    fine and is cheap to check.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
