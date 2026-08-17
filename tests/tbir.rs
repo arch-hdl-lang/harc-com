@@ -16526,7 +16526,7 @@ fn named_arguments_are_bound_by_position_by_v1() {
     );
     for arg in ["addr = t.addr", "nosuch = t.addr"] {
         let msg = assert_unsupported(&lower_src(&one(arg)).unwrap_err());
-        assert!(msg.contains("one-argument component method"), "{msg}");
+        assert!(msg.contains("single-argument component call"), "{msg}");
         assert_eq!(
             cpp_tb::emit(&merged_src(&one(arg))).expect("v1 emits"),
             v1_one_ctl,
@@ -16542,7 +16542,7 @@ fn named_arguments_are_bound_by_position_by_v1() {
     // arity gap (tbir lowers `axil_write(t.value)` too) rather than
     // something naming the argument caused.
     let msg = assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
-    assert!(msg.contains("one-argument component method"), "{msg}");
+    assert!(msg.contains("single-argument component call"), "{msg}");
     lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
     let v1_named_short = cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits");
     // Anchor first: the under-supplied call really is in v1's output,
@@ -16585,6 +16585,119 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
             "v1 drops the name and emits the same predicate"
         );
     }
+
+    // `quiesced` is a separate arm with its own message, and the
+    // doc comment claimed it without exercising it.
+    let quiesce = |arg: &str| {
+        fixture.replacen(
+            IDLE,
+            &format!("assert tagger.idle_in(4)\n        assert tagger.quiesced({arg})\n"),
+            1,
+        )
+    };
+    let v1_q_ctl = cpp_tb::emit(&merged_src(&quiesce("4"))).expect("v1 emits");
+    lower_src(&quiesce("4")).expect("the positional quiesce form lowers");
+    assert_ne!(
+        v1_q_ctl, v1_ctl,
+        "the injected `quiesced` call must reach v1's output"
+    );
+    for arg in ["n = 4", "nosuch = 4"] {
+        let msg = assert_unsupported(&lower_src(&quiesce(arg)).unwrap_err());
+        assert!(msg.contains("a named argument to `quiesced`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&quiesce(arg))).expect("v1 emits"),
+            v1_q_ctl,
+            "v1 drops the name and emits the same quiesce predicate"
+        );
+    }
+}
+
+/// The component-parameter construct has FOUR landings, and the fourth
+/// classifies differently from the other three. `transactors.rs` agrees
+/// with the `components.rs` arms — v1 drops the list, and a method-body
+/// reference silently picks up a same-named file-scope `const`.
+/// `scoreboards.rs` does not: a data-only scoreboard's only items are
+/// fields, so its only way to name a parameter is a field default or
+/// width, both emitted INSIDE the struct and ahead of every const. No
+/// silent case is reachable there.
+#[test]
+fn the_other_two_component_parameter_landings_do_not_agree() {
+    // ── `transactors.rs`: an ordinary DUT-poking transactor.
+    let f = fixture("axilite_hooks_test.harc");
+    const TX: &str = "transactor HookXactor";
+    const STRB: &str = "dut.axil_w_strb = 15";
+    assert!(f.contains(TX) && f.contains(STRB), "fixture shape changed");
+
+    let with_param = format!(
+        "const N = 15\n\n{}",
+        f.replacen(TX, "transactor HookXactor #(N: int = 3)", 1)
+            .replacen(STRB, "dut.axil_w_strb = N", 1)
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&with_param).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("generic parameters"), "{msg}");
+
+    let v1_param = cpp_tb::emit(&merged_src(&with_param)).expect("v1 emits");
+    let line_of = |out: &str, needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` missing from v1's output"))
+    };
+    // The const precedes the method-body use, so this one compiles.
+    assert!(
+        line_of(&v1_param, "static constexpr int64_t N = 15;")
+            < line_of(&v1_param, "axil_w_strb, N)"),
+        "the const precedes the use"
+    );
+    // And `#(N: int = 3)` is invisible: the same source with no
+    // parameter at all emits byte-identically.
+    let const_only = format!(
+        "const N = 15\n\n{}",
+        f.replacen(STRB, "dut.axil_w_strb = N", 1)
+    );
+    lower_src(&const_only).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&const_only)).expect("v1 emits"),
+        v1_param,
+        "the parameter changes nothing, so the transactor runs with 15"
+    );
+
+    // ── `scoreboards.rs`: one rung down, and this is the reason.
+    let g = fixture("axilite_bound_mon_test.harc");
+    const SB: &str = "scoreboard AxilSb";
+    const ERRS: &str = "errors  : uint<32> default 0";
+    assert!(
+        g.contains(SB) && g.contains(ERRS),
+        "fixture 2 shape changed"
+    );
+    let sb = format!(
+        "const N = 5\n\n{}",
+        g.replacen(SB, "scoreboard AxilSb #(N: int = 3)", 1)
+            .replacen(ERRS, "errors  : uint<32> default N", 1)
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&sb).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("parameters on scoreboard"), "{msg}");
+
+    let merged = {
+        let fixp = parse_source(&sb).expect("parses");
+        let bus_src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
+        )
+        .expect("stdlib bus readable");
+        let bus = parse_source(&bus_src).expect("bus parses");
+        merge::merge_for_sim(vec![fixp, bus], None).expect("merge")
+    };
+    let v1_sb = cpp_tb::emit(&merged).expect("v1 emits");
+    // Even WITH the const present, the field initializer precedes it.
+    assert!(
+        line_of(&v1_sb, "uint64_t errors = N;") < line_of(&v1_sb, "int64_t N = 5;"),
+        "the field initializer precedes the const, so no shadowing can rescue it"
+    );
 }
 
 /// `#(...)` parameters on a component. v1 never reads the list, and
@@ -16606,9 +16719,12 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
 /// generated file's header set, against a control that moves only the
 /// const.
 ///
-/// Probed at BOTH landings: the analysis-source (transactor) arm and the
-/// env/agent/scoreboard/sequencer arm are four lines apart and were
-/// measured separately.
+/// Probed at both `components.rs` landings — the analysis-source
+/// (transactor) arm and the env/agent/sequencer composite arm — which
+/// agree. The other two landings of the same construct classify in
+/// their own tests: `transactors.rs` agrees, and `scoreboards.rs` does
+/// not, because a data-only scoreboard has no emission position after
+/// v1's file-scope consts.
 #[test]
 fn component_parameters_are_dropped_by_v1() {
     const SRC: &str = r#"

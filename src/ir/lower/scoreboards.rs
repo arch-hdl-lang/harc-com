@@ -33,7 +33,26 @@ pub(crate) fn lower_scoreboard(
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
     if !c.params.is_empty() {
-        return Err(unsupported(&format!("parameters on scoreboard `{sb}`"), ""));
+        // The fourth landing of the component-parameter construct, and
+        // the one that classifies DIFFERENTLY — which is why it was
+        // probed rather than given the sibling arms' verdict.
+        //
+        // Those arms are `SilentlyMisLowers` because a reference emitted
+        // AFTER v1's file-scope consts picks one up and the program runs
+        // with the wrong value. A data-only scoreboard has no such
+        // position: its only items are fields, and a field default or
+        // width is emitted inside the struct, ahead of every const. So
+        // `errors : uint<32> default N` emits `uint64_t errors = N;`
+        // with `N` unresolvable even when a `const N` exists, and the
+        // unused case is a plain no-op. Nothing silent is reachable
+        // here, so the honest label is one rung down.
+        return Err(super::not_implemented(
+            &format!("parameters on scoreboard `{sb}`"),
+            "v1 drops the parameter list entirely; a data-only scoreboard can only \
+             reference one from a field default or width, both emitted ahead of any \
+             file-scope `const`, so the reference resolves to nothing",
+            super::V1Status::EmitsUncompilable,
+        ));
     }
     if c.bound_to.is_some() {
         return Err(unsupported(

@@ -3046,12 +3046,13 @@ impl super::FuncBuilder<'_> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             let CallArg::Expr(e) = a else {
-                // No CODEGEN site in v1 reads an argument name: of the 30
-                // `CallArg::Named` matches in `cpp_tb.rs`, 26 destructure
-                // `{ value, .. }` and drop the name, and the 4 that do
-                // bind `name` are AST-rewrite passes that reconstruct the
-                // node and pass it along. So binding is by position
-                // everywhere. Measured, not just read:
+                // No CODEGEN site in v1 reads an argument name: of the
+                // 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
+                // `{ value, .. }` and one is `{ value: e, .. }` — all 26
+                // drop the name — and the 4 that bind `name` are
+                // AST-rewrite passes that reconstruct the node and pass
+                // it along. So binding is by position everywhere.
+                // Measured, not just read:
                 // `axil_write(data = t.value, addr = t.addr)` emits
                 // `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` —
                 // the two arguments SWAPPED, silently, in code that
@@ -3084,10 +3085,13 @@ impl super::FuncBuilder<'_> {
                 // callee's parameter list, and an arm's status is the
                 // worst thing under it.
                 if args.len() == 1 {
+                    // Not "method call": this helper also lowers the
+                    // payload of `emit <ev>(...)`, so the construct name
+                    // covers both callers rather than naming one of them.
                     return Err(unsupported(
-                        "a named argument to a one-argument component method call",
+                        "a named argument in a single-argument component call",
                         "v1 ignores the name and binds by position; with one argument there \
-                         is no other position, so it emits exactly the positional call",
+                         is no other position, so it emits exactly the positional form",
                     ));
                 }
                 return Err(not_implemented(

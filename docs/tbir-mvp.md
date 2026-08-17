@@ -3673,11 +3673,21 @@ case and only locally-determinable `Assign` types are compared).
     any identity. This is divergence 51's lesson applied before being
     caught by it rather than after.
 
-    Probed at BOTH landings rather than one: the analysis-source
-    (transactor) arm and the env/agent/scoreboard/sequencer arm sit four
-    lines apart and were measured separately, because divergence 47's
-    tseq pair sat four lines apart and classified differently. This time
-    they agreed — which is a result, not a reason to have assumed it.
+    Probed at all FOUR landings rather than one, because divergence
+    47's tseq pair sat four lines apart and classified differently. The
+    analysis-source (transactor) arm, the env/agent/sequencer composite
+    arm and the ordinary-transactor arm in `transactors.rs` all agree on
+    `SilentlyMisLowers` — a result, not a reason to have assumed it. The
+    fourth, `scoreboards.rs`, does NOT: a data-only scoreboard's only
+    items are fields, so its only way to name a parameter is a field
+    default or width, both emitted INSIDE the struct and ahead of every
+    file-scope `const`. No silent case is reachable there, and the
+    honest label is `EmitsUncompilable`, one rung down from its
+    siblings.
+
+    The first version of this entry claimed the first two arms "sit four
+    lines apart". They are 41 lines apart in the base and 82 after this
+    change — a detail invented to make a point that stood without it.
 
 ### The probe method
 
