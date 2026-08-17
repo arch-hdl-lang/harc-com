@@ -152,13 +152,16 @@ struct LowerCtx<'a> {
     /// `should_stop`.
     saw_relation_error: bool,
     /// Expression nodes this problem may still produce by relation
-    /// expansion. One budget per `lower_problem` call — i.e. per
-    /// randomize site — matching how v1's expander scopes its own.
+    /// expansion. One budget per `lower_problem` call — one per
+    /// randomize site, plus one per transaction TEMPLATE, since
+    /// `build_typed_solver_problem_table` walks each transaction's
+    /// `keep`s on their own. That matches how v1's expander scopes its
+    /// own: one budget per top-level constraint list.
     relation_budget: u32,
 }
 
 impl LowerError {
-    /// The four variants `lower_program` acts on.
+    /// The five variants `lower_program` acts on.
     ///
     /// `surface_constraint_lower_error` matches these variants by hand
     /// to word each diagnostic, so the list really is written twice.

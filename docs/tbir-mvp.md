@@ -3976,17 +3976,18 @@ case and only locally-determinable `Assign` types are compared).
     a working fixture. `axi_agent` is rejected by both backends anyway,
     for an unrelated covergroup reason — an earlier draft of this entry
     said "v1 lowers both", which was false and would have counted a
-    rejected fixture as evidence. Three of the four that do surface are program errors under
-    any backend — a relation that does not exist, one called with the
-    wrong arity, and one that expands into itself — so they are `Invalid`
-    and name no escape hatch.
+    rejected fixture as evidence. Four of the five that do surface are
+    program errors under any backend — a relation that does not exist,
+    one called with the wrong arity, one that expands into itself, and
+    (since divergence 72) one whose expansion is finite but past the
+    shared size limit — so they are `Invalid` and name no escape hatch.
 
-    The FOURTH is not. A misplaced argument name is accepted by v1, which
+    The ODD ONE OUT is not. A misplaced argument name is accepted by v1, which
     emits working C++ with the values swapped, so `Invalid`'s "program
     error under every backend" is literally false for it. It carries
     `SilentlyMisLowers` instead — the sweep's ordinary shape, and the
-    verdict that keeps the diagnostic from naming v1 as a way out. Three
-    siblings sharing one code path is not a reason to share one verdict.
+    verdict that keeps the diagnostic from naming v1 as a way out.
+    Siblings sharing one code path is not a reason to share one verdict.
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
@@ -4237,6 +4238,16 @@ case and only locally-determinable `Assign` types are compared).
     test would be measuring the other component. That blowup is
     pre-existing — it reproduces on a clean `origin/main` worktree — and
     budgeting that expander is a separate change.
+
+    **Closed in divergence 72.** That separate change was made, and the
+    reasoning above turned out to be the wrong conclusion from a right
+    observation: both expanders run on every `harc sim`, so leaving one
+    unbudgeted left the pair unbudgeted. The limits are shared now and
+    both backstops ARE pinned, at the same boundary in both backends.
+    The "corpus's deepest real nest is 3" line above stands; the
+    "passes at 96 and fails at 88" figure quoted with it does not
+    reproduce — see the constant's own doc in `ast.rs` for the
+    re-measurement.
 
     The regression test steps over the boundary divergence 59 documented:
     it calls `cpp_tb::emit` on five shapes: self-recursive, mutually

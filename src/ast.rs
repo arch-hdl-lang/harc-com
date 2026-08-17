@@ -1973,11 +1973,19 @@ impl Item {
 /// substitutes the argument into both occurrences of `r`, doubling it
 /// every level, so a handful of expansions build an astronomical tree.
 ///
-/// MEASURED, not guessed: the whole fixture corpus passes at 96 and
-/// fails at 88, so 8192 is roughly 90x the deepest real program's need.
-/// The budget is shared across a whole top-level constraint list, so it
-/// scales with program size, not per constraint — which is why the
-/// margin is that wide.
+/// MEASURED: the deepest relation expansion anywhere in the 190-file
+/// fixture corpus consumes 23 nodes, identically in both expanders, so
+/// 8192 is ~350x the deepest real program's need. The budget is shared
+/// across a whole top-level constraint list, so it scales with program
+/// size, not per constraint — which is why the margin is that wide.
+///
+/// The figure this replaces — "the corpus passes at 96 and fails at
+/// 88" — does not reproduce: swept at 8192, 96 and 88, the corpus
+/// produces zero relation-expansion refusals at every setting, so that
+/// pair discriminates nothing. It was carried over from the v1-only
+/// batch and re-presented here as the justification for a constant
+/// that now binds two expanders, which is a heavier claim than it
+/// could support.
 pub(crate) const RELATION_EXPANSION_BUDGET: u32 = 8_192;
 
 /// How deep relation bodies may nest before the expander gives up.
@@ -1996,10 +2004,17 @@ pub(crate) const RELATION_EXPANSION_MAX_DEPTH: u32 = 64;
 /// `RELATION_EXPANSION_BUDGET` for what an expansion actually
 /// PRODUCES.
 ///
-/// The arms mirror the expanders' own walks: those are exactly the
-/// forms that can carry a substituted argument, so they are exactly the
-/// forms through which a relation body can grow. Anything else counts
-/// as a leaf, which can only undercount forms that cannot grow.
+/// The arms mirror `cpp_tb::expand_relation_subtree`'s: those are
+/// exactly the forms that can carry a substituted argument, so they are
+/// exactly the forms through which a relation body can grow. Anything
+/// else counts as a leaf, which can only undercount forms that cannot
+/// grow.
+///
+/// `typed_lower::expand_relation_subtree` walks slightly LESS — it has
+/// no `SoftConstraint` arm, and takes its `ForEachConstraint` body
+/// through the subtree walker rather than the top-level one. Counting
+/// more than a walker visits only charges more than it will produce,
+/// which is the safe direction, so one counter serves both.
 pub(crate) fn expr_node_count(e: &Expr) -> u32 {
     fn n(e: &Expr) -> u32 {
         1u32.saturating_add(match &*e.kind {

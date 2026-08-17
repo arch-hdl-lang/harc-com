@@ -19235,6 +19235,20 @@ fn a_doubling_relation_chain_is_refused_at_the_same_point_by_both_backends() {
             msg.contains("exceeds the relation-expansion limit"),
             "{links} links: {msg}"
         );
+
+        // The WHOLE message, not a prefix of it. The first version of
+        // this diagnostic reached users with two runs of 22 spaces in
+        // it — a `format!` body whose line continuations had been
+        // flattened — and every assertion above matches text that
+        // lands before the first gap, so none of them could see it.
+        assert!(
+            !msg.contains("  "),
+            "{links} links: the diagnostic must not carry run-on whitespace: {msg:?}"
+        );
+        assert!(
+            msg.ends_with("more than once doubles at every level"),
+            "{links} links: {msg:?}"
+        );
     }
 
     // The other shared limit, on the same footing: a chain of SINGLE

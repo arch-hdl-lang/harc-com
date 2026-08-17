@@ -662,14 +662,16 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// diagnostics entirely: a `randomize ... with NoSuchRelation(r)`
 /// lowered clean under TB-IR while v1 refused it outright.
 ///
-/// Only the RELATION errors surface. Three of them are program errors
+/// Only the RELATION errors surface. Four of them are program errors
 /// under any backend: a relation that does not exist, one called with
-/// the wrong arity, and one that expands into itself. Measured against
-/// v1: it rejects all three with "constraint function call not
+/// the wrong arity, one that expands into itself, and one whose
+/// expansion is finite but past the shared size limit. Measured against
+/// v1: it rejects all four with "constraint function call not
 /// supported in v0 solver path", so none is an escape hatch and
 /// `Invalid` is the honest verdict. The third used to take the process
 /// down with a stack overflow instead; divergence 62 replaced that with
-/// the same diagnostic as the other two.
+/// the same diagnostic as the other two, and divergence 72 gave the
+/// fourth its limit.
 ///
 /// The other variants stay discarded ON PURPOSE. They are capability
 /// gaps in the constraint IR, not bad programs:
@@ -710,7 +712,9 @@ fn surface_constraint_lower_error(
             // one as the way out would be false.
             CErr::RelationExpansionTooLarge { name, .. } => {
                 format!(
-                    "expanding `{name}` exceeds the relation-expansion limit; the form is                      finite but astronomical — a chain of relations each calling the                      previous one more than once doubles at every level"
+                    "expanding `{name}` exceeds the relation-expansion limit; the form \
+                     is finite but astronomical — a chain of relations each calling the \
+                     previous one more than once doubles at every level"
                 )
             }
             // NOT `Invalid`, unlike its three siblings. v1 ACCEPTS a
