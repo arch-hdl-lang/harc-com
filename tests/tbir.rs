@@ -14834,7 +14834,7 @@ fn a_rejected_bin_spec_is_reported_as_a_bin() {
         ("sel_lo   = [dut.en .. 7]", r#"sel_lo   = ["x" .. 7]"#),
     ] {
         let err = lower_src(&fixture.replace(from, to)).unwrap_err();
-        let msg = assert_unsupported(&err);
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
         assert!(msg.contains("bin `"), "`{to}`: {msg}");
         assert!(!msg.contains("point `"), "`{to}`: {msg}");
     }
@@ -14849,5 +14849,247 @@ fn a_rejected_bin_spec_is_reported_as_a_bin() {
     // scoped to the bin path rather than renaming the noun everywhere.
     let err =
         lower_src(&fixture.replace("cp_en : cover dut.en", r#"cp_en : cover "x""#)).unwrap_err();
-    assert!(assert_unsupported(&err).contains("point `cp_en`"));
+    assert!(
+        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers).contains("point `cp_en`")
+    );
+}
+
+/// The coverpoint/bin subset gate used to be one blanket `Unsupported`
+/// arm — "re-run with `--codegen v1`" for everything it rejected.
+/// Probing every `ExprKind` it can receive found FOUR different v1
+/// behaviours, and only one of them makes v1 an escape hatch. It is not
+/// the common one.
+///
+/// v1 has no subset gate here at all: it renders the expression with
+/// `emit_expr` and casts to `uint64_t`, so whatever the user wrote lands
+/// in the sampler verbatim. What varies is whether that text compiles,
+/// and whether it means anything.
+#[test]
+fn the_coverpoint_subset_gate_is_classified_by_what_v1_does() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    const TGT: &str = "cp_en : cover dut.en";
+
+    // Control: the registered fixture lowers under both backends, so
+    // every mutation below reaches the subset gate.
+    emit_cpp_src(&fixture);
+    cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    let target = |t: &str| fixture.replace(TGT, &format!("cp_en : cover {t}"));
+
+    // ── v1 compiles it and samples the WRONG THING ───────────────────
+    for (expr, needle) in [
+        ("[1..2]", "sampling a range"),
+        ("1.5", "sampling a float literal"),
+        (r#""x""#, "sampling a string literal"),
+    ] {
+        let err = lower_src(&target(expr)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains(needle), "`{expr}`: {msg}");
+    }
+    // The load-bearing one, with v1's own words as the evidence: its
+    // emitter leaves a comment admitting it dropped the bounds, then
+    // samples zero on every cycle.
+    let v1_range = cpp_tb::emit(&merged_src(&target("[1..2]"))).expect("v1 emits a range target");
+    assert!(
+        v1_range.contains("(uint64_t)(/* range 1..2 */ 0)"),
+        "v1 drops the range and samples 0:\n{v1_range}"
+    );
+    // …and the control proves a real target does reach that same slot,
+    // so the zero is the range being dropped rather than the sampler
+    // being inert.
+    assert!(
+        cpp_tb::emit(&merged_src(&fixture))
+            .expect("v1 emits")
+            .contains("(uint64_t)(harc_rt::harc_read(dut->en))"),
+        "a real target lands in the same slot"
+    );
+
+    // A range NESTED in a set never reaches the gate — `lower_bin_values`
+    // has its own arm and lowers it correctly today. Sweeping the two
+    // together would have broken working code.
+    emit_cpp_src(&fixture.replace("en0 = {0}", "en0 = {[1..2]}"));
+
+    // ── v1 emits something that does not compile ─────────────────────
+    for (expr, needle) in [
+        ("NOPE", "not a DUT port or hook parameter"),
+        ("foo.bar", "not a DUT port or hook parameter"),
+        ("foo[1]", "not a DUT port or hook parameter"),
+        (".en", "not a DUT port or hook parameter"),
+        ("undefined_fn(1)", "sampling an unsupported call"),
+        ("dut.en.nope()", "sampling an unsupported call"),
+    ] {
+        let err = lower_src(&target(expr)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains(needle), "`{expr}`: {msg}");
+        // v1 accepts each one and prints it verbatim into the sampler.
+        assert!(
+            cpp_tb::emit(&merged_src(&target(expr)))
+                .expect("v1 emits")
+                .contains("uint64_t _v = (uint64_t)("),
+            "`{expr}` reaches v1's sampler cast"
+        );
+    }
+
+    // ── v1 refuses too ───────────────────────────────────────────────
+    for (expr, needle) in [
+        ("{1, 2}", "set literal or `randomize`"),
+        ("randomize(dut.en)", "set literal or `randomize`"),
+        ("fork dut.en()", "temporal or fork expression"),
+        ("##1 dut.en", "temporal or fork expression"),
+        ("$clog2(dut.en)", "system function"),
+    ] {
+        let err = lower_src(&target(expr)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(needle), "`{expr}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&target(expr))).is_err(),
+            "v1 must reject `{expr}` too, or this is a real gap"
+        );
+    }
+}
+
+/// `$clog2(x)` is the case that nearly went in mis-classified, and the
+/// reason is worth a test of its own: it was first probed as
+/// `clog2(dut.en)`, WITHOUT the `$`.
+///
+/// That spelling is not a system call at all — it parses as a plain call
+/// to an undefined function, which v1 emits verbatim and g++ rejects. It
+/// looked like `EmitsUncompilable` in legitimate language surface. The
+/// real spelling is a construct v1 refuses outright, and the two land in
+/// different arms.
+#[test]
+fn the_sigil_is_what_makes_a_system_call_a_system_call() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let target = |t: &str| fixture.replace("cp_en : cover dut.en", &format!("cp_en : cover {t}"));
+
+    // With the sigil: a system call, and v1 rejects it.
+    let err = lower_src(&target("$clog2(dut.en)")).unwrap_err();
+    assert!(assert_not_implemented(&err, lower::V1Status::Rejects).contains("system function"));
+    assert!(cpp_tb::emit(&merged_src(&target("$clog2(dut.en)"))).is_err());
+
+    // Without it: an ordinary call to a name nothing declares, which v1
+    // accepts and emits into C++ that cannot compile.
+    let err = lower_src(&target("clog2(dut.en)")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("not a declared helper or extern function"),
+        "{msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&target("clog2(dut.en)")))
+            .expect("v1 emits an undefined call")
+            .contains("(uint64_t)(clog2(harc_rt::harc_read(dut->en)))"),
+        "v1 prints the undefined call verbatim"
+    );
+}
+
+/// A file-scope `const` sampled directly by a coverpoint. Degenerate —
+/// the point reads the same value forever — but legal, and v1 supports
+/// it: it emits its own `static constexpr uint64_t K = 7;` and samples
+/// `(uint64_t)(K)`, which compiles and is correct.
+///
+/// So this is a gap CLOSED, not classified. It was nearly the opposite:
+/// the subset-gate split above was probed with UNKNOWN idents and would
+/// have swept a known const in with them, telling users v1 emits
+/// uncompilable C++ for something v1 gets right.
+#[test]
+fn a_const_coverpoint_target_folds() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    const TGT: &str = "cp_en : cover dut.en";
+    let with = |pre: &str, t: &str| {
+        format!(
+            "{pre}{}",
+            fixture.replace(TGT, &format!("cp_en : cover {t}"))
+        )
+    };
+
+    // Control: the registered fixture lowers.
+    emit_cpp_src(&fixture);
+
+    // The fold gives byte-identical output to the literal it computes…
+    let literal = emit_cpp_src(&with("", "7"));
+    let folded = emit_cpp_src(&with("const K = 7\n\n", "K"));
+    assert_eq!(
+        folded, literal,
+        "`cover K` with `const K = 7` must lower exactly like `cover 7`"
+    );
+    // …and the VALUE is used, so the equality is not the target being
+    // dropped.
+    assert_ne!(
+        emit_cpp_src(&with("const K = 9\n\n", "K")),
+        folded,
+        "a different const must change the sampler"
+    );
+
+    // v1's side: it declares the constant and samples it, which is why
+    // this is a gap to close rather than a divergence to document.
+    let v1 = cpp_tb::emit(&merged_src(&with("const K = 7\n\n", "K"))).expect("v1 emits");
+    assert!(
+        v1.contains("(uint64_t)(K)"),
+        "v1 samples the constant:\n{v1}"
+    );
+}
+
+/// The classifier is handed the node the walk FAILED on, not the
+/// top-level target.
+///
+/// `lower_point_target` descends through parentheses before failing, so
+/// a classifier closed over the outer expression would see the
+/// parenthesis and reach its catch-all — losing the range case, which is
+/// the whole reason the classifier exists.
+#[test]
+fn parentheses_do_not_hide_the_failing_node_from_the_classifier() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let target = |t: &str| fixture.replace("cp_en : cover dut.en", &format!("cp_en : cover {t}"));
+
+    // Bare and parenthesised must classify the same way, arm for arm.
+    for (bare, wrapped, status, needle) in [
+        (
+            "[1..2]",
+            "([1..2])",
+            lower::V1Status::SilentlyMisLowers,
+            "sampling a range",
+        ),
+        (
+            "NOPE",
+            "(NOPE)",
+            lower::V1Status::EmitsUncompilable,
+            "not a DUT port or hook parameter",
+        ),
+    ] {
+        for spelling in [bare, wrapped] {
+            let err = lower_src(&target(spelling)).unwrap_err();
+            let msg = assert_not_implemented(&err, status);
+            assert!(msg.contains(needle), "`{spelling}`: {msg}");
+        }
+    }
+
+    // v1's parenthesised output confirms the classification travels with
+    // the inner node: it still drops the range and samples 0.
+    assert!(
+        cpp_tb::emit(&merged_src(&target("([1..2])")))
+            .expect("v1 emits")
+            .contains("/* range 1..2 */ 0"),
+        "v1 drops a parenthesised range too"
+    );
+}
+
+/// A Verilog-sized literal in a coverpoint target keeps pointing at v1,
+/// which lowers a bare one correctly — the same split the addrmap and
+/// regblock address folds carry.
+#[test]
+fn a_sized_literal_coverpoint_target_still_points_at_v1() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let src = fixture.replace("cp_en : cover dut.en", "cp_en : cover 32'h7");
+
+    let err = lower_src(&src).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("sized or over-wide literal"), "{msg}");
+
+    // v1's evidence: it lowers the sized literal to the right value.
+    assert!(
+        cpp_tb::emit(&merged_src(&src))
+            .expect("v1 emits a sized literal")
+            .contains("(uint64_t)(0x7)"),
+        "v1 lowers a bare sized literal correctly, which is why this points at it"
+    );
 }
