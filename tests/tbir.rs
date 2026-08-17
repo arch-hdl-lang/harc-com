@@ -19032,8 +19032,10 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
             "target",
             base.replacen(THREAD, &format!("{periodic}\n{THREAD}"), 1),
         ),
-        // initiator-side, always-on items.
-        ("initiator items", initiator(periodic)),
+        // initiator-side, always-on items. `active` here too: the
+        // initiator BFM form refuses a `passive` binding outright, so
+        // a passive source never reaches the arm at all.
+        ("initiator items", active(initiator(periodic))),
         // initiator-side, inside `when active`.
         (
             "initiator when active",
@@ -19042,33 +19044,54 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
             ))),
         ),
     ] {
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
         assert!(
             msg.contains("periodic `on <N> cycles` handlers"),
             "{what}: {msg}"
         );
 
-        // `Unsupported` promises v1 runs the program, so v1 must emit —
-        // and the handler must CONTRIBUTE, or the promise is about
-        // nothing. v1 registers a cycle-stamped closure that fires the
-        // body every N cycles against the instance's state struct.
+        // The arm is `EmitsUncompilable` because of the period
+        // EXPRESSION, not the handler, so the literal case must still
+        // be shown to work — otherwise the status is unearned in the
+        // other direction. v1 registers a cycle-stamped closure that
+        // fires the body every N cycles against the instance's state
+        // struct.
         let v1 =
             cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
         assert!(
             v1.contains("_period = (int64_t)(5);") && v1.contains("prep_acc + 1;"),
             "{what}: v1 must emit the periodic body"
         );
+
+        // And the row that sets the status: a period naming an
+        // impl-scope `let`. v1 emits it into the same closure, which
+        // is registered BEFORE that `let` exists.
+        let named = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
+            "    run\n",
+            "    let limit = 5\n\n    run\n",
+            1,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&named))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the named period: {e}"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let declared = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            declared > used,
+            "{what}: the `let` must be emitted AFTER the use, or the C++ compiles"
+        );
     }
 
-    // And the negative half: a NON-periodic `on` never arrives. Both
-    // shapes below are routed to the composite table by the gate, and
-    // fail there — on the target thread the component path does not
-    // lower — with a message that names neither of these arms.
-    // The `when active` row above needed an `active` instance, and
-    // this is why: bound `passive`, v1 SCOPES THE HANDLER OUT — its
-    // output is byte-identical to the same program with the handler
-    // deleted. That is v1 obeying `when active`, not dropping the
-    // construct, so it does not weaken the `Unsupported` above.
+    // The `when active` rows needed an `active` instance, and this is
+    // why: bound `passive`, v1 SCOPES THE HANDLER OUT — its output is
+    // byte-identical to the same program with the handler deleted.
+    // That is v1 obeying `when active`, not dropping the construct.
     let when_active = initiator(&format!("    when active\n{periodic}    end when\n"));
     assert!(
         when_active.contains(PASSIVE),
@@ -19080,23 +19103,52 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         "v1 scopes a `when active` periodic handler out of a passive instance"
     );
 
+    // The negative half: a NON-periodic `on` never arrives at any of
+    // the three arms. Each row below is the same source as one of the
+    // positive rows above with only the TRIGGER changed, so what moves
+    // it is the gate and nothing else.
     let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
     for (what, src) in [
         (
             "target",
             base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
         ),
+        ("initiator items", active(initiator(non_periodic))),
         (
-            "initiator",
-            base.replacen(THREAD, &format!("{hookable}{non_periodic}\n{THREAD}"), 1),
+            "initiator when active",
+            active(initiator(&format!(
+                "    when active\n{non_periodic}    end when\n"
+            ))),
         ),
     ] {
-        let msg = format!("{}", lower_src(&src).unwrap_err());
-        assert!(
-            msg.contains("reached through the component path"),
-            "{what}: a non-periodic `on` must route to the composite table: {msg}"
-        );
-        assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
+        match lower_src(&src) {
+            // The two initiator rows go further than "not here": the
+            // composite table LOWERS them, and the trigger lands as a
+            // cycle handler on the component. That is the positive
+            // witness for where they went.
+            Ok(prog) => {
+                let c = prog
+                    .components
+                    .iter()
+                    .find(|c| c.name == "TlmMemTarget")
+                    .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
+                assert!(
+                    !c.cycle_handlers.is_empty(),
+                    "{what}: the composite table must carry the trigger"
+                );
+            }
+            // The target row still has its `thread`, which the
+            // composite path does not lower — but it fails THERE, and
+            // says so.
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("reached through the component path"),
+                    "{what}: a non-periodic `on` must route to the composite table: {msg}"
+                );
+                assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
+            }
+        }
     }
 }
 

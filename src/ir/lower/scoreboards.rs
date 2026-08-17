@@ -165,13 +165,20 @@ pub(crate) fn lower_scoreboard(
             // as well — which is the second reason the syntactic split
             // recorded above failed.
             //
-            // As a TRANSACTOR field, v1 emits output byte-identical to
-            // the same program with the `connect`/`on` deleted (608
-            // lines either way; the only textual difference is a source
-            // OFFSET baked into `_solver_site_<N>` names and an
-            // auto-coverage plan literal). It silently DROPS the
-            // wiring, so the scoreboard observes nothing and a test
-            // that should catch a mismatch passes green.
+            // As a TRANSACTOR field, v1 emits output byte-identical
+            // to the same program with the `connect`/`on` deleted. It
+            // silently DROPS the wiring, so the scoreboard observes
+            // nothing and a test that should catch a mismatch passes
+            // green.
+            //
+            // "Byte-identical" is exact on the program the test uses
+            // (`a_transactor_held_scoreboard_has_its_wiring_dropped_by_
+            // v1`, string equality, both wiring forms). A first probe
+            // reported it as 608 lines either way with a source OFFSET
+            // left in `_solver_site_<N>` names and an auto-coverage
+            // plan literal — which is not byte-identity, and was a
+            // property of that probe's unrelated randomize sites rather
+            // than of the wiring.
             //
             // As a TESTBENCH field the same three inputs diverge three
             // ways:

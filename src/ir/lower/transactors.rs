@@ -633,18 +633,45 @@ fn lower_bound_target_transactor(
                 // transactors await the event slice" — named a
                 // construct no program reaching this arm can contain.
                 //
-                // `Unsupported` is right, and measured rather than
-                // assumed: v1 emits a `_checkers` closure holding a
-                // `static ..._last` stamp and the period, firing the
-                // body every N cycles against the instance's state
-                // struct (verified compilable). On a `passive`
+                // v1 emits a `_checkers` closure holding a `static
+                // ..._last` stamp and the period, firing the body every
+                // N cycles against the instance's state struct. Whether
+                // that output COMPILES depends on where the period
+                // expression's names land in the emitted file, and the
+                // registration sits near the top of the run function:
+                //
+                //   * `on 5 cycles`, `on 2 + 3 cycles` — literals, fine.
+                //   * `on NPER cycles` for a file-scope `const` —
+                //     emitted at namespace scope ~80 lines earlier,
+                //     fine.
+                //   * `on read_count cycles` for a transactor state
+                //     field — the instance is declared three lines
+                //     earlier, fine.
+                //   * `on limit cycles` for an impl-scope `let` —
+                //     emitted ~64 lines LATER. g++: "'limit' was not
+                //     declared in this scope". `<N>` is any integer
+                //     expression per spec §7.10, and the name resolver
+                //     does not visit a bound-to transactor's `on`
+                //     trigger, so this reaches here and type-checks.
+                //
+                // So the discriminator is name resolution in the
+                // emitted C++, not the shape of the trigger — the same
+                // thing that defeated a syntactic split on the
+                // scoreboard wiring arm. An arm's status is the worst
+                // thing v1 does anywhere under it, so the whole arm is
+                // `EmitsUncompilable`, and the literal case pays for it
+                // by losing a suggestion it would have deserved.
+                //
+                // Separately measured and not a gap: on a `passive`
                 // instance a `when active`-scoped periodic handler is
                 // correctly dropped — output byte-identical to the same
-                // program without it.
-                return Err(unsupported(
+                // program without it. That is v1 obeying `when active`.
+                return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` periodic `on <N> cycles` handlers"),
-                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
-                     never reaches this path",
+                    "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
+                     test's own `let` bindings, so a period naming one of those does not \
+                     compile; a non-periodic `on` never reaches this path",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1076,14 +1103,19 @@ fn lower_bound_initiator_transactor(
                 // composite table, so `on <N> cycles` is the sole shape
                 // that arrives. Measured at both positions (always-on
                 // items and `when active`) — v1 emits the same
-                // cycle-stamped `_checkers` closure either way.
-                return Err(unsupported(
+                // cycle-stamped `_checkers` closure either way, and
+                // registers it in the same place, so it inherits the
+                // same period-expression scoping problem. See the
+                // target-side arm for the four measured rows.
+                return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` periodic \
                          `on <N> cycles` handlers"
                     ),
-                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
-                     never reaches this path",
+                    "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
+                     test's own `let` bindings, so a period naming one of those does not \
+                     compile; a non-periodic `on` never reaches this path",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             ComponentItem::Watchdog(_) => {
@@ -1164,14 +1196,19 @@ fn lower_bound_initiator_transactor(
                 // composite table, so `on <N> cycles` is the sole shape
                 // that arrives. Measured at both positions (always-on
                 // items and `when active`) — v1 emits the same
-                // cycle-stamped `_checkers` closure either way.
-                return Err(unsupported(
+                // cycle-stamped `_checkers` closure either way, and
+                // registers it in the same place, so it inherits the
+                // same period-expression scoping problem. See the
+                // target-side arm for the four measured rows.
+                return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` periodic \
                          `on <N> cycles` handlers"
                     ),
-                    "v1 emits it as a cycle-stamped checker closure; a non-periodic `on` \
-                     never reaches this path",
+                    "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
+                     test's own `let` bindings, so a period naming one of those does not \
+                     compile; a non-periodic `on` never reaches this path",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             ComponentItem::Watchdog(_) => {

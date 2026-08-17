@@ -3411,7 +3411,10 @@ case and only locally-determinable `Assign` types are compared).
     rather than by file turns up NINE existing sites across four files —
     three in `components.rs` and six that were invisible from inside it.
     Every one carried at least one wrong verdict, and four were
-    mixed-verdict and had to be split, leaving fifteen arms:
+    mixed-verdict and had to be split. The table below is the current
+    state, not the state at the batch that wrote it: later batches have
+    split rows and re-measured verdicts in place, so the row count no
+    longer matches any one batch's arm count.
 
     | site (→ arms after splitting) | v1 | was | now |
     |---|---|---|---|
@@ -4657,6 +4660,7 @@ case and only locally-determinable `Assign` types are compared).
     |---|---|---|
     | transactor field | `connect` / `on` | **silently drops the wiring** |
     | testbench field | `connect` | emits uncompilable C++ |
+    | testbench field | `on w.seen > 0` | emits uncompilable C++ |
     | testbench field | `on hits > 0` | emits a working checker |
     | testbench field | `on dut.rst` | emits a working checker |
 
@@ -4695,7 +4699,8 @@ case and only locally-determinable `Assign` types are compared).
     silent drop is the worst of the three, so the whole arm is now
     `SilentlyMisLowers` — strictly better than the old `Unsupported`
     for the rows where v1 is no escape hatch, worse than necessary for
-    the one row where it is.
+    the two where it is (`on hits > 0` and `on dut.rst`, both in a
+    testbench container).
 
     Splitting on the container alone would not recover that row. A
     container-split testbench arm still spans `connect` and
@@ -4722,27 +4727,51 @@ case and only locally-determinable `Assign` types are compared).
     through. A user who lands here wrote a periodic handler and was told
     to wait for a slice that will never cover it.
 
-    The verdict itself is right, and now measured. v1 emits a
-    `_checkers` closure holding a `static ..._last` stamp and the
-    period, firing the body every N cycles against the instance's state
-    struct — spliced into g++ with the emitted state struct and
-    verified compilable, at all three positions. The handler is not
-    merely present but load-bearing: removing any one arm makes TB-IR
-    lower the program SILENTLY with the periodic handler dropped from
-    the IR, which is what the arms are holding back.
+    The arms are load-bearing, not decorative: stub any one of them to
+    `=> {}` and TB-IR lowers the program with the periodic handler
+    simply absent from the IR. (Two of the three do that outright; the
+    initiator always-on position needs an `active` binding to show it,
+    because the initiator BFM form refuses a `passive` one before the
+    arm is reached. The first version of this entry claimed the plain
+    silent drop at all three and was measured only at two.)
 
-    One row needed care. A `when active` periodic handler on a
-    `passive` instance produces v1 output byte-identical to the same
-    program with the handler deleted — which reads like a silent drop
-    and is not: it is v1 obeying `when active`. The first version of
-    the test asserted emission on the fixture's own `passive` binding
-    and failed for exactly that reason. Both halves are pinned now, the
-    `active` binding for emission and the `passive` one for the
-    scoping.
+    The VERDICT, though, was wrong — `Unsupported`, kept from the old
+    code and asserted on one probe. `<N>` is any integer expression
+    (spec §7.10), and v1 registers the closure near the top of the run
+    function, so whether its output compiles depends on where the
+    period expression's names are emitted:
 
-    The general shape here is the same one that has bitten this sweep
-    repeatedly: the arms in a file do not tell you what reaches the
-    file. Only the gate does.
+    | period | v1 emits | compiles |
+    |---|---|---|
+    | `5`, `2 + 3` | `(int64_t)(5)`, `(int64_t)(2 + 3)` | yes |
+    | `NPER`, a file-scope `const` | `(int64_t)(NPER)`, declared at namespace scope ~80 lines earlier | yes |
+    | `read_count`, a state field | `(int64_t)(target.read_count)`, instance declared 3 lines earlier | yes |
+    | `limit`, an impl-scope `let` | `(int64_t)(limit)`, declared **64 lines later** | **no** |
+
+    The last row is compiler-measured, not read off the text: g++ on
+    the spliced closure says "'limit' was not declared in this scope".
+    It reaches the arm because the name resolver does not visit a
+    bound-to transactor's `on` trigger at all — `on some_undefined_name
+    cycles` also passes `harc check`.
+
+    So the discriminator is again name resolution in the emitted C++
+    rather than the shape of the trigger, exactly as on the scoreboard
+    wiring arm, and there is no predicate over the trigger to split on.
+    Worst-under-arm makes all three `EmitsUncompilable`. The literal
+    case pays for that by losing a suggestion it would have deserved.
+
+    One row needed care in the other direction. A `when active`
+    periodic handler on a `passive` instance produces v1 output
+    byte-identical to the same program with the handler deleted — which
+    reads like a silent drop and is not: it is v1 obeying `when
+    active`. The first version of the test asserted emission on the
+    fixture's own `passive` binding and failed for exactly that reason.
+    Both halves are pinned now.
+
+    Two general shapes, both of which have bitten this sweep before:
+    the arms in a file do not tell you what reaches the file — only the
+    gate does; and one probe of one shape does not measure an arm whose
+    input space is an expression.
 
 72. **Bounding one of two expanders bounds nothing (2026-08-17).**
 
