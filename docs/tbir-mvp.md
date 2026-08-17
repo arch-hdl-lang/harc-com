@@ -3694,15 +3694,40 @@ case and only locally-determinable `Assign` types are compared).
     any identity. This is divergence 51's lesson applied before being
     caught by it rather than after.
 
-    Probed at all SIX landings rather than one, because divergence 47's
-    tseq pair sat four lines apart and classified differently. They all
-    agree on `SilentlyMisLowers` — a result, not a reason to have
-    assumed it, and it took two wrong labels and four review rounds to
-    establish. The sixth, `mod.rs`'s `test parameters`, is the only one
-    whose surface syntax is paren params (`test T(N: int = 3)`) rather
-    than `#(...)`, which is why searching for the `#(...)` spelling
-    missed it five times running. **Grouping by construct means grouping
-    by what the construct DOES, not by how it is spelled.**
+    Probed at all SEVEN landings rather than one, because divergence
+    47's tseq pair sat four lines apart and classified differently. They
+    all agree on `SilentlyMisLowers` — a result, not a reason to have
+    assumed it, and it took two wrong labels and six review rounds to
+    establish, with the set of landings growing at four of them (2 → 4 →
+    5 → 6 → 7).
+
+    The sixth, `mod.rs`'s `test parameters`, is the only one whose
+    surface syntax is paren params (`test T(N: int = 3)`) rather than
+    `#(...)`, which is why searching for the `#(...)` spelling missed it
+    five rounds running. **Grouping by construct means grouping by what
+    the construct DOES, not by how it is spelled.** The search that
+    finally found the last two was over the thirteen `params: Vec<Param>`
+    fields in `ast.rs` — the declaration sites — rather than over any
+    spelling.
+
+    The seventh is different in kind and is the most serious thing in
+    this entry. `testbench Tb #(N: int = 3)` was not misclassified; it
+    was **not rejected at all**. `ComponentDecl` carries a `Testbench`
+    kind, and `comp_sources` admits `Item::Env` only when the kind is
+    `Env`, so a testbench reaches no parameter check anywhere. With a
+    file-scope `const N = 9` to shadow, TB-IR lowered it, VERIFIED it and
+    emitted `harc_assign(dut->rst, ((int64_t)(9)))` — byte-identical to
+    the same source with the parameter list deleted. That is precisely
+    what `SilentlyMisLowers` is documented as ("the worst outcome, and
+    the reason TB-IR refuses rather than matching it"), and TB-IR was
+    matching it.
+
+    Only half the shape leaked: with nothing to shadow, the
+    unresolved-name path already caught it. A probe that used a fresh
+    parameter name would have reported the hole closed. **The shadowing
+    case is not an exotic corner of this construct — it is the only case
+    that distinguishes a dropped parameter from a rejected one**, and six
+    of the seven landings needed it to classify at all.
 
     The fourth landing, `scoreboards.rs`, was first labelled
     `EmitsUncompilable` on a structural argument: a data-only scoreboard

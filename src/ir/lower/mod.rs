@@ -2009,6 +2009,32 @@ fn validate_testbench_component(
     function_library_names: &HashSet<String>,
     passive_helper_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
+    // The SEVENTH landing of the dropped-parameter-list construct, and
+    // the only one that was not a mislabelled diagnostic but a hole:
+    // nothing rejected it, so TB-IR silently mis-lowered it too.
+    //
+    // `ComponentDecl` has a `Testbench` kind, and it escapes every other
+    // parameter check — `comp_sources` admits `Item::Env` only when the
+    // kind is `Env`, so a testbench never reaches the composite arm in
+    // `components.rs`. With a file-scope `const N = 9` in scope,
+    // `testbench Tb #(N: int = 3)` lowered, VERIFIED and emitted, with
+    // the reference bound to the const's 9 and byte-identical to the
+    // same source with the parameter list deleted. (Without a const to
+    // shadow, the unresolved-name path already caught it, which is why
+    // only half the shape leaked.)
+    //
+    // That is the exact behaviour `V1Status::SilentlyMisLowers` is
+    // documented as "the worst outcome, and the reason TB-IR refuses
+    // rather than matching it" — and TB-IR was matching it.
+    if !c.params.is_empty() {
+        return Err(not_implemented(
+            &format!("parameters on testbench `{}`", c.name.name),
+            "v1 drops the parameter list entirely: a reference to one either fails to \
+             resolve or silently picks up a same-named file-scope `const`, and the \
+             parameter's own default is never used",
+            V1Status::SilentlyMisLowers,
+        ));
+    }
     for ci in &c.items {
         match ci {
             ComponentItem::Field(f) => {

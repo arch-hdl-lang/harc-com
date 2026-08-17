@@ -17140,3 +17140,77 @@ end test ParamTest
     // And the control: without a parameter, the same test lowers.
     lower_src(&mk("", "ParamTest", "1")).expect("the unparameterized test lowers");
 }
+
+/// The SEVENTH landing, and the only one that was a hole rather than a
+/// mislabel: nothing rejected `testbench Tb #(N: int = 3)` at all, so
+/// TB-IR silently mis-lowered it exactly as v1 does.
+///
+/// `ComponentDecl` has a `Testbench` kind, and it escapes every other
+/// parameter check — `comp_sources` admits `Item::Env` only when the
+/// kind is `Env`, so a testbench never reaches the composite arm. With
+/// a file-scope `const` to shadow, the reference bound to the const and
+/// the whole program lowered, verified AND emitted. Without one, the
+/// unresolved-name path already caught it, which is why only half the
+/// shape leaked and why probing only the unshadowed form would have
+/// found nothing.
+#[test]
+fn a_testbench_parameter_was_silently_mis_lowered_by_tbir_too() {
+    const SRC: &str = r#"CONST
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TbDECL
+    dut : Top
+end testbench Tb
+
+impl TbTest for Tb
+    clock clk = SysDomain
+    run
+        dut.rst = USE
+        wait 2 cycles
+    end run
+end impl TbTest
+"#;
+    let mk = |cst: &str, decl: &str, use_: &str| {
+        SRC.replace("CONST\n", cst)
+            .replace("TbDECL", decl)
+            .replace("USE", use_)
+    };
+
+    // The shape that leaked: shadowed by a file-scope const.
+    let shadowed = mk("const N = 9\n\n", "Tb #(N: int = 3)", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&shadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on testbench `Tb`"), "{msg}");
+
+    // v1 binds it to the const, and the parameter's own default 3
+    // reaches nothing — the same shape as the other six landings.
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    assert!(
+        v1.contains("static constexpr int64_t N = 9;")
+            && v1.contains("harc_rt::harc_assign(dut->rst, N);"),
+        "v1 binds the reference to the const"
+    );
+    let no_param = mk("const N = 9\n\n", "Tb", "N");
+    lower_src(&no_param).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+        v1,
+        "`#(N: int = 3)` changes nothing under v1 either"
+    );
+
+    // The half that never leaked: with nothing to shadow, the
+    // unresolved-name path catches it before this arm can.
+    let unshadowed = mk("", "Tb #(WIDE: int = 3)", "WIDE");
+    let msg = assert_not_implemented(
+        &lower_src(&unshadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("parameters on testbench `Tb`"), "{msg}");
+
+    // And the control: without a parameter list, the testbench lowers.
+    lower_src(&mk("", "Tb", "1")).expect("the unparameterized testbench lowers");
+}
