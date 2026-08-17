@@ -896,7 +896,7 @@ fn bin_value_str(v: &CovBinValue) -> String {
         }
     }
     match v {
-        CovBinValue::Eq(x) => x.to_string(),
+        CovBinValue::Eq(x) => bound_str(x),
         CovBinValue::Range { lo, hi } => format!(
             "[{}..{}]",
             lo.as_ref().map(bound_str).unwrap_or_default(),

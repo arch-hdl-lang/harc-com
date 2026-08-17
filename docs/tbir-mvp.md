@@ -2766,6 +2766,86 @@ case and only locally-determinable `Assign` types are compared).
     first by not looking, then twice by reasoning outward from a single
     look instead of running the next probe.
 
+45. **Covergroup bin exact VALUES may be runtime expressions
+    (2026-08-17).**
+
+    `cg-nonconst-bin` had been carried as unresolved for several sweeps
+    because the first probe measured nothing — the control compared a
+    one-bin covergroup against a two-bin one, so the diff was dominated
+    by the bin count and said nothing about the bin spec. Re-probed
+    properly against `cov_runtime_bound_test` (registered, passing under
+    both backends), mutating one token at a time, it is a **real gap**:
+
+    | spelling | v1 | TB-IR (before) |
+    |---|---|---|
+    | `en0 = dut.en` | `_v == harc_rt::harc_read(dut->en)` | rejected |
+    | `en0 = {dut.en}` | same | rejected |
+    | `en0 = {0, dut.en}` | same, alongside the literal | rejected |
+    | `en0 = {dut.en + 0}` | the expression, per-sample | rejected |
+
+    All four landings, working code in every one. The odd part is what
+    the code already contained: range BOUNDS had carried
+    `CovBinBound::Runtime` since #494, so `[dut.en .. 7]` worked while
+    `{dut.en}` was refused **in the same bins block**. v1 never had that
+    split — it renders both with the same `emit_expr`.
+
+    The fix is the shape of the IR, not a new code path: `CovBinValue::
+    Eq(u64)` becomes `Eq(CovBinBound)`, and the exact-value arm calls
+    the same `lower_bin_bound` a range end does. The constant fast path
+    is untouched, so the emitter, the dump-IR printer, and every
+    existing bin keep their behaviour; the sampler-subset diagnostic is
+    now shared rather than duplicated. Two `Unsupported` sites removed
+    by deleting code.
+
+    Registered as `cov_runtime_bin_value_test`, so the equivalence
+    harness trace-diffs the two backends on it — unlike divergence 44's
+    folds, this one is a gap CLOSED, so the registry is available as
+    evidence and is the right place for it.
+
+    The lesson is about the first probe, not the second: a control that
+    differs from the mutation in more than one respect measures the
+    wrong thing, and "no signal" reads identically to "no gap". This one
+    sat unresolved for five batches because of it.
+
+    **Closing the gap uncovered a second, opposite one.** Runtime bin
+    members and bounds are NOT emitted byte-for-byte with v1:
+    `cover_expr_cpp` parenthesises a compound expression, v1's
+    `emit_expr` does not. TB-IR's rendering therefore always differs;
+    what varies is whether the difference MATTERS. For an operator that
+    binds tighter than the comparison it does not — the two group the
+    same way —
+
+        {dut.en + 4}  ->  _v == harc_read(dut->en) + 4      (v1)
+                      ->  _v == (harc_read(dut->en) + 4)    (TB-IR)
+
+    — which is why the registry fixture can use `+`: the trace diff
+    compares behaviour, not text. For an operator that binds looser, the
+    difference is the whole meaning, and v1 is **wrong**:
+
+        {dut.en | 8}  ->  _v == harc_read(dut->en) | 8      (v1)
+                      ->  _v == (harc_read(dut->en) | 8)    (TB-IR)
+
+    C++ groups v1's as `(_v == en) | 8` — non-zero on every sample, so
+    the bin always hits. TB-IR counts what the user wrote. The same was
+    already true of range bounds; the widening made it reachable in one
+    more position.
+
+    So a single construct is a gap in one direction and a divergence in
+    the other, depending on the operator: `+` goes in the equivalence
+    registry, `|` cannot, because the trace diff would fail on v1's bug.
+    Both are pinned by
+    `a_low_precedence_bin_value_is_a_place_v1_is_wrong`, so a later
+    "make the emitters byte-identical" change has to confront the bug
+    rather than adopt it.
+
+    Worth generalizing: **byte-identity with v1 is the goal only where
+    v1 is right.** Every previous slice could treat "matches v1's
+    output" as the success condition; here that would mean reproducing a
+    precedence bug. The equivalence registry encodes agreement, not
+    correctness, and those come apart exactly where v1 is wrong —
+    divergence 44's addrmap folds and this precedence case are the two
+    known places so far.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

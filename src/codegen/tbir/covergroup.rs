@@ -338,9 +338,26 @@ fn bin_membership(
     if values.is_empty() {
         return Ok("(false)".to_string());
     }
-    // Render one range bound. A constant folds inline; a runtime bound is
+    // Render one bin bound — an exact value or a range end, which are
+    // the same thing here. A constant folds inline; a runtime bound is
     // emitted with the same expression lowerer used for point targets,
-    // matching v1's per-sample `emit_expr(bound)` byte-for-byte.
+    // matching v1's per-sample `emit_expr(bound)`.
+    //
+    // NOT byte-for-byte, and deliberately so: `cover_expr_cpp`
+    // parenthesises a compound expression, v1 does not. For an operator
+    // that binds tighter than the comparison (`{dut.en + 4}` ->
+    // `_v == harc_read(dut->en) + 4`) the two agree. For one that does
+    // not, v1 is WRONG: `{dut.en | 8}` emits `_v == harc_read(dut->en) | 8`,
+    // which C++ groups as `(_v == en) | 8` — non-zero always, so the bin
+    // hits on every sample. TB-IR emits `_v == (harc_read(dut->en) | 8)`
+    // and counts what the user wrote.
+    //
+    // So a low-precedence operator here is a place TB-IR is AHEAD, and
+    // a program using one must not go in `tbir_equiv_fixtures.txt` — the
+    // trace diff would fail on v1's bug. `cov_runtime_bin_value_test`
+    // uses `+` for exactly that reason; the divergence itself is pinned
+    // by `a_low_precedence_bin_value_is_a_place_v1_is_wrong`. The same
+    // was already true of range bounds before exact values joined them.
     let bound = |b: &CovBinBound| -> Result<String, EmitError> {
         match b {
             CovBinBound::Const(x) => Ok(x.to_string()),
@@ -350,7 +367,7 @@ fn bin_membership(
     let mut parts = Vec::with_capacity(values.len());
     for v in values {
         let part = match v {
-            CovBinValue::Eq(x) => format!("(_v == {x})"),
+            CovBinValue::Eq(x) => format!("(_v == {})", bound(x)?),
             CovBinValue::Range { lo, hi } => match (lo, hi) {
                 (Some(l), Some(h)) => format!("(_v >= {} && _v <= {})", bound(l)?, bound(h)?),
                 (Some(l), None) => format!("(_v >= {})", bound(l)?),

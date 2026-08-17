@@ -154,7 +154,7 @@ fn bin_repr(v: &ir::CovBinValue) -> (&'static str, Option<u64>, Option<u64>) {
         }
     }
     match v {
-        ir::CovBinValue::Eq(x) => ("eq", Some(*x), None),
+        ir::CovBinValue::Eq(x) => ("eq", bound(x), None),
         ir::CovBinValue::Range { lo, hi } => (
             "range",
             lo.as_ref().and_then(bound),
@@ -14552,4 +14552,302 @@ fn a_bus_bound_to_a_non_dut_target_does_not_point_at_v1() {
         field.contains("harc_rt::harc_read(dut->core)->mem_read_addr"),
         "v1 dereferences the bind expression itself:\n{field}"
     );
+}
+
+/// A covergroup bin's EXACT VALUE may now be a runtime expression
+/// (`{dut.en}`), not only a folded constant. Ranges got runtime bounds
+/// first and exact values were left behind, so `[dut.en .. 7]` worked
+/// while `{dut.en}` was rejected in the same bins block — a split v1
+/// never had, since it renders both with the same `emit_expr`.
+///
+/// Both forms now carry a `CovBinBound`, so `lower_bin_bound` is the
+/// single implementation and the sampler-subset diagnostic is shared.
+#[test]
+fn covergroup_runtime_bin_values_lower_and_emit() {
+    let prog = lower_src(&fixture("cov_runtime_bin_value_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cp_count = &prog.covgroups[0].points[0];
+    assert_eq!(cp_count.name, "cp_count");
+
+    // `eq_en = {dut.en}` — a bare port read, carried as Runtime.
+    assert_eq!(cp_count.bins[0].name, "eq_en");
+    assert!(
+        matches!(
+            &cp_count.bins[0].values[0],
+            ir::CovBinValue::Eq(ir::CovBinBound::Runtime(ir::Expr::Port(_)))
+        ),
+        "eq_en must be a runtime port read, got {:?}",
+        cp_count.bins[0].values[0]
+    );
+
+    // `eq_expr = {dut.en + 4}` — an expression over the port.
+    assert_eq!(cp_count.bins[1].name, "eq_expr");
+    assert!(
+        matches!(
+            &cp_count.bins[1].values[0],
+            ir::CovBinValue::Eq(ir::CovBinBound::Runtime(ir::Expr::Binary(..)))
+        ),
+        "eq_expr must be a runtime binary expr, got {:?}",
+        cp_count.bins[1].values[0]
+    );
+
+    // `eq_const = {12}` — the constant fast path is UNCHANGED, which is
+    // what keeps the widening from being a rewrite of every bin.
+    assert_eq!(cp_count.bins[2].name, "eq_const");
+    assert!(
+        matches!(
+            &cp_count.bins[2].values[0],
+            ir::CovBinValue::Eq(ir::CovBinBound::Const(12))
+        ),
+        "eq_const must still fold, got {:?}",
+        cp_count.bins[2].values[0]
+    );
+
+    // `mixed = {dut.en + 1, 15}` — one set, both kinds, in order.
+    assert_eq!(cp_count.bins[3].name, "mixed");
+    assert_eq!(cp_count.bins[3].values.len(), 2);
+    assert!(matches!(
+        &cp_count.bins[3].values[1],
+        ir::CovBinValue::Eq(ir::CovBinBound::Const(15))
+    ));
+
+    // Emission: the runtime value is compared against a live port read
+    // at sample time, which is exactly what v1 emits.
+    let cpp = emit_fixture_cpp("cov_runtime_bin_value_test.harc");
+    assert!(
+        cpp.contains("_v == harc_rt::harc_read(dut->en)"),
+        "a runtime bin value must emit a live port read; got:\n{cpp}"
+    );
+}
+
+/// The v1 evidence behind the bin-value widening, with both anchors —
+/// and the reason it is a gap CLOSED rather than a diagnostic
+/// reclassified.
+///
+/// Probed by mutating `cov_runtime_bound_test` (registered, passing
+/// under both backends) one token at a time, at every position an exact
+/// value can be written.
+#[test]
+fn v1_has_always_compared_runtime_bin_values_per_sample() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    const LIT: &str = "en0 = {0}";
+
+    // Control: the unmutated fixture emits under both backends…
+    let ctl_v1 = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    emit_cpp_src(&fixture);
+    // …and its literal bin renders as a comparison against 0, so the
+    // value is genuinely in the output and the diffs below measure it.
+    assert!(ctl_v1.contains("(_v == 0)"), "control:\n{ctl_v1}");
+
+    // Every position an exact value can appear: bare, in a one-element
+    // set, alongside a literal, and as an expression. The expected
+    // needle is per-spelling because TB-IR parenthesises a compound
+    // sub-expression where v1 does not — a rendering difference the
+    // equivalence harness trace-diffs past, and one the existing
+    // runtime-BOUND fixture already carries.
+    for (spelling, needle) in [
+        ("en0 = dut.en", "_v == harc_rt::harc_read(dut->en)"),
+        ("en0 = {dut.en}", "_v == harc_rt::harc_read(dut->en)"),
+        ("en0 = {0, dut.en}", "_v == harc_rt::harc_read(dut->en)"),
+        ("en0 = {dut.en + 0}", "harc_rt::harc_read(dut->en) + 0"),
+    ] {
+        let src = fixture.replace(LIT, spelling);
+        // v1 emits a live per-sample comparison — working code, not a
+        // shape it silently drops…
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits a runtime bin value");
+        assert!(
+            v1.contains(needle),
+            "`{spelling}` must emit a live port read under v1:\n{v1}"
+        );
+        // …and it differs from the control, so the bin value reaches the
+        // output rather than the two happening to agree.
+        assert_ne!(v1, ctl_v1, "`{spelling}` must change v1's output");
+        // TB-IR now matches instead of rejecting.
+        assert!(
+            emit_cpp_src(&src).contains(needle),
+            "`{spelling}` must lower and emit the same comparison under TB-IR"
+        );
+    }
+}
+
+/// Runtime bin members and range bounds are NOT emitted byte-for-byte
+/// with v1, and the difference is one where v1 is wrong.
+///
+/// `cover_expr_cpp` parenthesises a compound expression; v1's
+/// `emit_expr` does not. For an operator binding tighter than the
+/// comparison the two agree — which is why `cov_runtime_bin_value_test`
+/// can use `+` and sit in the equivalence registry. For one that does
+/// not, v1 emits `_v == harc_read(dut->en) | 8`, which C++ groups as
+/// `(_v == en) | 8` — non-zero on every sample, so the bin always hits.
+///
+/// This became reachable on the exact-value path when runtime members
+/// landed; it was already reachable on the range-bound path, and both
+/// are pinned here so a future "make them byte-identical" change has to
+/// confront the bug rather than adopt it.
+#[test]
+fn a_low_precedence_bin_value_is_a_place_v1_is_wrong() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+
+    // Control: the registered fixture emits under both backends.
+    emit_cpp_src(&fixture);
+    cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+
+    // An operator that binds TIGHTER than `==`: the two agree, so the
+    // registry fixture's `+` really is safe rather than untested.
+    let tight = fixture.replace("en0 = {0}", "en0 = {dut.en + 8}");
+    assert!(
+        cpp_tb::emit(&merged_src(&tight))
+            .expect("v1 emits")
+            .contains("_v == harc_rt::harc_read(dut->en) + 8"),
+        "v1 groups `+` correctly, needing no parens"
+    );
+    assert!(
+        emit_cpp_src(&tight).contains("harc_rt::harc_read(dut->en) + 8"),
+        "TB-IR computes the same value"
+    );
+
+    // An operator that binds LOOSER: v1's rendering changes what the
+    // bin means…
+    let loose = fixture.replace("en0 = {0}", "en0 = {dut.en | 8}");
+    assert!(
+        cpp_tb::emit(&merged_src(&loose))
+            .expect("v1 emits")
+            .contains("_v == harc_rt::harc_read(dut->en) | 8"),
+        "v1 emits the bare expression, which C++ groups as `(_v == en) | 8`"
+    );
+    // …and TB-IR's does not.
+    assert!(
+        emit_cpp_src(&loose).contains("_v == (harc_rt::harc_read(dut->en) | 8)"),
+        "TB-IR parenthesises, so the comparison is against the value"
+    );
+
+    // Same on a range BOUND, which predates the exact-value widening.
+    let bound = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [dut.en | 8 .. 7]");
+    assert!(
+        cpp_tb::emit(&merged_src(&bound))
+            .expect("v1 emits")
+            .contains("_v >= harc_rt::harc_read(dut->en) | 8"),
+        "v1 has the same bug on a range bound"
+    );
+    assert!(
+        emit_cpp_src(&bound).contains("_v >= (harc_rt::harc_read(dut->en) | 8)"),
+        "TB-IR parenthesises the bound too"
+    );
+}
+
+/// A bare name in a bin spec that is neither a `const`/enum variant nor
+/// a hook param is a typo, and keeps the message that says so. Routing
+/// every non-range member through `lower_bin_bound` would otherwise hand
+/// the user the generic sampler-subset list — less precise, and it
+/// labels a bin as a "point".
+#[test]
+fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    emit_cpp_src(&fixture);
+
+    let err = lower_src(&fixture.replace("en0 = {0}", "en0 = {NOPE}")).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("bin `en0`"), "a bin is not a point: {msg}");
+    assert!(
+        msg.contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"),
+        "{msg}"
+    );
+
+    // The escape hatches the message names all work, so it is accurate.
+    lower_src(&format!(
+        "const NOPE = 3\n\n{}",
+        fixture.replace("en0 = {0}", "en0 = {NOPE}")
+    ))
+    .expect("a const name folds");
+}
+
+/// A record-typed hook parameter is rejected in a bin the same way it
+/// is in a coverpoint TARGET, and for the same reason: a bin compares
+/// `_v` against the bound, so `one = {cmd}` emits `_v == cmd` —
+/// `uint64_t` against a struct, which g++ rejects.
+///
+/// v1 emits exactly the same thing, so this is a malformed program
+/// under both backends (`Invalid`), not a subset gap.
+///
+/// The exact-value landing became reachable when bin members were
+/// allowed to be runtime expressions; the range-bound landing was
+/// reachable before that and unguarded. Both are checked.
+#[test]
+fn a_record_hook_param_is_rejected_in_a_bin_not_just_a_target() {
+    let fixture = fixture("covergroup_hook_param_test.harc");
+
+    // Control: the registered fixture lowers — the guard added here is
+    // not rejecting scalar hook-param bins.
+    emit_cpp_src(&fixture);
+
+    for (from, to) in [
+        ("one  = {1}", "one  = {cmd}"),
+        ("pair = [2..3]", "pair = [cmd..3]"),
+    ] {
+        let err = lower_src(&fixture.replace(from, to)).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("must compare against a scalar"),
+            "`{to}`: {msg}"
+        );
+        assert!(msg.contains("record `RunCmd`"), "{msg}");
+    }
+
+    // The scalar FIELD of the same param is still fine, so the guard
+    // rejects the record rather than the hook param.
+    lower_src(&fixture.replace("one  = {1}", "one  = {cmd.ticks}"))
+        .expect("a scalar hook-param field is a valid bin member");
+
+    // A hook param WINS over a file-scope const of the same name, which
+    // is the precedence a coverpoint target already uses. Without it,
+    // adding an unrelated `const cmd = 1` would silently turn
+    // `one = {cmd}` into `_v == 1` while `cover cmd.ticks` in the same
+    // covergroup still meant the hook argument — one name, two
+    // meanings, no diagnostic. Here the hook param wins and the scalar
+    // guard above catches it, which is the whole point.
+    let err = lower_src(&format!(
+        "const cmd = 1\n\n{}",
+        fixture.replace("one  = {1}", "one  = {cmd}")
+    ))
+    .unwrap_err();
+    assert!(
+        assert_invalid(&err).contains("must compare against a scalar"),
+        "a hook param must shadow a same-named const: {err:?}"
+    );
+}
+
+/// A rejected bin spec is reported as a `bin`, not as a `point`.
+///
+/// `lower_point_target` serves coverpoint targets, hook params, bin
+/// bounds and bin values but names only the first, so delegating bin
+/// members to it made a rejected `{"x"}` report a "point" the source
+/// never declared.
+#[test]
+fn a_rejected_bin_spec_is_reported_as_a_bin() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    emit_cpp_src(&fixture);
+
+    // Both a MEMBER and a range END, since they share one implementation
+    // and a relabel applied to only one of them would go unnoticed.
+    for (from, to) in [
+        ("en0 = {0}", r#"en0 = {"x"}"#),
+        ("sel_lo   = [dut.en .. 7]", r#"sel_lo   = ["x" .. 7]"#),
+    ] {
+        let err = lower_src(&fixture.replace(from, to)).unwrap_err();
+        let msg = assert_unsupported(&err);
+        assert!(msg.contains("bin `"), "`{to}`: {msg}");
+        assert!(!msg.contains("point `"), "`{to}`: {msg}");
+    }
+
+    // The typo message reaches a range end too.
+    let err = lower_src(&fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [NOPE .. 7]"))
+        .unwrap_err();
+    assert!(assert_unsupported(&err)
+        .contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"));
+
+    // A rejected coverpoint TARGET still says "point", so the relabel is
+    // scoped to the bin path rather than renaming the noun everywhere.
+    let err =
+        lower_src(&fixture.replace("cp_en : cover dut.en", r#"cp_en : cover "x""#)).unwrap_err();
+    assert!(assert_unsupported(&err).contains("point `cp_en`"));
 }

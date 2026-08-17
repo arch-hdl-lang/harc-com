@@ -306,6 +306,25 @@ fn lower_hook_param_field(
 /// subset deliberately smaller than general expression lowering because
 /// covergroup schemas lower before test/run scopes exist: no locals,
 /// helper calls, regblock reads, or transactor edges.
+///
+/// Also serves bin range BOUNDS and, since the exact-value widening, bin
+/// VALUES — which is where `point` becomes a misnomer: those callers
+/// pass the BIN name, so a rejected `{dut.q}` reports "point `en0`" for
+/// something that is a bin. Two follow-ups, deliberately not folded into
+/// the widening:
+///
+///   * the label wants to be a caller-supplied phrase ("point `cp_en`" /
+///     "bin `en0`"), which also means threading it through the nested
+///     `cover_const_u32` / `cover_infer_expr_width` / `cover_width_arg`
+///     helpers that build their own "point `{point}`" messages;
+///   * `unsupported_target` is very likely mis-CLASSIFIED. v1 emits an
+///     out-of-subset bin value verbatim — `_v == NOPE`,
+///     `_v == undefined_fn(1)`, `_v == "x"` — none of which compiles, so
+///     this looks like `EmitsUncompilable` rather than a v1 escape
+///     hatch. It is shared across four landings (point targets, hook
+///     params, bin bounds, bin values), and reclassifying a shared arm
+///     without probing every one of them is exactly the mistake
+///     divergences 43 and 44 record, so it wants its own slice.
 fn lower_point_target(
     group: &str,
     point: &str,
@@ -815,12 +834,18 @@ fn cover_infer_expr_width(
 }
 
 /// Lower a bin spec into its membership set. Supported shapes:
-///   `{v}` / `{a, b, c}`  — set literals of integer literals
-///   `v`                  — a bare integer literal or file-scope const/enum variant
+///   `{v}` / `{a, b, c}`  — set literals
+///   `v`                  — a bare member
 ///   `[a..b]`             — inclusive range; either bound may be open
 ///   `{[1..3], 7}`        — set-of-ranges (recursion)
 ///   `(inner)`            — parenthesized recursion
-/// Non-constant members/bounds are post-MVP.
+///
+/// A member or bound may be a compile-time constant (an integer
+/// literal, a file-scope `const`, an enum variant) or a genuine RUNTIME
+/// expression over the sampler subset — a DUT port, a hook param, a
+/// pure helper call, or arithmetic over those. Both forms carry a
+/// [`CovBinBound`], and both go through `lower_bin_bound`, so a member
+/// and a range end accept exactly the same thing.
 pub(crate) fn lower_bin_values(
     group: &str,
     bin: &str,
@@ -849,43 +874,80 @@ pub(crate) fn lower_bin_values(
         ExprKind::Paren(inner) => {
             lower_bin_values(group, bin, inner, consts, hook_params, helpers, extern_fns)
         }
-        ExprKind::Int(s) => {
-            let v = parse_bound(group, bin, s)?;
-            Ok(vec![CovBinValue::Eq(v)])
-        }
-        ExprKind::Ident(id) => {
-            let Some(v) = consts.get(&id.name).copied() else {
-                return Err(unsupported(
-                    &format!("covergroup `{group}` bin `{bin}` with a non-constant spec"),
-                    format!("`{}` is not a file-scope const or enum variant", id.name),
-                ));
-            };
-            Ok(vec![CovBinValue::Eq(v)])
-        }
         ExprKind::RangeLit { lo, hi } => {
-            let lo = lo
-                .as_ref()
-                .map(|e| lower_bin_bound(group, bin, e, consts, hook_params, helpers, extern_fns))
-                .transpose()?;
-            let hi = hi
-                .as_ref()
-                .map(|e| lower_bin_bound(group, bin, e, consts, hook_params, helpers, extern_fns))
-                .transpose()?;
+            let end = |e: &AstExpr| {
+                lower_bin_bound(group, bin, e, consts, hook_params, helpers, extern_fns)
+            };
+            let lo = lo.as_ref().map(&end).transpose()?;
+            let hi = hi.as_ref().map(end).transpose()?;
             Ok(vec![CovBinValue::Range { lo, hi }])
         }
-        _ => Err(unsupported(
-            &format!("covergroup `{group}` bin `{bin}` with a non-constant spec"),
-            "",
-        )),
+        // Every other element is an exact value, and takes the SAME
+        // path a range bound does. A literal or a file-scope const name
+        // folds; anything else (`{dut.en}`, `{dut.en + 1}`, a hook
+        // param, a pure helper call) becomes a runtime expression
+        // compared per-sample, which is what v1 has always done here —
+        // it emits `_v == harc_rt::harc_read(dut->en)` and the bin
+        // counts correctly.
+        //
+        // Ranges got runtime bounds first and exact values were left
+        // behind; there was never a reason for the two to differ, since
+        // v1 renders both with the same `emit_expr`. `lower_bin_bound`
+        // is the shared implementation, so every member and every range
+        // end accepts exactly the same thing and fails the same way.
+        _ => Ok(vec![CovBinValue::Eq(lower_bin_bound(
+            group,
+            bin,
+            spec,
+            consts,
+            hook_params,
+            helpers,
+            extern_fns,
+        )?)]),
     }
 }
 
-/// Lower a range bound. A plain integer literal or file-scope const/enum
-/// variant folds to `CovBinBound::Const` (unchanged fast path). A genuine
-/// runtime bound (a DUT port, hook param, or any expression over those)
-/// lowers via `lower_point_target` — the same sampler-subset expression
-/// lowerer used for point targets — to `CovBinBound::Runtime`, mirroring
-/// v1, which emits the raw bound expression per sample.
+/// Rewrite `lower_point_target`'s "point `X`" as "bin `X`".
+///
+/// That function serves coverpoint targets, hook params, bin bounds and
+/// bin values, but names only the first in its diagnostics, so a
+/// rejected bin spec reports a "point" the source never declared. The
+/// real fix is a caller-supplied label threaded through it and the
+/// nested `cover_const_u32` / `cover_infer_expr_width` / `cover_width_arg`
+/// helpers that build their own messages — see the note on
+/// `lower_point_target`. This keeps the user-visible noun honest until
+/// then, and is a no-op on any message that does not contain the phrase.
+fn relabel_point_as_bin(e: LowerError, bin: &str) -> LowerError {
+    let from = format!("point `{bin}`");
+    let to = format!("bin `{bin}`");
+    match e {
+        LowerError::Unsupported { construct, detail } => LowerError::Unsupported {
+            construct: construct.replace(&from, &to),
+            detail,
+        },
+        LowerError::NotImplemented {
+            construct,
+            detail,
+            v1,
+        } => LowerError::NotImplemented {
+            construct: construct.replace(&from, &to),
+            detail,
+            v1,
+        },
+        LowerError::Invalid(m) => LowerError::Invalid(m.replace(&from, &to)),
+    }
+}
+
+/// Lower ONE bin member or range end — the two are the same thing, and
+/// this is the single implementation of both, so `{x}` and `[x .. y]`
+/// accept the same shapes and fail the same way.
+///
+/// A plain integer literal or file-scope const/enum variant folds to
+/// `CovBinBound::Const`. A genuine runtime value (a DUT port, hook
+/// param, or any expression over those) lowers via `lower_point_target`
+/// — the same sampler-subset expression lowerer used for point targets —
+/// to `CovBinBound::Runtime`, mirroring v1, which emits the raw
+/// expression per sample.
 fn lower_bin_bound(
     group: &str,
     bin: &str,
@@ -900,19 +962,35 @@ fn lower_bin_bound(
             lower_bin_bound(group, bin, inner, consts, hook_params, helpers, extern_fns)
         }
         ExprKind::Int(s) => Ok(CovBinBound::Const(parse_bound(group, bin, s)?)),
-        // A bare ident that names a file-scope const/enum variant folds to
-        // a constant (unchanged). Anything else falls through to the
-        // runtime-expression lowerer below.
-        ExprKind::Ident(id) if consts.contains_key(&id.name) => {
+        // A bare ident that names a file-scope const/enum variant folds
+        // to a constant — but a HOOK PARAM of the same name wins, which
+        // is the precedence a coverpoint target already uses. Without
+        // this order, adding an unrelated `const cmd = 1` silently turns
+        // `one = {cmd}` into `_v == 1` while `cover cmd.ticks` in the
+        // same covergroup still means the hook argument: one name, two
+        // meanings, no diagnostic.
+        ExprKind::Ident(id) if consts.contains_key(&id.name) && !hook_params.contains(&id.name) => {
             Ok(CovBinBound::Const(consts[&id.name]))
         }
+        // A bare name that is neither is a TYPO, and gets a message that
+        // says so rather than `lower_point_target`'s generic subset
+        // list.
+        ExprKind::Ident(id) if !hook_params.contains(&id.name) => Err(unsupported(
+            &format!("covergroup `{group}` bin `{bin}` with a non-constant spec"),
+            format!(
+                "`{}` is not a file-scope const, enum variant, or hook parameter",
+                id.name
+            ),
+        )),
         _ => {
             // Reuse the point-target expression lowerer for the runtime
-            // case so the emitted per-sample bound matches v1 exactly
-            // (v1 renders the bound with the same `emit_expr` it uses for
-            // point targets). It rejects anything outside the sampler
-            // subset with a precise diagnostic.
-            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns, consts)?;
+            // case so the emitted per-sample value matches v1 (v1 renders
+            // it with the same `emit_expr` it uses for point targets). It
+            // rejects anything outside the sampler subset with a precise
+            // diagnostic — but names it a "point", so relabel: the source
+            // declared a bin.
+            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns, consts)
+                .map_err(|err| relabel_point_as_bin(err, bin))?;
             Ok(CovBinBound::Runtime(expr))
         }
     }
