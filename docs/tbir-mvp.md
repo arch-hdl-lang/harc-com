@@ -2937,6 +2937,75 @@ case and only locally-determinable `Assign` types are compared).
     until its input space is sampled, and "I probed that arm" is not the
     same claim as "I probed that arm's inputs."**
 
+47. **The four small files: `addrmap.rs` reaches zero (2026-08-17).**
+
+    Ten sites across the four files with the fewest of them. Eight moved,
+    two were already right, and the two that were right are the
+    interesting ones — both sit beside a site that moved.
+
+    | site | was | is | v1 |
+    |---|---|---|---|
+    | `tseq X()` with no `-> TSeq<T>` | `Unsupported` | **unchanged** | defaults to `std::vector<int64_t>` — works |
+    | `TSeq<BadType>` | `Unsupported` | `EmitsUncompilable` | emits `std::vector<NoSuchType>` |
+    | regblock register width 0 / 65 | `Unsupported` | `Invalid` | falls back to `uint64_t`, silently loses a bit |
+    | regblock zero-width field | `Unsupported` | `Invalid` | mask `0x0u` — reads 0 forever, writes are no-ops |
+    | regblock unknown register access | `Unsupported` | `EmitsUncompilable` | emits `NOPE.RS = 1`, not a member |
+    | addrmap unknown instance access | `Unsupported` | `EmitsUncompilable` | same |
+    | `for x in <scalar>` | `Unsupported` | `EmitsUncompilable` | range-for over a value with no `begin()` |
+    | non-literal timeout `fail(...)` | `Unsupported` | `SilentlyMisLowers` | **discards the message**, substitutes its own |
+    | record-API non-constant address | `Unsupported` | **unchanged** | genuine runtime decode — works |
+
+    `src/ir/lower/addrmap.rs` now has zero `Unsupported` sites, joining
+    `bus.rs`. regblock went 4 → 1, control 3 → 1, tseqs 2 → 1.
+
+    **The two `tseqs.rs` sites are four lines apart and classify
+    oppositely.** The difference is whether the element-type annotation
+    is ABSENT or PRESENT-but-unresolvable: absent makes v1 substitute a
+    working default, present-and-bad makes it print the name into a type
+    position. One code path handles both, which is exactly how they came
+    to share a classification. Worth naming as a shape — **an absent
+    annotation and an invalid one are different input classes**, and a
+    probe that only omits the annotation will never find the second.
+
+    The `control.rs` pair splits the same way for a different reason:
+    `for x in <scalar>` fails loudly at compile time, while a non-literal
+    timeout message fails silently at runtime — v1 emits
+    `sim_log_line("FAIL", "wait until timed out after %lld cycles", …)`
+    in place of whatever the user wrote. The failure still fires; the
+    diagnostic just isn't theirs.
+
+    **Rule 4 earned its keep, via a test rather than a probe.** The
+    regblock access catch-all was probed with two mutations, an unknown
+    register and a method call, and both were rejected — so both looked
+    like they reached it. They did not: `regs.reset_all()` is
+    intercepted by generic statement lowering (`stmts.rs`) well before
+    regblock access resolution, and is still `Unsupported` because that
+    is a different site in a file this batch never touched. The probe's
+    exit status could not tell them apart; the test asserting the
+    message did. **A rejection is evidence that SOMETHING rejected, not
+    that the thing under edit did** — and the cheapest way to hold
+    yourself to that is to assert on the message text, not on the error
+    kind.
+
+    Review then found the same shape twice more, in this batch's own
+    comments and tests: the `reset_all()` example was left in BOTH
+    access-catch-all comments as though it reached them, and the test
+    named for both catch-alls exercised only the regblock one — so the
+    `addrmap.rs` change, the batch's headline, shipped untested. Both
+    fixed; the addrmap case now uses the self-contained `ADDRMAP_TB`
+    helper already in the file.
+
+    A fixture note, since it cost two attempts. A zero-width FIELD is
+    reachable only past the register-width check, and the natural
+    fixture for it (`regblock_fields_test`) resolves its bus through
+    `use BusAxiLite`, which the unit-test harness does not search for —
+    so the field has to be grown on a self-contained fixture instead.
+    And a field with no ACCESS site emits nothing at all, so v1's `0x0u`
+    mask is not visible there either (rule 2, in a place it is easy to
+    forget). What the test can show is the claim that classifies the
+    site: v1 does not check.
+
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
