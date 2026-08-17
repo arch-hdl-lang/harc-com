@@ -72,9 +72,15 @@ is_wired() {
     # it moved to fixtures.tbl so run_fixtures.sh and run_emit_parity.sh
     # share one source of truth, and this check has to follow it or every
     # correctly-registered fixture looks unwired.
-    if grep -qE "(^|[ |])${base}(\.harc)?([ |]|$)" tests/fixtures.tbl 2>/dev/null; then
-        return 0
-    fi
+    # NOTE: there is deliberately no special-cased grep of fixtures.tbl
+    # here. The loop below already globs tests/*.tbl, strips comment rows
+    # the same way, and does it with process substitution rather than a
+    # pipeline. A separate `grep -vE ... | grep -q ...` here was dead code
+    # carrying a racy SIGPIPE-under-pipefail bug: the downstream grep exits
+    # on first match, the upstream one dies with 141, and pipefail turns a
+    # successful match into "not wired" once the table outgrows the pipe
+    # buffer. That bug has now been written three times in this codebase;
+    # do not add a fourth.
     # Any other shell runner, Rust test, or fixture list. Two kinds of
     # file are excluded because naming a fixture in them means the
     # OPPOSITE of "wired":
@@ -89,8 +95,14 @@ is_wired() {
         [ "$candidate" = "$ALLOWLIST" ] && continue
         [ "$candidate" = "tests/emit_parity_known.txt" ] && continue
         [ "$candidate" = "tests/check_fixture_registration.sh" ] && continue
-        if grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null \
-            | grep -qF "$base"; then
+        # NOT a pipeline into `grep -q`: under `set -o pipefail` the
+        # downstream grep exits on first match, the upstream one dies with
+        # SIGPIPE, and pipefail turns a successful match into rc 141. The
+        # verdict would then depend on the byte offset of the match inside
+        # a 400 KB file. (run_emit_parity.sh's known_exemption had the
+        # identical bug; this copy was introduced by the same commit that
+        # removed it there.)
+        if grep -qF "$base" <(grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null); then
             return 0
         fi
     done
