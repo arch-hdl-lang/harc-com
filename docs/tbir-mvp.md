@@ -3592,6 +3592,57 @@ case and only locally-determinable `Assign` types are compared).
     was leaking into a user-facing message, quoting back a `_tb` nobody
     typed; that shape now gets its own sentence.
 
+55. **Named arguments are decoration to v1, and `#(...)` parameters do
+    not exist to it (2026-08-17).**
+
+    Two `components.rs` families that share a shape: the user writes
+    something to make their intent explicit, and v1 throws that
+    something away.
+
+    **Named arguments.** v1 NEVER reads an argument name — all 30
+    `CallArg::Named` matches in `cpp_tb.rs` destructure `{ value, .. }`
+    and bind by position. The structural claim was checked as carefully
+    as a count would have been, and then measured:
+    `axil_write(data = t.value, addr = t.addr)` emits
+    `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` — the two
+    arguments SWAPPED, in code that compiles and runs. A name matching
+    no parameter draws no diagnostic at all. Reordering is the entire
+    point of naming arguments, so this is `SilentlyMisLowers` and v1 is
+    the last place to send the user.
+
+    Split on ARITY, because a one-argument call cannot reorder: v1's
+    positional binding puts the value in the only slot there is and its
+    output is identical to the positional form. There v1 really is an
+    escape hatch, and the same reasoning keeps the two one-argument
+    predicates (`idle_in`/`idle_out`, `quiesced`) on `Unsupported`
+    rather than sweeping them up with the general call. Arity ≥ 2 is not
+    split further: same-order names emit correctly too, but telling that
+    apart needs the callee's parameter list, which the seam does not
+    have, and an arm's status is the worst thing under it.
+
+    **`#(...)` parameters on a component.** v1 drops the list, and the
+    two consequences are very different for the user. Declared but
+    unused, v1's output is BYTE-IDENTICAL to the same component written
+    without the parameter — and a `#(4)` argument at the instantiation
+    vanishes with it, so the knob the user added does nothing at all.
+    Referenced in the body, `limit : uint<32> default N` emits
+    `uint64_t limit = N;` with `N` declared nowhere in the generated
+    file, which does not compile. `SilentlyMisLowers` is the worse of
+    the two and so the label.
+
+    Both anchors were needed here and both were nearly skipped. Byte
+    identity means nothing unless the component contributes at all, and
+    unless something the component carries is VISIBLE in the output — so
+    the probe pins `uint64_t limit = 7;` in the control before trusting
+    any identity. This is divergence 51's lesson applied before being
+    caught by it rather than after.
+
+    Probed at BOTH landings rather than one: the analysis-source
+    (transactor) arm and the env/agent/scoreboard/sequencer arm sit four
+    lines apart and were measured separately, because divergence 47's
+    tseq pair sat four lines apart and classified differently. This time
+    they agreed — which is a result, not a reason to have assumed it.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

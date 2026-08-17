@@ -16436,3 +16436,233 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     ))
     .expect("and the test-scope arm lowers the same source");
 }
+
+/// Named arguments in a component method call. v1 never reads an
+/// argument NAME — all 30 `CallArg::Named` matches in `cpp_tb.rs`
+/// destructure `{ value, .. }` — so it binds strictly by position.
+///
+/// With two parameters that is a silent argument swap: the user writes
+/// the names precisely so the order does not matter, and v1 does the one
+/// thing that makes the order matter. It compiles and it runs.
+///
+/// With ONE parameter there is nowhere else for the value to go, so v1
+/// is correct and that arm keeps its `--codegen v1` suggestion.
+#[test]
+fn named_arguments_are_bound_by_position_by_v1() {
+    let fixture = fixture("axilite_env_test.harc");
+    const CALL: &str = "env.drv.axil_write(t.addr, t.value)";
+    let call = |args: &str| fixture.replacen(CALL, &format!("env.drv.axil_write({args})"), 1);
+
+    // The control, and the shape of the emitted call it produces.
+    lower_src(&fixture).expect("the positional form lowers");
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits");
+    assert!(
+        v1_ctl.contains("AxilXactor_axil_write(_tb.env.drv, t.addr, t.value)"),
+        "control binds addr then value"
+    );
+
+    // Same order: v1 happens to be right, which is what makes the
+    // reversed case below dangerous rather than merely broken.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&call("addr = t.addr, data = t.value"))).expect("v1 emits"),
+        v1_ctl,
+        "names in declaration order emit the same call"
+    );
+
+    // Reversed: the values SWAP, silently.
+    let v1_rev =
+        cpp_tb::emit(&merged_src(&call("data = t.value, addr = t.addr"))).expect("v1 emits");
+    assert!(
+        v1_rev.contains("AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)"),
+        "v1 binds by position, so `data = ..` lands in `addr` and vice versa"
+    );
+
+    // A name that matches no parameter is accepted without a word.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&call("nosuch = t.addr, data = t.value"))).expect("v1 emits"),
+        v1_ctl,
+        "a misspelled parameter name produces no diagnostic at all"
+    );
+
+    for args in [
+        "addr = t.addr, data = t.value",
+        "data = t.value, addr = t.addr",
+        "nosuch = t.addr, data = t.value",
+        "t.addr, data = t.value",
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&call(args)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("named arguments"), "{msg}");
+    }
+
+    // Arity 1: no slot to swap with, so v1 is a real escape hatch.
+    // `axil_read(addr)` lives in the same fixture.
+    let one = |arg: &str| {
+        fixture.replacen(
+            CALL,
+            &format!("{CALL}\n            let _rb = env.drv.axil_read({arg})"),
+            1,
+        )
+    };
+    let v1_one_ctl = cpp_tb::emit(&merged_src(&one("t.addr"))).expect("v1 emits");
+    for arg in ["addr = t.addr", "nosuch = t.addr"] {
+        let msg = assert_unsupported(&lower_src(&one(arg)).unwrap_err());
+        assert!(msg.contains("one-argument component method"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&one(arg))).expect("v1 emits"),
+            v1_one_ctl,
+            "`axil_read({arg})` emits exactly the positional call"
+        );
+    }
+}
+
+/// The single-argument heartbeat and quiesce predicates share the
+/// named-argument construct but not its hazard, for the same reason the
+/// one-argument method call does not have it. They keep `Unsupported`.
+#[test]
+fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
+    let fixture = fixture("agent_on_handler_test.harc");
+    const IDLE: &str = "assert tagger.idle_in(4)\n";
+    assert!(fixture.contains(IDLE), "fixture shape changed");
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits");
+    // The anchor: the predicate's argument is visible in the output, so
+    // a later byte-identity is the NAME being ignored rather than the
+    // call vanishing.
+    assert!(
+        v1_ctl.contains("tagger._last_in_cycle) >= (uint64_t)(4)"),
+        "the cycle count reaches the emitted predicate"
+    );
+
+    for arg in ["n = 4", "nosuch = 4"] {
+        let src = fixture.replacen(IDLE, &format!("assert tagger.idle_in({arg})\n"), 1);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("a named argument to `idle_in`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            v1_ctl,
+            "v1 drops the name and emits the same predicate"
+        );
+    }
+}
+
+/// `#(...)` parameters on a component. v1 never reads the list, and the
+/// two things that follow from that are very different for the user.
+///
+/// Declared but unused, v1's output is byte-identical to the same
+/// component written without the parameter — and a `#(4)` argument at
+/// the instantiation vanishes with it, so the knob the user added does
+/// nothing. Referenced in the body, `default N` emits `uint64_t limit =
+/// N;` with `N` declared nowhere.
+///
+/// Probed at BOTH landings: the analysis-source (transactor) arm and the
+/// env/agent/scoreboard/sequencer arm are four lines apart and were
+/// measured separately.
+#[test]
+fn component_parameters_are_dropped_by_v1() {
+    const SRC: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction TinyTxn
+    tag : uint<8>
+end transaction TinyTxn
+
+KINDWORD TaggerDECL
+    in_ev : event<TinyTxn>
+    seen  : uint<32> default 0
+    limit : uint<32> default LIMIT
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+end KINDWORD Tagger
+
+testbench ParamTb
+    dut  : Top
+    tg   : TaggerINST MODE
+end testbench ParamTb
+
+impl ParamTest for ParamTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl ParamTest
+"#;
+    // One shape, two landings: `agent` reaches the composite-component
+    // arm and `transactor ... active` the analysis-source one.
+    for (kind, mode, construct) in [
+        ("agent", "", "parameters on `Tagger`"),
+        (
+            "transactor",
+            "active",
+            "generic parameters on analysis-source `Tagger`",
+        ),
+    ] {
+        let mk = |decl: &str, inst: &str, limit: &str| {
+            SRC.replace("KINDWORD", kind)
+                .replace("TaggerDECL", decl)
+                .replace("TaggerINST MODE", &format!("{inst} {mode}"))
+                .replace("LIMIT", limit)
+        };
+        let ctl = mk("Tagger", "Tagger", "7");
+        lower_src(&ctl).unwrap_or_else(|e| panic!("{kind} control lowers: {e:?}"));
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+
+        // Two anchors. The component contributes at all, and the field
+        // `default` it carries is visible in the output — so a byte
+        // identity below is the PARAMETER being dropped rather than the
+        // whole component being inert.
+        let without = ctl.replace(&format!("    tg   : Tagger {mode}\n"), "");
+        assert_ne!(
+            cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
+            v1_ctl,
+            "{kind}: the component must contribute"
+        );
+        assert!(
+            v1_ctl.contains("uint64_t limit = 7;"),
+            "{kind}: the field default reaches the output"
+        );
+
+        // Unused parameter: dropped, and so is the instantiation arg.
+        for (decl, inst) in [
+            ("Tagger #(N: int)", "Tagger"),
+            ("Tagger #(N: int)", "Tagger #(4)"),
+            ("Tagger #(N: int = 3)", "Tagger"),
+        ] {
+            let src = mk(decl, inst, "7");
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::SilentlyMisLowers,
+            );
+            assert!(msg.contains(construct), "{msg}");
+            assert_eq!(
+                cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+                v1_ctl,
+                "{kind}: `{decl}` / `{inst}` emits as if the parameter were not there"
+            );
+        }
+
+        // Referenced parameter: an undeclared name in the output.
+        let used = mk("Tagger #(N: int = 3)", "Tagger", "N");
+        assert_not_implemented(
+            &lower_src(&used).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_used = cpp_tb::emit(&merged_src(&used)).expect("v1 emits");
+        assert!(
+            v1_used.contains("uint64_t limit = N;"),
+            "{kind}: the parameter name survives into the initializer"
+        );
+        assert!(
+            !v1_used
+                .lines()
+                .any(|l| !l.trim_start().starts_with("//") && l.contains("int64_t N")),
+            "{kind}: and `N` is declared nowhere, so it does not compile"
+        );
+    }
+}
