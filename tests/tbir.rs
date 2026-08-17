@@ -18204,3 +18204,349 @@ fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
         );
     }
 }
+
+/// A constraint BUILTIN is not an unknown relation.
+///
+/// Every `name(...)` with an `Ident` callee in a constraint was routed
+/// through the relation path, and a name that is not a declared
+/// relation was reported as one. v1 handles a small set of these
+/// itself — `sum(<list>[lo..hi])`, read off
+/// `cpp_tb::try_emit_constraint_list_call` — so calling it an unknown
+/// relation is a false refusal of a program v1 compiles, with a
+/// diagnostic that sends the reader looking for a `relation`
+/// declaration they never meant to write.
+///
+/// Only the FALSE-REFUSAL case is latent — an earlier version of this
+/// doc said the whole thing was. TB-IR refuses any transaction carrying
+/// a `list<T>` field before constraint lowering runs, and every `sum`
+/// v1 ACCEPTS needs a list field, so no v1-compiling program reaches
+/// the fix today. That is why the list-bearing cases are asserted on
+/// the constraint table: end-to-end there would pass for the wrong
+/// reason, since the list-field gate fires first and would keep passing
+/// however this were classified.
+///
+/// But `sum` over a SCALAR reaches the fixed line today, with no list
+/// field anywhere, and that case is asserted end to end — because the
+/// predicate checks NAME and ARITY only, deliberately wider than v1,
+/// which also requires a range-sliced list field. What keeps the
+/// widening safe is not the predicate but the shared emitter, and a
+/// predicate that is safe only because of what happens downstream needs
+/// the downstream asserted.
+#[test]
+fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
+    let src = |clause: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction P\n    n     : uint<8>\n    items : list<uint<8>>\n\
+             end transaction P\n\n\
+             test T\n    let dut : Top\n    let p : P\n    clock clk = D\n    run\n\
+             \x20       randomize(p) with\n            {clause}\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    // Every entry's errors, flattened, with the relation ones marked.
+    let errs = |clause: &str| -> Vec<(bool, String)> {
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&src(clause)))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect()
+    };
+
+    // The list-field gate really does fire first, for every one of
+    // these — including the clause with no call in it at all. That is
+    // the masking, stated as a measurement rather than assumed.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "NoSuchRel(p)",
+        "p.n > 3",
+    ] {
+        let err = lower_src(&src(clause)).unwrap_err();
+        assert!(
+            format!("{err}").contains("`P.items` with an unsupported (non-scalar) leaf type"),
+            "{clause}: expected the list-field gate, got {err}"
+        );
+    }
+
+    // And that gate's `--codegen v1` suggestion is honest, which is
+    // what makes this worth fixing rather than filing as unreachable:
+    // give the list a bound and v1 emits the whole thing, `sum` call
+    // included. So the false `UnknownRelation` sat directly in front of
+    // a form v1 compiles.
+    let bounded = src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100");
+    cpp_tb::emit(&merged_src(&bounded)).expect("v1 emits a bounded list with a `sum` constraint");
+
+    // `sum` is a v1 builtin: not a relation error, so it is discarded
+    // and the program would lower once list fields do.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "sum(items[0 .. items.len()])",
+    ] {
+        let got = errs(clause);
+        assert!(
+            !got.is_empty() && got.iter().all(|(is_rel, _)| !is_rel),
+            "`{clause}` must produce no relation error: {got:?}"
+        );
+    }
+
+    // A name that is neither a relation nor a v1 builtin stays a
+    // relation error. v1 rejects it too ("constraint function call not
+    // supported in v0 solver path"), so refusing is the right verdict
+    // even when the name was never meant as a relation.
+    for clause in ["NoSuchRel(p)", "nosuchfn(p.n) == 1", "sum(p.n, p.n) == 1"] {
+        let got = errs(clause);
+        assert!(
+            got.iter().any(|(is_rel, _)| *is_rel),
+            "`{clause}` must still be a relation error: {got:?}"
+        );
+    }
+
+    // A relation whose name shadows the builtin but takes a different
+    // arity. v1's expander declines on the arity and its list-`sum`
+    // builtin takes over, so v1 EMITS — reporting an arity mismatch
+    // would be the same false refusal one shape further out.
+    let shadowed = format!(
+        "relation sum(a: P, b: P) = a.n > 1\n\n{}",
+        src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100")
+    );
+    cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits when a relation shadows `sum`");
+    let got: Vec<(bool, String)> =
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&shadowed))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect();
+    assert!(
+        got.iter().all(|(is_rel, _)| !is_rel),
+        "a relation shadowing `sum` at the builtin's arity is not a relation error: {got:?}"
+    );
+
+    // END TO END, on a transaction with NO list field, which reaches
+    // the fixed line today. `sum` over a scalar is a v1 error this
+    // predicate deliberately waves through; what refuses it is the
+    // shared emitter, in v1's own words. Before the fix the user got
+    // "`sum` names no `relation` declared in this file" instead —
+    // accurate diagnostic, same verdict.
+    let scalar = "domain D\n  freq_mhz: 100\nend domain D\n\n\
+                  transaction Q\n    n : uint<8>\nend transaction Q\n\n\
+                  test T\n    let dut : Top\n    let q : Q\n    clock clk = D\n    run\n\
+                  \x20       randomize(q) with\n            sum(q.n) == 1\n        end randomize\n\
+                  \x20   end run\nend test T\n";
+    let merged = merged_src(scalar);
+    let v1 = cpp_tb::emit(&merged).expect_err("v1 refuses `sum` over a scalar");
+    assert!(
+        format!("{v1}").contains("constraint function call not supported in v0 solver path"),
+        "{v1}"
+    );
+    // TB-IR lowers it — the refusal has MOVED, not disappeared.
+    let program = lower_src(scalar).expect("`sum` over a scalar now lowers");
+    verify::verify_program(&program).expect("verifies");
+    let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("the shared emitter refuses it");
+    assert!(
+        format!("{tb}").contains("constraint function call not supported in v0 solver path"),
+        "TB-IR must refuse in v1's own words, not invent one about relations: {tb}"
+    );
+}
+
+/// `logf` finds its message positionally, the way v1 does.
+///
+/// v1 CONSUMES the path — `StmtKind::LogF` splits the first positional
+/// string out of the argument list and hands `emit_log` what is left —
+/// so its rule is positional. TB-IR compared each string's VALUE
+/// against the path instead, which gives the same answer only while the
+/// message happens to differ from the path.
+///
+/// This was divergence 58: a live silent DIVERGENCE, not a shared
+/// mis-lowering. Both backends accept both programs below and emitted
+/// different text.
+#[test]
+fn logf_takes_its_path_by_position_not_by_value() {
+    let src = |stmt: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n\
+             \x20       {stmt}\n        wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+    // The emitted log call, for whichever backend. The `seed=` line is
+    // the harness preamble every test emits, not the statement under
+    // test — dropping it by name rather than by position so a change in
+    // preamble ordering fails loudly instead of silently selecting the
+    // wrong line.
+    let line = |out: &str| -> String {
+        out.lines()
+            .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
+            .filter(|l| !l.contains("seed="))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+
+    for (what, stmt, expected) in [
+        // Divergence 58's two cases. The message EQUALS the path, so a
+        // value comparison skips it and lands on the next string.
+        (
+            "a message equal to the path",
+            r#"logf("t.log", "t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        (
+            "the path repeated as the message",
+            r#"logf("t.log", error, "t.log")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        // Controls: the shapes that already agreed must keep agreeing.
+        (
+            "an ordinary logf",
+            r#"logf("t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a severity written after the message",
+            r#"logf("t.log", "BOOM", error)"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a third string, which is ignored",
+            r#"logf("t.log", "A", "B")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "INFO", "A");"#,
+        ),
+        // Plain `log` consumes no path, so its message is the FIRST
+        // string — the same code now has to get both cases right.
+        (
+            "a plain log",
+            r#"log(error, "BOOM")"#,
+            r#"sim_log_line("ERROR", "BOOM");"#,
+        ),
+        (
+            "a plain log with a second string",
+            r#"log(error, "A", "B")"#,
+            r#"sim_log_line("ERROR", "A");"#,
+        ),
+    ] {
+        let merged = merged_src(&src(stmt));
+        let v1 = cpp_tb::emit(&merged).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        let program = lower_src(&src(stmt)).unwrap_or_else(|e| panic!("{what}: lowers: {e}"));
+        let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("{what}: tbir emits: {e}"));
+        assert_eq!(line(&v1), expected, "{what}: v1's own output moved");
+        assert_eq!(line(&tb), line(&v1), "{what}: backends disagree");
+    }
+}
+
+/// The one-argument record API is guarded like every other, and the
+/// guard reports the WORST argument rather than the first.
+///
+/// `record_read` was the only record-API site that accepted an unknown
+/// parameter name silently. One argument does not make the check
+/// pointless: a name matching nothing is still a program error no
+/// backend can honour, and `record_read(reg = 4)` reads like it names
+/// something.
+///
+/// The worst-argument half is a separate claim. The two verdicts are
+/// not equally bad and the arguments are not examined in order of
+/// badness, so returning on the first one found let an unknown name
+/// hide a genuine swap behind it — the silent mis-lowering being the
+/// graver of the two.
+#[test]
+fn the_record_api_guard_reports_the_worst_argument_not_the_first() {
+    const READ: &str = "let sa  = regs.record_read(0x18)";
+    const WRITE: &str = "regs.record_write(0x18, 305419896)";
+    let fixture_src = fixture("regblock_record_api_test.harc");
+    assert!(
+        fixture_src.contains(READ) && fixture_src.contains(WRITE),
+        "fixture shape changed"
+    );
+    // The fixture `use`s a stdlib bus, so it only lowers alongside the
+    // bus declaration — same as the CLI's `resolve_use_imports`.
+    let bus_src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch"),
+    )
+    .expect("read stdlib bus");
+    let merge_with_bus = |src: &str| {
+        merge::merge_for_sim(
+            vec![
+                parse_source(src).expect("fixture parses"),
+                parse_source(&bus_src).expect("stdlib bus parses"),
+            ],
+            None,
+        )
+        .expect("merge")
+    };
+    let lower_it = |src: &str| lower::lower_program(&merge_with_bus(src));
+    let with = |old: &str, new: &str| fixture_src.replacen(old, new, 1);
+
+    // The fixture is a working program under both backends: the control
+    // that keeps every assertion below from passing for the wrong
+    // reason.
+    lower_it(&fixture_src).expect("the unmodified fixture lowers");
+
+    // `record_read`, one argument, name in its own position: inert, and
+    // must still lower.
+    lower_it(&with(READ, "let sa  = regs.record_read(addr = 0x18)"))
+        .expect("a correctly-named single argument lowers");
+
+    // A name matching no parameter is `Invalid` — v1 binds by position
+    // and emits exactly the right code, so claiming it mis-lowers would
+    // be a false explanation.
+    // NOT `reg = 0x18`: `reg` is a lexer keyword, so that program does
+    // not parse and the assertion would be measuring the parser. The
+    // same trap already cost this guard once, when `record_write` was
+    // given an invented `["reg", "value"]` list whose first entry could
+    // never match a parseable program.
+    assert!(
+        parse_source(&with(READ, "let sa  = regs.record_read(reg = 0x18)")).is_err(),
+        "`reg` is a keyword; if this starts parsing, the example below can use it"
+    );
+    let msg = assert_invalid(
+        &lower_it(&with(READ, "let sa  = regs.record_read(nosuch = 0x18)")).unwrap_err(),
+    );
+    assert!(
+        msg.contains("`nosuch` names no parameter of a `record_read(...)` call")
+            && msg.contains("expected `addr`"),
+        "{msg}"
+    );
+
+    // The worst-argument case, on the two-argument sibling: an unknown
+    // name FIRST and a genuine swap SECOND. The swap must win.
+    let msg = assert_not_implemented(
+        &lower_it(&with(
+            WRITE,
+            "regs.record_write(nosuch = 0x18, addr = 305419896)",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`addr` is parameter 1 here but was written in position 2"),
+        "the swap must outrank the unknown name: {msg}"
+    );
+
+    // With no swap present the unknown name is still reported, so
+    // preferring the swap did not silence it.
+    let msg = assert_invalid(
+        &lower_it(&with(WRITE, "regs.record_write(nosuch = 0x18, 305419896)")).unwrap_err(),
+    );
+    assert!(msg.contains("`nosuch` names no parameter"), "{msg}");
+
+    // And v1 accepts both named arguments and binds them by position,
+    // which is what makes the swap the graver verdict of the two.
+    cpp_tb::emit(&merge_with_bus(&with(
+        WRITE,
+        "regs.record_write(nosuch = 0x18, addr = 305419896)",
+    )))
+    .expect("v1 accepts both named arguments");
+}

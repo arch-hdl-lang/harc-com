@@ -3197,8 +3197,28 @@ impl FuncBuilder<'_> {
             ));
         }
         // Mirror v1's extraction rules: first bare ident is the
-        // severity (default info); first string literal that isn't the
-        // logf path is the message.
+        // severity (default info); the message is the first positional
+        // string AFTER the one `logf` consumes as its path.
+        //
+        // v1 CONSUMES the path (`StmtKind::LogF` splits the first
+        // positional string out of the list and hands `emit_log` what
+        // is left), so its rule is POSITIONAL. This used to compare
+        // each string's VALUE against the path instead, which is the
+        // same answer only while the message happens to differ from the
+        // path:
+        //
+        //   `logf("t.log", "t.log", error, "BOOM")` gave TB-IR "BOOM"
+        //   where v1 emits "t.log", and `logf("t.log", error, "t.log")`
+        //   gave TB-IR "" where v1 emits "t.log".
+        //
+        // Both backends accept both programs, so that was a live silent
+        // DIVERGENCE, not a shared mis-lowering.
+        //
+        // The named-argument guard above deliberately still runs on the
+        // FULL argument list, before the path is consumed: it exists to
+        // catch a named argument that leaves a positional slot empty,
+        // and counting a list the path has already been removed from
+        // would tell it there was one fewer slot to fill.
         let sev = args
             .iter()
             .find_map(|a| match a {
@@ -3218,7 +3238,7 @@ impl FuncBuilder<'_> {
                 },
                 _ => None,
             })
-            .find(|s| file.as_deref() != Some(s.as_str()))
+            .nth(usize::from(file.is_some()))
             .unwrap_or_default();
 
         let base = match sev.as_str() {

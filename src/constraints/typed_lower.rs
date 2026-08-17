@@ -1798,6 +1798,42 @@ fn expand_top_level_clause(
     vec![(default_origin, expand_relation_subtree(ctx, expr, stack))]
 }
 
+/// Ident-callee calls that v1 handles as constraint BUILTINS rather
+/// than relation applications.
+///
+/// Read off `cpp_tb::try_emit_constraint_list_call`, which is v1's
+/// whole list for this shape: `sum(<list>[lo..hi])`, one argument.
+/// (`<list>.len()` is the other constraint builtin, but its callee is a
+/// `Field`, so it never reaches the relation path at all.) Everything
+/// else with an `Ident` callee is rejected by v1 too — "constraint
+/// function call not supported in v0 solver path" — so refusing it is
+/// the right verdict even when the name was never meant as a relation.
+///
+/// Only the FALSE-REFUSAL case is latent, and an earlier version of
+/// this comment said the whole predicate was — wrongly. TB-IR refuses
+/// any transaction carrying a `list<T>` field before constraint
+/// lowering runs, and every `sum` v1 ACCEPTS needs a list field, so no
+/// v1-compiling program reaches the fix today. But `sum` over a scalar
+/// reaches this line right now, with no list field anywhere:
+/// `randomize(p) with sum(p.n) == 1` used to be refused as "`sum` names
+/// no `relation` declared in this file" and now lowers.
+///
+/// That is an improvement, not a regression, and what makes it safe is
+/// the shared emitter rather than this predicate. The check is on NAME
+/// and ARITY only — deliberately wider than v1, which also requires the
+/// argument to be a range-sliced list field, so `sum(p.n)` and
+/// `sum(items[0])` are v1 errors this predicate waves through. They do
+/// not become accepted programs: `tbir::emit` routes every constraint
+/// site back through v1's own emitter, which refuses them in v1's own
+/// words. The user gets an accurate diagnostic instead of a fictitious
+/// one about relations. `a_v1_constraint_builtin_is_not_reported_as_an_
+/// unknown_relation` pins that end to end, because a predicate that is
+/// safe only because of what happens downstream needs the downstream
+/// asserted.
+fn is_v1_constraint_builtin(name: &str, arity: usize) -> bool {
+    name == "sum" && arity == 1
+}
+
 fn expand_top_level_relation_call(
     ctx: &mut LowerCtx<'_>,
     name: &str,
@@ -1807,10 +1843,34 @@ fn expand_top_level_relation_call(
     let rel = match ctx.elab.relation(name) {
         Some(rel) => rel.clone(),
         None => {
-            ctx.record_error(LowerError::UnknownRelation {
-                name: name.to_string(),
-                span: call.span,
-            });
+            let arity = match &*call.kind {
+                ExprKind::Call { args, .. } => args.len(),
+                _ => 0,
+            };
+            // Not every `name(...)` in a constraint is a relation call.
+            // v1 handles a small set of constraint BUILTINS itself, and
+            // reporting one of those as an unknown relation is a false
+            // refusal of a program v1 compiles — the wrong verdict AND
+            // a diagnostic that sends the reader looking for a
+            // `relation` declaration they never meant to write.
+            //
+            // The builtin is left unexpanded and reported as an
+            // ordinary capability gap, which `lower_program` discards
+            // (see `surface_constraint_lower_error`), so the program
+            // lowers and reaches the shared emitter that knows how to
+            // emit it.
+            let err = if is_v1_constraint_builtin(name, arity) {
+                LowerError::UnsupportedV1 {
+                    feature: "v1 constraint builtin call",
+                    span: call.span,
+                }
+            } else {
+                LowerError::UnknownRelation {
+                    name: name.to_string(),
+                    span: call.span,
+                }
+            };
+            ctx.record_error(err);
             return Some(Vec::new());
         }
     };
@@ -1818,12 +1878,27 @@ fn expand_top_level_relation_call(
         return None;
     };
     if rel.params.len() != args.len() {
-        ctx.record_error(LowerError::RelationArityMismatch {
-            name: name.to_string(),
-            expected: rel.params.len(),
-            found: args.len(),
-            span: call.span,
-        });
+        // A relation whose name shadows a builtin, called with the
+        // BUILTIN's arity, is a builtin call. v1 does exactly this: its
+        // expander declines on the arity mismatch
+        // (`cpp_tb::try_expand_top_level_call`) and the list-`sum`
+        // builtin then takes over, so v1 EMITS. Reporting an arity
+        // mismatch here would be the same false refusal this function
+        // was just fixed to stop producing, one shape further out.
+        let err = if is_v1_constraint_builtin(name, args.len()) {
+            LowerError::UnsupportedV1 {
+                feature: "v1 constraint builtin call",
+                span: call.span,
+            }
+        } else {
+            LowerError::RelationArityMismatch {
+                name: name.to_string(),
+                expected: rel.params.len(),
+                found: args.len(),
+                span: call.span,
+            }
+        };
+        ctx.record_error(err);
         return Some(Vec::new());
     }
     // Checked BEFORE the substitution, which reads positions only. The

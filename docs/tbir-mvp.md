@@ -3934,8 +3934,7 @@ case and only locally-determinable `Assign` types are compared).
     `"t.log"`. Both backends accept both programs, so this is a live
     silent DIVERGENCE rather than a shared mis-lowering — the only one
     found in this batch. v1 takes the path positionally; matching that is
-    the fix, and it is recorded rather than made here because it changes
-    an extractor the equivalence corpus exercises heavily.
+    the fix. **Closed in divergence 64.**
 
 59. **Every constraint diagnostic was thrown away, and v1 crashes on
     one of them (2026-08-17).**
@@ -4011,9 +4010,7 @@ case and only locally-determinable `Assign` types are compared).
     * **`MAX_ERRORS = 5` can disable the refusal.** Closed in
       divergence 61 below.
     * **Every Ident-callee constraint call is treated as a relation
-      call**, so a v1-supported `sum(...)` records `UnknownRelation`.
-      Masked today only because TB-IR rejects `list<T>` fields earlier;
-      it becomes a false `Invalid` the moment list fields lower.
+      call.** Closed in divergence 63 below.
 
 60. **A constraint written in a component body reached C++ unchecked
     (2026-08-17).**
@@ -4239,6 +4236,174 @@ case and only locally-determinable `Assign` types are compared).
     chain of distinct relations and a 60-paren expression both still
     emit with the innermost bound intact. Disabling the name stack
     reproduces the SIGABRT and the test binary dies with signal 6.
+
+63. **Not every `name(...)` in a constraint is a relation call
+    (2026-08-17).**
+
+    Divergence 59 recorded this as the last of its three open limits.
+    Any `Ident`-callee call in a constraint went down the relation path,
+    and a name that is not a declared relation came back as
+    `UnknownRelation` — which divergence 59 had just promoted to a hard
+    `Invalid`. v1 handles a small set of these itself, so that is a
+    false refusal of a program v1 compiles, carrying a diagnostic that
+    sends the reader looking for a `relation` declaration they never
+    meant to write.
+
+    v1's whole list for this shape is one entry, read off
+    `cpp_tb::try_emit_constraint_list_call` rather than recalled:
+    `sum(<list>[lo..hi])`, one argument. (`<list>.len()` is the other
+    constraint builtin, but its callee is a `Field`, so it never reaches
+    the relation path.) Everything else with an `Ident` callee v1
+    rejects too — "constraint function call not supported in v0 solver
+    path" — so `nosuchfn(p.n)` keeps its refusal. The verdict is right
+    there even though the wording is about relations, because refusing
+    is what both backends do.
+
+    The builtin now records an ordinary capability gap, which
+    `lower_program` discards, so the program lowers and reaches the
+    shared emitter that knows how to emit it.
+
+    **Three call sites, one fix.** The search found `expand_relation_
+    subtree` already guarding correctly (`relation(name).is_some()`
+    before expanding), which made it look like the top-level path was
+    the only offender. The probe disagreed: a `sum(...)` nested inside
+    a `==` also produced `UnknownRelation`. The third site is
+    `lower_expr`'s `Call { Ident }` arm, and it reaches the same
+    `expand_top_level_relation_call` — so the fix lands once, in the
+    function all three funnel through. *Reading two of three call sites
+    and generalising is how the previous batch got a verdict wrong; the
+    probe is what found the third.*
+
+    **Only the FALSE-REFUSAL case is latent — the first draft of this
+    entry said the whole predicate was, and that was wrong.** TB-IR
+    refuses any transaction carrying a `list<T>` field before constraint
+    lowering runs (measured: the `sum` probe, an unknown-relation probe,
+    and a clause with no call in it at all are all refused with the same
+    "unsupported (non-scalar) leaf type" message), and every `sum` v1
+    ACCEPTS needs a list field. So no v1-compiling program reaches the
+    fix today, and the list-bearing assertions are on the constraint
+    table: end-to-end there would pass for the wrong reason, since the
+    list gate fires first and would keep passing however this were
+    classified.
+
+    But `sum` over a SCALAR reaches the fixed line right now, with no
+    list field anywhere. `randomize(p) with sum(p.n) == 1` used to be
+    refused as "`sum` names no `relation` declared in this file" and now
+    lowers — an improvement, since v1 refuses it too and the user now
+    gets v1's own accurate wording instead of a fiction about relations.
+    *"Nothing can reach this" was asserted from the shape that motivated
+    the fix, not from the predicate's actual domain.*
+
+    That case also exposes what makes the fix safe, which is **not** the
+    predicate. The check is on NAME and ARITY only, deliberately wider
+    than v1 — which also requires a range-sliced list field, so
+    `sum(p.n)` and `sum(items[0])` are v1 errors this predicate waves
+    through. They do not become accepted programs: `tbir::emit` routes
+    every constraint site back through v1's own emitter, which refuses
+    them in v1's own words. The scalar case is now asserted end to end,
+    because a predicate that is safe only because of what happens
+    downstream needs the downstream asserted.
+
+    What makes it worth fixing rather than filing as unreachable: the
+    list gate's `--codegen v1` suggestion is **honest**. Give the list a
+    bound (`items.len() <= 4`) and v1 emits the whole thing, `sum` call
+    included — verified in the test. The false `UnknownRelation` was
+    sitting directly in front of a form v1 compiles.
+
+    One shape further out, same bug, found by the same review: a
+    **relation whose name shadows the builtin at a different arity**.
+    v1's expander declines on the arity mismatch and its list-`sum`
+    builtin takes over, so v1 EMITS; TB-IR reported
+    `RelationArityMismatch`, a hard `Invalid`. The arity arm now defers
+    to the builtin the same way v1 does.
+
+    Both directions are pinned by mutation, because widening a gate is
+    as much a claim as narrowing one: emptying the builtin list makes
+    `sum` a relation error again, and dropping the NAME check so any
+    one-argument call counts makes `NoSuchRel(p)` stop being one.
+
+64. **`logf`'s message is positional, and now TB-IR agrees
+    (2026-08-17).**
+
+    Divergence 58 measured this and deferred it because it changes an
+    extractor the equivalence corpus exercises heavily. This closes it.
+
+    v1 **consumes** the path: `StmtKind::LogF` splits the first
+    positional string out of the argument list and hands `emit_log` what
+    is left, so the message is simply the next positional string.
+    TB-IR's `lower_log` instead searched for the first string whose
+    VALUE differs from the path — the same answer only while the message
+    happens not to equal the path. The fix is one line: take the first
+    positional string for `log`, the second for `logf`.
+
+    Measured on the two divergence-58 cases, comparing the emitted call
+    from both backends:
+
+    | source | v1 | TB-IR before | after |
+    |---|---|---|---|
+    | `logf("t.log", "t.log", error, "BOOM")` | `"t.log"` | `"BOOM"` | `"t.log"` |
+    | `logf("t.log", error, "t.log")` | `"t.log"` | `""` | `"t.log"` |
+
+    Five control shapes that already agreed still agree, `log`'s own
+    first-string rule included — the same line has to get both right,
+    which is why the plain-`log` controls are in the test rather than
+    assumed. Full suite green, the equivalence registry included.
+
+    Both directions are pinned by mutation: restoring the value
+    comparison fails the message-equals-path case, and dropping the
+    path-consumption so the first string is always taken fails the
+    ordinary-`logf` case.
+
+    One thing deliberately NOT moved: the named-argument guard above
+    still runs on the FULL argument list, before the path is consumed.
+    It exists to catch a named argument that leaves a positional slot
+    empty, and counting a list the path has already been removed from
+    would tell it there was one fewer slot to fill.
+
+65. **The worst argument, not the first (2026-08-17).**
+
+    Two loose ends on `reject_misplaced_named_args`, closed together
+    because they are the same function.
+
+    **`record_read` was unguarded.** It was the only record-API site
+    that accepted an unknown parameter name silently. One argument does
+    not make the check pointless: a name matching nothing is still a
+    program error no backend can honour. Its parameter list — `addr` —
+    comes from the compiler's own `Invalid` message two lines above the
+    guard and from `docs/ral-support.md`, not from memory, which is the
+    discipline `record_write` earned the hard way when it was given an
+    invented `["reg", "value"]`.
+
+    That lesson bit again while writing the test. The natural example
+    for an unknown name is `record_read(reg = 4)` — and `reg` is a lexer
+    keyword, so that program does not parse, and the assertion would
+    have been measuring the parser rather than the guard. The test now
+    asserts that it does not parse, and uses `nosuch` for the real case.
+    *The same trap, at the same site, caught twice.*
+
+    **The guard reported the first bad argument, not the worst.** Its
+    two verdicts are not equally bad — an unknown name is `Invalid` (v1
+    binds by position and emits exactly the right code), a misplaced
+    known name is `SilentlyMisLowers` (v1 emits working C++ with the
+    values swapped) — and the arguments are not examined in order of
+    badness. So in `record_write(nosuch = 0x18, addr = 305419896)` the
+    unknown name came first, its `Invalid` was returned, and the genuine
+    swap behind it was never reported. Fixing the typo would then
+    reveal a second error: exactly the experience a diagnostic should
+    not give. The unknown-name verdict is now held rather than returned,
+    so a swap anywhere in the list outranks it, and with no swap present
+    it is still reported.
+
+    Both are pinned by mutation: deleting the `record_read` call site
+    fails the guard test, and restoring first-wins ordering fails the
+    worst-argument case.
+
+    Not guarded, and deliberately: `bitbash(regs)`. Its single argument
+    has no declared parameter name anywhere — the compiler's message
+    calls it "the regblock binding" and the docs write `bitbash(regs)`,
+    where `regs` is the user's binding, not a parameter. Guarding it
+    would mean inventing a name to check against, which is the mistake
+    `record_write` already made once.
 
 ### The probe method
 
