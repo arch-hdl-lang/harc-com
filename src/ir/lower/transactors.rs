@@ -462,7 +462,14 @@ pub(crate) fn lower_transactor(
         if sibling_methods
             .insert(
                 mname.clone(),
-                (h.params.len(), h.return_ty.is_some(), *active_only),
+                (
+                    h.params
+                        .iter()
+                        .map(|p| p.name.name.clone())
+                        .collect::<Vec<_>>(),
+                    h.return_ty.is_some(),
+                    *active_only,
+                ),
             )
             .is_some()
         {
@@ -516,7 +523,7 @@ pub(crate) fn lower_transactor(
         schema.methods.push(TransactorMethodSchema {
             name: mname.clone(),
             function: fid,
-            n_params: f.params.len(),
+            param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             has_ret: f.ret.is_some(),
             active_only,
             pre_hooks: Vec::new(),
@@ -1227,7 +1234,14 @@ fn lower_bound_initiator_transactor(
         if sibling_methods
             .insert(
                 mname.clone(),
-                (h.params.len(), h.return_ty.is_some(), *active_only),
+                (
+                    h.params
+                        .iter()
+                        .map(|p| p.name.name.clone())
+                        .collect::<Vec<_>>(),
+                    h.return_ty.is_some(),
+                    *active_only,
+                ),
             )
             .is_some()
         {
@@ -1286,7 +1300,7 @@ fn lower_bound_initiator_transactor(
         schema.methods.push(TransactorMethodSchema {
             name: mname.clone(),
             function: fid,
-            n_params: f.params.len(),
+            param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             has_ret: f.ret.is_some(),
             active_only,
             pre_hooks: Vec::new(),

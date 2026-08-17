@@ -784,11 +784,12 @@ impl super::FuncBuilder<'_> {
                 schema.name
             )));
         };
-        if m.n_params != arity {
+        if m.param_names.len() != arity {
             return Err(LowerError::Invalid(format!(
                 "regblock `via` helper `{}` method `{method}` takes {} argument(s), \
                  the frontdoor passes {arity}",
-                schema.name, m.n_params,
+                schema.name,
+                m.param_names.len(),
             )));
         }
         Ok(schema.name.clone())
@@ -1136,12 +1137,12 @@ impl super::FuncBuilder<'_> {
                 schema.name
             )));
         };
-        if m.n_params != args.len() {
+        if m.param_names.len() != args.len() {
             return Err(LowerError::Invalid(format!(
                 "regblock `via` helper `{}` method `{method}` takes {} argument(s), \
                  the frontdoor passes {}",
                 schema.name,
-                m.n_params,
+                m.param_names.len(),
                 args.len()
             )));
         }

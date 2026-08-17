@@ -3840,12 +3840,13 @@ fn lower_test(
         let xschema = &prog.transactors[xid.index()];
         for (m, n) in [("write", 2usize), ("read", 1usize)] {
             match xschema.method(m) {
-                Some(ms) if ms.n_params == n => {}
+                Some(ms) if ms.param_names.len() == n => {}
                 Some(ms) => {
                     return Err(LowerError::Invalid(format!(
                         "regblock `via` helper `{}` method `{m}` takes {} argument(s), \
                          the frontdoor needs {n}",
-                        xschema.name, ms.n_params
+                        xschema.name,
+                        ms.param_names.len()
                     )));
                 }
                 None => {
@@ -3926,12 +3927,13 @@ fn lower_test(
         let xschema = &prog.transactors[xid.index()];
         for (m, n) in [("write", 2usize), ("read", 1usize)] {
             match xschema.method(m) {
-                Some(ms) if ms.n_params == n => {}
+                Some(ms) if ms.param_names.len() == n => {}
                 Some(ms) => {
                     return Err(LowerError::Invalid(format!(
                         "addrmap `via` helper `{}` method `{m}` takes {} argument(s), \
                          the frontdoor needs {n}",
-                        xschema.name, ms.n_params
+                        xschema.name,
+                        ms.param_names.len()
                     )));
                 }
                 None => {
@@ -4971,6 +4973,19 @@ pub(crate) fn reject_misplaced_named_args(
             });
             continue;
         }
+        // A "swap" claim only makes sense when the positions
+        // correspond, i.e. when the call supplies exactly as many
+        // arguments as the callee declares. `axil_write(data = t.value)`
+        // on a two-parameter method is UNDER-SUPPLIED: v1 emits the same
+        // under-supplied call the positional `axil_write(t.value)`
+        // emits, so the name changes nothing and there is no swap to
+        // describe. Reporting one would be a false explanation of a
+        // pre-existing arity gap — the exact failure mode this guard was
+        // rewritten to stop producing. Call sites that check arity
+        // themselves never reach this branch anyway.
+        if args.len() != declared.len() {
+            continue;
+        }
         return Err(not_implemented(
             &format!("a misplaced named argument in {construct}"),
             format!(
@@ -5809,7 +5824,16 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) self_transactor: Option<String>,
     /// Full sibling method signature table for the current transactor,
     /// including methods declared later in source order.
-    pub(crate) self_transactor_methods: HashMap<String, (usize, bool, bool)>,
+    /// Sibling methods visible inside a transactor method body:
+    /// name -> (declared parameter NAMES, has_ret, active_only).
+    ///
+    /// The first slot was a bare `usize` count. Carrying the names lets
+    /// `lower_transactor_self_call` check a named argument against the
+    /// declaration instead of refusing every one of them; it is the
+    /// same information `TransactorMethodSchema::param_names` carries
+    /// for the bound-instance path, and it was dropped in both places
+    /// for the same reason.
+    pub(crate) self_transactor_methods: HashMap<String, (Vec<String>, bool, bool)>,
     /// True while lowering a transactor method declared under
     /// `when active`. Used to reject an always-on method that would
     /// backdoor-call an active-only sibling.
