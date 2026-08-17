@@ -16507,6 +16507,19 @@ fn named_arguments_are_bound_by_position_by_v1() {
         )
     };
     let v1_one_ctl = cpp_tb::emit(&merged_src(&one("t.addr"))).expect("v1 emits");
+    // The anchor: the injected call reaches v1's output, so a byte
+    // identity below is the NAME being ignored rather than both sides
+    // dropping the call together.
+    assert_eq!(
+        v1_one_ctl
+            .matches("AxilXactor_axil_read(_tb.env.drv, t.addr)")
+            .count(),
+        v1_ctl
+            .matches("AxilXactor_axil_read(_tb.env.drv, t.addr)")
+            .count()
+            + 1,
+        "the injected `axil_read` call must add a call site"
+    );
     for arg in ["addr = t.addr", "nosuch = t.addr"] {
         let msg = assert_unsupported(&lower_src(&one(arg)).unwrap_err());
         assert!(msg.contains("one-argument component method"), "{msg}");
@@ -16516,6 +16529,21 @@ fn named_arguments_are_bound_by_position_by_v1() {
             "`axil_read({arg})` emits exactly the positional call"
         );
     }
+
+    // The split keys on the ARGUMENT count, not the callee's parameter
+    // count, and the message must not be read as a claim about the
+    // latter. A single named argument to the TWO-parameter method emits
+    // exactly what the equivalent positional call emits — both are
+    // under-supplied and neither compiles, but that is a pre-existing
+    // arity gap (tbir lowers `axil_write(t.value)` too) rather than
+    // something naming the argument caused.
+    assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
+    lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&call("t.value"))).expect("v1 emits"),
+        "the name changes nothing about what v1 emits"
+    );
 }
 
 /// The single-argument heartbeat and quiesce predicates share the
@@ -16663,6 +16691,38 @@ end impl ParamTest
                 .lines()
                 .any(|l| !l.trim_start().starts_with("//") && l.contains("int64_t N")),
             "{kind}: and `N` is declared nowhere, so it does not compile"
+        );
+
+        // The case that EARNS `SilentlyMisLowers` rather than
+        // `EmitsUncompilable`. With a file-scope `const N`, the dropped
+        // parameter falls back to it: v1 emits the const and the
+        // reference resolves, so the program compiles and quietly uses
+        // 9 instead of the 4 the instantiation passed.
+        let shadowed = format!(
+            "const N = 9\n{}",
+            mk("Tagger #(N: int = 3)", "Tagger #(4)", "N")
+        );
+        assert_not_implemented(
+            &lower_src(&shadowed).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_shadowed = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+        assert!(
+            v1_shadowed.contains("static constexpr int64_t N = 9;")
+                && v1_shadowed.contains("uint64_t limit = N;"),
+            "{kind}: the const is emitted and the reference resolves to it"
+        );
+        // And the anchor that makes it a MIS-lowering rather than a
+        // coincidence: the same source with no parameter at all emits
+        // the identical initializer, so `#(4)` changed nothing.
+        let no_param = format!("const N = 9\n{}", mk("Tagger", "Tagger", "N"));
+        lower_src(&no_param)
+            .unwrap_or_else(|e| panic!("{kind}: the const-only form lowers: {e:?}"));
+        assert!(
+            cpp_tb::emit(&merged_src(&no_param))
+                .expect("v1 emits")
+                .contains("uint64_t limit = N;"),
+            "{kind}: `#(4)` is invisible — the const-only form initializes identically"
         );
     }
 }

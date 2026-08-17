@@ -3599,10 +3599,14 @@ case and only locally-determinable `Assign` types are compared).
     something to make their intent explicit, and v1 throws that
     something away.
 
-    **Named arguments.** v1 NEVER reads an argument name — all 30
-    `CallArg::Named` matches in `cpp_tb.rs` destructure `{ value, .. }`
-    and bind by position. The structural claim was checked as carefully
-    as a count would have been, and then measured:
+    **Named arguments.** No CODEGEN site in v1 reads an argument name:
+    of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 26 destructure
+    `{ value, .. }` and the 4 that bind `name` are AST-rewrite passes
+    that reconstruct the node and pass it along. (The first draft of this
+    entry said "all 30 destructure `{ value, .. }`" — the conclusion
+    survived the correction, but the sentence was a count that had not
+    been counted.) Binding is by position everywhere, and that was
+    measured, not only read:
     `axil_write(data = t.value, addr = t.addr)` emits
     `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` — the two
     arguments SWAPPED, in code that compiles and runs. A name matching
@@ -3610,25 +3614,44 @@ case and only locally-determinable `Assign` types are compared).
     point of naming arguments, so this is `SilentlyMisLowers` and v1 is
     the last place to send the user.
 
-    Split on ARITY, because a one-argument call cannot reorder: v1's
-    positional binding puts the value in the only slot there is and its
-    output is identical to the positional form. There v1 really is an
-    escape hatch, and the same reasoning keeps the two one-argument
-    predicates (`idle_in`/`idle_out`, `quiesced`) on `Unsupported`
-    rather than sweeping them up with the general call. Arity ≥ 2 is not
-    split further: same-order names emit correctly too, but telling that
-    apart needs the callee's parameter list, which the seam does not
-    have, and an arm's status is the worst thing under it.
+    Split on the ARGUMENT count, because a single argument cannot be
+    reordered — there is no other position for it to land in, so v1
+    emits exactly the positional call. There v1 really is an escape
+    hatch, and the same reasoning keeps the two one-argument predicates
+    (`idle_in`/`idle_out`, `quiesced`) on `Unsupported` rather than
+    sweeping them up with the general call. Arity ≥ 2 is not split
+    further: same-order names emit correctly too, but telling that apart
+    needs the callee's parameter list, which the seam does not have, and
+    an arm's status is the worst thing under it.
 
-    **`#(...)` parameters on a component.** v1 drops the list, and the
-    two consequences are very different for the user. Declared but
-    unused, v1's output is BYTE-IDENTICAL to the same component written
-    without the parameter — and a `#(4)` argument at the instantiation
-    vanishes with it, so the knob the user added does nothing at all.
-    Referenced in the body, `limit : uint<32> default N` emits
-    `uint64_t limit = N;` with `N` declared nowhere in the generated
-    file, which does not compile. `SilentlyMisLowers` is the worse of
-    the two and so the label.
+    The first wording of that arm said "with a single PARAMETER that is
+    the same thing", which the seam cannot know and does not check. A
+    one-argument call to a two-parameter method emits an uncompilable
+    call under v1 — but so does the positional `axil_write(t.value)`,
+    which tbir lowers and verifies clean today. The arity gap is real
+    and pre-existing; naming the argument did not cause it, and the
+    message no longer implies the call is well-formed. **Splitting on a
+    quantity you have is not the same as splitting on the quantity your
+    sentence is about.**
+
+    **`#(...)` parameters on a component.** v1 drops the list, and three
+    things follow. Declared but unused, v1's output is BYTE-IDENTICAL to
+    the same component written without the parameter, and a `#(4)`
+    argument at the instantiation vanishes with it — nothing is
+    mis-lowered, the knob simply did nothing. Referenced in the body with
+    no name to fall back on, `limit : uint<32> default N` emits
+    `uint64_t limit = N;` with `N` declared nowhere, which does not
+    compile. Referenced while a file-scope `const N = 9` exists, v1 emits
+    `static constexpr int64_t N = 9;` alongside it: the program COMPILES
+    and the component quietly uses 9 instead of the 4 that was passed.
+
+    That third case is the only one that earns `SilentlyMisLowers`, and
+    the first version of this classification did not have it. The label
+    was asserted off the first two cases, where the honest reading is
+    `EmitsUncompilable` — **the label happened to be right and the
+    evidence recorded for it did not support it**, which is the same
+    failure as a correct answer with a wrong proof. It was found by a
+    reviewer asking for the input space, not by the probe.
 
     Both anchors were needed here and both were nearly skipped. Byte
     identity means nothing unless the component contributes at all, and
