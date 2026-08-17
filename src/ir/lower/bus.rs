@@ -413,8 +413,10 @@ impl FuncBuilder<'_> {
                 args.len()
             )));
         }
-        super::reject_positional_named_args(
+        let declared: Vec<String> = h.payload.iter().map(|p| p.name.name.clone()).collect();
+        super::reject_misplaced_named_args(
             args,
+            &declared,
             &format!("a `bus.{}.send(...)` payload", h.name.name),
         )?;
         for (sig, arg) in h.payload.iter().zip(args.iter()) {
@@ -561,7 +563,12 @@ impl FuncBuilder<'_> {
         // wide temp instead of truncating to u64 (`port_temp_type` only
         // honors the hint for >64-bit widths, so narrow args are
         // unaffected).
-        super::reject_positional_named_args(args, &format!("a `bus.{}(...)` call", m.name.name))?;
+        let declared: Vec<String> = m.args.iter().map(|(n, _)| n.name.clone()).collect();
+        super::reject_misplaced_named_args(
+            args,
+            &declared,
+            &format!("a `bus.{}(...)` call", m.name.name),
+        )?;
         let mut lowered = Vec::with_capacity(args.len());
         for (a, (_, decl_ty)) in args.iter().zip(m.args.iter()) {
             let hint = super::helpers::ir_type_of(Some(decl_ty));
@@ -717,8 +724,10 @@ impl FuncBuilder<'_> {
         }
         // Request payload evaluates now (same cycle as the request, no
         // tick between args and req_valid — v1's inline arg emission).
-        super::reject_positional_named_args(
+        let declared: Vec<String> = m.args.iter().map(|(n, _)| n.name.clone()).collect();
+        super::reject_misplaced_named_args(
             args,
+            &declared,
             &format!("a `fork bus.{}(...)` call", m.name.name),
         )?;
         let mut lowered = Vec::with_capacity(args.len());

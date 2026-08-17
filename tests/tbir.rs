@@ -17222,12 +17222,14 @@ end impl TbTest
 /// position — `bus.w.send(strb = 15, data = t.value)` emitted
 /// `axil_w_data = 15` and `axil_w_strb = t.value`.
 ///
-/// That is the silent swap `SilentlyMisLowers` documents TB-IR as
-/// refusing rather than matching, and it was found the same way the
-/// seventh parameter landing was: by looking for the BEHAVIOUR outside
-/// the file the first fix was written in.
+/// The guard checks names against the DECLARATION rather than counting
+/// arguments. Its first version keyed on arity alone and so refused
+/// `bus.w.send(data = t.value, strb = 15)` — names in declaration order,
+/// which both backends lower correctly — while telling the user v1
+/// "silently emits something else". Every caller here has the declared
+/// names in hand, so both halves are pinned below.
 #[test]
-fn tbir_no_longer_binds_reordered_named_arguments_by_position() {
+fn tbir_binds_named_arguments_by_name_or_refuses_to_bind_them() {
     let fixture = fixture("axilite_bound_mon_test.harc");
     const CALL: &str = "bus.w.send(t.value, 15)";
     assert!(fixture.contains(CALL), "fixture shape changed");
@@ -17249,7 +17251,7 @@ fn tbir_no_longer_binds_reordered_named_arguments_by_position() {
         Ok::<_, lower::LowerError>(tbir::emit(&p, &m, &cpp_tb::EmitOpts::default()).expect("emits"))
     };
 
-    // The control still lowers and binds in declaration order.
+    // The control binds in declaration order.
     let ctl = emit_tbir(&fixture).expect("the positional form lowers");
     assert!(
         ctl.contains("harc_rt::harc_assign(dut->axil_w_data, t.value);")
@@ -17257,22 +17259,48 @@ fn tbir_no_longer_binds_reordered_named_arguments_by_position() {
         "control binds data then strb"
     );
 
-    // Both named forms are now refused rather than bound by position.
-    for args in ["data = t.value, strb = 15", "strb = 15, data = t.value"] {
-        let err = emit_tbir(&call(args))
-            .err()
-            .unwrap_or_else(|| panic!("`bus.w.send({args})` must not lower silently"));
-        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(msg.contains("`bus.w.send(...)` payload"), "{msg}");
-    }
+    // Names in DECLARATION ORDER still lower, and bind exactly as the
+    // positional form does — this is the half the arity-only guard
+    // broke. (Not a whole-file identity: adding `data = ` shifts source
+    // offsets, which appear in generated symbol names.)
+    let in_order = emit_tbir(&call("data = t.value, strb = 15")).expect("in-order names lower");
+    assert!(
+        in_order.contains("harc_rt::harc_assign(dut->axil_w_data, t.value);")
+            && in_order.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "names written where they belong bind where they belong"
+    );
 
-    // A SINGLE named argument is still accepted: there is no other
-    // position for it to land in, so dropping the name is a no-op. This
-    // is what keeps the guard from rejecting working programs.
-    const RECV: &str = "let val = bus.r.recv()";
-    if fixture.contains(RECV) {
-        emit_tbir(&fixture).expect("the one-argument surface is untouched");
-    }
-    let one_arg = fixture.replacen("bus.aw.addr = t.addr", "bus.aw.addr = t.addr", 1);
-    emit_tbir(&one_arg).expect("unrelated single-argument sites keep working");
+    // REORDERED names are refused, and the message says which parameter
+    // was written where rather than just that names were used.
+    let err = emit_tbir(&call("strb = 15, data = t.value"))
+        .err()
+        .expect("a reordered call must not lower silently");
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("`bus.w.send(...)` payload"), "{msg}");
+    assert!(
+        msg.contains("`strb` is parameter 2 here but was written in position 1"),
+        "the message must name the misplacement: {msg}"
+    );
+
+    // A name matching NO parameter is refused too — v1 accepts it
+    // silently, which is the quieter half of the same hazard.
+    let err = emit_tbir(&call("nosuch = t.value, strb = 15"))
+        .err()
+        .expect("an unknown parameter name must not lower silently");
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("names no parameter of this call"), "{msg}");
+
+    // Mixed positional/named is checked by position too: `strb` sits in
+    // position 2, where it belongs, so this lowers.
+    let mixed = emit_tbir(&call("t.value, strb = 15")).expect("a correctly-placed name lowers");
+    assert!(
+        mixed.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "and binds where the name says"
+    );
+
+    // (A single argument cannot be misplaced at all, so the guard is a
+    // no-op there. It cannot be exercised on this channel — an arity
+    // check above rejects a one-argument `bus.w.send` outright — and the
+    // one-argument surface is pinned instead by
+    // `named_arguments_are_bound_by_position_by_v1`.)
 }

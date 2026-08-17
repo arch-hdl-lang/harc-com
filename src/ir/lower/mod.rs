@@ -4752,7 +4752,8 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
     }
 }
 
-/// Reject named arguments at a call site that binds them BY POSITION.
+/// Reject named arguments that would be bound BY POSITION to the wrong
+/// parameter.
 ///
 /// Every `CallArg::Named` consumer that simply takes `value` and drops
 /// `name` is silently reordering: `bus.w.send(strb = 15, data = t.value)`
@@ -4761,28 +4762,54 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// which is exactly what `SilentlyMisLowers` documents TB-IR as refusing
 /// rather than matching.
 ///
-/// Gated on TWO or more arguments, because a single argument cannot be
-/// reordered: there is no other position for it to land in, so dropping
-/// the name is a no-op and the existing behaviour is correct. That is
-/// the same split `lower_component_call_args` makes, and it is what
-/// keeps this guard from rejecting working programs.
-pub(crate) fn reject_positional_named_args(
+/// Takes the DECLARED parameter names and refuses only when a name does
+/// not match the position it sits in. That matters: the first version of
+/// this guard keyed on arity alone, and so refused
+/// `bus.w.send(data = t.value, strb = 15)` — names in declaration order,
+/// which both backends lower correctly — with a message asserting v1
+/// "silently emits something else". Unlike `lower_component_call_args`,
+/// which sees only `&[CallArg]`, every caller here has the declaration
+/// in hand, so there is no reason to answer a question this precise with
+/// a count. **Refusing a correct program with a false explanation is not
+/// the safe side of a classification.**
+pub(crate) fn reject_misplaced_named_args(
     args: &[crate::ast::CallArg],
+    declared: &[String],
     construct: &str,
 ) -> Result<(), LowerError> {
-    if args.len() < 2
-        || !args
-            .iter()
-            .any(|a| matches!(a, crate::ast::CallArg::Named { .. }))
-    {
-        return Ok(());
+    for (i, a) in args.iter().enumerate() {
+        let crate::ast::CallArg::Named { name, .. } = a else {
+            continue;
+        };
+        // A name that matches its own position binds where the user
+        // meant, so the dropped name changes nothing.
+        if declared.get(i).is_some_and(|d| *d == name.name) {
+            continue;
+        }
+        let detail = if declared.contains(&name.name) {
+            format!(
+                "`{}` is parameter {} here but was written in position {}; argument names \
+                 are dropped and the values bound strictly by position, so this silently \
+                 swaps them",
+                name.name,
+                declared.iter().position(|d| *d == name.name).unwrap() + 1,
+                i + 1,
+            )
+        } else {
+            format!(
+                "`{}` names no parameter of this call; argument names are dropped and the \
+                 values bound strictly by position, so it is accepted and misplaced \
+                 silently",
+                name.name,
+            )
+        };
+        return Err(not_implemented(
+            &format!("a misplaced named argument in {construct}"),
+            &detail,
+            V1Status::SilentlyMisLowers,
+        ));
     }
-    Err(not_implemented(
-        &format!("named arguments in {construct}"),
-        "argument names are dropped here and the values bound strictly by position, so \
-         names written out of declaration order silently swap them",
-        V1Status::SilentlyMisLowers,
-    ))
+    Ok(())
 }
 
 /// True when a hooked `on` handler has the shape v1's method-hook

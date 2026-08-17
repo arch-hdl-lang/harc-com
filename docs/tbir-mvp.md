@@ -3610,9 +3610,29 @@ case and only locally-determinable `Assign` types are compared).
 
     That is the same class as the seventh parameter landing and was found
     the same way: by looking for the BEHAVIOUR outside the file the first
-    fix was written in. The guard is now one shared
-    `reject_positional_named_args`, gated on two or more arguments so the
-    single-argument surface — which cannot reorder — keeps working.
+    fix was written in.
+
+    The guard took two tries. The first keyed on ARITY alone — reject any
+    multi-argument call carrying a name — and so refused
+    `bus.w.send(data = t.value, strb = 15)`, names in declaration order,
+    which both backends lower correctly, while telling the user v1
+    "silently emits something else". That sentence was false for the
+    program in front of it. **Refusing a correct program with a false
+    explanation is not the safe side of a classification**, and the
+    excuse for the shortcut did not even apply: unlike
+    `lower_component_call_args`, which sees only `&[CallArg]`, every one
+    of these callers has the declaration in hand. The guard now compares
+    each name against the parameter at its position and says which
+    parameter was written where.
+
+    Three named-argument sites remain UNFIXED and are recorded rather
+    than guessed at: relation calls in `randomize ... with`
+    (`typed_lower.rs`), and `log`/`logf`, which discards the name and can
+    silently swallow the message entirely. Six further arms still answer
+    `Unsupported` for calls v1 swaps — helper, extern-fn, testbench-method,
+    two transactor-method sites and the covergroup helper target. They are
+    the same misdirection this batch has been closing; they are just not
+    closed yet.
 
     No CODEGEN site in v1 reads an argument name:
     of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
