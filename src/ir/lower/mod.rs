@@ -2247,19 +2247,24 @@ fn validate_testbench_component(
                     // drops the hook side and lowers the trigger as an
                     // ordinary testbench-scope cycle trigger:
                     //
-                    //   * `on <bool-expr> pre` — byte-identical to the
-                    //     same handler written without the hook, so the
-                    //     ordering is silently lost. (Anchored: deleting
-                    //     the handler does change v1's output.)
+                    //   * `on <bool-expr> pre` and `on <N> cycles pre` —
+                    //     byte-identical to the same handler written
+                    //     without the hook, so the ordering is silently
+                    //     lost. (Anchored: deleting the handler does
+                    //     change v1's output.) Note the periodic form
+                    //     stays a PERIODIC handler under v1, not a cycle
+                    //     trigger — the detail below says "a plain
+                    //     handler of the same kind" for that reason.
                     //   * `on <obj>.<method> pre` — v1 emits
                     //     `(bool)(_tb.s.send)` against a `struct Sender`
                     //     whose members are `dut`, `_last_in_cycle` and
                     //     `_last_out_cycle`, which does not compile.
                     //
-                    // `SilentlyMisLowers` is the worse of the two and so
+                    // `SilentlyMisLowers` is the worse of these and so
                     // the arm's label. The construct name says "handler
                     // hook" rather than "`<obj>.<method>` method hook"
-                    // because the bool-expr input has no method in it.
+                    // because two of the three inputs have no method in
+                    // them.
                     return Err(not_implemented(
                         &format!(
                             "a testbench-scoped `pre`/`post` hook on an `on` handler in `{}`",
@@ -2267,7 +2272,7 @@ fn validate_testbench_component(
                         ),
                         "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
                          handlers are lowered at testbench scope; v1 accepts a hook side, \
-                         drops it and lowers the trigger as a plain cycle trigger",
+                         drops it and lowers the trigger as a plain handler of the same kind",
                         V1Status::SilentlyMisLowers,
                     ));
                 }
@@ -3921,11 +3926,34 @@ fn lower_test(
     let mut promoted_lets: HashSet<String> = HashSet::new();
     for (side, h) in &method_hook_asts {
         let (xfield, method) = resolve_method_hook_target(&h.event).ok_or_else(|| {
-            unsupported(
-                "an `on <obj>.<method> pre/post` hook whose `<obj>.<method>` is not \
-                 a `<transactor-field>.<method>` access",
-                "the hook target must resolve to a method on a transactor testbench field",
-            )
+            // Two shapes miss, and v1 separates them the same way the
+            // statement-position arm in `stmts.rs` does.
+            //
+            //   * A DEEPER path (`on e.inner.note pre`, an env's
+            //     sub-component). The resolver here accepts only
+            //     `<field>.<method>` / `_tb.<field>.<method>`; v1 walks
+            //     the whole path and emits a working
+            //     `Watcher_note_pre.push_back`, so `--codegen v1` is a
+            //     real escape hatch.
+            //   * A trigger that is not a path at all — `on <bool-expr>
+            //     pre`, `on <N> cycles pre`, `on ev(x) pre`. v1 refuses
+            //     these outright; naming it would send the user to a
+            //     second error.
+            if !h.periodic && components::dotted_path(&h.event).is_some() {
+                unsupported(
+                    "an `on <obj>.<method> pre/post` hook on a nested component path",
+                    "the hook target must resolve to a method on a DIRECT transactor \
+                     testbench field in this subset",
+                )
+            } else {
+                not_implemented(
+                    "a `pre`/`post` hook on a non-method-path `on` handler at test scope",
+                    "a hook side names a method to wrap; v1 routes every hooked `on` through \
+                     its method-hook resolver and refuses a trigger that is not an \
+                     `<obj>.<method>` path",
+                    V1Status::Rejects,
+                )
+            }
         })?;
         // Not a transactor field. Two very different programs land here
         // and v1 separates them exactly, so this must not answer with

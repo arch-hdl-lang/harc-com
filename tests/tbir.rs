@@ -15914,6 +15914,7 @@ end transactor Sender
 
 agent Watcher
     seen : uint<32> default 0
+    ev   : event<RegOp>
     hookable note(t: RegOp)
         seen = seen + 1
     end note
@@ -15922,10 +15923,15 @@ agent Watcher
     end plain
 end agent Watcher
 
+env Holder
+    inner : Watcher
+end env Holder
+
 testbench HookTb
     dut : Top
     s   : Sender active
     w   : Watcher
+    e   : Holder
 HOOK
 end testbench HookTb
 
@@ -16056,19 +16062,90 @@ fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination()
         msg.contains("test scope") && msg.contains("transactor"),
         "the suggestion must name the placement that actually lowers: {msg}"
     );
-    for (label, bad) in [
-        ("testbench declaration", hook_positions(&pre_hook_on("s.send", "    "), "", "")),
+    // Each rejected placement is checked against ITS OWN hook-free
+    // control. Asserting only `is_err()` would pass on a source that
+    // fails for an unrelated reason, which is how a placement gets
+    // recommended by accident.
+    let component_body = |hook: &str| {
+        hook_positions("", "", "").replace(
+            "    hookable note(t: RegOp)",
+            &format!("{hook}    hookable note(t: RegOp)"),
+        )
+    };
+    for (label, bad, control) in [
+        (
+            "testbench declaration",
+            hook_positions(&pre_hook_on("s.send", "    "), "", ""),
+            hook_positions("", "", ""),
+        ),
         (
             "component body",
-            hook_positions("", "", "").replace(
-                "    hookable note(t: RegOp)",
-                "    on s.send pre\n        log(info, \"p\")\n    end on\n    hookable note(t: RegOp)",
-            ),
+            component_body("    on s.send pre\n        log(info, \"p\")\n    end on\n"),
+            component_body(""),
         ),
     ] {
+        lower_src(&control).unwrap_or_else(|e| {
+            panic!("the {label} control must lower, or its rejection proves nothing: {e:?}")
+        });
+        let err = lower_src(&bad)
+            .err()
+            .unwrap_or_else(|| panic!("the {label} placement must not be a working destination"));
         assert!(
-            lower_src(&bad).is_err(),
-            "the {label} placement must not be a destination worth naming"
+            err.to_string().contains("hook"),
+            "and it must be the HOOK that is rejected there, not something else: {err:?}"
+        );
+    }
+}
+
+/// The statement-position arm is mixed, because v1's method-hook
+/// resolver is what every hooked `on` goes through. A path trigger it
+/// wires; anything else it refuses outright, so pointing those at
+/// `--codegen v1` would hand the user a second error.
+#[test]
+fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
+    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)"] {
+        let src = hook_positions("", "", &pre_hook_on(trigger, "        "));
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-method-path"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `on {trigger} pre`, or `Rejects` is wrong"
+        );
+        // The anchor: the SAME trigger without a hook side is fine, so
+        // the rejection is about the hook and not about the trigger.
+        if trigger != "w.ev(x)" {
+            let ctl = hook_positions(
+                "",
+                "",
+                &format!("        on {trigger}\n            log(info, \"p\")\n        end on"),
+            );
+            lower_src(&ctl).unwrap_or_else(|e| panic!("`on {trigger}` alone must lower: {e:?}"));
+        }
+    }
+}
+
+/// The same split at test scope, where the target resolver takes only
+/// `<field>.<method>`. A DEEPER path is a subset gap — v1 walks the
+/// whole path and wires it — while a non-path trigger is refused by v1.
+#[test]
+fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
+    let nested = hook_positions("", &pre_hook_on("e.inner.note", "    "), "");
+    let msg = assert_unsupported(&lower_src(&nested).unwrap_err());
+    assert!(msg.contains("nested component path"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&nested))
+            .expect("v1 emits")
+            .contains("Watcher_note_pre.push_back"),
+        "v1 walks the nested path, so the `--codegen v1` suggestion is honest"
+    );
+
+    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)"] {
+        let src = hook_positions("", &pre_hook_on(trigger, "    "), "");
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-method-path"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse `on {trigger} pre` at test scope, or `Rejects` is wrong"
         );
     }
 }
@@ -16105,6 +16182,8 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
             "v1 must refuse `{target}`, or `Invalid` over-claims"
         );
         let msg = assert_invalid(&lower_src(&src).unwrap_err());
-        assert!(msg.contains(target.split('.').next().unwrap()), "{msg}");
+        // Name the whole target, not just its head — `s.nosuch` and
+        // `w.plain` would otherwise match on a one-character needle.
+        assert!(msg.contains(&format!("`on {target}`")), "{msg}");
     }
 }

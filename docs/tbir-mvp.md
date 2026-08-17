@@ -3402,21 +3402,25 @@ case and only locally-determinable `Assign` types are compared).
     that also fails is worse than no hint** — which is divergence 51's
     lesson, reintroduced two entries after writing it down.
 
-54. **The `on <obj>.<method> pre/post` hook spans four positions and
-    three verdicts (2026-08-17).**
+54. **The `on <obj>.<method> pre/post` hook spans six sites across
+    three files, and four verdicts (2026-08-17).**
 
     Divergences 52 and 53 treated "the hook family" as the arms inside
     `components.rs`. It is not a file-local construct. A user writes the
-    same source in four places, and grouping by construct rather than by
-    file turns up three more sites, each classified wrong:
+    same source in four different places, and grouping by construct
+    rather than by file turns up six sites, five of them classified
+    wrong. Two of the six are mixed-verdict arms that had to be split:
 
     | position | v1 | was | now |
     |---|---|---|---|
     | component body (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
     | event subscription (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
     | `testbench` declaration (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | statement position (`stmts.rs`) | **implements it** | `Unsupported` | `Unsupported` |
+    | statement position, path trigger (`stmts.rs`) | **implements it** | `Unsupported` | `Unsupported` |
+    | statement position, other trigger (`stmts.rs`) | rejects | `Unsupported` | `Rejects` |
     | non-transactor field (`mod.rs`) | **implements it** | `Invalid` | `Unsupported` |
+    | test-scope nested path (`mod.rs`) | **implements it** | `Unsupported` | `Unsupported` |
+    | test-scope other trigger (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
 
     Two of these are worth reading closely.
 
@@ -3439,15 +3443,36 @@ case and only locally-determinable `Assign` types are compared).
     binds to a component type declaring a `hookable` of that name) and
     keeps `Invalid` only for the half v1 also refuses: an undeclared
     field, the DUT handle, a `function` rather than `hookable` method, or
-    a transactor missing the method. Each of those four was probed, and
-    v1 rejects each with its own message.
+    a transactor missing the method. Each of those four was probed and v1
+    refuses each — with the SAME message in all four cases ("obj.method
+    must resolve to a `hookable` on a known component type"), not four
+    distinct ones. That is enough to keep them `Invalid` but not enough
+    to claim v1 diagnoses them individually.
+
+    Two more sites turned up on the next pass, both mixed-verdict, and
+    both were split on the same predicate rather than given one label.
+    v1 routes EVERY hooked `on` through its method-hook resolver, which
+    accepts an `<obj>.<method>` path and refuses anything else outright.
+    So at both the statement position and the test-scope target
+    resolution, a path trigger keeps `Unsupported` (v1 wires it) and a
+    non-path trigger — `on <bool-expr> pre`, `on <N> cycles pre`,
+    `on ev(x) pre` — becomes `NotImplemented { Rejects }`. `dotted_path`
+    is the discriminator, and it separates all four probed inputs
+    exactly. The residual is bounded and stated: a path that is
+    well-formed but does not resolve to a `hookable` still gets the
+    suggestion, and the user lands on v1's own message rather than on
+    silence.
 
     The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
     `components.rs` by "what a user would have to write to reach the
     site" — and then applied that grouping only inside one file. The
-    construct does not respect the file boundary, and three of the five
-    sites above were invisible from inside `components.rs`. **Group by
-    construct, then find every file that implements it.**
+    construct does not respect the file boundary: it has SIX sites across
+    three files, and five of them were invisible from inside
+    `components.rs`. **Group by construct, then find every file that
+    implements it.** Note also that this entry's own table was written
+    saying "four positions" and had to be corrected twice as further
+    positions appeared — a count of sites is a claim like any other, and
+    it needs a search, not a recollection.
 
 ### The probe method
 

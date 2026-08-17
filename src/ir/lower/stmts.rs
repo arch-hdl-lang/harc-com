@@ -2620,18 +2620,40 @@ impl FuncBuilder<'_> {
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
-            // v1 IS an escape hatch here: it emits the same
-            // `<Type>_<method>_pre.push_back` registration a test-scope
-            // hook gets, byte-identically, so the suggestion is honest.
+            // A hook side in statement position splits on the TRIGGER,
+            // because v1 does. v1 routes any hooked `on` here through
+            // its method-hook resolver, which wants an `<obj>.<method>`
+            // path and refuses anything else outright.
+            //
+            //   * `on s.send pre` — v1 emits the same
+            //     `<Type>_<method>_pre.push_back` registration a
+            //     test-scope hook gets, so `--codegen v1` is a real
+            //     escape hatch and this stays `Unsupported`.
+            //   * `on <bool-expr> pre`, `on <N> cycles pre`,
+            //     `on ev(x) pre` — v1 REFUSES ("obj.method must resolve
+            //     to a `hookable` on a known component type"). Pointing
+            //     at v1 there sends the user to a second error.
             //
             // The destination named below used to be "the component or
             // testbench", and BOTH of those fail — a hook in a component
             // body hits `components::validate_cycle_handler` and one in
             // a `testbench` declaration hits the testbench-scope arm in
-            // this file. The destination that works is the test / `impl
+            // `mod.rs`. The destination that works is the test / `impl
             // ... for` body, against a DIRECT transactor field, which is
             // what `axilite_hooks_test` exercises in the equivalence
-            // registry.
+            // registry. (A path that is well-formed but does not resolve
+            // to a `hookable` — `w.plain`, `nosuch.send` — is refused by
+            // v1 too; those keep the suggestion, and the user lands on
+            // v1's own precise message rather than on silence.)
+            if h.periodic || super::components::dotted_path(&h.event).is_none() {
+                return Err(not_implemented(
+                    "a `pre`/`post` hook on a non-method-path `on` handler in statement position",
+                    "a hook side names a method to wrap; v1 routes every hooked `on` through \
+                     its method-hook resolver and refuses a trigger that is not an \
+                     `<obj>.<method>` path",
+                    V1Status::Rejects,
+                ));
+            }
             return Err(unsupported(
                 "an `on <obj>.<method> pre/post` hook in statement position",
                 "declare the hook at test scope (`impl ... for <Tb>` / `test` body), on a \
