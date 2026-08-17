@@ -19246,3 +19246,73 @@ fn a_doubling_relation_chain_is_refused_at_the_same_point_by_both_backends() {
         "{msg}"
     );
 }
+
+/// `emit <ev>(...)` has three lowering branches, and only ONE of them
+/// checked that an event payload is exactly one argument: the
+/// test-scope `let e : event<T>` local. The dotted-path form
+/// (`emit tagger.in_ev(v)`) and the self-relative form
+/// (`emit observed(v)` inside a method body) both took whatever they
+/// were given.
+///
+/// Measured on both backends at both sites, which is what makes this
+/// `Invalid` rather than a gap:
+///
+/// | arity | tbir | v1 |
+/// |---|---|---|
+/// | over | `_s(v, 2)` — uncompilable | `_s(v)` — silently drops it |
+/// | under | `_s()` — uncompilable | `_s()` — uncompilable |
+///
+/// g++ on the over-supply form: "no match for call to
+/// '(std::function<void(long unsigned int)>) (int, int)'". So no
+/// backend runs the program as written under any of the four cells,
+/// and the verdict is the one the local-event branch already gave.
+#[test]
+fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
+    for (what, base, call) in [
+        (
+            "dotted path",
+            fixture("agent_on_handler_test.harc"),
+            "emit tagger.in_ev(i + 1)",
+        ),
+        (
+            "self-relative",
+            fixture("analysis_sink_connect_test.harc"),
+            "emit observed(v)",
+        ),
+    ] {
+        assert!(base.contains(call), "{what}: fixture shape changed");
+        // The control lowers, so the refusals below are about arity and
+        // not about the fixture.
+        lower_src(&base).unwrap_or_else(|e| panic!("{what}: control lowers: {e}"));
+
+        let one = call.rfind('(').expect("call has args");
+        for (arity, args) in [("over", "(i + 1, 2)"), ("under", "()")] {
+            let args = if what == "self-relative" && arity == "over" {
+                "(v, 2)"
+            } else {
+                args
+            };
+            let src = base.replacen(call, &format!("{}{args}", &call[..one]), 1);
+            let msg = assert_invalid(&lower_src(&src).unwrap_err());
+            assert!(
+                msg.contains("an event payload is exactly one"),
+                "{what}/{arity}: {msg}"
+            );
+
+            // v1 emits both, which is exactly why TB-IR must not send
+            // anyone there: the over-supply form drops the extra
+            // payload silently and the under-supply form does not
+            // compile.
+            let v1 = cpp_tb::emit(&merged_src(&src))
+                .unwrap_or_else(|e| panic!("{what}/{arity}: v1 emits: {e}"));
+            if arity == "under" {
+                assert!(v1.contains(") _s();"), "{what}: v1 emits a no-arg call");
+            } else {
+                assert!(
+                    !v1.contains(", 2);"),
+                    "{what}: v1 must drop the extra payload silently"
+                );
+            }
+        }
+    }
+}

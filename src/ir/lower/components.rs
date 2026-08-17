@@ -3191,6 +3191,25 @@ impl super::FuncBuilder<'_> {
                         ));
                     }
                 }
+                // The arity check the test-scope `let e : event<T>`
+                // branch below has had all along, missing here and at
+                // the self-relative site. Measured at both, on both
+                // backends: `emit tagger.in_ev(i + 1, 2)` makes TB-IR
+                // emit `_s((i + 1), 2)` against a
+                // `std::function<void(uint64_t)>` — g++: "no match for
+                // call to '(std::function<void(long unsigned int)>)
+                // (int, int)'" — while v1 emits `_s(i + 1)`, silently
+                // dropping the extra payload. Under-supply is
+                // uncompilable under both. So no backend runs the
+                // program as written, and `Invalid` is the verdict the
+                // sibling branch already gives it.
+                if args.len() != 1 {
+                    return Err(LowerError::Invalid(format!(
+                        "`emit {}` carries {} argument(s); an event payload is exactly one",
+                        path_str(name),
+                        args.len()
+                    )));
+                }
                 let lowered = self.lower_component_call_args(args, None)?;
                 self.push(IrStmt::ComponentEmit {
                     base: ComponentBase::Path(recv),
@@ -3280,6 +3299,14 @@ impl super::FuncBuilder<'_> {
                     "",
                 ));
             }
+        }
+        // Same missing arity check as the path form above; see the
+        // measurement there.
+        if args.len() != 1 {
+            return Err(LowerError::Invalid(format!(
+                "`emit {event}` carries {} argument(s); an event payload is exactly one",
+                args.len()
+            )));
         }
         let lowered = self.lower_component_call_args(args, None)?;
         self.push(IrStmt::ComponentEmit {

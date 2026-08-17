@@ -4829,6 +4829,37 @@ case and only locally-determinable `Assign` types are compared).
     lower with the constraint silently gone. It records the error, and
     `is_relation_error` includes it, so the walk stops.
 
+73. **One of three `emit` branches checked the payload arity
+    (2026-08-17).**
+
+    `emit <ev>(...)` lowers through three branches in `components.rs`:
+    the test-scope `let e : event<T>` local, the dotted path
+    (`emit tagger.in_ev(v)`), and the self-relative form
+    (`emit observed(v)` inside a method body). Only the first checked
+    that an event payload is exactly one argument. The other two took
+    whatever they were given, and the asymmetry showed up incidentally
+    while probing something else — the same source shape refused as a
+    local and accepted as a path.
+
+    Measured on both backends at both unchecked sites:
+
+    | arity | tbir | v1 |
+    |---|---|---|
+    | over — `(v, 2)` | `_s(v, 2)` — uncompilable | `_s(v)` — **silently drops the extra payload** |
+    | under — `()` | `_s()` — uncompilable | `_s()` — uncompilable |
+
+    The uncompilable cells are compiler-measured against the emitted
+    channel type: g++ on `_s(v, 2)` against
+    `std::function<void(uint64_t)>` says "no match for call to
+    '(std::function<void(long unsigned int)>) (int, int)'".
+
+    No backend runs any of the four cells as written, so `Invalid` —
+    the same verdict the local-event branch has given all along, now
+    given by all three. The worst cell is v1's silent drop, which is
+    what makes this worth more than a tidier diagnostic: `emit
+    tagger.in_ev(i + 1, 2)` ran green under v1 with the second payload
+    thrown away.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
