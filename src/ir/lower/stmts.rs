@@ -2391,6 +2391,44 @@ impl FuncBuilder<'_> {
             // Scalar-element sequence: yield any scalar expression.
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown => {
                 let v = self.lower_expr_no_ports(value)?;
+                // A scalar-element sequence must not accept a RECORD.
+                // Without this the record local is pushed verbatim and
+                // the emitter writes `std::vector<int64_t>::push_back(t)`
+                // with `t` a struct — uncompilable C++, no diagnostic.
+                //
+                // Previously unreachable: every scalar-element seq came
+                // from an explicit `TSeq<uint<N>>`, and a body yielding a
+                // record against that annotation was caught by the type
+                // in the annotation. Defaulting an UNANNOTATED tseq to a
+                // scalar element made it reachable — the check the
+                // narrower gate had been providing for free.
+                if let Expr::Local(id) = &v {
+                    // Any NON-SCALAR local, not just a record: a
+                    // sequence-typed one (`let xs = Inner(2); yield xs`)
+                    // slips through a record-only check and pushes a
+                    // `std::vector` into a `std::vector<int64_t>` just
+                    // as silently.
+                    let want = match self.local_type(*id) {
+                        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown => None,
+                        IrType::Record(rid) => Some(self.ctx.records[rid.index()].name.clone()),
+                        other => Some(format!("{other:?}")),
+                    };
+                    if let Some(what) = want {
+                        // v1 accepts this and emits the mismatched
+                        // `push_back` — same behaviour, and so the same
+                        // classification, as the sibling bad-element-type
+                        // arm in `tseqs.rs`.
+                        return Err(not_implemented(
+                            "`yield` of a non-scalar value in a tseq whose element type is a \
+                             scalar",
+                            format!(
+                                "annotate the tseq with `-> TSeq<{what}>`; v1 emits the \
+                                 mismatched `push_back`, which does not compile"
+                            ),
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
                 self.push(Stmt::SeqPush { seq, value: v });
                 Ok(())
             }

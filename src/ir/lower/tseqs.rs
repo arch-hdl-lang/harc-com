@@ -104,9 +104,13 @@ fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
 /// Build the `tseq name → element type` map, validating each declaration
 /// up front. A `tseq`'s element is either a declared record (`TSeq<Record>`,
 /// → `TseqElem::Record`) or a primitive scalar (`TSeq<uint<N>>`, →
-/// `TseqElem::Scalar`); both render as `std::vector<T>`. A `tseq` with no
-/// `TSeq<...>` return, or a `TSeq<Name>` whose `Name` is not a declared
-/// record, is an explicit `Unsupported` — rejected here, never mis-lowered.
+/// `TseqElem::Scalar`); both render as `std::vector<T>`.
+///
+/// A `tseq` with NO return type at all defaults its element to a signed
+/// 64-bit scalar, matching v1's `std::vector<int64_t>`. A `TSeq<Name>`
+/// whose `Name` is not a declared record, and any other present-but-
+/// unusable annotation, is rejected — absent and invalid are different
+/// input classes and must not share an arm.
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
@@ -141,14 +145,38 @@ pub(crate) fn collect_tseq_records(
                 ));
             };
             TseqElem::Record(rid)
+        } else if decl.return_ty.is_none() {
+            // No `-> TSeq<T>` at all: default the element to a signed
+            // 64-bit scalar, which is exactly what v1 does — it emits
+            // `-> std::vector<int64_t>` where an annotated tseq gets
+            // `std::vector<uint64_t>`. That is a signedness difference,
+            // not a failure, so the sequence runs correctly under v1 and
+            // this was a gap to CLOSE rather than a diagnostic to
+            // reclassify.
+            //
+            // Deliberately not merged with the bad-element-type arm
+            // above: an ABSENT annotation is defaultable, a PRESENT but
+            // unresolvable one is not (v1 prints the bad name into a
+            // type position, which does not compile). Same code path,
+            // different input classes.
+            TseqElem::Scalar(IrType::SInt(Some(64)))
         } else {
+            // A `-> TSeq<...>` that is PRESENT but names neither a
+            // scalar builtin nor a declared record — `TSeq<int>`,
+            // `TSeq<time>`, `TSeq<Vec<uint<8>, 4>>`. The default above
+            // must not swallow these: v1 renders each differently
+            // (`vector<uint64_t>`, `vector<std::array<uint64_t,4>>`),
+            // so defaulting them to `int64_t` would silently change the
+            // element type rather than close a gap.
+            //
+            // Reached whenever `return_ty` is PRESENT but unusable —
+            // including a non-`TSeq` return like `-> Req`, which also
+            // has no `TSeq` args and would otherwise fall into the
+            // default arm.
             return Err(unsupported(
-                &format!(
-                    "`tseq {}` without a `-> TSeq<T>` return type",
-                    decl.name.name
-                ),
-                "a tseq must yield a declared `transaction`/`struct` record or a primitive \
-                 scalar (`uint<N>`/`sint<N>`/`bool`) element type",
+                &format!("`tseq {}` element type", decl.name.name),
+                "a `-> TSeq<T>` must name a declared `transaction`/`struct` record or a \
+                 primitive scalar (`uint<N>`/`sint<N>`/`bool`)",
             ));
         };
         if out.insert(decl.name.name.clone(), elem).is_some() {
