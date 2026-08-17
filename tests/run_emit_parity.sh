@@ -143,16 +143,32 @@ is_subset_gap() {
 # guts a floor. Bounding the UNCHECKED count instead is independent of
 # corpus size, so adding or removing fixtures needs no edit here.
 #
-# Current values: 1 unchecked (one known exemption), 15 with solver text.
-# The headroom is for a few more legitimate gaps before this complains.
+# `n` is the exception and DOES get a floor. Rows only disappear from the
+# shared table by a deliberate edit to it — never because a fixture became
+# a subset gap or gained an exemption — so flooring it cannot reintroduce
+# the escape-valve problem above. Without it, deleting the table down to
+# ten rows is a fully green run: `unchecked` and `n` shrink together, so
+# capping the ratio's numerator alone sees nothing.
+#
+# Current values: 149 rows, 1 unchecked (one known exemption), 15 with
+# solver text. Headroom is for a few legitimate changes, not a third of
+# the corpus.
+MIN_ROWS="${MIN_ROWS:-140}"
 MAX_UNCHECKED="${MAX_UNCHECKED:-10}"
-MIN_SOLVER="${MIN_SOLVER:-10}"
-for _v in MAX_UNCHECKED MIN_SOLVER; do
+MIN_SOLVER="${MIN_SOLVER:-13}"
+for _v in MIN_ROWS MAX_UNCHECKED MIN_SOLVER; do
+    # Shape AND range. Digit-shape alone was not enough: a value above
+    # 2^63-1 is all digits, makes `[ -lt ]` error out, and left the gate
+    # reporting success — the same fail-open the validation was added for.
     case "${!_v}" in
-        ''|*[!0-9]*)
+        *[!0-9]*|'')
             echo "error: $_v must be a non-negative integer, got '${!_v}'" >&2
             exit 1 ;;
     esac
+    if [ "${#_v}" -gt 0 ] && [ "$(printf '%s' "${!_v}" | wc -c)" -gt 7 ]; then
+        echo "error: $_v is implausibly large ('${!_v}'); refusing to run" >&2
+        exit 1
+    fi
 done
 
 KNOWN="$SCRIPT_DIR/emit_parity_known.txt"
@@ -325,6 +341,13 @@ echo "        $nostatus lost"
 compared=$((pass + passc))
 unchecked=$((skip + known))
 floors_ok=1
+if [ "$n" -lt "$MIN_ROWS" ]; then
+    echo "error: only $n rows in the shared fixture table (min $MIN_ROWS)." >&2
+    echo "       The table shrank — a bad merge or an over-eager edit drops" >&2
+    echo "       fixtures from every consumer at once, and the remaining rows" >&2
+    echo "       still pass. If the shrink was deliberate, lower MIN_ROWS." >&2
+    floors_ok=0
+fi
 if [ "$unchecked" -gt "$MAX_UNCHECKED" ]; then
     echo "error: $unchecked of $n fixtures went unchecked (max $MAX_UNCHECKED):" >&2
     echo "       $skip skipped, $known known-exempt, $compared compared." >&2
