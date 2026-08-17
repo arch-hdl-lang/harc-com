@@ -4405,6 +4405,67 @@ case and only locally-determinable `Assign` types are compared).
     would mean inventing a name to check against, which is the mistake
     `record_write` already made once.
 
+66. **A named argument in its own position is inert (2026-08-17).**
+
+    Six arms answered `Unsupported` for any named argument, refusing the
+    whole construct. v1 drops argument names and binds strictly by
+    position, so the reordered form silently swaps values — already
+    classified in divergence 57 — but the IN-ORDER form is inert.
+    Measured per family, comparing emitted C++:
+
+    | call | v1 emits |
+    |---|---|
+    | `hlp(111, 222)` | `hlp(111, 222)` |
+    | `hlp(a = 111, b = 222)` | `hlp(111, 222)` |
+    | `hlp(b = 222, a = 111)` | `hlp(222, 111)` |
+
+    Byte-identical for the in-order form, in every family measured:
+    free-function helper, testbench method (`Tb_hlp(_tb, 111, 222)`),
+    extern fn (`ref_add(111, 222)`), transactor/component method
+    (`AxilXactor_axil_write(_tb.env.drv, t.addr, t.value)`), and tseq
+    (`mine(111, 222)`). Refusing the whole construct refused a form that
+    costs the user nothing.
+
+    Three of those families now route through
+    `reject_misplaced_named_args`, which splits the three cases: name in
+    its own position lowers, name in another position is
+    `SilentlyMisLowers`, name matching no parameter is `Invalid`. Each
+    parameter list is read off the DECLARATION the call resolves to.
+
+    **Three are NOT converted, and the reason is the same in each: the
+    seam has no parameter names to check against.** Saying so beats
+    inventing a list, which is what `record_write` once did.
+
+    * The transactor-method sites in `stmts.rs` lower under a schema
+      SNAPSHOT. `TransactorMethodSchema` carries `n_params` and not the
+      names — its own doc comment says the count is "duplicated from the
+      function so call sites (which lower under a schema snapshot,
+      without the functions table) can check arity". Adding names to the
+      schema is the enabling change.
+    * `lower_component_call_args` serves **seven** callers, and some of
+      them have no parameter list at all — it also lowers the payload of
+      `emit <ev>(...)`. Its existing comment already recorded this
+      ("telling the two apart needs the callee's parameter list"); this
+      entry records that the measurement now exists, so only the
+      plumbing is missing.
+    * The covergroup helper target is reached from the covergroup
+      lowering path, which resolves helpers through a different
+      registry.
+
+    That leaves the component-method arm still refusing an in-order
+    named argument v1 emits identically — a known, measured, un-closed
+    gap rather than an unexamined one.
+
+    Each of the three converted call sites is pinned by mutation:
+    deleting any one of them fails
+    `a_named_argument_in_its_own_position_lowers_for_the_families_that_
+    know_their_parameters`.
+
+    Two keyword traps turned up while writing the probes, both the same
+    class as the `reg` one from divergence 65: `seq` cannot name a
+    `tseq` and `reg` cannot name a variable, so an example using either
+    measures the parser rather than the thing under test.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

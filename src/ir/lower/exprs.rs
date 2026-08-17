@@ -421,7 +421,7 @@ impl FuncBuilder<'_> {
                         if self.helpers.contains(&id.name) {
                             return self.lower_helper_call(&id.name, args);
                         }
-                        if self.ctx.extern_fns.contains(&id.name) {
+                        if self.ctx.extern_fns.contains_key(&id.name) {
                             return self.lower_extern_fn_call(&id.name, args);
                         }
                         // `past(x)` / `rose(x)` / `fell(x)` / `stable(x)`
