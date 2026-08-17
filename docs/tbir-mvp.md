@@ -3981,14 +3981,14 @@ case and only locally-determinable `Assign` types are compared).
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
-    the third it **STACK-OVERFLOWS and aborts the process**.
-    `expand_relation_subtree` in `cpp_tb.rs` has no depth guard, so
-    `relation R(r) = R(r)` takes the compiler down. No `V1Status` fits a
+    the third it **STACK-OVERFLOWED and aborted the process**.
+    `expand_relation_subtree` in `cpp_tb.rs` had no depth guard, so
+    `relation R(r) = R(r)` took the compiler down. No `V1Status` fits a
     SIGABRT, which is part of why `Invalid` is the right verdict — and
-    the regression test asserts on TB-IR only and never calls
+    the regression test asserted on TB-IR only and never called
     `cpp_tb::emit` on that input, because a test cannot catch an abort.
-    A depth guard in v1 is a real fix and is NOT made here; it is
-    recorded so the next batch can take it deliberately.
+    **Closed in divergence 62**, which is why that test now does call
+    it.
 
     With the diagnostics surfacing, the misplaced-named-argument check
     from divergence 57 finally does something. Relation calls bind by
@@ -4008,11 +4008,8 @@ case and only locally-determinable `Assign` types are compared).
 
     * **Only Test and Tseq randomize sites are collected.** Closed in
       divergence 60 below.
-    * **`MAX_ERRORS = 5` can disable the refusal.** Five preceding
-      discarded errors (`r.addr == r.len` trips `WidthMismatch`, which is
-      deliberately not surfaced) hit `at_error_cap()` before the relation
-      clause is reached, and the program lowers. The cap is a
-      diagnostics-volume guard being load-bearing for correctness.
+    * **`MAX_ERRORS = 5` can disable the refusal.** Closed in
+      divergence 61 below.
     * **Every Ident-callee constraint call is treated as a relation
       call**, so a v1-supported `sum(...)` records `UnknownRelation`.
       Masked today only because TB-IR rejects `list<T>` fields earlier;
@@ -4112,6 +4109,136 @@ case and only locally-determinable `Assign` types are compared).
     watchdog arm is belt-and-braces, not a live filter — `watchdog
     disabled` takes no body at all, the parser refuses the first
     statement, so the body is empty there either way.
+
+61. **A diagnostics-volume guard was load-bearing for correctness
+    (2026-08-17).**
+
+    Divergence 59 recorded this as a known limit; this closes it.
+    `MAX_ERRORS = 5` bounds how many constraint-lowering errors are
+    collected, and `at_error_cap()` was doubling as the stop condition
+    for the whole clause walk. So five clauses tripping an error that is
+    *deliberately discarded* — `t.addr == t.value` trips
+    `WidthMismatch`, a capability gap, not a bad program — filled the
+    vector and stopped the walk before a later relation call was ever
+    expanded.
+
+    Measured on the exact boundary: four noise clauses refuse, **five
+    lower**, and at five both backends emit
+    `value > 2000 && value < 1000` from
+    `Band(t, hi = 2000, lo = 1000)`. A program was mis-lowered because
+    of how many *other*, unrelated, unreported things were wrong with
+    it.
+
+    The split is now explicit, and `MAX_ERRORS` is out of the
+    control-flow decision entirely. The walk stops exactly when a
+    relation error is in hand — that is the only class a caller acts on,
+    and only the first one is ever reported. A program with no relation
+    error is walked to the end and its diagnostics are capped by
+    `record_error` alone, which is what the cap was for.
+
+    The FIRST relation error is stored cap or no cap; dropping it as the
+    sixth error would convert a refusal into a mis-lowering just as
+    surely. Later ones are dropped rather than also exempted, and that
+    distinction is not cosmetic: a first draft exempted *every* relation
+    error, which made the vector unbounded. A depth-12 relation
+    fan-out over two unknown relations produced **8192** errors where
+    the cap had held it to 5. The bound is now `MAX_ERRORS + 1`, and in
+    practice 1 — the walk stops at the first one. Removing a bound while
+    fixing a bug the bound caused is not a fix.
+
+    The four relation variants live behind
+    `LowerError::is_relation_error`, next to the enum.
+    `surface_constraint_lower_error` still matches them by hand to word
+    each diagnostic, so the list really is written twice — an earlier
+    draft of this entry claimed the consumer read the predicate, and it
+    did not. What keeps the copies honest is a `debug_assert!` on that
+    function's skip arm: adding a fifth variant to the predicate alone
+    fails the suite with the variant named. Silent drift would
+    reintroduce this very bug — the walk stopping on an error nobody
+    acts on, or not stopping on one that matters.
+
+    Both halves are pinned by mutation: restoring `should_stop` to
+    `at_error_cap` fails the five-noise-clause case, and dropping the
+    exemption for the first relation error fails it too. Blast radius, measured across all
+    190 fixtures: the error sets are unchanged and no entry gains a
+    relation error, so the longer walk costs nothing and reports
+    nothing new.
+
+62. **The compiler died instead of complaining (2026-08-17).**
+
+    Divergence 59 measured this and left it open: `expand_relation_subtree`
+    in `cpp_tb.rs` had no guard of any kind, so `relation R(r) = R(r)`
+    recursed until the stack ran out. SIGABRT — no message, no exit code
+    a build system can interpret, nothing a user can act on. It was left
+    open on the reasoning that "a test cannot catch an abort", which is
+    true and is exactly why the guard had to come before the test.
+
+    **Three shapes ran away, and each defeated the guard written for the
+    one before it. The lesson is where the guard belongs, not how big
+    the number is.**
+
+    The first attempt was a work budget, on the argument that every step
+    which grows the expression passes through one choke point. Correct,
+    and it still aborted: the expander recurses once per level, so
+    10 000 levels overflow the stack long before a 10 000-unit budget is
+    spent. Depth got its own, smaller, limit.
+
+    The second attempt — depth 64 plus a budget counting EXPANSIONS —
+    was measured against `relation R(r: Req) = R(r + r)` and killed the
+    process by OOM instead: the argument is substituted into both
+    occurrences of `r`, so it doubles every level, and 64 expansions
+    build about 2^64 nodes. The budget was re-charged per node PRODUCED.
+
+    The third attempt was measured against
+    `relation R(r: Req) = R((((…r…))))` — 60 nested parens, **418 bytes
+    of source** — and **still aborted with a stack overflow**. The
+    argument does not get bigger, it gets DEEPER: 60x per level, until
+    the structural walk runs out of stack. Node count does not see
+    depth. That is the very SIGABRT the guard was written to prevent,
+    and two rounds of "the guard now covers X" had already been written
+    down as closed.
+
+    There is no end to that list, because **bounding the output of an
+    unbounded loop is the wrong place to stand.** The fix is a
+    relation-NAME stack: a relation already being expanded is expanding
+    into itself, and is refused before any tree is built, so it does not
+    matter how fast the body would have grown. Every shape above now
+    returns a diagnostic in under 4 ms.
+
+    `constraints::typed_lower` already guarded the same recursion this
+    way. Three attempts were spent inventing worse versions of a guard
+    that existed one module over — each one measured, each one shipped
+    as a fix, each one wrong. The reviewer's counter-example, not the
+    author's argument, ended each round.
+
+    The budget and depth limit stay as backstops for growth that is
+    finite but exponential — a chain of DISTINCT relations, each calling
+    the previous one twice. Both numbers are measured: the corpus passes
+    at a node budget of **96** and fails at **88**, so 8192 is about 90x
+    the deepest real need (wide because the budget is shared across a
+    whole constraint list, so it scales with program size); and a
+    63-deep chain still expands with its innermost bound reaching the
+    emitted C++, while at 64 the call is left unexpanded. That last one
+    does refuse a **finite, correct** program, with v1's generic
+    "constraint function call not supported in v0 solver path" — bought
+    cheaply, since the corpus's deepest real nest is 3.
+
+    Neither backstop is pinned by a test, and that is stated rather than
+    papered over: the non-cyclic doubling chain they exist for is
+    bottlenecked in `typed_lower`'s own un-budgeted expander (103 ms at
+    12 levels, 11.3 s at 18) long before v1's backstop is reached, so a
+    test would be measuring the other component. That blowup is
+    pre-existing — it reproduces on a clean `origin/main` worktree — and
+    budgeting that expander is a separate change.
+
+    The regression test steps over the boundary divergence 59 documented:
+    it calls `cpp_tb::emit` on five shapes: self-recursive, mutually
+    recursive, both of those with a growing argument, and the
+    paren-deepening one that defeated two earlier guards. Controls in
+    the same test keep the guard honest about what it is not: a 40-deep
+    chain of distinct relations and a 60-paren expression both still
+    emit with the innermost bound intact. Disabling the name stack
+    reproduces the SIGABRT and the test binary dies with signal 6.
 
 ### The probe method
 

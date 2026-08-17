@@ -665,9 +665,11 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// Only the RELATION errors surface. Three of them are program errors
 /// under any backend: a relation that does not exist, one called with
 /// the wrong arity, and one that expands into itself. Measured against
-/// v1: it rejects the first two ("constraint function call not
-/// supported in v0 solver path") and STACK-OVERFLOWS on the third, so
-/// none of them is an escape hatch and `Invalid` is the honest verdict.
+/// v1: it rejects all three with "constraint function call not
+/// supported in v0 solver path", so none is an escape hatch and
+/// `Invalid` is the honest verdict. The third used to take the process
+/// down with a stack overflow instead; divergence 62 replaced that with
+/// the same diagnostic as the other two.
 ///
 /// The other variants stay discarded ON PURPOSE. They are capability
 /// gaps in the constraint IR, not bad programs:
@@ -732,7 +734,17 @@ fn surface_constraint_lower_error(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            _ => continue,
+            // Must stay in step with `LowerError::is_relation_error`,
+            // which decides when the constraint walk may stop. A
+            // relation variant that reaches here unhandled would be
+            // dropped silently, so it trips under `cargo test` instead.
+            _ => {
+                debug_assert!(
+                    !e.is_relation_error(),
+                    "relation error not handled by surface_constraint_lower_error: {e:?}"
+                );
+                continue;
+            }
         };
         // Not "`randomize ... with`": a relation call also appears in a
         // transaction-level `keep` (spec §4), and naming a `with` clause

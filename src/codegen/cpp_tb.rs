@@ -51,6 +51,41 @@ pub const QUEUE_RT_HEADER: &str = include_str!("../../runtime/harc_queue_rt.h");
 pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
 pub const LOG_RT_HEADER: &str = include_str!("../../runtime/harc_log_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
+
+/// How many expression NODES one top-level constraint list may produce
+/// by expanding relation bodies before the expander gives up and leaves
+/// the call in place.
+///
+/// A BACKSTOP, not the guard. What actually stops a relation expanding
+/// into itself is the relation-name stack in
+/// `try_expand_top_level_call`; this bounds growth that is finite but
+/// exponential — a chain of DISTINCT relations, each calling the
+/// previous one twice.
+///
+/// It counts nodes rather than expansions because a per-expansion
+/// budget cannot see growth in the ARGUMENT: `relation R(r) = R(r + r)`
+/// substitutes the argument into both occurrences of `r`, doubling it
+/// every level, so a handful of expansions build an astronomical tree.
+///
+/// MEASURED, not guessed: the whole fixture corpus passes at 96 and
+/// fails at 88, so 8192 is roughly 90x the deepest real program's need.
+/// The budget is shared across a whole top-level constraint list, so it
+/// scales with program size, not per constraint — which is why the
+/// margin is that wide.
+const RELATION_EXPANSION_BUDGET: u32 = 8_192;
+
+/// How deep relation bodies may nest before the expander gives up.
+///
+/// The other BACKSTOP: the budget bounds total work but not stack, and
+/// the expander recurses once per level. With the name stack in place
+/// nothing cyclic reaches either limit, so this only ever fires on a
+/// finite chain of distinct relations 64 deep — which it refuses, with
+/// v1's generic "constraint function call not supported in v0 solver
+/// path". That is a real tradeoff against a correct program, bought
+/// cheaply: the corpus's deepest real nest is 3, and a 40-deep chain
+/// still emits (there is a control for it in
+/// `v1_no_longer_aborts_on_a_relation_that_expands_forever`).
+const RELATION_EXPANSION_MAX_DEPTH: u32 = 64;
 pub const COSIM_RT_HEADER: &str = include_str!("../../runtime/harc_cosim_rt.h");
 
 const INDENT: &str = "    ";
@@ -13238,21 +13273,44 @@ impl Emitter {
     /// so a nested relation call (e.g. inside a `Binary &&`) expands too.
     /// Recursion handles relations of relations.
     fn expand_relation_calls(&self, exprs: &[Expr]) -> Vec<Expr> {
+        // One budget per top-level constraint list, so a big but honest
+        // program cannot exhaust it by accumulation. See
+        // `RELATION_EXPANSION_BUDGET`.
+        let budget = std::cell::Cell::new(RELATION_EXPANSION_BUDGET);
+        let mut active: Vec<&str> = Vec::new();
+        self.expand_relation_calls_budgeted(&budget, &mut active, 0, exprs)
+    }
+
+    fn expand_relation_calls_budgeted<'r>(
+        &'r self,
+        budget: &std::cell::Cell<u32>,
+        active: &mut Vec<&'r str>,
+        depth: u32,
+        exprs: &[Expr],
+    ) -> Vec<Expr> {
         let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
         for e in exprs {
             // Top-level Call: expand to potentially multiple constraints.
-            if let Some(expanded) = self.try_expand_top_level_call(e) {
+            if let Some((name, expanded)) = self.try_expand_top_level_call(budget, active, depth, e)
+            {
                 // Each body expr is itself walked so block-form
                 // relations that contain nested calls flatten too.
+                active.push(name);
                 for be in &expanded {
-                    out.extend(self.expand_relation_calls(&[be.clone()]));
+                    out.extend(self.expand_relation_calls_budgeted(
+                        budget,
+                        active,
+                        depth + 1,
+                        &[be.clone()],
+                    ));
                 }
+                active.pop();
                 continue;
             }
             // Non-call (or unknown-name call): walk the subtree so any
             // nested R(args) inside Binary / Unary / Paren / etc.
             // expands inline.
-            out.push(self.expand_relation_subtree(e));
+            out.push(self.expand_relation_subtree(budget, active, depth, e));
         }
         out
     }
@@ -13263,15 +13321,51 @@ impl Emitter {
     /// subtree walking). Arity-mismatched calls return `None` so the
     /// downstream translator surfaces a "constraint expression not
     /// supported" error with a useful span — better than swallowing.
-    fn try_expand_top_level_call(&self, e: &Expr) -> Option<Vec<Expr>> {
+    fn try_expand_top_level_call<'r>(
+        &'r self,
+        budget: &std::cell::Cell<u32>,
+        active: &[&str],
+        depth: u32,
+        e: &Expr,
+    ) -> Option<(&'r str, Vec<Expr>)> {
         let ExprKind::Call { callee, args } = &*e.kind else {
             return None;
         };
         let ExprKind::Ident(id) = &*callee.kind else {
             return None;
         };
-        let rel = self.relations.get(&id.name)?;
+        let (name, rel) = self.relations.get_key_value(&id.name)?;
         if rel.params.len() != args.len() {
+            return None;
+        }
+        // A relation already being expanded is expanding into itself.
+        // THIS is what stops the runaway, and it stops it at the root:
+        // no tree is built, so it does not matter how fast the body
+        // would have grown. Everything below is a backstop.
+        //
+        // Guards that only bounded the RESULT were tried first and each
+        // was defeated by a shape it did not measure. A per-expansion
+        // budget left `R(r) = R(r + r)` doubling the argument until the
+        // process was OOM-killed. Charging per produced node fixed that
+        // and left `R(r) = R((((…r…))))` — 60 nested parens, 418 bytes
+        // of source — multiplying the tree's DEPTH by 60 per level
+        // until the structural walk overflowed the stack, which is the
+        // very SIGABRT the guard was written to prevent. There is no
+        // end to that list, because bounding the output of an
+        // unbounded loop is the wrong place to stand.
+        //
+        // `constraints::typed_lower` already guarded the same recursion
+        // this way. Reaching for it here took three tries.
+        if active.contains(&name.as_str()) {
+            return None;
+        }
+        // Backstop, for growth that is not cyclic: a chain of DISTINCT
+        // relations, each calling the previous one twice, is finite and
+        // exponential. Out of budget or too deep behaves exactly like
+        // an unknown relation — the call is left unexpanded and the
+        // downstream translator reports "constraint function call not
+        // supported in v0 solver path".
+        if depth >= RELATION_EXPANSION_MAX_DEPTH {
             return None;
         }
         let mut subst: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
@@ -13288,7 +13382,26 @@ impl Emitter {
             }
             RelationBody::Alias(expr) => vec![substitute_idents(expr, &subst)],
         };
-        Some(body_exprs)
+        // Spend the budget on NODES PRODUCED, not on the number of
+        // expansions: a per-expansion budget cannot see growth in the
+        // ARGUMENT, and `relation R(r: Req) = R(r + r)` doubles it
+        // every level.
+        //
+        // This charges AFTER `substitute_idents` has already built the
+        // tree, so a single step can overshoot — by one step's worth,
+        // which is the body's occurrence count times the argument's
+        // size. That is acceptable HERE only because the name stack
+        // above has already refused everything cyclic; the shapes that
+        // made the overshoot matter cannot reach this line. Charging
+        // during substitution would be tighter and is not done.
+        let produced: u32 = body_exprs
+            .iter()
+            .fold(0u32, |acc, e| acc.saturating_add(expr_node_count(e)));
+        match budget.get().checked_sub(produced) {
+            Some(left) => budget.set(left),
+            None => return None,
+        }
+        Some((name, body_exprs))
     }
 
     /// Walk a constraint expression, replacing any nested
@@ -13297,93 +13410,111 @@ impl Emitter {
     /// single expression is expected (e.g. inside a `Binary &&`); use
     /// `expand_relation_calls` at the top level to get one constraint
     /// per body expression.
-    fn expand_relation_subtree(&self, expr: &Expr) -> Expr {
+    fn expand_relation_subtree<'r>(
+        &'r self,
+        budget: &std::cell::Cell<u32>,
+        active: &mut Vec<&'r str>,
+        depth: u32,
+        expr: &Expr,
+    ) -> Expr {
         let span = expr.span;
         // Recognize a relation Call anywhere in the tree. For block-form
         // bodies, build the AND-of-all-body-exprs expression so the
         // call site (which expected one Expr) gets one Expr back.
-        if let Some(body_exprs) = self.try_expand_top_level_call(expr) {
+        if let Some((name, body_exprs)) =
+            self.try_expand_top_level_call(budget, active, depth, expr)
+        {
+            active.push(name);
             let exprs: Vec<Expr> = body_exprs
                 .iter()
-                .map(|x| self.expand_relation_subtree(x))
+                .map(|x| self.expand_relation_subtree(budget, active, depth + 1, x))
                 .collect();
+            active.pop();
             return and_join(&exprs, span);
         }
         let new_kind: ExprKind = match &*expr.kind {
             ExprKind::Field { target, name } => ExprKind::Field {
-                target: self.expand_relation_subtree(target),
+                target: self.expand_relation_subtree(budget, active, depth, target),
                 name: name.clone(),
             },
             ExprKind::Index { target, index } => ExprKind::Index {
-                target: self.expand_relation_subtree(target),
-                index: self.expand_relation_subtree(index),
+                target: self.expand_relation_subtree(budget, active, depth, target),
+                index: self.expand_relation_subtree(budget, active, depth, index),
             },
             ExprKind::BitSlice { target, hi, lo } => ExprKind::BitSlice {
-                target: self.expand_relation_subtree(target),
-                hi: self.expand_relation_subtree(hi),
-                lo: self.expand_relation_subtree(lo),
+                target: self.expand_relation_subtree(budget, active, depth, target),
+                hi: self.expand_relation_subtree(budget, active, depth, hi),
+                lo: self.expand_relation_subtree(budget, active, depth, lo),
             },
             ExprKind::Call { callee, args } => ExprKind::Call {
-                callee: self.expand_relation_subtree(callee),
+                callee: self.expand_relation_subtree(budget, active, depth, callee),
                 args: args
                     .iter()
                     .map(|a| match a {
-                        CallArg::Expr(e) => CallArg::Expr(self.expand_relation_subtree(e)),
+                        CallArg::Expr(e) => {
+                            CallArg::Expr(self.expand_relation_subtree(budget, active, depth, e))
+                        }
                         CallArg::Named { name, value } => CallArg::Named {
                             name: name.clone(),
-                            value: self.expand_relation_subtree(value),
+                            value: self.expand_relation_subtree(budget, active, depth, value),
                         },
                     })
                     .collect(),
             },
             ExprKind::ForEachConstraint { var, iter, body } => ExprKind::ForEachConstraint {
                 var: var.clone(),
-                iter: self.expand_relation_subtree(iter),
-                body: self.expand_relation_calls(body),
+                iter: self.expand_relation_subtree(budget, active, depth, iter),
+                body: self.expand_relation_calls_budgeted(budget, active, depth, body),
             },
             ExprKind::SoftConstraint(sc) => ExprKind::SoftConstraint(SoftConstraint {
-                expr: self.expand_relation_subtree(&sc.expr),
+                expr: self.expand_relation_subtree(budget, active, depth, &sc.expr),
                 weight: sc
                     .weight
                     .as_ref()
-                    .map(|weight| self.expand_relation_subtree(weight)),
+                    .map(|weight| self.expand_relation_subtree(budget, active, depth, weight)),
             }),
             ExprKind::Cast { expr, ty } => ExprKind::Cast {
-                expr: self.expand_relation_subtree(expr),
+                expr: self.expand_relation_subtree(budget, active, depth, expr),
                 ty: ty.clone(),
             },
             ExprKind::Unary { op, expr } => ExprKind::Unary {
                 op: *op,
-                expr: self.expand_relation_subtree(expr),
+                expr: self.expand_relation_subtree(budget, active, depth, expr),
             },
             ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
                 op: *op,
-                lhs: self.expand_relation_subtree(lhs),
-                rhs: self.expand_relation_subtree(rhs),
+                lhs: self.expand_relation_subtree(budget, active, depth, lhs),
+                rhs: self.expand_relation_subtree(budget, active, depth, rhs),
             },
             ExprKind::Ternary {
                 cond,
                 then_branch,
                 else_branch,
             } => ExprKind::Ternary {
-                cond: self.expand_relation_subtree(cond),
-                then_branch: self.expand_relation_subtree(then_branch),
-                else_branch: self.expand_relation_subtree(else_branch),
+                cond: self.expand_relation_subtree(budget, active, depth, cond),
+                then_branch: self.expand_relation_subtree(budget, active, depth, then_branch),
+                else_branch: self.expand_relation_subtree(budget, active, depth, else_branch),
             },
-            ExprKind::Paren(inner) => ExprKind::Paren(self.expand_relation_subtree(inner)),
+            ExprKind::Paren(inner) => {
+                ExprKind::Paren(self.expand_relation_subtree(budget, active, depth, inner))
+            }
             ExprKind::Membership { expr, set } => ExprKind::Membership {
-                expr: self.expand_relation_subtree(expr),
-                set: self.expand_relation_subtree(set),
+                expr: self.expand_relation_subtree(budget, active, depth, expr),
+                set: self.expand_relation_subtree(budget, active, depth, set),
             },
             ExprKind::SetLit(items) => ExprKind::SetLit(
                 items
                     .iter()
-                    .map(|x| self.expand_relation_subtree(x))
+                    .map(|x| self.expand_relation_subtree(budget, active, depth, x))
                     .collect(),
             ),
             ExprKind::RangeLit { lo, hi } => ExprKind::RangeLit {
-                lo: lo.as_ref().map(|x| self.expand_relation_subtree(x)),
-                hi: hi.as_ref().map(|x| self.expand_relation_subtree(x)),
+                lo: lo
+                    .as_ref()
+                    .map(|x| self.expand_relation_subtree(budget, active, depth, x)),
+                hi: hi
+                    .as_ref()
+                    .map(|x| self.expand_relation_subtree(budget, active, depth, x)),
             },
             other => other.clone(),
         };
@@ -22730,6 +22861,57 @@ fn and_join(exprs: &[Expr], span: Span) -> Expr {
 /// case: `R(pkt)` → `pkt`), a field access (`R(env.agent.txn)`), or
 /// a deeper subtree. Field-access names (`Field { name, .. }`) are
 /// attribute references, not bindings, so they're never substituted.
+/// Nodes in `e`, saturating. Used to charge
+/// `RELATION_EXPANSION_BUDGET` for what an expansion actually
+/// PRODUCES.
+///
+/// The arms mirror `expand_relation_subtree`'s: those are exactly the
+/// forms that can carry a substituted argument, so they are exactly the
+/// forms through which a relation body can grow. Anything else counts
+/// as a leaf, which can only undercount forms that cannot grow.
+fn expr_node_count(e: &Expr) -> u32 {
+    fn n(e: &Expr) -> u32 {
+        1u32.saturating_add(match &*e.kind {
+            ExprKind::Field { target, .. } => n(target),
+            ExprKind::Index { target, index } => n(target).saturating_add(n(index)),
+            ExprKind::BitSlice { target, hi, lo } => {
+                n(target).saturating_add(n(hi)).saturating_add(n(lo))
+            }
+            ExprKind::Call { callee, args } => args.iter().fold(n(callee), |a, arg| {
+                a.saturating_add(match arg {
+                    CallArg::Expr(x) => n(x),
+                    CallArg::Named { value, .. } => n(value),
+                })
+            }),
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                body.iter().fold(n(iter), |a, x| a.saturating_add(n(x)))
+            }
+            ExprKind::SoftConstraint(sc) => {
+                sc.weight.as_ref().map_or(0, n).saturating_add(n(&sc.expr))
+            }
+            ExprKind::Unary { expr, .. } => n(expr),
+            ExprKind::Binary { lhs, rhs, .. } => n(lhs).saturating_add(n(rhs)),
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => n(cond)
+                .saturating_add(n(then_branch))
+                .saturating_add(n(else_branch)),
+            ExprKind::Paren(inner) => n(inner),
+            ExprKind::Membership { expr, set } => n(expr).saturating_add(n(set)),
+            ExprKind::Cast { expr, .. } => n(expr),
+            ExprKind::SetLit(items) => items.iter().fold(0, |a, x| a.saturating_add(n(x))),
+            ExprKind::RangeLit { lo, hi } => lo
+                .as_ref()
+                .map_or(0, n)
+                .saturating_add(hi.as_ref().map_or(0, n)),
+            _ => 0,
+        })
+    }
+    n(e)
+}
+
 fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
     let span = expr.span;
     let new_kind: ExprKind = match &*expr.kind {
