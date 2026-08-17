@@ -599,9 +599,32 @@ pub(crate) fn lower_component_schema(
                         activation,
                     });
                 }
+                // Connect ownership is modeled only for env/agent and
+                // reusable-testbench composition. A transactor-owned block
+                // used to be silently discarded here, including inside
+                // `when active`; reject it until that ownership has an IR
+                // representation with activation provenance.
+                ComponentItem::Connect(_) if is_transactor => {
+                    let placement = if matches!(activation, Activation::ActiveOnly) {
+                        " inside `when active`"
+                    } else {
+                        ""
+                    };
+                    return Err(unsupported(
+                        &format!("a `connect` declaration{placement} on transactor `{name}`"),
+                        "connect declarations are supported on env, agent, and testbench composition, not on analysis-source transactors",
+                    ));
+                }
+                // Testbench lifecycle blocks are parser-restricted already;
+                // retain a precise lowerer guard for malformed AST input.
+                ComponentItem::Lifecycle(..) if is_transactor => {
+                    return Err(unsupported(
+                        &format!("a lifecycle declaration on transactor `{name}`"),
+                        "lifecycle declarations are supported only on testbench composition",
+                    ));
+                }
                 // Connect blocks are resolved separately (env-binding stage).
-                ComponentItem::Connect(_) => {}
-                ComponentItem::Lifecycle(..) => {}
+                ComponentItem::Connect(_) | ComponentItem::Lifecycle(..) => {}
                 ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push((h, activation)),
                 // `on bus.<ch>.handshake(arg)` — the passive bus-monitor half
                 // of a bound transactor (v1's `emit_bound_monitor_actors`).
@@ -838,9 +861,20 @@ pub(crate) fn lower_component_schema(
         _ => None,
     };
 
+    let instance_mode_policy = match src {
+        CompSource::Transactor(t)
+            if transactor_is_analysis_source(t)
+                && !transactor_has_mode_sensitive_analysis_surface(t) =>
+        {
+            crate::ir::ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+        }
+        _ => crate::ir::ComponentInstanceModePolicy::Standard,
+    };
+
     Ok(ComponentSchema {
         name: name.to_string(),
         kind,
+        instance_mode_policy,
         fields,
         methods,
         // Connects resolved in a third pass once all schemas exist.
@@ -3228,51 +3262,46 @@ impl super::FuncBuilder<'_> {
         head: ComponentId,
         segs: &[String],
     ) -> Result<Option<ComponentInstanceMode>, LowerError> {
-        let mut mode = self.ctx.component_modes.get(head_name).copied().flatten();
-        let mut cid = head;
+        let inherited = self.ctx.component_modes.get(head_name).copied().flatten();
         if matches!(
-            self.ctx.components[cid.index()].kind,
+            self.ctx.components[head.index()].kind,
             crate::ir::ComponentKindTag::Transactor
-        ) && mode.is_none()
+        ) && inherited.is_none()
         {
             return Err(LowerError::Invalid(format!(
                 "transactor `{head_name}` has no effective active/passive mode"
             )));
         }
-        for seg in segs {
-            let comp = &self.ctx.components[cid.index()];
-            let Some(ComponentFieldKind::Sub {
-                component,
-                mode: declared_mode,
-            }) = comp.field(seg).map(|field| &field.kind)
-            else {
-                return Err(unsupported(
-                    &format!("`{seg}` is not a sub-component of `{}`", comp.name),
-                    "",
-                ));
-            };
-            cid = *component;
-            let child = &self.ctx.components[cid.index()];
-            if matches!(child.kind, crate::ir::ComponentKindTag::Transactor) {
-                mode = (*declared_mode).or(mode);
-                if mode.is_none() {
-                    return Err(LowerError::Invalid(format!(
-                        "transactor path `{}.{seg}` has no effective active/passive mode",
-                        head_name
-                    )));
-                }
-            } else if declared_mode.is_some() {
-                return Err(LowerError::Invalid(format!(
-                    "a transactor mode on {} field `{head_name}.{seg}`",
-                    child.kind.keyword()
-                )));
+        let resolved = crate::ir::resolve_component_path_mode(
+            &self.ctx.components,
+            head,
+            inherited,
+            segs,
+        )
+        .map_err(|err| match err {
+            crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
+                unsupported(&err.to_string(), "")
             }
+            _ => LowerError::Invalid(err.to_string()),
+        })?;
+        let target = &self.ctx.components[resolved.component.index()];
+        if matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
+            && target.requires_instance_mode()
+            && resolved.effective_mode.is_none()
+        {
+            let path = std::iter::once(head_name)
+                .chain(segs.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(LowerError::Invalid(format!(
+                "transactor path `{path}` has no effective active/passive mode"
+            )));
         }
         Ok(matches!(
-            self.ctx.components[cid.index()].kind,
+            target.kind,
             crate::ir::ComponentKindTag::Transactor
         )
-        .then_some(mode)
+        .then_some(resolved.effective_mode)
         .flatten())
     }
 

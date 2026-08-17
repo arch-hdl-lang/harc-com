@@ -725,6 +725,10 @@ pub struct ComponentSchema {
     /// Source keyword, for diagnostics + dump-ir (`env`/`scoreboard`/
     /// `transactor`).
     pub kind: ComponentKindTag,
+    /// Binding rule that remains meaningful even when the schema has no
+    /// active-only member. In particular, an always-on analysis monitor may
+    /// be modeless or passive, but an explicitly active monitor is invalid.
+    pub instance_mode_policy: ComponentInstanceModePolicy,
     pub fields: Vec<ComponentFieldSchema>,
     /// Methods in declaration order. Each has one lowered `TbFunction`
     /// (`kind: ComponentMethod`) whose body addresses fields self-
@@ -780,16 +784,34 @@ pub struct ComponentSchema {
 /// The source-level ownership mode of a component-path transactor binding.
 /// Structural components may carry this only as inherited context for a nested
 /// transactor; they never gain an active surface themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComponentInstanceMode {
     Active,
     Passive,
+}
+
+/// Per-schema rule for explicit instance-mode annotations. Most component
+/// schemas use `Standard`; only always-on analysis monitors reject an
+/// explicitly active binding because it selects no source-level behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentInstanceModePolicy {
+    Standard,
+    AlwaysOnAnalysisMonitor,
 }
 
 impl ComponentInstanceMode {
     pub fn includes(self, activation: Activation) -> bool {
         matches!(activation, Activation::Always) || matches!(self, ComponentInstanceMode::Active)
     }
+}
+
+/// Whether an optional effective instance mode exposes a member with this
+/// activation. A missing mode never exposes an active-only member.
+pub fn component_mode_includes_activation(
+    mode: Option<ComponentInstanceMode>,
+    activation: Activation,
+) -> bool {
+    matches!(activation, Activation::Always) || mode.is_some_and(|mode| mode.includes(activation))
 }
 
 /// Whether a component member came from the ordinary body or `when active`.
@@ -981,6 +1003,192 @@ impl ComponentSchema {
                         || matches!(edge.sink_activation, Activation::ActiveOnly)
                 }))
     }
+}
+
+/// The component and effective transactor mode reached by a path through
+/// by-value component fields. Structural components preserve their inherited
+/// context; a transactor field may replace it with its declared mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedComponentPath {
+    pub component: ComponentId,
+    pub effective_mode: Option<ComponentInstanceMode>,
+}
+
+/// A malformed component path or illegal structural mode encountered while
+/// resolving an instance path. Lowering maps these to source diagnostics;
+/// verification and codegen use the same policy to protect mutated IR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentPathResolutionError {
+    MissingComponent(ComponentId),
+    NotSubcomponent { component: String, segment: String },
+    StructuralMode { kind: ComponentKindTag, segment: String },
+    UnresolvedMode { path: String },
+    ForbiddenActiveMode { path: String },
+}
+
+impl std::fmt::Display for ComponentPathResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingComponent(component) => write!(f, "missing component c{}", component.0),
+            Self::NotSubcomponent { component, segment } => {
+                write!(f, "`{segment}` is not a sub-component of `{component}`")
+            }
+            Self::StructuralMode { kind, segment } => {
+                write!(f, "a transactor mode on {} field `{segment}`", kind.keyword())
+            }
+            Self::UnresolvedMode { path } => {
+                write!(f, "transactor path `{path}` has no effective active/passive mode")
+            }
+            Self::ForbiddenActiveMode { path } => write!(
+                f,
+                "an explicit `active` mode on always-on analysis monitor `{path}` is invalid"
+            ),
+        }
+    }
+}
+
+/// Resolve one component instance path for every consumer of mode metadata.
+/// This is the sole traversal policy for lowering access checks, verifier
+/// integrity checks, and TB-IR registration emission.
+pub fn resolve_component_path_mode(
+    components: &[ComponentSchema],
+    start: ComponentId,
+    inherited: Option<ComponentInstanceMode>,
+    path: &[String],
+) -> Result<ResolvedComponentPath, ComponentPathResolutionError> {
+    let mut component = start;
+    let mut effective_mode = inherited;
+    for segment in path {
+        let schema = components
+            .get(component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(component))?;
+        let field = schema.field(segment).ok_or_else(|| {
+            ComponentPathResolutionError::NotSubcomponent {
+                component: schema.name.clone(),
+                segment: segment.clone(),
+            }
+        })?;
+        let ComponentFieldKind::Sub {
+            component: child,
+            mode: declared_mode,
+        } = &field.kind
+        else {
+            return Err(ComponentPathResolutionError::NotSubcomponent {
+                component: schema.name.clone(),
+                segment: segment.clone(),
+            });
+        };
+        let child_schema = components
+            .get(child.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(*child))?;
+        if matches!(child_schema.kind, ComponentKindTag::Transactor) {
+            effective_mode = (*declared_mode).or(effective_mode);
+        } else if declared_mode.is_some() {
+            return Err(ComponentPathResolutionError::StructuralMode {
+                kind: child_schema.kind,
+                segment: segment.clone(),
+            });
+        }
+        component = *child;
+    }
+    if components.get(component.index()).is_none() {
+        return Err(ComponentPathResolutionError::MissingComponent(component));
+    }
+    Ok(ResolvedComponentPath {
+        component,
+        effective_mode,
+    })
+}
+
+/// Validate that every reachable transactor with a mode-sensitive surface has
+/// an effective mode. The traversal is type/mode memoized so malformed
+/// recursive schemas cannot make verifier or lowering validation recurse
+/// forever.
+pub fn validate_component_binding_modes(
+    components: &[ComponentSchema],
+    bindings: &[ComponentFieldBinding],
+) -> Result<(), ComponentPathResolutionError> {
+    fn visit(
+        components: &[ComponentSchema],
+        component: ComponentId,
+        inherited: Option<ComponentInstanceMode>,
+        path: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<(ComponentId, Option<ComponentInstanceMode>)>,
+    ) -> Result<(), ComponentPathResolutionError> {
+        let schema = components
+            .get(component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(component))?;
+        if schema.requires_instance_mode() && inherited.is_none() {
+            return Err(ComponentPathResolutionError::UnresolvedMode {
+                path: path.join("."),
+            });
+        }
+        if !visited.insert((component, inherited)) {
+            return Ok(());
+        }
+        for field in &schema.fields {
+            let ComponentFieldKind::Sub {
+                component: child,
+                mode: declared_mode,
+            } = &field.kind
+            else {
+                continue;
+            };
+            path.push(field.name.clone());
+            let child_schema = components
+                .get(child.index())
+                .ok_or(ComponentPathResolutionError::MissingComponent(*child))?;
+            if matches!(
+                child_schema.instance_mode_policy,
+                ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+            ) && matches!(declared_mode, Some(ComponentInstanceMode::Active))
+            {
+                return Err(ComponentPathResolutionError::ForbiddenActiveMode {
+                    path: path.join("."),
+                });
+            }
+            let resolved = resolve_component_path_mode(
+                components,
+                component,
+                inherited,
+                std::slice::from_ref(&field.name),
+            )?;
+            visit(
+                components,
+                resolved.component,
+                resolved.effective_mode,
+                path,
+                visited,
+            )?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    for binding in bindings {
+        let schema = components
+            .get(binding.component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(binding.component))?;
+        if matches!(
+            schema.instance_mode_policy,
+            ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+        ) && matches!(binding.mode, Some(ComponentInstanceMode::Active))
+        {
+            return Err(ComponentPathResolutionError::ForbiddenActiveMode {
+                path: binding.field.clone(),
+            });
+        }
+        let mut path = vec![binding.field.clone()];
+        visit(
+            components,
+            binding.component,
+            binding.mode,
+            &mut path,
+            &mut visited,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

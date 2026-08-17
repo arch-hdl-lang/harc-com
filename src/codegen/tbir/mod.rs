@@ -1644,75 +1644,30 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
     order
 }
 
-fn includes_activation(
-    mode: Option<ir::ComponentInstanceMode>,
-    activation: ir::Activation,
-) -> bool {
-    matches!(activation, ir::Activation::Always)
-        || matches!(mode, Some(ir::ComponentInstanceMode::Active))
-}
-
-fn nested_component_mode(
-    prog: &TbProgram,
-    inherited: Option<ir::ComponentInstanceMode>,
-    field: &ir::ComponentFieldSchema,
-) -> Option<ir::ComponentInstanceMode> {
-    let ir::ComponentFieldKind::Sub { component, mode } = &field.kind else {
-        return inherited;
-    };
-    if matches!(
-        prog.components[component.index()].kind,
-        ir::ComponentKindTag::Transactor
-    ) {
-        (*mode).or(inherited)
-    } else {
-        inherited
-    }
-}
-
-/// Effective mode at the component reached by a path relative to `start`.
-/// Structural components pass their inherited context through; a nested
-/// transactor's explicit mode overrides it.
-fn mode_at_component_path(
-    prog: &TbProgram,
-    start: ir::ComponentId,
-    inherited: Option<ir::ComponentInstanceMode>,
-    path: &[String],
-) -> Option<ir::ComponentInstanceMode> {
-    let mut component = start;
-    let mut mode = inherited;
-    for segment in path {
-        let field = prog.components[component.index()]
-            .field(segment)
-            .expect("verified component connect path");
-        let ir::ComponentFieldKind::Sub {
-            component: child,
-            mode: declared,
-        } = field.kind
-        else {
-            unreachable!("verified component connect path terminates at a component");
-        };
-        component = child;
-        if matches!(
-            prog.components[component.index()].kind,
-            ir::ComponentKindTag::Transactor
-        ) {
-            mode = declared.or(mode);
-        }
-    }
-    mode
-}
-
 fn edge_is_enabled(
     prog: &TbProgram,
     owner: ir::ComponentId,
     inherited: Option<ir::ComponentInstanceMode>,
     edge: &ir::ConnectEdgeSchema,
 ) -> bool {
-    let source_mode = mode_at_component_path(prog, owner, inherited, &edge.src_path);
-    let sink_mode = mode_at_component_path(prog, owner, inherited, &edge.sink_path);
-    includes_activation(source_mode, edge.src_activation)
-        && includes_activation(sink_mode, edge.sink_activation)
+    let source_mode = ir::resolve_component_path_mode(
+        &prog.components,
+        owner,
+        inherited,
+        &edge.src_path,
+    )
+    .expect("verified component connect source path")
+    .effective_mode;
+    let sink_mode = ir::resolve_component_path_mode(
+        &prog.components,
+        owner,
+        inherited,
+        &edge.sink_path,
+    )
+    .expect("verified component connect sink path")
+    .effective_mode;
+    ir::component_mode_includes_activation(source_mode, edge.src_activation)
+        && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
 }
 
 /// Register every `on <ev>(arg)` handler on `component` (and nested
@@ -1737,7 +1692,7 @@ fn emit_on_handler_regs(
     let comp = &prog.components[component.index()];
     if !skip_top_on_handlers {
         for oh in &comp.on_handlers {
-            if !includes_activation(mode, oh.activation) {
+            if !ir::component_mode_includes_activation(mode, oh.activation) {
                 continue;
             }
             let lambda = func::on_handler_lambda_name(comp, oh);
@@ -1759,7 +1714,14 @@ fn emit_on_handler_regs(
                 *sub,
                 &sub_path,
                 false,
-                nested_component_mode(prog, mode, f),
+                ir::resolve_component_path_mode(
+                    &prog.components,
+                    component,
+                    mode,
+                    std::slice::from_ref(&f.name),
+                )
+                .expect("verified nested component path")
+                .effective_mode,
             );
         }
     }
@@ -1830,7 +1792,14 @@ fn emit_nested_connects(
         if let ir::ComponentFieldKind::Sub { component: sub, .. } = &f.kind {
             let sub_path = format!("{inst_path}.{}", f.name);
             let sub_comp = &prog.components[sub.index()];
-            let sub_mode = nested_component_mode(prog, mode, f);
+            let sub_mode = ir::resolve_component_path_mode(
+                &prog.components,
+                component,
+                mode,
+                std::slice::from_ref(&f.name),
+            )
+            .expect("verified nested component path")
+            .effective_mode;
             for edge in &sub_comp.connects {
                 if edge_is_enabled(prog, *sub, sub_mode, edge) {
                     emit_one_connect(out, prog, &sub_path, edge);
@@ -1866,7 +1835,7 @@ fn emit_lifecycle_checkers(
     let inst_tag = inst_path.replace('.', "_");
 
     for ph in &comp.periodic_handlers {
-        if !includes_activation(mode, ph.activation) {
+        if !ir::component_mode_includes_activation(mode, ph.activation) {
             continue;
         }
         let lambda = func::periodic_handler_lambda_name(comp, ph);
@@ -1900,7 +1869,7 @@ fn emit_lifecycle_checkers(
     // primary-clock cycle and fires the body when the predicate satisfies
     // the requested edge mode. Mirrors v1's `emit_cycle_trigger`.
     for ch in &comp.cycle_handlers {
-        if !includes_activation(mode, ch.activation) {
+        if !ir::component_mode_includes_activation(mode, ch.activation) {
             continue;
         }
         let lambda = func::cycle_handler_lambda_name(comp, ch);
@@ -1974,7 +1943,7 @@ fn emit_lifecycle_checkers(
     }
 
     if let Some(w) = &comp.watchdog {
-        if !includes_activation(mode, w.activation) {
+        if !ir::component_mode_includes_activation(mode, w.activation) {
             // A passive instance has no active-only watchdog registration.
         } else {
             let lambda = func::watchdog_lambda_name(comp, w);
@@ -2044,7 +2013,14 @@ fn emit_lifecycle_checkers(
                 prog,
                 *sub,
                 &sub_path,
-                nested_component_mode(prog, mode, f),
+                ir::resolve_component_path_mode(
+                    &prog.components,
+                    component,
+                    mode,
+                    std::slice::from_ref(&f.name),
+                )
+                .expect("verified nested component path")
+                .effective_mode,
             )?;
         }
     }
@@ -2281,6 +2257,23 @@ fn emit_test(
                         receiver_path.join(".")
                     )));
                 };
+                if let Some(binding) = tb.component_fields.iter().find(|binding| {
+                    binding.field == *receiver
+                }) {
+                    let component = &prog.components[binding.component.index()];
+                    if let Some(target_method) = component.method(method) {
+                        if !ir::component_mode_includes_activation(
+                            binding.mode,
+                            target_method.activation,
+                        ) {
+                            return Err(EmitError(format!(
+                                "tbir: hook-triggered covergroup `{}` targets active-only \
+                                 method `{receiver}.{method}` through passive component binding",
+                                schema.name
+                            )));
+                        }
+                    }
+                }
                 let target = tb
                     .transactor_fields
                     .iter()

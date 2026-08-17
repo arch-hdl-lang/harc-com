@@ -2469,6 +2469,18 @@ end test RelayEnvTest
         .expect_err("passive mode on structural field is invalid");
     let msg = assert_invalid(&err);
     assert!(msg.contains("RelayEnvTb.env") && msg.contains("mode"), "{msg}");
+
+    // An otherwise-unused mode-sensitive leaf must still be rejected. This
+    // proves validation walks the composed instance tree, rather than only
+    // noticing the missing mode when a run/check body reaches the leaf.
+    let unresolved_leaf = src.replace("let env : RelayEnv active", "let env : RelayEnv").replace(
+        "        env.inherited.bump()",
+        "        assert 1 == 1",
+    );
+    let err = lower_src(&unresolved_leaf)
+        .expect_err("a nested mode-sensitive transactor leaf needs an inherited or declared mode");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("env.inherited") && msg.contains("effective"), "{msg}");
 }
 
 #[test]
@@ -2519,6 +2531,89 @@ end test SourceEnvTest
     let err = lower_src(&always_on).expect_err("always-on member cannot access active-only state");
     let msg = assert_invalid(&err);
     assert!(msg.contains("always-on") && msg.contains("active-only"), "{msg}");
+}
+
+/// `connect` belongs to env/agent/testbench composition. The component
+/// lowering route for analysis-source transactors must reject an active-only
+/// declaration instead of silently dropping it while collecting the ordinary
+/// and `when active` surfaces.
+#[test]
+fn analysis_source_transactor_active_connect_is_rejected() {
+    let src = r#"
+transactor Relay
+    observed : out event<uint<8>>
+
+    when active
+        connect
+            ignored.observed -> ignored.accept
+        end connect
+    end when
+end transactor Relay
+
+testbench RelayTb
+    dut : Top
+    relay : Relay passive
+end testbench RelayTb
+
+impl RelayTest for RelayTb
+    run
+        assert 1 == 1
+    end run
+end impl RelayTest
+"#;
+    let err = lower_src(src).expect_err("active transactor connects cannot be silently dropped");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("when active") && msg.contains("connect") && msg.contains("Relay"), "{msg}");
+}
+
+/// A hook trigger subscribes to its target method during compilation. That
+/// subscription must not make an active-only method reachable on a passive
+/// analysis-source instance.
+#[test]
+fn passive_analysis_source_active_hook_trigger_is_rejected() {
+    let src = r#"
+covergroup RelayCov @(relay.bump(v) post)
+    cp : cover v
+        bins
+            seen = [0..255]
+        end bins
+end covergroup RelayCov
+
+transactor Relay
+    when active
+        hookable bump(v: uint<8>)
+        end bump
+    end when
+end transactor Relay
+
+testbench RelayTb
+    dut : Top
+    relay : Relay passive
+    cov : RelayCov
+end testbench RelayTb
+
+impl RelayTest for RelayTb
+    run
+        assert 1 == 1
+    end run
+end impl RelayTest
+"#;
+    let err = lower_src(src).expect_err("a passive binding cannot subscribe to an active-only hook");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("relay.bump") && msg.contains("active-only") && msg.contains("passive"), "{msg}");
+
+    // Emission remains defensive when a later pass corrupts a previously
+    // valid active binding after hook subscriptions have been recorded.
+    let active_src = src.replace("relay : Relay passive", "relay : Relay active");
+    let mut malformed = lower_src(&active_src).expect("active hook binding lowers");
+    malformed.testbenches[0].component_fields[0].mode = Some(ir::ComponentInstanceMode::Passive);
+    let err = tbir::emit(
+        &malformed,
+        &merged_src(&active_src),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect_err("emission rejects malformed passive active-only hook subscription");
+    assert!(err.to_string().contains("active-only") && err.to_string().contains("relay.bump"));
 }
 
 #[test]
@@ -2971,7 +3066,7 @@ fn modeless_analysis_monitor_testbench_field_lowers() {
 fn active_mode_on_analysis_monitor_field_is_rejected() {
     let err = lower_src(&passive_monitor_src(" active"))
         .expect_err("`active` on a composite-component field is out of subset");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(
         msg.contains("`active` mode on composite-component"),
         "diagnostic should name the offending mode and construct: {msg}"
@@ -2988,8 +3083,53 @@ fn active_mode_on_analysis_monitor_field_is_rejected() {
         "    on 1 cycles\n        starts = starts + 1\n    end on\nend transactor LifecycleMonitor",
     );
     let err = lower_src(&reactive).expect_err("active periodic analysis monitor is invalid");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("active") && msg.contains("LargeTb.lifecycle"), "{msg}");
+}
+
+/// The always-on analysis-monitor rule applies at every component binding
+/// seam, not just a reusable testbench field. A structural root may carry an
+/// inherited mode for a mode-sensitive descendant, but an explicit `active`
+/// annotation on the monitor itself is meaningless and invalid.
+#[test]
+fn active_mode_on_always_on_analysis_monitor_is_rejected_at_all_binding_seams() {
+    let direct = r#"
+transactor Monitor
+    observed : out event<uint<8>>
+end transactor Monitor
+
+test MonitorTest
+    let dut : Top
+    let monitor : Monitor active
+    run
+        assert 1 == 1
+    end run
+end test MonitorTest
+"#;
+    let err = lower_src(direct).expect_err("test-scope active monitor is invalid");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("monitor") && msg.contains("active"), "{msg}");
+
+    let nested = r#"
+transactor Monitor
+    observed : out event<uint<8>>
+end transactor Monitor
+
+env Wrapper
+    monitor : Monitor active
+end env Wrapper
+
+test MonitorTest
+    let dut : Top
+    let wrapper : Wrapper
+    run
+        assert 1 == 1
+    end run
+end test MonitorTest
+"#;
+    let err = lower_src(nested).expect_err("nested active monitor is invalid");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("wrapper.monitor") && msg.contains("active"), "{msg}");
 }
 
 /// A method-bearing scoreboard lowers as a composite component

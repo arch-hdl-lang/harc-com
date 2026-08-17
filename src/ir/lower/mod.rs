@@ -2241,15 +2241,13 @@ fn validate_testbench_component(
                     }
                     if always_on_analysis_source_names.contains(simple) {
                         if matches!(mode, Some(TransactorMode::Active)) {
-                            return Err(unsupported(
-                                &format!(
-                                    "an `active` mode on composite-component \
-                                     testbench field `{}.{} : {simple}`",
-                                    c.name.name, f.name.name
-                                ),
-                                "only the passive ownership annotation is accepted for an \
-                                 always-on analysis-source component field",
-                            ));
+                            return Err(LowerError::Invalid(format!(
+                                "an `active` mode on composite-component testbench field \
+                                 `{}.{} : {simple}` is invalid: only the passive ownership \
+                                 annotation is accepted for an always-on analysis-source \
+                                 component field",
+                                c.name.name, f.name.name
+                            )));
                         }
                         continue;
                     }
@@ -4471,6 +4469,14 @@ fn lower_test(
     }
 
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
+    ir::validate_component_binding_modes(&prog.components, &component_field_bindings).map_err(
+        |err| {
+            LowerError::Invalid(format!(
+                "test `{}` has invalid component instance modes: {err}",
+                t.name.name
+            ))
+        },
+    )?;
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
         dut_field: "dut".to_string(),

@@ -667,16 +667,6 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
             match prog.components.get(binding.component.index()) {
-                Some(component) if component.requires_instance_mode() => {
-                    if binding.mode.is_none() {
-                        errs.push(VerifyError::BadProgramRef {
-                            what: format!(
-                                "tb{ti} transactor component field `{}` has no active/passive mode",
-                                binding.field
-                            ),
-                        });
-                    }
-                }
                 Some(_) => {}
                 None => errs.push(VerifyError::BadProgramRef {
                     what: format!(
@@ -685,6 +675,12 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     ),
                 }),
             }
+        }
+        if let Err(detail) = validate_component_binding_modes(&prog.components, &tb.component_fields)
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!("tb{ti} has invalid component instance modes: {detail}"),
+            });
         }
         for edge in &tb.connects {
             if let Err(detail) = verify_testbench_connect(prog, tb, edge) {

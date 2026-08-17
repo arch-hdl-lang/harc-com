@@ -136,6 +136,17 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
                         p.method, p.cov_field
                     )));
                 }
+                let target_method = &prog.components[cid.index()].methods[midx];
+                if !crate::ir::component_mode_includes_activation(
+                    binding.mode,
+                    target_method.activation,
+                ) {
+                    return Err(LowerError::Invalid(format!(
+                        "covergroup `{cg_name}` hook trigger `{field}.{}` (cov field `{}`) \
+                         targets active-only method on passive component binding `{field}`",
+                        p.method, p.cov_field
+                    )));
+                }
                 HookTarget::Component {
                     cid,
                     midx,
