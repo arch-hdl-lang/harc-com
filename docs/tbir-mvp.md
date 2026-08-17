@@ -3427,9 +3427,9 @@ case and only locally-determinable `Assign` types are compared).
     | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
     | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
     | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
+    | test-scope bare field, no method (`mod.rs`) | rejects | `Invalid` | `Invalid` (message fixed) |
     | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | …→ unhooked method path | uncompilable | `Unsupported` | `EmitsUncompilable` |
-    | …→ unhooked bool expression | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | …→ unhooked `on` / `connect` | mixed, see below | `Unsupported` | `Unsupported` (kept) |
 
     Two of these are worth reading closely.
 
@@ -3492,13 +3492,40 @@ case and only locally-determinable `Assign` types are compared).
     an input v1 names in its own refusal.
 
     A ninth site sat in a fourth file: `scoreboards.rs` answered every
-    `connect`/`on` in a scoreboard body with one `Unsupported`. Three
-    things live under it — a hooked handler (v1 drops the hook,
-    byte-identically, anchored at both trigger shapes), an unhooked
-    method path (v1 emits `(bool)(w.note)` against a `struct Watcher`
-    with no `note` member), and an unhooked bool expression (v1 emits
-    `(bool)(_tb.b.hits > 0)`, which works and keeps the suggestion). The
-    `connect` half is untouched and unprobed.
+    `connect`/`on` in a scoreboard body with one `Unsupported`. Its
+    HOOKED half is uniform and was reclassified — v1 drops the hook
+    byte-identically at both trigger shapes, anchored.
+
+    Its UNHOOKED half was split too, and the split was **reverted**,
+    which is the most useful thing in this entry. The arm is genuinely
+    mixed: `on w.note` makes v1 emit `(bool)(w.note)` against a
+    `struct Watcher` with no `note` member, while `on hits > 0` makes it
+    emit `(bool)(_tb.b.hits > 0)`, which compiles. Reading that as
+    "method path bad, expression good" and reusing
+    `is_v1_method_hook_shape` was wrong in both directions at once:
+    `on dut.en` is a two-segment path that COMPILES
+    (`harc_read(dut->en)`), and `on w.seen > 0` is an expression that
+    does NOT (no `w` in the checker lambda's scope). What separates the
+    inputs is name resolution in the emitted C++, not the syntax of the
+    trigger. The split also leaked `on (w.note)`, `on w.note cycles` and
+    `on w.note phase post_eval` — the predicate's `Paren`, periodic and
+    phase strictness are right for the hook resolver's question and
+    meaningless for this one.
+
+    **Borrowing a predicate borrows its question.** That is the same
+    mistake as the `dotted_path` one above, made one commit later, on
+    the predicate written to fix it. Classifying this arm needs the
+    scope analysis; the site now says so instead of guessing.
+
+    A tenth candidate in `transactors.rs` (a hooked `on` on a `bound to`
+    transactor) is NOT classified here. Every well-formed bound
+    transactor routes its handlers through the `components.rs` arms
+    above — verified against `axilite_bound_mon_test`, where hook and
+    control differ only in source-offset-derived symbol names
+    (`_solver_site_2233` vs `_2237`), so the hook is dropped there too.
+    The `transactors.rs` arm was only reachable in probes whose
+    instantiation v1 rejects for an unrelated reason, which measures
+    nothing. Recorded as unprobed rather than classified on that.
 
     The residual is bounded and stated: a path that is well-formed but
     does not resolve to a `hookable` still gets the suggestion, and the
@@ -3507,17 +3534,18 @@ case and only locally-determinable `Assign` types are compared).
     The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
     `components.rs` by "what a user would have to write to reach the
     site" — and then applied that grouping only inside one file. The
-    construct does not respect the file boundary: it has NINE sites
-    across four files, and six of them were invisible from inside
+    construct does not respect the file boundary: it has at least NINE
+    sites across four files, and six of them were invisible from inside
     `components.rs`. **Group by construct, then find every file that
     implements it.** Note also that this entry's own table was written
     saying "four positions" and had to be corrected twice as further
     positions appeared, a third time when the phase modifier turned up
     two more, and a fourth when `scoreboards.rs` turned up — a count of
     sites is a claim like any other, and it needs a search, not a
-    recollection. Five review rounds on one construct, each finding real
-    leaks the previous round's probe had not sampled, is the honest cost
-    of a WIDE surface: the input space, not the arm, is the unit of work.
+    recollection. It now says "at least nine". Six review rounds on one
+    construct, each finding real leaks the previous round's probe had
+    not sampled, is the honest cost of a WIDE surface: the input space,
+    not the arm, is the unit of work.
 
     The predicate itself took three attempts, and the failure mode was
     the same each time — reaching for an existing helper instead of
@@ -3526,11 +3554,21 @@ case and only locally-determinable `Assign` types are compared).
     both; guarding only the top-level node moved the leak one segment
     inward (`on (s).send pre`). `is_v1_method_hook_shape` now does its
     own walk with no `Paren` arm, matching v1's own pattern match. It
-    also carries no `!h.periodic` clause: a period makes the trigger an
-    integer, which the walk already rejects, and adding the clause made
-    `on s.send cycles pre` disagree with v1 AND with the sibling arm
-    that shares the predicate. **A conjunct that is redundant on the
-    inputs you sampled is not free — it is an untested claim.**
+    also carries no `!h.periodic` clause: `on s.send cycles pre` is a
+    path with a period, v1's hook branch ignores `h.periodic` and wires
+    it, and the clause made the statement position disagree with v1 AND
+    with the sibling arm that shares the predicate. **A conjunct that is
+    redundant on the inputs you sampled is not free — it is an untested
+    claim.**
+
+    A fourth leak closed the same way: the impl-for desugarer rewrites a
+    bare testbench field to `_tb.<field>`, so a plain length test counts
+    the synthetic root as a real segment and read `on s pre` — one
+    identifier, no method — as `<obj>.<method>`. The walk now mirrors
+    `resolve_method_hook_target`'s two accepted forms exactly
+    (`<field>.<method>`, `_tb.<field>.<method>`). The same synthetic root
+    was leaking into a user-facing message, quoting back a `_tb` nobody
+    typed; that shape now gets its own sentence.
 
 ### The probe method
 

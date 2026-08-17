@@ -16119,6 +16119,10 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         "(s.send)",
         "(s).send",
         "(e.inner).note",
+        // A bare identifier that IS a testbench field. The impl-for
+        // desugarer rewrites it to `_tb.s`, so a plain length test
+        // counts the synthetic root and reads it as `<obj>.<method>`.
+        "s",
     ] {
         let src = hook_positions("", "", &pre_hook_on(trigger, "        "));
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
@@ -16129,7 +16133,10 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         );
         // The anchor: the SAME trigger without a hook side is fine, so
         // the rejection is about the hook and not about the trigger.
-        if !trigger.contains('(') {
+        // Only these two have a hook-free form that lowers; the rest
+        // fail for their own reasons, so an anchor there would measure
+        // nothing.
+        if matches!(trigger, "dut.en > 0" | "5 cycles") {
             let ctl = hook_positions(
                 "",
                 "",
@@ -16201,6 +16208,11 @@ fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
         "(s.send)",
         "(s).send",
         "(e.inner).note",
+        // No `"s"` here: at test scope the desugarer rewrites it to
+        // `_tb.s`, which `resolve_method_hook_target` ACCEPTS as
+        // `<field>.<method>`, so it lands in the target-lookup arm and
+        // is answered `Invalid` — correctly, since v1 refuses it too.
+        // Only the statement position reaches this split with it.
     ] {
         let src = hook_positions("", &pre_hook_on(trigger, "    "), "");
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
@@ -16236,6 +16248,23 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
     // The transactor case is the control: it is not a gap at all.
     lower_src(&hook("s.send")).expect("a transactor field lowers");
 
+    // A bare field with no method: the desugarer rewrites it to
+    // `_tb.s`, so the resolver accepts the SHAPE and the lookup then
+    // fails on the synthetic root. v1 refuses it, so `Invalid` is
+    // right — but the message must not quote back a `_tb` the user
+    // never typed.
+    let bare = hook_positions("", &pre_hook_on("s", "    "), "");
+    assert!(
+        cpp_tb::emit(&merged_src(&bare)).is_err(),
+        "v1 must refuse a hook with no method"
+    );
+    let msg = assert_invalid(&lower_src(&bare).unwrap_err());
+    assert!(
+        !msg.contains("_tb"),
+        "must not name the desugarer's root: {msg}"
+    );
+    assert!(msg.contains("names a method to wrap"), "{msg}");
+
     // v1 refuses these itself, so they really are program errors.
     for target in ["w.plain", "nosuch.send", "dut.send", "s.nosuch"] {
         let src = hook(target);
@@ -16250,11 +16279,19 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
     }
 }
 
-/// The ninth site, in `scoreboards.rs`, which answered every
-/// `connect`/`on` in a scoreboard body with one `Unsupported`. Three
-/// things live under it and v1 does three different things.
+/// The ninth site, in `scoreboards.rs`, which answers every
+/// `connect`/`on` in a scoreboard body with one `Unsupported`. The
+/// HOOKED half of it is uniform and reclassified: v1 drops the hook,
+/// byte-identically to the same handler without one, at both trigger
+/// shapes.
+///
+/// The unhooked half is deliberately left whole. It is mixed, but what
+/// separates its inputs is name resolution in the emitted C++, not
+/// syntax — `on dut.en` compiles and `on w.seen > 0` does not, despite
+/// being a path and an expression respectively. A syntactic split was
+/// written and reverted; see the comment at the site.
 #[test]
-fn a_scoreboard_on_handler_splits_three_ways() {
+fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
     let scoreboard = |body: &str| {
         HOOK_POSITIONS_SRC
             .replace("HOOK\n", "")
@@ -16277,8 +16314,6 @@ fn a_scoreboard_on_handler_splits_three_ways() {
     // handler at all differs from each control.
     let v1_none = cpp_tb::emit(&merged_src(&scoreboard(""))).expect("v1 emits");
 
-    // (a) A hook side — v1 drops it, byte-identically to the same
-    //     handler without one, at BOTH trigger shapes.
     for trigger in ["hits > 0", "w.note"] {
         let ctl = scoreboard(&handler(trigger, ""));
         let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
@@ -16286,6 +16321,10 @@ fn a_scoreboard_on_handler_splits_three_ways() {
             v1_ctl, v1_none,
             "`on {trigger}` must contribute, or the identity below is vacuous"
         );
+        // The control itself is still a subset gap, which is what makes
+        // the hook the only thing under test here.
+        assert_unsupported(&lower_src(&ctl).unwrap_err());
+
         let hooked = scoreboard(&handler(trigger, " pre"));
         let msg = assert_not_implemented(
             &lower_src(&hooked).unwrap_err(),
@@ -16298,41 +16337,6 @@ fn a_scoreboard_on_handler_splits_three_ways() {
             "v1 drops the hook on `on {trigger} pre`"
         );
     }
-
-    // (b) An unhooked METHOD PATH — v1 edge-detects on it and emits a
-    //     member access `struct Watcher` does not have.
-    let path = scoreboard(&handler("w.note", ""));
-    let msg = assert_not_implemented(
-        &lower_src(&path).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("`on <obj>.<method>` handler"), "{msg}");
-    let v1_path = cpp_tb::emit(&merged_src(&path)).expect("v1 emits");
-    assert!(
-        v1_path.contains("(bool)(w.note)"),
-        "v1 edge-detects the path"
-    );
-    let watcher = v1_path
-        .split_once("struct Watcher {")
-        .and_then(|(_, rest)| rest.split_once("};"))
-        .map(|(body, _)| body.to_string())
-        .expect("v1 emits a `Watcher` struct");
-    assert!(
-        !watcher.contains("note"),
-        "no `note` member, so `(bool)(w.note)` cannot compile: {watcher}"
-    );
-
-    // (c) An unhooked BOOL EXPRESSION — v1 emits a cycle trigger that
-    //     compiles, so this one keeps the `--codegen v1` suggestion.
-    let expr = scoreboard(&handler("hits > 0", ""));
-    let msg = assert_unsupported(&lower_src(&expr).unwrap_err());
-    assert!(msg.contains("event wiring"), "{msg}");
-    assert!(
-        cpp_tb::emit(&merged_src(&expr))
-            .expect("v1 emits")
-            .contains("(bool)(_tb.b.hits > 0)"),
-        "v1 lowers a bool-expression trigger against real members"
-    );
 }
 
 /// A period does not change what v1 does with a hooked method path: its

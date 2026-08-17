@@ -4004,11 +4004,23 @@ fn lower_test(
                      field in this subset",
                 )
             } else {
-                LowerError::Invalid(format!(
-                    "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench \
-                     field, and no component field of that name declares a `hookable` \
-                     named `{method}`"
-                ))
+                // `xfield` can be the desugarer's synthetic `_tb` root
+                // when the user wrote a bare `on <field> pre` with no
+                // method — quoting it back would name something they
+                // never typed, so that shape gets its own sentence.
+                if xfield == "_tb" {
+                    LowerError::Invalid(format!(
+                        "`on {method}` hook: a `pre`/`post` hook names a method to wrap \
+                         (`on <field>.<method> pre`), and `{method}` is a field, not a \
+                         `<field>.<method>` path"
+                    ))
+                } else {
+                    LowerError::Invalid(format!(
+                        "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench \
+                         field, and no component field of that name declares a `hookable` \
+                         named `{method}`"
+                    ))
+                }
             }
         })?;
         let xschema = prog.transactor(xid);
@@ -4718,14 +4730,31 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// arm, which lowers it).
 pub(crate) fn is_v1_method_hook_shape(h: &crate::ast::OnHandler) -> bool {
     /// `<ident>(.<ident>)*` with no parens, indexing or calls anywhere.
-    fn strict_path_len(e: &crate::ast::Expr) -> Option<usize> {
+    fn strict_path(e: &crate::ast::Expr) -> Option<Vec<&str>> {
         match &*e.kind {
-            ExprKind::Ident(_) => Some(1),
-            ExprKind::Field { target, .. } => Some(strict_path_len(target)? + 1),
+            ExprKind::Ident(id) => Some(vec![id.name.as_str()]),
+            ExprKind::Field { target, name } => {
+                let mut p = strict_path(target)?;
+                p.push(name.name.as_str());
+                Some(p)
+            }
             _ => None,
         }
     }
-    h.phase != OnPhase::PostEval && strict_path_len(&h.event).is_some_and(|n| n >= 2)
+    if h.phase == OnPhase::PostEval {
+        return false;
+    }
+    let Some(p) = strict_path(&h.event) else {
+        return false;
+    };
+    // The impl-for desugarer rewrites a bare testbench field to
+    // `_tb.<field>`, so a length test alone counts the synthetic root as
+    // a real segment and lets `on w pre` — one identifier, no method —
+    // through as if it were `<obj>.<method>`. v1 refuses that. Mirror
+    // `resolve_method_hook_target`'s two accepted forms exactly:
+    // `<field>.<method>` and `_tb.<field>.<method>`.
+    let min = if p.first() == Some(&"_tb") { 3 } else { 2 };
+    p.len() >= min
 }
 
 /// Resolve an `on <obj>.<method> pre/post` hook target expression to
