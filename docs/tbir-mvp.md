@@ -4582,6 +4582,53 @@ case and only locally-determinable `Assign` types are compared).
     wording the adjacent single-argument arm had already been given for
     exactly this reason.
 
+69. **Shape is not resolution (2026-08-17).**
+
+    The statement-position hooked-`on` arm asked
+    `is_v1_method_hook_shape`, which accepts any dotted path of the
+    right length. So `drv.send.x`, `nosuch.send`, `drv.plain` and
+    `dut.rst.x` all reached an `Unsupported` — and therefore a
+    "re-run with `--codegen v1`" suggestion.
+
+    Measured, one program per shape against the `axilite_hooks_test`
+    fixture:
+
+    | trigger | v1 | suggestion honest? |
+    |---|---|---|
+    | `drv.send` | **emits** | yes |
+    | `drv.send.x` | refuses | no |
+    | `nosuch.send` | refuses | no |
+    | `drv.plain` | refuses | no |
+    | `dut.rst.x` | refuses | no |
+
+    v1's message for all four is "obj.method must resolve to a
+    `hookable` on a known component type". So the suggestion was honest
+    for exactly ONE of the five, and the other four sent the user to a
+    second error.
+
+    A previous batch recorded this deliberately: the arm's comment said
+    such paths "keep the suggestion, and the user lands on v1's own
+    precise message rather than on silence". That is a defensible thing
+    to want and the wrong verdict to encode — `Unsupported` promises v1
+    is a way to run the program, and here it is not. The four now get
+    `Rejects`, whose rendering ends "`--codegen v1` does not implement
+    it either".
+
+    The gate is v1's own condition and the same one the test-scope arm
+    in `mod.rs` already applied: does `<obj>.<method>` name a `hookable`
+    on a transactor or component testbench field? Checked in the
+    recoverable direction — a miss yields the honest `Rejects`, a hit
+    only ever upgrades to the suggestion.
+
+    One implementation note, because it cost a wrong first attempt:
+    `strip_tb_prefix` does not strip the desugarer's `_tb` root here.
+    It only strips ahead of a COMPONENT field, and a hook target is
+    usually a TRANSACTOR field, so `_tb.drv.send` stayed three segments
+    long and every path failed the two-segment test — including the one
+    that should have passed. The strip is done locally instead;
+    widening the shared helper would change what its other callers
+    resolve.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
