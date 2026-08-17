@@ -3648,14 +3648,35 @@ case and only locally-determinable `Assign` types are compared).
     exactly the right code — so claiming a silent mis-lowering there was
     the same false explanation one layer down.
 
-    Three named-argument sites remain UNFIXED and are recorded rather
-    than guessed at: relation calls in `randomize ... with`
-    (`typed_lower.rs`), and `log`/`logf`, which discards the name and can
-    silently swallow the message entirely. Six further arms still answer
-    `Unsupported` for calls v1 swaps — helper, extern-fn, testbench-method,
-    two transactor-method sites and the covergroup helper target. They are
-    the same misdirection this batch has been closing; they are just not
-    closed yet.
+    Sites that remain UNFIXED, recorded rather than guessed at. The
+    first is the most serious thing left in this construct:
+
+    * **`log`/`logf` downgrade the SEVERITY.** `log(level = fatal,
+      "BOOM")` emits `sim_log_line("INFO", "BOOM")` under BOTH backends —
+      measured. Not "swallows the message": the message survives and the
+      severity does not, so there is no `ctx.errors++` and no `_fatal`,
+      and a test that should abort passes green. This is a live silent
+      mis-lowering in the DEFAULT backend and should be first in the next
+      batch.
+    * Relation calls in `randomize ... with` (`typed_lower.rs`) drop the
+      name and bind by position.
+    * `record_read` and the other one-argument regblock builtins accept
+      an unknown name silently, which is now inconsistent with the
+      guarded one-argument `fork` site that refuses it.
+    * Six arms still answer `Unsupported` for calls v1 swaps — helper,
+      extern-fn, testbench-method, two transactor-method sites and the
+      covergroup helper target.
+
+    One classification is also left open rather than settled. The guard
+    reports an unknown parameter name as `Invalid`, and a review pass
+    showed that is not quite right in either direction: for a typo in a
+    VALID position v1 emits byte-identical correct code, so `Invalid`
+    over-claims and `--codegen v1` does in fact work; while
+    `record_write(nosuch = 0x18, addr = 305419896)` really is swapped by
+    v1, and returning on the first bad argument hides it. Settling it
+    means scanning every argument and reporting the worst rather than the
+    first, which is a change with its own input space and belongs to its
+    own batch.
 
     No CODEGEN site in v1 reads an argument name:
     of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are

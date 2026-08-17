@@ -4767,11 +4767,17 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// this guard keyed on arity alone, and so refused
 /// `bus.w.send(data = t.value, strb = 15)` — names in declaration order,
 /// which both backends lower correctly — with a message asserting v1
-/// "silently emits something else". Unlike `lower_component_call_args`,
-/// which sees only `&[CallArg]`, every caller here has the declaration
-/// in hand, so there is no reason to answer a question this precise with
-/// a count. **Refusing a correct program with a false explanation is not
-/// the safe side of a classification.**
+/// "silently emits something else". **Refusing a correct program with a
+/// false explanation is not the safe side of a classification.**
+///
+/// The three bus callers read `declared` from the channel payload or
+/// `m.args`. `record_write` is a BUILTIN with no declaration node, and
+/// its list was consequently written from memory as `["reg", "value"]`
+/// when the real signature is `(addr, data)` — refusing the documented
+/// named form, and unmatchable at position 1 besides, since `reg` is a
+/// lexer keyword. A caller without a declaration to read has to check
+/// its list against the diagnostic and the docs; do not assume every
+/// caller here has one.
 pub(crate) fn reject_misplaced_named_args(
     args: &[crate::ast::CallArg],
     declared: &[String],

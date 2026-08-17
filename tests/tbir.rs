@@ -17304,11 +17304,12 @@ fn tbir_binds_named_arguments_by_name_or_refuses_to_bind_them() {
         "the message must list the real parameter names: {msg}"
     );
 
-    // (A single argument cannot be misplaced at all, so the guard is a
-    // no-op there. It cannot be exercised on this channel — an arity
-    // check above rejects a one-argument `bus.w.send` outright — and the
-    // one-argument surface is pinned instead by
-    // `named_arguments_are_bound_by_position_by_v1`.)
+    // (A single argument cannot be MISPLACED, so the swap half of the
+    // guard is a no-op there — but its unknown-name half still fires,
+    // which `every_named_argument_call_site_is_guarded` exercises on
+    // `fork mem.read(nosuch = 5)`. The one-argument swap surface cannot
+    // be reached on this channel at all: an arity check above rejects a
+    // one-argument `bus.w.send` outright.)
 }
 
 /// Per-site pins for the other three `reject_misplaced_named_args`
