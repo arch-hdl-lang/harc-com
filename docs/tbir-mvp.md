@@ -3620,10 +3620,33 @@ case and only locally-determinable `Assign` types are compared).
     program in front of it. **Refusing a correct program with a false
     explanation is not the safe side of a classification**, and the
     excuse for the shortcut did not even apply: unlike
-    `lower_component_call_args`, which sees only `&[CallArg]`, every one
-    of these callers has the declaration in hand. The guard now compares
-    each name against the parameter at its position and says which
-    parameter was written where.
+    `lower_component_call_args`, which sees only `&[CallArg]`, the three
+    bus callers have the declaration in hand — from the channel payload
+    or `m.args`. The guard now compares each name against the parameter
+    at its position and says which parameter was written where.
+
+    `record_write` is the exception that proves the rule: it is a builtin
+    with no declaration node, so its list was written from memory as
+    `["reg", "value"]`. The real signature is `(addr, data)` — the
+    compiler's own `Invalid` message three lines above the guard says so,
+    and so do the docs and every fixture. The consequence was the very
+    thing the rewrite was for: `record_write(addr = .., data = ..)`, the
+    documented form, refused as a silent mis-lowering. Worse, `reg` is a
+    lexer keyword and does not parse as an argument name at all, so
+    position 1 could never match and the site degenerated into "refuse
+    every named first argument" — the arity behaviour, reintroduced by
+    accident behind a check that looked precise.
+
+    Three of the four guard CALL SITES could be deleted with the suite
+    still green, which is how that shipped. **A test that pins a
+    predicate does not pin the places it is called from.** Each site now
+    has its own assertion, and each was verified by deleting the call.
+
+    An unknown parameter name is now `Invalid` rather than
+    `SilentlyMisLowers`: no backend can honour a name that matches no
+    parameter, and for a typo sitting in a valid position v1 emits
+    exactly the right code — so claiming a silent mis-lowering there was
+    the same false explanation one layer down.
 
     Three named-argument sites remain UNFIXED and are recorded rather
     than guessed at: relation calls in `randomize ... with`

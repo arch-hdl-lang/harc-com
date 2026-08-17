@@ -17282,14 +17282,6 @@ fn tbir_binds_named_arguments_by_name_or_refuses_to_bind_them() {
         "the message must name the misplacement: {msg}"
     );
 
-    // A name matching NO parameter is refused too — v1 accepts it
-    // silently, which is the quieter half of the same hazard.
-    let err = emit_tbir(&call("nosuch = t.value, strb = 15"))
-        .err()
-        .expect("an unknown parameter name must not lower silently");
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("names no parameter of this call"), "{msg}");
-
     // Mixed positional/named is checked by position too: `strb` sits in
     // position 2, where it belongs, so this lowers.
     let mixed = emit_tbir(&call("t.value, strb = 15")).expect("a correctly-placed name lowers");
@@ -17298,9 +17290,112 @@ fn tbir_binds_named_arguments_by_name_or_refuses_to_bind_them() {
         "and binds where the name says"
     );
 
+    // A name matching NO parameter is `Invalid`, not a subset gap: no
+    // backend can honour it, and for a typo in a valid position v1 emits
+    // exactly the right code, so claiming it mis-lowers would be the
+    // same false explanation this guard was rewritten to stop making.
+    let msg = assert_invalid(
+        &emit_tbir(&call("nosuch = t.value, strb = 15"))
+            .err()
+            .expect("an unknown parameter name must not lower silently"),
+    );
+    assert!(
+        msg.contains("names no parameter") && msg.contains("`data`"),
+        "the message must list the real parameter names: {msg}"
+    );
+
     // (A single argument cannot be misplaced at all, so the guard is a
     // no-op there. It cannot be exercised on this channel — an arity
     // check above rejects a one-argument `bus.w.send` outright — and the
     // one-argument surface is pinned instead by
     // `named_arguments_are_bound_by_position_by_v1`.)
+}
+
+/// Per-site pins for the other three `reject_misplaced_named_args`
+/// callers. The guard's comparison logic was already pinned by
+/// `tbir_binds_named_arguments_by_name_or_refuses_to_bind_them`, but its
+/// CALL SITES were not: three of four could be deleted with the suite
+/// still green, which is how `record_write` shipped with an invented
+/// parameter list (`["reg","value"]` for a builtin whose real signature
+/// is `(addr, data)` — and since `reg` is a lexer keyword, position 1
+/// could never match, so the site degenerated into "refuse every named
+/// first argument", including the documented form).
+#[test]
+fn every_named_argument_call_site_is_guarded() {
+    // ── `record_write(addr, data)`: the documented named form must
+    //    lower, and only a genuine swap may be refused.
+    let regs = fixture("regblock_record_api_test.harc");
+    const WRITE: &str = "regs.record_write(0x18, 305419896)";
+    assert!(regs.contains(WRITE), "fixture shape changed");
+    // This fixture `use`s a stdlib bus, which the unit-test harness does
+    // not resolve on its own.
+    let lower_with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
+        )
+        .expect("stdlib bus readable");
+        let b = parse_source(&bus_src).expect("bus parses");
+        lower::lower_program(&merge::merge_for_sim(vec![f, b], None).expect("merge"))
+    };
+    let w = |args: &str| regs.replacen(WRITE, &format!("regs.record_write({args})"), 1);
+
+    lower_with_bus(&regs).expect("the fixture itself lowers");
+    lower_with_bus(&w("addr = 0x18, data = 305419896"))
+        .expect("the documented named form must lower");
+    let msg = assert_not_implemented(
+        &lower_with_bus(&w("data = 305419896, addr = 0x18")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`record_write(...)` call"), "{msg}");
+    assert!(
+        msg.contains("`data` is parameter 2 here but was written in position 1"),
+        "the message must use the REAL parameter names: {msg}"
+    );
+    // And an invented name is reported against the real list. Note the
+    // invented list could never have matched position 1 at all: `reg` is
+    // a lexer keyword and does not even parse as an argument name, so the
+    // site silently degenerated into "refuse every named first
+    // argument" — including the documented form asserted above.
+    assert!(
+        parse_source(&w("reg = 0x18, value = 3")).is_err(),
+        "`reg` is a keyword, so the invented list was unmatchable"
+    );
+    let msg = assert_invalid(&lower_with_bus(&w("nosuch = 0x18, data = 3")).unwrap_err());
+    assert!(
+        msg.contains("`addr`") && msg.contains("`data`"),
+        "the diagnostic must quote the real signature: {msg}"
+    );
+
+    // ── The BLOCKING `tlm_method` site, whose declared names come from
+    //    `m.args` rather than a channel payload.
+    let mem = fixture("msg_suspending_call_test.harc");
+    const POKE: &str = "mem.poke(8, 264)";
+    assert!(mem.contains(POKE), "poke fixture shape changed");
+    let p = |args: &str| mem.replacen(POKE, &format!("mem.poke({args})"), 1);
+
+    lower_src(&mem).expect("the poke fixture lowers");
+    lower_src(&p("addr = 8, data = 264")).expect("the in-order named form must lower");
+    let msg = assert_not_implemented(
+        &lower_src(&p("data = 264, addr = 8")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`bus.poke(...)` call"), "{msg}");
+    assert!(
+        msg.contains("`data` is parameter 2 here but was written in position 1"),
+        "the message must use the declared names: {msg}"
+    );
+
+    // The FORKED `tlm_method` site shares `m.args` but is a separate
+    // call, so it gets its own pin. `fork` needs a returning method.
+    let forked = fixture("tlm_method_blocking_fork_bus_test.harc");
+    const FORK: &str = "fork mem.read(5)";
+    assert!(forked.contains(FORK), "fork fixture shape changed");
+    lower_src(&forked).expect("the fork fixture lowers");
+    // One argument cannot be misplaced, so name it wrongly to reach the
+    // guard at all.
+    let msg = assert_invalid(
+        &lower_src(&forked.replacen(FORK, "fork mem.read(nosuch = 5)", 1)).unwrap_err(),
+    );
+    assert!(msg.contains("names no parameter"), "{msg}");
 }

@@ -4786,7 +4786,26 @@ pub(crate) fn reject_misplaced_named_args(
         if declared.get(i).is_some_and(|d| *d == name.name) {
             continue;
         }
-        let detail = if declared.contains(&name.name) {
+        // A name that matches NO parameter is a program error, not a
+        // subset gap: there is no backend that could honour it, and the
+        // value simply lands wherever it was written. Calling it
+        // `SilentlyMisLowers` would claim v1 emits something else, and
+        // for a typo sitting in a valid position v1 emits exactly the
+        // right code — the same false-explanation class this guard was
+        // rewritten to stop producing.
+        if !declared.contains(&name.name) {
+            return Err(LowerError::Invalid(format!(
+                "`{}` names no parameter of {construct} (expected {})",
+                name.name,
+                declared
+                    .iter()
+                    .map(|d| format!("`{d}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        return Err(not_implemented(
+            &format!("a misplaced named argument in {construct}"),
             format!(
                 "`{}` is parameter {} here but was written in position {}; argument names \
                  are dropped and the values bound strictly by position, so this silently \
@@ -4794,18 +4813,7 @@ pub(crate) fn reject_misplaced_named_args(
                 name.name,
                 declared.iter().position(|d| *d == name.name).unwrap() + 1,
                 i + 1,
-            )
-        } else {
-            format!(
-                "`{}` names no parameter of this call; argument names are dropped and the \
-                 values bound strictly by position, so it is accepted and misplaced \
-                 silently",
-                name.name,
-            )
-        };
-        return Err(not_implemented(
-            &format!("a misplaced named argument in {construct}"),
-            &detail,
+            ),
             V1Status::SilentlyMisLowers,
         ));
     }
