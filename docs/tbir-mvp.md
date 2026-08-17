@@ -2608,6 +2608,76 @@ case and only locally-determinable `Assign` types are compared).
     and the right move was to close the gap. Every instance still needs
     its own probe; what the lead buys is knowing where to point one.
 
+43. **Fourteenth probe sweep: `bus.rs` reaches zero `Unsupported`
+    sites (2026-08-17).**
+
+    The six arms left in `src/ir/lower/bus.rs` all classified, none of
+    them a v1 escape hatch:
+
+    | shape | v1 |
+    |---|---|
+    | direct (non-`fork`) call on an `out_of_order` tlm_method | rejects — "supports only `blocking` tlm_method calls" |
+    | `fork <not-a-call>` | rejects |
+    | `fork <bare-ident>(args)` | rejects |
+    | `fork <a>.<b>.<m>(args)` | rejects — "requires `bus.method(args)`" |
+    | bus channel method outside `send` / `recv` | **splits** — see below |
+    | `= bind <non-dut>` | **emits uncompilable C++** |
+
+    Four of the six are `fork` shape guards that v1's
+    `try_emit_bus_tlm_fork` carries one-for-one, in the same order and at
+    the same granularity — unsurprising once seen, since the TB-IR arms
+    were written against that function. That correspondence is the useful
+    positive result: where one backend's guard was transcribed from the
+    other's, the classification is `Rejects` and the arms can be swept
+    together rather than one at a time.
+
+    The two that break the pattern are the two that had no v1
+    counterpart to transcribe, and both needed a SECOND probe to get
+    right:
+
+    * **Channel methods split on the method NAME.** `strm.s.poke()` is
+      not a signal on `s`, so v1 resolves it against the channel's
+      signal list and refuses, with a better message than ours. But
+      `strm.s.data()` IS a signal, and v1 emits it as a signal read with
+      the call parens left on: `harc_rt::harc_read(dut->strm_s_data)()`.
+      `harc_read` returns a value, so that is "expression cannot be used
+      as a function". One probe (`.poke`) said `Rejects`; the arm is
+      `EmitsUncompilable`, because the status of an arm is the WORST
+      thing v1 does anywhere under it, not the first thing it does.
+
+    * **Bind targets fail two different ways.** v1 never resolves a bus
+      bind target — it substitutes the bind EXPRESSION where the DUT
+      pointer goes and dereferences it. `= bind nope` emits
+      `nope->mem_read_addr` and 71 more lines against a symbol it never
+      declares; `= bind dut.core` emits
+      `harc_rt::harc_read(dut->core)->mem_read_addr`, a real DUT member
+      read with `operator->` applied to the value it returns. The
+      classification survived the second probe, but the DIAGNOSTIC did
+      not: written from the bare-ident case alone, it told users v1
+      "names a symbol that does not exist", which is false for every
+      field path.
+
+    Both are the same lesson at the level of a single arm that "every
+    landing" is at the level of a construct: one arm can cover more than
+    one v1 behaviour, so the probe has to sample the arm's INPUT space,
+    not just reach it once.
+
+    Two mode arms also turned out to be **unreachable**: the shared
+    parser (`parse_tlm_method_decl`) admits only `blocking` and
+    `out_of_order`, and `try_lower_tlm_fork` handles both. The arm is
+    kept as a defensive `Rejects` because v1's fork path carries the
+    identical unreachable arm and errors in it — so a third mode added
+    to the shared parser would be rejected by both backends, and the
+    classification stays true without anyone re-probing it.
+
+    A probing note: the channel-method site needed a `.send` / `.recv`
+    call in a fixture whose bus is declared LOCALLY (the registered
+    `axilite_bus_send_test` resolves its bus through `use BusAxiLite`,
+    which the unit-test harness does not do). `stream_burst_mon_test`
+    fits, and adding a `recv()` to it is itself a control — both
+    backends emit — which pins the `.poke` rejection on the method name
+    rather than on the call site being new.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

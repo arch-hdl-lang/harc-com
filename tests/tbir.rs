@@ -5621,9 +5621,11 @@ end impl MixTest
 }
 
 /// A direct (non-fork) call of an `out_of_order` method is rejected by
-/// mode, naming the mode and the call site.
+/// mode, naming the mode and the call site — and NOT by pointing at v1,
+/// which rejects the same shape (see
+/// `the_remaining_bus_shapes_are_not_v1_escape_hatches`).
 #[test]
-fn bus_ooo_direct_call_is_unsupported() {
+fn bus_ooo_direct_call_is_rejected_by_mode() {
     let src = r#"
 bus OooBus
     tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
@@ -5641,7 +5643,7 @@ impl OooTest for OooTb
 end impl OooTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
     assert!(
         msg.contains("`out_of_order` tlm_method calls") && msg.contains("mem.read_ooo"),
         "{msg}"
@@ -14160,4 +14162,156 @@ fn a_const_record_field_default_folds() {
     // rather than the default being dropped.
     let k3 = emit_cpp_src(&with("a : uint<8>  default K", "const K = 3\n\n"));
     assert_ne!(k9, k3, "a different const must change the emitted default");
+}
+
+/// `bus.rs`'s remaining out-of-subset arms, every one of them probed by
+/// mutating a REGISTERED fixture (`tlm_method_bus_test`,
+/// `stream_burst_mon_test`) one token at a time. Five of the six turn
+/// out to be shapes v1 rejects too — its `try_emit_bus_tlm_fork` and
+/// `emit_bus_call` carry the same guards, in the same order, with the
+/// same granularity — so none of them is a v1 escape hatch. The sixth
+/// (`= bind <non-dut>`) is the opposite: v1 accepts it and emits
+/// uncompilable C++.
+///
+/// With these, `src/ir/lower/bus.rs` has no `LowerError::Unsupported`
+/// site left.
+#[test]
+fn the_remaining_bus_shapes_are_not_v1_escape_hatches() {
+    let tlm = fixture("tlm_method_bus_test.harc");
+    const FORKED: &str = "let forked0 = fork mem.read_ooo(9)";
+
+    // Control: the unmutated fixture lowers under both backends, so the
+    // mutations below reach the bus arms rather than an earlier gate.
+    emit_cpp_src(&tlm);
+    cpp_tb::emit(&merged_src(&tlm)).expect("v1 emits the control");
+
+    // A DIRECT (non-`fork`) call on an `out_of_order` method. The parser
+    // admits only `blocking` and `out_of_order`, so this is the sole way
+    // to reach `lower_tlm_method_call`'s mode guard.
+    //
+    // The three `fork` RHS shape guards follow: not a call, a call whose
+    // callee is a bare ident, and a field chain that is not rooted at a
+    // bus binding.
+    for (mutation, needle) in [
+        (
+            "let forked0 = mem.read_ooo(9)",
+            "`out_of_order` tlm_method calls",
+        ),
+        ("let forked0 = fork 9", "not a direct bus tlm_method call"),
+        (
+            "let forked0 = fork read_ooo(9)",
+            "not `<bus>.<method>(args)`",
+        ),
+        (
+            "let forked0 = fork mem.inner.read_ooo(9)",
+            "not rooted at a bus binding",
+        ),
+    ] {
+        let src = tlm.replace(FORKED, mutation);
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+        assert!(msg.contains(needle), "`{mutation}`: {msg}");
+        // The anchor that makes `Rejects` a claim and not an assumption:
+        // v1 refuses the same source.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must reject `{mutation}` too, or this is a real gap"
+        );
+    }
+
+    // A channel method outside `send` / `recv`. `stream_burst_mon_test`
+    // declares its bus locally, so no `use` resolution is needed; adding
+    // a `recv()` to it is itself a control (both backends emit), which
+    // pins the rejections below on the METHOD NAME rather than on the
+    // call site being new.
+    //
+    // This arm is `EmitsUncompilable` rather than `Rejects`, and the two
+    // probes below are why: v1's behaviour splits on whether the name
+    // happens to be a channel SIGNAL, and only the worse half sets the
+    // status.
+    let stream = fixture("stream_burst_mon_test.harc");
+    const WAIT: &str = "        wait 12 cycles";
+    let with_call =
+        |m: &str| stream.replace(WAIT, &format!("        let d = strm.s.{m}()\n{WAIT}"));
+
+    emit_cpp_src(&with_call("recv"));
+    cpp_tb::emit(&merged_src(&with_call("recv"))).expect("v1 emits a channel recv");
+
+    for m in ["poke", "data"] {
+        let src = with_call(m);
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains(&format!("bus channel method `.{m}(...)`")),
+            "{msg}"
+        );
+    }
+
+    // `.poke` is not a signal on `s`, so v1 resolves it against the
+    // channel's signal list and refuses — with a better message than
+    // ours.
+    assert!(
+        cpp_tb::emit(&merged_src(&with_call("poke"))).is_err(),
+        "v1 rejects a method name that is not a channel signal"
+    );
+    // `.data` IS a signal, so v1 emits — and emits a signal READ with
+    // the call parens still attached. `harc_read` returns a value, so
+    // `harc_read(...)()` is "expression cannot be used as a function".
+    // That half is what makes the arm EmitsUncompilable.
+    let data = cpp_tb::emit(&merged_src(&with_call("data")))
+        .expect("v1 accepts a channel method that names a signal");
+    assert!(
+        data.contains("harc_rt::harc_read(dut->strm_s_data)()"),
+        "v1 leaves the call parens on a signal read:\n{data}"
+    );
+}
+
+/// `let <b> : <Bus> = bind <x>` where `x` is not `dut`. Unlike every
+/// other arm in `bus.rs`, this one is a shape v1 ACCEPTS — and then
+/// emits C++ that cannot compile. v1 does not resolve the bind target
+/// at all: it substitutes the bind EXPRESSION where the DUT pointer
+/// goes and dereferences it, which fails two different ways depending
+/// on the shape, so both are probed.
+#[test]
+fn a_bus_bound_to_a_non_dut_target_does_not_point_at_v1() {
+    let fixture = fixture("tlm_method_blocking_bus_test.harc");
+    const BIND: &str = "= bind dut";
+    assert!(fixture.contains(BIND), "fixture shape changed");
+
+    // Control: the registered fixture lowers under both backends.
+    emit_cpp_src(&fixture);
+    let good = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    assert!(
+        good.contains("dut->mem_read_addr"),
+        "the control proves the access is real, not dropped:\n{good}"
+    );
+
+    let bound_to = |target: &str| fixture.replace(BIND, &format!("= bind {target}"));
+    for target in ["nope", "dut.core"] {
+        let err = lower_src(&bound_to(target)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("non-DUT target"), "`{target}`: {msg}");
+    }
+
+    // A bare name: v1 prints it as the DUT pointer…
+    let bare = cpp_tb::emit(&merged_src(&bound_to("nope"))).expect("v1 accepts a non-DUT bind");
+    assert!(
+        bare.contains("nope->mem_read_addr"),
+        "v1 prints the bind name as the DUT pointer:\n{bare}"
+    );
+    // …and never brings it into scope.
+    assert!(
+        !bare.contains("nope ="),
+        "if v1 ever declares `nope`, this is no longer uncompilable:\n{bare}"
+    );
+
+    // A field path: v1 emits a real DUT member read and then applies
+    // `operator->` to it. `harc_read` returns a VALUE, so this is
+    // uncompilable for a different reason than the bare-name case — and
+    // the reason the diagnostic names both.
+    let field = cpp_tb::emit(&merged_src(&bound_to("dut.core"))).expect("v1 accepts a field bind");
+    assert!(
+        field.contains("harc_rt::harc_read(dut->core)->mem_read_addr"),
+        "v1 dereferences the bind expression itself:\n{field}"
+    );
 }
