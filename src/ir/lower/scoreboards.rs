@@ -157,10 +157,45 @@ pub(crate) fn lower_scoreboard(
             // through, because that predicate answers the hook
             // resolver's question, not this one. Classifying this arm
             // needs the scope analysis, not another shape test.
+            // MEASURED across both containers a data-only scoreboard
+            // can sit in, because what v1 does depends on the container
+            // and not on the syntax — which is why the syntactic split
+            // recorded above failed.
+            //
+            // As a TRANSACTOR field, v1 emits output byte-identical to
+            // the same program with the `connect`/`on` deleted (608
+            // lines either way; the only textual difference is a source
+            // OFFSET baked into `_solver_site_<N>` names and an
+            // auto-coverage plan literal). It silently DROPS the
+            // wiring, so the scoreboard observes nothing and a test
+            // that should catch a mismatch passes green.
+            //
+            // As a TESTBENCH field the same three inputs diverge three
+            // ways:
+            //   * `connect` emits `_tb.b.hits.push_back(...)` against a
+            //     `uint32_t` member — g++: "request for member
+            //     'push_back' ... which is of non-class type
+            //     'uint32_t'". Uncompilable.
+            //   * `on hits > 0` emits a `_checkers` closure around
+            //     `(bool)(_tb.b.hits > 0)`, which compiles and works.
+            //   * `on dut.rst` emits `(bool)(harc_rt::harc_read(
+            //     dut->rst))`, which also compiles and works.
+            //
+            // So `--codegen v1` IS a real escape hatch for a
+            // testbench-field `on` — and this seam cannot offer it.
+            // `lower_scoreboard` lowers a DECLARATION; the same type can
+            // be instantiated in either container, so the container is
+            // not knowable here. An arm's status is the worst thing v1
+            // does anywhere under it, and a silent drop is the worst of
+            // the three.
             ComponentItem::Connect(_) | ComponentItem::OnHandler(_) => {
-                return Err(unsupported(
+                return Err(super::not_implemented(
                     &format!("event wiring (`connect`/`on`) on scoreboard `{sb}`"),
-                    "",
+                    "as a transactor field v1 drops the wiring entirely and emits the same \
+                     code it emits without it, so the scoreboard observes nothing and a \
+                     check that should fail passes; as a testbench field it emits an \
+                     uncompilable `connect` but a working `on`",
+                    super::V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::Lifecycle(..) => {}

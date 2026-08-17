@@ -16348,16 +16348,17 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
 }
 
 /// The ninth site, in `scoreboards.rs`, which answers every
-/// `connect`/`on` in a scoreboard body with one `Unsupported`. The
-/// HOOKED half of it is uniform and reclassified: v1 drops the hook,
-/// byte-identically to the same handler without one, at both trigger
-/// shapes.
+/// `connect`/`on` in a scoreboard body with one verdict. The HOOKED
+/// half of it is uniform: v1 drops the hook, byte-identically to the
+/// same handler without one, at both trigger shapes.
 ///
 /// The unhooked half is deliberately left whole. It is mixed, but what
-/// separates its inputs is name resolution in the emitted C++, not
-/// syntax — `on dut.en` compiles and `on w.seen > 0` does not, despite
-/// being a path and an expression respectively. A syntactic split was
-/// written and reverted; see the comment at the site.
+/// separates its inputs is the CONTAINER the scoreboard is instantiated
+/// in — not knowable where a declaration is lowered — and, within one
+/// container, name resolution in the emitted C++ rather than syntax:
+/// `on dut.en` compiles and `on w.seen > 0` does not, despite being a
+/// path and an expression respectively. A syntactic split was written
+/// and reverted; see the comment at the site and the sibling test.
 #[test]
 fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
     let scoreboard = |body: &str| {
@@ -16390,8 +16391,12 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
             "`on {trigger}` must contribute, or the identity below is vacuous"
         );
         // The control itself is still a subset gap, which is what makes
-        // the hook the only thing under test here.
-        assert_unsupported(&lower_src(&ctl).unwrap_err());
+        // the hook the only thing under test here. It carries the
+        // unhooked arm's verdict, measured in the sibling test below.
+        assert_not_implemented(
+            &lower_src(&ctl).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
 
         let hooked = scoreboard(&handler(trigger, " pre"));
         let msg = assert_not_implemented(
@@ -16407,19 +16412,29 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
     }
 }
 
-/// Pins the REVERT. The unhooked `connect`/`on` arm in a scoreboard
-/// body answers one `Unsupported` for its whole input space, and it
-/// must keep doing so until someone classifies it with the scope
-/// analysis it actually needs.
+/// The unhooked `connect`/`on` arm in a scoreboard body answers ONE
+/// verdict for its whole input space, and that verdict is now measured
+/// rather than provisional.
 ///
-/// A syntactic split was written here and undone. The sibling hooked
-/// test's `on w.note` control already fails if it comes back, so this
-/// is not the only guard — it is the one that pins `dut.en`,
-/// `(w.note)`, `w.note cycles` and `w.note phase post_eval`, and that
-/// asserts the two rows the split got BACKWARDS: `on dut.en` is a
+/// A syntactic split was written here and undone. This test pins why:
+/// it asserts the two rows the split got BACKWARDS — `on dut.en` is a
 /// two-segment PATH that v1 compiles, and `on w.seen > 0` is an
 /// EXPRESSION that v1 does not. No predicate over trigger syntax can
 /// separate this arm.
+///
+/// What DOES separate the cases is the CONTAINER, and that is not
+/// knowable here: `lower_scoreboard` lowers a declaration, and the same
+/// scoreboard type can be instantiated as a transactor field or a
+/// testbench field. Measured across both (divergence 70):
+///
+///   * transactor field — v1 emits output byte-identical to the same
+///     program with the wiring DELETED, so it silently drops it;
+///   * testbench field — `connect` emits an uncompilable `.push_back`
+///     on a `uint32_t`, while `on` emits a working checker.
+///
+/// An arm's status is the worst thing v1 does anywhere under it, and a
+/// silent drop is the worst of the three. Hence one
+/// `SilentlyMisLowers`, not one `Unsupported`.
 #[test]
 fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
     let scoreboard = |body: &str| {
@@ -16448,7 +16463,10 @@ fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
         "w.note cycles",
         "w.note phase post_eval",
     ] {
-        let msg = assert_unsupported(&lower_src(&scoreboard(&handler(trigger))).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&scoreboard(&handler(trigger))).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
         assert!(
             msg.contains("event wiring"),
             "`on {trigger}` must still reach the one generic arm: {msg}"

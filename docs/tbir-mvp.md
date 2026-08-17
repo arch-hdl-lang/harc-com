@@ -4629,6 +4629,51 @@ case and only locally-determinable `Assign` types are compared).
     widening the shared helper would change what its other callers
     resolve.
 
+70. **The container, not the syntax, decides what v1 does with a
+    scoreboard's `connect`/`on` (2026-08-17).**
+
+    `lower_scoreboard` answers every `connect` and every unhooked `on`
+    in a data-only scoreboard body with one verdict. That verdict was
+    `Unsupported` — "re-run with `--codegen v1`" — and a previous batch
+    tried to split it syntactically, on `is_v1_method_hook_shape`. The
+    split got its rows backwards and was reverted: `on dut.en` is a
+    two-segment PATH that v1 compiles, and `on w.seen > 0` is an
+    EXPRESSION that v1 does not.
+
+    Re-measured, and the reason no shape predicate can work here is
+    that the discriminator is the CONTAINER the scoreboard is
+    instantiated in, which a declaration-lowering seam cannot see. The
+    same `scoreboard Board` type can be a transactor field or a
+    testbench field:
+
+    | container | input | v1 |
+    |---|---|---|
+    | transactor field | `connect` / `on` | **silently drops the wiring** |
+    | testbench field | `connect` | emits uncompilable C++ |
+    | testbench field | `on hits > 0` | emits a working checker |
+    | testbench field | `on dut.rst` | emits a working checker |
+
+    The transactor-field row is byte-measured: 608 emitted lines with
+    the wiring and 608 without, differing only in a source OFFSET baked
+    into `_solver_site_<N>` names and in an auto-coverage plan literal.
+    Nothing in the output observes the event. A scoreboard that should
+    catch a mismatch sees no traffic and the test passes green.
+
+    The testbench-field `connect` row is compiler-measured, not read
+    off the text: v1 emits `_tb.b.hits.push_back(...)` where `hits` is
+    a `uint32_t` field, and g++ says "request for member 'push_back'
+    ... which is of non-class type 'uint32_t'".
+
+    So `--codegen v1` genuinely IS a way to run a testbench-field `on`,
+    and this seam cannot offer it — it lowers a declaration, and the
+    instantiation is elsewhere. An arm's status is the worst thing v1
+    does anywhere under it, and a silent drop is the worst of the
+    three, so the whole arm is now `SilentlyMisLowers`. That is a
+    strictly better answer than the old `Unsupported` for the two rows
+    where v1 is not an escape hatch, and a worse-than-necessary one for
+    the two where it is; splitting it correctly needs the
+    instantiation, not another shape test.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
