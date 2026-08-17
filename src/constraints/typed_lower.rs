@@ -444,32 +444,39 @@ fn build_enum_variant_lookup(
 
 // ─── Expression lowering ────────────────────────────────────────────
 
-fn lower_top_clause(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
-    let lowered = lower_expr(ctx, expr);
-    // A ONE-BIT clause is a flag, and reads as `<expr> != 0`. Both C++
-    // emitters have always coerced it that way — `keep ready` on a
-    // `uint<1>` field emits `_s.add(_z_ready != bv_val(0))`, under v1 and
-    // TB-IR alike — while this path rejected it as non-Bool, so a program
-    // both backends compile and solve failed to lower here (harc#596).
-    //
-    // One bit only, and unsigned only, matching the emitters exactly: a
-    // wider field has no reading that is obviously `!= 0` rather than a
-    // typo for a comparison, and harc#560 made the emitters reject it with
-    // a diagnostic — which is what this function's own
-    // `rejects_clause_that_is_not_bool` test has always asserted.
-    if let Some((1, Sign::Unsigned)) = lowered.ty.as_bv() {
-        let span = lowered.span;
-        let zero = CTypedExpr::new(CExprKind::BvLit { value: 0 }, lowered.ty.clone(), span);
-        return CTypedExpr::new(
-            CExprKind::Binary {
-                op: CBinaryOp::Ne,
-                lhs: Box::new(lowered),
-                rhs: Box::new(zero),
-            },
-            CType::Bool,
-            span,
-        );
+/// Rewrite a one-bit unsigned value as `<expr> != 0`, leaving anything else
+/// untouched. The coercion both C++ emitters apply wherever a Bool is
+/// expected: `keep ready` on a `uint<1>` field emits
+/// `_s.add(_z_ready != bv_val(0))` under v1 and TB-IR alike.
+///
+/// ONE BIT and UNSIGNED only, matching them exactly. A wider field has no
+/// reading that is obviously `!= 0` rather than a typo for a comparison, and
+/// harc#560 made the emitters reject it with a diagnostic — which is what
+/// `rejects_clause_that_is_not_bool` asserts here.
+fn coerce_flag_to_bool(e: CTypedExpr) -> CTypedExpr {
+    if !matches!(e.ty.as_bv(), Some((1, Sign::Unsigned))) {
+        return e;
     }
+    let span = e.span;
+    let zero = CTypedExpr::new(CExprKind::BvLit { value: 0 }, e.ty.clone(), span);
+    CTypedExpr::new(
+        CExprKind::Binary {
+            op: CBinaryOp::Ne,
+            lhs: Box::new(e),
+            rhs: Box::new(zero),
+        },
+        CType::Bool,
+        span,
+    )
+}
+
+fn lower_top_clause(ctx: &mut LowerCtx<'_>, expr: &Expr) -> CTypedExpr {
+    // A ONE-BIT clause is a flag and reads as `<expr> != 0`, which is what
+    // both C++ emitters do; this path rejected it, so a program both
+    // backends compile and solve failed to lower here (harc#596). The same
+    // coercion applies to a Bool OPERAND of `&&` / `||` / `!`, which is
+    // where harc#599 found the two paths still disagreeing.
+    let lowered = coerce_flag_to_bool(lower_expr(ctx, expr));
     // Clauses must be Bool.
     if !lowered.ty.is_bool() && !lowered.ty.is_bottom() {
         ctx.record_error(LowerError::NonBoolLogical {
@@ -812,6 +819,13 @@ fn collect_dotted(expr: &Expr) -> Option<Vec<String>> {
 
 fn lower_unary(ctx: &mut LowerCtx<'_>, op: AstUnaryOp, expr: &Expr, span: Span) -> CTypedExpr {
     let inner = lower_expr(ctx, expr);
+    // `!` takes a Bool, so a one-bit flag coerces here too (harc#599).
+    // NOT for `-` or `~`, which take a BV and would be broken by it — hence
+    // coercing after the operand is lowered but only on the logical arm.
+    let inner = match op {
+        AstUnaryOp::Not | AstUnaryOp::NotKw => coerce_flag_to_bool(inner),
+        _ => inner,
+    };
     let cop = match op {
         AstUnaryOp::Neg => CUnaryOp::Neg,
         AstUnaryOp::Not | AstUnaryOp::NotKw => CUnaryOp::LogicalNot,
@@ -881,6 +895,16 @@ fn lower_binary(
 
     let mut lhs = lower_expr(ctx, lhs_ast);
     let mut rhs = lower_expr(ctx, rhs_ast);
+
+    // A one-bit flag is a condition in Bool POSITION, not only at the top of
+    // a clause. harc#596 coerced the clause root; `keep f && g > 3` still
+    // failed here while both C++ emitters coerced it, because their Bool
+    // emitter recurses into `&&` / `||` / `!` operands and applies `!= 0`
+    // there (harc#599).
+    if matches!(cop, CBinaryOp::LogicalAnd | CBinaryOp::LogicalOr) {
+        lhs = coerce_flag_to_bool(lhs);
+        rhs = coerce_flag_to_bool(rhs);
+    }
 
     // Width coercion for literal/concrete pairings on BV ops.
     if is_bv_op(cop) {
@@ -2196,6 +2220,62 @@ end transaction X
             "it must coerce to `!= 0`, not merely be relabelled Bool; got {:?}",
             clause.kind
         );
+    }
+
+    /// harc#599. The coercion applies to a Bool OPERAND, not only a clause
+    /// root. harc#596 fixed the root, leaving `keep !f` and `keep f && g > 3`
+    /// rejected here while both C++ emitters coerced them — their Bool
+    /// emitter recurses into `&&` / `||` / `!` operands and applies `!= 0`
+    /// there, and has done so since long before either issue.
+    #[test]
+    fn coerces_a_one_bit_flag_in_nested_bool_positions() {
+        let src = r#"
+transaction X
+  f : uint<1>
+  g : uint<8>
+end transaction X
+"#;
+        for clause in [
+            "!f",
+            "not f",
+            "f && g > 3",
+            "g > 3 && f",
+            "f || g > 3",
+            "f && !f",
+        ] {
+            let prob = lower_with_body(src, &[clause])
+                .unwrap_or_else(|e| panic!("`{clause}` must lower: {e:?}"));
+            let c = prob.constraints.first().expect("one clause");
+            assert!(
+                c.expr.ty.is_bool(),
+                "`{clause}` must lower to Bool; got {:?}",
+                c.expr.ty
+            );
+        }
+    }
+
+    /// One bit is load-bearing in the nested positions too: anything wider
+    /// stays an error, which is what harc#560 made the emitters do rather
+    /// than guess at `!= 0`. A coercion that fired on `uint<8>` would make
+    /// this path accept what both backends reject — the same divergence in
+    /// the opposite direction.
+    #[test]
+    fn does_not_coerce_a_wider_field_in_nested_bool_positions() {
+        let src = r#"
+transaction X
+  f : uint<1>
+  g : uint<8>
+end transaction X
+"#;
+        for clause in ["!g", "g && g > 3", "g > 3 && g"] {
+            let err =
+                lower_with_body(src, &[clause]).expect_err(&format!("`{clause}` must NOT lower"));
+            assert!(
+                err.iter()
+                    .any(|e| matches!(e, LowerError::NonBoolLogical { .. })),
+                "`{clause}` must fail as non-Bool; got {err:?}"
+            );
+        }
     }
 
     /// The width above is load-bearing: one bit reads as a flag, anything
