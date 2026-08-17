@@ -3937,6 +3937,182 @@ case and only locally-determinable `Assign` types are compared).
     the fix, and it is recorded rather than made here because it changes
     an extractor the equivalence corpus exercises heavily.
 
+59. **Every constraint diagnostic was thrown away, and v1 crashes on
+    one of them (2026-08-17).**
+
+    `build_typed_solver_problem_table` records the constraint lowerer's
+    errors as `TypedSolverProblemBuild::LowerError` entries.
+    `lower_program`'s consuming loop read only `Z3` entries and
+    `continue`d past the rest, so **none of them ever reached a user**.
+    `randomize(r) with NoSuchRelation(r)` lowered clean under TB-IR while
+    v1 refused it outright.
+
+    Only the RELATION errors now surface, and the split was MEASURED, not
+    reasoned — though the first measurement was over the wrong set. It
+    swept the 173 entries of `tbir_equiv_fixtures.txt` and reported
+    "exactly one" non-relation `LowerError`. Sweeping every `.harc` in
+    `tests/fixtures` instead — 190 files, 184 of which merge — gives the
+    real numbers: **two** fixtures produce non-relation errors
+    (`uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
+    `DisallowedInConstraint`, and `axi_agent`, with `UnresolvedIdent`),
+    and **zero** produce a relation error. The second number is the one
+    that matters and it is stronger than what was claimed: surfacing the
+    relation variants breaks nothing in the corpus at all. *Measuring the
+    registry is not measuring the corpus* — the registry is what runs
+    under equivalence, not what exists.
+
+    Only the first of those two actually supports the discard decision:
+    `uint64_unique_randomize_test` is lowered by BOTH backends and passes
+    trace equivalence, so surfacing `DisallowedInConstraint` would reject
+    a working fixture. `axi_agent` is rejected by both backends anyway,
+    for an unrelated covergroup reason — an earlier draft of this entry
+    said "v1 lowers both", which was false and would have counted a
+    rejected fixture as evidence. Three of the four that do surface are program errors under
+    any backend — a relation that does not exist, one called with the
+    wrong arity, and one that expands into itself — so they are `Invalid`
+    and name no escape hatch.
+
+    The FOURTH is not. A misplaced argument name is accepted by v1, which
+    emits working C++ with the values swapped, so `Invalid`'s "program
+    error under every backend" is literally false for it. It carries
+    `SilentlyMisLowers` instead — the sweep's ordinary shape, and the
+    verdict that keeps the diagnostic from naming v1 as a way out. Three
+    siblings sharing one code path is not a reason to share one verdict.
+
+    v1's behaviour, measured for each: it rejects the first two
+    ("constraint function call not supported in v0 solver path") and on
+    the third it **STACK-OVERFLOWS and aborts the process**.
+    `expand_relation_subtree` in `cpp_tb.rs` has no depth guard, so
+    `relation R(r) = R(r)` takes the compiler down. No `V1Status` fits a
+    SIGABRT, which is part of why `Invalid` is the right verdict — and
+    the regression test asserts on TB-IR only and never calls
+    `cpp_tb::emit` on that input, because a test cannot catch an abort.
+    A depth guard in v1 is a real fix and is NOT made here; it is
+    recorded so the next batch can take it deliberately.
+
+    With the diagnostics surfacing, the misplaced-named-argument check
+    from divergence 57 finally does something. Relation calls bind by
+    position and drop the name, so `Between(r, hi = 131072, lo = 65536)`
+    inlined `addr >= 131072 && addr <= 65536` — unsatisfiable, silently.
+    The check was written a batch earlier and reverted as "does not
+    fire". **It fired. Its error was discarded.** The control that hid
+    that asked whether the program lowers, which cannot tell the two
+    apart; one call to the table builder can.
+
+    Both halves of the split are pinned by mutation: widening the arm to
+    surface every variant fails the capability-gap fixture, and neutering
+    the name comparison fails the swap test.
+
+    Three limits are known and NOT closed here, recorded so the next
+    batch takes them deliberately:
+
+    * **Only Test and Tseq randomize sites are collected.** Closed in
+      divergence 60 below.
+    * **`MAX_ERRORS = 5` can disable the refusal.** Five preceding
+      discarded errors (`r.addr == r.len` trips `WidthMismatch`, which is
+      deliberately not surfaced) hit `at_error_cap()` before the relation
+      clause is reached, and the program lowers. The cap is a
+      diagnostics-volume guard being load-bearing for correctness.
+    * **Every Ident-callee constraint call is treated as a relation
+      call**, so a v1-supported `sum(...)` records `UnknownRelation`.
+      Masked today only because TB-IR rejects `list<T>` fields earlier;
+      it becomes a false `Invalid` the moment list fields lower.
+
+60. **A constraint written in a component body reached C++ unchecked
+    (2026-08-17).**
+
+    Divergence 59 recorded this as a known limit; this closes it.
+    `collect_randomize_sites` walks `Item::Test` and `Item::Tseq` and
+    nothing else, so the solver problem table had no entry for a
+    `randomize ... with` written in an agent's `on` handler, a component
+    method, a `testbench` lifecycle phase, a transactor TLM target
+    thread or a file-scope `function`. The refusal from divergence 59
+    reads that table, so it never saw those sites.
+
+    They are not skipped at EMISSION. Both backends emit them through
+    `cpp_tb::emit_randomize_for_site`, which lowers the constraint
+    itself. Measured on `component_method_randomize_test` with a
+    two-parameter relation added and called from the agent handler,
+    `Band(r, hi = 2000, lo = 1000)` emitted
+
+    ```cpp
+    _s.add(z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))
+        && z3::ult(_z_value, _ctx.bv_val((uint64_t)1000, 64)));
+    ```
+
+    byte-identically under **both** codegens — an unsatisfiable
+    constraint, silently. So this was TB-IR mis-lowering, not a v1 gap
+    TB-IR happened to inherit, and `SilentlyMisLowers` is the verdict on
+    both sides of the split (the `Invalid` relation errors reach these
+    sites too).
+
+    The fix is a **separate, validation-only** table
+    (`build_component_scope_problem_table`) rather than more arms in
+    `collect_randomize_sites`. Entry order in the main table assigns the
+    `problem_id`s both backends bake into emitted symbol names, so
+    widening it would renumber every site that follows a component-scope
+    one and churn emitted output for reasons unrelated to the check. The
+    new table is read for its `LowerError`s and never reaches emission.
+
+    Blast radius, measured before the change: of the 190 `.harc` files in
+    `tests/fixtures` (184 merge), exactly **one** contains a
+    component-scope randomize site, and it builds clean — zero new
+    refusals across the corpus.
+
+    Walking the bodies is only half of it, and the first version shipped
+    only that half. **A randomize target is resolved by NAME**, so a body
+    whose scope is empty contributes nothing however carefully it is
+    walked — and a component binds names three ways a `test` body does
+    not: a field (`r : RegOp`), a method parameter
+    (`hookable go(r: RegOp)`), and an `on` handler's event payload
+    (`req : event<RegOp>` + `on req(t)`). Seeding only the
+    statement-position `let`s collected **zero** sites for all three,
+    including the `on req(t)` shape `transactor_active_test` uses. The
+    justifying comment reasoned about `let`s and stopped there; walking
+    the right blocks with the wrong scope looks exactly like walking the
+    right blocks. *Two more shapes were missed the same way*: a
+    `watchdog` body hosts statements, and `event<RegOp>` parses its
+    argument as an EXPRESSION (`TypeArg::Expr`), not a type, so reading
+    only the `TypeArg::Type` arm resolved nothing.
+
+    Ten body shapes and three target bindings are each pinned by
+    mutation in `every_component_body_that_can_host_a_randomize_is_
+    walked`; deleting the consuming loop in `lower_program` fails
+    `a_component_scope_relation_argument_swap_is_refused`. The shape
+    count is deliberately larger than the arm count — the parser maps
+    both `hookable` and `function` in any component body to
+    `ComponentItem::Hookable`, so three shapes share one arm — and an
+    earlier draft claimed "deleting any one arm fails this test", which
+    was false for `Item::Scoreboard` and `Item::Sequencer` because no
+    shape exercised either. They have shapes now.
+
+    Assembling a scope from the wrong set of declarations turned out to
+    be the recurring mistake, and it had two more landings. A
+    transactor's two halves were walked as INDEPENDENT scopes, so a
+    field declared in the always-present half was invisible inside
+    `when active` and those bodies collected nothing —
+    `synth_component_from_transactor` concatenates the halves, so the
+    field really is in scope there. And a `let` or parameter whose type
+    does not resolve to a plain named type failed to UNBIND the name a
+    field had seeded, recording the site under the field's transaction:
+    `agent A { r : RegOp; hookable go() { let r = 5; randomize(r) ... } }`
+    was collected as `RegOp`. Nothing on today's surfaced error set
+    reads the target transaction — all four variants come out of
+    `expand_top_level_relation_call`, which reads only the relation and
+    the call's arguments — so the verdict was right anyway. A wrong
+    attribution that happens not to matter is still wrong, and it
+    becomes a wrong refusal the moment the surfaced set widens.
+
+    Two smaller corrections, recorded because each is the kind of claim
+    this document exists to keep honest. The table is **not** a strict
+    complement of the emission table: a `testbench` lifecycle phase
+    lands in both, because `desugar_impl_for_test_in_file` folds those
+    blocks into the bound test while leaving the component intact
+    (measured: one entry in each). And the `!w.disabled` guard on the
+    watchdog arm is belt-and-braces, not a live filter — `watchdog
+    disabled` takes no body at all, the parser refuses the first
+    statement, so the body is empty there either way.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

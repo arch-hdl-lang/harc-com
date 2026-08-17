@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Block, CallArg, Expr, ExprKind, Item, SourceFile, Stmt, StmtKind, TestDecl, TestItem, TseqDecl,
-    TypeExpr,
+    Block, CallArg, ComponentItem, Expr, ExprKind, Item, SourceFile, Stmt, StmtKind, TestDecl,
+    TestItem, TseqDecl, TypeExpr,
 };
 use crate::constraints::elaborate_constraints;
 use crate::constraints::typed::{CTypedProblem, ConstraintProblemId};
@@ -119,7 +119,57 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
         next_problem_id += 1;
     }
 
-    for site in collect_randomize_sites(file) {
+    push_site_entries(
+        &elab,
+        &backend,
+        collect_randomize_sites(file),
+        &mut entries,
+        &mut next_problem_id,
+    );
+
+    TypedSolverProblemTable { entries }
+}
+
+/// A table over the randomize sites `build_typed_solver_problem_table`
+/// does **not** collect: those in component method bodies, `on`
+/// handlers, lifecycle phases, transactor bodies and free functions.
+///
+/// This is a **validation-only** table and deliberately a separate
+/// function rather than more arms in `collect_randomize_sites`. The
+/// main table's entry order assigns `problem_id`s that both backends
+/// bake into emitted symbol names, so widening it would renumber
+/// existing sites; these entries are built purely to be read for their
+/// `LowerError`s and never reach emission. Problem ids therefore
+/// restart at 1 and mean nothing outside this table.
+pub fn build_component_scope_problem_table(file: &SourceFile) -> TypedSolverProblemTable {
+    let sites = collect_component_randomize_sites(file);
+    // Collect first, and return before `elaborate_constraints` when
+    // there is nothing to elaborate FOR. Its caller has already
+    // elaborated the same file once for the main table, and a
+    // component-scope randomize site is rare — one file in the 190 in
+    // `tests/fixtures` has one — so this keeps the duplicate walk off
+    // the path every other program takes.
+    if sites.is_empty() {
+        return TypedSolverProblemTable {
+            entries: Vec::new(),
+        };
+    }
+    let elab = elaborate_constraints(file);
+    let backend = Z3Backend;
+    let mut entries = Vec::new();
+    let mut next_problem_id = 1u32;
+    push_site_entries(&elab, &backend, sites, &mut entries, &mut next_problem_id);
+    TypedSolverProblemTable { entries }
+}
+
+fn push_site_entries(
+    elab: &crate::constraints::ConstraintElaboration,
+    backend: &Z3Backend,
+    sites: Vec<RandomizeSite>,
+    entries: &mut Vec<TypedSolverProblemEntry>,
+    next_problem_id: &mut u32,
+) {
+    for site in sites {
         let Some(txn) = elab.transaction(&site.txn_name).cloned() else {
             continue;
         };
@@ -132,11 +182,11 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
             span: site.span,
         };
         let build = match lower_problem(
-            &elab,
+            elab,
             &txn,
             Some(&site.with_body),
             site.span,
-            ConstraintProblemId(next_problem_id),
+            ConstraintProblemId(*next_problem_id),
         ) {
             Ok(problem) => match backend.build(&problem) {
                 Ok(z3) => TypedSolverProblemBuild::Z3 {
@@ -148,10 +198,206 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
             Err(errors) => TypedSolverProblemBuild::LowerError(errors),
         };
         entries.push(TypedSolverProblemEntry { source, build });
-        next_problem_id += 1;
+        *next_problem_id += 1;
     }
+}
 
-    TypedSolverProblemTable { entries }
+/// Randomize sites in the bodies `collect_randomize_sites` skips. Both
+/// backends emit these through `cpp_tb::emit_randomize_for_site`, which
+/// does its own constraint lowering, so a bad constraint here reaches
+/// C++ under *both* codegens with no diagnostic from either.
+fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
+                let scope = component_field_scope([&c.items[..]]);
+                collect_component_items(&c.items, &scope, &c.name.name, &mut out);
+            }
+            Item::Transactor(t) => {
+                // ONE scope across both halves, not one per half.
+                // `synth_component_from_transactor` concatenates the
+                // always-present items and the `when active` block, so
+                // a field declared in the shared half really is in
+                // scope inside `when active` — walking the two halves
+                // as independent scopes made those bodies collect zero
+                // sites, the same empty-scope hole this seeding exists
+                // to close.
+                let active = t.when_active.as_deref().unwrap_or(&[]);
+                let scope = component_field_scope([&t.items[..], active]);
+                collect_component_items(&t.items, &scope, &t.name.name, &mut out);
+                collect_component_items(active, &scope, &t.name.name, &mut out);
+            }
+            Item::Function(f) => {
+                let mut env = BTreeMap::new();
+                extend_env_with_params(&mut env, &f.params);
+                collect_block(
+                    &f.body,
+                    &mut env,
+                    &format!("function {}", f.name.name),
+                    &mut out,
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The field-derived half of a component's name scope: every field's
+/// declared type, plus the payload type of every `event<T>` field.
+///
+/// A randomize target is resolved by NAME through `env`, so a body
+/// whose `env` is empty contributes nothing no matter how it is walked.
+/// Statement-position `let`s are picked up by `collect_stmt` as it
+/// descends, but a component body binds names three other ways that a
+/// `test` body does not, and all three are ordinary shapes: a component
+/// FIELD (`r : RegOp`), a method PARAMETER (`hookable go(r: RegOp)`),
+/// and an `on` handler's event PAYLOAD (`req : event<RegOp>` +
+/// `on req(t)` binds `t : RegOp`). Seeding only the `let`s collected
+/// zero sites for all three.
+fn component_field_scope<'a>(
+    halves: impl IntoIterator<Item = &'a [ComponentItem]>,
+) -> ComponentScope {
+    let mut scope = ComponentScope::default();
+    for item in halves.into_iter().flatten() {
+        let ComponentItem::Field(f) = item else {
+            continue;
+        };
+        if let Some(ty) = simple_type_name(Some(&f.ty)) {
+            scope.fields.insert(f.name.name.clone(), ty);
+        }
+        if let Some(ty) = event_payload_type_name(&f.ty) {
+            scope.payloads.insert(f.name.name.clone(), ty);
+        }
+    }
+    scope
+}
+
+#[derive(Default)]
+struct ComponentScope {
+    fields: BTreeMap<String, String>,
+    payloads: BTreeMap<String, String>,
+}
+
+fn collect_component_items(
+    items: &[ComponentItem],
+    scope: &ComponentScope,
+    owner: &str,
+    out: &mut Vec<RandomizeSite>,
+) {
+    let (fields, payloads) = (&scope.fields, &scope.payloads);
+    for item in items {
+        let mut env = fields.clone();
+        match item {
+            ComponentItem::OnHandler(h) => {
+                // `on <ev>(<binder>)` — the binder's type is the event
+                // field's payload type. Any other trigger shape (a
+                // cycle expression, a period) binds nothing.
+                if let ExprKind::Call { callee, args } = h.event.kind.as_ref() {
+                    if let ExprKind::Ident(ev) = callee.kind.as_ref() {
+                        if let (Some(ty), [CallArg::Expr(a)]) = (payloads.get(&ev.name), &args[..])
+                        {
+                            if let ExprKind::Ident(binder) = a.kind.as_ref() {
+                                env.insert(binder.name.clone(), ty.clone());
+                            }
+                        }
+                    }
+                }
+                collect_block(&h.body, &mut env, owner, out);
+            }
+            ComponentItem::Hookable(h) => {
+                extend_env_with_params(&mut env, &h.params);
+                collect_block(&h.body, &mut env, owner, out);
+            }
+            ComponentItem::TargetTlmThread(t) => {
+                extend_env_with_params(&mut env, &t.params);
+                collect_block(&t.body, &mut env, owner, out);
+            }
+            // Reached only from a `testbench`, and a `testbench` is
+            // either bound by `impl ... for` — in which case
+            // `desugar_impl_for_test_in_file` has already folded these
+            // blocks into the bound test, so the MAIN table collects
+            // the same site (measured: one entry in each) — or unbound,
+            // in which case `lower_program`'s item loop refuses the
+            // component before this table is built. So the arm is
+            // redundant today. It stays because its redundancy is a
+            // property of the desugarer, not of this walk, and a
+            // duplicate diagnostic costs a caller nothing: both tables
+            // produce the same error and the first one wins.
+            ComponentItem::Lifecycle(_, block) => {
+                collect_block(block, &mut env, owner, out);
+            }
+            // `watchdog disabled` suppresses all codegen for the
+            // block, body included, so nothing written there can reach
+            // C++ and refusing it would reject a program neither
+            // backend mis-lowers. The guard is belt-and-braces today:
+            // the parser takes no body after `watchdog disabled` (see
+            // the control in `every_component_body_that_can_host_a_
+            // randomize_is_walked`), so `w.body` is empty there either
+            // way. It stays so that allowing a body later cannot
+            // silently start refusing a suppressed block.
+            ComponentItem::Watchdog(w) if !w.disabled => {
+                collect_block(&w.body, &mut env, owner, out);
+            }
+            ComponentItem::Field(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::Apply(_)
+            | ComponentItem::Watchdog(_) => {}
+        }
+    }
+}
+
+fn extend_env_with_params(env: &mut BTreeMap<String, String>, params: &[crate::ast::Param]) {
+    for p in params {
+        bind(env, &p.name.name, p.ty.as_ref());
+    }
+}
+
+/// Bind `name` to `ty`'s simple name — and UNBIND it when `ty` resolves
+/// to nothing.
+///
+/// The unbind arm matters because these scopes now nest. A component
+/// field seeds the scope before a method's parameters and `let`s are
+/// walked, so `hookable go()` with `let r = 5` inside, in a component
+/// that also declares `r : RegOp`, used to leave the field's binding
+/// standing and record the site under the WRONG transaction. Nothing on
+/// today's surfaced error set reads the target transaction, so the
+/// verdict came out right anyway — but a wrong attribution that happens
+/// not to matter is a wrong attribution, and it becomes a wrong refusal
+/// the moment the surfaced set widens.
+fn bind(env: &mut BTreeMap<String, String>, name: &str, ty: Option<&TypeExpr>) {
+    match simple_type_name(ty) {
+        Some(t) => {
+            env.insert(name.to_string(), t);
+        }
+        None => {
+            env.remove(name);
+        }
+    }
+}
+
+/// The `T` of an `event<T>` field type, when `T` is a plain named type.
+fn event_payload_type_name(t: &TypeExpr) -> Option<String> {
+    let TypeExpr::Builtin {
+        name: crate::ast::BuiltinTy::Event,
+        args,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    // `event<RegOp>` parses its argument as an EXPRESSION, not a type
+    // — `TypeArg::Expr(Ident("RegOp"))` — so reading only the
+    // `TypeArg::Type` arm resolved nothing and collected zero sites.
+    match args.first()? {
+        crate::ast::TypeArg::Type(inner) => simple_type_name(Some(inner)),
+        crate::ast::TypeArg::Expr(e) => match e.kind.as_ref() {
+            ExprKind::Ident(id) => Some(id.name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn collect_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
@@ -180,9 +426,7 @@ fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
     let mut env = BTreeMap::new();
     for item in &test.items {
         if let TestItem::Let(l) = item {
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
+            bind(&mut env, &l.name.name, l.ty.as_ref());
         }
     }
 
@@ -232,9 +476,7 @@ fn collect_stmt(
             if let Some(value) = &l.value {
                 collect_expr(value, env, context, out);
             }
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
+            bind(env, &l.name.name, l.ty.as_ref());
         }
         StmtKind::Randomize {
             blocking,

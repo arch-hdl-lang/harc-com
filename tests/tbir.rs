@@ -17552,3 +17552,436 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
         "detail has collapsed whitespace: {msg}"
     );
 }
+
+/// Constraint-lowering diagnostics used to be thrown away wholesale.
+/// `build_typed_solver_problem_table` records them as
+/// `TypedSolverProblemBuild::LowerError` entries, and `lower_program`'s
+/// consuming loop read only `Z3` entries — so
+/// `randomize(r) with NoSuchRelation(r)` lowered clean under TB-IR
+/// while v1 refused it outright.
+///
+/// Only the RELATION errors surface, and that split was measured rather
+/// than reasoned: all 190 `.harc` files in `tests/fixtures` were run
+/// through the table builder (184 merge). Two produce a non-relation
+/// `LowerError` and ZERO produce a relation one — so the surfaced arms
+/// break nothing in the corpus, while surfacing every variant would
+/// reject `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0`
+/// trips `DisallowedInConstraint`. That is a capability gap in the
+/// constraint IR, not a bad program: both backends lower it and it
+/// passes trace equivalence.
+///
+/// (The other non-relation fixture, `axi_agent`, is rejected by BOTH
+/// backends for an unrelated covergroup reason, so only the first
+/// actually supports the discard decision. An earlier write-up said "v1
+/// lowers both", which was false.)
+#[test]
+fn relation_errors_in_randomize_with_now_reach_the_user() {
+    let src = fixture("relation_inlining_test.harc");
+    const ALIAS: &str = "relation HighAddr(r: Req) = r.addr >= 0x10000";
+    const CALL: &str = "randomize(r) with BoundedAndHigh(r) end randomize";
+    assert!(
+        src.contains(ALIAS) && src.contains(CALL),
+        "fixture shape changed"
+    );
+    let two = format!(
+        "{ALIAS}\n\nrelation Between(r: Req, lo: int, hi: int) = r.addr >= lo && r.addr <= hi"
+    );
+    let with = |call: &str| {
+        src.replacen(ALIAS, &two, 1).replacen(
+            CALL,
+            &format!("randomize(r) with {call} end randomize"),
+            1,
+        )
+    };
+
+    // The control: a correct call still lowers.
+    lower_src(&with("Between(r, 65536, 131072)")).expect("the correct call lowers");
+
+    for (call, needle) in [
+        (
+            "Between(r, 65536)",
+            "takes 3 argument(s) but was called with 2",
+        ),
+        (
+            "NoSuchRelation(r)",
+            "names no `relation` declared in this file",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&with(call)).unwrap_err());
+        assert!(msg.contains(needle), "{msg}");
+    }
+
+    // A self-recursive relation. NOTE: this asserts on TB-IR only, and
+    // deliberately never calls `cpp_tb::emit` on it — v1 has no depth
+    // guard in `expand_relation_subtree` and STACK-OVERFLOWS, aborting
+    // the process. That is recorded in divergence 59; a test cannot
+    // catch a SIGABRT, so this one documents the boundary instead of
+    // stepping over it.
+    let recursive = src.replacen(ALIAS, "relation HighAddr(r: Req) = HighAddr(r)", 1);
+    let msg = assert_invalid(&lower_src(&recursive).unwrap_err());
+    assert!(msg.contains("expands into itself"), "{msg}");
+
+    // The capability-gap variant must STILL lower — this is the half a
+    // blanket surfacing would have broken.
+    lower_src(&fixture("uint64_unique_randomize_test.harc"))
+        .expect("a constraint the IR cannot express is not a bad program");
+}
+
+/// With the diagnostics surfacing, the misplaced-named-argument check
+/// can finally do something. Relation calls bind by POSITION and drop
+/// the name, so `Between(r, hi = 131072, lo = 65536)` inlined
+/// `addr >= 131072 && addr <= 65536` — unsatisfiable, silently, from a
+/// program written to mean the opposite.
+///
+/// The check itself was written a batch earlier and reverted as
+/// "does not fire". It fired; its error was discarded. The control that
+/// hid it asked whether the PROGRAM lowers, which cannot tell those two
+/// apart — only asking the table builder directly can.
+#[test]
+fn a_misplaced_relation_argument_name_is_refused() {
+    let fixture = fixture("relation_inlining_test.harc");
+    const ALIAS: &str = "relation HighAddr(r: Req) = r.addr >= 0x10000";
+    const CALL: &str = "randomize(r) with BoundedAndHigh(r) end randomize";
+    let two = format!(
+        "{ALIAS}\n\nrelation Between(r: Req, lo: int, hi: int) = r.addr >= lo && r.addr <= hi"
+    );
+    let with = |call: &str| {
+        fixture.replacen(ALIAS, &two, 1).replacen(
+            CALL,
+            &format!("randomize(r) with {call} end randomize"),
+            1,
+        )
+    };
+
+    // Names written where they belong bind where they belong, and emit
+    // exactly what the positional form emits.
+    let positional = cpp_tb::emit(&merged_src(&with("Between(r, 65536, 131072)")))
+        .expect("v1 emits the positional form");
+    assert!(
+        positional.contains("z3::uge(_z_addr, _ctx.bv_val((uint64_t)65536, 64))"),
+        "the positional form binds lo=65536"
+    );
+    lower_src(&with("Between(r, lo = 65536, hi = 131072)")).expect("in-order names lower");
+
+    // Reordered names are refused, and the message says which parameter
+    // was written where. NOT `Invalid`, unlike the three sibling
+    // relation errors: v1 ACCEPTS this one and emits working C++ with
+    // the values swapped, so "a program error under every backend"
+    // would be literally false.
+    let msg = assert_not_implemented(
+        &lower_src(&with("Between(r, hi = 131072, lo = 65536)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`hi` is parameter 3 but was written in position 2"),
+        "{msg}"
+    );
+    // v1 really does swap them, which is what makes this worth refusing.
+    assert!(
+        cpp_tb::emit(&merged_src(&with("Between(r, hi = 131072, lo = 65536)")))
+            .expect("v1 emits")
+            .contains("z3::uge(_z_addr, _ctx.bv_val((uint64_t)131072, 64))"),
+        "v1 binds lo := 131072, an unsatisfiable constraint"
+    );
+
+    // A name matching no parameter gets its own sentence.
+    let msg = assert_not_implemented(
+        &lower_src(&with("Between(r, nosuch = 65536, hi = 131072)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`nosuch` names no parameter of `Between`"),
+        "{msg}"
+    );
+}
+
+/// A `randomize ... with` written inside a component method body is
+/// refused for the same reasons a test-body one is.
+///
+/// The check above it reads the solver problem table, and that table
+/// only ever collected `test` and `tseq` sites — so the identical
+/// swapped call inside an agent's `on` handler lowered clean and
+/// reached C++ with the bounds reversed. The sites are not skipped at
+/// EMISSION: both backends emit them through
+/// `cpp_tb::emit_randomize_for_site`, which lowers the constraint
+/// itself, so this was TB-IR silently mis-lowering, not just v1.
+#[test]
+fn a_component_scope_relation_argument_swap_is_refused() {
+    let fixture = fixture("component_method_randomize_test.harc");
+    const BODY: &str =
+        "            r.value > 1000\n            r.value < 2000\n            r.addr == 24";
+    assert!(fixture.contains(BODY), "fixture shape changed");
+    // The randomize this rewrites lives in `agent Randomizer`'s
+    // `on in_ev(t)` handler — a component method body, not a test body.
+    let with = |call: &str| {
+        fixture
+            .replacen(
+                "agent Randomizer",
+                "relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi\n\
+                 \n\
+                 agent Randomizer",
+                1,
+            )
+            .replacen(
+                BODY,
+                &format!("            {call}\n            r.addr == 24"),
+                1,
+            )
+    };
+
+    // Controls: the positional form and the in-order named form both
+    // still lower, and both emit the bounds the source asked for.
+    for call in ["Band(r, 1000, 2000)", "Band(r, lo = 1000, hi = 2000)"] {
+        let program = lower_src(&with(call)).unwrap_or_else(|e| panic!("`{call}` lowers: {e}"));
+        let emitted = tbir::emit(
+            &program,
+            &merged_src(&with(call)),
+            &cpp_tb::EmitOpts::default(),
+        )
+        .expect("emits");
+        assert!(
+            emitted.contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)1000, 64))"),
+            "`{call}` binds lo := 1000"
+        );
+    }
+
+    let msg = assert_not_implemented(
+        &lower_src(&with("Band(r, hi = 2000, lo = 1000)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`hi` is parameter 3 but was written in position 2"),
+        "{msg}"
+    );
+
+    // What made it worth refusing: v1 emits the swapped bounds, and so
+    // did TB-IR before this check existed — `value > 2000 && value <
+    // 1000` has no solution.
+    assert!(
+        cpp_tb::emit(&merged_src(&with("Band(r, hi = 2000, lo = 1000)")))
+            .expect("v1 emits")
+            .contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))"),
+        "v1 binds lo := 2000"
+    );
+
+    // The `Invalid` half of the same check reaches component scope too.
+    let err = lower_src(&with("NoSuchRel(r)")).unwrap_err();
+    assert!(
+        format!("{err}").contains("`NoSuchRel` names no `relation` declared in this file"),
+        "{err}"
+    );
+}
+
+/// Every body shape that can host a `randomize` is walked, and every
+/// way a component body can NAME the randomize target is resolved.
+///
+/// The second half is what the first sweep missed. A randomize target
+/// is looked up by name, so a body whose scope is empty contributes
+/// nothing however carefully it is walked — and a component binds names
+/// three ways a `test` body does not: a field, a method parameter, and
+/// an `on` handler's event payload. All three collected zero sites
+/// until the scope was seeded.
+///
+/// The test probes the collector rather than `lower_program`, because
+/// most of these shapes are refused earlier by unrelated gates (an
+/// unbound `testbench` is not lowered at all), and a refusal from one
+/// of those gates would prove nothing about whether the site was
+/// collected. The end-to-end refusal is pinned by
+/// `a_component_scope_relation_argument_swap_is_refused` above.
+#[test]
+fn every_component_body_that_can_host_a_randomize_is_walked() {
+    const PRELUDE: &str = "\
+bus B
+    tlm_method go(addr: uint<32>): blocking;
+end bus B
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
+";
+    // The swapped call, written once and dropped into each shape. `RZ`
+    // declares its own target; `RZ_R` and `RZ_T` randomize a name the
+    // enclosing body is expected to have bound.
+    const RZ: &str = "        let r : RegOp\n\
+                      \x20       randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    const RZ_R: &str = "        randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    const RZ_T: &str = "        randomize(t) with Band(t, hi = 2000, lo = 1000) end randomize\n";
+
+    // Each entry names the collector arm it exercises. Three of these
+    // land on ONE arm — the parser maps both `hookable` and `function`
+    // in any component body to `ComponentItem::Hookable` — so the arms
+    // are fewer than the shapes, and the shapes are what users write.
+    let shapes: [(&str, String); 10] = [
+        (
+            "an `on` handler [OnHandler]",
+            format!("agent A\n    in_ev : event<uint<8>>\n    on in_ev(t)\n{RZ}    end on\nend agent A\n"),
+        ),
+        (
+            "a hookable method [Hookable]",
+            format!("agent A\n    hookable go()\n{RZ}    end go\nend agent A\n"),
+        ),
+        (
+            "a scoreboard method [Item::Scoreboard]",
+            format!("scoreboard S\n    hookable go()\n{RZ}    end go\nend scoreboard S\n"),
+        ),
+        (
+            "a sequencer method [Item::Sequencer]",
+            format!("sequencer Q\n    hookable go()\n{RZ}    end go\nend sequencer Q\n"),
+        ),
+        (
+            "a testbench `function` [Hookable]",
+            format!("testbench Tb\n    dut : Top\n    function go()\n{RZ}    end function go\nend testbench Tb\n"),
+        ),
+        (
+            "a testbench lifecycle phase [Lifecycle]",
+            format!("testbench Tb\n    dut : Top\n    setup\n{RZ}    end setup\nend testbench Tb\n"),
+        ),
+        (
+            "a watchdog body [Watchdog]",
+            format!("agent A\n    watchdog\n        period 10 cycles\n{RZ}    end watchdog\nend agent A\n"),
+        ),
+        (
+            "a file-scope `function` [Item::Function]",
+            format!("function go()\n{RZ}end function go\n"),
+        ),
+        (
+            "a transactor TLM target thread [TargetTlmThread]",
+            format!("transactor X bound to B\n    thread bus.go(addr: uint<32>)\n{RZ}    end thread\nend transactor X\n"),
+        ),
+        (
+            "a transactor `when active` method [when_active]",
+            format!(
+                "transactor X bound to B\n    when active\n        hookable go()\n{RZ}        end go\n    end when\nend transactor X\n"
+            ),
+        ),
+    ];
+
+    // The three name bindings a component body has and a test body does
+    // not. Each of these collected NOTHING before the scope was seeded.
+    let targets: [(&str, String); 3] = [
+        (
+            "a component field as the target",
+            format!("agent A\n    r : RegOp\n    hookable go()\n{RZ_R}    end go\nend agent A\n"),
+        ),
+        (
+            "a method parameter as the target",
+            format!("agent A\n    hookable go(r: RegOp)\n{RZ_R}    end go\nend agent A\n"),
+        ),
+        (
+            "an event payload as the target",
+            format!(
+                "agent A\n    req : event<RegOp>\n    on req(t)\n{RZ_T}    end on\nend agent A\n"
+            ),
+        ),
+    ];
+
+    for (what, body) in shapes.iter().chain(targets.iter()) {
+        let src = format!("{PRELUDE}\n{body}");
+        let parsed = harc::parser::parse_source(&src).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        let table = harc::solver::problem_table::build_component_scope_problem_table(&parsed);
+        let msgs: Vec<String> = table
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => {
+                    Some(format!("{v:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(table.entries.len(), 1, "{what}: site not collected");
+        assert!(
+            msgs.iter().any(|m| m.contains("RelationNamedArgMisplaced")),
+            "{what}: {msgs:?}"
+        );
+    }
+
+    // The `!w.disabled` guard on the watchdog arm is belt-and-braces,
+    // not a live filter, and this records why rather than leaving a
+    // reader to assume it is load-bearing: `watchdog disabled` takes no
+    // body at all — the parser refuses the first statement — so a
+    // disabled watchdog's `body` is always empty and would collect
+    // nothing with or without the guard. The guard stays so that
+    // allowing a body later cannot silently start refusing a block
+    // whose codegen is suppressed.
+    let disabled =
+        format!("{PRELUDE}\nagent A\n    watchdog disabled\n{RZ}    end watchdog\nend agent A\n");
+    let err = harc::parser::parse_source(&disabled).expect_err("`watchdog disabled` takes no body");
+    assert!(format!("{err:?}").contains("UnexpectedToken"), "{err:?}");
+}
+
+/// The two halves of a transactor share ONE name scope, and a name
+/// rebound to an unresolvable type stops resolving.
+///
+/// Both are the same mistake in different places: a scope assembled
+/// from the wrong set of declarations. `synth_component_from_
+/// transactor` concatenates a transactor's always-present items and its
+/// `when active` block, so a field declared in the shared half really
+/// is in scope inside `when active` — walking the halves as independent
+/// scopes made those bodies collect nothing at all. And a `let` or
+/// parameter whose type does not resolve must UNBIND the name a field
+/// seeded, not leave the field's type standing.
+#[test]
+fn a_component_scope_spans_both_transactor_halves_and_honours_shadowing() {
+    const PRELUDE: &str = "\
+bus B
+    tlm_method go(addr: uint<32>): blocking;
+end bus B
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
+";
+    const RZ_R: &str =
+        "            randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    let sites = |body: &str| {
+        let src = format!("{PRELUDE}\n{body}");
+        let parsed = harc::parser::parse_source(&src).unwrap_or_else(|e| panic!("{src}\n{e:?}"));
+        harc::solver::problem_table::build_component_scope_problem_table(&parsed)
+            .entries
+            .len()
+    };
+
+    // The field is in the SHARED half; the randomize is in `when
+    // active`. One scope spans both, so the site resolves.
+    assert_eq!(
+        sites(&format!(
+            "transactor X bound to B\n    r : RegOp\n    when active\n        hookable go()\n{RZ_R}        end go\n    end when\nend transactor X\n"
+        )),
+        1,
+        "a shared-half field is in scope inside `when active`"
+    );
+
+    // A `let` that rebinds the same name to a type this walk cannot
+    // resolve leaves it unresolved rather than falling back to the
+    // field's type — so the site is not collected under `RegOp`.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : RegOp\n    hookable go()\n        let r = 5\n{RZ_R}    end go\nend agent A\n"
+        )),
+        0,
+        "an untyped `let` shadows the field rather than inheriting its type"
+    );
+    // The same, via a parameter.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : RegOp\n    hookable go(r)\n{RZ_R}    end go\nend agent A\n"
+        )),
+        0,
+        "an untyped parameter shadows the field"
+    );
+    // Shadowing that DOES resolve still resolves — to the inner type.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : uint<8>\n    hookable go()\n        let r : RegOp\n{RZ_R}    end go\nend agent A\n"
+        )),
+        1,
+        "a typed `let` shadowing a non-transaction field resolves"
+    );
+}

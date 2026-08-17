@@ -103,6 +103,20 @@ pub enum LowerError {
     },
     /// Relation expansion is recursive.
     RecursiveRelation { name: String, span: Span },
+    /// Relation call gives an argument a name that does not match the
+    /// parameter at that position. `build_relation_subst` zips params
+    /// with args POSITIONALLY and drops the name, so
+    /// `Between(r, hi = 131072, lo = 65536)` substituted `lo := 131072`
+    /// and `hi := 65536` — inlining `addr >= 131072 && addr <= 65536`,
+    /// an unsatisfiable constraint, from a program written to mean the
+    /// opposite. Silent under both backends until this existed.
+    RelationNamedArgMisplaced {
+        name: String,
+        arg: String,
+        expected: Option<usize>,
+        found: usize,
+        span: Span,
+    },
     /// Generic catch-all for AST nodes the constraint sub-language does
     /// not allow at all (e.g. string literals, fork-call, time literals).
     DisallowedInConstraint { what: &'static str, span: Span },
@@ -1744,6 +1758,25 @@ fn expand_top_level_relation_call(
             name: name.to_string(),
             expected: rel.params.len(),
             found: args.len(),
+            span: call.span,
+        });
+        return Some(Vec::new());
+    }
+    // Checked BEFORE the substitution, which reads positions only. The
+    // params are right here, so there is no reason to bind by position
+    // while ignoring what the user wrote.
+    for (i, arg) in args.iter().enumerate() {
+        let CallArg::Named { name: arg_name, .. } = arg else {
+            continue;
+        };
+        if rel.params.get(i).is_some_and(|p| p.name == arg_name.name) {
+            continue;
+        }
+        ctx.record_error(LowerError::RelationNamedArgMisplaced {
+            name: name.to_string(),
+            arg: arg_name.name.clone(),
+            expected: rel.params.iter().position(|p| p.name == arg_name.name),
+            found: i,
             span: call.span,
         });
         return Some(Vec::new());
