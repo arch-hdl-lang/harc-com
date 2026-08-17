@@ -982,7 +982,7 @@ impl FuncBuilder<'_> {
         // name and a transactor field are disjoint namespaces).
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some(elem) = self.ctx.tseqs.get(&name.name) {
+                if let Some((elem, _)) = self.ctx.tseqs.get(&name.name) {
                     let seq_ty = elem.seq_type();
                     let call = self.lower_tseq_call(&name.name, args)?;
                     let id = self.declare(&l.name.name);
@@ -2353,14 +2353,21 @@ impl FuncBuilder<'_> {
         name: &str,
         args: &[crate::ast::CallArg],
     ) -> Result<Expr, LowerError> {
+        // v1 drops argument names and binds by position here too:
+        // measured, `RandomTxns(n = 5)` emits `RandomTxns(5)` against
+        // `auto RandomTxns = [&](uint64_t n)` — byte-identical to the
+        // positional call. The names ride in `ctx.tseqs` for this.
+        if let Some((_, declared)) = self.ctx.tseqs.get(name) {
+            let declared = declared.clone();
+            super::reject_misplaced_named_args(
+                args,
+                &declared,
+                &format!("tseq call `{name}(...)`"),
+            )?;
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let crate::ast::CallArg::Expr(e) = a else {
-                return Err(unsupported(
-                    &format!("named argument in tseq call `{name}`"),
-                    "tseq parameters are positional",
-                ));
-            };
+            let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Expr::Call(

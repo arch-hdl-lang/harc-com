@@ -4545,13 +4545,42 @@ case and only locally-determinable `Assign` types are compared).
     so a covergroup would report coverage against the wrong values with
     nothing to show for it.
 
-    When NEITHER registry resolves the callee there is no parameter list
-    to check a written name against, and the call keeps its blanket
-    refusal — the same rule as the `emit <ev>(...)` payload callers.
-    Refusing beats guessing a list.
+    The first version of this also wrote a fallback refusing every
+    named argument when neither registry resolved. **That arm was dead
+    code**, and the commit message described a behaviour it did not
+    implement: both call sites are inside `if let Some(...)` on those
+    same registries, so the lookup could not fail. (A callee in neither
+    registry is refused earlier, by the coverpoint call classifier — so
+    the *program* behaviour the message claimed was real; the arm
+    written to produce it was not.) The names are passed IN now, which
+    makes the fact structural rather than accidental.
 
-    That makes all six families measured and five converted; the sixth
-    (`emit <ev>(...)`) has no declaration to convert against.
+    A **seventh** family turned up in the same review: the `tseq` call.
+    Measured — `RandomTxns(n = 5)` emits `RandomTxns(5)` under v1,
+    byte-identical to positional, against
+    `auto RandomTxns = [&](uint64_t n)` — and converted the same way, by
+    carrying `TseqDecl::params` names in the `tseqs` map beside the
+    element type.
+
+    Two sites stay unconverted, and both for the same stated reason:
+    `emit <ev>(...)` (an event payload has no parameter list) and
+    `idle(N)` / `quiesced(N)`. The second is worth spelling out because
+    it looks inconsistent with `record_read`, which WAS given a
+    hand-written one-element list. The difference is whether a name
+    exists to check against: `record_read`'s `addr` is stated by the
+    compiler's own diagnostic and by `docs/ral-support.md`, while
+    `idle`'s arity message says "exactly one cycle-count argument" and
+    the docs write `idle(N)` with `N` a value placeholder. No parameter
+    name is stated anywhere, so guarding it would mean inventing one —
+    the `record_write` mistake. It stays as `bitbash` does.
+
+    The `emit` arm's ≥2-argument diagnostic also said "named arguments
+    in a component METHOD call". Every method caller now takes the
+    guarded path, so that branch is reachable only from the three `emit`
+    callers, and it was measured saying "method call" about
+    `emit tagger.in_ev(a = 1, b = 2)`. Reworded to "component call", the
+    wording the adjacent single-argument arm had already been given for
+    exactly this reason.
 
 ### The probe method
 

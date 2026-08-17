@@ -1655,7 +1655,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
-        let elem = tseq_records[&decl.name.name].clone();
+        let elem = tseq_records[&decl.name.name].0.clone();
         let id = FunctionId(prog.functions.len() as u32);
         let f = tseqs::lower_tseq(id, decl, elem, &tseq_ctx, &helper_registry, &side_tables)?;
         prog.functions.push(f);
@@ -2553,7 +2553,7 @@ fn lower_test(
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
-    tseq_records: &HashMap<String, TseqElem>,
+    tseq_records: &HashMap<String, (TseqElem, Vec<String>)>,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
@@ -4981,8 +4981,24 @@ pub(crate) fn reject_misplaced_named_args(
         // emits, so the name changes nothing and there is no swap to
         // describe. Reporting one would be a false explanation of a
         // pre-existing arity gap — the exact failure mode this guard was
-        // rewritten to stop producing. Call sites that check arity
-        // themselves never reach this branch anyway.
+        // rewritten to stop producing.
+        //
+        // An earlier version of this comment claimed call sites check
+        // arity first so the branch is unreachable. That is false at
+        // exactly two of them: `lower_extern_fn_call` has no arity check
+        // anywhere in the pipeline, and TB-IR never checks
+        // component-method arity (`axil_write(t.value)` lowers). Both
+        // reach here, and both LOSE a diagnostic they used to give:
+        // `ref_add(b = 2, a = 1, 3)` reported a swap before and lowers
+        // now.
+        //
+        // Measured before accepting that: the two backends emit the same
+        // arguments in the same order for those calls
+        // (`ref_add(2, 1, 3)` under both), and both outputs are
+        // uncompilable against the emitted signature, so the C++
+        // compiler catches it and nothing runs silently wrong. The
+        // trade is a diagnostic for a pre-existing SHARED arity gap, not
+        // a new v1/TB-IR divergence.
         if args.len() != declared.len() {
             continue;
         }
@@ -5588,7 +5604,14 @@ pub(crate) struct LowerCtx {
     /// `CallTarget::Tseq` whose result types the local as the element's
     /// `RecordSeq`/`Seq` (`TseqElem::seq_type`), and a `for t in txns` over
     /// such a local lowers to a counted loop over `txns`.
-    pub tseqs: HashMap<String, TseqElem>,
+    /// tseq name -> (element type, declared parameter NAMES).
+    ///
+    /// The names ride along for the same reason
+    /// `TransactorMethodSchema::param_names` carries them: the call site
+    /// lowers from this map alone, and without the names it could only
+    /// refuse every named argument — including the in-order form v1
+    /// emits byte-identically.
+    pub tseqs: HashMap<String, (TseqElem, Vec<String>)>,
     /// DUT-internal `probe` declarations on `let dut` (probe name →
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with

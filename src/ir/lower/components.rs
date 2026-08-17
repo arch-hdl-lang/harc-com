@@ -3135,8 +3135,15 @@ impl super::FuncBuilder<'_> {
                          is no other position, so it emits exactly the positional form",
                     ));
                 }
+                // "component call", not "method call": every method
+                // caller now passes `declared` and takes the guarded
+                // path above, so this is reached ONLY from the
+                // `emit <ev>(...)` payload callers. The single-argument
+                // arm was already worded that way for the same reason;
+                // this one said "method call" and was measured saying
+                // it about `emit tagger.in_ev(a = 1, b = 2)`.
                 return Err(not_implemented(
-                    "named arguments in a component method call",
+                    "named arguments in a component call",
                     "v1 ignores argument names and binds strictly by position, so names \
                      written out of declaration order silently SWAP the values",
                     V1Status::SilentlyMisLowers,
@@ -3329,6 +3336,16 @@ impl super::FuncBuilder<'_> {
             // positional binding lands the value in the only slot there
             // is and emits code identical to the positional form. No
             // reordering hazard exists here.
+            // Deliberately NOT name-checked, unlike `record_read`, which
+            // was given a hand-written `["addr"]` so that an unknown
+            // name becomes `Invalid`. The difference is whether there
+            // is a name to check AGAINST: the compiler's own arity
+            // message here says "exactly one cycle-count argument" and
+            // the docs write `idle(N)`, where `N` is a value
+            // placeholder — no parameter name is stated anywhere.
+            // `record_read`'s `addr` came from the compiler's own
+            // diagnostic AND the docs. Inventing one here is the
+            // `record_write` mistake, so this stays as `bitbash` does.
             return Err(unsupported(
                 &format!("a named argument to `{}`", name.name),
                 "v1 ignores the name and binds by position; with one parameter that is \
