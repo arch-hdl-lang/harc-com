@@ -2678,6 +2678,94 @@ case and only locally-determinable `Assign` types are compared).
     backends emit — which pins the `.poke` rejection on the method name
     rather than on the call site being new.
 
+44. **Addrmap and regblock addresses now fold — the last two
+    fold-to-zero sites closed (2026-08-17).**
+
+    Divergences 39 and 41 found the two places where v1 does not reject
+    a non-literal address; it accepts one and yields ZERO:
+
+    | site | what v1 emits |
+    |---|---|
+    | addrmap `@ <base>` | `AxilHelper_write(helper, (0 + 0x18), …)` — the write lands at 0x18 instead of 0x78 |
+    | addrmap `size` | the window collapses to 0, so the overlap check stops firing |
+    | regblock `@ <addr>` | table entry `{ "SRC", 0, 32 }` and decode `addr == 0` — the register aliases offset 0 |
+    | regblock `reset` | `uint32_t CTRL = 0;` — the mirror starts wrong and every readback compares against it |
+
+    All four now fold through the file constant table, via a shared
+    `fold_addr_const` that is the address counterpart to
+    `components::fold_field_default` (divergence 35). The two differ in
+    exactly the way their call sites do: a field default carries a
+    `TypeExpr` and is range-checked against it, an address carries none
+    and is checked against zero instead.
+
+    **This puts TB-IR ahead of v1 rather than level with it**, which
+    changes what a test can assert. A program using a folded address
+    cannot go in `tests/tbir_equiv_fixtures.txt` — the two backends
+    genuinely disagree, because one of them is wrong — so the registry
+    cannot be the end-to-end evidence here the way it is for a closed
+    gap.
+
+    What replaces it: every folding spelling is asserted **byte-identical
+    to the literal it computes**, against `regblock_subset_test` and the
+    self-contained addrmap testbench. Byte-identity with a program CI
+    already runs under Verilator is the end-to-end argument — the fold
+    emits exactly the translation unit the registered fixture emits — and
+    the paired `assert_ne!` against a different constant is what stops
+    that equality from being the value silently dropped. v1's
+    fold-to-zero is pinned in the same tests, so a change to it is caught
+    rather than assumed.
+
+    Folding also widened the accepted set, which needed two checks the
+    literals-only gate never had to make:
+
+    * a **negative** address (`const B = 0 - 8`) is `Invalid` — an
+      address cannot be negative under any backend;
+    * a **reset wider than the register** (`const R = 4294967296` on a
+      `uint<32>`) is `Invalid`. A literal past the width used to be
+      caught downstream by C++ narrowing; a `const` reaches lowering
+      first, so lowering checks it.
+
+    That is the same failure mode divergence 36 recorded for the field
+    defaults, arriving a second time at a different site. Worth stating
+    as a rule: **whenever a fold replaces a literals-only gate, the range
+    check the literal got for free has to be written by hand.**
+
+    A shape that still does not fold (`@ dut.count_out`) stays
+    `SilentlyMisLowers`, not `Rejects`: v1 accepts it and emits address
+    0, so pointing the user there would hand them a register at the
+    wrong address.
+
+    **One shape here is the exception, and rule 6 caught it twice.**
+    A Verilog-sized literal (`@ 32'h18`) is `Unsupported` — pointing at
+    v1 — because TB-IR lowers sized literals NOWHERE (`let z = 32'h18`
+    is refused the same way) while v1's `c_int_literal` emits
+    `{ "SRC", 0x18, 32 }`, correctly. Sweeping it into the
+    `SilentlyMisLowers` mapping with everything else that will not fold
+    would have replaced a correct diagnostic with a false claim about
+    v1. That was the first catch.
+
+    The next two came from the fix, and both were the SAME
+    over-generalization from that one probe:
+
+    * having probed `32'h18`, the obvious move is a walk over the
+      expression tree so `32'h10 + 0x08` is classified by its literal
+      too. **Wrong** — v1's `c_int_literal_from` matches `ExprKind::Int`
+      and nothing else, so a sized literal inside an expression, and
+      even a parenthesised one, falls to its `"0"` arm. `@ 32'h18` and
+      `@ (32'h18)` are opposite classifications.
+    * the equally obvious "any literal `parse_int_literal` rejects" test
+      is also wrong: an over-wide literal (`0x10000000000000000`) is
+      unreadable by that parser too, but v1 emits it as a `_harc_u128`
+      composite that truncates into the 64-bit table field —
+      `{ "SRC", (((_harc_u128)0x1ULL << 64) | ...), 32 }`, offset 0
+      again.
+
+    So the arm is narrowed twice, top-level AND sized-only, each
+    narrowing pinned by a test that reads v1's actual table entry.
+    One arm, one probe, three wrong generalizations available from it —
+    first by not looking, then twice by reasoning outward from a single
+    look instead of running the next probe.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

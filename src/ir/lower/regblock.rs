@@ -41,6 +41,8 @@
 //!     `on regs.REG` write callbacks (see `detect_regblock_residual`),
 //!   * `addrmap` composition (incl. `alias of`).
 
+use std::collections::HashMap;
+
 use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
@@ -68,6 +70,7 @@ pub(crate) struct RegblockBindingCtx {
 pub(crate) fn lower_regblock(
     r: &RegblockDecl,
     record: RecordId,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<(RecordSchema, RegblockSchema), LowerError> {
     let name = &r.name.name;
     let default_w = r.default_width.unwrap_or(32);
@@ -121,35 +124,43 @@ pub(crate) fn lower_regblock(
                 access: lower_access(fld.access),
             });
         }
-        let offset = fold_offset(name, rname, &reg.offset)?;
+        let offset = super::fold_addr_const(
+            &reg.offset,
+            consts,
+            &format!("`@ <addr>` offset on regblock `{name}` register `{rname}`"),
+        )?;
         let reset = match &reg.reset {
             None => None,
+            // A reset value is not an address, but it folds through the
+            // same helper: it has no declared type of its own (the
+            // register's `width` is checked below, against the folded
+            // value), and v1 gets it wrong the same way — `reset R` with
+            // `const R = 7` emits `uint32_t CTRL = 0;`, so the mirror
+            // starts at the wrong value and every readback compares
+            // against it.
             Some(rv) => match &*rv.kind {
-                ExprKind::Int(s) => Some(super::exprs::parse_int_literal(s).ok_or_else(|| {
-                    unsupported(
-                        &format!("regblock `{name}` register `{rname}` reset value `{s}`"),
-                        "not a plain integer literal",
-                    )
-                })?),
                 ExprKind::Bool(b) => Some(*b as u64),
-                _ => {
-                    // v1 folds a non-literal reset to ZERO: `reset R`
-                    // with `const R = 7` emits `uint32_t CTRL = 0;`, so
-                    // the mirror starts at the wrong value and every
-                    // readback compares against it. Verified by
-                    // mutating `regblock_subset_test` (registered,
-                    // passing under both backends) one token at a time.
-                    return Err(not_implemented(
-                        &format!(
-                            "a non-literal reset value on regblock `{name}` register `{rname}`"
-                        ),
-                        "v1 folds it to 0, so the register mirror silently resets to the \
-                         wrong value",
-                        V1Status::SilentlyMisLowers,
-                    ));
-                }
+                _ => Some(super::fold_addr_const(
+                    rv,
+                    consts,
+                    &format!("reset value on regblock `{name}` register `{rname}`"),
+                )?),
             },
         };
+        // The mirror is `uint<width>`, so a reset the register cannot
+        // hold is a program error under every backend rather than a
+        // subset gap. A literal past the width was previously caught by
+        // C++ narrowing; folding makes it reachable with a `const`, so
+        // it is checked here instead.
+        if let Some(rv) = reset {
+            if width < 64 && rv >= (1u64 << width) {
+                return Err(LowerError::Invalid(format!(
+                    "the reset value on regblock `{name}` register `{rname}` is {rv}, which does \
+                     not fit its {width}-bit width (max {})",
+                    (1u64 << width) - 1
+                )));
+            }
+        }
         let access = lower_access(reg.access);
         fields.push(RecordFieldSchema {
             name: rname.clone(),
@@ -213,31 +224,6 @@ fn lower_access(a: AstRegAccess) -> RegAccess {
         AstRegAccess::Rw => RegAccess::Rw,
         AstRegAccess::Ro => RegAccess::Ro,
         AstRegAccess::Wo => RegAccess::Wo,
-    }
-}
-
-/// Fold a register's `@ <addr>` offset to a constant. Only plain integer
-/// literals are lowered (v1 const-folds arbitrary expressions; the
-/// corpus uses literals exclusively).
-fn fold_offset(block: &str, reg: &str, e: &crate::ast::Expr) -> Result<u64, LowerError> {
-    match &*e.kind {
-        ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-            unsupported(
-                &format!("regblock `{block}` register `{reg}` offset `{s}`"),
-                "not a plain integer literal",
-            )
-        }),
-        // Same fold-to-zero as the reset value above, and worse: the
-        // address TABLE entry becomes `{ "SRC", 0, 32 }` and the decode
-        // becomes `addr == 0`, so the register aliases whatever lives
-        // at offset 0. Reads and writes silently hit the wrong
-        // register.
-        _ => Err(not_implemented(
-            &format!("a non-literal `@ <addr>` offset on regblock `{block}` register `{reg}`"),
-            "v1 folds it to 0, so the register aliases offset 0 and the address decode \
-             sends its reads and writes to the wrong register",
-            V1Status::SilentlyMisLowers,
-        )),
     }
 }
 

@@ -22,10 +22,21 @@
 //! overlap`: alias targets must exist, must not themselves be aliases
 //! (no chains), must reference the same regblock type, and sized windows
 //! must not overlap.
+//!
+//! `@ <base>` and `size` fold through the file constant table
+//! (`fold_addr_const`), so `@ BASE + 0x10` means what it says. v1 does
+//! NOT: its own fold accepts any expression and yields ZERO, emitting
+//! `AxilHelper_write(helper, (0 + 0x18), …)` for `@ 0x50 + 0x10` — a
+//! write to the wrong register, with no diagnostic. A non-literal `size`
+//! collapses the same way there, taking the overlap check with it. This
+//! is one of the places TB-IR is AHEAD of v1 rather than catching up, so
+//! a program using it is deliberately absent from
+//! `tests/tbir_equiv_fixtures.txt`: the two backends do not agree,
+//! because one of them is wrong.
 
 use std::collections::HashMap;
 
-use super::{not_implemented, unsupported, LowerError, V1Status};
+use super::{unsupported, LowerError};
 use crate::ast::{AddrmapDecl, ExprKind};
 use crate::ir::{Expr, RecordId, RegRegisterSchema};
 
@@ -76,6 +87,7 @@ pub(crate) fn build_binding_ctx(
     helper_field: &str,
     record_of: &HashMap<String, RecordId>,
     regblock_registers: &HashMap<String, Vec<RegRegisterSchema>>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<AddrmapBindingCtx, LowerError> {
     // First pass: resolve each instance's base, regblock type, register
     // table, and validate alias targets.
@@ -88,32 +100,21 @@ pub(crate) fn build_binding_ctx(
                 inst.name.name
             )));
         }
-        let base = fold_const(&inst.base_addr).ok_or_else(|| {
-            not_implemented(
-                &format!(
-                    "a non-literal `@ <base>` on addrmap `{chip}` instance `{}`",
-                    inst.name.name
-                ),
-                "v1 accepts a non-literal here and folds it to ZERO — `@ 0x50 + 0x10` \
-                 emits a write to base 0 — so the testbench pokes the wrong \
-                 register rather than failing",
-                V1Status::SilentlyMisLowers,
-            )
-        })?;
+        let base = super::fold_addr_const(
+            &inst.base_addr,
+            consts,
+            &format!(
+                "`@ <base>` on addrmap `{chip}` instance `{}`",
+                inst.name.name
+            ),
+        )?;
         let size = match &inst.size {
             None => None,
-            Some(e) => Some(fold_const(e).ok_or_else(|| {
-                not_implemented(
-                    &format!(
-                        "a non-literal `size` on addrmap `{chip}` instance `{}`",
-                        inst.name.name
-                    ),
-                    "v1 accepts a non-literal here and folds it to ZERO, so the \
-                     declared window collapses and the overlap check it exists for \
-                     silently stops firing",
-                    V1Status::SilentlyMisLowers,
-                )
-            })?),
+            Some(e) => Some(super::fold_addr_const(
+                e,
+                consts,
+                &format!("`size` on addrmap `{chip}` instance `{}`", inst.name.name),
+            )?),
         };
         if !regblock_registers.contains_key(&inst.regblock_ty.name) {
             return Err(LowerError::Invalid(format!(
@@ -179,8 +180,22 @@ pub(crate) fn build_binding_ctx(
             let (Some(asz), Some(bsz)) = (asize, bsize) else {
                 continue;
             };
-            let aend = abase + asz;
-            let bend = bbase + bsz;
+            // `checked_add`: a base and size are now folded, not
+            // literal, so `@ B size S` can reach values whose sum
+            // overflows. An unchecked add panics in debug and wraps in
+            // release — the wrap silently defeating the very overlap
+            // check this loop is.
+            let window_end = |inst: &crate::ast::InstanceDecl, base: &u64, sz: &u64| {
+                base.checked_add(*sz).ok_or_else(|| {
+                    LowerError::Invalid(format!(
+                        "addrmap `{chip}`: instance `{}` window 0x{base:x} + 0x{sz:x} overflows \
+                         a 64-bit address",
+                        inst.name.name
+                    ))
+                })
+            };
+            let aend = window_end(a, abase, asz)?;
+            let bend = window_end(b, bbase, bsz)?;
             if *abase < bend && *bbase < aend {
                 return Err(LowerError::Invalid(format!(
                     "addrmap `{chip}`: instance windows `{}` (0x{abase:x}..0x{aend:x}) and `{}` \
@@ -198,14 +213,26 @@ pub(crate) fn build_binding_ctx(
     for inst in &order {
         let (base, _, ty) = &bases[&inst.name.name];
         let regs = &regblock_registers[ty];
-        // Pre-shift register offsets by the instance base.
+        // Pre-shift register offsets by the instance base. Checked for
+        // the same reason as the window ends above: both operands are
+        // folded now, so their sum can leave the 64-bit address space,
+        // and a wrapped offset would emit a real bus write to a
+        // plausible-looking wrong address.
         let registers: Vec<RegRegisterSchema> = regs
             .iter()
-            .map(|r| RegRegisterSchema {
-                offset: base + r.offset,
-                ..r.clone()
+            .map(|r| {
+                Ok(RegRegisterSchema {
+                    offset: base.checked_add(r.offset).ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "addrmap `{chip}`: instance `{}` base 0x{base:x} + register `{}` \
+                             offset 0x{:x} overflows a 64-bit address",
+                            inst.name.name, r.name, r.offset
+                        ))
+                    })?,
+                    ..r.clone()
+                })
             })
-            .collect();
+            .collect::<Result<_, LowerError>>()?;
         let mirror_key = match &inst.alias_of {
             Some(t) => instance_mirror_key(chip, &t.name),
             None => {
@@ -227,27 +254,6 @@ pub(crate) fn build_binding_ctx(
         instances,
         mirror_inits,
     })
-}
-
-/// Fold a base/size `Expr` to a constant. Only plain integer literals
-/// are lowered.
-///
-/// The comment this replaces said v1 "const-folds arbitrary
-/// expressions". It does not: `@ 0x50 + 0x10` folds to ZERO there, and
-/// v1 emits a write to base 0 (`AxilHelper_write(helper, (0 + 0x18), …)`)
-/// instead of 0x60. A non-literal `size` collapses the same way, taking
-/// the overlap check with it. Hence the `SilentlyMisLowers` on both
-/// arms rather than a pointer at `--codegen v1`.
-///
-/// Folding constants here (as the component/scoreboard/transactor field
-/// defaults now do, divergence 35) would put TB-IR ahead of v1 and is
-/// the natural next step; it needs the file constant table threaded to
-/// this call site.
-fn fold_const(e: &crate::ast::Expr) -> Option<u64> {
-    match &*e.kind {
-        ExprKind::Int(s) => super::exprs::parse_int_literal(s),
-        _ => None,
-    }
 }
 
 impl super::FuncBuilder<'_> {
