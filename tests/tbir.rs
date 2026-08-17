@@ -17265,12 +17265,15 @@ impl ParamTest for ParamTb
 end impl ParamTest
 "#;
     // One shape, two landings: `agent` reaches the composite-component
-    // arm and `transactor ... active` the analysis-source one.
+    // arm and `transactor ... passive` the analysis-source one. This
+    // transactor has only an always-on analysis surface, so `active` would
+    // violate the analysis-source mode contract before the parameter
+    // landing under test is reached.
     for (kind, mode, construct) in [
         ("agent", "", "parameters on `Tagger`"),
         (
             "transactor",
-            "active",
+            "passive",
             "generic parameters on analysis-source `Tagger`",
         ),
     ] {
