@@ -2623,7 +2623,11 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
                 if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
                     if let Some(w) = type_arg_width(args) {
-                        if e.let_widths.insert(l.name.name.clone(), w).is_some() {
+                        let lw = LetWidth {
+                            bits: w,
+                            signed: matches!(name, BuiltinTy::SInt),
+                        };
+                        if e.let_widths.insert(l.name.name.clone(), lw).is_some() {
                             e.shadowed_lets.insert(l.name.name.clone());
                         }
                     }
@@ -5978,15 +5982,23 @@ struct Emitter {
     /// `randomize_T()` function to call. Populated by `let t : T` and
     /// function parameters.
     let_types: std::collections::HashMap<String, String>,
-    /// Per-test bit-widths for `let X : uint<W>` (and sint/bits)
-    /// declarations. Used by the width-method intrinsics
+    /// Per-test declared width AND signedness for `let X : uint<W>` (and
+    /// sint/bits) declarations. Used by the width-method intrinsics
     /// (`.trunc<N>()` / `.zext<N>()` / `.sext<N>()` / `.resize<N>()`)
     /// to (a) reject wrong-direction casts at codegen time and (b)
     /// give sext the correct source-width for its shift-fill. Lets
     /// without an explicit type (`let x = expr`) don't populate this
     /// map — width-direction checks then fall back to best-effort
     /// inference on the RHS expression.
-    let_widths: std::collections::HashMap<String, u32>,
+    ///
+    /// The `signed` half is what lets a signed local compare signed inside
+    /// a `blocking randomize` constraint (harc#563). It lives HERE, on the
+    /// existing entry, rather than in a table of its own: harc#550 removed
+    /// a flat `let_signed_widths` because a signed local in one function
+    /// poisoned the name for every other, and a fourth parallel table keyed
+    /// the same way would reintroduce exactly that failure. One entry per
+    /// name cannot disagree with itself.
+    let_widths: std::collections::HashMap<String, LetWidth>,
     /// DUT top-module port-name → per-lane bit-width for ports that
     /// flatten to a PACKED SystemVerilog vector (`Vec<Bus, N>` /
     /// multi-lane bus ports). Forwarded from `EmitOpts::vec_lane_widths`
@@ -10423,7 +10435,7 @@ impl Emitter {
                 };
                 v.map(|v| if v == 0 { 1 } else { 64 - v.leading_zeros() })
             }
-            ExprKind::Ident(id) => self.let_widths.get(&id.name).copied(),
+            ExprKind::Ident(id) => self.let_widths.get(&id.name).map(|lw| lw.bits),
             _ => None,
         }
     }
@@ -10478,7 +10490,7 @@ impl Emitter {
     /// emit `HarcWide<7> b = a;` for a 256-bit `a` (which does not
     /// compile) and silently accept the ≤64-bit cases.
     fn check_scalar_assign_width(&mut self, name: &str, value: &Expr) {
-        let Some(dw) = self.let_widths.get(name).copied() else {
+        let Some(dw) = self.let_widths.get(name).map(|lw| lw.bits) else {
             return;
         };
         if dw == 0 {
@@ -15119,23 +15131,74 @@ impl Emitter {
     ) -> bool {
         let recur = |inner| self.constraint_expr_is_signed(inner, field_info, target_root);
         match &*e.kind {
-            ExprKind::Ident(id) => field_info.get(&id.name).map(|f| f.signed).unwrap_or(false),
+            // A transaction field first; failing that, a `let` inlined from
+            // the surrounding scope under `blocking randomize`.
+            //
+            // `let_widths` carries the declared signedness precisely so this
+            // needs no table of its own: harc#550 removed a flat
+            // `let_signed_widths` because a signed local in one function
+            // poisoned the name for every other, and harc#563 asks for the
+            // declared signedness to be threaded rather than for that
+            // mistake to be repeated. Without this, `t.x < s` on a
+            // `let s : sint<8> = 0 - 1` emitted `z3::ult(_z_x, 0xFFFF...)`,
+            // true for every `x`, where the source `x < -1` forbids all of
+            // them — the solver returned a value the source excludes.
+            ExprKind::Ident(id) => field_info
+                .get(&id.name)
+                .map(|f| f.signed)
+                .or_else(|| self.let_widths.get(&id.name).map(|lw| lw.signed))
+                .unwrap_or(false),
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))
                 .map(|f| f.signed)
                 .unwrap_or(false),
+            // A list ELEMENT carries the list's signedness. Without this
+            // arm `v < 0` over a `list<sint<8>>` emitted `z3::ult(_z_vals_0,
+            // 0)` — unsigned, and so unsatisfiable for every value, where
+            // the source is satisfied by any negative element (harc#563).
+            // Resolved the same way `constraint_expr_width`'s `Index` arm
+            // does, so the two agree about what a subscript denotes: a list
+            // element, or a bit-select on a scalar. A bit-select is one
+            // unsigned bit, hence `false`.
+            // Note `elem_signed`, not `signed`: a list field's own `signed`
+            // is about the list, and is false for `list<sint<8>>`. The
+            // element's signedness lives on `ListFieldInfo`, which is why
+            // reading the obvious field here still emitted `ult`.
+            ExprKind::Index { target, .. } => {
+                list_field_name_from_expr(target, field_info, target_root)
+                    .and_then(|field| field_info.get(&field))
+                    .and_then(|f| f.list.as_ref())
+                    .map(|l| l.elem_signed)
+                    .unwrap_or(false)
+            }
             ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => recur(inner),
             ExprKind::Binary { lhs, rhs, .. } => recur(lhs) || recur(rhs),
             ExprKind::Membership { expr, .. } => recur(expr),
+            // A `const` and an enum variant are always emitted as a
+            // non-negative `uint64_t`, so unsigned is correct for those.
             _ => false,
         }
     }
 
-    /// Translate a HARC expression to a z3++ C++ expression. Field accesses
-    /// `t.<name>` resolve to the per-field `_z_<name>` Z3 var declared in
-    /// the surrounding solver block. Integer literals become `_ctx.bv_val(N, W)`
-    /// at the field's width inferred from context. v0 is permissive — any
-    /// untranslatable form falls back to a comment + `_ctx.bool_val(true)`.
+    /// A `${...}` capture that does not parse as an expression.
+    ///
+    /// This used to `write!(self.out, "{}", cap.expr)` — the raw HARC text,
+    /// straight into the generated C++, so `log(info, "b=${1 +}")` emitted
+    /// `harc_printf_ll(1 +)` and the user's first sign of trouble was their
+    /// C++ compiler complaining about a line they never wrote (harc#593).
+    ///
+    /// The parser now rejects such a capture, so this should be
+    /// unreachable. It stays as a fail-closed backstop: an error plus a
+    /// value that at least compiles, rather than a silent paste that does
+    /// not.
+    fn reject_unparseable_capture(&mut self, expr: &str) {
+        self.errors.push(format!(
+            "`${{{expr}}}` is not an expression; an interpolation holds one complete \
+             expression, optionally followed by `:` and a format spec"
+        ));
+        write!(self.out, "0").ok();
+    }
+
     /// A resolvable target field that is not a flag cannot be a whole
     /// constraint. Its own arm cannot express this — `Ident` and `Field`
     /// match earlier in `emit_constraint_bool_expr_w` than any guard could
@@ -15640,6 +15703,11 @@ impl Emitter {
         write!(self.out, " & harc_z3_bv_value(_ctx, {mask}, {width}))").ok();
     }
 
+    /// Translate a HARC expression to a z3++ C++ expression. Field accesses
+    /// `t.<name>` resolve to the per-field `_z_<name>` Z3 var declared in
+    /// the surrounding solver block. Integer literals become `_ctx.bv_val(N, W)`
+    /// at the field's width inferred from context. v0 is permissive — any
+    /// untranslatable form falls back to a comment + `_ctx.bool_val(true)`.
     fn emit_constraint_expr_w(
         &mut self,
         e: &Expr,
@@ -16497,9 +16565,7 @@ impl Emitter {
                 }
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
-                    Err(_) => {
-                        write!(self.out, "{}", cap.expr).ok();
-                    }
+                    Err(_) => self.reject_unparseable_capture(&cap.expr),
                 }
                 write!(self.out, ", {width}, {upper_str})").ok();
             }
@@ -16512,9 +16578,7 @@ impl Emitter {
                 write!(self.out, "harc_rt::harc_printf_ll(").ok();
                 match crate::parser::parse_expr_fragment(&cap.expr) {
                     Ok(e) => self.emit_expr(&e),
-                    Err(_) => {
-                        write!(self.out, "{}", cap.expr).ok();
-                    }
+                    Err(_) => self.reject_unparseable_capture(&cap.expr),
                 }
                 write!(self.out, ")").ok();
             }
@@ -17332,7 +17396,11 @@ impl Emitter {
                             ));
                         }
                     }
-                    if self.let_widths.insert(l.name.name.clone(), dw).is_some() {
+                    let lw = LetWidth {
+                        bits: dw,
+                        signed: matches!(name, BuiltinTy::SInt),
+                    };
+                    if self.let_widths.insert(l.name.name.clone(), lw).is_some() {
                         self.shadowed_lets.insert(l.name.name.clone());
                     }
                 }
@@ -20036,6 +20104,14 @@ fn wide_literal_bit_width(s: &str) -> Option<u32> {
     let lead_bits = 32 - lead.leading_zeros();
     let bits = (trimmed.len() as u32 - 1) * bits_per_digit + lead_bits;
     (bits > 64).then_some(bits)
+}
+
+/// Declared width and signedness of a typed `let`. See `Emitter::let_widths`
+/// for why signedness rides on this entry rather than in its own table.
+#[derive(Clone, Copy, Debug)]
+struct LetWidth {
+    bits: u32,
+    signed: bool,
 }
 
 /// A one-bit UNSIGNED scalar field, the only field shape that reads as a
