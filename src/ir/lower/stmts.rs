@@ -10,6 +10,59 @@ use crate::ir::{
     Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, TbFunction, Terminator,
 };
 
+/// Does a hooked `on <obj>.<method>` path name a real `hookable`?
+///
+/// v1's own condition, and the same one the test-scope arm in `mod.rs`
+/// applies: the receiver must be a transactor or component testbench
+/// field, and the trailing segment must be a `hookable` method on it.
+/// A shape test cannot answer this — `drv.plain` and `nosuch.send` are
+/// the same SHAPE as `drv.send` and v1 refuses them.
+fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHandler) -> bool {
+    fn path(e: &crate::ast::Expr) -> Option<Vec<String>> {
+        match &*e.kind {
+            ExprKind::Ident(id) => Some(vec![id.name.clone()]),
+            ExprKind::Field { target, name } => {
+                let mut p = path(target)?;
+                p.push(name.name.clone());
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+    let Some(segs) = path(&h.event) else {
+        return false;
+    };
+    // Strip the desugarer's `_tb` root locally rather than through
+    // `strip_tb_prefix`, which only strips ahead of a COMPONENT field —
+    // the field here is usually a transactor (`_tb.drv.send`), so the
+    // shared helper leaves the path three segments long and every path
+    // then fails the two-segment test below. Widening the shared helper
+    // would change what its other callers resolve.
+    let segs: &[String] = if segs.len() >= 2
+        && Some(segs[0].as_str()) == b.ctx.tb_field.as_deref()
+        && (b.ctx.transactor_fields.contains_key(&segs[1])
+            || b.ctx.component_fields.contains_key(&segs[1]))
+    {
+        &segs[1..]
+    } else {
+        &segs
+    };
+    // Exactly `<field>.<method>`: a longer path (`drv.send.x`) is a
+    // nested reach v1's resolver does not walk here.
+    let [field, method] = segs else { return false };
+    let hookable_on = |methods: &[crate::ir::ComponentMethodSchema]| {
+        methods.iter().any(|m| m.name == *method && m.hookable)
+    };
+    if let Some(xid) = b.ctx.transactor_fields.get(field) {
+        let x = &b.ctx.transactors[xid.index()];
+        return x.methods.iter().any(|m| m.name == *method);
+    }
+    b.ctx
+        .component_fields
+        .get(field)
+        .is_some_and(|cid| hookable_on(&b.ctx.components[cid.index()].methods))
+}
+
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
         self.ensure_open_block();
@@ -2675,6 +2728,32 @@ impl FuncBuilder<'_> {
                     "a hook side names a method to wrap; v1 routes every hooked `on` through \
                      its method-hook resolver and refuses a trigger that is not an \
                      `<obj>.<method>` path",
+                    V1Status::Rejects,
+                ));
+            }
+            // Shape is not resolution, and this arm used to stop at
+            // shape. `is_v1_method_hook_shape` accepts any dotted path
+            // of the right length, so `drv.send.x`, `nosuch.send`,
+            // `drv.plain` and `dut.rst.x` all reached the suggestion
+            // below — and MEASURED, v1 refuses every one of them with
+            // "obj.method must resolve to a `hookable` on a known
+            // component type", while the resolving `drv.send` emits.
+            // So the suggestion was honest for exactly one of the five
+            // and misdirection for the rest.
+            //
+            // This is v1's own condition, and it is the same check the
+            // test-scope arm in `mod.rs` makes: does `<obj>.<method>`
+            // name a `hookable` on a transactor or component testbench
+            // field? Checked in the recoverable direction — a miss
+            // yields the honest `Rejects`, and a hit only ever upgrades
+            // to the suggestion.
+            let resolves = hook_path_names_a_hookable(self, h);
+            if !resolves {
+                return Err(not_implemented(
+                    "a `pre`/`post` hook whose path names no `hookable` in statement position",
+                    "v1 routes every hooked `on` through its method-hook resolver and \
+                     refuses a path that does not resolve to a `hookable` on a known \
+                     component type, so it is not a way to run this program",
                     V1Status::Rejects,
                 ));
             }

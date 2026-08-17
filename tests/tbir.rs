@@ -18819,3 +18819,60 @@ fn a_covergroup_helper_call_judges_a_named_argument_by_its_position() {
         assert_invalid(&lower_src(&src("pick(nosuch = dut.count_out[3:0], b = 1)")).unwrap_err());
     assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
 }
+
+/// A hooked `on` in statement position is judged by whether its path
+/// RESOLVES, not by its shape.
+///
+/// `is_v1_method_hook_shape` accepts any dotted path of the right
+/// length, so `drv.send.x`, `nosuch.send`, `drv.plain` and `dut.rst.x`
+/// all reached the `--codegen v1` suggestion. Measured: v1 refuses
+/// every one of them ("obj.method must resolve to a `hookable` on a
+/// known component type") while the resolving `drv.send` emits. The
+/// suggestion was honest for exactly one of the five.
+///
+/// The gate is v1's own condition and the same one the test-scope arm
+/// applies. It is checked in the recoverable direction: a miss yields
+/// the honest `Rejects`, a hit only ever upgrades to the suggestion.
+#[test]
+fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
+    let fixture = fixture("axilite_hooks_test.harc");
+    const ANCHOR: &str = "        log(info, \"AxiLiteRegs pre/post hooks test\")";
+    assert!(fixture.contains(ANCHOR), "fixture shape changed");
+    let with = |path: &str| {
+        fixture.replacen(
+            ANCHOR,
+            &format!(
+                "{ANCHOR}\n        on {path} pre\n            pre_count = pre_count + 1\n\
+                 \x20       end on"
+            ),
+            1,
+        )
+    };
+
+    // The one that resolves: v1 EMITS, so `--codegen v1` is a real
+    // escape hatch and the arm keeps its suggestion.
+    cpp_tb::emit(&merged_src(&with("drv.send"))).expect("v1 emits a resolving hook path");
+    let msg = assert_unsupported(&lower_src(&with("drv.send")).unwrap_err());
+    assert!(msg.contains("hook in statement position"), "{msg}");
+
+    // The four that do not. Same SHAPE, and v1 refuses each one, so a
+    // suggestion would send the user to a second error.
+    for (what, path) in [
+        ("a path one segment too long", "drv.send.x"),
+        ("an undeclared receiver", "nosuch.send"),
+        ("a real receiver with no such method", "drv.plain"),
+        ("a DUT port path", "dut.rst.x"),
+    ] {
+        let err = cpp_tb::emit(&merged_src(&with(path)))
+            .expect_err(&format!("{what}: v1 refuses `{path}`"));
+        assert!(
+            format!("{err}").contains("must resolve to a `hookable`"),
+            "{what}: {err}"
+        );
+        let msg = assert_not_implemented(
+            &lower_src(&with(path)).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains("names no `hookable`"), "{what}: {msg}");
+    }
+}
