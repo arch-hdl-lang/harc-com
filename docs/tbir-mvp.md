@@ -3981,14 +3981,14 @@ case and only locally-determinable `Assign` types are compared).
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
-    the third it **STACK-OVERFLOWS and aborts the process**.
-    `expand_relation_subtree` in `cpp_tb.rs` has no depth guard, so
-    `relation R(r) = R(r)` takes the compiler down. No `V1Status` fits a
+    the third it **STACK-OVERFLOWED and aborted the process**.
+    `expand_relation_subtree` in `cpp_tb.rs` had no depth guard, so
+    `relation R(r) = R(r)` took the compiler down. No `V1Status` fits a
     SIGABRT, which is part of why `Invalid` is the right verdict — and
-    the regression test asserts on TB-IR only and never calls
+    the regression test asserted on TB-IR only and never called
     `cpp_tb::emit` on that input, because a test cannot catch an abort.
-    A depth guard in v1 is a real fix and is NOT made here; it is
-    recorded so the next batch can take it deliberately.
+    **Closed in divergence 62**, which is why that test now does call
+    it.
 
     With the diagnostics surfacing, the misplaced-named-argument check
     from divergence 57 finally does something. Relation calls bind by
@@ -4163,6 +4163,82 @@ case and only locally-determinable `Assign` types are compared).
     190 fixtures: the error sets are unchanged and no entry gains a
     relation error, so the longer walk costs nothing and reports
     nothing new.
+
+62. **The compiler died instead of complaining (2026-08-17).**
+
+    Divergence 59 measured this and left it open: `expand_relation_subtree`
+    in `cpp_tb.rs` had no guard of any kind, so `relation R(r) = R(r)`
+    recursed until the stack ran out. SIGABRT — no message, no exit code
+    a build system can interpret, nothing a user can act on. It was left
+    open on the reasoning that "a test cannot catch an abort", which is
+    true and is exactly why the guard had to come before the test.
+
+    **Three shapes ran away, and each defeated the guard written for the
+    one before it. The lesson is where the guard belongs, not how big
+    the number is.**
+
+    The first attempt was a work budget, on the argument that every step
+    which grows the expression passes through one choke point. Correct,
+    and it still aborted: the expander recurses once per level, so
+    10 000 levels overflow the stack long before a 10 000-unit budget is
+    spent. Depth got its own, smaller, limit.
+
+    The second attempt — depth 64 plus a budget counting EXPANSIONS —
+    was measured against `relation R(r: Req) = R(r + r)` and killed the
+    process by OOM instead: the argument is substituted into both
+    occurrences of `r`, so it doubles every level, and 64 expansions
+    build about 2^64 nodes. The budget was re-charged per node PRODUCED.
+
+    The third attempt was measured against
+    `relation R(r: Req) = R((((…r…))))` — 60 nested parens, **418 bytes
+    of source** — and **still aborted with a stack overflow**. The
+    argument does not get bigger, it gets DEEPER: 60x per level, until
+    the structural walk runs out of stack. Node count does not see
+    depth. That is the very SIGABRT the guard was written to prevent,
+    and two rounds of "the guard now covers X" had already been written
+    down as closed.
+
+    There is no end to that list, because **bounding the output of an
+    unbounded loop is the wrong place to stand.** The fix is a
+    relation-NAME stack: a relation already being expanded is expanding
+    into itself, and is refused before any tree is built, so it does not
+    matter how fast the body would have grown. Every shape above now
+    returns a diagnostic in under 4 ms.
+
+    `constraints::typed_lower` already guarded the same recursion this
+    way. Three attempts were spent inventing worse versions of a guard
+    that existed one module over — each one measured, each one shipped
+    as a fix, each one wrong. The reviewer's counter-example, not the
+    author's argument, ended each round.
+
+    The budget and depth limit stay as backstops for growth that is
+    finite but exponential — a chain of DISTINCT relations, each calling
+    the previous one twice. Both numbers are measured: the corpus passes
+    at a node budget of **96** and fails at **88**, so 8192 is about 90x
+    the deepest real need (wide because the budget is shared across a
+    whole constraint list, so it scales with program size); and a
+    63-deep chain still expands with its innermost bound reaching the
+    emitted C++, while at 64 the call is left unexpanded. That last one
+    does refuse a **finite, correct** program, with v1's generic
+    "constraint function call not supported in v0 solver path" — bought
+    cheaply, since the corpus's deepest real nest is 3.
+
+    Neither backstop is pinned by a test, and that is stated rather than
+    papered over: the non-cyclic doubling chain they exist for is
+    bottlenecked in `typed_lower`'s own un-budgeted expander (103 ms at
+    12 levels, 11.3 s at 18) long before v1's backstop is reached, so a
+    test would be measuring the other component. That blowup is
+    pre-existing — it reproduces on a clean `origin/main` worktree — and
+    budgeting that expander is a separate change.
+
+    The regression test steps over the boundary divergence 59 documented:
+    it calls `cpp_tb::emit` on five shapes: self-recursive, mutually
+    recursive, both of those with a growing argument, and the
+    paren-deepening one that defeated two earlier guards. Controls in
+    the same test keep the guard honest about what it is not: a 40-deep
+    chain of distinct relations and a 60-paren expression both still
+    emit with the innermost bound intact. Disabling the name stack
+    reproduces the SIGABRT and the test binary dies with signal 6.
 
 ### The probe method
 

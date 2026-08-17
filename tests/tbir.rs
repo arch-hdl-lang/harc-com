@@ -17611,12 +17611,12 @@ fn relation_errors_in_randomize_with_now_reach_the_user() {
         assert!(msg.contains(needle), "{msg}");
     }
 
-    // A self-recursive relation. NOTE: this asserts on TB-IR only, and
-    // deliberately never calls `cpp_tb::emit` on it — v1 has no depth
-    // guard in `expand_relation_subtree` and STACK-OVERFLOWS, aborting
-    // the process. That is recorded in divergence 59; a test cannot
-    // catch a SIGABRT, so this one documents the boundary instead of
-    // stepping over it.
+    // A self-recursive relation. This used to assert on TB-IR only and
+    // deliberately never call `cpp_tb::emit`, because v1 had no guard
+    // in `expand_relation_subtree` and STACK-OVERFLOWED, aborting the
+    // process — a test cannot catch a SIGABRT. Divergence 62 added the
+    // guard; `v1_no_longer_aborts_on_a_relation_that_expands_forever`
+    // now steps over that boundary deliberately.
     let recursive = src.replacen(ALIAS, "relation HighAddr(r: Req) = HighAddr(r)", 1);
     let msg = assert_invalid(&lower_src(&recursive).unwrap_err());
     assert!(msg.contains("expands into itself"), "{msg}");
@@ -18056,4 +18056,151 @@ fn a_run_of_discarded_errors_no_longer_hides_a_relation_error() {
         errs.iter().all(|n| *n <= 5),
         "non-relation errors stay capped at MAX_ERRORS: {errs:?}"
     );
+}
+
+/// v1 gives a diagnostic instead of taking the process down.
+///
+/// `expand_relation_subtree` had no guard of any kind, so
+/// `relation R(r) = R(r)` recursed until the stack ran out: SIGABRT,
+/// no message, no exit code a build system can interpret. Divergence 59
+/// recorded it and left it open because "a test cannot catch an abort"
+/// — which is true, and is exactly why the guard had to come before the
+/// test.
+///
+/// Three shapes ran away, and each defeated the guard written for the
+/// one before it. The fix is not a better bound on the RESULT; it is a
+/// relation-NAME stack, which stops the loop at its root:
+///
+///   * A per-expansion budget left `relation R(r) = R(r + r)` doubling
+///     the argument until the process was OOM-killed.
+///   * Charging per node PRODUCED fixed that, and left
+///     `relation R(r) = R((((…r…))))` — 60 nested parens, 418 bytes of
+///     source — multiplying the tree's DEPTH by 60 per level until the
+///     structural walk overflowed the stack. That is the very SIGABRT
+///     the guard was written to prevent.
+///   * A relation already being expanded is expanding into itself, so
+///     the name stack refuses it before any tree is built. It does not
+///     matter how fast the body would have grown.
+///
+/// There is no end to the first list, because bounding the output of an
+/// unbounded loop is the wrong place to stand.
+/// `constraints::typed_lower` already guarded the same recursion this
+/// way; reaching for it here took three tries.
+///
+/// The node budget and depth limit stay as backstops for growth that is
+/// not cyclic — a chain of DISTINCT relations each calling the previous
+/// one twice is finite and exponential. No such case appears below: it
+/// is bottlenecked in `typed_lower`'s own un-budgeted expander long
+/// before v1's backstop is reached, so a test here would be measuring
+/// something else.
+#[test]
+fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
+    let head = "domain D\n  freq_mhz: 100\nend domain D\n\n\
+                transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+                end transaction Req\n\n";
+    let test = |call: &str| {
+        format!(
+            "test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            {call}\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    let chain = |depth: usize| {
+        let mut rels = String::from("relation R0(r: Req) = r.value > 1000\n");
+        for i in 1..=depth {
+            rels += &format!("relation R{i}(r: Req) = R{}(r)\n", i - 1);
+        }
+        rels
+    };
+
+    // Reaching any of these lines at all is the assertion: on the old
+    // code the test binary died here with signal 6 (the first two) or
+    // was OOM-killed (the last two).
+    for (what, rels, call) in [
+        (
+            "a relation that calls itself",
+            "relation R(r: Req) = R(r)\n".to_string(),
+            "R(t)",
+        ),
+        (
+            "two relations that call each other",
+            "relation A(r: Req) = B(r)\nrelation B(r: Req) = A(r)\n".to_string(),
+            "A(t)",
+        ),
+        // The one a per-expansion budget missed: the ARGUMENT doubles,
+        // so the tree explodes at a depth the depth guard is nowhere
+        // near.
+        (
+            "a relation whose argument grows",
+            "relation R(r: Req) = R(r + r)\n".to_string(),
+            "R(t)",
+        ),
+        (
+            "two that call each other with a growing argument",
+            "relation A(r: Req) = B(r + r)\nrelation B(r: Req) = A(r + r)\n".to_string(),
+            "A(t)",
+        ),
+        // The one the node budget missed: the argument does not get
+        // BIGGER, it gets DEEPER, 60x per level, until the structural
+        // walk runs out of stack.
+        (
+            "a relation whose argument deepens",
+            format!(
+                "relation R(r: Req) = R({}r{})\n",
+                "(".repeat(60),
+                ")".repeat(60)
+            ),
+            "R(t)",
+        ),
+    ] {
+        let src = format!("{head}{rels}\n{}", test(call));
+        let err = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses");
+        assert!(
+            format!("{err}").contains("constraint function call not supported"),
+            "{what}: {err}"
+        );
+        // TB-IR names the actual problem rather than inheriting v1's
+        // generic message — its own cycle detector is unchanged.
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("expands into itself"), "{what}: {msg}");
+    }
+
+    // The guard is a limit, not a ban: a chain far deeper than anything
+    // real still expands, and the innermost bound survives to the
+    // emitted C++.
+    let deep = format!("{head}{}\n{}", chain(30), test("R30(t)"));
+    assert!(
+        cpp_tb::emit(&merged_src(&deep))
+            .expect("a 30-deep chain still emits")
+            .contains("(uint64_t)1000"),
+        "the innermost relation's bound reaches the output"
+    );
+
+    // The guard is a limit on RECURSION, not on size or nesting, and
+    // these controls say so: a chain of 40 distinct relations and an
+    // expression 60 parens deep both still emit with the innermost
+    // bound intact. The depth backstop is what would refuse the chain
+    // at 64 — deliberate, and the corpus's deepest real nest is 3.
+    for (what, src) in [
+        (
+            "a 40-deep chain of distinct relations",
+            format!("{head}{}\n{}", chain(40), test("R40(t)")),
+        ),
+        (
+            "a 60-paren expression",
+            format!(
+                "{head}relation R(r: Req) = {}r.value{} > 1000\n\n{}",
+                "(".repeat(60),
+                ")".repeat(60),
+                test("R(t)")
+            ),
+        ),
+    ] {
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .contains("(uint64_t)1000"),
+            "{what}: the innermost bound reaches the output"
+        );
+    }
 }

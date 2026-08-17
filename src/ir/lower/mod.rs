@@ -665,9 +665,11 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// Only the RELATION errors surface. Three of them are program errors
 /// under any backend: a relation that does not exist, one called with
 /// the wrong arity, and one that expands into itself. Measured against
-/// v1: it rejects the first two ("constraint function call not
-/// supported in v0 solver path") and STACK-OVERFLOWS on the third, so
-/// none of them is an escape hatch and `Invalid` is the honest verdict.
+/// v1: it rejects all three with "constraint function call not
+/// supported in v0 solver path", so none is an escape hatch and
+/// `Invalid` is the honest verdict. The third used to take the process
+/// down with a stack overflow instead; divergence 62 replaced that with
+/// the same diagnostic as the other two.
 ///
 /// The other variants stay discarded ON PURPOSE. They are capability
 /// gaps in the constraint IR, not bad programs:
