@@ -17552,3 +17552,130 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
         "detail has collapsed whitespace: {msg}"
     );
 }
+
+/// Constraint-lowering diagnostics used to be thrown away wholesale.
+/// `build_typed_solver_problem_table` records them as
+/// `TypedSolverProblemBuild::LowerError` entries, and `lower_program`'s
+/// consuming loop read only `Z3` entries — so
+/// `randomize(r) with NoSuchRelation(r)` lowered clean under TB-IR
+/// while v1 refused it outright.
+///
+/// Only the RELATION errors surface, and that split was measured rather
+/// than reasoned: all 173 registry fixtures were run through the table
+/// builder, and exactly ONE produces a non-relation `LowerError` —
+/// `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
+/// `DisallowedInConstraint`. That is a capability gap in the constraint
+/// IR, not a bad program: v1 lowers it and the fixture passes trace
+/// equivalence. Surfacing every variant would have rejected it.
+#[test]
+fn relation_errors_in_randomize_with_now_reach_the_user() {
+    let src = fixture("relation_inlining_test.harc");
+    const ALIAS: &str = "relation HighAddr(r: Req) = r.addr >= 0x10000";
+    const CALL: &str = "randomize(r) with BoundedAndHigh(r) end randomize";
+    assert!(
+        src.contains(ALIAS) && src.contains(CALL),
+        "fixture shape changed"
+    );
+    let two = format!(
+        "{ALIAS}\n\nrelation Between(r: Req, lo: int, hi: int) = r.addr >= lo && r.addr <= hi"
+    );
+    let with = |call: &str| {
+        src.replacen(ALIAS, &two, 1).replacen(
+            CALL,
+            &format!("randomize(r) with {call} end randomize"),
+            1,
+        )
+    };
+
+    // The control: a correct call still lowers.
+    lower_src(&with("Between(r, 65536, 131072)")).expect("the correct call lowers");
+
+    for (call, needle) in [
+        (
+            "Between(r, 65536)",
+            "takes 3 argument(s) but was called with 2",
+        ),
+        (
+            "NoSuchRelation(r)",
+            "names no `relation` declared in this file",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&with(call)).unwrap_err());
+        assert!(msg.contains(needle), "{msg}");
+    }
+
+    // A self-recursive relation. NOTE: this asserts on TB-IR only, and
+    // deliberately never calls `cpp_tb::emit` on it — v1 has no depth
+    // guard in `expand_relation_subtree` and STACK-OVERFLOWS, aborting
+    // the process. That is recorded in divergence 59; a test cannot
+    // catch a SIGABRT, so this one documents the boundary instead of
+    // stepping over it.
+    let recursive = src.replacen(ALIAS, "relation HighAddr(r: Req) = HighAddr(r)", 1);
+    let msg = assert_invalid(&lower_src(&recursive).unwrap_err());
+    assert!(msg.contains("expands into itself"), "{msg}");
+
+    // The capability-gap variant must STILL lower — this is the half a
+    // blanket surfacing would have broken.
+    lower_src(&fixture("uint64_unique_randomize_test.harc"))
+        .expect("a constraint the IR cannot express is not a bad program");
+}
+
+/// With the diagnostics surfacing, the misplaced-named-argument check
+/// can finally do something. Relation calls bind by POSITION and drop
+/// the name, so `Between(r, hi = 131072, lo = 65536)` inlined
+/// `addr >= 131072 && addr <= 65536` — unsatisfiable, silently, from a
+/// program written to mean the opposite.
+///
+/// The check itself was written a batch earlier and reverted as
+/// "does not fire". It fired; its error was discarded. The control that
+/// hid it asked whether the PROGRAM lowers, which cannot tell those two
+/// apart — only asking the table builder directly can.
+#[test]
+fn a_misplaced_relation_argument_name_is_refused() {
+    let fixture = fixture("relation_inlining_test.harc");
+    const ALIAS: &str = "relation HighAddr(r: Req) = r.addr >= 0x10000";
+    const CALL: &str = "randomize(r) with BoundedAndHigh(r) end randomize";
+    let two = format!(
+        "{ALIAS}\n\nrelation Between(r: Req, lo: int, hi: int) = r.addr >= lo && r.addr <= hi"
+    );
+    let with = |call: &str| {
+        fixture.replacen(ALIAS, &two, 1).replacen(
+            CALL,
+            &format!("randomize(r) with {call} end randomize"),
+            1,
+        )
+    };
+
+    // Names written where they belong bind where they belong, and emit
+    // exactly what the positional form emits.
+    let positional = cpp_tb::emit(&merged_src(&with("Between(r, 65536, 131072)")))
+        .expect("v1 emits the positional form");
+    assert!(
+        positional.contains("z3::uge(_z_addr, _ctx.bv_val((uint64_t)65536, 64))"),
+        "the positional form binds lo=65536"
+    );
+    lower_src(&with("Between(r, lo = 65536, hi = 131072)")).expect("in-order names lower");
+
+    // Reordered names are refused, and the message says which parameter
+    // was written where.
+    let msg = assert_invalid(&lower_src(&with("Between(r, hi = 131072, lo = 65536)")).unwrap_err());
+    assert!(
+        msg.contains("`hi` is parameter 3 but was written in position 2"),
+        "{msg}"
+    );
+    // v1 really does swap them, which is what makes this worth refusing.
+    assert!(
+        cpp_tb::emit(&merged_src(&with("Between(r, hi = 131072, lo = 65536)")))
+            .expect("v1 emits")
+            .contains("z3::uge(_z_addr, _ctx.bv_val((uint64_t)131072, 64))"),
+        "v1 binds lo := 131072, an unsatisfiable constraint"
+    );
+
+    // A name matching no parameter gets its own sentence.
+    let msg =
+        assert_invalid(&lower_src(&with("Between(r, nosuch = 65536, hi = 131072)")).unwrap_err());
+    assert!(
+        msg.contains("`nosuch` names no parameter of `Between`"),
+        "{msg}"
+    );
+}

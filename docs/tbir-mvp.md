@@ -3937,6 +3937,52 @@ case and only locally-determinable `Assign` types are compared).
     the fix, and it is recorded rather than made here because it changes
     an extractor the equivalence corpus exercises heavily.
 
+59. **Every constraint diagnostic was thrown away, and v1 crashes on
+    one of them (2026-08-17).**
+
+    `build_typed_solver_problem_table` records the constraint lowerer's
+    errors as `TypedSolverProblemBuild::LowerError` entries.
+    `lower_program`'s consuming loop read only `Z3` entries and
+    `continue`d past the rest, so **none of them ever reached a user**.
+    `randomize(r) with NoSuchRelation(r)` lowered clean under TB-IR while
+    v1 refused it outright.
+
+    Only the RELATION errors now surface, and the split was MEASURED, not
+    reasoned. All 173 registry fixtures were run through the table
+    builder: exactly one produces a non-relation `LowerError` —
+    `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
+    `DisallowedInConstraint`. That is a capability gap in the constraint
+    IR, not a bad program; v1 lowers it and it passes trace equivalence.
+    Surfacing every variant would have rejected a registered, working
+    fixture. The three that do surface are program errors under any
+    backend — a relation that does not exist, one called with the wrong
+    arity, and one that expands into itself — so they are `Invalid` and
+    name no escape hatch.
+
+    v1's behaviour, measured for each: it rejects the first two
+    ("constraint function call not supported in v0 solver path") and on
+    the third it **STACK-OVERFLOWS and aborts the process**.
+    `expand_relation_subtree` in `cpp_tb.rs` has no depth guard, so
+    `relation R(r) = R(r)` takes the compiler down. No `V1Status` fits a
+    SIGABRT, which is part of why `Invalid` is the right verdict — and
+    the regression test asserts on TB-IR only and never calls
+    `cpp_tb::emit` on that input, because a test cannot catch an abort.
+    A depth guard in v1 is a real fix and is NOT made here; it is
+    recorded so the next batch can take it deliberately.
+
+    With the diagnostics surfacing, the misplaced-named-argument check
+    from divergence 57 finally does something. Relation calls bind by
+    position and drop the name, so `Between(r, hi = 131072, lo = 65536)`
+    inlined `addr >= 131072 && addr <= 65536` — unsatisfiable, silently.
+    The check was written a batch earlier and reverted as "does not
+    fire". **It fired. Its error was discarded.** The control that hid
+    that asked whether the program lowers, which cannot tell the two
+    apart; one call to the table builder can.
+
+    Both halves of the split are pinned by mutation: widening the arm to
+    surface every variant fails the capability-gap fixture, and neutering
+    the name comparison fails the swap test.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

@@ -1362,10 +1362,73 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         else {
             continue;
         };
-        if let crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } =
-            &entry.build
-        {
-            randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+        match &entry.build {
+            crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } => {
+                randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+            }
+            // Every non-Z3 entry used to be skipped, which threw away
+            // the constraint lowerer's diagnostics entirely — a
+            // `randomize ... with NoSuchRelation(r)` lowered clean under
+            // TB-IR while v1 refused it outright.
+            //
+            // Only the RELATION errors surface. They are program errors
+            // under any backend: a relation that does not exist, one
+            // called with the wrong arity, and one that expands into
+            // itself. Measured against v1: it rejects the first two
+            // ("constraint function call not supported in v0 solver
+            // path") and STACK-OVERFLOWS on the third, so none of them
+            // is an escape hatch and `Invalid` is the honest verdict.
+            //
+            // The other variants stay discarded ON PURPOSE. They are
+            // capability gaps in the constraint IR, not bad programs:
+            // `DisallowedInConstraint` fires on `s.sample[63:32] != 0`
+            // in `uint64_unique_randomize_test`, a REGISTERED fixture
+            // that v1 lowers and that passes trace equivalence today.
+            // Surfacing them would reject working programs. That is not
+            // a guess — all 173 registry fixtures were run through the
+            // table builder, and exactly one produces a non-relation
+            // `LowerError`.
+            crate::solver::problem_table::TypedSolverProblemBuild::LowerError(errs) => {
+                for e in errs {
+                    use crate::constraints::typed_lower::LowerError as CErr;
+                    let detail = match e {
+                        CErr::UnknownRelation { name, .. } => {
+                            format!("`{name}` names no `relation` declared in this file")
+                        }
+                        CErr::RelationArityMismatch {
+                            name,
+                            expected,
+                            found,
+                            ..
+                        } => format!(
+                            "`{name}` takes {expected} argument(s) but was called with {found}"
+                        ),
+                        CErr::RecursiveRelation { name, .. } => format!(
+                            "`{name}` expands into itself, so the constraint has no finite form"
+                        ),
+                        CErr::RelationNamedArgMisplaced {
+                            name,
+                            arg,
+                            expected,
+                            found,
+                            ..
+                        } => match expected {
+                            Some(e) => format!(
+                                "`{name}` binds arguments by position, and `{arg}` is \
+                                 parameter {} but was written in position {}",
+                                e + 1,
+                                found + 1
+                            ),
+                            None => format!("`{arg}` names no parameter of `{name}`"),
+                        },
+                        _ => continue,
+                    };
+                    return Err(LowerError::Invalid(format!(
+                        "`randomize ... with`: {detail}"
+                    )));
+                }
+            }
+            _ => {}
         }
     }
 
