@@ -15136,6 +15136,19 @@ impl Emitter {
     /// the surrounding solver block. Integer literals become `_ctx.bv_val(N, W)`
     /// at the field's width inferred from context. v0 is permissive — any
     /// untranslatable form falls back to a comment + `_ctx.bool_val(true)`.
+    /// A resolvable target field that is not a flag cannot be a whole
+    /// constraint. Its own arm cannot express this — `Ident` and `Field`
+    /// match earlier in `emit_constraint_bool_expr_w` than any guard could
+    /// run — so both arms call this in their non-flag branch.
+    fn reject_non_flag_field(&mut self, name: &str) {
+        self.errors.push(format!(
+            "`{name}` is a value, not a condition, so it cannot be a constraint on its own \
+             — write a comparison such as `{name} != 0`. Only a one-bit UNSIGNED field \
+             reads as a flag on its own; a wider, signed or enum-typed field does not"
+        ));
+        write!(self.out, "_ctx.bool_val(true)").ok();
+    }
+
     /// A whole constraint, as passed to `_s.add(...)`.
     ///
     /// This is a BOOL position and must route to the Bool emitter. It used
@@ -15363,31 +15376,35 @@ impl Emitter {
                 return;
             }
             ExprKind::Ident(id) => {
-                if field_info.get(&id.name).is_some_and(|f| {
-                    f.list.is_none() && f.enum_variants.is_none() && f.width == 1 && !f.signed
-                }) {
-                    write!(
-                        self.out,
-                        "_z_{} != _ctx.bv_val((uint64_t)0, {})",
-                        c_ident(&id.name),
-                        width
-                    )
-                    .ok();
+                if let Some(f) = field_info.get(&id.name) {
+                    if is_flag_field(f) {
+                        write!(
+                            self.out,
+                            "_z_{} != _ctx.bv_val((uint64_t)0, {})",
+                            c_ident(&id.name),
+                            width
+                        )
+                        .ok();
+                    } else {
+                        self.reject_non_flag_field(&id.name);
+                    }
                     return;
                 }
             }
             ExprKind::Field { .. } => {
                 if let Some(field) = expr_field_path(e, target_root) {
-                    if field_info.get(&field).is_some_and(|f| {
-                        f.list.is_none() && f.enum_variants.is_none() && f.width == 1 && !f.signed
-                    }) {
-                        write!(
-                            self.out,
-                            "_z_{} != _ctx.bv_val((uint64_t)0, {})",
-                            c_ident(&field),
-                            width
-                        )
-                        .ok();
+                    if let Some(f) = field_info.get(&field) {
+                        if is_flag_field(f) {
+                            write!(
+                                self.out,
+                                "_z_{} != _ctx.bv_val((uint64_t)0, {})",
+                                c_ident(&field),
+                                width
+                            )
+                            .ok();
+                        } else {
+                            self.reject_non_flag_field(&field);
+                        }
                         return;
                     }
                 }
@@ -15509,10 +15526,16 @@ impl Emitter {
                      must be a comparison"
                 );
                 if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) {
+                    // Says "the comparison operators" rather than naming
+                    // `==`: `a & b != c` and `a & b < c` reach here too, and
+                    // quoting an operator the author did not write reads as
+                    // a diagnostic about someone else's program. `==` stays
+                    // as the illustration only.
                     msg.push_str(&format!(
-                        ". Note `{spelling}` binds LOOSER than `==`, so `a {spelling} b == c` \
-                         groups as `a {spelling} (b == c)`; write `(a {spelling} b) == c` if \
-                         that is what you meant"
+                        ". Note `{spelling}` binds LOOSER than the comparison operators, so \
+                         `a {spelling} b == c` groups as `a {spelling} (b == c)`; write \
+                         `(a {spelling} b) == c` if that is what you meant. For a logical \
+                         and/or, use `&&` / `||`"
                     ));
                 }
                 self.errors.push(msg);
@@ -15536,6 +15559,33 @@ impl Emitter {
                     "the literal `{lit}` is a value, not a condition, so it cannot be a \
                      constraint — write a comparison such as `x == {lit}`, or `true` / \
                      `false` for a constant one"
+                ));
+                write!(self.out, "_ctx.bool_val(true)").ok();
+                return;
+            }
+            // A bare field reference is a value too, and only ONE width of
+            // it is a condition: the arms above coerce a one-bit unsigned
+            // scalar to `!= 0`. Anything else — a wider field, a signed
+            // one-bit field, an enum field, a bit-select, a bit-slice, a
+            // list element — reached `z3::solver::add` as a bitvector and
+            // died as the same runtime sort error the operator arms above
+            // are about (harc#560). The coercion cannot simply be widened
+            // to cover them: `keep len` on a `uint<8>` has no meaning that
+            // is obviously `!= 0` rather than a typo for a comparison, so
+            // it is rejected and named.
+            //
+            // The `Ident` and `Field` arms above do the rejecting for a
+            // resolvable field, since they match first — see the
+            // `reject_non_flag_field` calls there.
+            ExprKind::Index { .. } | ExprKind::BitSlice { .. } => {
+                self.errors.push(format!(
+                    "a {} is a value, not a condition, so it cannot be a constraint on its \
+                     own — compare it, as in `x[0] == 1`",
+                    if matches!(&*e.kind, ExprKind::BitSlice { .. }) {
+                        "bit-slice"
+                    } else {
+                        "bit-select or list element"
+                    }
                 ));
                 write!(self.out, "_ctx.bool_val(true)").ok();
                 return;
@@ -16327,6 +16377,17 @@ impl Emitter {
             _ => {
                 // Fallback: treat rhs as a singleton — `a in b` becomes
                 // `a == b`. Same shape `emit_bin_membership` uses.
+                //
+                // Parenthesised, unlike the original: HARC puts `in` at
+                // RELATIONAL precedence, tighter than `==`, but the `==`
+                // this lowers to is looser than a relational operator in
+                // C++. So `a in b < c`, which HARC grouped as
+                // `(a in b) < c`, re-parsed as `a == (b < c)`. The sibling
+                // range and set arms already wrap; this arm did not
+                // (harc#560 review). Unlike the bitwise case, this IS a
+                // codegen grouping bug, because the operator being emitted
+                // is not the operator that was written.
+                write!(self.out, "(").ok();
                 self.emit_constraint_expr_w(
                     lhs,
                     field_info,
@@ -16344,6 +16405,7 @@ impl Emitter {
                     blocking,
                     list_unroll_bounds,
                 );
+                write!(self.out, ")").ok();
             }
         }
     }
@@ -19976,17 +20038,55 @@ fn wide_literal_bit_width(s: &str) -> Option<u32> {
     (bits > 64).then_some(bits)
 }
 
+/// A one-bit UNSIGNED scalar field, the only field shape that reads as a
+/// condition on its own (`keep flag` means `flag != 0`). A signed one-bit
+/// field, an enum field and a list are all excluded.
+fn is_flag_field(f: &TxnFieldInfo) -> bool {
+    f.list.is_none() && f.enum_variants.is_none() && f.width == 1 && !f.signed
+}
+
 /// HARC spelling of an operator, for diagnostics. Distinct from
 /// `c_binary_op`, which gives the C++ spelling and so collapses `+%` onto
 /// `+` — an error message quoting the operator back to the author has to
 /// use the one they wrote.
+///
+/// Every arm is spelled out rather than delegating the tail to
+/// `c_binary_op`. That delegation was safe only by luck: `c_binary_op`
+/// renders the temporal and membership operators as
+/// `"/* unsupported-op */ ,"`, so the first person to add `in` or `|->` to
+/// the caller's reject list would have shipped that string quoted inside a
+/// user-facing diagnostic. Now the compiler makes them choose a spelling.
 fn constraint_op_spelling(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
         AddWrap => "+%",
         SubWrap => "-%",
         MulWrap => "*%",
-        other => c_binary_op(other),
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        AndAnd | AndKw => "&&",
+        OrOr | OrKw => "||",
+        In => "in",
+        Inside => "inside",
+        PipeImplies => "|->",
+        PipeImpliesNext => "|=>",
+        Throughout => "throughout",
+        Within => "within",
+        Intersect => "intersect",
     }
 }
 

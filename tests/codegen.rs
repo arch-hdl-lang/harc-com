@@ -9934,6 +9934,29 @@ end test T"#
     )
 }
 
+/// `keep_src` plus a signed one-bit field and an enum field — the two
+/// shapes that are one bit wide, or scalar, yet still not flags.
+fn keep_src_enum(constraint: &str) -> String {
+    format!(
+        r#"enum Mode {{ A, B }}
+transaction Txn
+    len : uint<8> default 0
+    flag : uint<1> default 0
+    sflag : sint<1> default 0
+    mode : Mode
+    keep {constraint}
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${{t.len}}")
+    end run
+end test T"#
+    )
+}
+
 /// harc#560. A constraint has to BE a proposition. The top-level `_s.add`
 /// site emitted through the VALUE emitter, so an arithmetic, bitwise,
 /// shift or wrapping operator produced a bitvector, which
@@ -9942,30 +9965,76 @@ end test T"#
 ///
 /// Both backends share this emitter, so both must reject: a one-sided
 /// rejection here would be the exact divergence harc#551 is about.
+/// EVERY value operator, not a sample. An earlier version of this test
+/// listed nine of them, and deleting `- * / % -% *%` and unary `-` from
+/// the rule left all 263 tests passing — a compiler that emitted
+/// `_s.add(_z_len - 1)` with no complaint. The spelling assertion is part
+/// of it: `-%` and `*%` are the two ops whose HARC spelling differs from
+/// the C++ one, so they are where a spelling helper regresses silently.
 #[test]
 fn a_value_operator_cannot_be_a_whole_constraint() {
-    for c in [
-        "len & 3",
-        "len | 3",
-        "len ^ 3",
-        "len << 2",
-        "len >> 2",
-        "len + 1",
-        "len +% 1",
-        "(len +% 1)",
-        "~len",
-    ] {
+    let binaries = [
+        ("len + 1", "+"),
+        ("len - 1", "-"),
+        ("len * 2", "*"),
+        ("len / 2", "/"),
+        ("len % 2", "%"),
+        ("len +% 1", "+%"),
+        ("len -% 1", "-%"),
+        ("len *% 2", "*%"),
+        ("len & 3", "&"),
+        ("len | 3", "|"),
+        ("len ^ 3", "^"),
+        ("len << 2", "<<"),
+        ("len >> 2", ">>"),
+        ("(len +% 1)", "+%"),
+    ];
+    for (c, spelling) in binaries {
         let src = keep_src(c);
         let v1 = v1_emit_err(&src);
         assert!(
-            v1.contains("produces a value, not a condition"),
-            "v1 must reject `keep {c}`; got: {v1}"
+            v1.contains(&format!("`{spelling}` produces a value, not a condition")),
+            "v1 must reject `keep {c}` naming `{spelling}`; got: {v1}"
         );
         let tbir = tbir_constraint_snippets(&src)
             .expect_err(&format!("the default backend must reject `keep {c}` too"));
         assert!(
-            tbir.contains("produces a value, not a condition"),
+            tbir.contains(&format!("`{spelling}` produces a value, not a condition")),
             "the default backend must reject `keep {c}` the same way, not diverge; got: {tbir}"
+        );
+    }
+    for (c, spelling) in [("~len", "~"), ("-len", "-")] {
+        let v1 = v1_emit_err(&keep_src(c));
+        assert!(
+            v1.contains(&format!("`{spelling}` produces a value, not a condition")),
+            "v1 must reject `keep {c}` naming `{spelling}`; got: {v1}"
+        );
+    }
+}
+
+/// The rule has to reach bare references too, and that is where the first
+/// version of this fix stopped short: only a one-bit UNSIGNED field was
+/// coerced to `!= 0`, and every other reference fell through to the value
+/// emitter with no diagnostic — so `keep len` on a `uint<8>` still handed
+/// `z3::solver::add` a bitvector and still died at runtime, which is the
+/// whole bug.
+#[test]
+fn a_bare_reference_that_is_not_a_flag_cannot_be_a_constraint() {
+    for (c, needle) in [
+        ("len", "`len` is a value, not a condition"),
+        ("sflag", "`sflag` is a value, not a condition"),
+        ("mode", "`mode` is a value, not a condition"),
+        ("len[0]", "bit-select or list element is a value"),
+        ("len[3:0]", "bit-slice is a value"),
+    ] {
+        let src = keep_src_enum(c);
+        let v1 = v1_emit_err(&src);
+        assert!(v1.contains(needle), "v1 must reject `keep {c}`; got: {v1}");
+        let tbir = tbir_constraint_snippets(&src)
+            .expect_err(&format!("the default backend must reject `keep {c}` too"));
+        assert!(
+            tbir.contains(needle),
+            "the default backend must reject `keep {c}` identically; got: {tbir}"
         );
     }
 }
@@ -9982,8 +10051,16 @@ fn a_value_operator_cannot_be_a_whole_constraint() {
 fn the_bitwise_precedence_surprise_is_explained_not_guessed_at() {
     let err = v1_emit_err(&keep_src("len & 3 == 0"));
     assert!(
-        err.contains("binds LOOSER than `==`"),
+        err.contains("binds LOOSER than the comparison operators"),
         "the diagnostic must name the precedence, not just reject; got: {err}"
+    );
+    // Says "the comparison operators" rather than `==`, because `a & b != c`
+    // and `a & b < c` reach the same message and quoting `==` at an author
+    // who wrote `!=` describes someone else's program.
+    let ne = v1_emit_err(&keep_src("len & 3 != 0"));
+    assert!(
+        ne.contains("binds LOOSER than the comparison operators"),
+        "the `!=` form gets the same explanation; got: {ne}"
     );
     assert!(
         err.contains("`a & (b == c)`") && err.contains("`(a & b) == c`"),
@@ -10026,27 +10103,82 @@ fn a_bare_one_bit_field_constraint_coerces_to_a_comparison() {
 /// recommends — so it had better work.
 #[test]
 fn real_conditions_still_emit_after_the_bool_position_check() {
-    for c in [
-        "(len & 3) == 0",
-        "(len << 2) == 0",
-        "len == 3",
-        "len != 3",
-        "len +% 1 == 5",
-        "len in [1..16]",
-        "flag",
-        "not flag",
-        "len == 1 && flag",
-        "len == 1 || len == 2",
-    ] {
+    // Each case asserts the DISTINCTIVE text it lowers to, not merely that
+    // some `_s.add(` exists. A transaction emits four of those before any
+    // `keep` is considered — two range assumptions and two randomize
+    // preferences — so `contains("_s.add(")` passed even against an
+    // implementation that dropped every constraint on the floor.
+    let cases = [
+        (
+            "(len & 3) == 0",
+            "(_z_len & _ctx.bv_val((uint64_t)3, 64)) == _ctx.bv_val((uint64_t)0, 64)",
+        ),
+        (
+            "(len << 2) == 0",
+            "(_z_len << _ctx.bv_val((uint64_t)2, 64)) == _ctx.bv_val((uint64_t)0, 64)",
+        ),
+        ("len == 3", "_s.add(_z_len == _ctx.bv_val((uint64_t)3, 64))"),
+        ("len != 3", "_s.add(_z_len != _ctx.bv_val((uint64_t)3, 64))"),
+        (
+            "len +% 1 == 5",
+            "((_z_len + _ctx.bv_val((uint64_t)1, 64)) &",
+        ),
+        (
+            "len in [1..16]",
+            "z3::uge(_z_len, _ctx.bv_val((uint64_t)1, 64))",
+        ),
+        // The `!= 0` coercion, and the same coercion under a `Paren`.
+        ("flag", "_s.add(_z_flag != _ctx.bv_val((uint64_t)0, 64))"),
+        (
+            "(flag)",
+            "_s.add((_z_flag != _ctx.bv_val((uint64_t)0, 64)))",
+        ),
+        (
+            "not flag",
+            "_s.add(!(_z_flag != _ctx.bv_val((uint64_t)0, 64)))",
+        ),
+        (
+            "len == 1 && flag",
+            "&& _z_flag != _ctx.bv_val((uint64_t)0, 64)",
+        ),
+        ("len == 1 || len == 2", "||"),
+        // Bool literals. Routing the top level through the Bool emitter
+        // changed these from `bv_val(1, 64)` / `bv_val(0, 64)` — bitvectors
+        // handed to `add()` — to real Bools. Cheapest possible canary for
+        // the routing, and unpinned until the review pointed it out.
+        ("true", "_s.add(_ctx.bool_val(true))"),
+        ("false", "_s.add(_ctx.bool_val(false))"),
+    ];
+    for (c, needle) in cases {
         let src = keep_src(c);
         let cpp = v1_cpp(&src);
         assert!(
-            cpp.contains("_s.add("),
-            "`keep {c}` must still emit an assertion; got:\n{cpp}"
+            cpp.contains(needle),
+            "`keep {c}` must emit `{needle}`; got:\n{cpp}"
         );
         tbir_constraint_snippets(&src)
             .unwrap_or_else(|e| panic!("`keep {c}` must still lower under tbir: {e}"));
     }
+}
+
+/// `a in b` on a scalar lowers to `a == b`, and that `==` is NOT the
+/// operator the author wrote: HARC puts `in` at relational precedence,
+/// tighter than `==`, while C++'s `==` is looser than a relational
+/// operator. So `keep sf in 3 < 5`, grouped by HARC as `(sf in 3) < 5`,
+/// re-parsed in C++ as `sf == (3 < 5)`. Its sibling range and set arms
+/// already parenthesised; this one did not.
+///
+/// This is a genuine codegen grouping bug, and the distinction from
+/// harc#560's reported one matters: here the emitter substitutes an
+/// operator, so it owns the grouping. There, it reproduced the operator
+/// the author wrote, so the parser owned it.
+#[test]
+fn a_scalar_membership_lowering_parenthesises_its_substituted_operator() {
+    let cpp = v1_cpp(&keep_src("len in 3"));
+    assert!(
+        cpp.contains("_s.add((_z_len == _ctx.bv_val((uint64_t)3, 64)))"),
+        "the substituted `==` must be parenthesised; got:\n{cpp}"
+    );
 }
 
 /// The membership call site passes `target_root` too — a nested signed
