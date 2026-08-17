@@ -3599,7 +3599,22 @@ case and only locally-determinable `Assign` types are compared).
     something to make their intent explicit, and v1 throws that
     something away.
 
-    **Named arguments.** No CODEGEN site in v1 reads an argument name:
+    **Named arguments — and TB-IR was doing it too.** The named-argument
+    construct turned out to have the same shape as the parameter one:
+    arms that REPORT it, and sites that silently DO it. `bus.rs` and
+    `regblock.rs` each carried a private `call_arg` helper that took
+    `value` and dropped `name`, so TB-IR itself bound reordered named
+    arguments by position — `bus.w.send(strb = 15, data = t.value)`
+    emitted `axil_w_data = 15` and `axil_w_strb = t.value`, swapped, with
+    no diagnostic from either backend.
+
+    That is the same class as the seventh parameter landing and was found
+    the same way: by looking for the BEHAVIOUR outside the file the first
+    fix was written in. The guard is now one shared
+    `reject_positional_named_args`, gated on two or more arguments so the
+    single-argument surface — which cannot reorder — keeps working.
+
+    No CODEGEN site in v1 reads an argument name:
     of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
     `{ value, .. }` and one is `{ value: e, .. }` — all 26 drop the name
     — and the 4 that bind `name` are AST-rewrite passes that reconstruct

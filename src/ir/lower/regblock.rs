@@ -844,6 +844,7 @@ impl super::FuncBuilder<'_> {
                 args.len()
             )));
         }
+        super::reject_positional_named_args(args, "a `record_write(...)` call")?;
         let reg = self.resolve_record_api_reg(&binding, "record_write", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(
@@ -911,6 +912,7 @@ impl super::FuncBuilder<'_> {
                 args.len()
             )));
         }
+        super::reject_positional_named_args(args, "a `record_read(...)` call")?;
         let reg = self.resolve_record_api_reg(&binding, "record_read", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(

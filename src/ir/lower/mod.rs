@@ -4752,6 +4752,39 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
     }
 }
 
+/// Reject named arguments at a call site that binds them BY POSITION.
+///
+/// Every `CallArg::Named` consumer that simply takes `value` and drops
+/// `name` is silently reordering: `bus.w.send(strb = 15, data = t.value)`
+/// emitted `axil_w_data = 15` / `axil_w_strb = t.value` under TB-IR
+/// itself until this guard existed — the same silent swap v1 performs,
+/// which is exactly what `SilentlyMisLowers` documents TB-IR as refusing
+/// rather than matching.
+///
+/// Gated on TWO or more arguments, because a single argument cannot be
+/// reordered: there is no other position for it to land in, so dropping
+/// the name is a no-op and the existing behaviour is correct. That is
+/// the same split `lower_component_call_args` makes, and it is what
+/// keeps this guard from rejecting working programs.
+pub(crate) fn reject_positional_named_args(
+    args: &[crate::ast::CallArg],
+    construct: &str,
+) -> Result<(), LowerError> {
+    if args.len() < 2
+        || !args
+            .iter()
+            .any(|a| matches!(a, crate::ast::CallArg::Named { .. }))
+    {
+        return Ok(());
+    }
+    Err(not_implemented(
+        &format!("named arguments in {construct}"),
+        "argument names are dropped here and the values bound strictly by position, so \
+         names written out of declaration order silently swap them",
+        V1Status::SilentlyMisLowers,
+    ))
+}
+
 /// True when a hooked `on` handler has the shape v1's method-hook
 /// resolver accepts: a bare `<obj>.<method>` dotted path, the default
 /// phase, and no periodic trigger.

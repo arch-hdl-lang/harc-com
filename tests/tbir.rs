@@ -17214,3 +17214,65 @@ end impl TbTest
     // And the control: without a parameter list, the testbench lowers.
     lower_src(&mk("", "Tb", "1")).expect("the unparameterized testbench lowers");
 }
+
+/// The named-argument construct has the same shape as the parameter one:
+/// arms that report it, and sites that silently DO it. `bus.rs` and
+/// `regblock.rs` each carried a `call_arg` helper that took `value` and
+/// dropped `name`, so TB-IR itself bound reordered named arguments by
+/// position — `bus.w.send(strb = 15, data = t.value)` emitted
+/// `axil_w_data = 15` and `axil_w_strb = t.value`.
+///
+/// That is the silent swap `SilentlyMisLowers` documents TB-IR as
+/// refusing rather than matching, and it was found the same way the
+/// seventh parameter landing was: by looking for the BEHAVIOUR outside
+/// the file the first fix was written in.
+#[test]
+fn tbir_no_longer_binds_reordered_named_arguments_by_position() {
+    let fixture = fixture("axilite_bound_mon_test.harc");
+    const CALL: &str = "bus.w.send(t.value, 15)";
+    assert!(fixture.contains(CALL), "fixture shape changed");
+    let call = |args: &str| fixture.replacen(CALL, &format!("bus.w.send({args})"), 1);
+
+    let with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
+        )
+        .expect("stdlib bus readable");
+        let b = parse_source(&bus_src).expect("bus parses");
+        merge::merge_for_sim(vec![f, b], None).expect("merge")
+    };
+    let emit_tbir = |src: &str| {
+        let m = with_bus(src);
+        let p = lower::lower_program(&m)?;
+        verify::verify_program(&p).expect("verifies");
+        Ok::<_, lower::LowerError>(tbir::emit(&p, &m, &cpp_tb::EmitOpts::default()).expect("emits"))
+    };
+
+    // The control still lowers and binds in declaration order.
+    let ctl = emit_tbir(&fixture).expect("the positional form lowers");
+    assert!(
+        ctl.contains("harc_rt::harc_assign(dut->axil_w_data, t.value);")
+            && ctl.contains("harc_rt::harc_assign(dut->axil_w_strb, 15);"),
+        "control binds data then strb"
+    );
+
+    // Both named forms are now refused rather than bound by position.
+    for args in ["data = t.value, strb = 15", "strb = 15, data = t.value"] {
+        let err = emit_tbir(&call(args))
+            .err()
+            .unwrap_or_else(|| panic!("`bus.w.send({args})` must not lower silently"));
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("`bus.w.send(...)` payload"), "{msg}");
+    }
+
+    // A SINGLE named argument is still accepted: there is no other
+    // position for it to land in, so dropping the name is a no-op. This
+    // is what keeps the guard from rejecting working programs.
+    const RECV: &str = "let val = bus.r.recv()";
+    if fixture.contains(RECV) {
+        emit_tbir(&fixture).expect("the one-argument surface is untouched");
+    }
+    let one_arg = fixture.replacen("bus.aw.addr = t.addr", "bus.aw.addr = t.addr", 1);
+    emit_tbir(&one_arg).expect("unrelated single-argument sites keep working");
+}
