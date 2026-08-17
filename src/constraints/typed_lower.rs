@@ -1809,13 +1809,27 @@ fn expand_top_level_clause(
 /// function call not supported in v0 solver path" — so refusing it is
 /// the right verdict even when the name was never meant as a relation.
 ///
-/// This gap is LATENT, and saying so is the point: TB-IR refuses any
-/// transaction carrying a `list<T>` field before constraint lowering
-/// runs, so no program can reach it today. Measured, not assumed — a
-/// `sum(items[0 .. items.len()])` probe is refused with "transaction
-/// field `P.items` with an unbounded length", and so is the same
-/// program with no `sum` at all. It stops being latent the moment list
-/// fields lower.
+/// Only the FALSE-REFUSAL case is latent, and an earlier version of
+/// this comment said the whole predicate was — wrongly. TB-IR refuses
+/// any transaction carrying a `list<T>` field before constraint
+/// lowering runs, and every `sum` v1 ACCEPTS needs a list field, so no
+/// v1-compiling program reaches the fix today. But `sum` over a scalar
+/// reaches this line right now, with no list field anywhere:
+/// `randomize(p) with sum(p.n) == 1` used to be refused as "`sum` names
+/// no `relation` declared in this file" and now lowers.
+///
+/// That is an improvement, not a regression, and what makes it safe is
+/// the shared emitter rather than this predicate. The check is on NAME
+/// and ARITY only — deliberately wider than v1, which also requires the
+/// argument to be a range-sliced list field, so `sum(p.n)` and
+/// `sum(items[0])` are v1 errors this predicate waves through. They do
+/// not become accepted programs: `tbir::emit` routes every constraint
+/// site back through v1's own emitter, which refuses them in v1's own
+/// words. The user gets an accurate diagnostic instead of a fictitious
+/// one about relations. `a_v1_constraint_builtin_is_not_reported_as_an_
+/// unknown_relation` pins that end to end, because a predicate that is
+/// safe only because of what happens downstream needs the downstream
+/// asserted.
 fn is_v1_constraint_builtin(name: &str, arity: usize) -> bool {
     name == "sum" && arity == 1
 }
@@ -1864,12 +1878,27 @@ fn expand_top_level_relation_call(
         return None;
     };
     if rel.params.len() != args.len() {
-        ctx.record_error(LowerError::RelationArityMismatch {
-            name: name.to_string(),
-            expected: rel.params.len(),
-            found: args.len(),
-            span: call.span,
-        });
+        // A relation whose name shadows a builtin, called with the
+        // BUILTIN's arity, is a builtin call. v1 does exactly this: its
+        // expander declines on the arity mismatch
+        // (`cpp_tb::try_expand_top_level_call`) and the list-`sum`
+        // builtin then takes over, so v1 EMITS. Reporting an arity
+        // mismatch here would be the same false refusal this function
+        // was just fixed to stop producing, one shape further out.
+        let err = if is_v1_constraint_builtin(name, args.len()) {
+            LowerError::UnsupportedV1 {
+                feature: "v1 constraint builtin call",
+                span: call.span,
+            }
+        } else {
+            LowerError::RelationArityMismatch {
+                name: name.to_string(),
+                expected: rel.params.len(),
+                found: args.len(),
+                span: call.span,
+            }
+        };
+        ctx.record_error(err);
         return Some(Vec::new());
     }
     // Checked BEFORE the substitution, which reads positions only. The

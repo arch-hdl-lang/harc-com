@@ -18216,13 +18216,22 @@ fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
 /// diagnostic that sends the reader looking for a `relation`
 /// declaration they never meant to write.
 ///
-/// **This gap is LATENT, and the test says so rather than pretending
-/// otherwise.** TB-IR refuses any transaction carrying a `list<T>`
-/// field before constraint lowering runs, so no program can reach it
-/// today — which is why the assertions below are on the constraint
-/// table rather than on `lower_program`. Asserting end-to-end here
-/// would pass for the wrong reason: the list-field gate fires first and
-/// would keep passing however this were classified.
+/// Only the FALSE-REFUSAL case is latent — an earlier version of this
+/// doc said the whole thing was. TB-IR refuses any transaction carrying
+/// a `list<T>` field before constraint lowering runs, and every `sum`
+/// v1 ACCEPTS needs a list field, so no v1-compiling program reaches
+/// the fix today. That is why the list-bearing cases are asserted on
+/// the constraint table: end-to-end there would pass for the wrong
+/// reason, since the list-field gate fires first and would keep passing
+/// however this were classified.
+///
+/// But `sum` over a SCALAR reaches the fixed line today, with no list
+/// field anywhere, and that case is asserted end to end — because the
+/// predicate checks NAME and ARITY only, deliberately wider than v1,
+/// which also requires a range-sliced list field. What keeps the
+/// widening safe is not the predicate but the shared emitter, and a
+/// predicate that is safe only because of what happens downstream needs
+/// the downstream asserted.
 #[test]
 fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
     let src = |clause: &str| {
@@ -18296,6 +18305,58 @@ fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
             "`{clause}` must still be a relation error: {got:?}"
         );
     }
+
+    // A relation whose name shadows the builtin but takes a different
+    // arity. v1's expander declines on the arity and its list-`sum`
+    // builtin takes over, so v1 EMITS — reporting an arity mismatch
+    // would be the same false refusal one shape further out.
+    let shadowed = format!(
+        "relation sum(a: P, b: P) = a.n > 1\n\n{}",
+        src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100")
+    );
+    cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits when a relation shadows `sum`");
+    let got: Vec<(bool, String)> =
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&shadowed))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect();
+    assert!(
+        got.iter().all(|(is_rel, _)| !is_rel),
+        "a relation shadowing `sum` at the builtin's arity is not a relation error: {got:?}"
+    );
+
+    // END TO END, on a transaction with NO list field, which reaches
+    // the fixed line today. `sum` over a scalar is a v1 error this
+    // predicate deliberately waves through; what refuses it is the
+    // shared emitter, in v1's own words. Before the fix the user got
+    // "`sum` names no `relation` declared in this file" instead —
+    // accurate diagnostic, same verdict.
+    let scalar = "domain D\n  freq_mhz: 100\nend domain D\n\n\
+                  transaction Q\n    n : uint<8>\nend transaction Q\n\n\
+                  test T\n    let dut : Top\n    let q : Q\n    clock clk = D\n    run\n\
+                  \x20       randomize(q) with\n            sum(q.n) == 1\n        end randomize\n\
+                  \x20   end run\nend test T\n";
+    let merged = merged_src(scalar);
+    let v1 = cpp_tb::emit(&merged).expect_err("v1 refuses `sum` over a scalar");
+    assert!(
+        format!("{v1}").contains("constraint function call not supported in v0 solver path"),
+        "{v1}"
+    );
+    // TB-IR lowers it — the refusal has MOVED, not disappeared.
+    let program = lower_src(scalar).expect("`sum` over a scalar now lowers");
+    verify::verify_program(&program).expect("verifies");
+    let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("the shared emitter refuses it");
+    assert!(
+        format!("{tb}").contains("constraint function call not supported in v0 solver path"),
+        "TB-IR must refuse in v1's own words, not invent one about relations: {tb}"
+    );
 }
 
 /// `logf` finds its message positionally, the way v1 does.

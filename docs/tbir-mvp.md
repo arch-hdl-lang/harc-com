@@ -4274,21 +4274,48 @@ case and only locally-determinable `Assign` types are compared).
     and generalising is how the previous batch got a verdict wrong; the
     probe is what found the third.*
 
-    **The gap is LATENT and the test says so.** TB-IR refuses any
-    transaction carrying a `list<T>` field before constraint lowering
-    runs — measured: the `sum` probe, an unknown-relation probe, and a
-    clause with no call in it at all are all refused with the same
-    "`P.items` with an unsupported (non-scalar) leaf type" message. So
-    the assertions are on the constraint table, not on `lower_program`;
-    an end-to-end assertion would pass for the wrong reason, since the
-    list-field gate fires first and would keep passing however this were
+    **Only the FALSE-REFUSAL case is latent — the first draft of this
+    entry said the whole predicate was, and that was wrong.** TB-IR
+    refuses any transaction carrying a `list<T>` field before constraint
+    lowering runs (measured: the `sum` probe, an unknown-relation probe,
+    and a clause with no call in it at all are all refused with the same
+    "unsupported (non-scalar) leaf type" message), and every `sum` v1
+    ACCEPTS needs a list field. So no v1-compiling program reaches the
+    fix today, and the list-bearing assertions are on the constraint
+    table: end-to-end there would pass for the wrong reason, since the
+    list gate fires first and would keep passing however this were
     classified.
 
-    What makes it worth fixing rather than filing as unreachable: that
-    gate's `--codegen v1` suggestion is **honest**. Give the list a
+    But `sum` over a SCALAR reaches the fixed line right now, with no
+    list field anywhere. `randomize(p) with sum(p.n) == 1` used to be
+    refused as "`sum` names no `relation` declared in this file" and now
+    lowers — an improvement, since v1 refuses it too and the user now
+    gets v1's own accurate wording instead of a fiction about relations.
+    *"Nothing can reach this" was asserted from the shape that motivated
+    the fix, not from the predicate's actual domain.*
+
+    That case also exposes what makes the fix safe, which is **not** the
+    predicate. The check is on NAME and ARITY only, deliberately wider
+    than v1 — which also requires a range-sliced list field, so
+    `sum(p.n)` and `sum(items[0])` are v1 errors this predicate waves
+    through. They do not become accepted programs: `tbir::emit` routes
+    every constraint site back through v1's own emitter, which refuses
+    them in v1's own words. The scalar case is now asserted end to end,
+    because a predicate that is safe only because of what happens
+    downstream needs the downstream asserted.
+
+    What makes it worth fixing rather than filing as unreachable: the
+    list gate's `--codegen v1` suggestion is **honest**. Give the list a
     bound (`items.len() <= 4`) and v1 emits the whole thing, `sum` call
     included — verified in the test. The false `UnknownRelation` was
     sitting directly in front of a form v1 compiles.
+
+    One shape further out, same bug, found by the same review: a
+    **relation whose name shadows the builtin at a different arity**.
+    v1's expander declines on the arity mismatch and its list-`sum`
+    builtin takes over, so v1 EMITS; TB-IR reported
+    `RelationArityMismatch`, a hard `Invalid`. The arity arm now defers
+    to the builtin the same way v1 does.
 
     Both directions are pinned by mutation, because widening a gate is
     as much a claim as narrowing one: emptying the builtin list makes
