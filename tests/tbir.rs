@@ -17400,3 +17400,88 @@ fn every_named_argument_call_site_is_guarded() {
     );
     assert!(msg.contains("names no parameter"), "{msg}");
 }
+
+/// `log`/`logf` read the severity and message POSITIONALLY, matching
+/// `CallArg::Expr` only — and so does v1. A named argument therefore
+/// hides whatever it wraps, under both backends:
+///
+///   `log(level = fatal, "BOOM")` → `sim_log_line("INFO", "BOOM")`
+///   `log(fatal, msg = "BOOM")`   → `sim_log_line("FATAL", "")`
+///
+/// The first is the dangerous one and is why this led its batch: a
+/// `fatal` silently becomes an `info`, so nothing bumps the failure
+/// counter and a test that should abort passes green. The severity guard
+/// below it rejects a TYPO for exactly this reason, and a named severity
+/// walked past that guard.
+///
+/// Gated on what the name HIDES, not on named-ness: an argument the
+/// extractors would never have looked at is harmless under both
+/// backends, and refusing it would be refusing a correct program.
+#[test]
+fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
+    let fixture = fixture("agent_periodic_test.harc");
+    const LOG: &str = r#"log(info, "PASS: periodic handler fired ${tk.beats} times")"#;
+    assert!(fixture.contains(LOG), "fixture shape changed");
+    let log = |args: &str| fixture.replacen(LOG, &format!("log({args})"), 1);
+
+    // The control, and the anchor: a positional `fatal` really does
+    // reach the emitted severity, so a later `INFO` means it was lost.
+    let v1_ctl = cpp_tb::emit(&merged_src(&log(r#"fatal, "BOOM""#))).expect("v1 emits");
+    assert!(
+        v1_ctl.contains(r#"sim_log_line("FATAL", "BOOM");"#),
+        "the positional form carries both severity and message"
+    );
+    lower_src(&log(r#"fatal, "BOOM""#)).expect("the positional form lowers");
+
+    // A named SEVERITY is refused — and v1 downgrades it to INFO.
+    let msg = assert_not_implemented(
+        &lower_src(&log(r#"level = fatal, "BOOM""#)).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`level` carrying a severity"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&log(r#"level = fatal, "BOOM""#)))
+            .expect("v1 emits")
+            .contains(r#"sim_log_line("INFO", "BOOM");"#),
+        "v1 silently downgrades the severity to INFO"
+    );
+
+    // A named MESSAGE is refused — and v1 empties the message.
+    let msg = assert_not_implemented(
+        &lower_src(&log(r#"fatal, msg = "BOOM""#)).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`msg` carrying the message"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&log(r#"fatal, msg = "BOOM""#)))
+            .expect("v1 emits")
+            .contains(r#"sim_log_line("FATAL", "");"#),
+        "v1 silently empties the message"
+    );
+
+    // A named argument the extractors would never look at is HARMLESS,
+    // and must keep working — this is the half a blanket rejection
+    // would have broken.
+    for args in [
+        r#"fatal, "BOOM", extra = 1"#,
+        r#"nosuch = 1, fatal, "BOOM""#,
+    ] {
+        lower_src(&log(args)).unwrap_or_else(|e| panic!("`log({args})` must lower: {e:?}"));
+        assert!(
+            cpp_tb::emit(&merged_src(&log(args)))
+                .expect("v1 emits")
+                .contains(r#"sim_log_line("FATAL", "BOOM");"#),
+            "`log({args})` emits the correct line under v1 too"
+        );
+    }
+
+    // `logf` shares the extractors, and its PATH literal must not be
+    // mistaken for a hidden message.
+    let logf = |args: &str| fixture.replacen(LOG, &format!("logf({args})"), 1);
+    lower_src(&logf(r#""t.log", error, "BOOM""#)).expect("the positional logf form lowers");
+    let msg = assert_not_implemented(
+        &lower_src(&logf(r#""t.log", level = error, "BOOM""#)).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("carrying a severity"), "{msg}");
+}

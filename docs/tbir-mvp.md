@@ -3835,6 +3835,65 @@ case and only locally-determinable `Assign` types are compared).
     82 after this change — a detail invented to decorate a point that
     stood without it.
 
+56. **`log` downgrades a named severity to `info` (2026-08-17).**
+
+    `lower_log` finds the severity as "the first bare ident among the
+    args" and the message as "the first string literal", and both
+    searches match `CallArg::Expr` only. v1's do the same. So a NAMED
+    argument hides whatever it wraps, under both backends:
+
+    * `log(level = fatal, "BOOM")` → `sim_log_line("INFO", "BOOM")`
+    * `log(fatal, msg = "BOOM")`   → `sim_log_line("FATAL", "")`
+
+    The first is why this led the batch. A `fatal` silently becomes an
+    `info`: nothing bumps `ctx.errors++`, nothing sets `_fatal`, and a
+    test that should abort passes green. Four lines below the extractor,
+    the severity guard rejects a TYPO (`log(errror, ...)`) with the
+    comment *"rejecting it is what makes `log(error, ...)` trustworthy"*
+    — and a named severity walked straight past that guard into exactly
+    the outcome it exists to prevent.
+
+    Gated on what the name HIDES, not on named-ness. A named argument
+    wrapping anything the extractors would not have looked at is
+    invisible to both backends and harmless: `log(fatal, "BOOM",
+    extra = 1)` emits the correct `FATAL`/`BOOM` line, so a blanket
+    rejection would have refused a correct program — the trap batch 23
+    fell into and had to undo. The test pins BOTH directions: removing
+    the guard fails it, and widening it to reject every named argument
+    fails it too.
+
+57. **A guard written where the arity check does not fire (2026-08-17).**
+
+    Relation calls in `randomize ... with` bind by position and drop the
+    name, so `Between(r, hi = 131072, lo = 65536)` inlines
+    `addr >= 131072 && addr <= 65536` — unsatisfiable, silently, from a
+    program written to mean the opposite. Measured through TB-IR's own
+    emitter.
+
+    The obvious home for a check was `expand_top_level_relation_call` in
+    `constraints/typed_lower.rs`, which has the params in hand and an
+    error path already in use one statement above. A check was written
+    there, and it **did not fire**. The control that showed why: the
+    EXISTING arity check beside it does not fire either —
+    `Between(r, 65536)` on a three-parameter relation lowers clean. That
+    function is not on the path this program takes.
+
+    The substitution that actually runs is `cpp_tb.rs`'s
+    `try_expand_top_level_call`, reached through the randomize seam that
+    both backends share, so TB-IR cannot emit different Z3 without
+    changing v1. A TB-IR-side refusal belongs in `lower_randomize`,
+    which has `with_body` and a `LowerError` return — but no relations
+    table in `LowerCtx`, so it needs one threaded through. That is a
+    scoped change, not a drive-by, and it is the next batch's first item.
+
+    The guard was **reverted rather than shipped**. It compiled, it
+    read correctly, and it would have sat in the tree looking like
+    coverage. *A guard you cannot demonstrate firing is not a
+    conservative addition; it is a claim.* The cheap control — run the
+    check that is already there and see whether IT fires — cost one
+    probe and would have been worth running before writing the code
+    rather than after.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

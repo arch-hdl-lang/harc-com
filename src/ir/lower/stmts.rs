@@ -3115,6 +3115,41 @@ impl FuncBuilder<'_> {
     }
 
     fn lower_log(&mut self, args: &[CallArg], file: Option<String>) -> Result<(), LowerError> {
+        // Both extractors below match `CallArg::Expr` only, so a NAMED
+        // argument hides whatever it wraps — and v1's do the same, so
+        // this is a silent mis-lowering under both backends rather than
+        // a divergence:
+        //
+        //   `log(level = fatal, "BOOM")`  -> `sim_log_line("INFO", "BOOM")`
+        //   `log(fatal, msg = "BOOM")`    -> `sim_log_line("FATAL", "")`
+        //
+        // The first is the dangerous one. A `fatal` silently becomes an
+        // `info`: no `ctx.errors++`, no `_fatal`, and a test that should
+        // abort passes green. The severity guard further down rejects a
+        // TYPO (`log(errror, ...)`) for exactly this reason — "rejecting
+        // it is what makes `log(error, ...)` trustworthy" — and a named
+        // severity walked straight past it.
+        //
+        // Gated on what the name HIDES, not on named-ness. A named
+        // argument wrapping anything else is invisible to both
+        // extractors and harmless: `log(fatal, "BOOM", extra = 1)` emits
+        // the same `FATAL`/`BOOM` line under both backends, so refusing
+        // it would be refusing a correct program.
+        for a in args {
+            let CallArg::Named { name, value } = a else {
+                continue;
+            };
+            let hidden = match &*value.kind {
+                ExprKind::Ident(_) => "a severity",
+                ExprKind::String(s) if file.as_deref() != Some(s.as_str()) => "the message",
+                _ => continue,
+            };
+            return Err(not_implemented(
+                &format!("a named argument `{}` carrying {hidden} in `log`", name.name),
+                "both backends read the severity and message positionally and skip named                  arguments entirely, so this silently drops what the name wraps — a named                  `fatal` becomes `info`, which bumps no failure counter",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
         // Mirror v1's extraction rules: first bare ident is the
         // severity (default info); first string literal that isn't the
         // logf path is the message.
