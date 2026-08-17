@@ -15114,15 +15114,13 @@ impl Emitter {
     ///
     /// It does NOT have the width oracle's `const`/enum fallbacks, and
     /// that is correct: both are emitted as non-negative `uint64_t`, so
-    /// `false` is the right answer for them. A signed `let` under
-    /// `blocking randomize` really is a gap — `t.x < s` on a `sint<8>`
-    /// compares unsigned — but it predates this path, and like the width
-    /// oracle's blocking gap (harc#566) it cannot be closed by reading
-    /// per-test emitter state, which the TB-IR randomize emitter does not
-    /// have. It also needs a signedness table for locals, and the flat
-    /// one was removed once already for poisoning unrelated functions
-    /// (harc#550). Tracked in harc#563; do not paper over it with another
-    /// flat side table.
+    /// `false` is the right answer for them.
+    ///
+    /// A signed `let` under `blocking randomize` and a signed list element
+    /// were the two gaps harc#563 tracked; both are closed below. A
+    /// SHADOWED local is the one case still answered `false` — see the
+    /// `shadowed_lets` guard on the `Ident` arm for why guessing there is
+    /// worse than under-reporting.
     fn constraint_expr_is_signed(
         &self,
         e: &Expr,
@@ -15143,10 +15141,28 @@ impl Emitter {
             // `let s : sint<8> = 0 - 1` emitted `z3::ult(_z_x, 0xFFFF...)`,
             // true for every `x`, where the source `x < -1` forbids all of
             // them — the solver returned a value the source excludes.
+            //
+            // But `let_widths` is keyed by BARE NAME with no scoping, so a
+            // shadowed name's entry belongs to whichever `let` was seen
+            // last, not to the one in scope at the constraint. Signedness
+            // cannot ride that out the way a width check can: reading the
+            // wrong entry flips `udiv` to `/` and `ult` to `<`, changing
+            // the solved VALUE. An inner-block `let m : sint<64>` would
+            // make an outer `uint<64>` `m` divide signed, and an inner
+            // `uint<8>` would silently un-fix harc#563 for an outer signed
+            // one. So a shadowed name answers `false` — the pre-harc#563
+            // answer, which is under-reporting rather than a new wrong
+            // predicate — using the same `shadowed_lets` guard the width
+            // oracle already consults for the same reason.
             ExprKind::Ident(id) => field_info
                 .get(&id.name)
                 .map(|f| f.signed)
-                .or_else(|| self.let_widths.get(&id.name).map(|lw| lw.signed))
+                .or_else(|| {
+                    if self.shadowed_lets.contains(&id.name) {
+                        return None;
+                    }
+                    self.let_widths.get(&id.name).map(|lw| lw.signed)
+                })
                 .unwrap_or(false),
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))

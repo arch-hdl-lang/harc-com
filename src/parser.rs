@@ -4688,26 +4688,49 @@ fn check_interpolated_sized_literals(s: &str, span: Span) -> Result<(), CompileE
         // at v1. Worse, a PARTIAL parse was silently truncated by both:
         // `${1 2}` printed `1`. Validating here covers `harc check` and both
         // backends at once, which is the only place that does (harc#593).
-        if !expr_src.is_empty() {
+        // No `is_empty()` exemption. `${}` and `${:04x}` leave nothing
+        // before the last `:`, and `parse_expr_fragment("")` FAILS — so
+        // exempting them here let `harc check` accept a program both
+        // backends then rejected, which is the check-versus-backend split
+        // harc#593 is about, reproduced by the fix for it.
+        {
             crate::parser::parse_expr_fragment_complete(expr_src).map_err(|_| {
                 // A ternary is the one shape that fails here for a reason
                 // the author cannot guess from the text: the capture is
                 // split on its LAST `:`, so `${a ? b : c}` hands `a ? b` to
                 // the parser and keeps `c` as a format spec. Adding an
                 // explicit spec moves the split point and makes it work.
-                let (why, help) = if inner.contains('?') {
-                    (
-                        ": a capture is split on its LAST `:`, which collides with the \
-                         ternary's own",
-                        "write `${a ? b : c:d}` — an explicit format spec moves the \
-                         split point — or assign the ternary to a `let` first",
-                    )
+                // Two constructs carry a `:` of their own inside an
+                // expression — a ternary and a bit-slice — and both collide
+                // with the last-`:` split that separates off the format
+                // spec. They fail for a reason the author cannot read off
+                // the text, and both have the same fix, so say so instead
+                // of claiming they did not write an expression.
+                //
+                // Those two are the complete set: named call arguments use
+                // `=`, so no other expression form contains a `:`.
+                let colon_construct = if inner.contains('?') {
+                    Some("ternary")
+                } else if inner.contains('[') && inner.contains(':') {
+                    Some("bit-slice")
                 } else {
-                    (
-                        "",
+                    None
+                };
+                let (why, help) = match colon_construct {
+                    Some(what) => (
+                        format!(
+                            ": a capture is split on its LAST `:`, which collides with the \
+                             {what}'s own"
+                        ),
+                        "add an explicit format spec to move the split point — \
+                         `${a ? b : c:d}`, `${x[7:0]:02x}` — or assign the value to a \
+                         `let` first",
+                    ),
+                    None => (
+                        String::new(),
                         "an interpolation holds one complete expression, optionally \
                          followed by `:` and a format spec",
-                    )
+                    ),
                 };
                 CompileError::invalid_literal(
                     &format!("`${{{inner}}}` is not an expression{why}"),

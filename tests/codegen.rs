@@ -9901,6 +9901,46 @@ fn the_ternary_interpolation_collision_is_explained() {
         .expect("an explicit format spec moves the split and makes a ternary work");
 }
 
+/// An EMPTY capture is not an expression either, and `parse_expr_fragment("")`
+/// fails — so exempting it from the check let `harc check` accept a program
+/// both backends then rejected. That is the check-versus-backend split
+/// harc#593 is about, reproduced by the first version of the fix for it.
+///
+/// The point of validating in the parser is that one place answers for
+/// `harc check` and both backends, so this asserts the three agree.
+#[test]
+fn an_empty_interpolation_capture_is_rejected_by_the_parser() {
+    for c in ["", ":04x", ":"] {
+        let src = format!(
+            "test T\n    let dut : Top\n    run\n        log(info, \"v=${{{c}}}\")\n    end run\nend test T"
+        );
+        let err = parse_source(&src)
+            .expect_err(&format!("`${{{c}}}` must be rejected at parse time"))
+            .to_string();
+        assert!(err.contains("is not an expression"), "got: {err}");
+    }
+}
+
+/// A bit-slice carries the ternary's exact root cause — its own `:` collides
+/// with the last-`:` format-spec split — and has the exact same fix, so it
+/// must get the same explanation rather than "you did not write an
+/// expression", which is false: the author wrote one.
+#[test]
+fn the_bit_slice_interpolation_collision_is_explained_too() {
+    let src = |body: &str| {
+        format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T")
+    };
+    let err = parse_source(&src(r#"log(info, "v=${a[1:0]}")"#))
+        .expect_err("a bare bit-slice capture collides with the spec split")
+        .to_string();
+    assert!(
+        err.contains("split on its LAST `:`") && err.contains("bit-slice"),
+        "the diagnostic must name the bit-slice collision; got: {err}"
+    );
+    parse_source(&src(r#"log(info, "v=${a[1:0]:02x}")"#))
+        .expect("an explicit format spec moves the split and makes a bit-slice work");
+}
+
 /// Captures that ARE expressions must still parse, including the format-spec
 /// form — the whole risk of validating here is rejecting working programs.
 #[test]
@@ -10315,6 +10355,67 @@ end test T"#
     assert!(
         unsigned.contains("z3::ult(_z_x, _ctx.bv_val((uint64_t)(s), 64))"),
         "an unsigned local must stay unsigned; got:\n{unsigned}"
+    );
+}
+
+/// `let_widths` is keyed by bare name with NO scoping, so a shadowed name's
+/// entry belongs to whichever `let` was seen last rather than the one in
+/// scope. Signedness cannot ride that out the way a width check can:
+/// reading the wrong entry flips `udiv` to `/`, changing the solved value.
+///
+/// The first version of the harc#563 fix ignored the `shadowed_lets` guard
+/// the width oracle already consults, so an inner-block `let m : sint<64>`
+/// made an OUTER `uint<64>` `m` divide signed — a regression in a
+/// constraint that mentions neither block. A shadowed name now answers
+/// unsigned: under-reporting, i.e. the pre-harc#563 answer, rather than a
+/// new wrong predicate.
+#[test]
+fn a_shadowed_local_does_not_flip_the_predicate() {
+    let shadowed = v1_cpp(
+        r#"transaction Txn
+    u : uint<64> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let m : uint<64> = 10000000000000000000
+        if dut.en == 1
+            let m : sint<64> = 0 - 1
+            log(info, "inner=${m}")
+        end if
+        let t : Txn
+        blocking randomize(t) with
+            t.u == m / 2
+        end randomize
+        log(info, "${t.u}")
+    end run
+end test T"#,
+    );
+    assert!(
+        shadowed.contains("z3::udiv(_ctx.bv_val((uint64_t)(m), 64)"),
+        "the outer `m` is unsigned; an inner shadow must not make it divide \
+         signed; got:\n{shadowed}"
+    );
+    // And the guard must not swallow the fix for an UNSHADOWED local.
+    let plain = v1_cpp(
+        r#"transaction Txn
+    x : uint<8> default 0
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let s : sint<8> = 0 - 1
+        let t : Txn
+        blocking randomize(t) with
+            t.x < s
+        end randomize
+        log(info, "${t.x}")
+    end run
+end test T"#,
+    );
+    assert!(
+        plain.contains("_s.add(_z_x < _ctx.bv_val((uint64_t)(s), 64))"),
+        "an unshadowed signed local must still compare signed; got:\n{plain}"
     );
 }
 
