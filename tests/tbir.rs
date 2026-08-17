@@ -17657,8 +17657,14 @@ fn a_misplaced_relation_argument_name_is_refused() {
     lower_src(&with("Between(r, lo = 65536, hi = 131072)")).expect("in-order names lower");
 
     // Reordered names are refused, and the message says which parameter
-    // was written where.
-    let msg = assert_invalid(&lower_src(&with("Between(r, hi = 131072, lo = 65536)")).unwrap_err());
+    // was written where. NOT `Invalid`, unlike the three sibling
+    // relation errors: v1 ACCEPTS this one and emits working C++ with
+    // the values swapped, so "a program error under every backend"
+    // would be literally false.
+    let msg = assert_not_implemented(
+        &lower_src(&with("Between(r, hi = 131072, lo = 65536)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(
         msg.contains("`hi` is parameter 3 but was written in position 2"),
         "{msg}"
@@ -17672,8 +17678,10 @@ fn a_misplaced_relation_argument_name_is_refused() {
     );
 
     // A name matching no parameter gets its own sentence.
-    let msg =
-        assert_invalid(&lower_src(&with("Between(r, nosuch = 65536, hi = 131072)")).unwrap_err());
+    let msg = assert_not_implemented(
+        &lower_src(&with("Between(r, nosuch = 65536, hi = 131072)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(
         msg.contains("`nosuch` names no parameter of `Between`"),
         "{msg}"

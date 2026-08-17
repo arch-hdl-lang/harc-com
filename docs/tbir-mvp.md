@@ -3948,16 +3948,32 @@ case and only locally-determinable `Assign` types are compared).
     v1 refused it outright.
 
     Only the RELATION errors now surface, and the split was MEASURED, not
-    reasoned. All 173 registry fixtures were run through the table
-    builder: exactly one produces a non-relation `LowerError` —
-    `uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
-    `DisallowedInConstraint`. That is a capability gap in the constraint
-    IR, not a bad program; v1 lowers it and it passes trace equivalence.
-    Surfacing every variant would have rejected a registered, working
-    fixture. The three that do surface are program errors under any
-    backend — a relation that does not exist, one called with the wrong
-    arity, and one that expands into itself — so they are `Invalid` and
-    name no escape hatch.
+    reasoned — though the first measurement was over the wrong set. It
+    swept the 173 entries of `tbir_equiv_fixtures.txt` and reported
+    "exactly one" non-relation `LowerError`. Sweeping every `.harc` in
+    `tests/fixtures` instead — 190 files, 184 of which merge — gives the
+    real numbers: **two** fixtures produce non-relation errors
+    (`uint64_unique_randomize_test`, whose `s.sample[63:32] != 0` trips
+    `DisallowedInConstraint`, and `axi_agent`, with `UnresolvedIdent`),
+    and **zero** produce a relation error. The second number is the one
+    that matters and it is stronger than what was claimed: surfacing the
+    relation variants breaks nothing in the corpus at all. *Measuring the
+    registry is not measuring the corpus* — the registry is what runs
+    under equivalence, not what exists.
+
+    Those two are capability gaps in the constraint IR, not bad programs;
+    v1 lowers both. Surfacing every variant would have rejected working
+    fixtures. Three of the four that do surface are program errors under
+    any backend — a relation that does not exist, one called with the
+    wrong arity, and one that expands into itself — so they are `Invalid`
+    and name no escape hatch.
+
+    The FOURTH is not. A misplaced argument name is accepted by v1, which
+    emits working C++ with the values swapped, so `Invalid`'s "program
+    error under every backend" is literally false for it. It carries
+    `SilentlyMisLowers` instead — the sweep's ordinary shape, and the
+    verdict that keeps the diagnostic from naming v1 as a way out. Three
+    siblings sharing one code path is not a reason to share one verdict.
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
@@ -3982,6 +3998,24 @@ case and only locally-determinable `Assign` types are compared).
     Both halves of the split are pinned by mutation: widening the arm to
     surface every variant fails the capability-gap fixture, and neutering
     the name comparison fails the swap test.
+
+    Three limits are known and NOT closed here, recorded so the next
+    batch takes them deliberately:
+
+    * **Only Test and Tseq randomize sites are collected.** A
+      `randomize(r) with Band(r, hi = 2000, lo = 1000)` inside an agent's
+      `on` handler still lowers clean and still emits the swapped,
+      unsatisfiable constraint — the same call in a test body is refused.
+      The gate is `collect_randomize_sites`, not the check.
+    * **`MAX_ERRORS = 5` can disable the refusal.** Five preceding
+      discarded errors (`r.addr == r.len` trips `WidthMismatch`, which is
+      deliberately not surfaced) hit `at_error_cap()` before the relation
+      clause is reached, and the program lowers. The cap is a
+      diagnostics-volume guard being load-bearing for correctness.
+    * **Every Ident-callee constraint call is treated as a relation
+      call**, so a v1-supported `sum(...)` records `UnknownRelation`.
+      Masked today only because TB-IR rejects `list<T>` fields earlier;
+      it becomes a false `Invalid` the moment list fields lower.
 
 ### The probe method
 

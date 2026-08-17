@@ -1406,21 +1406,42 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         CErr::RecursiveRelation { name, .. } => format!(
                             "`{name}` expands into itself, so the constraint has no finite form"
                         ),
+                        // NOT `Invalid`, unlike its three siblings. v1
+                        // ACCEPTS a misplaced name — it emits working
+                        // C++ with the arguments silently swapped — so
+                        // "a program error under every backend" is
+                        // literally false here. This is the sweep's
+                        // ordinary `SilentlyMisLowers` shape and gets
+                        // that verdict, which also keeps the diagnostic
+                        // from naming v1 as a way out.
                         CErr::RelationNamedArgMisplaced {
                             name,
                             arg,
                             expected,
                             found,
                             ..
-                        } => match expected {
-                            Some(e) => format!(
-                                "`{name}` binds arguments by position, and `{arg}` is \
-                                 parameter {} but was written in position {}",
-                                e + 1,
-                                found + 1
-                            ),
-                            None => format!("`{arg}` names no parameter of `{name}`"),
-                        },
+                        } => {
+                            let detail = match expected {
+                                Some(e) => format!(
+                                    "`{name}` binds arguments by position, and `{arg}` is \
+                                     parameter {} but was written in position {}; v1 \
+                                     substitutes it positionally anyway, silently swapping \
+                                     the values",
+                                    e + 1,
+                                    found + 1
+                                ),
+                                None => format!(
+                                    "`{arg}` names no parameter of `{name}`; v1 substitutes \
+                                     it positionally anyway"
+                                ),
+                            };
+                            return Err(not_implemented(
+                                "a misplaced named argument in a `randomize ... with` \
+                                 relation call",
+                                detail,
+                                V1Status::SilentlyMisLowers,
+                            ));
+                        }
                         _ => continue,
                     };
                     return Err(LowerError::Invalid(format!(
