@@ -15136,6 +15136,20 @@ impl Emitter {
     /// the surrounding solver block. Integer literals become `_ctx.bv_val(N, W)`
     /// at the field's width inferred from context. v0 is permissive — any
     /// untranslatable form falls back to a comment + `_ctx.bool_val(true)`.
+    /// A whole constraint, as passed to `_s.add(...)`.
+    ///
+    /// This is a BOOL position and must route to the Bool emitter. It used
+    /// to call `emit_constraint_expr_w` — the value emitter — so a
+    /// constraint that is not a proposition was emitted as a bitvector and
+    /// handed to `z3::solver::add`, which takes a Bool: it built cleanly
+    /// and died as a sort error at runtime (harc#560). All four callers
+    /// write `_s.add(` immediately before this, so there is no value-
+    /// position caller to preserve.
+    ///
+    /// Beyond the diagnostics this now reaches, it fixes a bare one-bit
+    /// field: `keep flag` emitted `_s.add(_z_flag)` and now emits
+    /// `_s.add(_z_flag != 0)`, the coercion the Bool emitter already
+    /// applied everywhere the same field appeared under `&&` or `||`.
     fn emit_constraint_expr_with_list_bounds(
         &mut self,
         e: &Expr,
@@ -15145,13 +15159,13 @@ impl Emitter {
         blocking: bool,
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
-        self.emit_constraint_expr_w(
+        self.emit_constraint_bool_expr_w(
             e,
             field_info,
             width,
             target_root,
             blocking,
-            &list_unroll_bounds,
+            list_unroll_bounds,
         );
     }
 
@@ -15453,6 +15467,77 @@ impl Emitter {
                     blocking,
                     list_unroll_bounds,
                 );
+                return;
+            }
+            // A constraint has to BE a proposition. Everything above
+            // produces a z3 Bool; the fall-through below produces whatever
+            // the expression is, and for an arithmetic, bitwise, shift or
+            // wrapping operator that is a BITVECTOR. `z3::solver::add`
+            // takes a Bool, so those built cleanly and died as a sort
+            // error at runtime (harc#560).
+            //
+            // `keep len & 3 == 0` is the case worth explaining rather than
+            // just rejecting. HARC's precedence, like C++'s, binds `&`
+            // LOOSER than `==`, so that parses as `len & (3 == 0)` — the
+            // top operator is `&`, which is why this one rule catches it.
+            // Emitting a paren to "fix" it would make codegen contradict
+            // the parser and silently change what the program means, so
+            // the diagnostic names the grouping and lets the author say
+            // which one they meant.
+            ExprKind::Binary { op, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::AddWrap
+                        | BinaryOp::SubWrap
+                        | BinaryOp::MulWrap
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                ) =>
+            {
+                let spelling = constraint_op_spelling(*op);
+                let mut msg = format!(
+                    "`{spelling}` produces a value, not a condition, so it cannot be a \
+                     constraint on its own — a `keep` (or a `randomize ... with` line) \
+                     must be a comparison"
+                );
+                if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) {
+                    msg.push_str(&format!(
+                        ". Note `{spelling}` binds LOOSER than `==`, so `a {spelling} b == c` \
+                         groups as `a {spelling} (b == c)`; write `(a {spelling} b) == c` if \
+                         that is what you meant"
+                    ));
+                }
+                self.errors.push(msg);
+                write!(self.out, "_ctx.bool_val(true)").ok();
+                return;
+            }
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Neg | UnaryOp::BitNot),
+                ..
+            } => {
+                let spelling = if matches!(op, UnaryOp::Neg) { "-" } else { "~" };
+                self.errors.push(format!(
+                    "`{spelling}` produces a value, not a condition, so it cannot be a \
+                     constraint on its own — compare it, as in `{spelling}x == 0`"
+                ));
+                write!(self.out, "_ctx.bool_val(true)").ok();
+                return;
+            }
+            ExprKind::Int(lit) => {
+                self.errors.push(format!(
+                    "the literal `{lit}` is a value, not a condition, so it cannot be a \
+                     constraint — write a comparison such as `x == {lit}`, or `true` / \
+                     `false` for a constant one"
+                ));
+                write!(self.out, "_ctx.bool_val(true)").ok();
                 return;
             }
             _ => {}
@@ -19889,6 +19974,20 @@ fn wide_literal_bit_width(s: &str) -> Option<u32> {
     let lead_bits = 32 - lead.leading_zeros();
     let bits = (trimmed.len() as u32 - 1) * bits_per_digit + lead_bits;
     (bits > 64).then_some(bits)
+}
+
+/// HARC spelling of an operator, for diagnostics. Distinct from
+/// `c_binary_op`, which gives the C++ spelling and so collapses `+%` onto
+/// `+` — an error message quoting the operator back to the author has to
+/// use the one they wrote.
+fn constraint_op_spelling(op: BinaryOp) -> &'static str {
+    use BinaryOp::*;
+    match op {
+        AddWrap => "+%",
+        SubWrap => "-%",
+        MulWrap => "*%",
+        other => c_binary_op(other),
+    }
 }
 
 fn c_binary_op(op: BinaryOp) -> &'static str {

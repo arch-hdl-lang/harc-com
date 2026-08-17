@@ -9915,6 +9915,140 @@ end test T"#,
     );
 }
 
+/// Build a transaction with `keep <expr>` and a `randomize(t)`.
+fn keep_src(constraint: &str) -> String {
+    format!(
+        r#"transaction Txn
+    len : uint<8> default 0
+    flag : uint<1> default 0
+    keep {constraint}
+end transaction Txn
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${{t.len}}")
+    end run
+end test T"#
+    )
+}
+
+/// harc#560. A constraint has to BE a proposition. The top-level `_s.add`
+/// site emitted through the VALUE emitter, so an arithmetic, bitwise,
+/// shift or wrapping operator produced a bitvector, which
+/// `z3::solver::add` — which takes a Bool — accepted at build time and
+/// rejected at runtime as a sort error.
+///
+/// Both backends share this emitter, so both must reject: a one-sided
+/// rejection here would be the exact divergence harc#551 is about.
+#[test]
+fn a_value_operator_cannot_be_a_whole_constraint() {
+    for c in [
+        "len & 3",
+        "len | 3",
+        "len ^ 3",
+        "len << 2",
+        "len >> 2",
+        "len + 1",
+        "len +% 1",
+        "(len +% 1)",
+        "~len",
+    ] {
+        let src = keep_src(c);
+        let v1 = v1_emit_err(&src);
+        assert!(
+            v1.contains("produces a value, not a condition"),
+            "v1 must reject `keep {c}`; got: {v1}"
+        );
+        let tbir = tbir_constraint_snippets(&src)
+            .expect_err(&format!("the default backend must reject `keep {c}` too"));
+        assert!(
+            tbir.contains("produces a value, not a condition"),
+            "the default backend must reject `keep {c}` the same way, not diverge; got: {tbir}"
+        );
+    }
+}
+
+/// `keep len & 3 == 0` is the case from the issue, and the one worth a
+/// hint rather than a bare rejection. HARC binds `&` looser than `==`,
+/// exactly as C++ does, so it parses as `len & (3 == 0)` — the top
+/// operator is `&`, which is why the one rule above catches it.
+///
+/// The fix must NOT be to parenthesise it in codegen: the emitter would
+/// then contradict the parser and silently change what the program means.
+/// So the diagnostic states the grouping and lets the author choose.
+#[test]
+fn the_bitwise_precedence_surprise_is_explained_not_guessed_at() {
+    let err = v1_emit_err(&keep_src("len & 3 == 0"));
+    assert!(
+        err.contains("binds LOOSER than `==`"),
+        "the diagnostic must name the precedence, not just reject; got: {err}"
+    );
+    assert!(
+        err.contains("`a & (b == c)`") && err.contains("`(a & b) == c`"),
+        "it must show both groupings so the author picks; got: {err}"
+    );
+    // The shift and arithmetic forms bind TIGHTER than `==`, so the
+    // precedence note would be false for them and must not appear.
+    let shift = v1_emit_err(&keep_src("len << 2"));
+    assert!(
+        !shift.contains("binds LOOSER"),
+        "the precedence note is only true of the bitwise operators; got: {shift}"
+    );
+}
+
+/// A bare integer is a value too. It used to reach `add()` as a bitvector.
+#[test]
+fn a_bare_literal_cannot_be_a_constraint() {
+    let err = v1_emit_err(&keep_src("1"));
+    assert!(
+        err.contains("is a value, not a condition") && err.contains("`x == 1`"),
+        "got: {err}"
+    );
+}
+
+/// Routing the top-level assertion through the Bool emitter also fixes a
+/// bare one-bit field, which used to be emitted as a raw bitvector at the
+/// top level while the SAME field under `&&` already got the `!= 0`
+/// coercion. This is the only emitted-text change in harc#560's fix.
+#[test]
+fn a_bare_one_bit_field_constraint_coerces_to_a_comparison() {
+    let cpp = v1_cpp(&keep_src("flag"));
+    assert!(
+        cpp.contains("_s.add(_z_flag != _ctx.bv_val((uint64_t)0, 64))"),
+        "a bare one-bit field must be compared, not asserted as a bitvector; got:\n{cpp}"
+    );
+}
+
+/// The other half: everything that IS a proposition still emits, and the
+/// parenthesised form of the rejected shape is the one the diagnostic
+/// recommends — so it had better work.
+#[test]
+fn real_conditions_still_emit_after_the_bool_position_check() {
+    for c in [
+        "(len & 3) == 0",
+        "(len << 2) == 0",
+        "len == 3",
+        "len != 3",
+        "len +% 1 == 5",
+        "len in [1..16]",
+        "flag",
+        "not flag",
+        "len == 1 && flag",
+        "len == 1 || len == 2",
+    ] {
+        let src = keep_src(c);
+        let cpp = v1_cpp(&src);
+        assert!(
+            cpp.contains("_s.add("),
+            "`keep {c}` must still emit an assertion; got:\n{cpp}"
+        );
+        tbir_constraint_snippets(&src)
+            .unwrap_or_else(|e| panic!("`keep {c}` must still lower under tbir: {e}"));
+    }
+}
+
 /// The membership call site passes `target_root` too — a nested signed
 /// field in `x in [lo..hi]` must compare signed.
 #[test]
