@@ -395,26 +395,37 @@ pub(crate) fn lower_component_schema(
             //     `default` is visible in the output, so the identity is
             //     the parameter being dropped rather than the component
             //     being inert.)
-            //   * referenced in the body with no name to fall back on —
+            //   * referenced with no name to fall back on — e.g.
             //     `limit : uint<32> default N` emits `uint64_t limit = N;`
             //     with `N` declared nowhere. `EmitsUncompilable`.
-            //   * referenced in the body while a file-scope `const N`
-            //     exists — v1 emits `static constexpr int64_t N = 9;`
-            //     alongside `uint64_t limit = N;`. It COMPILES, and the
-            //     component silently uses the const instead of the `#(4)`
-            //     the instantiation passed. `SilentlyMisLowers`.
+            //   * referenced from a HANDLER BODY while a file-scope
+            //     `const N = 9` exists — v1 emits
+            //     `static constexpr int64_t N = 9;` at namespace scope
+            //     and the use lands well after it, so the file COMPILES
+            //     and the component silently uses 9 instead of the `#(4)`
+            //     the instantiation passed. `SilentlyMisLowers`, and the
+            //     only case that earns the arm's label.
             //
-            // The third case is why the label is `SilentlyMisLowers`
-            // rather than `EmitsUncompilable`. It was missing from the
-            // first version of this classification, which asserted the
-            // worse label off the first two cases alone — the label
-            // happened to be right and the evidence for it did not exist.
+            // The POSITION of the reference decides which of the last two
+            // applies, and it is not intuition: v1 emits the const AFTER
+            // the component struct, so a field default (`limit = N`,
+            // inside the struct) still fails to compile even with the
+            // const present, while a handler-body use (emitted much
+            // later) resolves. Both were checked by splicing the emitted
+            // region into g++ with the generated file's own header set,
+            // against a control that moves the const and changes nothing
+            // else.
+            //
+            // The first version of this classification named the
+            // field-default case as the compiling one, on two `contains`
+            // checks that never looked at order. Same label, and the
+            // evidence for it was wrong twice running.
             return Err(not_implemented(
                 &format!("generic parameters on analysis-source `{name}`"),
                 "v1 drops the parameter list entirely: an unused parameter vanishes along \
-                 with any `#(...)` argument at the instantiation, and one used in the body \
-                 resolves to a same-named file-scope `const` if there is one and to nothing \
-                 at all otherwise",
+                 with any `#(...)` argument at the instantiation, and a reference to one \
+                 either fails to resolve or silently picks up a same-named file-scope \
+                 `const`, depending on where in the emitted file the reference lands",
                 V1Status::SilentlyMisLowers,
             ));
         }
@@ -459,9 +470,9 @@ pub(crate) fn lower_component_schema(
             return Err(not_implemented(
                 &format!("parameters on `{name}`"),
                 "v1 drops the parameter list entirely: an unused parameter vanishes along \
-                 with any `#(...)` argument at the instantiation, and one used in the body \
-                 resolves to a same-named file-scope `const` if there is one and to nothing \
-                 at all otherwise",
+                 with any `#(...)` argument at the instantiation, and a reference to one \
+                 either fails to resolve or silently picks up a same-named file-scope \
+                 `const`, depending on where in the emitted file the reference lands",
                 V1Status::SilentlyMisLowers,
             ));
         }

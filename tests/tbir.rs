@@ -16437,16 +16437,20 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     .expect("and the test-scope arm lowers the same source");
 }
 
-/// Named arguments in a component method call. v1 never reads an
-/// argument NAME — all 30 `CallArg::Named` matches in `cpp_tb.rs`
-/// destructure `{ value, .. }` — so it binds strictly by position.
+/// Named arguments in a component method call. No CODEGEN site in v1
+/// reads an argument NAME: of the 30 `CallArg::Named` matches in
+/// `cpp_tb.rs`, 26 destructure `{ value, .. }` and the 4 that bind
+/// `name` are AST-rewrite passes that reconstruct the node. Binding is
+/// by position everywhere.
 ///
-/// With two parameters that is a silent argument swap: the user writes
-/// the names precisely so the order does not matter, and v1 does the one
-/// thing that makes the order matter. It compiles and it runs.
+/// With two arguments that is a silent swap: the user writes the names
+/// precisely so the order does not matter, and v1 does the one thing
+/// that makes the order matter. It compiles and it runs.
 ///
-/// With ONE parameter there is nowhere else for the value to go, so v1
-/// is correct and that arm keeps its `--codegen v1` suggestion.
+/// With ONE argument there is no other position for the value to land
+/// in, so v1 emits exactly the positional call and that arm keeps its
+/// `--codegen v1` suggestion. That is a claim about the call, not about
+/// the callee — see the under-supply case at the end.
 #[test]
 fn named_arguments_are_bound_by_position_by_v1() {
     let fixture = fixture("axilite_env_test.harc");
@@ -16537,10 +16541,18 @@ fn named_arguments_are_bound_by_position_by_v1() {
     // under-supplied and neither compiles, but that is a pre-existing
     // arity gap (tbir lowers `axil_write(t.value)` too) rather than
     // something naming the argument caused.
-    assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
+    let msg = assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
+    assert!(msg.contains("one-argument component method"), "{msg}");
     lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
+    let v1_named_short = cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits");
+    // Anchor first: the under-supplied call really is in v1's output,
+    // so the identity below is not two absences matching.
+    assert!(
+        v1_named_short.contains("AxilXactor_axil_write(_tb.env.drv, t.value)"),
+        "the under-supplied call reaches v1's output"
+    );
     assert_eq!(
-        cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits"),
+        v1_named_short,
         cpp_tb::emit(&merged_src(&call("t.value"))).expect("v1 emits"),
         "the name changes nothing about what v1 emits"
     );
@@ -16575,14 +16587,24 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
     }
 }
 
-/// `#(...)` parameters on a component. v1 never reads the list, and the
-/// two things that follow from that are very different for the user.
+/// `#(...)` parameters on a component. v1 never reads the list, and
+/// THREE things follow, only the last of which earns the label.
 ///
 /// Declared but unused, v1's output is byte-identical to the same
 /// component written without the parameter — and a `#(4)` argument at
 /// the instantiation vanishes with it, so the knob the user added does
-/// nothing. Referenced in the body, `default N` emits `uint64_t limit =
-/// N;` with `N` declared nowhere.
+/// nothing. Referenced with no name to fall back on, `default N` emits
+/// `uint64_t limit = N;` with `N` declared nowhere. Referenced from a
+/// HANDLER BODY while a file-scope `const N` exists, the reference
+/// silently resolves to the const and the program runs with the wrong
+/// value.
+///
+/// The position of the reference is what separates the last two, and it
+/// is not intuition: v1 emits the const AFTER the component struct, so a
+/// field default still fails to compile even with the const present.
+/// Both were checked by splicing the emitted region into g++ with the
+/// generated file's header set, against a control that moves only the
+/// const.
 ///
 /// Probed at BOTH landings: the analysis-source (transactor) arm and the
 /// env/agent/scoreboard/sequencer arm are four lines apart and were
@@ -16694,35 +16716,66 @@ end impl ParamTest
         );
 
         // The case that EARNS `SilentlyMisLowers` rather than
-        // `EmitsUncompilable`. With a file-scope `const N`, the dropped
-        // parameter falls back to it: v1 emits the const and the
-        // reference resolves, so the program compiles and quietly uses
-        // 9 instead of the 4 the instantiation passed.
-        let shadowed = format!(
-            "const N = 9\n{}",
-            mk("Tagger #(N: int = 3)", "Tagger #(4)", "N")
-        );
+        // `EmitsUncompilable`, and it is NOT the field default. v1 emits
+        // the file-scope const AFTER the component struct, so a
+        // `default N` initializer is still a use-before-declaration even
+        // when the const exists. A HANDLER-BODY reference is emitted far
+        // later and resolves — that file compiles, and the component
+        // runs with 9 instead of the 4 the instantiation passed.
+        //
+        // Both orderings are asserted below, because the first version
+        // of this test checked only that the two strings were PRESENT
+        // and concluded the wrong one compiles.
+        let shadow = |limit: &str, body: &str| {
+            format!(
+                "const N = 9\n{}",
+                mk("Tagger #(N: int = 3)", "Tagger #(4)", limit)
+                    .replace("seen = seen + 1", &format!("seen = seen + {body}"))
+            )
+        };
+        let line_of = |out: &str, needle: &str| {
+            out.lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{kind}: `{needle}` missing from v1's output"))
+        };
+
+        // Field default: const lands after the struct, so it does not help.
+        let by_default = shadow("N", "1");
         assert_not_implemented(
-            &lower_src(&shadowed).unwrap_err(),
+            &lower_src(&by_default).unwrap_err(),
             lower::V1Status::SilentlyMisLowers,
         );
-        let v1_shadowed = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+        let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
         assert!(
-            v1_shadowed.contains("static constexpr int64_t N = 9;")
-                && v1_shadowed.contains("uint64_t limit = N;"),
-            "{kind}: the const is emitted and the reference resolves to it"
+            line_of(&v1_default, "uint64_t limit = N;")
+                < line_of(&v1_default, "static constexpr int64_t N = 9;"),
+            "{kind}: the initializer precedes the const, so it cannot compile"
+        );
+
+        // Handler body: emitted after the const, so it resolves.
+        let by_body = shadow("7", "N");
+        assert_not_implemented(
+            &lower_src(&by_body).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1_body = cpp_tb::emit(&merged_src(&by_body)).expect("v1 emits");
+        assert!(
+            line_of(&v1_body, "static constexpr int64_t N = 9;") < line_of(&v1_body, "seen + N"),
+            "{kind}: the const precedes the use, so this one compiles"
         );
         // And the anchor that makes it a MIS-lowering rather than a
-        // coincidence: the same source with no parameter at all emits
-        // the identical initializer, so `#(4)` changed nothing.
-        let no_param = format!("const N = 9\n{}", mk("Tagger", "Tagger", "N"));
+        // coincidence: the same source with no parameter at all emits the
+        // identical use, so `#(4)` changed nothing about the value used.
+        let no_param = format!(
+            "const N = 9\n{}",
+            mk("Tagger", "Tagger", "7").replace("seen = seen + 1", "seen = seen + N")
+        );
         lower_src(&no_param)
             .unwrap_or_else(|e| panic!("{kind}: the const-only form lowers: {e:?}"));
-        assert!(
-            cpp_tb::emit(&merged_src(&no_param))
-                .expect("v1 emits")
-                .contains("uint64_t limit = N;"),
-            "{kind}: `#(4)` is invisible — the const-only form initializes identically"
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+            v1_body,
+            "{kind}: `#(N: int = 3)` and `#(4)` are both invisible in the output"
         );
     }
 }

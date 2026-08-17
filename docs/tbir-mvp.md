@@ -3638,20 +3638,33 @@ case and only locally-determinable `Assign` types are compared).
     things follow. Declared but unused, v1's output is BYTE-IDENTICAL to
     the same component written without the parameter, and a `#(4)`
     argument at the instantiation vanishes with it — nothing is
-    mis-lowered, the knob simply did nothing. Referenced in the body with
-    no name to fall back on, `limit : uint<32> default N` emits
-    `uint64_t limit = N;` with `N` declared nowhere, which does not
-    compile. Referenced while a file-scope `const N = 9` exists, v1 emits
-    `static constexpr int64_t N = 9;` alongside it: the program COMPILES
-    and the component quietly uses 9 instead of the 4 that was passed.
+    mis-lowered, the knob simply did nothing. Referenced with no name to
+    fall back on, `limit : uint<32> default N` emits `uint64_t limit = N;`
+    with `N` declared nowhere, which does not compile. Referenced from a
+    HANDLER BODY while a file-scope `const N = 9` exists, the reference
+    resolves to the const: that file compiles, and the component runs
+    with 9 instead of the 4 that was passed.
 
-    That third case is the only one that earns `SilentlyMisLowers`, and
-    the first version of this classification did not have it. The label
-    was asserted off the first two cases, where the honest reading is
-    `EmitsUncompilable` — **the label happened to be right and the
-    evidence recorded for it did not support it**, which is the same
-    failure as a correct answer with a wrong proof. It was found by a
-    reviewer asking for the input space, not by the probe.
+    Only the third case earns `SilentlyMisLowers`, and it took two tries
+    to record one that does. The first version asserted the label off the
+    first two cases, where the honest reading is `EmitsUncompilable` for
+    one and "correct" for the other. The second version added a
+    shadowing case — the FIELD DEFAULT one — and asserted it compiles on
+    two `contains` checks that never looked at order. It does not: v1
+    emits the const at namespace scope AFTER the component struct, so
+    `uint64_t limit = N;` inside the struct is still a
+    use-before-declaration. Spliced into g++ with the generated file's
+    own header set, against a control that moves only the const, it fails
+    with `'N' was not declared in this scope`; the handler-body use,
+    emitted a hundred lines later, compiles clean.
+
+    Twice in a row the LABEL was right and the evidence recorded for it
+    was not, which is a correct answer with a wrong proof and reads
+    exactly like a correct one. **"It compiles" is a claim that requires
+    a compiler.** Two `contains` checks on the same file establish that
+    two strings exist, never that one may refer to the other — and this
+    entry already carried a rule about reading the generated C++, which
+    is not the same as reading two lines out of it.
 
     Both anchors were needed here and both were nearly skipped. Byte
     identity means nothing unless the component contributes at all, and
