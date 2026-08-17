@@ -85,10 +85,25 @@ pub(crate) fn lower_regblock(
         }
         let width = reg.width.unwrap_or(default_w);
         if width == 0 || width > 64 {
-            return Err(unsupported(
-                &format!("regblock `{name}` register `{rname}` width {width}"),
-                "the tbir value model is 64-bit; register widths must be 1..=64",
-            ));
+            // A program error, not a subset gap: no backend can hold a
+            // 0- or 65-bit register. v1 does not check — it falls the
+            // mirror back to `uint64_t` and records the declared width in
+            // an address table nothing reads — so `width 65` silently
+            // loses the top bit and `width 0` holds values it should not.
+            // Pointing at `--codegen v1` would offer that as a fix.
+            // Name where the width CAME FROM: with no per-register
+            // `width`, it is the regblock default, and blaming the
+            // register sends the reader to a line that declares no
+            // width at all.
+            let source = if reg.width.is_some() {
+                format!("register `{rname}`")
+            } else {
+                format!("default width (register `{rname}` declares none)")
+            };
+            return Err(LowerError::Invalid(format!(
+                "regblock `{name}` {source} has width {width}: the value model is 64-bit, \
+                 so register widths must be 1..=64"
+            )));
         }
         // Field-level decomposition: lower each `field N : T @ <pos>`
         // into its mask/shift metadata. The mirror stays whole-register
@@ -105,10 +120,15 @@ pub(crate) fn lower_regblock(
             }
             let bit_width = field_bit_width(&fld.ty);
             if bit_width == 0 {
-                return Err(unsupported(
-                    &format!("regblock `{name}` register `{rname}` field `{fname}` of zero width"),
-                    "",
-                ));
+                // Same value-model violation as the register width
+                // above, and v1 is worse here than merely unchecked: it
+                // emits the field's mask as `0x0u`, so the field reads
+                // as 0 forever and every write to it is a no-op. That
+                // compiles cleanly, which is the whole problem.
+                return Err(LowerError::Invalid(format!(
+                    "regblock `{name}` register `{rname}` field `{fname}` has zero width: a \
+                     field must hold at least one bit"
+                )));
             }
             if fld.bit_pos as u64 + bit_width as u64 > width as u64 {
                 return Err(LowerError::Invalid(format!(
@@ -1039,12 +1059,25 @@ impl super::FuncBuilder<'_> {
             ),
             _ => format!("a {ctx_label} on regblock binding `{binding}`"),
         };
-        Err(unsupported(
+        // v1 has no gate here: it prints the access path straight into
+        // the C++, so `regs.NOPE = v` becomes `NOPE = v` — not a member
+        // of the mirror struct — and does not compile.
+        //
+        // A METHOD CALL does not reach this arm: `regs.reset_all()` is
+        // intercepted by generic statement lowering (`stmts.rs`) well
+        // before regblock access resolution, and is still `Unsupported`
+        // there. Pinned by
+        // `out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1`,
+        // which asserts on the MESSAGE precisely because both spellings
+        // are rejected and the exit status cannot tell them apart.
+        Err(not_implemented(
             &format!("{detail} (regblock `{binding}`)"),
             "register-level `regs.NAME = v` writes/`regs.NAME` reads, field-level \
              `regs.REG.FIELD` writes/reads (incl. assert/format positions), and \
-             `bitbash(regs)` are lowered; the `record_write`/`record_read` API and \
-             per-register `on` callbacks are follow-up slices",
+             `bitbash(regs)`, and the passive `record_write`/`record_read` API are \
+             lowered; per-register `on` callbacks are a follow-up slice. v1 emits an \
+             unresolved access path verbatim, naming a member it never declares",
+            V1Status::EmitsUncompilable,
         ))
     }
 

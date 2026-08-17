@@ -15093,3 +15093,239 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
         "v1 lowers a bare sized literal correctly, which is why this points at it"
     );
 }
+
+/// `tseqs.rs` has two rejection sites four lines apart that look
+/// interchangeable and classify OPPOSITELY.
+///
+/// The difference is whether the element-type annotation is ABSENT or
+/// PRESENT-but-unresolvable. An absent one makes v1 substitute a working
+/// default; a bad one makes it print the name verbatim into a type
+/// position. One code path handles both, which is exactly how they got
+/// the same classification.
+#[test]
+fn an_absent_tseq_element_type_is_not_a_bad_one() {
+    let fixture = fixture("tseq_scalar_test.harc");
+    const DECL: &str = "tseq Squares(n: int) -> TSeq<uint<16>>";
+    assert!(fixture.contains(DECL), "fixture shape changed");
+
+    // Control: the registered fixture lowers under both backends, and
+    // v1's lambda returns the element type it was given.
+    emit_cpp_src(&fixture);
+    assert!(
+        cpp_tb::emit(&merged_src(&fixture))
+            .expect("v1 emits the control")
+            .contains("-> std::vector<uint64_t>"),
+        "the control's element type reaches v1's return type"
+    );
+
+    // ABSENT: v1 defaults the element type and the sequence still works.
+    // `int64_t` vs `uint64_t` is a signedness difference, not a failure,
+    // so v1 is a genuine escape hatch and this stays `Unsupported`.
+    let absent = fixture.replace(DECL, "tseq Squares(n: int)");
+    assert_unsupported(&lower_src(&absent).unwrap_err());
+    assert!(
+        cpp_tb::emit(&merged_src(&absent))
+            .expect("v1 emits without a return type")
+            .contains("-> std::vector<int64_t>"),
+        "v1 substitutes a working default"
+    );
+
+    // PRESENT AND BAD: v1 prints the name into the return type, naming a
+    // type nothing declares.
+    let bad = fixture.replace(DECL, "tseq Squares(n: int) -> TSeq<NoSuchType>");
+    let msg = assert_not_implemented(
+        &lower_src(&bad).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("`NoSuchType`"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&bad))
+            .expect("v1 emits a bad element type")
+            .contains("-> std::vector<NoSuchType>"),
+        "v1 emits the undeclared type verbatim"
+    );
+}
+
+/// A register width outside 1..=64, or a zero-width field, is a program
+/// error under every backend — not a subset gap, so no `--codegen v1`.
+///
+/// v1 does not check either one. A bad width falls the mirror back to
+/// `uint64_t` and records the declared width in an address table nothing
+/// reads; a zero-width field gets mask `0x0u`, so it reads 0 forever and
+/// every write to it is a no-op. Both compile, which is the problem.
+#[test]
+fn a_regblock_width_outside_the_value_model_is_a_program_error() {
+    let fixture = fixture("regblock_subset_test.harc");
+    const DECL: &str = "regblock DmaRegs via RegHelper width 32";
+
+    // Control: the registered fixture lowers, and v1 sizes the mirror
+    // from the declared width.
+    emit_cpp_src(&fixture);
+    assert!(
+        cpp_tb::emit(&merged_src(&fixture))
+            .expect("v1 emits the control")
+            .contains("uint32_t CTRL = 7;"),
+        "the control's width reaches the mirror type"
+    );
+
+    for width in [0, 65] {
+        let src = fixture.replace(
+            DECL,
+            &format!("regblock DmaRegs via RegHelper width {width}"),
+        );
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("must be 1..=64"), "width {width}: {msg}");
+        // The width came from the regblock DEFAULT here, so the message
+        // must not blame a register that declares no width of its own.
+        assert!(msg.contains("default width"), "width {width}: {msg}");
+        // v1's evidence: it accepts, and silently widens the cell.
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 accepts a bad width")
+                .contains("uint64_t CTRL = 7;"),
+            "v1 falls back to a 64-bit cell for width {width}"
+        );
+    }
+
+    // The zero-width FIELD is a separate check, reachable only past the
+    // register-width one — mutating the regblock default returns before
+    // it ever runs. `regblock_fields_test` would be the natural fixture
+    // but resolves its bus through `use BusAxiLite`, which this harness
+    // does not search for, so the field is grown on the self-contained
+    // one instead.
+    const REG: &str = "    register CTRL    @ 0x00 reset 7 access rw";
+    let with_field = |ty: &str| {
+        fixture.replace(
+            REG,
+            &format!(
+                "{REG}\n        field MODE : {ty} @ 4  reset 0  access rw\n    end register CTRL"
+            ),
+        )
+    };
+
+    // Control: a real field width lowers under both backends.
+    emit_cpp_src(&with_field("uint<3>"));
+    cpp_tb::emit(&merged_src(&with_field("uint<3>"))).expect("v1 emits the control");
+
+    let msg = assert_invalid(&lower_src(&with_field("uint<0>")).unwrap_err());
+    assert!(msg.contains("field `MODE` has zero width"), "{msg}");
+    // v1's evidence: it does not check either, and accepts the same
+    // source. (At an ACCESS site it goes further and emits the field's
+    // mask as `0x0u`, so the field reads 0 forever and every write is a
+    // no-op — but a field with no access site emits nothing at all, so
+    // that is not what this fixture can show.)
+    cpp_tb::emit(&merged_src(&with_field("uint<0>"))).expect("v1 accepts a zero-width field");
+}
+
+/// The regblock and addrmap ACCESS catch-alls. v1 has no gate at either:
+/// it prints the access path straight into the C++, so an unknown
+/// register becomes a non-member and a method call becomes an undeclared
+/// function. Neither compiles.
+#[test]
+fn out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1() {
+    // Both fixtures resolve their bus through `use BusAxiLite`, which
+    // the unit-test harness does not search for — so lower the access
+    // paths against a locally-declared regblock instead, and keep the
+    // v1-behaviour anchors on what it emits for the path itself.
+    let fixture = fixture("regblock_subset_test.harc");
+    emit_cpp_src(&fixture);
+
+    // An unknown REGISTER is what reaches the catch-all. A method call
+    // (`regs.reset_all()`) does NOT: generic statement lowering
+    // intercepts it first, so it is still `Unsupported` and belongs to
+    // whatever sweep covers `stmts.rs`. Asserted here so the boundary is
+    // recorded rather than rediscovered.
+    let src = fixture.replace("regs.SRC = 305419896", "regs.NOPE = 305419896");
+    let msg = assert_not_implemented(
+        &lower_src(&src).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("not a declared register"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&src))
+            .expect("v1 accepts the bad access")
+            .contains("NOPE"),
+        "v1 emits the path verbatim"
+    );
+
+    let method = fixture.replace("regs.SRC = 305419896", "regs.reset_all()");
+    let msg = assert_unsupported(&lower_src(&method).unwrap_err());
+    assert!(
+        msg.contains("method call `.reset_all(...)`"),
+        "a method call is intercepted before the regblock catch-all: {msg}"
+    );
+
+    // The addrmap twin, on the self-contained `ADDRMAP_TB` (the
+    // registered addrmap fixtures resolve their bus through
+    // `use BusAxiLite`, which this harness does not search for).
+    let amap = addrmap_src("@ 0x00 size 0x30");
+    emit_cpp_src(&amap);
+    let bad = amap.replace("chip.mm2s.SA", "chip.nope.SA");
+    let msg = assert_not_implemented(
+        &lower_src(&bad).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("no such instance/register/field"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&bad))
+            .expect("v1 accepts the bad addrmap access")
+            .contains("nope.SA"),
+        "v1 emits the addrmap path verbatim"
+    );
+}
+
+/// Two `control.rs` sites, classified opposite ways.
+///
+/// `for x in <scalar>` makes v1 emit a C++ range-for over a value with
+/// no iterator — a compile error. A non-literal timeout message makes v1
+/// DISCARD the message and substitute its own, which compiles and runs:
+/// the failure still fires, but the diagnostic the user wrote is gone
+/// and nothing says so.
+#[test]
+fn the_control_flow_sites_split_between_uncompilable_and_silent() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+
+    // Control: the registered fixture lowers under both backends, and
+    // v1 emits the timeout message it was given.
+    emit_cpp_src(&fixture);
+    let ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    assert!(
+        ctl.contains(r#""count never reached 15""#),
+        "the control's message reaches v1's output"
+    );
+
+    // A non-literal timeout message: v1 replaces it with a generic line.
+    let msg_src = fixture.replace(r#"fail("count never reached 15")"#, "fail(dut.count_out)");
+    let msg = assert_not_implemented(
+        &lower_src(&msg_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("never appears"), "{msg}");
+    let v1_msg = cpp_tb::emit(&merged_src(&msg_src)).expect("v1 accepts it");
+    assert!(
+        v1_msg.contains("wait until timed out after"),
+        "v1 substitutes its own message:\n{v1_msg}"
+    );
+    assert!(
+        !v1_msg.contains(r#""count never reached 15""#),
+        "and drops the one that was written"
+    );
+
+    // `for x in <scalar>`: v1 emits a range-for over a value with no
+    // `begin()`.
+    let for_src = fixture.replace(
+        "        dut.en = 1\n",
+        "        for x in dut.count_out\n            wait 1 cycle\n        end for\n        dut.en = 1\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&for_src).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("no iterator"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&for_src))
+            .expect("v1 accepts it")
+            .contains("for (auto& x : harc_rt::harc_read(dut->count_out))"),
+        "v1 emits a range-for over a scalar"
+    );
+}

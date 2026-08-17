@@ -122,10 +122,18 @@ impl FuncBuilder<'_> {
             hi: Some(hi),
         } = &*f.iter.kind
         else {
-            return Err(unsupported(
+            // v1 emits a C++ range-for over whatever the sequence
+            // expression lowers to: `for (auto& x :
+            // harc_rt::harc_read(dut->count_out))`. `harc_read` returns a
+            // scalar value with no `begin()`/`end()`, so the translation
+            // unit does not compile ("'begin' was not declared in this
+            // scope"), verified against the real runtime header.
+            return Err(not_implemented(
                 "`for x in <sequence>`",
                 "only literal ranges `for i in lo .. hi`, `for t in <tseq-result>`, and \
-                 `for x in <rec>.<vecfield>` are lowered",
+                 `for x in <rec>.<vecfield>` are lowered; v1 emits a C++ range-for over a \
+                 value that has no iterator, which does not compile",
+                V1Status::EmitsUncompilable,
             ));
         };
 
@@ -594,9 +602,17 @@ impl FuncBuilder<'_> {
             Some(m) => match &*m.kind {
                 ExprKind::String(s) => self.lower_fmt(s)?,
                 _ => {
-                    return Err(unsupported(
+                    // v1 DISCARDS the message and substitutes its own
+                    // generic one: `sim_log_line("FAIL", "wait until
+                    // timed out after %lld cycles", _wu_budget)`. It
+                    // compiles and runs, so the failure still fires —
+                    // but the diagnostic the user wrote is gone, and
+                    // nothing says so.
+                    return Err(not_implemented(
                         "non-string-literal timeout `fail(...)` message",
-                        "",
+                        "v1 silently replaces it with a generic \"wait until timed out\" line, \
+                         so the message written here never appears",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
             },

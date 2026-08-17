@@ -36,7 +36,7 @@
 
 use std::collections::HashMap;
 
-use super::{unsupported, LowerError};
+use super::{not_implemented, LowerError, V1Status};
 use crate::ast::{AddrmapDecl, ExprKind};
 use crate::ir::{Expr, RecordId, RegRegisterSchema};
 
@@ -470,10 +470,19 @@ impl super::FuncBuilder<'_> {
             ),
             _ => format!("a {ctx_label} on addrmap binding `{binding}`"),
         };
-        Err(unsupported(
+        // v1 has no gate here: it prints the access path straight into
+        // the C++, so `chip.nope.SA = v` becomes `nope.SA = v` — not a
+        // member of the mirror struct — and does not compile.
+        //
+        // A METHOD CALL does not reach this arm: `chip.mm2s.reset_all()`
+        // is intercepted by generic statement lowering (`stmts.rs`)
+        // first, and is still `Unsupported` there.
+        Err(not_implemented(
             &format!("{detail} (addrmap `{binding}`)"),
             "3-level `chip.inst.REG` and 4-level `chip.inst.REG.FIELD` reads/writes \
-             (incl. assert/format positions) are lowered",
+             (incl. assert/format positions) are lowered; v1 emits the path verbatim, \
+             naming a member or function it never declares",
+            V1Status::EmitsUncompilable,
         ))
     }
 }

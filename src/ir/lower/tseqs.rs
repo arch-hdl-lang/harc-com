@@ -49,7 +49,9 @@ use crate::ir::{
 };
 
 use super::helpers::{ir_type_of, HelperRegistry};
-use super::{unsupported, FuncBuilder, LowerCtx, LowerError, SideTables};
+use super::{
+    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
+};
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
 /// single identifier (record element). `None` for a missing/non-`TSeq`
@@ -116,10 +118,26 @@ pub(crate) fn collect_tseq_records(
             TseqElem::Scalar(scalar)
         } else if let Some(name) = tseq_element_name(decl) {
             let Some(&rid) = record_ids.get(&name) else {
-                return Err(unsupported(
+                // v1 prints the element type straight into the lambda's
+                // return type — `-> std::vector<NoSuchType>` — naming a
+                // type nothing declares, so the translation unit does not
+                // compile.
+                //
+                // NOT the same as the missing-return-type site below, four
+                // lines down and easy to mistake for this one: an ABSENT
+                // annotation makes v1 substitute a working default, while a
+                // PRESENT but unresolvable one makes it emit the bad name.
+                // Absent and invalid are different input classes even
+                // though one code path handles both.
+                return Err(not_implemented(
                     &format!("`tseq {}` element type `{name}`", decl.name.name),
-                    "only declared `transaction`/`struct` records and primitive scalars \
-                     (`uint<N>`/`sint<N>`/`bool`) are lowered as tseq element types",
+                    format!(
+                        "only declared `transaction`/`struct` records and primitive scalars \
+                         (`uint<N>`/`sint<N>`/`bool`) are lowered as tseq element types; v1 \
+                         emits the name verbatim as `std::vector<{name}>`, which does not \
+                         compile"
+                    ),
+                    V1Status::EmitsUncompilable,
                 ));
             };
             TseqElem::Record(rid)
