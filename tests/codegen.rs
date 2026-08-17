@@ -9782,6 +9782,91 @@ fn a_sized_literal_with_no_digits_is_rejected() {
     assert!(err.contains("no digits"), "got: {err}");
 }
 
+/// A `${...}` capture is not in the token stream — the whole string is
+/// one `StringLit`, re-parsed later and separately by each backend — so a
+/// sized literal written there bypassed the check completely. It bypassed
+/// it into the two worst available outcomes: v1 discarded the re-parse
+/// error and wrote the raw HARC text into the C++ (`harc_printf_ll(4'hFF)`,
+/// which does not compile), and TB-IR reported it as an unimplemented
+/// subset gap pointing at `--codegen v1`, i.e. at the backend that emits
+/// that.
+#[test]
+fn a_sized_literal_inside_a_string_interpolation_is_checked() {
+    let bad = |body: &str| {
+        let src =
+            format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T");
+        match parse_source(&src) {
+            Ok(_) => panic!("expected rejection of: {body}"),
+            Err(e) => e.to_string(),
+        }
+    };
+    assert!(
+        bad(r#"log(info, "b=${4'hFF}")"#).contains("needs 8 bits"),
+        "an overwide literal in an interpolation must be rejected"
+    );
+    // With a format spec, so the capture/spec split matches
+    // `process_interp`'s (expression is everything before the LAST `:`).
+    assert!(
+        bad(r#"log(info, "b=${4'hFF:04x}")"#).contains("needs 8 bits"),
+        "the format-spec form must be checked too"
+    );
+    // Second capture bad: the scan must not stop at the first one.
+    assert!(
+        bad(r#"log(info, "${8'hFF} ${0'h0}")"#).contains("width of 0"),
+        "every capture must be checked, not just the first"
+    );
+}
+
+/// The other half of that check, and the one that would make it worse
+/// than the bug: text OUTSIDE `${...}` is prose, not code. Rejecting a
+/// log message that happens to mention `4'hFF` would break working
+/// programs to fix a bug none of them had.
+#[test]
+fn a_sized_literal_in_plain_string_text_is_left_alone() {
+    let ok = |body: &str| {
+        let src =
+            format!("test T\n    let dut : Top\n    run\n        {body}\n    end run\nend test T");
+        parse_source(&src).is_ok()
+    };
+    assert!(
+        ok(r#"log(info, "wrote 4'hFF to the register")"#),
+        "prose mentioning an overwide literal must still parse"
+    );
+    assert!(
+        ok(r#"log(info, "wrote 4'hFF, read ${8'hFF}")"#),
+        "prose alongside a legal capture must still parse"
+    );
+    assert!(
+        ok(r#"log(info, "unmatched ${4'hFF")"#),
+        "an unmatched brace is not a capture — `process_interp` bails too"
+    );
+}
+
+/// Sizing a decimal literal above `u128` is quadratic in the digit count,
+/// and it runs in the parser on whatever the source says: 100 000 digits
+/// took ~10s, and `MAX_SOURCE_LEN` is `u32::MAX`. Capped, with hex and
+/// binary left uncapped because they are sized structurally.
+#[test]
+fn an_absurdly_long_sized_decimal_literal_is_capped() {
+    let at_cap = format!("40000'd{}", "9".repeat(4096));
+    assert!(
+        literal_parses(&at_cap),
+        "4096 digits is at the cap and must be accepted"
+    );
+    let over = format!("40000'd{}", "9".repeat(4097));
+    let err = parse_err_with_literal(&over);
+    assert!(
+        err.contains("4097 digits") && err.contains("maximum is 4096"),
+        "got: {err}"
+    );
+    // Hex is structural, so length costs nothing and is not capped.
+    let long_hex = format!("400000'h{}", "F".repeat(50000));
+    assert!(
+        literal_parses(&long_hex),
+        "a 50 000-digit hex literal is sized structurally and must parse"
+    );
+}
+
 /// The point of rejecting rather than choosing. harc#565's table had two
 /// programs that the same mask rule could not both satisfy while `4'hFF`
 /// was legal: masking at the declared 4 made `keep (len +% 4'hFF) ==

@@ -5403,9 +5403,11 @@ fn value_bit_width(v: u64) -> u32 {
 /// what §2.4 masks at — the same declared-width rule a `const` follows,
 /// so the two agree about a token like `8'd300` that can be spelled
 /// either way. The digits are not consulted, and since harc#565 they no
-/// longer can disagree: the parser rejects a literal whose value does
-/// not fit the width it declares, so the declared width IS the value's
-/// width. Before that fix this function had to choose between the two,
+/// longer can EXCEED the declared width: the parser rejects a literal
+/// whose value does not fit. The two are not equal — `8'h0F` declares 8
+/// and needs 4, and the mask follows the 8 — but the declared width is
+/// now guaranteed to be wide enough for the value, which is the property
+/// that was missing. Before that fix this function had to choose,
 /// and either choice was wrong somewhere — masking at the declared width
 /// turned `keep (len +% 4'hFF) == 4'hFF` on a `uint<4>` field from
 /// solvable into unsatisfiable, and masking at the value's width did the
