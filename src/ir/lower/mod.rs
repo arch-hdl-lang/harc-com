@@ -1475,10 +1475,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // which lowers the constraint itself — so the identical
     // `Band(r, hi = 2000, lo = 1000)` that a test body now refuses was
     // reaching C++ with the bounds swapped, from TB-IR as much as from
-    // v1. `build_component_scope_problem_table` covers exactly the
-    // bodies the emission table leaves out; it is read for its
-    // diagnostics and nothing else, so no `problem_id` from it is ever
-    // observable.
+    // v1. `build_component_scope_problem_table` covers those bodies; it
+    // is read for its diagnostics and nothing else, so no `problem_id`
+    // from it is ever observable. It is not a strict complement of the
+    // emission table — a `testbench` lifecycle phase lands in BOTH,
+    // because `desugar_impl_for_test_in_file` (run above) folds those
+    // blocks into the bound test while leaving the component intact.
+    // The duplicate costs nothing: both tables produce the same error
+    // and the first one wins.
     for entry in &crate::solver::problem_table::build_component_scope_problem_table(&file).entries {
         if let crate::solver::problem_table::TypedSolverProblemBuild::LowerError(errs) =
             &entry.build

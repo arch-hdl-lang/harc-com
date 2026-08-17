@@ -4059,16 +4059,42 @@ case and only locally-determinable `Assign` types are compared).
     component-scope randomize site, and it builds clean — zero new
     refusals across the corpus.
 
-    Each of the seven body shapes is a separate claim about where a
-    randomize can be written, so each is pinned by mutation: deleting any
-    one arm of the collector fails
-    `every_component_body_that_can_host_a_randomize_is_walked`, and
-    deleting the new consuming loop in `lower_program` fails
-    `a_component_scope_relation_argument_swap_is_refused`. That test
-    probes the collector rather than `lower_program`, because most of
-    these shapes are refused earlier by unrelated gates — an unbound
-    `testbench` is not lowered at all — and a refusal from one of those
-    gates would prove nothing about whether the site was collected.
+    Walking the bodies is only half of it, and the first version shipped
+    only that half. **A randomize target is resolved by NAME**, so a body
+    whose scope is empty contributes nothing however carefully it is
+    walked — and a component binds names three ways a `test` body does
+    not: a field (`r : RegOp`), a method parameter
+    (`hookable go(r: RegOp)`), and an `on` handler's event payload
+    (`req : event<RegOp>` + `on req(t)`). Seeding only the
+    statement-position `let`s collected **zero** sites for all three,
+    including the `on req(t)` shape `transactor_active_test` uses. The
+    justifying comment reasoned about `let`s and stopped there; walking
+    the right blocks with the wrong scope looks exactly like walking the
+    right blocks. *Two more shapes were missed the same way*: a
+    `watchdog` body hosts statements, and `event<RegOp>` parses its
+    argument as an EXPRESSION (`TypeArg::Expr`), not a type, so reading
+    only the `TypeArg::Type` arm resolved nothing.
+
+    Ten body shapes and three target bindings are each pinned by
+    mutation in `every_component_body_that_can_host_a_randomize_is_
+    walked`; deleting the consuming loop in `lower_program` fails
+    `a_component_scope_relation_argument_swap_is_refused`. The shape
+    count is deliberately larger than the arm count — the parser maps
+    both `hookable` and `function` in any component body to
+    `ComponentItem::Hookable`, so three shapes share one arm — and an
+    earlier draft claimed "deleting any one arm fails this test", which
+    was false for `Item::Scoreboard` and `Item::Sequencer` because no
+    shape exercised either. They have shapes now.
+
+    Two smaller corrections, recorded because each is the kind of claim
+    this document exists to keep honest. The table is **not** a strict
+    complement of the emission table: a `testbench` lifecycle phase
+    lands in both, because `desugar_impl_for_test_in_file` folds those
+    blocks into the bound test while leaving the component intact
+    (measured: one entry in each). And the `!w.disabled` guard on the
+    watchdog arm is belt-and-braces, not a live filter — `watchdog
+    disabled` takes no body at all, the parser refuses the first
+    statement, so the body is empty there either way.
 
 ### The probe method
 

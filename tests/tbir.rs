@@ -17772,16 +17772,21 @@ fn a_component_scope_relation_argument_swap_is_refused() {
     );
 }
 
-/// Every body shape that can host a `randomize` is walked, not just the
-/// `on` handler the bug was found in.
+/// Every body shape that can host a `randomize` is walked, and every
+/// way a component body can NAME the randomize target is resolved.
 ///
-/// Each arm of `collect_component_randomize_sites` is a separate claim
-/// about where a randomize can be written; deleting any one of them
-/// must fail this test. It probes the collector rather than
-/// `lower_program`, because most of these shapes are refused earlier by
-/// unrelated gates (an unbound `testbench` is not lowered at all), and
-/// a refusal from one of those gates would prove nothing about whether
-/// the site was collected. The end-to-end refusal is pinned by
+/// The second half is what the first sweep missed. A randomize target
+/// is looked up by name, so a body whose scope is empty contributes
+/// nothing however carefully it is walked — and a component binds names
+/// three ways a `test` body does not: a field, a method parameter, and
+/// an `on` handler's event payload. All three collected zero sites
+/// until the scope was seeded.
+///
+/// The test probes the collector rather than `lower_program`, because
+/// most of these shapes are refused earlier by unrelated gates (an
+/// unbound `testbench` is not lowered at all), and a refusal from one
+/// of those gates would prove nothing about whether the site was
+/// collected. The end-to-end refusal is pinned by
 /// `a_component_scope_relation_argument_swap_is_refused` above.
 #[test]
 fn every_component_body_that_can_host_a_randomize_is_walked() {
@@ -17797,44 +17802,83 @@ end transaction RegOp
 
 relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
 ";
-    // The swapped call, written once and dropped into each body shape.
+    // The swapped call, written once and dropped into each shape. `RZ`
+    // declares its own target; `RZ_R` and `RZ_T` randomize a name the
+    // enclosing body is expected to have bound.
     const RZ: &str = "        let r : RegOp\n\
                       \x20       randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    const RZ_R: &str = "        randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    const RZ_T: &str = "        randomize(t) with Band(t, hi = 2000, lo = 1000) end randomize\n";
 
-    let shapes: [(&str, String); 7] = [
+    // Each entry names the collector arm it exercises. Three of these
+    // land on ONE arm — the parser maps both `hookable` and `function`
+    // in any component body to `ComponentItem::Hookable` — so the arms
+    // are fewer than the shapes, and the shapes are what users write.
+    let shapes: [(&str, String); 10] = [
         (
-            "an `on` handler",
+            "an `on` handler [OnHandler]",
             format!("agent A\n    in_ev : event<uint<8>>\n    on in_ev(t)\n{RZ}    end on\nend agent A\n"),
         ),
         (
-            "a hookable method",
+            "a hookable method [Hookable]",
             format!("agent A\n    hookable go()\n{RZ}    end go\nend agent A\n"),
         ),
         (
-            "a testbench `function`",
+            "a scoreboard method [Item::Scoreboard]",
+            format!("scoreboard S\n    hookable go()\n{RZ}    end go\nend scoreboard S\n"),
+        ),
+        (
+            "a sequencer method [Item::Sequencer]",
+            format!("sequencer Q\n    hookable go()\n{RZ}    end go\nend sequencer Q\n"),
+        ),
+        (
+            "a testbench `function` [Hookable]",
             format!("testbench Tb\n    dut : Top\n    function go()\n{RZ}    end function go\nend testbench Tb\n"),
         ),
         (
-            "a testbench lifecycle phase",
+            "a testbench lifecycle phase [Lifecycle]",
             format!("testbench Tb\n    dut : Top\n    setup\n{RZ}    end setup\nend testbench Tb\n"),
         ),
         (
-            "a file-scope `function`",
+            "a watchdog body [Watchdog]",
+            format!("agent A\n    watchdog\n        period 10 cycles\n{RZ}    end watchdog\nend agent A\n"),
+        ),
+        (
+            "a file-scope `function` [Item::Function]",
             format!("function go()\n{RZ}end function go\n"),
         ),
         (
-            "a transactor TLM target thread",
+            "a transactor TLM target thread [TargetTlmThread]",
             format!("transactor X bound to B\n    thread bus.go(addr: uint<32>)\n{RZ}    end thread\nend transactor X\n"),
         ),
         (
-            "a transactor `when active` method",
+            "a transactor `when active` method [when_active]",
             format!(
                 "transactor X bound to B\n    when active\n        hookable go()\n{RZ}        end go\n    end when\nend transactor X\n"
             ),
         ),
     ];
 
-    for (what, body) in &shapes {
+    // The three name bindings a component body has and a test body does
+    // not. Each of these collected NOTHING before the scope was seeded.
+    let targets: [(&str, String); 3] = [
+        (
+            "a component field as the target",
+            format!("agent A\n    r : RegOp\n    hookable go()\n{RZ_R}    end go\nend agent A\n"),
+        ),
+        (
+            "a method parameter as the target",
+            format!("agent A\n    hookable go(r: RegOp)\n{RZ_R}    end go\nend agent A\n"),
+        ),
+        (
+            "an event payload as the target",
+            format!(
+                "agent A\n    req : event<RegOp>\n    on req(t)\n{RZ_T}    end on\nend agent A\n"
+            ),
+        ),
+    ];
+
+    for (what, body) in shapes.iter().chain(targets.iter()) {
         let src = format!("{PRELUDE}\n{body}");
         let parsed = harc::parser::parse_source(&src).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         let table = harc::solver::problem_table::build_component_scope_problem_table(&parsed);
@@ -17854,4 +17898,17 @@ relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
             "{what}: {msgs:?}"
         );
     }
+
+    // The `!w.disabled` guard on the watchdog arm is belt-and-braces,
+    // not a live filter, and this records why rather than leaving a
+    // reader to assume it is load-bearing: `watchdog disabled` takes no
+    // body at all — the parser refuses the first statement — so a
+    // disabled watchdog's `body` is always empty and would collect
+    // nothing with or without the guard. The guard stays so that
+    // allowing a body later cannot silently start refusing a block
+    // whose codegen is suppressed.
+    let disabled =
+        format!("{PRELUDE}\nagent A\n    watchdog disabled\n{RZ}    end watchdog\nend agent A\n");
+    let err = harc::parser::parse_source(&disabled).expect_err("`watchdog disabled` takes no body");
+    assert!(format!("{err:?}").contains("UnexpectedToken"), "{err:?}");
 }

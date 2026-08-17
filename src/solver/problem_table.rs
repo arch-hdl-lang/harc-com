@@ -142,17 +142,23 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
 /// `LowerError`s and never reach emission. Problem ids therefore
 /// restart at 1 and mean nothing outside this table.
 pub fn build_component_scope_problem_table(file: &SourceFile) -> TypedSolverProblemTable {
+    let sites = collect_component_randomize_sites(file);
+    // Collect first, and return before `elaborate_constraints` when
+    // there is nothing to elaborate FOR. Its caller has already
+    // elaborated the same file once for the main table, and a
+    // component-scope randomize site is rare — one file in the 190 in
+    // `tests/fixtures` has one — so this keeps the duplicate walk off
+    // the path every other program takes.
+    if sites.is_empty() {
+        return TypedSolverProblemTable {
+            entries: Vec::new(),
+        };
+    }
     let elab = elaborate_constraints(file);
     let backend = Z3Backend;
     let mut entries = Vec::new();
     let mut next_problem_id = 1u32;
-    push_site_entries(
-        &elab,
-        &backend,
-        collect_component_randomize_sites(file),
-        &mut entries,
-        &mut next_problem_id,
-    );
+    push_site_entries(&elab, &backend, sites, &mut entries, &mut next_problem_id);
     TypedSolverProblemTable { entries }
 }
 
@@ -215,6 +221,7 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
             }
             Item::Function(f) => {
                 let mut env = BTreeMap::new();
+                extend_env_with_params(&mut env, &f.params);
                 collect_block(
                     &f.body,
                     &mut env,
@@ -229,29 +236,118 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
 }
 
 fn collect_component_items(items: &[ComponentItem], owner: &str, out: &mut Vec<RandomizeSite>) {
+    // A randomize target is resolved by NAME through `env`, so a body
+    // whose `env` is empty contributes nothing no matter how it is
+    // walked. Statement-position `let`s are picked up by `collect_stmt`
+    // as it descends, but a component body binds names three other ways
+    // that a `test` body does not, and all three are ordinary shapes:
+    // a component FIELD (`r : RegOp`), a method PARAMETER
+    // (`hookable go(r: RegOp)`), and an `on` handler's event PAYLOAD
+    // (`req : event<RegOp>` + `on req(t)` binds `t : RegOp`). Seeding
+    // only the `let`s collected zero sites for all three.
+    let mut fields = BTreeMap::new();
+    let mut payloads = BTreeMap::new();
     for item in items {
-        // Every arm gets a fresh `env`: a component body has no
-        // statement-position `let`s shared between its methods, so
-        // there is nothing to thread across them.
-        let mut env = BTreeMap::new();
+        let ComponentItem::Field(f) = item else {
+            continue;
+        };
+        if let Some(ty) = simple_type_name(Some(&f.ty)) {
+            fields.insert(f.name.name.clone(), ty);
+        }
+        if let Some(ty) = event_payload_type_name(&f.ty) {
+            payloads.insert(f.name.name.clone(), ty);
+        }
+    }
+
+    for item in items {
+        let mut env = fields.clone();
         match item {
             ComponentItem::OnHandler(h) => {
+                // `on <ev>(<binder>)` — the binder's type is the event
+                // field's payload type. Any other trigger shape (a
+                // cycle expression, a period) binds nothing.
+                if let ExprKind::Call { callee, args } = h.event.kind.as_ref() {
+                    if let ExprKind::Ident(ev) = callee.kind.as_ref() {
+                        if let (Some(ty), [CallArg::Expr(a)]) = (payloads.get(&ev.name), &args[..])
+                        {
+                            if let ExprKind::Ident(binder) = a.kind.as_ref() {
+                                env.insert(binder.name.clone(), ty.clone());
+                            }
+                        }
+                    }
+                }
                 collect_block(&h.body, &mut env, owner, out);
             }
             ComponentItem::Hookable(h) => {
+                extend_env_with_params(&mut env, &h.params);
                 collect_block(&h.body, &mut env, owner, out);
             }
             ComponentItem::TargetTlmThread(t) => {
+                extend_env_with_params(&mut env, &t.params);
                 collect_block(&t.body, &mut env, owner, out);
             }
+            // Reached only from a `testbench`, and a `testbench` is
+            // either bound by `impl ... for` — in which case
+            // `desugar_impl_for_test_in_file` has already folded these
+            // blocks into the bound test, so the MAIN table collects
+            // the same site (measured: one entry in each) — or unbound,
+            // in which case `lower_program`'s item loop refuses the
+            // component before this table is built. So the arm is
+            // redundant today. It stays because its redundancy is a
+            // property of the desugarer, not of this walk, and a
+            // duplicate diagnostic costs a caller nothing: both tables
+            // produce the same error and the first one wins.
             ComponentItem::Lifecycle(_, block) => {
                 collect_block(block, &mut env, owner, out);
+            }
+            // `watchdog disabled` suppresses all codegen for the
+            // block, body included, so nothing written there can reach
+            // C++ and refusing it would reject a program neither
+            // backend mis-lowers. The guard is belt-and-braces today:
+            // the parser takes no body after `watchdog disabled` (see
+            // the control in `every_component_body_that_can_host_a_
+            // randomize_is_walked`), so `w.body` is empty there either
+            // way. It stays so that allowing a body later cannot
+            // silently start refusing a suppressed block.
+            ComponentItem::Watchdog(w) if !w.disabled => {
+                collect_block(&w.body, &mut env, owner, out);
             }
             ComponentItem::Field(_)
             | ComponentItem::Connect(_)
             | ComponentItem::Apply(_)
             | ComponentItem::Watchdog(_) => {}
         }
+    }
+}
+
+fn extend_env_with_params(env: &mut BTreeMap<String, String>, params: &[crate::ast::Param]) {
+    for p in params {
+        if let Some(ty) = simple_type_name(p.ty.as_ref()) {
+            env.insert(p.name.name.clone(), ty);
+        }
+    }
+}
+
+/// The `T` of an `event<T>` field type, when `T` is a plain named type.
+fn event_payload_type_name(t: &TypeExpr) -> Option<String> {
+    let TypeExpr::Builtin {
+        name: crate::ast::BuiltinTy::Event,
+        args,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    // `event<RegOp>` parses its argument as an EXPRESSION, not a type
+    // — `TypeArg::Expr(Ident("RegOp"))` — so reading only the
+    // `TypeArg::Type` arm resolved nothing and collected zero sites.
+    match args.first()? {
+        crate::ast::TypeArg::Type(inner) => simple_type_name(Some(inner)),
+        crate::ast::TypeArg::Expr(e) => match e.kind.as_ref() {
+            ExprKind::Ident(id) => Some(id.name.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
