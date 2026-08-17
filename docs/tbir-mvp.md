@@ -4450,7 +4450,8 @@ case and only locally-determinable `Assign` types are compared).
       plumbing is missing.
     * The covergroup helper target is reached from the covergroup
       lowering path, which resolves helpers through a different
-      registry.
+      registry. Closed in divergence 68 — that registry turned out to
+      carry the declaration too.
 
     That leaves the component-method arm still refusing an in-order
     named argument v1 emits identically — a known, measured, un-closed
@@ -4519,6 +4520,38 @@ case and only locally-determinable `Assign` types are compared).
     `transactor_sibling_call_named_argument_is_rejected`, had pinned a
     refusal of `inner(n = 5)`: a name in its own position, the inert
     form. It was asserting that a working program was rejected.
+
+68. **The last named-argument family (2026-08-17).**
+
+    The covergroup helper call was the one site divergence 66 left and
+    divergence 67 did not reach. It was assumed to need a fourth
+    enabling change; it needed none. Both registries the site already
+    takes as parameters carry the declaration — `HelperRegistry` for a
+    file-level `function` (via `HelperEntry::decl`) and the extern map
+    for an `extern function` — so the parameter names were in scope the
+    whole time. *Checking beat assuming, again.*
+
+    Measured for this family specifically rather than inherited from its
+    five siblings, because variants sharing a shape do not share a
+    verdict. In a coverpoint target:
+
+    | call | v1 emits |
+    |---|---|
+    | `pick(<slice>, 1)` | `pick(<slice>, 1)` |
+    | `pick(a = <slice>, b = 1)` | `pick(<slice>, 1)` |
+    | `pick(b = 1, a = <slice>)` | `pick(1, <slice>)` |
+
+    The swap lands inside the sampler that decides which bin gets hit,
+    so a covergroup would report coverage against the wrong values with
+    nothing to show for it.
+
+    When NEITHER registry resolves the callee there is no parameter list
+    to check a written name against, and the call keeps its blanket
+    refusal — the same rule as the `emit <ev>(...)` payload callers.
+    Refusing beats guessing a list.
+
+    That makes all six families measured and five converted; the sixth
+    (`emit <ev>(...)`) has no declaration to convert against.
 
 ### The probe method
 

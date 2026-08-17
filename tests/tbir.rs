@@ -18745,3 +18745,77 @@ fn a_named_argument_in_its_own_position_lowers_for_the_families_that_know_their_
         );
     }
 }
+
+/// The covergroup helper call is the last named-argument family, and it
+/// resolves its parameter names through a different registry.
+///
+/// Measured for THIS family rather than inherited from its siblings: in
+/// a coverpoint target, `pick(a = .., b = 1)` emits the same
+/// `pick(<slice>, 1)` v1 emits positionally, and `pick(b = 1, a = ..)`
+/// emits `pick(1, <slice>)` — the values swapped, silently, inside the
+/// sampler that decides which bin gets hit.
+///
+/// The names come from whichever registry resolves the callee: a
+/// file-level `function` via `HelperRegistry`, or an `extern function`
+/// via the extern map. When neither resolves there is no parameter list
+/// to check against and the call keeps its blanket refusal, because
+/// refusing beats guessing a list.
+#[test]
+fn a_covergroup_helper_call_judges_a_named_argument_by_its_position() {
+    let fixture = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "    cp_low_nibble : cover dut.count_out[3:0]";
+    assert!(fixture.contains(CP), "fixture shape changed");
+    let src = |call: &str| {
+        format!(
+            "function pick(a: uint<8>, b: uint<8>) -> uint<8>\n    return a\n\
+             end function pick\n\n{}",
+            fixture.replacen(CP, &format!("    cp_low_nibble : cover {call}"), 1)
+        )
+    };
+    let emitted = |call: &str| -> String {
+        cpp_tb::emit(&merged_src(&src(call)))
+            .unwrap_or_else(|e| panic!("v1 emits `{call}`: {e}"))
+            .lines()
+            .filter(|l| l.contains("pick("))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+
+    // v1's behaviour, which the classification rests on.
+    let positional = emitted("pick(dut.count_out[3:0], 1)");
+    assert!(
+        positional.contains("pick("),
+        "the helper call reaches v1's output"
+    );
+    assert_eq!(
+        emitted("pick(a = dut.count_out[3:0], b = 1)"),
+        positional,
+        "in-order names emit the positional call byte-for-byte"
+    );
+    assert_ne!(
+        emitted("pick(b = 1, a = dut.count_out[3:0])"),
+        positional,
+        "reordered names swap the values inside the sampler"
+    );
+
+    // TB-IR: the inert forms lower.
+    lower_src(&src("pick(dut.count_out[3:0], 1)")).expect("positional lowers");
+    lower_src(&src("pick(a = dut.count_out[3:0], b = 1)")).expect("in-order names lower");
+
+    // The swap is the silent mis-lowering.
+    let msg = assert_not_implemented(
+        &lower_src(&src("pick(b = 1, a = dut.count_out[3:0])")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("covergroup helper call `pick(...)`")
+            && msg.contains("`b` is parameter 2 here but was written in position 1"),
+        "{msg}"
+    );
+
+    // A name matching no parameter is a program error.
+    let msg =
+        assert_invalid(&lower_src(&src("pick(nosuch = dut.count_out[3:0], b = 1)")).unwrap_err());
+    assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
+}
