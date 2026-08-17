@@ -62,6 +62,23 @@ pub enum CompileError {
         #[label("here")]
         span: SourceSpan,
     },
+
+    /// A literal token the lexer matched but whose contents are not a
+    /// well-formed value — an overwide sized literal (`4'hFF`), a digit
+    /// outside its radix (`8'dFF`), a zero declared width.
+    ///
+    /// Deliberately NOT `UnsupportedSyntax`: nothing here is awaiting
+    /// implementation and no backend would accept it. Naming it that way
+    /// would put it in the same bucket as the real subset gaps, which is
+    /// the distinction harc#551 was about.
+    #[error("{message}")]
+    #[diagnostic(help("{help}"))]
+    InvalidLiteral {
+        message: String,
+        help: String,
+        #[label("here")]
+        span: SourceSpan,
+    },
 }
 
 pub fn span_to_source_span(span: Span) -> SourceSpan {
@@ -105,6 +122,14 @@ impl CompileError {
 
     pub fn unsupported_syntax(message: &str, help: &str, span: Span) -> Self {
         CompileError::UnsupportedSyntax {
+            message: message.to_string(),
+            help: help.to_string(),
+            span: span_to_source_span(span),
+        }
+    }
+
+    pub fn invalid_literal(message: &str, help: &str, span: Span) -> Self {
+        CompileError::InvalidLiteral {
             message: message.to_string(),
             help: help.to_string(),
             span: span_to_source_span(span),
