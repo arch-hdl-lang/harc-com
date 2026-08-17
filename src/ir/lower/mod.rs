@@ -2386,7 +2386,26 @@ fn lower_test(
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
-        return Err(unsupported("test parameters", ""));
+        // The SIXTH landing of the dropped-parameter-list construct, and
+        // the only one whose surface syntax is paren params
+        // (`test T(N: int = 3)`) rather than `#(...)` — `parse_test`
+        // accepts them, so this is reachable, while `impl X for Tb`
+        // hard-codes an empty list.
+        //
+        // v1 behaves exactly as it does at the other five: with a
+        // file-scope `const N = 9` in scope, the emitted C++ is
+        // BYTE-IDENTICAL to the same test with the parameter list
+        // deleted — `harc_assign(dut->rst, N)` binds to the const's 9
+        // and the parameter's own default 3 appears nowhere. Rename the
+        // parameter so nothing shadows it and v1 emits
+        // `harc_assign(dut->rst, WIDE)` with `WIDE` declared on no line.
+        return Err(not_implemented(
+            "test parameters",
+            "v1 drops the parameter list entirely: a reference to one either fails to \
+             resolve or silently picks up a same-named file-scope `const`, and the \
+             parameter's own default is never used",
+            V1Status::SilentlyMisLowers,
+        ));
     }
 
     let mut dut_type: Option<String> = None;

@@ -17065,3 +17065,78 @@ end impl RecTest
         "the field initializer precedes the const, so that position does not compile"
     );
 }
+
+/// The SIXTH landing, and the only one whose surface syntax is paren
+/// params (`test T(N: int = 3)`) rather than `#(...)`. `parse_test`
+/// accepts them, so it is reachable; `impl X for Tb` hard-codes an
+/// empty list.
+#[test]
+fn a_test_parameter_is_dropped_by_v1_like_every_other_parameter_list() {
+    const SRC: &str = r#"CONST
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test ParamTestDECL
+    let dut : Top
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = USE
+        wait 2 cycles
+    end run
+end test ParamTest
+"#;
+    let mk = |cst: &str, decl: &str, use_: &str| {
+        SRC.replace("CONST\n", cst)
+            .replace("ParamTestDECL", decl)
+            .replace("USE", use_)
+    };
+
+    // Shadowed: the reference binds to the const, and the parameter's
+    // own default 3 reaches nothing.
+    let shadowed = mk("const N = 9\n\n", "ParamTest(N: int = 3)", "N");
+    let msg = assert_not_implemented(
+        &lower_src(&shadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("test parameters"), "{msg}");
+
+    let v1_shadowed = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    assert!(
+        v1_shadowed.contains("static constexpr int64_t N = 9;")
+            && v1_shadowed.contains("harc_rt::harc_assign(dut->rst, N);"),
+        "the const is emitted and the reference binds to it"
+    );
+    // The anchor: the same test with NO parameter list emits
+    // identically, so the parameter is provably invisible.
+    let no_param = mk("const N = 9\n\n", "ParamTest", "N");
+    lower_src(&no_param).expect("the const-only form lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&no_param)).expect("v1 emits"),
+        v1_shadowed,
+        "`(N: int = 3)` changes nothing, so the test runs with the const's 9"
+    );
+
+    // Unshadowed: nothing to bind to, so the reference is undeclared.
+    let unshadowed = mk("", "ParamTest(WIDE: int = 3)", "WIDE");
+    assert_not_implemented(
+        &lower_src(&unshadowed).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_unshadowed = cpp_tb::emit(&merged_src(&unshadowed)).expect("v1 emits");
+    assert!(
+        v1_unshadowed.contains("harc_rt::harc_assign(dut->rst, WIDE);"),
+        "the parameter name survives into the assignment"
+    );
+    assert!(
+        !v1_unshadowed
+            .lines()
+            .any(|l| !l.trim_start().starts_with("//") && l.contains("int64_t WIDE")),
+        "and `WIDE` is declared nowhere, so it does not compile"
+    );
+
+    // And the control: without a parameter, the same test lowers.
+    lower_src(&mk("", "ParamTest", "1")).expect("the unparameterized test lowers");
+}

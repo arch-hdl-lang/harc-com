@@ -3667,7 +3667,7 @@ case and only locally-determinable `Assign` types are compared).
     entry already carried a rule about reading the generated C++, which
     is not the same as reading two lines out of it.
 
-    A FIFTH landing, `records.rs`'s `parameters on transaction`, agrees
+    A fifth landing, `records.rs`'s `parameters on transaction`, agrees
     too, and its silent position is the worst of the set. A `keep`
     constraint referencing the parameter does not emit the name at all:
     the constraint IR CONST-FOLDS it against a same-named file-scope
@@ -3694,10 +3694,15 @@ case and only locally-determinable `Assign` types are compared).
     any identity. This is divergence 51's lesson applied before being
     caught by it rather than after.
 
-    Probed at all FIVE landings rather than one, because divergence
-    47's tseq pair sat four lines apart and classified differently. They
-    all agree on `SilentlyMisLowers` — a result, not a reason to have
-    assumed it, and it took two wrong labels along the way to establish.
+    Probed at all SIX landings rather than one, because divergence 47's
+    tseq pair sat four lines apart and classified differently. They all
+    agree on `SilentlyMisLowers` — a result, not a reason to have
+    assumed it, and it took two wrong labels and four review rounds to
+    establish. The sixth, `mod.rs`'s `test parameters`, is the only one
+    whose surface syntax is paren params (`test T(N: int = 3)`) rather
+    than `#(...)`, which is why searching for the `#(...)` spelling
+    missed it five times running. **Grouping by construct means grouping
+    by what the construct DOES, not by how it is spelled.**
 
     The fourth landing, `scoreboards.rs`, was first labelled
     `EmitsUncompilable` on a structural argument: a data-only scoreboard
