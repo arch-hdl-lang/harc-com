@@ -15674,69 +15674,75 @@ fn a_thread_on_a_bound_transactor_still_points_at_v1() {
     );
 }
 
-/// Three handler-validator arms in `components.rs`, two of which sit
-/// four lines apart and looked interchangeable.
+/// The `components.rs` handler-validator family: THREE hook arms and one
+/// phase arm, and the hook arms and the phase arm classify opposite ways
+/// despite sitting four lines apart.
 ///
-/// A `pre`/`post` hook on a cycle-trigger or periodic handler is
-/// `SilentlyMisLowers`: v1 emits the handler with the hook side
-/// DISCARDED, byte-identically to the same handler written without it.
-/// The user asks for pre/post ordering and gets the default.
+/// A `pre`/`post` hook on a cycle-trigger, periodic, or event-
+/// subscription handler is `SilentlyMisLowers`: v1 emits the handler
+/// with the hook side DISCARDED, byte-identically to the same handler
+/// written without it. The user asks for pre/post ordering and gets the
+/// default.
 ///
 /// A non-default PHASE is not the same. v1 implements it —
 /// `phase post_eval` emits `_post_eval_services.push_back` where the
 /// default emits `_checkers.push_back` — so v1 is a real escape hatch
 /// and that arm keeps `Unsupported`.
+///
+/// Every byte-identity below is paired with its OWN anchor (the same
+/// mutation with the handler removed rather than the hook added). A
+/// shared anchor would not do: it holds for one trigger kind and says
+/// nothing about the others, and in an uninstantiated component it is
+/// vacuously true for all of them.
 #[test]
 fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
     let fixture = fixture("agent_periodic_test.harc");
     const PERIODIC: &str = "    on 10 cycles";
 
-    // Control, and the ANCHOR: removing the handler entirely changes
-    // v1's output, so a later byte-identity is the MODIFIER being
-    // dropped rather than the handler being inert.
-    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    // Replace the handler's TRIGGER line, and separately produce the
+    // same source with the whole handler deleted — the anchor that
+    // makes a later byte-identity mean "the modifier was dropped"
+    // rather than "the handler was inert".
     let start = fixture.find(PERIODIC).expect("fixture shape changed");
     let end = fixture[start..]
         .find("end on")
         .map(|i| start + i + "end on\n".len())
         .expect("fixture shape changed");
     let without = format!("{}{}", &fixture[..start], &fixture[end..]);
-    assert_ne!(
-        cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
-        v1_ctl,
-        "the handler genuinely contributes, so byte-identity below means something"
-    );
+    let v1_without = cpp_tb::emit(&merged_src(&without)).expect("v1 emits");
 
-    // A hook on the PERIODIC form: dropped.
-    let p_hook = fixture.replacen(PERIODIC, "    on 10 cycles pre", 1);
-    let msg = assert_not_implemented(
-        &lower_src(&p_hook).unwrap_err(),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("`on <N> cycles` handler"), "{msg}");
-    assert_eq!(
-        cpp_tb::emit(&merged_src(&p_hook)).expect("v1 emits"),
-        v1_ctl,
-        "v1 emits the periodic handler with the hook discarded"
-    );
+    // Assert `hook` is dropped relative to `ctl`, with `ctl` itself
+    // anchored against the handler-free source. Both mutations differ
+    // from `ctl` in exactly one token.
+    let check_dropped = |ctl_trigger: &str, hook_trigger: &str, construct: &str| {
+        let ctl = fixture.replacen(PERIODIC, ctl_trigger, 1);
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+        assert_ne!(
+            v1_ctl, v1_without,
+            "`{ctl_trigger}` must genuinely contribute, or the identity below is vacuous"
+        );
+        let hooked = fixture.replacen(PERIODIC, hook_trigger, 1);
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains(construct), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 emits `{hook_trigger}` with the hook discarded"
+        );
+        v1_ctl
+    };
 
-    // The CYCLE-TRIGGER control differs from its mutations in exactly
-    // one token. Reusing the periodic control would change the trigger
-    // kind AND the modifier, which made both arms below read as
-    // "differs" and hid the split.
-    let c_ctl = fixture.replacen(PERIODIC, "    on beats > 0", 1);
-    let v1_c_ctl = cpp_tb::emit(&merged_src(&c_ctl)).expect("v1 emits");
-
-    let c_hook = fixture.replacen(PERIODIC, "    on beats > 0 pre", 1);
-    let msg = assert_not_implemented(
-        &lower_src(&c_hook).unwrap_err(),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("cycle-trigger `on` handler"), "{msg}");
-    assert_eq!(
-        cpp_tb::emit(&merged_src(&c_hook)).expect("v1 emits"),
-        v1_c_ctl,
-        "v1 emits the cycle-trigger handler with the hook discarded"
+    check_dropped(PERIODIC, "    on 10 cycles pre", "`on <N> cycles` handler");
+    // The CYCLE-TRIGGER control carries its own anchor. Reusing the
+    // periodic one would change the trigger kind AND the modifier at
+    // once, which made both arms read as "differs" and hid the split.
+    let v1_c_ctl = check_dropped(
+        "    on beats > 0",
+        "    on beats > 0 pre",
+        "cycle-trigger `on` handler",
     );
 
     // The PHASE, by contrast, v1 implements.
@@ -15745,8 +15751,137 @@ fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
     assert!(msg.contains("non-default-phase"), "{msg}");
     let v1_phase = cpp_tb::emit(&merged_src(&c_phase)).expect("v1 emits");
     assert!(
-        v1_phase.contains("_post_eval_services.push_back")
-            && v1_c_ctl.contains("_checkers.push_back"),
-        "the phase selects the dispatch vector, so v1 is a real escape hatch"
+        v1_phase.contains("_post_eval_services.push_back"),
+        "`phase post_eval` selects the post-eval dispatch vector"
+    );
+    assert!(
+        v1_c_ctl.contains("_checkers.push_back")
+            && !v1_c_ctl.contains("_post_eval_services.push_back"),
+        "and the default registers into `_checkers` only, so the phase is not a no-op"
+    );
+}
+
+/// The third hook arm, on the event-subscription path: `on ev(t) pre`.
+/// Probes identically to the other two — v1 emits the subscription with
+/// the hook side discarded — so it carries the same `SilentlyMisLowers`
+/// verdict rather than the `--codegen v1` suggestion it used to.
+#[test]
+fn an_event_subscription_hook_is_dropped_by_v1_too() {
+    let fixture = fixture("heartbeat_idle_test.harc");
+    const SUB: &str = "    on in_ev(t)";
+
+    let v1_ctl = cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+    let start = fixture.find(SUB).expect("fixture shape changed");
+    let end = fixture[start..]
+        .find("end on")
+        .map(|i| start + i + "end on\n".len())
+        .expect("fixture shape changed");
+    let without = format!("{}{}", &fixture[..start], &fixture[end..]);
+    assert_ne!(
+        cpp_tb::emit(&merged_src(&without)).expect("v1 emits"),
+        v1_ctl,
+        "the subscription genuinely contributes, so the identities below mean something"
+    );
+
+    for hook in ["pre", "post"] {
+        let hooked = fixture.replacen(SUB, &format!("    on in_ev(t) {hook}"), 1);
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("`pre`/`post` hook `on` handler"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 emits the subscription with the `{hook}` hook discarded"
+        );
+    }
+}
+
+/// The cycle-trigger hook arm's OTHER input: a spec §7.3 method hook
+/// written in a component body instead of at test scope. It is not an
+/// event subscription and not a handshake monitor, so it lands in the
+/// same arm as a stray `pre` on a bool expression — but v1 fails it
+/// differently, dropping the hook AND edge-detecting on a struct member
+/// that does not exist.
+///
+/// That makes the arm's input space non-uniform. `SilentlyMisLowers` is
+/// still the honest label (it is the worse of the two outcomes), but the
+/// message must not claim byte-identity, which holds only for the other
+/// shape.
+#[test]
+fn a_method_hook_in_a_component_body_reaches_the_cycle_trigger_arm() {
+    const BASE: &str = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction RegOp
+    addr  : uint<8>
+    value : uint<32>
+end transaction RegOp
+
+transactor Sender
+    dut : Top
+
+    when active
+        hookable send(t: RegOp)
+            dut.en = 1
+        end send
+    end when
+end transactor Sender
+
+env HookEnv
+    s : Sender active
+HOOK
+end env HookEnv
+
+test MethodHookTest
+    let dut : Top
+    let e : HookEnv
+
+    clock clk = SysDomain
+
+    run
+        e.s.dut = dut
+        wait 2 cycles
+    end run
+end test MethodHookTest
+"#;
+    let ctl = BASE.replace("HOOK\n", "");
+    let hooked = BASE.replace(
+        "HOOK",
+        "    on s.send pre\n        log(info, \"prehook\")\n    end on",
+    );
+
+    // The arm it lands in, and the message it must NOT make.
+    let msg = assert_not_implemented(
+        &lower_src(&hooked).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cycle-trigger `on` handler"), "{msg}");
+
+    // v1 does NOT drop the hook silently here: the output differs from
+    // the control, and what it adds is a cycle trigger reading
+    // `e.s.send` — a member the emitted `struct Sender` does not have,
+    // so the C++ does not compile.
+    let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+    let v1_hooked = cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits");
+    assert_ne!(
+        v1_ctl, v1_hooked,
+        "the byte-identity that holds for a stray `pre` does not hold here"
+    );
+    assert!(
+        v1_hooked.contains("(bool)(e.s.send)"),
+        "v1 lowers the method hook as a cycle trigger on the method path"
+    );
+    let sender_struct = v1_hooked
+        .split_once("struct Sender {")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(body, _)| body.to_string())
+        .expect("v1 emits a `Sender` struct");
+    assert!(
+        !sender_struct.contains("send"),
+        "no `send` member, so `(bool)(e.s.send)` cannot compile: {sender_struct}"
     );
 }

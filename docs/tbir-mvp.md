@@ -3358,9 +3358,48 @@ case and only locally-determinable `Assign` types are compared).
     touching an arm, because a previous batch may already have paid for
     the answer.
 
-    Family C was re-run in both positions before being trusted. The
-    hook is dropped whether or not the agent is instantiated, so the
-    verdict holds.
+    Family C was re-run in the uninstantiated position too, and that
+    re-run **proved nothing** — a mistake worth recording, because it
+    was made while writing up the family-B lesson about positions. With
+    `Ticker` uninstantiated, v1 emits nothing for the agent at all:
+    hook-vs-control is byte-identical, but so is handler-vs-no-handler.
+    The second position cannot distinguish "the hook was dropped" from
+    "the handler was inert" — the exact anchorless reading divergence 51
+    records — so citing it as corroboration was divergence 51 repeated
+    one entry later. The verdict stands on the instantiated probe, which
+    carries a real anchor; the second position is silent, not agreeing.
+    **A control that is vacuously equal agrees with every hypothesis.**
+
+53. **The cycle-trigger hook arm has a second input, and v1 fails it
+    differently (2026-08-17).**
+
+    The arm above was probed only with a stray modifier on a genuine
+    cycle trigger (`on beats > 0 pre`). It also catches a **spec §7.3
+    method hook written in a component body** (`on s.send pre`) — not an
+    event subscription, not a handshake monitor, so it falls through to
+    the same place. For that input v1 does not silently drop the hook and
+    stop: it drops the hook and then lowers `s.send` as a cycle trigger,
+    emitting `(bool)(e.s.send)` against a `struct Sender` whose only
+    members are `dut`, `_last_in_cycle` and `_last_out_cycle`. That does
+    not compile.
+
+    Two consequences, and only the second changed any code. The verdict
+    is unchanged: `SilentlyMisLowers` is the worse of the two outcomes
+    and an arm's status is the worst thing v1 does anywhere under it. But
+    the DETAIL claimed byte-identity, which is true of one input and
+    false of the other, so it was reworded to describe what v1 actually
+    does to both — drop the hook and lower the trigger as a plain cycle
+    trigger — plus the hint that a §7.3 hook belongs at test scope, where
+    tbir does lower it (`axilite_hooks_test` is in the equivalence
+    registry, so that destination is checked, not guessed).
+
+    A third hook arm was found in the same pass, on the event-
+    subscription path (`on ev(t) pre`). It probes identically to the
+    periodic one — byte-identical to the hook-free handler, with the
+    anchor holding — and was still returning `Unsupported`. Reclassified.
+    **The family was described as "three arms, two behaviours" while it
+    was four arms**: the write-up counted the arms the probe had touched,
+    not the arms that share the construct.
 
 ### The probe method
 

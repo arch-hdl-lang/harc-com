@@ -851,16 +851,34 @@ fn edge_to_ir(e: crate::ast::EdgeMode) -> crate::ir::CycleEdge {
 /// handled elsewhere; only the checker phase is lowered here.
 fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
-        // v1 emits the handler with the hook side DISCARDED — byte-
-        // identical to the same handler written without it. The user
-        // asks for pre/post ordering and gets the default, silently.
-        // (Anchored: removing the handler entirely does change v1's
-        // output, so the byte-identity is the modifier being dropped
-        // rather than the handler being inert.)
+        // v1 drops the hook side and lowers the trigger as an ordinary
+        // cycle trigger. TWO user-visible shapes reach here and v1 fails
+        // each differently, so the label is the worse of the two:
+        //
+        //   * `on <bool-expr> pre` — a stray modifier on a genuine
+        //     cycle trigger. v1's output is BYTE-IDENTICAL to the same
+        //     handler written without the hook, so the requested
+        //     ordering is silently ignored. (Anchored: removing the
+        //     handler entirely does change v1's output, so the identity
+        //     is the modifier being dropped, not the handler being
+        //     inert.) `SilentlyMisLowers`, and the worst of the two.
+        //
+        //   * `on <sub>.<method> pre` — a spec §7.3 method hook written
+        //     in a component body instead of at test scope. Not an
+        //     event subscription and not a handshake monitor, so it
+        //     lands here too. v1 drops the hook AND edge-detects on
+        //     `(bool)(e.s.send)`, a member that the emitted struct does
+        //     not have, so the C++ does not compile. `EmitsUncompilable`
+        //     on its own, and subsumed by the arm's label.
+        //
+        // Both are `NotImplemented`: v1 is not an escape hatch for
+        // either. The detail below is worded to stay true of both
+        // rather than describing only the byte-identical one.
         return Err(not_implemented(
             &format!("a `pre`/`post` hook on a cycle-trigger `on` handler on `{comp}`"),
-            "cycle-trigger handlers take no hook side; v1 accepts one and emits the handler \
-             without it, so the requested ordering is silently ignored",
+            "cycle-trigger handlers take no hook side; v1 accepts one, drops the hook and \
+             lowers the trigger as a plain cycle trigger, so the requested ordering is lost. \
+             (A spec §7.3 method hook belongs at test scope, where it is lowered.)",
             V1Status::SilentlyMisLowers,
         ));
     }
@@ -911,9 +929,20 @@ fn resolve_on_handler_event(
     fields: &[ComponentFieldSchema],
 ) -> Result<(String, EventPayload), LowerError> {
     if h.hook.is_some() {
-        return Err(unsupported(
+        // The third member of the hook family, and it probes exactly
+        // like the periodic one: v1 emits the subscription handler with
+        // the hook side discarded, byte-identically to the same handler
+        // written without it. (Anchored: removing the handler changes
+        // v1's output.) Nothing here needs the method-hook caveat that
+        // `validate_cycle_handler` carries — the trigger is already
+        // known to be a self `event<...>` subscription, so there is only
+        // one shape.
+        return Err(not_implemented(
             &format!("a `pre`/`post` hook `on` handler on `{comp}`"),
-            "only bare `on <event>(arg)` self-subscriptions are lowered",
+            "only bare `on <event>(arg)` self-subscriptions are lowered; v1 accepts a hook \
+             side and emits the handler without it, so the requested ordering is silently \
+             ignored",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if h.periodic {
