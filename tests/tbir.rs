@@ -15537,3 +15537,139 @@ env AnalysisEnv"#;
     );
     assert!(v1.contains("env.weird.cp.b0++"), "v1 wires the sampling");
 }
+
+/// A target-serving `thread` written on an env/agent instead of a
+/// bus-bound transactor. v1 accepts it and emits the component WITHOUT
+/// it — no `ThreadSlot`, no scheduler registration, no coroutine — so
+/// the target silently never serves.
+///
+/// The first probe of this "proved" it by showing v1's output was
+/// byte-identical with and without the thread. That proved nothing: an
+/// UNBOUND thread emits nothing under v1 wherever it sits, so the
+/// comparison had no signal in it. Both anchors below exist because of
+/// that.
+#[test]
+fn a_thread_in_a_component_is_silently_dropped_by_v1() {
+    let bound = fixture("tlm_target_thread_test.harc");
+    let thread_start = bound
+        .find("    thread bus.read(addr: uint<8>)")
+        .expect("fixture shape changed");
+    let thread_end = bound[thread_start..]
+        .find("end thread")
+        .map(|i| thread_start + i + "end thread\n".len())
+        .expect("fixture shape changed");
+    let thread_src = &bound[thread_start..thread_end];
+
+    // Control: the registered fixture emits under both backends.
+    emit_cpp_src(&bound);
+    let v1_bound = cpp_tb::emit(&merged_src(&bound)).expect("v1 emits the control");
+
+    // POSITIVE anchor: where the construct IS supported, it genuinely
+    // contributes — removing it costs the ThreadSlot and the coroutine.
+    // Without this, "no diff" below would be unreadable.
+    let without = format!("{}{}", &bound[..thread_start], &bound[thread_end..]);
+    let v1_without = cpp_tb::emit(&merged_src(&without)).expect("v1 emits");
+    // Counted, not just present: other machinery emits ThreadSlots too,
+    // so `contains` would be satisfied by those and measure nothing.
+    assert!(
+        v1_bound.matches("harc_rt::ThreadSlot").count()
+            > v1_without.matches("harc_rt::ThreadSlot").count(),
+        "a bus-bound thread adds a ThreadSlot; removing it takes one away"
+    );
+
+    // NEGATIVE anchor: the same thread moved into an `env` adds only the
+    // empty component struct. No ThreadSlot, no serving logic.
+    // INSTANTIATED. v1 registers scheduler slots at the `let` site, so an
+    // env that is declared but never bound contributes nothing whether or
+    // not the thread inside it works — the count equality would hold
+    // trivially and measure exactly nothing, which is the failure this
+    // test exists to avoid.
+    let in_env = bound
+        .replacen(
+            "testbench TlmTargetThreadTb",
+            &format!("env WrapEnv\n{thread_src}end env WrapEnv\n\ntestbench TlmTargetThreadTb"),
+            1,
+        )
+        .replacen(
+            "    let target : TlmMemTarget passive = bind mem",
+            "    let target : TlmMemTarget passive = bind mem\n    let wrap : WrapEnv",
+            1,
+        );
+    assert!(
+        in_env.contains("let wrap : WrapEnv"),
+        "the env is instantiated"
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&in_env).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("`thread` item in component"), "{msg}");
+
+    let v1_env = cpp_tb::emit(&merged_src(&in_env)).expect("v1 accepts a thread on an env");
+    assert!(
+        v1_env.contains("struct WrapEnv"),
+        "v1 emits the component struct"
+    );
+    // The count is what matters: the env's thread adds no NEW slot.
+    assert_eq!(
+        v1_env.matches("harc_rt::ThreadSlot").count(),
+        v1_bound.matches("harc_rt::ThreadSlot").count(),
+        "the env-held thread contributes no ThreadSlot — it silently never serves"
+    );
+}
+
+/// The same arm also catches a `thread` on a transactor that IS
+/// bus-bound: `transactor_is_component` routes one down the component
+/// path when it additionally has a non-periodic `on` handler.
+///
+/// There the construct works — `emit_bound_tlm_target_actors` emits the
+/// target actor regardless of the `on` handler — so v1 is a genuine
+/// escape hatch and the arm keeps `Unsupported`. The first version of
+/// the split reclassified the whole arm from a probe that only ever put
+/// a `thread` on an env.
+#[test]
+fn a_thread_on_a_bound_transactor_still_points_at_v1() {
+    let bound = fixture("tlm_target_thread_test.harc");
+    emit_cpp_src(&bound);
+
+    // Add a non-periodic `on` handler, which is what routes this
+    // transactor down the component path.
+    // `bus.read` is a tlm_method, so the `on` handler needs a real
+    // handshake channel — the bus is given one here. No fixture in the
+    // corpus has this shape (bound transactor + `on` + `thread`), which
+    // is why it went unprobed the first time.
+    let via_component = bound
+        .replacen(
+            "    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+            r#"    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    handshake_channel obs: receive kind: valid_ready
+        data: UInt<8>;
+    end handshake_channel obs"#,
+            1,
+        )
+        .replacen(
+            "transactor TlmMemTarget bound to TlmMemBus",
+            "transactor TlmMemTarget bound to TlmMemBus\n    sink : uint<8> default 0",
+            1,
+        )
+        .replacen(
+            "    thread bus.read(addr: uint<8>)",
+            "    on bus.obs.handshake(v)\n        sink = v\n    end on\n\n    thread bus.read(addr: uint<8>)",
+            1,
+        );
+    let err = lower_src(&via_component).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("bound transactor"), "{msg}");
+
+    // v1's evidence: the target actor is still emitted, so pointing the
+    // user at v1 is accurate rather than a dead end.
+    let v1 = cpp_tb::emit(&merged_src(&via_component)).expect("v1 emits");
+    assert!(
+        v1.matches("harc_rt::ThreadSlot").count()
+            > cpp_tb::emit(&merged_src(&bound))
+                .expect("v1 emits")
+                .matches("harc_rt::ThreadSlot")
+                .count(),
+        "the `on` handler adds slots and the thread's actor survives"
+    );
+}

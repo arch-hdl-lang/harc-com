@@ -3242,6 +3242,76 @@ case and only locally-determinable `Assign` types are compared).
     still returned one for both. Split now, on the same `'` the address
     site uses.
 
+51. **`components.rs` family E: the catch-all, and a probe that
+    measured nothing twice (2026-08-17).**
+
+    `ComponentItem::TargetTlmThread | Apply` shared one arm and one
+    message. The variant list is the whole input space — enumerable, so
+    this is a structural argument rather than a count.
+
+    **`thread` on an env/agent is `SilentlyMisLowers`.** v1 accepts it,
+    emits the component struct, and drops the thread: no
+    `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no serving
+    coroutine. A user writes a target-serving thread and the target
+    never serves, with no diagnostic.
+
+    Getting there took three probes, and the first two measured nothing:
+
+    * Adding a `thread` to the `analysis_sink_connect_test` env left
+      v1's output byte-identical, which reads as "v1 drops it".
+    * So did adding the same thread to a TRANSACTOR in that fixture —
+      where the construct is supposed to be supported. That is the
+      tell: an **unbound** thread emits nothing under v1 wherever it
+      sits, so neither comparison had any signal in it. Rule 2, and the
+      only reason it surfaced was checking the anchor rather than
+      banking the first agreeing result.
+    * Against `tlm_target_thread_test`, where the transactor is
+      bus-bound, removing the thread DOES change v1's output. With that
+      anchor established, moving the same thread into an `env` adds only
+      an empty `struct WrapEnv { … }` — and the conclusion is finally
+      supported.
+
+    The test carries both anchors, and counts `ThreadSlot` occurrences
+    rather than testing presence: other machinery emits them too, so a
+    `contains` check passes on those and measures nothing. That is the
+    same class of error as the byte-identity above, one level down.
+
+    **`apply` in a component was NOT reclassified.** It shares the arm,
+    and the obvious move is to give it the verdict the thread earned.
+    But v1's handling of `apply` varies by position and by whether the
+    named package is declared — in a test body a declared package is
+    rejected while an undeclared name is accepted — so the component
+    landing needs its own anchored probe. It keeps `Unsupported` and the
+    site says why. **Splitting an arm is also permission to leave half
+    of it alone.**
+
+    **Review then found the reclassification too broad, in the direction
+    that costs the most.** `transactor_is_component` routes a `bound to
+    <bus>` transactor down this same component path when it also has a
+    non-periodic `on` handler — so the arm catches a `thread` sitting on
+    exactly the construct that serves it. There v1 emits the target
+    actor normally (6 `ThreadSlot`s against the control's 4;
+    `emit_bound_tlm_target_actors` is not gated on `on` handlers), so
+    the shipped `SilentlyMisLowers` was false for that input, the hint
+    told the user to move the thread somewhere it already was, and
+    `not_implemented` suppressed the `--codegen v1` pointer that had
+    been correct. A regression, from a probe that only ever put a
+    `thread` on an env.
+
+    No fixture in the corpus has that shape, which is why it went
+    unprobed: the arm is reachable from a construct combination the
+    whole test suite never writes. Building it took adding a
+    `handshake_channel` to a bus that had only a `tlm_method`.
+
+    Two smaller findings from the same review, both about *pointing*
+    rather than classifying: the `apply` detail said "aspects apply at
+    test scope", but test scope rejects `apply` too — a hint that names
+    a destination which also fails is worse than the empty detail it
+    replaced. And the negative anchor declared `env WrapEnv` without
+    instantiating it; v1 registers scheduler slots at the `let` site, so
+    the `ThreadSlot` count equality held trivially. **The test written
+    to avoid measuring nothing was measuring nothing.**
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

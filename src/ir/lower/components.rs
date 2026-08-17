@@ -456,6 +456,12 @@ pub(crate) fn lower_component_schema(
     // pointer rather than an unknown sub-component. Only transactors host
     // a DUT field — env/scoreboard/agent/sequencer never do.
     let is_transactor = matches!(src, CompSource::Transactor(_));
+    // A transactor with a `bound to <bus>` clause. `transactor_is_component`
+    // routes one here when it has a non-periodic `on` handler, so a
+    // `thread` item below can be sitting on exactly the construct that
+    // serves it — v1 emits the target actor for that shape, and the
+    // component arms must not claim otherwise.
+    let is_bound_transactor = matches!(src, CompSource::Transactor(t) if t.bound_to.is_some());
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
@@ -527,9 +533,65 @@ pub(crate) fn lower_component_schema(
                 watchdog_ast = Some(w);
             }
 
-            ComponentItem::TargetTlmThread(_) | ComponentItem::Apply(_) => {
+            // Two variants shared one message and one classification.
+            // Only the first is probed at THIS landing, so only the first
+            // is reclassified — the second keeps what it had rather than
+            // inheriting a verdict it did not earn.
+            // A `thread` on a BOUND transactor is the construct working
+            // as designed — `emit_bound_tlm_target_actors` emits the
+            // target actor for it, and this component path is reached
+            // only because the transactor also has a non-periodic `on`
+            // handler. v1 is a real escape hatch, so it keeps
+            // `Unsupported` and the `--codegen v1` pointer with it.
+            //
+            // The first version of this split reclassified the whole arm
+            // from a probe that only ever put a `thread` on an env.
+            ComponentItem::TargetTlmThread(_) if is_bound_transactor => {
                 return Err(unsupported(
-                    &format!("an unsupported item in component `{name}`"),
+                    &format!(
+                        "a `thread` item on bound transactor `{name}` reached through the \
+                         component path"
+                    ),
+                    "the target actor lowers on the transactor path; this component path is \
+                     taken because the transactor also has a non-periodic `on` handler",
+                ));
+            }
+            ComponentItem::TargetTlmThread(_) => {
+                // v1 accepts a `thread` on an env/agent/scoreboard and
+                // emits the component struct WITHOUT it: no
+                // `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no
+                // serving coroutine. The target never serves, silently.
+                //
+                // Anchored in both directions, because "v1's output did
+                // not change" is not by itself evidence of dropping —
+                // an unbound `thread` emits nothing under v1 wherever it
+                // sits, so the first probe proved nothing. Against
+                // `tlm_target_thread_test`, where the transactor IS
+                // bus-bound, removing the thread DOES change v1's output
+                // (it loses the ThreadSlot and the coroutine); moving
+                // that same thread into an `env` adds only an empty
+                // `struct WrapEnv { ... }`.
+                return Err(not_implemented(
+                    &format!("a `thread` item in component `{name}`"),
+                    "a target-serving `thread` belongs on a `transactor ... bound to <bus>`; on \
+                     an env/agent/scoreboard v1 emits the component without it, so the target \
+                     silently never serves",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            // NOT probed at this landing. v1's handling of `apply`
+            // differs by position and by whether the named package is
+            // declared — in a test body a declared package is rejected
+            // while an undeclared name is accepted — so the component
+            // landing needs its own anchored probe before any claim
+            // about v1 is made here.
+            ComponentItem::Apply(_) => {
+                // Detail deliberately says nothing about WHERE to put it:
+                // test scope rejects `apply` too (`TestItem::Apply` in
+                // `mod.rs`), so naming that scope would send the user
+                // somewhere that also fails.
+                return Err(unsupported(
+                    &format!("an `apply` item in component `{name}`"),
                     "",
                 ));
             }
