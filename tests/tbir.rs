@@ -16133,11 +16133,12 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         );
         // The anchor: the SAME trigger without a hook side is fine, so
         // the rejection is about the hook and not about the trigger.
-        // `"s"` is the exception: its hook-free form is a bare field
-        // reference, which fails for its own reasons, so an anchor
-        // there would measure nothing. Every other trigger here lowers
-        // without the hook side, which is what makes the rejection
-        // above about the hook.
+        // Anchored where the hook-free form lowers, which is what
+        // makes the rejection above about the HOOK rather than about
+        // the trigger. Skipped for `"s"` (a bare field reference) and
+        // for the parenthesised and call forms, none of which lower on
+        // their own — an anchor there would measure nothing. That
+        // leaves `dut.en > 0`, `5 cycles` and `ok` carrying it.
         if trigger != "s" && !trigger.contains('(') {
             let ctl = hook_positions(
                 "",
@@ -16351,11 +16352,14 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
 /// must keep doing so until someone classifies it with the scope
 /// analysis it actually needs.
 ///
-/// A syntactic split was written here and undone; without this test,
-/// re-applying it is green. The two rows that matter are the two the
-/// split got backwards: `on dut.en` is a two-segment PATH that v1
-/// compiles, and `on w.seen > 0` is an EXPRESSION that v1 does not —
-/// so no predicate over trigger syntax can separate this arm.
+/// A syntactic split was written here and undone. The sibling hooked
+/// test's `on w.note` control already fails if it comes back, so this
+/// is not the only guard — it is the one that pins `dut.en`,
+/// `(w.note)`, `w.note cycles` and `w.note phase post_eval`, and that
+/// asserts the two rows the split got BACKWARDS: `on dut.en` is a
+/// two-segment PATH that v1 compiles, and `on w.seen > 0` is an
+/// EXPRESSION that v1 does not. No predicate over trigger syntax can
+/// separate this arm.
 #[test]
 fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
     let scoreboard = |body: &str| {

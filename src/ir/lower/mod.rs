@@ -4021,8 +4021,8 @@ fn lower_test(
                 if xfield == "_tb" {
                     LowerError::Invalid(format!(
                         "`on {method}` hook: a `pre`/`post` hook names a method to wrap \
-                         (`on <field>.<method> pre`), and `{method}` resolves to a field \
-                         rather than a method on one. (If you wrote `_tb.{method}` \
+                         (`on <field>.<method> pre`), and `{method}` does not resolve to a \
+                         `hookable` on a testbench field. (If you wrote `_tb.{method}` \
                          literally, `_tb` is neither a transactor field nor a component \
                          field declaring a `hookable` `{method}`.)"
                     ))

@@ -3518,14 +3518,20 @@ case and only locally-determinable `Assign` types are compared).
     the predicate written to fix it. Classifying this arm needs the
     scope analysis; the site now says so instead of guessing, and
     `an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space`
-    pins the revert — without it, re-applying the split leaves the suite
-    green, which is how an undone mistake comes back. The `connect` half
-    of the same arm is untouched and was never probed at all.
+    pins the revert. The `connect` half of the same arm is untouched and
+    was never probed at all.
 
-    A revert needs a test as much as a change does. This one asserts the
-    two rows the split got backwards (`on dut.en` compiles, `on w.seen >
-    0` does not) rather than just the verdict, so it fails for the right
-    reason.
+    That test was first justified as "without it, re-applying the split
+    leaves the suite green", and that was **wrong** — the sibling hooked
+    test's own `on w.note` control already fails when the split comes
+    back. The test still earns its place, because it pins `dut.en`,
+    `(w.note)`, `w.note cycles` and `w.note phase post_eval`, which the
+    sibling does not, and because it asserts the two rows the split got
+    backwards (`on dut.en` compiles, `on w.seen > 0` does not) rather
+    than just a verdict. But the justification was written from one
+    run of one test rather than from removing the test and running the
+    suite — **checking that a new test fails is not the same as checking
+    that nothing else already did.**
 
     A tenth candidate in `transactors.rs` (a hooked `on` on a `bound to`
     transactor) is NOT classified here. Every well-formed bound
@@ -3539,7 +3545,13 @@ case and only locally-determinable `Assign` types are compared).
 
     The residual is bounded and stated: a path that is well-formed but
     does not resolve to a `hookable` still gets the suggestion, and the
-    user lands on v1's own message rather than on silence.
+    user lands on v1's own message rather than on silence. That covers
+    more inputs than it may read as — `e.inner.plain` (a `function`, not
+    a `hookable`), `e.nosuch.note`, `s.send.x`, `dut.en.x` are all
+    well-formed paths that v1 refuses, and `e.inner.note` is the only
+    nested path in that set v1 actually wires. Closing the residual means
+    resolving the path against the component tree, which is the same
+    scope analysis the scoreboard arm below is waiting on.
 
     The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
     `components.rs` by "what a user would have to write to reach the
