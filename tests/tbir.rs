@@ -14285,8 +14285,9 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
     assert!(msg.contains("non-constant `@ <addr>` offset"), "{msg}");
 
     // A BARE Verilog-sized literal is the one shape here v1 gets right,
-    // and TB-IR lowers sized literals nowhere — `let z = 32'h18` is
-    // refused the same way. So it stays `Unsupported`, pointing at v1,
+    // and TB-IR does not lower them HERE — `let z = 32'h18` is refused
+    // the same way, though a `keep` constraint lowers them under both
+    // backends. So it stays `Unsupported`, pointing at v1,
     // and must not be swept in with the fold-to-zero shapes around it.
     let err = lower_src(&offset("", "32'h18")).unwrap_err();
     let msg = assert_unsupported(&err);

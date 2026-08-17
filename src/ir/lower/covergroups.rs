@@ -712,14 +712,21 @@ fn classify_out_of_subset_target(
         }
 
         // A literal `parse_int_literal` cannot read — a Verilog-sized
-        // literal (`32'h18`) or one over 64 bits. TB-IR lowers sized
-        // literals nowhere, while v1's `c_int_literal` handles a BARE
-        // one correctly, so this is the one arm here where `--codegen
-        // v1` is a real escape hatch. Same split, and the same reason,
-        // as the addrmap/regblock address folds (divergence 44).
+        // literal (`32'h18`) or one over 64 bits. TB-IR does not lower
+        // either in a coverpoint, while v1's `c_int_literal` handles a
+        // BARE sized one correctly, so this is the one arm here where
+        // `--codegen v1` is a real escape hatch. Same split, and the
+        // same reason, as the addrmap/regblock address folds
+        // (divergence 44).
+        //
+        // The escape hatch is for the SIZED case only. An over-wide
+        // literal shares this arm but not that property: v1 emits a
+        // `_harc_u128` composite that narrows — `0x10000000000000000`
+        // to 0 — so the message must not advertise anywhere it "works".
         ExprKind::Int(lit) => unsupported(
             &format!("{what} sampling the integer literal `{lit}`"),
-            "a sized or over-wide literal; TB-IR does not lower these anywhere yet",
+            "a sized or over-wide literal; TB-IR does not lower either in a coverpoint yet. \
+             v1 lowers a bare SIZED one correctly here; an over-wide one it narrows",
         ),
 
         // ── v1 compiles it and SAMPLES THE WRONG THING ───────────────

@@ -2737,9 +2737,11 @@ case and only locally-determinable `Assign` types are compared).
 
     **One shape here is the exception, and rule 6 caught it twice.**
     A Verilog-sized literal (`@ 32'h18`) is `Unsupported` — pointing at
-    v1 — because TB-IR lowers sized literals NOWHERE (`let z = 32'h18`
-    is refused the same way) while v1's `c_int_literal` emits
-    `{ "SRC", 0x18, 32 }`, correctly. Sweeping it into the
+    v1 — because TB-IR does not lower one at an address site while v1's
+    `c_int_literal` emits `{ "SRC", 0x18, 32 }`, correctly. (The scope of
+    that claim was later narrowed: TB-IR *does* lower sized literals in
+    `keep` constraints. See divergence 49 — the arm's classification is
+    unaffected, since it is about this site.) Sweeping it into the
     `SilentlyMisLowers` mapping with everything else that will not fold
     would have replaced a correct diagnostic with a false claim about
     v1. That was the first catch.
@@ -3099,6 +3101,62 @@ case and only locally-determinable `Assign` types are compared).
     inherits every check that gate was silently performing, and they are
     only visible by enumerating what the OLD arm used to reject** — not
     by testing what the new one now accepts.
+
+49. **Correction: TB-IR does lower sized literals — in `keep`
+    constraints (2026-08-17).**
+
+    Divergences 44 and 46, and the diagnostics they shipped, asserted
+    that TB-IR "does not lower sized literals ANYWHERE yet". That is
+    **false**, and it reached users: the messages in `fold_addr_const`
+    and the coverpoint classifier both said it.
+
+    ```
+    transaction Req
+        a : uint<8>
+        keep a == 8'h0F
+    end transaction Req
+    ```
+
+    lowers under **both** backends today. The gap is specific to
+    STATEMENT position (`let z = 32'h18`) and to the address/coverpoint
+    sites; the constraint path has always handled these.
+
+    Caught by PR #591 (a different session, fixing sized-literal width
+    semantics), whose author found the same false claim in the spec and
+    corrected it there. Re-verified here directly rather than taken on
+    report, then fixed in all four places — two shipped diagnostics, one
+    test comment, and divergence 44's own wording.
+
+    The lesson is about how the claim was formed. It came from a probe
+    that hit five sites — statement position, regblock offsets, regblock
+    resets, coverpoint targets, addrmap bases — and generalized from
+    "rejected at every site I tried" to "rejected everywhere". Five
+    agreeing observations felt like enough. But they were five instances
+    of *one* code path — `exprs.rs`'s `parse_int_literal`, which every
+    lowering entry point reaches and which does not strip the `N'r`
+    prefix. Constraints never route a sized literal through it: they have
+    their own prefix-stripping parser in
+    `src/constraints/typed_lower.rs`. **A sample that is large but not
+    diverse measures one thing repeatedly.**
+
+    Stated that precisely on the second attempt. The first draft of this
+    entry said "the constraint path never goes through
+    `parse_int_literal`" — which is false, since `cpp_tb.rs`'s wrap-mask
+    width oracle calls it directly; it just short-circuits on the `'`
+    first. A structural argument is only worth more than a count if it
+    is checked as carefully as one, and the version that survives a grep
+    is the one to write down.
+
+    That is the same error as divergence 48's unreachability claim, at a
+    different scale: N misses is evidence about the N routes tried, not
+    about the space. The fix in both cases is the same — a structural
+    argument, or a grep for the construct across the corpus, rather than
+    an accumulating count.
+
+    Practical consequence: **sized-literal lowering is no longer a
+    candidate for this sweep.** #591 owns that surface, and the honest
+    remaining gap is narrower than the "five sites" this file previously
+    recorded.
 
 ### The probe method
 

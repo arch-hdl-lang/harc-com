@@ -5120,11 +5120,13 @@ pub(crate) fn const_vals_from(
 /// splits two ways:
 ///
 ///   * a **sized literal** (`32'h18`) is `Unsupported`. TB-IR does not
-///     lower Verilog-sized literals ANYWHERE (`let z = 32'h18` is
-///     rejected the same way), while v1's `c_int_literal` handles them
-///     correctly — `{ "SRC", 0x18, 32 }`. Pointing at `--codegen v1` is
-///     accurate here, so this arm must not be swept in with the one
-///     below;
+///     lower one HERE, while v1's `c_int_literal` handles a bare one
+///     correctly — `{ "SRC", 0x18, 32 }` — so pointing at `--codegen v1`
+///     is accurate and this arm must not be swept in with the one below.
+///     Note the scope: TB-IR DOES lower sized literals inside a `keep`
+///     constraint (`src/constraints/typed_lower.rs` has its own
+///     prefix-stripping parser), so the claim is about this site and the
+///     statement position, not about the language (divergence 49);
 ///   * anything else that will not fold is `SilentlyMisLowers`, because
 ///     v1 accepts it and yields ZERO. Pointing a user at v1 for
 ///     `@ dut.count_out` would hand them a register at address 0.
@@ -5143,8 +5145,8 @@ pub(crate) fn fold_addr_const(
         return Err(unsupported(
             &format!("the {what}"),
             format!(
-                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower anywhere yet \
-                 (`let z = {lit}` is refused the same way); v1 lowers a bare one correctly"
+                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower at an address \
+                 site yet; v1 lowers a bare one correctly here"
             ),
         ));
     }
