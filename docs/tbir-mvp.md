@@ -3167,6 +3167,81 @@ case and only locally-determinable `Assign` types are compared).
     change's blast radius is exactly the kind that reads as obviously
     fine and is cheap to check.
 
+50. **`components.rs`: a wide surface, and the first family probed
+    (2026-08-17).**
+
+    72 sites but **62 distinct messages** — the opposite shape from the
+    coverpoint gate (divergence 46: one arm, four landings). Almost every
+    site here is its own construct, so no single split clears a large
+    fraction, and file order would be arbitrary. Grouped instead by what
+    a user would have to WRITE to reach them, so one fixture serves a
+    family: field declarations, paths/connects, handlers, method calls,
+    plus one genuine catch-all.
+
+    **Family A (field declarations) — the uniformity hypothesis was
+    wrong, which is why it was tested.** Several of these sites share a
+    `lower_*_field` helper, so v1's behaviour looked likely to be uniform
+    across them. Three probes, three different behaviours:
+
+    | field | v1 emits | compiles? |
+    |---|---|---|
+    | `event<Vec<uint<8>, 4>>` | `std::vector<std::function<void(std::array<uint64_t,4>)>>` | **yes** |
+    | `queue<Vec<uint<8>, 4>>` | `harc_rt::HarcQueue<std::array<uint64_t,4>>` | **yes** |
+    | `weird : NoSuchThing` | `VNoSuchThing* weird = nullptr;` | no — undeclared |
+
+    The first two are genuine escape hatches and keep `Unsupported`. The
+    third is the sub-component catch-all, and it splits again on its own
+    input space: a name declared NOWHERE is a typo (v1 invents a
+    Verilated handle type), while a DECLARED type that merely is not a
+    supported sub-component kind — a `covergroup` — v1 handles
+    **correctly**, emitting `ExtraCov weird;` and wiring
+    `env.weird.cp.b0++`.
+
+    So the arm now splits: undeclared → `Invalid` (a program error under
+    every backend), declared-but-unsupported → `Unsupported` (v1 works).
+    Distinguishing them needed the set of declared type names threaded
+    into `lower_field`, which had component/scoreboard/record tables but
+    no covergroup or regblock names.
+
+    Two method notes from this batch:
+
+    * A probe aimed at the "scalar field of an unsupported type" site
+      (`odd : float`) landed in the sub-component arm instead — `float`
+      parses as a Named type, not a builtin. Rule 4 again, and again the
+      tell was the message rather than the exit status.
+    * The compile probe for `HarcQueue` first reported "not a member of
+      `harc_rt`" because the probe included `harc_thread_rt.h` but not
+      `harc_queue_rt.h`, which the emitted file does include. Including
+      *the real header* is not enough — it has to be the same SET the
+      generated translation unit uses.
+
+    **Review then found the fix repeating the bug it fixed.** The
+    declared-type set was written as a whitelist of the item kinds that
+    seemed relevant, and it omitted `enum` — so `weird : Mode` against a
+    declared `enum Mode { A, B }` began hard-failing with "not declared
+    anywhere in the file", while v1 emits a working `Mode weird;`. A
+    declared-but-unsupported kind swept into the typo bucket: exactly the
+    defect the split existed to remove, inverted.
+
+    The repair is not "add `enum`" but noticing the failure modes are
+    **asymmetric**. A name missing from the set is a false hard error on
+    a valid program; a spurious extra name merely routes back to the
+    honest `Unsupported` the arm gave before. So the set is now
+    deliberately over-inclusive — every item that carries a name goes in,
+    whether or not it can currently appear in field position.
+
+    Worth stating generally: **when a lookup drives a claim, work out
+    which direction of error is recoverable and bias the lookup that
+    way.** A whitelist assembled from "what seems relevant" fails toward
+    the unrecoverable side by construction, and no amount of care in
+    assembling it changes that.
+
+    The same review found the batch's other arm documented but not
+    fixed: the coverpoint `ExprKind::Int` arm had a comment explaining
+    that sized and over-wide literals need opposite classifications, and
+    still returned one for both. Split now, on the same `'` the address
+    site uses.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

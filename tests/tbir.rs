@@ -15084,7 +15084,7 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
 
     let err = lower_src(&src).unwrap_err();
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("sized or over-wide literal"), "{msg}");
+    assert!(msg.contains("sampling the sized literal"), "{msg}");
 
     // v1's evidence: it lowers the sized literal to the right value.
     assert!(
@@ -15092,6 +15092,24 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
             .expect("v1 emits a sized literal")
             .contains("(uint64_t)(0x7)"),
         "v1 lowers a bare sized literal correctly, which is why this points at it"
+    );
+
+    // An OVER-WIDE literal shares the same `ExprKind::Int` arm and gets
+    // the opposite classification: v1 emits a `_harc_u128` composite
+    // that narrows, so the coverpoint would sample a truncated value.
+    // Pointing there would be the misdirection this sweep exists to
+    // remove.
+    let wide = fixture.replace("cp_en : cover dut.en", "cp_en : cover 0x10000000000000000");
+    let msg = assert_not_implemented(
+        &lower_src(&wide).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("over-wide integer literal"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&wide))
+            .expect("v1 emits an over-wide literal")
+            .contains("_harc_u128"),
+        "v1 emits the narrowing composite"
     );
 }
 
@@ -15439,4 +15457,83 @@ end impl MTest"#;
         emit_cpp_src(&scalar).contains("-> std::vector<int64_t>"),
         "an unannotated scalar tseq still defaults"
     );
+}
+
+/// `components.rs`'s sub-component-field arm covered two inputs that v1
+/// treats oppositely, and classified them alike.
+///
+/// A DECLARED type that simply is not a supported sub-component kind — a
+/// `covergroup`, say — is a real v1 escape hatch: v1 emits
+/// `AnalysisCovCollector2 weird;` and wires its sampling
+/// (`env.weird.cp.b0++`). A name declared NOWHERE is a typo, and v1
+/// assumes a Verilated DUT handle: `VNoSuchThing* weird = nullptr;`,
+/// naming a type that does not exist.
+///
+/// Probed against `analysis_sink_connect_test`, which is registered,
+/// self-contained, and passes under both backends.
+#[test]
+fn an_undeclared_component_field_type_is_a_typo_not_a_subset_gap() {
+    let fixture = fixture("analysis_sink_connect_test.harc");
+    const ANCHOR: &str = "    cov    : AnalysisCovCollector";
+    const EXTRA_COV: &str = r#"covergroup ExtraCov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            b0 = {0}
+        end bins
+end covergroup ExtraCov
+
+env AnalysisEnv"#;
+
+    // Control: the registered fixture lowers under both backends.
+    emit_cpp_src(&fixture);
+    cpp_tb::emit(&merged_src(&fixture)).expect("v1 emits the control");
+
+    // A name declared nowhere: a program error under every backend.
+    let typo = fixture.replace(ANCHOR, &format!("{ANCHOR}\n    weird  : NoSuchThing"));
+    let msg = assert_invalid(&lower_src(&typo).unwrap_err());
+    assert!(msg.contains("not declared anywhere in the file"), "{msg}");
+    // v1's evidence: it invents a Verilated handle type for it.
+    assert!(
+        cpp_tb::emit(&merged_src(&typo))
+            .expect("v1 accepts the typo")
+            .contains("VNoSuchThing* weird = nullptr;"),
+        "v1 emits an undeclared DUT-handle pointer"
+    );
+
+    // A DECLARED type of an unsupported kind stays `Unsupported`, since
+    // v1 handles it correctly — the arm must not sweep the two together.
+    let declared = fixture
+        .replace(ANCHOR, &format!("{ANCHOR}\n    weird  : ExtraCov"))
+        .replacen("env AnalysisEnv", EXTRA_COV, 1);
+    let msg = assert_unsupported(&lower_src(&declared).unwrap_err());
+    assert!(msg.contains("sub-component field"), "{msg}");
+
+    // An ENUM is the case the first draft broke: the declared-type set
+    // was a whitelist of the kinds that seemed relevant, and omitting
+    // one turns a valid program into a false "not declared anywhere".
+    // The set is over-inclusive for exactly this reason — a missing name
+    // is a hard error on working code, a spurious one is just the honest
+    // `Unsupported`.
+    let enum_field = format!(
+        "enum Mode {{ A, B }}\n\n{}",
+        fixture.replace(ANCHOR, &format!("{ANCHOR}\n    weird  : Mode"))
+    );
+    let msg = assert_unsupported(&lower_src(&enum_field).unwrap_err());
+    assert!(
+        msg.contains("sub-component field"),
+        "an enum is declared: {msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&enum_field))
+            .expect("v1 emits an enum field")
+            .contains("Mode weird"),
+        "v1 handles it, so v1 is a real escape hatch here"
+    );
+    // v1's evidence: a real member, and the sampling is wired.
+    let v1 = cpp_tb::emit(&merged_src(&declared)).expect("v1 emits a covergroup field");
+    assert!(
+        v1.contains("ExtraCov weird;"),
+        "v1 declares the member:\n{v1}"
+    );
+    assert!(v1.contains("env.weird.cp.b0++"), "v1 wires the sampling");
 }
