@@ -3402,25 +3402,29 @@ case and only locally-determinable `Assign` types are compared).
     that also fails is worse than no hint** — which is divergence 51's
     lesson, reintroduced two entries after writing it down.
 
-54. **The `on <obj>.<method> pre/post` hook spans six sites across
+54. **The `on <obj>.<method> pre/post` hook spans eight sites across
     three files, and four verdicts (2026-08-17).**
 
     Divergences 52 and 53 treated "the hook family" as the arms inside
     `components.rs`. It is not a file-local construct. A user writes the
     same source in four different places, and grouping by construct
-    rather than by file turns up six sites, five of them classified
-    wrong. Two of the six are mixed-verdict arms that had to be split:
+    rather than by file turns up EIGHT existing sites across three
+    files. Seven were classified wrong, and three of those were
+    mixed-verdict and had to be split, leaving eleven arms:
 
-    | position | v1 | was | now |
+    | site (→ arms after splitting) | v1 | was | now |
     |---|---|---|---|
-    | component body (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | event subscription (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | `testbench` declaration (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | statement position, path trigger (`stmts.rs`) | **implements it** | `Unsupported` | `Unsupported` |
-    | statement position, other trigger (`stmts.rs`) | rejects | `Unsupported` | `Rejects` |
-    | non-transactor field (`mod.rs`) | **implements it** | `Invalid` | `Unsupported` |
-    | test-scope nested path (`mod.rs`) | **implements it** | `Unsupported` | `Unsupported` |
-    | test-scope other trigger (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
+    | component body cycle-trigger hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | component body periodic hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | component body event-subscription hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | `testbench` declaration hook (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | statement position (`stmts.rs`) → `phase post_eval` | rejects | `Unsupported` | `Rejects` |
+    | …→ non-path trigger | rejects | `Unsupported` | `Rejects` |
+    | …→ method path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
+    | test-scope target resolution (`mod.rs`) → non-path trigger | rejects | `Unsupported` | `Rejects` |
+    | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | test-scope non-transactor field (`mod.rs`) | **implements it** | `Invalid` | `Unsupported` |
 
     Two of these are worth reading closely.
 
@@ -3456,23 +3460,44 @@ case and only locally-determinable `Assign` types are compared).
     So at both the statement position and the test-scope target
     resolution, a path trigger keeps `Unsupported` (v1 wires it) and a
     non-path trigger — `on <bool-expr> pre`, `on <N> cycles pre`,
-    `on ev(x) pre` — becomes `NotImplemented { Rejects }`. `dotted_path`
-    is the discriminator, and it separates all four probed inputs
-    exactly. The residual is bounded and stated: a path that is
-    well-formed but does not resolve to a `hookable` still gets the
-    suggestion, and the user lands on v1's own message rather than on
-    silence.
+    `on ev(x) pre` — becomes `NotImplemented { Rejects }`.
+
+    The first predicate tried was `dotted_path`, and it LEAKED TWICE. It
+    returns `Some` for a bare identifier and it unwraps `Paren`, so
+    `on ok pre` and `on (s.send) pre` both slid into the `--codegen v1`
+    branch for programs v1 refuses — and the paren case is one character
+    away from a program that works, which is the worst kind of wrong
+    suggestion to hand someone. v1 matches `ExprKind::Field` directly, so
+    `is_v1_method_hook_shape` now checks the top-level shape directly
+    too. **Reaching for the nearest existing helper is not the same as
+    writing the predicate you meant**; `dotted_path` exists to parse
+    `connect` endpoints, where a parenthesised path is fine.
+
+    A `phase post_eval` modifier is the one axis that flips the verdict
+    without touching the trigger: v1 refuses it by name at every position
+    that carries a hook. It gets its own message rather than being
+    blamed on the path shape, and it turned up a SEVENTH site — the
+    test-scope `phase post_eval` pre-check, which was `Unsupported` for
+    an input v1 names in its own refusal.
+
+    The residual is bounded and stated: a path that is well-formed but
+    does not resolve to a `hookable` still gets the suggestion, and the
+    user lands on v1's own message rather than on silence.
 
     The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
     `components.rs` by "what a user would have to write to reach the
     site" — and then applied that grouping only inside one file. The
-    construct does not respect the file boundary: it has SIX sites across
-    three files, and five of them were invisible from inside
+    construct does not respect the file boundary: it has EIGHT sites
+    across three files, and seven of them were invisible from inside
     `components.rs`. **Group by construct, then find every file that
     implements it.** Note also that this entry's own table was written
     saying "four positions" and had to be corrected twice as further
-    positions appeared — a count of sites is a claim like any other, and
-    it needs a search, not a recollection.
+    positions appeared, then a third time when the phase modifier turned
+    up two more — a count of sites is a claim like any other, and it
+    needs a search, not a recollection. Four review rounds on one
+    construct, each finding real leaks the previous round's probe had
+    not sampled, is the honest cost of a WIDE surface: the input space,
+    not the arm, is the unit of work.
 
 ### The probe method
 

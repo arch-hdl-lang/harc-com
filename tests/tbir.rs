@@ -15937,6 +15937,7 @@ end testbench HookTb
 
 impl HookTest for HookTb
     clock clk = SysDomain
+    let ok : uint<32> = 0
 IMPL
     run
         s.dut = dut
@@ -16101,9 +16102,15 @@ fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination()
 /// resolver is what every hooked `on` goes through. A path trigger it
 /// wires; anything else it refuses outright, so pointing those at
 /// `--codegen v1` would hand the user a second error.
+///
+/// The last two triggers are why the predicate is not `dotted_path`,
+/// which was tried first and leaked both: it returns `Some` for a bare
+/// identifier and unwraps `Paren`, while v1 matches `ExprKind::Field`
+/// directly. `on (s.send) pre` is one character from a program that
+/// works, and v1 refuses it.
 #[test]
 fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
-    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)"] {
+    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)", "ok", "(s.send)"] {
         let src = hook_positions("", "", &pre_hook_on(trigger, "        "));
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
         assert!(msg.contains("non-method-path"), "{msg}");
@@ -16113,7 +16120,7 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         );
         // The anchor: the SAME trigger without a hook side is fine, so
         // the rejection is about the hook and not about the trigger.
-        if trigger != "w.ev(x)" {
+        if !matches!(trigger, "w.ev(x)" | "(s.send)") {
             let ctl = hook_positions(
                 "",
                 "",
@@ -16121,6 +16128,44 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
             );
             lower_src(&ctl).unwrap_or_else(|e| panic!("`on {trigger}` alone must lower: {e:?}"));
         }
+    }
+}
+
+/// A `phase post_eval` modifier turns a wired hook into a refused one,
+/// at every position that carries a hook. It is the one axis that flips
+/// the verdict without touching the trigger, so it is called out with
+/// its own message rather than blamed on the path shape.
+#[test]
+fn a_phase_modifier_on_a_method_hook_is_refused_by_v1() {
+    let phase_hook = |ind: &str| {
+        format!("{ind}on s.send pre phase post_eval\n{ind}    log(info, \"p\")\n{ind}end on")
+    };
+    for (label, src) in [
+        (
+            "statement position",
+            hook_positions("", "", &phase_hook("        ")),
+        ),
+        ("test scope", hook_positions("", &phase_hook("    "), "")),
+    ] {
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("phase post_eval"), "{label}: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_err(),
+            "v1 must refuse the phase modifier at the {label}, or `Rejects` is wrong"
+        );
+    }
+    // The anchor: the same hook WITHOUT the modifier is wired by v1 at
+    // both positions, so it is the phase that is being refused.
+    for src in [
+        hook_positions("", "", &pre_hook_on("s.send", "        ")),
+        hook_positions("", &pre_hook_on("s.send", "    "), ""),
+    ] {
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains("Sender_send_pre.push_back"),
+            "the hook-free-of-phase control must be wired"
+        );
     }
 }
 
@@ -16139,7 +16184,7 @@ fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
         "v1 walks the nested path, so the `--codegen v1` suggestion is honest"
     );
 
-    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)"] {
+    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)", "ok", "(s.send)"] {
         let src = hook_positions("", &pre_hook_on(trigger, "    "), "");
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
         assert!(msg.contains("non-method-path"), "{msg}");

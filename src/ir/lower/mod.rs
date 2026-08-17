@@ -3093,9 +3093,21 @@ fn lower_test(
                 if let StmtKind::On(h) = &s.kind {
                     if let Some(side) = h.hook {
                         if h.phase == OnPhase::PostEval {
-                            return Err(unsupported(
+                            // v1 refuses this by name ("`on
+                            // <obj>.<method> phase post_eval` is not
+                            // supported; use `pre`/`post` method hooks
+                            // or a cycle-trigger `on <expr> phase
+                            // post_eval`"), so it is not an escape
+                            // hatch. Same construct as the hook sites in
+                            // `components.rs` and `stmts.rs`; a phase
+                            // modifier is the one axis that turns a
+                            // wired hook into a refused one.
+                            return Err(not_implemented(
                                 "a test-scope `on <obj>.<method> phase post_eval` hook",
-                                "only `pre`/`post` method hooks are lowered",
+                                "only `pre`/`post` method hooks are lowered; v1 refuses a \
+                                 phase modifier on a method hook and suggests a cycle-trigger \
+                                 `on <expr> phase post_eval` instead",
+                                V1Status::Rejects,
                             ));
                         }
                         method_hook_asts.push((side, h));
@@ -3939,7 +3951,7 @@ fn lower_test(
             //     pre`, `on <N> cycles pre`, `on ev(x) pre`. v1 refuses
             //     these outright; naming it would send the user to a
             //     second error.
-            if !h.periodic && components::dotted_path(&h.event).is_some() {
+            if is_v1_method_hook_shape(h) {
                 unsupported(
                     "an `on <obj>.<method> pre/post` hook on a nested component path",
                     "the hook target must resolve to a method on a DIRECT transactor \
@@ -4669,6 +4681,31 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
         }
         out.push(s);
     }
+}
+
+/// True when a hooked `on` handler has the shape v1's method-hook
+/// resolver accepts: a bare `<obj>.<method>` dotted path, the default
+/// phase, and no periodic trigger.
+///
+/// v1 routes EVERY hooked `on` through that resolver and refuses
+/// anything else outright — "obj.method must resolve to a `hookable` on
+/// a known component type", or "`on <obj>.<method> phase post_eval` is
+/// not supported". So this is the line between a TB-IR subset gap
+/// (`Unsupported`, and `--codegen v1` is a real escape hatch) and
+/// `NotImplemented { Rejects }`.
+///
+/// Deliberately structural, and deliberately STRICTER than
+/// `dotted_path`, which was the first predicate tried here and leaked
+/// twice: it returns `Some` for a bare identifier and unwraps `Paren`,
+/// so `on ok pre` and `on (s.send) pre` both slipped into the
+/// `--codegen v1` branch for programs v1 refuses. v1 matches
+/// `ExprKind::Field` directly, so the top-level shape is checked
+/// directly too.
+pub(crate) fn is_v1_method_hook_shape(h: &crate::ast::OnHandler) -> bool {
+    !h.periodic
+        && h.phase != OnPhase::PostEval
+        && matches!(&*h.event.kind, ExprKind::Field { .. })
+        && components::dotted_path(&h.event).is_some_and(|p| p.len() >= 2)
 }
 
 /// Resolve an `on <obj>.<method> pre/post` hook target expression to

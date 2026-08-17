@@ -2645,7 +2645,19 @@ impl FuncBuilder<'_> {
             // to a `hookable` — `w.plain`, `nosuch.send` — is refused by
             // v1 too; those keep the suggestion, and the user lands on
             // v1's own precise message rather than on silence.)
-            if h.periodic || super::components::dotted_path(&h.event).is_none() {
+            // The phase is called out separately from the trigger shape:
+            // both are `Rejects`, but "not a method path" would be a
+            // false explanation for `on s.send pre phase post_eval`,
+            // whose path is fine and whose phase is not.
+            if h.phase == crate::ast::OnPhase::PostEval {
+                return Err(not_implemented(
+                    "a `phase post_eval` modifier on a `pre`/`post` hook in statement position",
+                    "v1 refuses a phase modifier on a method hook and suggests a \
+                     cycle-trigger `on <expr> phase post_eval` instead",
+                    V1Status::Rejects,
+                ));
+            }
+            if !super::is_v1_method_hook_shape(h) {
                 return Err(not_implemented(
                     "a `pre`/`post` hook on a non-method-path `on` handler in statement position",
                     "a hook side names a method to wrap; v1 routes every hooked `on` through \
