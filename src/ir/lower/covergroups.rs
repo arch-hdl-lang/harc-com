@@ -6,7 +6,7 @@
 //! inclusive ranges, plus declared `cross` items over those points.
 //! Hook triggers stay `Unsupported` — never silently mis-lowered.
 
-use super::{helpers::HelperRegistry, unsupported, LowerError};
+use super::{helpers::HelperRegistry, not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{
     CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl, UnaryOp,
 };
@@ -307,24 +307,17 @@ fn lower_hook_param_field(
 /// covergroup schemas lower before test/run scopes exist: no locals,
 /// helper calls, regblock reads, or transactor edges.
 ///
-/// Also serves bin range BOUNDS and, since the exact-value widening, bin
-/// VALUES — which is where `point` becomes a misnomer: those callers
-/// pass the BIN name, so a rejected `{dut.q}` reports "point `en0`" for
-/// something that is a bin. Two follow-ups, deliberately not folded into
-/// the widening:
+/// Also serves bin range BOUNDS and bin VALUES, so a rejection here
+/// reaches four landings. Out-of-subset expressions are classified by
+/// `classify_out_of_subset_target` rather than by a single blanket arm —
+/// v1 does four different things to them.
 ///
-///   * the label wants to be a caller-supplied phrase ("point `cp_en`" /
-///     "bin `en0`"), which also means threading it through the nested
-///     `cover_const_u32` / `cover_infer_expr_width` / `cover_width_arg`
-///     helpers that build their own "point `{point}`" messages;
-///   * `unsupported_target` is very likely mis-CLASSIFIED. v1 emits an
-///     out-of-subset bin value verbatim — `_v == NOPE`,
-///     `_v == undefined_fn(1)`, `_v == "x"` — none of which compiles, so
-///     this looks like `EmitsUncompilable` rather than a v1 escape
-///     hatch. It is shared across four landings (point targets, hook
-///     params, bin bounds, bin values), and reclassifying a shared arm
-///     without probing every one of them is exactly the mistake
-///     divergences 43 and 44 record, so it wants its own slice.
+/// One follow-up remains: the `point` label is a misnomer for the bin
+/// callers, which pass the BIN name. `lower_bin_bound` relabels the
+/// message on the way out; the real fix threads a caller-supplied
+/// phrase through the nested `cover_const_u32` /
+/// `cover_infer_expr_width` / `cover_width_arg` helpers, which build
+/// their own "point `{point}`" messages.
 fn lower_point_target(
     group: &str,
     point: &str,
@@ -334,12 +327,13 @@ fn lower_point_target(
     extern_fns: &HashMap<String, &ExternFnDecl>,
     consts: &HashMap<String, u64>,
 ) -> Result<Expr, LowerError> {
-    let unsupported_target = || {
-        unsupported(
-            &format!("covergroup `{group}` point `{point}` with an unsupported target expression"),
-            "supported: dut.<port>, dut.<port>[idx], hook params, pure helper calls, expr[hi:lo], literals, unary/binary/ternary expressions",
-        )
-    };
+    // Takes the node the walk FAILED on, not the top-level `target`.
+    // The loop below unwraps `Paren` as it descends, so a closure over
+    // `target` would classify `cover ([1..2])` by the parenthesis and
+    // miss every arm — the range case included, which is the one this
+    // classifier exists for.
+    let unsupported_target =
+        |at: &AstExpr| classify_out_of_subset_target(group, point, at, helpers, extern_fns);
 
     // A hook-param field read (`cover t.burst` / `cover t.data[idx]`): the
     // receiver ident names a hook trigger parameter, so the target samples
@@ -404,9 +398,24 @@ fn lower_point_target(
         match &*cur.kind {
             ExprKind::Paren(inner) => cur = inner,
             ExprKind::Int(s) => {
-                let value = super::exprs::parse_int_literal(s).ok_or_else(unsupported_target)?;
+                let value =
+                    super::exprs::parse_int_literal(s).ok_or_else(|| unsupported_target(cur))?;
                 return Ok(Expr::Literal {
                     value,
+                    ty: IrType::Unknown,
+                });
+            }
+            // A file-scope `const` / enum variant sampled directly.
+            // Degenerate — the coverpoint reads the same value forever —
+            // but legal, and v1 supports it: it emits its own
+            // `static constexpr uint64_t K = 7;` and samples
+            // `(uint64_t)(K)`, which compiles and is correct. So the gap
+            // is closed rather than classified, folding through the same
+            // table `lower_bin_bound` already uses for a const bin
+            // member.
+            ExprKind::Ident(id) if consts.contains_key(&id.name) => {
+                return Ok(Expr::Literal {
+                    value: consts[&id.name],
                     ty: IrType::Unknown,
                 });
             }
@@ -517,8 +526,8 @@ fn lower_point_target(
                 });
             }
             ExprKind::Cast { expr, ty } => {
-                let width =
-                    cover_cast_width(group, point, ty, consts)?.ok_or_else(unsupported_target)?;
+                let width = cover_cast_width(group, point, ty, consts)?
+                    .ok_or_else(|| unsupported_target(cur))?;
                 let inner = lower_point_target(
                     group,
                     point,
@@ -592,9 +601,28 @@ fn lower_point_target(
                 if let ExprKind::Field { target: recv, name } = &*callee.kind {
                     if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
                         // Width-method calls are parsed with the width as the first argument.
+                        // Its own message rather than the out-of-subset
+                        // classifier: the construct IS a width method, it
+                        // just has the wrong arguments, and a program error
+                        // under every backend is `Invalid`.
                         let width_expr = match args.first() {
                             Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
-                            _ => return Err(unsupported_target()),
+                            // Names the actual problem: a NAMED argument
+                            // is the other way to get here, and reporting
+                            // "got 1" for `.trunc(w = 1)` would read as a
+                            // contradiction.
+                            _ => {
+                                let got = if args.len() == 1 {
+                                    "a named argument".to_string()
+                                } else {
+                                    format!("{} arguments", args.len())
+                                };
+                                return Err(LowerError::Invalid(format!(
+                                    "covergroup `{group}` point `{point}` `.{}()` takes exactly \
+                                     one positional width argument, got {got}",
+                                    name.name
+                                )));
+                            }
                         };
                         let width = cover_width_arg(group, point, &name.name, width_expr, consts)?;
                         let src_width = cover_infer_expr_width(group, point, recv, consts)?;
@@ -638,10 +666,199 @@ fn lower_point_target(
                         });
                     }
                 }
-                return Err(unsupported_target());
+                return Err(unsupported_target(cur));
             }
-            _ => return Err(unsupported_target()),
+            _ => return Err(unsupported_target(cur)),
         }
+    }
+}
+
+/// Classify an expression the coverpoint/bin subset does not lower, by
+/// what `--codegen v1` actually does with it.
+///
+/// This was one blanket `Unsupported` arm — "re-run with `--codegen v1`"
+/// for everything. Probing every `ExprKind` the arm can receive, at all
+/// four landings it serves (point target, hook param, bin range bound,
+/// bin exact value), found **four** different v1 behaviours, and only
+/// one of them makes v1 an escape hatch. It is not the common one.
+///
+/// v1 has no subset gate here at all: it renders the expression with
+/// `emit_expr` and casts the result to `uint64_t`, so whatever the user
+/// wrote lands in the sampler verbatim. What varies is whether that
+/// text compiles, and whether it means anything.
+///
+/// Every claim below was compile-tested against the real runtime header
+/// rather than a stand-in — `dut.en.nope()` looks like it compiles until
+/// `harc_read`'s actual return type is in scope.
+fn classify_out_of_subset_target(
+    group: &str,
+    point: &str,
+    e: &AstExpr,
+    helpers: &HelperRegistry<'_>,
+    extern_fns: &HashMap<String, &ExternFnDecl>,
+) -> LowerError {
+    let what = format!("covergroup `{group}` point `{point}`");
+    let subset = "supported: dut.<port>, dut.<port>[idx], hook params, pure helper calls, \
+                  expr[hi:lo], literals, unary/binary/ternary expressions";
+
+    match &*e.kind {
+        // Defensive unwrap. `lower_point_target` descends through
+        // parentheses before failing, so it hands over the inner node
+        // already — but a caller that does not would otherwise classify
+        // `([1..2])` by the parenthesis and reach the catch-all, losing
+        // every specific arm below.
+        ExprKind::Paren(inner) => {
+            classify_out_of_subset_target(group, point, inner, helpers, extern_fns)
+        }
+
+        // A literal `parse_int_literal` cannot read — a Verilog-sized
+        // literal (`32'h18`) or one over 64 bits. TB-IR lowers sized
+        // literals nowhere, while v1's `c_int_literal` handles a BARE
+        // one correctly, so this is the one arm here where `--codegen
+        // v1` is a real escape hatch. Same split, and the same reason,
+        // as the addrmap/regblock address folds (divergence 44).
+        ExprKind::Int(lit) => unsupported(
+            &format!("{what} sampling the integer literal `{lit}`"),
+            "a sized or over-wide literal; TB-IR does not lower these anywhere yet",
+        ),
+
+        // ── v1 compiles it and SAMPLES THE WRONG THING ───────────────
+        // The worst outcome, so it sets the classification wherever it
+        // is reachable. A range in scalar position is the load-bearing
+        // case: v1's own emitter leaves the comment admitting it dropped
+        // the bounds.
+        //
+        // (`{[1..2]}` — a range NESTED in a set — never reaches here.
+        // `lower_bin_values` has its own `RangeLit` arm and lowers it
+        // correctly today. Only a range in SCALAR position lands here.)
+        ExprKind::RangeLit { .. } => not_implemented(
+            &format!("{what} sampling a range"),
+            "v1 emits `(uint64_t)(/* range a..b */ 0)` — the coverpoint samples 0 on every \
+             cycle, with no diagnostic. Sample a scalar and put the range in `bins` instead",
+            V1Status::SilentlyMisLowers,
+        ),
+        ExprKind::Float(_) => not_implemented(
+            &format!("{what} sampling a float literal"),
+            "a coverpoint samples a 64-bit integer; v1 casts the literal, so the sample is \
+             the truncated value rather than the one written",
+            V1Status::SilentlyMisLowers,
+        ),
+        // Position-dependent, and classified by the WORSE half: in a bin
+        // value or range bound v1 emits `_v == "x"`, which g++ rejects as
+        // a pointer/int comparison; in a TARGET the C-style cast
+        // reinterprets the pointer, so `(uint64_t)("x")` compiles and
+        // samples an address.
+        ExprKind::String(_) => not_implemented(
+            &format!("{what} sampling a string literal"),
+            "a coverpoint samples a 64-bit integer; in a target position v1 reinterprets the \
+             pointer and samples an address, in a bin it emits a pointer/int comparison that \
+             does not compile",
+            V1Status::SilentlyMisLowers,
+        ),
+
+        // A system function in its real spelling (`$clog2(x)`). v1
+        // rejects it outright — "expression not supported in v0 cpp_tb".
+        //
+        // Worth recording how this was nearly mis-classified: probed as
+        // `clog2(dut.en)`, without the `$`, it parses as a plain call to
+        // an undefined function, which v1 emits verbatim and g++
+        // rejects. That made it look like an EmitsUncompilable gap in
+        // legitimate surface. It is neither — the wrong spelling was
+        // being probed, and the construct it actually names is one v1
+        // refuses.
+        ExprKind::SystemCall { name, .. } => {
+            // The SOURCE spelling, not the Rust variant: a user who
+            // wrote `$clog2` should not be told about `Clog2`.
+            let spelled = match name {
+                crate::ast::SystemFn::Rose => "$rose",
+                crate::ast::SystemFn::Fell => "$fell",
+                crate::ast::SystemFn::Stable => "$stable",
+                crate::ast::SystemFn::Past => "$past",
+                crate::ast::SystemFn::Clog2 => "$clog2",
+            };
+            not_implemented(
+                &format!("{what} sampling the system function `{spelled}`"),
+                format!("v1 rejects it as well. {subset}"),
+                V1Status::Rejects,
+            )
+        }
+        // Defensive: `.field` parses as `Field { target: ImplicitSelf }`
+        // and is classified by the arm below, so a bare `ImplicitSelf`
+        // is not reachable from a coverpoint position today. Kept with
+        // the same status the reachable spelling has.
+        ExprKind::ImplicitSelf => not_implemented(
+            &format!("{what} sampling the implicit-self shorthand `.field`"),
+            "v1 emits `(uint64_t)(.field)`, which is not an expression",
+            V1Status::EmitsUncompilable,
+        ),
+        // A field or index path that is neither a DUT port nor a hook
+        // param read: the earlier arms already declined it, so the root
+        // names nothing v1 declares either.
+        ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Ident(_) => not_implemented(
+            &format!("{what} sampling a name that is not a DUT port or hook parameter"),
+            format!(
+                "v1 emits the path verbatim (`(uint64_t)(foo.bar)`), naming a symbol it never \
+                 declares, so the generated C++ does not compile. {subset}"
+            ),
+            V1Status::EmitsUncompilable,
+        ),
+        // A call that reached here is not a pure helper, an extern fn, or
+        // a width method. A method call on a sampled value
+        // (`dut.en.nope()`) becomes a member access on `harc_read`'s
+        // return type; a bare unknown callee becomes an undeclared
+        // function. Both fail to compile.
+        ExprKind::Call { callee, .. } => {
+            let detail = match &*callee.kind {
+                ExprKind::Field { name, .. } => format!(
+                    "`.{}()` is not a width method (`trunc`/`zext`/`sext`/`resize`); v1 emits it \
+                     as a member call on the sampled value, which has no such member",
+                    name.name
+                ),
+                ExprKind::Ident(id)
+                    if !helpers.contains(&id.name) && !extern_fns.contains_key(&id.name) =>
+                {
+                    format!(
+                        "`{}` is not a declared helper or extern function; v1 emits the call \
+                         verbatim, naming a function it never declares",
+                        id.name
+                    )
+                }
+                _ => format!("v1 emits the call verbatim. {subset}"),
+            };
+            not_implemented(
+                &format!("{what} sampling an unsupported call"),
+                &detail,
+                V1Status::EmitsUncompilable,
+            )
+        }
+
+        // ── v1 refuses too ───────────────────────────────────────────
+        ExprKind::SetLit(_) | ExprKind::Randomize { .. } => not_implemented(
+            &format!("{what} sampling a set literal or `randomize`"),
+            format!("v1 rejects this shape as well. {subset}"),
+            V1Status::Rejects,
+        ),
+        ExprKind::ForkCall { .. } | ExprKind::HashHash { .. } => not_implemented(
+            &format!("{what} sampling a temporal or fork expression"),
+            format!(
+                "a coverpoint samples one value per trigger, so there is no cycle to span. v1 \
+                 rejects this shape as well. {subset}"
+            ),
+            V1Status::Rejects,
+        ),
+
+        // Nothing else reaches here: the remaining `ExprKind`s
+        // (`DistLit`, `Send`, `SeqRepeat`) are parse errors in a
+        // coverpoint position under BOTH backends, so the arm is
+        // unreachable for them. `SilentlyMisLowers` is the conservative
+        // default for anything a future parser change lets through — it
+        // never sends the user to v1, which is the only claim that could
+        // waste their time.
+        _ => not_implemented(
+            &format!("{what} with an unsupported target expression"),
+            subset,
+            V1Status::SilentlyMisLowers,
+        ),
     }
 }
 

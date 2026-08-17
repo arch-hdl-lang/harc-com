@@ -2846,6 +2846,97 @@ case and only locally-determinable `Assign` types are compared).
     divergence 44's addrmap folds and this precedence case are the two
     known places so far.
 
+46. **The coverpoint subset gate: one arm, four v1 behaviours
+    (2026-08-17).**
+
+    `lower_point_target`'s catch-all was a single blanket `Unsupported`
+    — "re-run with `--codegen v1`" for every expression the coverpoint
+    subset declines. It serves four landings (point target, hook param,
+    bin range bound, bin exact value), so it is the single most-reached
+    rejection in covergroup lowering.
+
+    **v1 has no subset gate here at all.** It renders the expression
+    with `emit_expr` and casts to `uint64_t`, so whatever the user wrote
+    lands in the sampler verbatim. What varies is whether that text
+    compiles and whether it means anything — which is why one
+    classification could never have been right.
+
+    Enumerating every `ExprKind` the arm can receive, and probing each
+    at all four landings:
+
+    | v1 does | shapes | status |
+    |---|---|---|
+    | compiles, samples the WRONG value | `[1..2]` in scalar position, `1.5`, `"x"` in a target | `SilentlyMisLowers` |
+    | emits, does not compile | unknown name, `foo.bar`, `foo[1]`, `.en`, `undefined_fn(1)`, `dut.en.nope()` | `EmitsUncompilable` |
+    | refuses | `{1,2}`, `randomize(e)`, `fork`, `##1 e`, `$clog2(e)` | `Rejects` |
+    | never reaches it | `dist{}`, `a <- b`, `e[*3]` — parse errors in both | unreachable |
+
+    The load-bearing case is `cover [1..2]`: v1 emits
+    `(uint64_t)(/* range 1..2 */ 0)` — its own emitter leaves a comment
+    admitting it dropped the bounds — and the coverpoint then samples
+    ZERO on every cycle with no diagnostic on either side. Sending a
+    user there was the worst thing the old blanket arm did.
+
+    Two things nearly went in wrong, both about the probe rather than
+    the code:
+
+    * **The first sample was unrepresentative even though it reached
+      the arm at every landing.** It was all garbage input — unknown
+      names, undefined calls, strings, floats. Those are malformed
+      programs; the arm exists to reject expressions that are
+      well-formed HARC but outside the SAMPLER subset. "Reaches the
+      arm" and "is the population the arm serves" are different
+      properties, and only the second one classifies it. Re-probing
+      with well-formed input is what surfaced `[1..2]`.
+
+    * **`$clog2` was probed with the wrong spelling.** Written
+      `clog2(dut.en)`, without the sigil, it is not a system call — it
+      is an ordinary call to a name nothing declares, which v1 emits
+      verbatim into uncompilable C++. That made it look like an
+      `EmitsUncompilable` gap in legitimate language surface, and it was
+      briefly written up as "a real gap worth implementing". With the
+      sigil, v1 rejects it outright. Two spellings, two arms, opposite
+      classifications — pinned by
+      `the_sigil_is_what_makes_a_system_call_a_system_call`.
+
+    One more trap avoided: `{[1..2]}`, a range NESTED in a set, never
+    reaches this arm — `lower_bin_values` has its own `RangeLit` arm and
+    lowers it correctly today. Only a range in SCALAR position lands
+    here. Sweeping the two together would have broken working code.
+
+    A method note that cost a wrong reading: `dut.en.nope()` first
+    compile-tested as OK because the probe declared a stand-in struct
+    with a `nope()` member. Against `harc_read`'s real return type it
+    fails. **A compile probe has to include the actual runtime header,
+    not a plausible model of it.**
+
+    **Review then found the same input-space mistake a third time, in
+    the fix itself.** The `Ident` arm was probed with UNKNOWN names only,
+    so a bare `Ident` was classified `EmitsUncompilable` wholesale — but
+    `cover MY_CONST` is a known const, and v1 emits its own
+    `static constexpr uint64_t MY_CONST = 7;` and samples it, correctly.
+    That is v1 working, which the blanket `Unsupported` had (accidentally)
+    been right about. Fixed by closing the gap instead: a const target
+    now folds through the same table `lower_bin_bound` uses, byte-identical
+    to the literal it computes.
+
+    Two structural bugs came out of the same review, both invisible to
+    the probe suite because they are about which NODE gets classified:
+
+    * the classifier was closed over the top-level `target`, while
+      `lower_point_target` descends through parentheses before failing —
+      so `cover ([1..2])` was classified by the parenthesis and reached
+      the catch-all, losing the range arm the whole change exists for.
+      It now takes the node the walk failed on.
+    * a sized literal (`cover 32'h7`) reached the same catch-all. v1
+      lowers a bare one correctly, so that arm keeps `Unsupported` —
+      the identical split divergence 44 records for addrmap and regblock
+      addresses.
+
+    Three rounds, three variants of one error: **an arm is not classified
+    until its input space is sampled, and "I probed that arm" is not the
+    same claim as "I probed that arm's inputs."**
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
