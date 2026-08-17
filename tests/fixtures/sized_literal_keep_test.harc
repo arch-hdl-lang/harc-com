@@ -1,0 +1,78 @@
+// End-to-end coverage for ARCH sized literals (`8'hFF`) — the first in
+// the corpus. Before harc#565 there was not a single sized literal in
+// any `.harc` file in the repo, which is why `4'hFF` could lower to
+// `0xFF` (255 out of a token declaring four bits) for as long as it did.
+//
+// Sized literals in STATEMENT position are still a declared TB-IR subset
+// gap (`let a : uint<8> = 8'hFF` names `--codegen v1`), so this fixture
+// puts them where both backends lower them: inside `keep` constraints.
+// That also makes the value checkable rather than just the emitted text
+// — each constraint pins a field to exactly one legal value, so a
+// literal that lowers to the wrong number fails an assert here instead
+// of passing silently.
+//
+// The wrap row is the one that motivated the fix. Its mask width comes
+// from the literal's DECLARED width, and while an overwide literal was
+// legal that width disagreed with the digits, so §2.4 had to guess which
+// one the author meant. Now they cannot disagree.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Lits
+    hex8  : uint<8>
+    hex4  : uint<4>
+    dec8  : uint<8>
+    bin8  : uint<8>
+    wrap8 : uint<8>
+
+    // Each literal fills its declared width exactly.
+    keep hex8 == 8'hFF
+    keep hex4 == 4'hF
+    keep dec8 == 8'd200
+    keep bin8 == 8'b1010_1010
+
+    // The §2.4 wrap, masked at the literal's declared 8 bits:
+    // (wrap8 + 255) & 0xFF == 15 has the single solution wrap8 == 16.
+    // Masking at any other width changes the answer, and reading the
+    // digits rather than the declared width used to be able to.
+    keep (wrap8 +% 8'hFF) == 8'h0F
+end transaction Lits
+
+testbench SizedLiteralKeepTb
+    dut : Top
+end testbench SizedLiteralKeepTb
+
+impl SizedLiteralKeepTest for SizedLiteralKeepTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Every constraint has a unique solution, so this is a value
+        // check, not a range check: any mis-sizing of a literal shows up
+        // as a wrong number rather than as a still-satisfiable range.
+        for i in 0 .. 4
+            let t : Lits
+            randomize(t)
+
+            assert t.hex8 == 255
+                else fail("iter ${i}: 8'hFF gave ${t.hex8}, want 255")
+            assert t.hex4 == 15
+                else fail("iter ${i}: 4'hF gave ${t.hex4}, want 15")
+            assert t.dec8 == 200
+                else fail("iter ${i}: 8'd200 gave ${t.dec8}, want 200")
+            assert t.bin8 == 170
+                else fail("iter ${i}: 8'b1010_1010 gave ${t.bin8}, want 170")
+            assert t.wrap8 == 16
+                else fail("iter ${i}: (wrap8 +% 8'hFF) == 8'h0F gave ${t.wrap8}, want 16")
+        end for
+
+        log(info, "PASS: sized literals lower to the values they declare")
+    end run
+end impl SizedLiteralKeepTest

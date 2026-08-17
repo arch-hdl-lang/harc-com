@@ -4384,10 +4384,13 @@ impl Parser {
                 self.advance();
                 Ok(Expr::new(ExprKind::Int(s), span0))
             }
-            Some(TokenKind::HexLiteral(s))
-            | Some(TokenKind::BinLiteral(s))
-            | Some(TokenKind::SizedLiteral(s)) => {
+            Some(TokenKind::HexLiteral(s)) | Some(TokenKind::BinLiteral(s)) => {
                 self.advance();
+                Ok(Expr::new(ExprKind::Int(s), span0))
+            }
+            Some(TokenKind::SizedLiteral(s)) => {
+                self.advance();
+                check_sized_literal(&s, span0)?;
                 Ok(Expr::new(ExprKind::Int(s), span0))
             }
             Some(TokenKind::FloatLiteral(s)) => {
@@ -4400,6 +4403,7 @@ impl Parser {
             }
             Some(TokenKind::StringLit(s)) => {
                 self.advance();
+                check_interpolated_sized_literals(&s, span0)?;
                 Ok(Expr::new(ExprKind::String(s), span0))
             }
             Some(TokenKind::True) => {
@@ -4592,6 +4596,270 @@ impl Parser {
 }
 
 // ── Helpers outside impl ──────────────────────────────────────────────────────
+
+/// Longest sized DECIMAL literal that gets sized exactly. Bounds the
+/// quadratic fallback in `significant_bits`; see the check that uses it.
+const MAX_EXACT_DECIMAL_DIGITS: usize = 4096;
+
+/// A `${...}` capture inside a string literal is not part of the token
+/// stream — the whole string is one `StringLit`, and both backends
+/// re-parse each capture later, independently. So a sized literal written
+/// inside an interpolation never reaches `parse_primary` and would escape
+/// `check_sized_literal` entirely.
+///
+/// It escaped into the worst of the available outcomes, too. v1's
+/// re-parse discards the error and writes the raw capture text into the
+/// output (`cpp_tb.rs`, the `Err(_)` arms of `emit_fmt_arg`), so
+/// `log(info, "b=${4'hFF}")` emitted `harc_printf_ll(4'hFF)` — not valid
+/// C++. The TB-IR path turns the same failure into
+/// `NotImplemented`/"does not support string interpolation yet ... re-run
+/// with `--codegen v1`", pointing at the backend that emits that. So the
+/// one place the check could not see was also the place where missing it
+/// was reported as a subset gap.
+///
+/// Only sized literals are validated here. Whether an unparseable capture
+/// should be an error in general is a separate question, and a wider one
+/// than harc#565 — this closes the hole for the tokens whose meaning this
+/// commit is fixing, and leaves that behaviour otherwise untouched.
+///
+/// The reported span is the whole string literal: the capture's offset
+/// within it is not tracked, so the message names the literal instead.
+fn check_interpolated_sized_literals(s: &str, span: Span) -> Result<(), CompileError> {
+    if !s.contains("${") {
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'$' || bytes[i + 1] != b'{' {
+            i += 1;
+            continue;
+        }
+        // Capture extent and format-spec split must match `process_interp`:
+        // first `}` closes, and the expression is everything before the
+        // LAST `:`. Diverging here would validate text the backends do not
+        // treat as an expression, or miss text they do.
+        let mut j = i + 2;
+        while j < bytes.len() && bytes[j] != b'}' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break; // unmatched — `process_interp` bails too
+        }
+        let inner = std::str::from_utf8(&bytes[i + 2..j]).unwrap_or("").trim();
+        let expr_src = match inner.rfind(':') {
+            Some(idx) => inner[..idx].trim(),
+            None => inner,
+        };
+        for lit in sized_literals_in(expr_src) {
+            check_sized_literal(&lit, span)?;
+        }
+        i = j + 1;
+    }
+    Ok(())
+}
+
+/// Sized-literal-shaped substrings of an expression fragment: a digit
+/// run, `'`, a radix letter, then radix-ish digits. Mirrors the lexer's
+/// `[0-9]+'[bhd][0-9a-fA-F_]+`, deliberately including uppercase radix
+/// letters so a token the lexer would reject outright is not silently
+/// accepted here instead.
+///
+/// Scanning only inside `${...}` matters: `log(info, "wrote 4'hFF")` is
+/// prose, not code, and must not be rejected.
+fn sized_literals_in(expr_src: &str) -> Vec<String> {
+    let b = expr_src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        // Not a sized literal unless a quote and a radix letter follow.
+        if i + 1 >= b.len()
+            || b[i] != b'\''
+            || !matches!(b[i + 1], b'b' | b'h' | b'd' | b'B' | b'H' | b'D')
+        {
+            continue;
+        }
+        let mut k = i + 2;
+        while k < b.len() && (b[k].is_ascii_hexdigit() || b[k] == b'_') {
+            k += 1;
+        }
+        out.push(expr_src[start..k].to_string());
+        i = k;
+    }
+    out
+}
+
+/// Reject a sized literal (`8'hAB`) whose digits do not agree with the
+/// width it declares. The lexer's rule is `[0-9]+'[bhd][0-9a-fA-F_]+`,
+/// which validates neither the digits against the radix nor the value
+/// against the width, and nothing downstream did either (harc#565):
+///
+///   - `4'hFF` emitted `0xFF` — 255 from a token declaring 4 bits, with
+///     the declared width and the emitted value simply disagreeing.
+///   - `8'dFF` emitted `uint64_t a = FF;` and `4'b1012` emitted
+///     `0b1012` — neither is valid C++, so the mismatch surfaced as a
+///     compiler error in generated code rather than a HARC diagnostic.
+///   - `0'h0` declared zero bits and lowered as a normal value.
+///
+/// Rejecting is what makes the declared width trustworthy, which is what
+/// the §2.4 wrap mask reads: `keep len +% 4'hFF == 15` masking at 4 is
+/// only correct once `4'hFF` cannot mean 255. Truncating instead would
+/// keep both spellings legal and silently discard written digits.
+fn check_sized_literal(text: &str, span: Span) -> Result<(), CompileError> {
+    let Some(tick) = text.find('\'') else {
+        return Ok(());
+    };
+    let (width_txt, rest) = (&text[..tick], &text[tick + 1..]);
+    let Some(radix_ch) = rest.chars().next() else {
+        return Ok(()); // not reachable via the lexer's rule
+    };
+    let radix: u32 = match radix_ch.to_ascii_lowercase() {
+        'b' => 2,
+        'd' => 10,
+        'h' => 16,
+        _ => return Ok(()),
+    };
+    let digits: String = rest[radix_ch.len_utf8()..]
+        .chars()
+        .filter(|c| *c != '_')
+        .collect();
+
+    let Ok(width) = width_txt.parse::<u32>() else {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` declares a width that is too large"),
+            "the declared width must fit in 32 bits",
+            span,
+        ));
+    };
+    if width == 0 {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` declares a width of 0"),
+            "a sized literal must declare at least 1 bit",
+            span,
+        ));
+    }
+    if digits.is_empty() {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` has no digits"),
+            &format!("write a value after `'{radix_ch}`, as in `{width}'{radix_ch}0`"),
+            span,
+        ));
+    }
+    // Sizing a decimal literal above `u128` costs work quadratic in the
+    // digit count (see `significant_bits`), and this runs in the parser on
+    // whatever the source says. Cap it: a 100 000-digit literal took ~10s
+    // to size, and `MAX_SOURCE_LEN` is `u32::MAX`, so an unbounded version
+    // lets a ~1 MB file hang the compiler for minutes. Binary and hex are
+    // sized structurally at any length and need no cap, which is also the
+    // way out for anyone who genuinely wants a value this wide.
+    if radix == 10 && digits.len() > MAX_EXACT_DECIMAL_DIGITS {
+        return Err(CompileError::invalid_literal(
+            &format!(
+                "sized decimal literal has {} digits; the maximum is {MAX_EXACT_DECIMAL_DIGITS}",
+                digits.len()
+            ),
+            "write the value in hexadecimal (`'h`) or binary (`'b`) — those are \
+             sized exactly at any length",
+            span,
+        ));
+    }
+    if let Some(bad) = digits.chars().find(|c| c.to_digit(radix).is_none()) {
+        // Name only the radices the author did NOT write — repeating
+        // theirs back reads as a non-answer.
+        let (name, valid, others) = match radix {
+            2 => (
+                "binary",
+                "0 and 1",
+                "`'h` for hexadecimal or `'d` for decimal",
+            ),
+            10 => ("decimal", "0-9", "`'h` for hexadecimal or `'b` for binary"),
+            _ => (
+                "hexadecimal",
+                "0-9, a-f and A-F",
+                "`'d` for decimal or `'b` for binary",
+            ),
+        };
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` has digit `{bad}`, which is not {name}"),
+            &format!("valid {name} digits are {valid}; use {others}"),
+            span,
+        ));
+    }
+
+    let bits = significant_bits(&digits, radix);
+    if bits > u64::from(width) {
+        return Err(CompileError::invalid_literal(
+            &format!("sized literal `{text}` needs {bits} bits, but declares {width}"),
+            &format!(
+                "widen the literal to `{bits}'{radix_ch}{digits}`, or write a \
+                 value that fits in {width} bits"
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+/// Bit length of `digits` in `radix`, i.e. the smallest width that can
+/// hold the value. Zero (however spelled) is 0 bits, so it fits any
+/// declared width.
+///
+/// Binary and hex are structural — no parsing, so an arbitrarily long
+/// literal costs nothing. Decimal takes a `u128` fast path and falls
+/// back to repeated halving, which is exact for any length; estimating
+/// with `log2(10)` instead would leave a corner where an overwide
+/// literal is accepted because the check could not prove it too wide.
+///
+/// The halving is quadratic in the digit count, so the caller caps
+/// decimal input at `MAX_EXACT_DECIMAL_DIGITS` before getting here —
+/// this function is exact for everything it is given, and is never given
+/// enough to be slow.
+fn significant_bits(digits: &str, radix: u32) -> u64 {
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let len = trimmed.len() as u64;
+    match radix {
+        2 => len,
+        16 => {
+            let first = trimmed
+                .chars()
+                .next()
+                .and_then(|c| c.to_digit(16))
+                .unwrap_or(0);
+            (len - 1) * 4 + u64::from(32 - first.leading_zeros())
+        }
+        _ => {
+            if let Ok(v) = trimmed.parse::<u128>() {
+                return u64::from(128 - v.leading_zeros());
+            }
+            let mut d: Vec<u8> = trimmed.bytes().map(|b| b - b'0').collect();
+            let mut bits = 0u64;
+            loop {
+                match d.iter().position(|&x| x != 0) {
+                    None => return bits,
+                    Some(i) => d.drain(..i),
+                };
+                let mut carry = 0u8;
+                for x in d.iter_mut() {
+                    let cur = carry * 10 + *x;
+                    *x = cur / 2;
+                    carry = cur % 2;
+                }
+                bits += 1;
+            }
+        }
+    }
+}
 
 /// Extract the `---` … `---` YAML frontmatter sub-block from an
 /// inner-doc string (the line-joined post-prefix-stripped text of a
