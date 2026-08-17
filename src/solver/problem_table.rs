@@ -211,13 +211,22 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
     for item in &file.items {
         match item {
             Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
-                collect_component_items(&c.items, &c.name.name, &mut out);
+                let scope = component_field_scope([&c.items[..]]);
+                collect_component_items(&c.items, &scope, &c.name.name, &mut out);
             }
             Item::Transactor(t) => {
-                collect_component_items(&t.items, &t.name.name, &mut out);
-                if let Some(active) = &t.when_active {
-                    collect_component_items(active, &t.name.name, &mut out);
-                }
+                // ONE scope across both halves, not one per half.
+                // `synth_component_from_transactor` concatenates the
+                // always-present items and the `when active` block, so
+                // a field declared in the shared half really is in
+                // scope inside `when active` — walking the two halves
+                // as independent scopes made those bodies collect zero
+                // sites, the same empty-scope hole this seeding exists
+                // to close.
+                let active = t.when_active.as_deref().unwrap_or(&[]);
+                let scope = component_field_scope([&t.items[..], active]);
+                collect_component_items(&t.items, &scope, &t.name.name, &mut out);
+                collect_component_items(active, &scope, &t.name.name, &mut out);
             }
             Item::Function(f) => {
                 let mut env = BTreeMap::new();
@@ -235,30 +244,49 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
     out
 }
 
-fn collect_component_items(items: &[ComponentItem], owner: &str, out: &mut Vec<RandomizeSite>) {
-    // A randomize target is resolved by NAME through `env`, so a body
-    // whose `env` is empty contributes nothing no matter how it is
-    // walked. Statement-position `let`s are picked up by `collect_stmt`
-    // as it descends, but a component body binds names three other ways
-    // that a `test` body does not, and all three are ordinary shapes:
-    // a component FIELD (`r : RegOp`), a method PARAMETER
-    // (`hookable go(r: RegOp)`), and an `on` handler's event PAYLOAD
-    // (`req : event<RegOp>` + `on req(t)` binds `t : RegOp`). Seeding
-    // only the `let`s collected zero sites for all three.
-    let mut fields = BTreeMap::new();
-    let mut payloads = BTreeMap::new();
-    for item in items {
+/// The field-derived half of a component's name scope: every field's
+/// declared type, plus the payload type of every `event<T>` field.
+///
+/// A randomize target is resolved by NAME through `env`, so a body
+/// whose `env` is empty contributes nothing no matter how it is walked.
+/// Statement-position `let`s are picked up by `collect_stmt` as it
+/// descends, but a component body binds names three other ways that a
+/// `test` body does not, and all three are ordinary shapes: a component
+/// FIELD (`r : RegOp`), a method PARAMETER (`hookable go(r: RegOp)`),
+/// and an `on` handler's event PAYLOAD (`req : event<RegOp>` +
+/// `on req(t)` binds `t : RegOp`). Seeding only the `let`s collected
+/// zero sites for all three.
+fn component_field_scope<'a>(
+    halves: impl IntoIterator<Item = &'a [ComponentItem]>,
+) -> ComponentScope {
+    let mut scope = ComponentScope::default();
+    for item in halves.into_iter().flatten() {
         let ComponentItem::Field(f) = item else {
             continue;
         };
         if let Some(ty) = simple_type_name(Some(&f.ty)) {
-            fields.insert(f.name.name.clone(), ty);
+            scope.fields.insert(f.name.name.clone(), ty);
         }
         if let Some(ty) = event_payload_type_name(&f.ty) {
-            payloads.insert(f.name.name.clone(), ty);
+            scope.payloads.insert(f.name.name.clone(), ty);
         }
     }
+    scope
+}
 
+#[derive(Default)]
+struct ComponentScope {
+    fields: BTreeMap<String, String>,
+    payloads: BTreeMap<String, String>,
+}
+
+fn collect_component_items(
+    items: &[ComponentItem],
+    scope: &ComponentScope,
+    owner: &str,
+    out: &mut Vec<RandomizeSite>,
+) {
+    let (fields, payloads) = (&scope.fields, &scope.payloads);
     for item in items {
         let mut env = fields.clone();
         match item {
@@ -322,8 +350,29 @@ fn collect_component_items(items: &[ComponentItem], owner: &str, out: &mut Vec<R
 
 fn extend_env_with_params(env: &mut BTreeMap<String, String>, params: &[crate::ast::Param]) {
     for p in params {
-        if let Some(ty) = simple_type_name(p.ty.as_ref()) {
-            env.insert(p.name.name.clone(), ty);
+        bind(env, &p.name.name, p.ty.as_ref());
+    }
+}
+
+/// Bind `name` to `ty`'s simple name — and UNBIND it when `ty` resolves
+/// to nothing.
+///
+/// The unbind arm matters because these scopes now nest. A component
+/// field seeds the scope before a method's parameters and `let`s are
+/// walked, so `hookable go()` with `let r = 5` inside, in a component
+/// that also declares `r : RegOp`, used to leave the field's binding
+/// standing and record the site under the WRONG transaction. Nothing on
+/// today's surfaced error set reads the target transaction, so the
+/// verdict came out right anyway — but a wrong attribution that happens
+/// not to matter is a wrong attribution, and it becomes a wrong refusal
+/// the moment the surfaced set widens.
+fn bind(env: &mut BTreeMap<String, String>, name: &str, ty: Option<&TypeExpr>) {
+    match simple_type_name(ty) {
+        Some(t) => {
+            env.insert(name.to_string(), t);
+        }
+        None => {
+            env.remove(name);
         }
     }
 }
@@ -377,9 +426,7 @@ fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
     let mut env = BTreeMap::new();
     for item in &test.items {
         if let TestItem::Let(l) = item {
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
+            bind(&mut env, &l.name.name, l.ty.as_ref());
         }
     }
 
@@ -429,9 +476,7 @@ fn collect_stmt(
             if let Some(value) = &l.value {
                 collect_expr(value, env, context, out);
             }
-            if let Some(ty) = simple_type_name(l.ty.as_ref()) {
-                env.insert(l.name.name.clone(), ty);
-            }
+            bind(env, &l.name.name, l.ty.as_ref());
         }
         StmtKind::Randomize {
             blocking,

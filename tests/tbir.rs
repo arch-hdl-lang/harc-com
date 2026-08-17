@@ -17912,3 +17912,76 @@ relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
     let err = harc::parser::parse_source(&disabled).expect_err("`watchdog disabled` takes no body");
     assert!(format!("{err:?}").contains("UnexpectedToken"), "{err:?}");
 }
+
+/// The two halves of a transactor share ONE name scope, and a name
+/// rebound to an unresolvable type stops resolving.
+///
+/// Both are the same mistake in different places: a scope assembled
+/// from the wrong set of declarations. `synth_component_from_
+/// transactor` concatenates a transactor's always-present items and its
+/// `when active` block, so a field declared in the shared half really
+/// is in scope inside `when active` — walking the halves as independent
+/// scopes made those bodies collect nothing at all. And a `let` or
+/// parameter whose type does not resolve must UNBIND the name a field
+/// seeded, not leave the field's type standing.
+#[test]
+fn a_component_scope_spans_both_transactor_halves_and_honours_shadowing() {
+    const PRELUDE: &str = "\
+bus B
+    tlm_method go(addr: uint<32>): blocking;
+end bus B
+
+transaction RegOp
+    addr  : uint<8>  with [range(0, 64)]
+    value : uint<32>
+end transaction RegOp
+
+relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
+";
+    const RZ_R: &str =
+        "            randomize(r) with Band(r, hi = 2000, lo = 1000) end randomize\n";
+    let sites = |body: &str| {
+        let src = format!("{PRELUDE}\n{body}");
+        let parsed = harc::parser::parse_source(&src).unwrap_or_else(|e| panic!("{src}\n{e:?}"));
+        harc::solver::problem_table::build_component_scope_problem_table(&parsed)
+            .entries
+            .len()
+    };
+
+    // The field is in the SHARED half; the randomize is in `when
+    // active`. One scope spans both, so the site resolves.
+    assert_eq!(
+        sites(&format!(
+            "transactor X bound to B\n    r : RegOp\n    when active\n        hookable go()\n{RZ_R}        end go\n    end when\nend transactor X\n"
+        )),
+        1,
+        "a shared-half field is in scope inside `when active`"
+    );
+
+    // A `let` that rebinds the same name to a type this walk cannot
+    // resolve leaves it unresolved rather than falling back to the
+    // field's type — so the site is not collected under `RegOp`.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : RegOp\n    hookable go()\n        let r = 5\n{RZ_R}    end go\nend agent A\n"
+        )),
+        0,
+        "an untyped `let` shadows the field rather than inheriting its type"
+    );
+    // The same, via a parameter.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : RegOp\n    hookable go(r)\n{RZ_R}    end go\nend agent A\n"
+        )),
+        0,
+        "an untyped parameter shadows the field"
+    );
+    // Shadowing that DOES resolve still resolves — to the inner type.
+    assert_eq!(
+        sites(&format!(
+            "agent A\n    r : uint<8>\n    hookable go()\n        let r : RegOp\n{RZ_R}    end go\nend agent A\n"
+        )),
+        1,
+        "a typed `let` shadowing a non-transaction field resolves"
+    );
+}

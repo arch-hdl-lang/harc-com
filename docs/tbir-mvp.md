@@ -4086,6 +4086,23 @@ case and only locally-determinable `Assign` types are compared).
     was false for `Item::Scoreboard` and `Item::Sequencer` because no
     shape exercised either. They have shapes now.
 
+    Assembling a scope from the wrong set of declarations turned out to
+    be the recurring mistake, and it had two more landings. A
+    transactor's two halves were walked as INDEPENDENT scopes, so a
+    field declared in the always-present half was invisible inside
+    `when active` and those bodies collected nothing —
+    `synth_component_from_transactor` concatenates the halves, so the
+    field really is in scope there. And a `let` or parameter whose type
+    does not resolve to a plain named type failed to UNBIND the name a
+    field had seeded, recording the site under the field's transaction:
+    `agent A { r : RegOp; hookable go() { let r = 5; randomize(r) ... } }`
+    was collected as `RegOp`. Nothing on today's surfaced error set
+    reads the target transaction — all four variants come out of
+    `expand_top_level_relation_call`, which reads only the relation and
+    the call's arguments — so the verdict was right anyway. A wrong
+    attribution that happens not to matter is still wrong, and it
+    becomes a wrong refusal the moment the surfaced set widens.
+
     Two smaller corrections, recorded because each is the kind of claim
     this document exists to keep honest. The table is **not** a strict
     complement of the emission table: a `testbench` lifecycle phase
