@@ -3600,12 +3600,13 @@ case and only locally-determinable `Assign` types are compared).
     something away.
 
     **Named arguments.** No CODEGEN site in v1 reads an argument name:
-    of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 26 destructure
-    `{ value, .. }` and the 4 that bind `name` are AST-rewrite passes
-    that reconstruct the node and pass it along. (The first draft of this
-    entry said "all 30 destructure `{ value, .. }`" — the conclusion
-    survived the correction, but the sentence was a count that had not
-    been counted.) Binding is by position everywhere, and that was
+    of the 30 `CallArg::Named` matches in `cpp_tb.rs`, 25 are
+    `{ value, .. }` and one is `{ value: e, .. }` — all 26 drop the name
+    — and the 4 that bind `name` are AST-rewrite passes that reconstruct
+    the node and pass it along. (The first draft said "all 30 destructure
+    `{ value, .. }`", the second "26 destructure `{ value, .. }`". The
+    conclusion survived both corrections; the sentence was a count that
+    had not been counted, twice.) Binding is by position everywhere, and that was
     measured, not only read:
     `axil_write(data = t.value, addr = t.addr)` emits
     `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)` — the two
@@ -3666,6 +3667,16 @@ case and only locally-determinable `Assign` types are compared).
     entry already carried a rule about reading the generated C++, which
     is not the same as reading two lines out of it.
 
+    A fifth, adjacent landing is left UNCLASSIFIED on purpose:
+    `records.rs`'s `parameters on transaction`. Three reference positions
+    were probed — a field default, a `range(0, N)` attribute and a `keep`
+    constraint — and all three emit ahead of v1's consts or (for `keep`)
+    only into a log string, so nothing silent turned up. That is evidence
+    about three positions, not about the space, and the scoreboard arm in
+    this same entry is what a fourth unenumerated position costs. It
+    stays `Unsupported` until someone enumerates transaction item kinds
+    the way the scoreboard gate had to be.
+
     Both anchors were needed here and both were nearly skipped. Byte
     identity means nothing unless the component contributes at all, and
     unless something the component carries is VISIBLE in the output — so
@@ -3674,20 +3685,36 @@ case and only locally-determinable `Assign` types are compared).
     caught by it rather than after.
 
     Probed at all FOUR landings rather than one, because divergence
-    47's tseq pair sat four lines apart and classified differently. The
-    analysis-source (transactor) arm, the env/agent/sequencer composite
-    arm and the ordinary-transactor arm in `transactors.rs` all agree on
-    `SilentlyMisLowers` — a result, not a reason to have assumed it. The
-    fourth, `scoreboards.rs`, does NOT: a data-only scoreboard's only
-    items are fields, so its only way to name a parameter is a field
-    default or width, both emitted INSIDE the struct and ahead of every
-    file-scope `const`. No silent case is reachable there, and the
-    honest label is `EmitsUncompilable`, one rung down from its
-    siblings.
+    47's tseq pair sat four lines apart and classified differently. They
+    all agree on `SilentlyMisLowers` — a result, not a reason to have
+    assumed it.
 
-    The first version of this entry claimed the first two arms "sit four
-    lines apart". They are 41 lines apart in the base and 82 after this
-    change — a detail invented to make a point that stood without it.
+    The fourth landing, `scoreboards.rs`, was first labelled
+    `EmitsUncompilable` on a structural argument: a data-only scoreboard
+    has only fields, so its only way to name a parameter is a field
+    default or width, both emitted inside the struct ahead of every
+    `const`, so no silent case is reachable. **The argument is wrong at
+    its first step.** `scoreboard_is_component` routes a scoreboard to
+    the composite table on `Hookable` ALONE, so one carrying fields plus
+    an `on` handler stays data-only and reaches the arm — and the
+    parameter check runs before the `on` rejection further down. v1 emits
+    that handler's trigger into a checker lambda ~110 lines after the
+    const, so `on hits > N` becomes `(bool)(_tb.b.hits > N)` resolving to
+    a file-scope `const N = 5`: it compiles, and the scoreboard runs with
+    5. `#(7)` and `#(8)` emit byte-identically, so the argument is
+    provably invisible.
+
+    "Its only items are fields" was read off the ARMS in `scoreboards.rs`,
+    which reject methods and `on` handlers, without checking the GATE
+    that decides which file gets the declaration in the first place. A
+    structural argument is only worth more than a count if it is checked
+    as carefully as one, and this one was checked one level too shallow —
+    two entries after that rule was written down.
+
+    The first version of this entry also claimed the two `components.rs`
+    arms "sit four lines apart". They are 41 lines apart in the base and
+    82 after this change — a detail invented to decorate a point that
+    stood without it.
 
 ### The probe method
 

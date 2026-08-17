@@ -34,24 +34,34 @@ pub(crate) fn lower_scoreboard(
     let sb = &c.name.name;
     if !c.params.is_empty() {
         // The fourth landing of the component-parameter construct, and
-        // the one that classifies DIFFERENTLY — which is why it was
-        // probed rather than given the sibling arms' verdict.
+        // it agrees with the other three.
         //
-        // Those arms are `SilentlyMisLowers` because a reference emitted
-        // AFTER v1's file-scope consts picks one up and the program runs
-        // with the wrong value. A data-only scoreboard has no such
-        // position: its only items are fields, and a field default or
-        // width is emitted inside the struct, ahead of every const. So
-        // `errors : uint<32> default N` emits `uint64_t errors = N;`
-        // with `N` unresolvable even when a `const N` exists, and the
-        // unused case is a plain no-op. Nothing silent is reachable
-        // here, so the honest label is one rung down.
+        // A first pass labelled this arm `EmitsUncompilable` on the
+        // argument that a data-only scoreboard has no emission position
+        // after v1's file-scope consts — only fields, whose defaults and
+        // widths are emitted inside the struct, ahead of every const.
+        // The argument is wrong at its first step. `scoreboard_is_
+        // component` routes to the composite table on `Hookable` ALONE,
+        // so a scoreboard carrying fields plus an `on` handler stays
+        // data-only and reaches here — and this check runs before the
+        // `on` rejection further down. v1 emits that handler's trigger
+        // into a checker lambda ~110 lines AFTER the const, so
+        // `on hits > N` becomes `(bool)(_tb.b.hits > N)` resolving to a
+        // file-scope `const N = 5`: it compiles and the scoreboard runs
+        // with 5. `#(7)` and `#(8)` emit byte-identically, so the
+        // argument is provably invisible.
+        //
+        // The lesson is not about scoreboards. The claim "its only items
+        // are fields" was read off the arms in THIS file, which reject
+        // methods and `on` handlers, without checking the gate that
+        // decides which file gets the declaration at all.
         return Err(super::not_implemented(
             &format!("parameters on scoreboard `{sb}`"),
-            "v1 drops the parameter list entirely; a data-only scoreboard can only \
-             reference one from a field default or width, both emitted ahead of any \
-             file-scope `const`, so the reference resolves to nothing",
-            super::V1Status::EmitsUncompilable,
+            "v1 drops the parameter list entirely: an unused parameter vanishes along \
+             with any `#(...)` argument at the instantiation, and a reference to one \
+             either fails to resolve or silently picks up a same-named file-scope \
+             `const`, depending on where in the emitted file the reference lands",
+            super::V1Status::SilentlyMisLowers,
         ));
     }
     if c.bound_to.is_some() {

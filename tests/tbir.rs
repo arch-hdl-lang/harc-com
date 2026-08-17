@@ -16597,9 +16597,13 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
     };
     let v1_q_ctl = cpp_tb::emit(&merged_src(&quiesce("4"))).expect("v1 emits");
     lower_src(&quiesce("4")).expect("the positional quiesce form lowers");
-    assert_ne!(
-        v1_q_ctl, v1_ctl,
-        "the injected `quiesced` call must reach v1's output"
+    // The same anchor its sibling uses: the ARGUMENT is visible in the
+    // emitted predicate. `assert_ne!` against the control would be
+    // satisfied by any added line at all.
+    assert!(
+        v1_q_ctl.contains("_last_out_cycle) >= (uint64_t)(4)")
+            || v1_q_ctl.contains("_last_in_cycle) >= (uint64_t)(4)"),
+        "the quiesce cycle count reaches the emitted predicate"
     );
     for arg in ["n = 4", "nosuch = 4"] {
         let msg = assert_unsupported(&lower_src(&quiesce(arg)).unwrap_err());
@@ -16612,14 +16616,16 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
     }
 }
 
-/// The component-parameter construct has FOUR landings, and the fourth
-/// classifies differently from the other three. `transactors.rs` agrees
-/// with the `components.rs` arms — v1 drops the list, and a method-body
-/// reference silently picks up a same-named file-scope `const`.
-/// `scoreboards.rs` does not: a data-only scoreboard's only items are
-/// fields, so its only way to name a parameter is a field default or
-/// width, both emitted INSIDE the struct and ahead of every const. No
-/// silent case is reachable there.
+/// The component-parameter construct has FOUR landings and they all
+/// agree: v1 drops the list, and a reference emitted after its
+/// file-scope consts silently picks one up.
+///
+/// The scoreboard arm was briefly labelled a rung lower, on the argument
+/// that a data-only scoreboard has only fields and so no emission
+/// position after the consts. `scoreboard_is_component` routes on
+/// `Hookable` alone, so a scoreboard with an `on` handler stays
+/// data-only and has one. Both positions are pinned below — a test that
+/// exercised only the field default is what let the wrong label pass.
 #[test]
 fn the_other_two_component_parameter_landings_do_not_agree() {
     // ── `transactors.rs`: an ordinary DUT-poking transactor.
@@ -16664,39 +16670,94 @@ fn the_other_two_component_parameter_landings_do_not_agree() {
         "the parameter changes nothing, so the transactor runs with 15"
     );
 
-    // ── `scoreboards.rs`: one rung down, and this is the reason.
-    let g = fixture("axilite_bound_mon_test.harc");
-    const SB: &str = "scoreboard AxilSb";
-    const ERRS: &str = "errors  : uint<32> default 0";
-    assert!(
-        g.contains(SB) && g.contains(ERRS),
-        "fixture 2 shape changed"
-    );
-    let sb = format!(
-        "const N = 5\n\n{}",
-        g.replacen(SB, "scoreboard AxilSb #(N: int = 3)", 1)
-            .replacen(ERRS, "errors  : uint<32> default N", 1)
-    );
+    // ── `scoreboards.rs`: agrees, and the position that decides it is
+    //    NOT the field default. A first pass labelled this arm
+    //    `EmitsUncompilable` because a data-only scoreboard "only has
+    //    fields", whose defaults are emitted inside the struct ahead of
+    //    every const. But `scoreboard_is_component` routes to the
+    //    composite table on `Hookable` ALONE, so a scoreboard with
+    //    fields plus an `on` handler stays data-only and reaches this
+    //    arm — and v1 emits that handler's trigger long AFTER the const.
+    //
+    //    Both positions are asserted, because pinning only the field
+    //    default is what let the wrong label pass.
+    const SB_SRC: &str = r#"const N = 5
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard BoardDECL
+    hits : uint<32> default HITS
+ONHANDLER
+end scoreboard Board
+
+testbench SbTb
+    dut : Top
+    b   : BoardINST
+end testbench SbTb
+
+impl SbTest for SbTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl SbTest
+"#;
+    let sb = |decl: &str, inst: &str, hits: &str, on: &str| {
+        let s = SB_SRC
+            .replace("BoardDECL", decl)
+            .replace("BoardINST", inst)
+            .replace("HITS", hits);
+        if on.is_empty() {
+            s.replace("ONHANDLER\n", "")
+        } else {
+            s.replace("ONHANDLER", on)
+        }
+    };
+    const ON_N: &str = "    on hits > N\n        hits = hits + 1\n    end on";
+
+    // The handler-trigger position: emitted after the const, so it
+    // compiles and the scoreboard silently runs with the const's 5.
+    let silent = sb("Board #(N: int = 3)", "Board #(7)", "0", ON_N);
     let msg = assert_not_implemented(
-        &lower_src(&sb).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
+        &lower_src(&silent).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
     );
     assert!(msg.contains("parameters on scoreboard"), "{msg}");
-
-    let merged = {
-        let fixp = parse_source(&sb).expect("parses");
-        let bus_src = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/BusAxiLite.arch"),
-        )
-        .expect("stdlib bus readable");
-        let bus = parse_source(&bus_src).expect("bus parses");
-        merge::merge_for_sim(vec![fixp, bus], None).expect("merge")
-    };
-    let v1_sb = cpp_tb::emit(&merged).expect("v1 emits");
-    // Even WITH the const present, the field initializer precedes it.
+    let v1_silent = cpp_tb::emit(&merged_src(&silent)).expect("v1 emits");
     assert!(
-        line_of(&v1_sb, "uint64_t errors = N;") < line_of(&v1_sb, "int64_t N = 5;"),
-        "the field initializer precedes the const, so no shadowing can rescue it"
+        line_of(&v1_silent, "static constexpr int64_t N = 5;")
+            < line_of(&v1_silent, "_tb.b.hits > N"),
+        "the const precedes the handler trigger, so this compiles"
+    );
+    // Equal-length arguments, so source offsets do not shift and the
+    // identity is the ARGUMENT being invisible rather than noise.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&sb(
+            "Board #(N: int = 3)",
+            "Board #(8)",
+            "0",
+            ON_N
+        )))
+        .expect("v1 emits"),
+        v1_silent,
+        "`#(7)` and `#(8)` emit identically, so the argument does nothing"
+    );
+
+    // The field-default position, which is where the wrong label came
+    // from: emitted inside the struct, ahead of the const.
+    let by_default = sb("Board #(N: int = 3)", "Board #(7)", "N", "");
+    assert_not_implemented(
+        &lower_src(&by_default).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    assert!(
+        line_of(&v1_default, "uint64_t hits = N;")
+            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+        "the field initializer precedes the const, so that position does not compile"
     );
 }
 
@@ -16720,11 +16781,8 @@ fn the_other_two_component_parameter_landings_do_not_agree() {
 /// const.
 ///
 /// Probed at both `components.rs` landings — the analysis-source
-/// (transactor) arm and the env/agent/sequencer composite arm — which
-/// agree. The other two landings of the same construct classify in
-/// their own tests: `transactors.rs` agrees, and `scoreboards.rs` does
-/// not, because a data-only scoreboard has no emission position after
-/// v1's file-scope consts.
+/// (transactor) arm and the env/agent/sequencer composite arm. The other
+/// two, in `transactors.rs` and `scoreboards.rs`, have their own test.
 #[test]
 fn component_parameters_are_dropped_by_v1() {
     const SRC: &str = r#"
