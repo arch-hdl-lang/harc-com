@@ -1948,3 +1948,97 @@ impl Item {
         }
     }
 }
+
+// ─── Relation-expansion limits ─────────────────────────────────────
+//
+// Two DIFFERENT expanders inline `relation` bodies into a constraint
+// block — `codegen::cpp_tb::expand_relation_calls` for the v1 solver
+// path and `constraints::typed_lower::expand_top_level_relation_call`
+// for the typed one — and both run on `harc sim`, whatever `--codegen`
+// says. A limit that only one of them honours bounds nothing, so the
+// limits and the counter that charges them live here, in the module
+// both already depend on. They are a property of how large a relation
+// expansion the compiler will accept, not of either emitter.
+
+/// Nodes a single top-level constraint list may PRODUCE by relation
+/// expansion before the expander gives up.
+///
+/// What stops a relation that expands into itself is the relation-name
+/// stack each expander keeps; this bounds growth that is finite but
+/// exponential — a chain of DISTINCT relations, each calling the
+/// previous one twice.
+///
+/// It counts nodes rather than expansions because a per-expansion
+/// budget cannot see growth in the ARGUMENT: `relation R(r) = R(r + r)`
+/// substitutes the argument into both occurrences of `r`, doubling it
+/// every level, so a handful of expansions build an astronomical tree.
+///
+/// MEASURED, not guessed: the whole fixture corpus passes at 96 and
+/// fails at 88, so 8192 is roughly 90x the deepest real program's need.
+/// The budget is shared across a whole top-level constraint list, so it
+/// scales with program size, not per constraint — which is why the
+/// margin is that wide.
+pub(crate) const RELATION_EXPANSION_BUDGET: u32 = 8_192;
+
+/// How deep relation bodies may nest before the expander gives up.
+///
+/// The other BACKSTOP: the budget bounds total work but not stack, and
+/// the expanders recurse once per level. With the name stack in place
+/// nothing cyclic reaches either limit, so this only ever fires on a
+/// finite chain of distinct relations 64 deep — which it refuses. That
+/// is a real tradeoff against a correct program, bought cheaply: the
+/// corpus's deepest real nest is 3, and a 40-deep chain still emits
+/// (there is a control for it in
+/// `v1_no_longer_aborts_on_a_relation_that_expands_forever`).
+pub(crate) const RELATION_EXPANSION_MAX_DEPTH: u32 = 64;
+
+/// Nodes in `e`, saturating. Used to charge
+/// `RELATION_EXPANSION_BUDGET` for what an expansion actually
+/// PRODUCES.
+///
+/// The arms mirror the expanders' own walks: those are exactly the
+/// forms that can carry a substituted argument, so they are exactly the
+/// forms through which a relation body can grow. Anything else counts
+/// as a leaf, which can only undercount forms that cannot grow.
+pub(crate) fn expr_node_count(e: &Expr) -> u32 {
+    fn n(e: &Expr) -> u32 {
+        1u32.saturating_add(match &*e.kind {
+            ExprKind::Field { target, .. } => n(target),
+            ExprKind::Index { target, index } => n(target).saturating_add(n(index)),
+            ExprKind::BitSlice { target, hi, lo } => {
+                n(target).saturating_add(n(hi)).saturating_add(n(lo))
+            }
+            ExprKind::Call { callee, args } => args.iter().fold(n(callee), |a, arg| {
+                a.saturating_add(match arg {
+                    CallArg::Expr(x) => n(x),
+                    CallArg::Named { value, .. } => n(value),
+                })
+            }),
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                body.iter().fold(n(iter), |a, x| a.saturating_add(n(x)))
+            }
+            ExprKind::SoftConstraint(sc) => {
+                sc.weight.as_ref().map_or(0, n).saturating_add(n(&sc.expr))
+            }
+            ExprKind::Unary { expr, .. } => n(expr),
+            ExprKind::Binary { lhs, rhs, .. } => n(lhs).saturating_add(n(rhs)),
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => n(cond)
+                .saturating_add(n(then_branch))
+                .saturating_add(n(else_branch)),
+            ExprKind::Paren(inner) => n(inner),
+            ExprKind::Membership { expr, set } => n(expr).saturating_add(n(set)),
+            ExprKind::Cast { expr, .. } => n(expr),
+            ExprKind::SetLit(items) => items.iter().fold(0, |a, x| a.saturating_add(n(x))),
+            ExprKind::RangeLit { lo, hi } => lo
+                .as_ref()
+                .map_or(0, n)
+                .saturating_add(hi.as_ref().map_or(0, n)),
+            _ => 0,
+        })
+    }
+    n(e)
+}

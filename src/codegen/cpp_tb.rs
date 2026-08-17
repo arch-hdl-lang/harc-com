@@ -52,40 +52,11 @@ pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
 pub const LOG_RT_HEADER: &str = include_str!("../../runtime/harc_log_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
 
-/// How many expression NODES one top-level constraint list may produce
-/// by expanding relation bodies before the expander gives up and leaves
-/// the call in place.
-///
-/// A BACKSTOP, not the guard. What actually stops a relation expanding
-/// into itself is the relation-name stack in
-/// `try_expand_top_level_call`; this bounds growth that is finite but
-/// exponential — a chain of DISTINCT relations, each calling the
-/// previous one twice.
-///
-/// It counts nodes rather than expansions because a per-expansion
-/// budget cannot see growth in the ARGUMENT: `relation R(r) = R(r + r)`
-/// substitutes the argument into both occurrences of `r`, doubling it
-/// every level, so a handful of expansions build an astronomical tree.
-///
-/// MEASURED, not guessed: the whole fixture corpus passes at 96 and
-/// fails at 88, so 8192 is roughly 90x the deepest real program's need.
-/// The budget is shared across a whole top-level constraint list, so it
-/// scales with program size, not per constraint — which is why the
-/// margin is that wide.
-const RELATION_EXPANSION_BUDGET: u32 = 8_192;
-
-/// How deep relation bodies may nest before the expander gives up.
-///
-/// The other BACKSTOP: the budget bounds total work but not stack, and
-/// the expander recurses once per level. With the name stack in place
-/// nothing cyclic reaches either limit, so this only ever fires on a
-/// finite chain of distinct relations 64 deep — which it refuses, with
-/// v1's generic "constraint function call not supported in v0 solver
-/// path". That is a real tradeoff against a correct program, bought
-/// cheaply: the corpus's deepest real nest is 3, and a 40-deep chain
-/// still emits (there is a control for it in
-/// `v1_no_longer_aborts_on_a_relation_that_expands_forever`).
-const RELATION_EXPANSION_MAX_DEPTH: u32 = 64;
+// The two relation-expansion limits and the node counter that charges
+// them live in `ast.rs`, because the TYPED lowering path has its own
+// expander over the same relations and both run on every `harc sim`.
+// Bounding only this one bounds nothing; see the comment there.
+use crate::ast::{expr_node_count, RELATION_EXPANSION_BUDGET, RELATION_EXPANSION_MAX_DEPTH};
 pub const COSIM_RT_HEADER: &str = include_str!("../../runtime/harc_cosim_rt.h");
 
 const INDENT: &str = "    ";
@@ -22861,57 +22832,6 @@ fn and_join(exprs: &[Expr], span: Span) -> Expr {
 /// case: `R(pkt)` → `pkt`), a field access (`R(env.agent.txn)`), or
 /// a deeper subtree. Field-access names (`Field { name, .. }`) are
 /// attribute references, not bindings, so they're never substituted.
-/// Nodes in `e`, saturating. Used to charge
-/// `RELATION_EXPANSION_BUDGET` for what an expansion actually
-/// PRODUCES.
-///
-/// The arms mirror `expand_relation_subtree`'s: those are exactly the
-/// forms that can carry a substituted argument, so they are exactly the
-/// forms through which a relation body can grow. Anything else counts
-/// as a leaf, which can only undercount forms that cannot grow.
-fn expr_node_count(e: &Expr) -> u32 {
-    fn n(e: &Expr) -> u32 {
-        1u32.saturating_add(match &*e.kind {
-            ExprKind::Field { target, .. } => n(target),
-            ExprKind::Index { target, index } => n(target).saturating_add(n(index)),
-            ExprKind::BitSlice { target, hi, lo } => {
-                n(target).saturating_add(n(hi)).saturating_add(n(lo))
-            }
-            ExprKind::Call { callee, args } => args.iter().fold(n(callee), |a, arg| {
-                a.saturating_add(match arg {
-                    CallArg::Expr(x) => n(x),
-                    CallArg::Named { value, .. } => n(value),
-                })
-            }),
-            ExprKind::ForEachConstraint { iter, body, .. } => {
-                body.iter().fold(n(iter), |a, x| a.saturating_add(n(x)))
-            }
-            ExprKind::SoftConstraint(sc) => {
-                sc.weight.as_ref().map_or(0, n).saturating_add(n(&sc.expr))
-            }
-            ExprKind::Unary { expr, .. } => n(expr),
-            ExprKind::Binary { lhs, rhs, .. } => n(lhs).saturating_add(n(rhs)),
-            ExprKind::Ternary {
-                cond,
-                then_branch,
-                else_branch,
-            } => n(cond)
-                .saturating_add(n(then_branch))
-                .saturating_add(n(else_branch)),
-            ExprKind::Paren(inner) => n(inner),
-            ExprKind::Membership { expr, set } => n(expr).saturating_add(n(set)),
-            ExprKind::Cast { expr, .. } => n(expr),
-            ExprKind::SetLit(items) => items.iter().fold(0, |a, x| a.saturating_add(n(x))),
-            ExprKind::RangeLit { lo, hi } => lo
-                .as_ref()
-                .map_or(0, n)
-                .saturating_add(hi.as_ref().map_or(0, n)),
-            _ => 0,
-        })
-    }
-    n(e)
-}
-
 fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
     let span = expr.span;
     let new_kind: ExprKind = match &*expr.kind {

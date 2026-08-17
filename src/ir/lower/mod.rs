@@ -701,6 +701,18 @@ fn surface_constraint_lower_error(
             CErr::RecursiveRelation { name, .. } => {
                 format!("`{name}` expands into itself, so the constraint has no finite form")
             }
+            // `Invalid` like its three siblings, and for the same
+            // reason: v1's expander charges the SAME budget out of the
+            // same constant, so it stops on the same programs and
+            // leaves the call unexpanded, and its translator then
+            // refuses it with "constraint function call not supported
+            // in v0 solver path". Neither backend runs this, so naming
+            // one as the way out would be false.
+            CErr::RelationExpansionTooLarge { name, .. } => {
+                format!(
+                    "expanding `{name}` exceeds the relation-expansion limit; the form is                      finite but astronomical — a chain of relations each calling the                      previous one more than once doubles at every level"
+                )
+            }
             // NOT `Invalid`, unlike its three siblings. v1 ACCEPTS a
             // misplaced name — it emits working C++ with the arguments
             // silently swapped — so "a program error under every

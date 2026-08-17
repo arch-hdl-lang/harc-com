@@ -18276,10 +18276,14 @@ fn a_run_of_discarded_errors_no_longer_hides_a_relation_error() {
 ///
 /// The node budget and depth limit stay as backstops for growth that is
 /// not cyclic — a chain of DISTINCT relations each calling the previous
-/// one twice is finite and exponential. No such case appears below: it
-/// is bottlenecked in `typed_lower`'s own un-budgeted expander long
-/// before v1's backstop is reached, so a test here would be measuring
-/// something else.
+/// one twice is finite and exponential. That case is NOT below, because
+/// it is not v1-specific: `typed_lower` has its own expander over the
+/// same relations, it ran unbudgeted for longer than this guard existed,
+/// and both run on every `harc sim` whatever `--codegen` says. Bounding
+/// one of two expanders bounds nothing. Both limits now live in
+/// `ast.rs` and both expanders charge them; the shape is pinned by
+/// `a_doubling_relation_chain_is_refused_at_the_same_point_by_both_
+/// backends`.
 #[test]
 fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
     let head = "domain D\n  freq_mhz: 100\nend domain D\n\n\
@@ -19094,4 +19098,99 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         );
         assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
     }
+}
+
+/// A chain of DISTINCT relations, each calling the previous one twice.
+/// Nothing is cyclic, so neither expander's relation-name stack sees
+/// anything wrong — and the expansion still doubles at every level.
+///
+/// v1's expander was given a node budget in an earlier batch and held.
+/// `constraints::typed_lower`'s was not, and it runs on EVERY `harc
+/// sim` regardless of `--codegen`, so the budget bounded nothing: a
+/// 16-link chain took 7s, an 18-link chain 34s, and a 20-link chain did
+/// not finish. Bounding one of two expanders over the same relations is
+/// not bounding the relation.
+///
+/// Both limits now live in `ast.rs` and both expanders charge them out
+/// of the same constant. The point of sharing it is the row below where
+/// the two backends agree: they refuse the same chain at the same
+/// length, so `Invalid` — "neither backend runs this" — is a measured
+/// claim rather than an assumption about v1.
+///
+/// This test finishing at all is part of the assertion. The 24-link
+/// case did not terminate before the guard existed.
+#[test]
+fn a_doubling_relation_chain_is_refused_at_the_same_point_by_both_backends() {
+    let src = |links: usize| {
+        let mut rels = String::new();
+        for k in 0..links {
+            rels += &format!("relation R{k}(r: Req) = R{}(r) && R{}(r)\n", k + 1, k + 1);
+        }
+        rels += &format!("relation R{links}(r: Req) = r.value > 1000\n");
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n{rels}\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            R0(t)\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+
+    // The guard is a limit, not a ban: a 9-link chain is 512 leaves and
+    // both backends still expand it.
+    let ok = src(9);
+    cpp_tb::emit(&merged_src(&ok)).expect("v1 expands a 9-link chain");
+    lower_src(&ok).expect("TB-IR expands a 9-link chain");
+
+    // One link further, and BOTH refuse — the same boundary, because
+    // the budget is one constant.
+    for links in [10, 16, 24] {
+        let too_big = src(links);
+
+        let v1 = cpp_tb::emit(&merged_src(&too_big)).expect_err("v1 refuses");
+        assert!(
+            format!("{v1}").contains("constraint function call not supported"),
+            "{links} links: {v1}"
+        );
+
+        // `Invalid`, not `Unsupported`: v1 is not a way to run it.
+        let msg = assert_invalid(&lower_src(&too_big).unwrap_err());
+        assert!(
+            msg.contains("exceeds the relation-expansion limit"),
+            "{links} links: {msg}"
+        );
+    }
+
+    // The other shared limit, on the same footing: a chain of SINGLE
+    // calls never doubles, so the budget never fires and the depth
+    // backstop is what answers. It answers at the same link in both
+    // backends — 63 expands, 64 does not — which is the whole point of
+    // the constants being one constant.
+    let linear = |links: usize| {
+        let mut rels = String::new();
+        for k in 0..links {
+            rels += &format!("relation R{k}(r: Req) = R{}(r)\n", k + 1);
+        }
+        rels += &format!("relation R{links}(r: Req) = r.value > 1000\n");
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n{rels}\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            R0(t)\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    let deep = linear(63);
+    cpp_tb::emit(&merged_src(&deep)).expect("v1 expands a 63-link chain");
+    lower_src(&deep).expect("TB-IR expands a 63-link chain");
+
+    let too_deep = linear(64);
+    cpp_tb::emit(&merged_src(&too_deep)).expect_err("v1 refuses a 64-link chain");
+    let msg = assert_invalid(&lower_src(&too_deep).unwrap_err());
+    assert!(
+        msg.contains("exceeds the relation-expansion limit"),
+        "{msg}"
+    );
 }

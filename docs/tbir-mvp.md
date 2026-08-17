@@ -4744,6 +4744,62 @@ case and only locally-determinable `Assign` types are compared).
     repeatedly: the arms in a file do not tell you what reaches the
     file. Only the gate does.
 
+72. **Bounding one of two expanders bounds nothing (2026-08-17).**
+
+    An earlier batch gave v1's relation expander a node budget and a
+    depth backstop, and closed the entry noting that the same shape was
+    "bottlenecked in `typed_lower`'s own un-budgeted expander long
+    before v1's backstop is reached, so a test here would be measuring
+    something else". Both halves of that sentence were true. The
+    conclusion drawn from them was wrong: it treated the second
+    expander as someone else's problem, when it is the same programs
+    running through it on the same command.
+
+    There are TWO expanders that inline `relation` bodies —
+    `codegen::cpp_tb::expand_relation_calls` and
+    `constraints::typed_lower::expand_top_level_relation_call` — and
+    BOTH run on every `harc sim`, whatever `--codegen` says. Measured
+    on a chain of distinct relations each calling the previous one
+    twice (nothing cyclic, so neither name stack fires):
+
+    | links | v1 | tbir |
+    |---|---|---|
+    | 16 | 2.5s | 7.3s |
+    | 18 | 12.1s | 33.5s |
+    | 20 | did not finish in 60s | did not finish in 60s |
+
+    Instrumenting both expanders with call counters settles which one:
+    at 16 links v1's is capped at ~4096 calls by its budget, while
+    `typed_lower`'s runs 2^16 and climbing. The v1 column is slow for
+    the same reason the tbir column is — `typed_lower` is on the path
+    under both.
+
+    That measurement also corrects a reading taken minutes earlier from
+    a modulo-100000 counter, which showed "2 calls" under `--codegen
+    v1` and looked like proof the typed path was tbir-only. A counter
+    that prints every 100000th call cannot distinguish 2 from 65536.
+
+    The fix is one budget, not two: both limits and the node counter
+    that charges them moved to `ast.rs`, the module both expanders
+    already depend on, and `typed_lower` now charges the same constants
+    v1 does. They are a property of how large an expansion the compiler
+    accepts, not of either emitter.
+
+    With that, the boundary is symmetric and measured: a 9-link
+    doubling chain expands in both backends, a 10-link one is refused
+    by both; a 63-link linear chain expands in both, a 64-link one is
+    refused by both. A 24-link chain that never finished now answers in
+    37ms. `typed_lower` gets a `RelationExpansionTooLarge` variant that
+    surfaces as `Invalid` — v1 stops at the same point and its
+    translator then says "constraint function call not supported in v0
+    solver path", so neither backend runs these and naming one as the
+    way out would be false.
+
+    One thing the new arm must not do is what the old code did on the
+    way to its error: return an empty clause list and let the program
+    lower with the constraint silently gone. It records the error, and
+    `is_relation_error` includes it, so the walk stops.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
