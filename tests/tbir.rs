@@ -18204,3 +18204,96 @@ fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
         );
     }
 }
+
+/// A constraint BUILTIN is not an unknown relation.
+///
+/// Every `name(...)` with an `Ident` callee in a constraint was routed
+/// through the relation path, and a name that is not a declared
+/// relation was reported as one. v1 handles a small set of these
+/// itself — `sum(<list>[lo..hi])`, read off
+/// `cpp_tb::try_emit_constraint_list_call` — so calling it an unknown
+/// relation is a false refusal of a program v1 compiles, with a
+/// diagnostic that sends the reader looking for a `relation`
+/// declaration they never meant to write.
+///
+/// **This gap is LATENT, and the test says so rather than pretending
+/// otherwise.** TB-IR refuses any transaction carrying a `list<T>`
+/// field before constraint lowering runs, so no program can reach it
+/// today — which is why the assertions below are on the constraint
+/// table rather than on `lower_program`. Asserting end-to-end here
+/// would pass for the wrong reason: the list-field gate fires first and
+/// would keep passing however this were classified.
+#[test]
+fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
+    let src = |clause: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction P\n    n     : uint<8>\n    items : list<uint<8>>\n\
+             end transaction P\n\n\
+             test T\n    let dut : Top\n    let p : P\n    clock clk = D\n    run\n\
+             \x20       randomize(p) with\n            {clause}\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    // Every entry's errors, flattened, with the relation ones marked.
+    let errs = |clause: &str| -> Vec<(bool, String)> {
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&src(clause)))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect()
+    };
+
+    // The list-field gate really does fire first, for every one of
+    // these — including the clause with no call in it at all. That is
+    // the masking, stated as a measurement rather than assumed.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "NoSuchRel(p)",
+        "p.n > 3",
+    ] {
+        let err = lower_src(&src(clause)).unwrap_err();
+        assert!(
+            format!("{err}").contains("`P.items` with an unsupported (non-scalar) leaf type"),
+            "{clause}: expected the list-field gate, got {err}"
+        );
+    }
+
+    // And that gate's `--codegen v1` suggestion is honest, which is
+    // what makes this worth fixing rather than filing as unreachable:
+    // give the list a bound and v1 emits the whole thing, `sum` call
+    // included. So the false `UnknownRelation` sat directly in front of
+    // a form v1 compiles.
+    let bounded = src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100");
+    cpp_tb::emit(&merged_src(&bounded)).expect("v1 emits a bounded list with a `sum` constraint");
+
+    // `sum` is a v1 builtin: not a relation error, so it is discarded
+    // and the program would lower once list fields do.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "sum(items[0 .. items.len()])",
+    ] {
+        let got = errs(clause);
+        assert!(
+            !got.is_empty() && got.iter().all(|(is_rel, _)| !is_rel),
+            "`{clause}` must produce no relation error: {got:?}"
+        );
+    }
+
+    // A name that is neither a relation nor a v1 builtin stays a
+    // relation error. v1 rejects it too ("constraint function call not
+    // supported in v0 solver path"), so refusing is the right verdict
+    // even when the name was never meant as a relation.
+    for clause in ["NoSuchRel(p)", "nosuchfn(p.n) == 1", "sum(p.n, p.n) == 1"] {
+        let got = errs(clause);
+        assert!(
+            got.iter().any(|(is_rel, _)| *is_rel),
+            "`{clause}` must still be a relation error: {got:?}"
+        );
+    }
+}

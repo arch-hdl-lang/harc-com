@@ -4011,9 +4011,7 @@ case and only locally-determinable `Assign` types are compared).
     * **`MAX_ERRORS = 5` can disable the refusal.** Closed in
       divergence 61 below.
     * **Every Ident-callee constraint call is treated as a relation
-      call**, so a v1-supported `sum(...)` records `UnknownRelation`.
-      Masked today only because TB-IR rejects `list<T>` fields earlier;
-      it becomes a false `Invalid` the moment list fields lower.
+      call.** Closed in divergence 63 below.
 
 60. **A constraint written in a component body reached C++ unchecked
     (2026-08-17).**
@@ -4239,6 +4237,64 @@ case and only locally-determinable `Assign` types are compared).
     chain of distinct relations and a 60-paren expression both still
     emit with the innermost bound intact. Disabling the name stack
     reproduces the SIGABRT and the test binary dies with signal 6.
+
+63. **Not every `name(...)` in a constraint is a relation call
+    (2026-08-17).**
+
+    Divergence 59 recorded this as the last of its three open limits.
+    Any `Ident`-callee call in a constraint went down the relation path,
+    and a name that is not a declared relation came back as
+    `UnknownRelation` — which divergence 59 had just promoted to a hard
+    `Invalid`. v1 handles a small set of these itself, so that is a
+    false refusal of a program v1 compiles, carrying a diagnostic that
+    sends the reader looking for a `relation` declaration they never
+    meant to write.
+
+    v1's whole list for this shape is one entry, read off
+    `cpp_tb::try_emit_constraint_list_call` rather than recalled:
+    `sum(<list>[lo..hi])`, one argument. (`<list>.len()` is the other
+    constraint builtin, but its callee is a `Field`, so it never reaches
+    the relation path.) Everything else with an `Ident` callee v1
+    rejects too — "constraint function call not supported in v0 solver
+    path" — so `nosuchfn(p.n)` keeps its refusal. The verdict is right
+    there even though the wording is about relations, because refusing
+    is what both backends do.
+
+    The builtin now records an ordinary capability gap, which
+    `lower_program` discards, so the program lowers and reaches the
+    shared emitter that knows how to emit it.
+
+    **Three call sites, one fix.** The search found `expand_relation_
+    subtree` already guarding correctly (`relation(name).is_some()`
+    before expanding), which made it look like the top-level path was
+    the only offender. The probe disagreed: a `sum(...)` nested inside
+    a `==` also produced `UnknownRelation`. The third site is
+    `lower_expr`'s `Call { Ident }` arm, and it reaches the same
+    `expand_top_level_relation_call` — so the fix lands once, in the
+    function all three funnel through. *Reading two of three call sites
+    and generalising is how the previous batch got a verdict wrong; the
+    probe is what found the third.*
+
+    **The gap is LATENT and the test says so.** TB-IR refuses any
+    transaction carrying a `list<T>` field before constraint lowering
+    runs — measured: the `sum` probe, an unknown-relation probe, and a
+    clause with no call in it at all are all refused with the same
+    "`P.items` with an unsupported (non-scalar) leaf type" message. So
+    the assertions are on the constraint table, not on `lower_program`;
+    an end-to-end assertion would pass for the wrong reason, since the
+    list-field gate fires first and would keep passing however this were
+    classified.
+
+    What makes it worth fixing rather than filing as unreachable: that
+    gate's `--codegen v1` suggestion is **honest**. Give the list a
+    bound (`items.len() <= 4`) and v1 emits the whole thing, `sum` call
+    included — verified in the test. The false `UnknownRelation` was
+    sitting directly in front of a form v1 compiles.
+
+    Both directions are pinned by mutation, because widening a gate is
+    as much a claim as narrowing one: emptying the builtin list makes
+    `sum` a relation error again, and dropping the NAME check so any
+    one-argument call counts makes `NoSuchRel(p)` stop being one.
 
 ### The probe method
 
