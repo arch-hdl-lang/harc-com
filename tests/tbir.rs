@@ -17514,10 +17514,36 @@ fn a_named_log_argument_that_hides_a_severity_or_message_is_refused() {
     // …and names the construct the user actually wrote.
     assert!(msg.contains("in `logf`"), "{msg}");
 
-    // A named argument ahead of the logf PATH is still inert, because
-    // the positional message slot is filled.
+    // A named argument ahead of the logf PATH is inert when BOTH string
+    // slots are filled positionally.
     lower_src(&logf(r#"p = "a.log", "t.log", error, "BOOM""#))
-        .expect("a named arg beside a filled message slot must lower");
+        .expect("a named arg beside two positional strings must lower");
+
+    // But `logf` needs TWO strings, and modelling only the message slot
+    // missed that: with one positional string left, a named path
+    // promotes the MESSAGE to filename — this program used to write to
+    // a file literally called `BOOM`.
+    let msg = assert_not_implemented(
+        &lower_src(&logf(r#"path = "t.log", error, "BOOM""#)).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("carrying a path or message"), "{msg}");
+    // And a named message with only the path positional.
+    assert_not_implemented(
+        &lower_src(&logf(r#""t.log", error, msg = "BOOM""#)).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+
+    // A named ident that is NOT a severity hides nothing: positionally
+    // it would have been rejected by the severity guard, not silently
+    // used, so claiming a loss would be claiming one that cannot happen.
+    lower_src(&log(r#""BOOM", who = nosuchident"#)).expect("a named non-severity ident must lower");
+    assert!(
+        cpp_tb::emit(&merged_src(&log(r#""BOOM", who = nosuchident"#)))
+            .expect("v1 emits")
+            .contains(r#"sim_log_line("INFO", "BOOM");"#),
+        "and v1 emits the correct default-severity line"
+    );
 
     // The detail must not carry the runs of literal spaces a hard-wrapped
     // string literal without `\` continuation produces.

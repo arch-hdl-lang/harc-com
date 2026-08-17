@@ -3853,14 +3853,36 @@ case and only locally-determinable `Assign` types are compared).
     — and a named severity walked straight past that guard into exactly
     the outcome it exists to prevent.
 
-    Gated on what the name HIDES, not on named-ness. A named argument
-    wrapping anything the extractors would not have looked at is
-    invisible to both backends and harmless: `log(fatal, "BOOM",
-    extra = 1)` emits the correct `FATAL`/`BOOM` line, so a blanket
-    rejection would have refused a correct program — the trap batch 23
-    fell into and had to undo. The test pins BOTH directions: removing
-    the guard fails it, and widening it to reject every named argument
-    fails it too.
+    Gated on what the name hides AND on the slot being empty, which took
+    three tries. The extractors take positional matches only, so a named
+    argument costs the user something exactly when a slot it could have
+    filled is left unfilled — `log` needs one string, `logf` needs two
+    (path then message), and a severity slot is filled by any positional
+    bare ident.
+
+    Each earlier version refused correct programs:
+
+    * keyed on named-ness alone → refused `log(fatal, "BOOM", extra = 1)`;
+    * keyed on the named VALUE → refused `log(fatal, "BOOM", lvl = warn)`
+      and `logf(p = "a.log", "t.log", error, "BOOM")`, where a positional
+      candidate wins under both backends;
+    * modelled the message slot but not `logf`'s PATH slot → let
+      `logf(path = "t.log", error, "BOOM")` through, which writes to a
+      file literally called `BOOM`. That one was a REGRESSION: the
+      cruder version had caught it.
+
+    A fourth edge: a named ident is only a hidden severity if it names a
+    real one. `log("BOOM", who = nosuch)` hides nothing, because
+    positionally `nosuch` would have been rejected by the severity guard
+    rather than silently used — so `is_log_severity` is now shared
+    between the gate and that guard, and the two answer "is this a
+    severity" the same way.
+
+    Every sub-condition is pinned by mutation: removing the guard,
+    dropping either slot-filled check, collapsing `logf`'s two-string
+    requirement to one, and dropping the severity-name check each fail
+    the test. **Widening a gate is as much a claim as narrowing one, and
+    needs its own case.**
 
 57. **A control that could not tell "did not fire" from "fired and was
     thrown away" (2026-08-17).**
