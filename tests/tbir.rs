@@ -15099,9 +15099,10 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
 ///
 /// The difference is whether the element-type annotation is ABSENT or
 /// PRESENT-but-unresolvable. An absent one makes v1 substitute a working
-/// default; a bad one makes it print the name verbatim into a type
-/// position. One code path handles both, which is exactly how they got
-/// the same classification.
+/// default — so TB-IR now substitutes the same one and the gap is
+/// CLOSED. A bad one makes v1 print the name verbatim into a type
+/// position, which does not compile. One code path handled both, which
+/// is exactly how they came to share a classification.
 #[test]
 fn an_absent_tseq_element_type_is_not_a_bad_one() {
     let fixture = fixture("tseq_scalar_test.harc");
@@ -15118,16 +15119,23 @@ fn an_absent_tseq_element_type_is_not_a_bad_one() {
         "the control's element type reaches v1's return type"
     );
 
-    // ABSENT: v1 defaults the element type and the sequence still works.
-    // `int64_t` vs `uint64_t` is a signedness difference, not a failure,
-    // so v1 is a genuine escape hatch and this stays `Unsupported`.
+    // ABSENT: a gap CLOSED, not classified. v1 defaults the element type
+    // to a signed 64-bit scalar and the sequence runs; TB-IR now does the
+    // same, byte-identically.
     let absent = fixture.replace(DECL, "tseq Squares(n: int)");
-    assert_unsupported(&lower_src(&absent).unwrap_err());
+    let tbir = emit_cpp_src(&absent);
+    let v1 = cpp_tb::emit(&merged_src(&absent)).expect("v1 emits without a return type");
+    for out in [&tbir, &v1] {
+        assert!(
+            out.contains("-> std::vector<int64_t>"),
+            "both backends default the element type:\n{out}"
+        );
+    }
+    // …and the default is a DEFAULT, not a coincidence: the annotated
+    // control still gets the element type it declared.
     assert!(
-        cpp_tb::emit(&merged_src(&absent))
-            .expect("v1 emits without a return type")
-            .contains("-> std::vector<int64_t>"),
-        "v1 substitutes a working default"
+        emit_cpp_src(&fixture).contains("-> std::vector<uint64_t>"),
+        "the annotated control keeps its own element type"
     );
 
     // PRESENT AND BAD: v1 prints the name into the return type, naming a
@@ -15327,5 +15335,107 @@ fn the_control_flow_sites_split_between_uncompilable_and_silent() {
             .expect("v1 accepts it")
             .contains("for (auto& x : harc_rt::harc_read(dut->count_out))"),
         "v1 emits a range-for over a scalar"
+    );
+}
+
+/// Defaulting an unannotated tseq's element type widened the accepted
+/// set, and two checks the narrower gate had been providing for free had
+/// to be written by hand.
+///
+/// This is the same failure mode as divergences 36 and 44 — a fold or
+/// default that replaces a rejection inherits the rejection's job.
+#[test]
+fn the_tseq_default_does_not_swallow_what_it_should_reject() {
+    const SRC: &str = r#"transaction Req
+    a : uint<8>
+end transaction Req
+
+tseq Gen(n: int) -> TSeq<Req>
+    let i = 1
+    while i <= n
+        let t : Req
+        t.a = i
+        yield t
+        i = i + 1
+    end while
+end tseq Gen
+
+testbench MTb
+    dut : Top
+end testbench MTb
+
+impl MTest for MTb
+    run
+        let xs = Gen(2)
+        wait 1 cycle
+    end run
+end impl MTest"#;
+    const DECL: &str = "tseq Gen(n: int) -> TSeq<Req>";
+
+    // Control: the annotated record tseq lowers.
+    emit_cpp_src(SRC);
+
+    // Dropping the annotation defaults the element to a SCALAR, but the
+    // body still yields a record. Without the yield check that emitted
+    // `std::vector<int64_t>::push_back(t)` with `t` a struct —
+    // uncompilable C++ with no diagnostic.
+    let msg = assert_not_implemented(
+        &lower_src(&SRC.replace(DECL, "tseq Gen(n: int)")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("non-scalar value in a tseq whose element type is a scalar"),
+        "{msg}"
+    );
+    // The message names the record the user should annotate with, not a
+    // placeholder.
+    assert!(msg.contains("`-> TSeq<Req>`"), "{msg}");
+
+    // A SEQUENCE-typed yield leaks the same way and a record-only check
+    // would miss it: `push_back` of a `std::vector` into a
+    // `std::vector<int64_t>` is just as silent.
+    let seq_yield = SRC
+        .replace(
+            DECL,
+            "tseq Inner(n: int) -> TSeq<uint<8>>\n    yield 1\nend tseq Inner\n\ntseq Gen(n: int)",
+        )
+        .replace(
+            "        let t : Req\n        t.a = i\n        yield t\n",
+            "        let xs = Inner(2)\n        yield xs\n",
+        );
+    let msg = assert_not_implemented(
+        &lower_src(&seq_yield).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("non-scalar value"), "{msg}");
+
+    // A PRESENT but unusable annotation must not reach the default
+    // either: v1 renders each of these differently (`TSeq<int>` ->
+    // `vector<uint64_t>`, `TSeq<Vec<..>>` -> `vector<std::array<..>>`),
+    // so defaulting them to `int64_t` would silently change the element
+    // type rather than close a gap.
+    for ret in [
+        "TSeq<int>",
+        "TSeq<time>",
+        // A PRESENT non-`TSeq` return has no `TSeq` args either, so
+        // gating on "the args did not resolve" would have let these
+        // default silently. The gate is `return_ty` being ABSENT.
+        "Req",
+        "uint<8>",
+    ] {
+        let src = SRC.replace(DECL, &format!("tseq Gen(n: int) -> {ret}"));
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("element type"), "`-> {ret}`: {msg}");
+    }
+
+    // The default still applies where it is safe: an unannotated tseq
+    // whose body yields scalars.
+    let scalar = SRC.replace(DECL, "tseq Gen(n: int)").replace(
+        "        let t : Req\n        t.a = i\n        yield t\n",
+        "        yield i\n",
+    );
+    assert!(
+        emit_cpp_src(&scalar).contains("-> std::vector<int64_t>"),
+        "an unannotated scalar tseq still defaults"
     );
 }

@@ -3006,6 +3006,100 @@ case and only locally-determinable `Assign` types are compared).
     site: v1 does not check.
 
 
+48. **`tseqs.rs` reaches zero — and a probe conclusion that the test
+    suite overturned (2026-08-17).**
+
+    Two sites left in the small files, both already probed in divergence
+    47 as cases where **v1 is correct** — so both were gaps to CLOSE, not
+    diagnostics to reclassify.
+
+    **`tseq X()` with no `-> TSeq<T>` now defaults** to a signed 64-bit
+    element, byte-identically to v1's `-> std::vector<int64_t>`. The
+    annotated form is untouched and still emits the type it declares.
+    `tseqs.rs` joins `bus.rs` and `addrmap.rs` at zero `Unsupported`
+    sites.
+
+    Deliberately NOT merged with the bad-element-type arm beside it: an
+    absent annotation is defaultable, a present-but-unresolvable one is
+    not (divergence 47).
+
+    **The other site produced a wrong conclusion, and the existing test
+    suite caught it.** Four probes at `control.rs`'s transactor-edge arm
+    each landed in a *different* upstream interceptor — a non-DUT field
+    access, `exprs.rs`'s transactor/method call arm, a helper-call arm,
+    and (for a regblock read) nothing at all, since `RegRead` is not a
+    transactor edge. From four misses I concluded the arm was
+    unreachable and reclassified it as a defensive
+    `SilentlyMisLowers`.
+
+    `cargo test` then failed on
+    `transactor_self_call_in_wait_until_predicate_is_rejected`, a test
+    that predates this whole sweep and reaches the arm on its first try
+    — with the one spelling I had not written: a bare call to a sibling
+    **hookable** inside a transactor's own `when active` block. My
+    probes used `function`, which is a helper, and cross-transactor
+    calls, which are refused earlier.
+
+    Probing the right spelling shows v1 emits
+    `while (!(Xt_ready(self))) tick();` — exactly what re-evaluating a
+    predicate means, and it works. **`Unsupported` was right all
+    along**, and the change was reverted.
+
+    Two things worth keeping from that:
+
+    * **A negative result from N probes is not a proof of
+      unreachability.** It is evidence about the N spellings tried.
+      "Unreachable" is a claim about the whole input space and needs a
+      structural argument — the parser excludes it (divergence 43), or
+      the enum has no other variants — not an accumulation of misses.
+    * The regression suite is a probe corpus that was already written.
+      Grepping it for a site's own message before concluding anything
+      about reachability would have answered this in one command.
+
+    The input-space sample did find something the single spelling would
+    have missed: if the called hookable itself BLOCKS, v1 emits the same
+    loop while the callee contains `for (int _w = 0; _w < 1; _w++)
+    tick();`, so time advances inside the callee and again in the loop.
+    It compiles and runs; the timing is not what the source reads like.
+    That is recorded at the site as the reason a future split may be
+    wanted — it needs the callee's body, which lowering does not have
+    there.
+
+    **Review then caught the default swallowing two things it should
+    have rejected** — the same failure mode as divergences 36 and 44,
+    third time in this sweep: *a default that replaces a rejection
+    inherits the rejection's job.*
+
+    * The default was the only thing rejecting an UNANNOTATED tseq whose
+      body yields a RECORD. That began lowering to
+      `std::vector<int64_t>` with `push_back(t)` on a struct —
+      uncompilable C++, no diagnostic. `lower_yield`'s scalar arm now
+      refuses a record value; it had never needed to, because every
+      scalar-element sequence used to come from an explicit
+      `TSeq<uint<N>>`.
+    * The arm was the fall-through for any annotation that is neither a
+      scalar builtin nor a single identifier, not just an absent one, so
+      `TSeq<int>`, `TSeq<time>` and `TSeq<Vec<uint<8>, 4>>` all became
+      `vector<int64_t>` — where v1 renders `vector<uint64_t>` and
+      `vector<std::array<uint64_t,4>>`. Now gated on v1's own condition
+      (`tseq_args` absent), so absent and present-but-unusable stay
+      separate, which was the point of the split in the first place.
+
+    A second review round found three more leaks from the same widening,
+    which is the number worth recording: a **sequence**-typed yield slid
+    past a record-only guard, a **present non-`TSeq` return** (`-> Req`,
+    `-> uint<8>`) has no `TSeq` args either and so fell into the default
+    arm, and the guard's own message shipped a literal `<Record>`
+    placeholder. The gate is now `return_ty` being absent — not "the
+    element type failed to resolve" — and the yield guard rejects any
+    non-scalar local, naming the record to annotate with.
+
+    Five leaks across two rounds, from one nine-line default. The rule
+    is not new; what this batch adds is its cost. **Widening a gate
+    inherits every check that gate was silently performing, and they are
+    only visible by enumerating what the OLD arm used to reject** — not
+    by testing what the new one now accepts.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
