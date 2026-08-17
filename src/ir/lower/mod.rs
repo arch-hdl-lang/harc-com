@@ -4694,18 +4694,38 @@ fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt
 /// (`Unsupported`, and `--codegen v1` is a real escape hatch) and
 /// `NotImplemented { Rejects }`.
 ///
-/// Deliberately structural, and deliberately STRICTER than
-/// `dotted_path`, which was the first predicate tried here and leaked
-/// twice: it returns `Some` for a bare identifier and unwraps `Paren`,
-/// so `on ok pre` and `on (s.send) pre` both slipped into the
-/// `--codegen v1` branch for programs v1 refuses. v1 matches
-/// `ExprKind::Field` directly, so the top-level shape is checked
-/// directly too.
+/// Deliberately structural, and it does its OWN walk rather than
+/// delegating to `components::dotted_path`. Two predicates were tried
+/// first and both leaked into the `--codegen v1` branch for programs v1
+/// refuses:
+///
+///   * `dotted_path` alone — it returns `Some` for a bare identifier
+///     (`on ok pre`) and unwraps `Paren` (`on (s.send) pre`).
+///   * a top-level `ExprKind::Field` guard PLUS `dotted_path` — the
+///     guard fixes the outermost node and `dotted_path` still unwraps
+///     `Paren` one segment inward, so `on (s).send pre` and
+///     `on (e.inner).note pre` leaked too.
+///
+/// v1 pattern-matches `Field`/`Ident` at every level with no `Paren`
+/// arm, so the walk below has none either. `dotted_path` exists to parse
+/// `connect` endpoints, where a parenthesised path is fine — borrowing
+/// it here was borrowing a different question's answer.
+///
+/// Note there is no `!h.periodic` clause: a period makes the trigger an
+/// integer rather than a path, so the walk already rejects it, and v1's
+/// hook branch does not consult `h.periodic` either. Adding the clause
+/// made `on s.send cycles pre` disagree with v1 (and with the test-scope
+/// arm, which lowers it).
 pub(crate) fn is_v1_method_hook_shape(h: &crate::ast::OnHandler) -> bool {
-    !h.periodic
-        && h.phase != OnPhase::PostEval
-        && matches!(&*h.event.kind, ExprKind::Field { .. })
-        && components::dotted_path(&h.event).is_some_and(|p| p.len() >= 2)
+    /// `<ident>(.<ident>)*` with no parens, indexing or calls anywhere.
+    fn strict_path_len(e: &crate::ast::Expr) -> Option<usize> {
+        match &*e.kind {
+            ExprKind::Ident(_) => Some(1),
+            ExprKind::Field { target, .. } => Some(strict_path_len(target)? + 1),
+            _ => None,
+        }
+    }
+    h.phase != OnPhase::PostEval && strict_path_len(&h.event).is_some_and(|n| n >= 2)
 }
 
 /// Resolve an `on <obj>.<method> pre/post` hook target expression to

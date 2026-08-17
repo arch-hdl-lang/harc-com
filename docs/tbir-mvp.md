@@ -3402,15 +3402,16 @@ case and only locally-determinable `Assign` types are compared).
     that also fails is worse than no hint** — which is divergence 51's
     lesson, reintroduced two entries after writing it down.
 
-54. **The `on <obj>.<method> pre/post` hook spans eight sites across
-    three files, and four verdicts (2026-08-17).**
+54. **The `on <obj>.<method> pre/post` hook spans nine sites across
+    four files, and four verdicts (2026-08-17).**
 
     Divergences 52 and 53 treated "the hook family" as the arms inside
     `components.rs`. It is not a file-local construct. A user writes the
     same source in four different places, and grouping by construct
-    rather than by file turns up EIGHT existing sites across three
-    files. Seven were classified wrong, and three of those were
-    mixed-verdict and had to be split, leaving eleven arms:
+    rather than by file turns up NINE existing sites across four files —
+    three in `components.rs` and six that were invisible from inside it.
+    Every one carried at least one wrong verdict, and four were
+    mixed-verdict and had to be split, leaving fifteen arms:
 
     | site (→ arms after splitting) | v1 | was | now |
     |---|---|---|---|
@@ -3418,13 +3419,17 @@ case and only locally-determinable `Assign` types are compared).
     | component body periodic hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
     | component body event-subscription hook (`components.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
     | `testbench` declaration hook (`mod.rs`) | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
     | statement position (`stmts.rs`) → `phase post_eval` | rejects | `Unsupported` | `Rejects` |
     | …→ non-path trigger | rejects | `Unsupported` | `Rejects` |
     | …→ method path | **implements it** | `Unsupported` | `Unsupported` (kept) |
-    | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
     | test-scope target resolution (`mod.rs`) → non-path trigger | rejects | `Unsupported` | `Rejects` |
     | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
-    | test-scope non-transactor field (`mod.rs`) | **implements it** | `Invalid` | `Unsupported` |
+    | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
+    | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
+    | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
+    | …→ unhooked method path | uncompilable | `Unsupported` | `EmitsUncompilable` |
+    | …→ unhooked bool expression | **implements it** | `Unsupported` | `Unsupported` (kept) |
 
     Two of these are worth reading closely.
 
@@ -3473,12 +3478,27 @@ case and only locally-determinable `Assign` types are compared).
     writing the predicate you meant**; `dotted_path` exists to parse
     `connect` endpoints, where a parenthesised path is fine.
 
-    A `phase post_eval` modifier is the one axis that flips the verdict
-    without touching the trigger: v1 refuses it by name at every position
-    that carries a hook. It gets its own message rather than being
-    blamed on the path shape, and it turned up a SEVENTH site — the
+    A `phase post_eval` modifier flips the verdict without touching the
+    trigger, but only where v1 routes the handler through its method-hook
+    resolver — the statement position and test scope, where it refuses
+    the modifier by name. At the component-body and testbench-declaration
+    positions v1 still emits, with hook AND phase dropped, so those keep
+    `SilentlyMisLowers`. (An earlier draft of this entry said v1 "refuses
+    it by name at every position that carries a hook", which is the same
+    over-generalisation from two positions to all of them that the entry
+    above it is about.) The modifier gets its own message rather than
+    being blamed on the path shape, and it turned up a fifth site, the
     test-scope `phase post_eval` pre-check, which was `Unsupported` for
     an input v1 names in its own refusal.
+
+    A ninth site sat in a fourth file: `scoreboards.rs` answered every
+    `connect`/`on` in a scoreboard body with one `Unsupported`. Three
+    things live under it — a hooked handler (v1 drops the hook,
+    byte-identically, anchored at both trigger shapes), an unhooked
+    method path (v1 emits `(bool)(w.note)` against a `struct Watcher`
+    with no `note` member), and an unhooked bool expression (v1 emits
+    `(bool)(_tb.b.hits > 0)`, which works and keeps the suggestion). The
+    `connect` half is untouched and unprobed.
 
     The residual is bounded and stated: a path that is well-formed but
     does not resolve to a `hookable` still gets the suggestion, and the
@@ -3487,17 +3507,30 @@ case and only locally-determinable `Assign` types are compared).
     The lesson is about SCOPE, not about hooks. Batch 20's plan grouped
     `components.rs` by "what a user would have to write to reach the
     site" — and then applied that grouping only inside one file. The
-    construct does not respect the file boundary: it has EIGHT sites
-    across three files, and seven of them were invisible from inside
+    construct does not respect the file boundary: it has NINE sites
+    across four files, and six of them were invisible from inside
     `components.rs`. **Group by construct, then find every file that
     implements it.** Note also that this entry's own table was written
     saying "four positions" and had to be corrected twice as further
-    positions appeared, then a third time when the phase modifier turned
-    up two more — a count of sites is a claim like any other, and it
-    needs a search, not a recollection. Four review rounds on one
-    construct, each finding real leaks the previous round's probe had
-    not sampled, is the honest cost of a WIDE surface: the input space,
-    not the arm, is the unit of work.
+    positions appeared, a third time when the phase modifier turned up
+    two more, and a fourth when `scoreboards.rs` turned up — a count of
+    sites is a claim like any other, and it needs a search, not a
+    recollection. Five review rounds on one construct, each finding real
+    leaks the previous round's probe had not sampled, is the honest cost
+    of a WIDE surface: the input space, not the arm, is the unit of work.
+
+    The predicate itself took three attempts, and the failure mode was
+    the same each time — reaching for an existing helper instead of
+    writing the question. `dotted_path` accepts a bare identifier and
+    unwraps `Paren` at every level, because `connect` endpoints allow
+    both; guarding only the top-level node moved the leak one segment
+    inward (`on (s).send pre`). `is_v1_method_hook_shape` now does its
+    own walk with no `Paren` arm, matching v1's own pattern match. It
+    also carries no `!h.periodic` clause: a period makes the trigger an
+    integer, which the walk already rejects, and adding the clause made
+    `on s.send cycles pre` disagree with v1 AND with the sibling arm
+    that shares the predicate. **A conjunct that is redundant on the
+    inputs you sampled is not free — it is an untested claim.**
 
 ### The probe method
 

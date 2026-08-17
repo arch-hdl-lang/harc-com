@@ -16103,14 +16103,23 @@ fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination()
 /// wires; anything else it refuses outright, so pointing those at
 /// `--codegen v1` would hand the user a second error.
 ///
-/// The last two triggers are why the predicate is not `dotted_path`,
-/// which was tried first and leaked both: it returns `Some` for a bare
-/// identifier and unwraps `Paren`, while v1 matches `ExprKind::Field`
-/// directly. `on (s.send) pre` is one character from a program that
-/// works, and v1 refuses it.
+/// The last four triggers are why the predicate is a hand-written walk
+/// rather than `components::dotted_path`, which leaked twice: it returns
+/// `Some` for a bare identifier, and it unwraps `Paren` at EVERY level,
+/// so guarding the top-level node only moved the leak one segment
+/// inward. `on (s.send) pre` and `on (s).send pre` are each one
+/// character from a program that works, and v1 refuses both.
 #[test]
 fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
-    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)", "ok", "(s.send)"] {
+    for trigger in [
+        "dut.en > 0",
+        "5 cycles",
+        "w.ev(x)",
+        "ok",
+        "(s.send)",
+        "(s).send",
+        "(e.inner).note",
+    ] {
         let src = hook_positions("", "", &pre_hook_on(trigger, "        "));
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
         assert!(msg.contains("non-method-path"), "{msg}");
@@ -16120,7 +16129,7 @@ fn a_non_path_hook_trigger_in_statement_position_is_refused_by_v1_too() {
         );
         // The anchor: the SAME trigger without a hook side is fine, so
         // the rejection is about the hook and not about the trigger.
-        if !matches!(trigger, "w.ev(x)" | "(s.send)") {
+        if !trigger.contains('(') {
             let ctl = hook_positions(
                 "",
                 "",
@@ -16184,7 +16193,15 @@ fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
         "v1 walks the nested path, so the `--codegen v1` suggestion is honest"
     );
 
-    for trigger in ["dut.en > 0", "5 cycles", "w.ev(x)", "ok", "(s.send)"] {
+    for trigger in [
+        "dut.en > 0",
+        "5 cycles",
+        "w.ev(x)",
+        "ok",
+        "(s.send)",
+        "(s).send",
+        "(e.inner).note",
+    ] {
         let src = hook_positions("", &pre_hook_on(trigger, "    "), "");
         let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
         assert!(msg.contains("non-method-path"), "{msg}");
@@ -16231,4 +16248,112 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
         // `w.plain` would otherwise match on a one-character needle.
         assert!(msg.contains(&format!("`on {target}`")), "{msg}");
     }
+}
+
+/// The ninth site, in `scoreboards.rs`, which answered every
+/// `connect`/`on` in a scoreboard body with one `Unsupported`. Three
+/// things live under it and v1 does three different things.
+#[test]
+fn a_scoreboard_on_handler_splits_three_ways() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            .replace("    e   : Holder", "    e   : Holder\n    b   : Board")
+    };
+    let handler = |trigger: &str, hook: &str| {
+        format!("    on {trigger}{hook}\n        log(info, \"p\")\n    end on\n")
+    };
+
+    // The anchor for every byte-identity below: the scoreboard with no
+    // handler at all differs from each control.
+    let v1_none = cpp_tb::emit(&merged_src(&scoreboard(""))).expect("v1 emits");
+
+    // (a) A hook side — v1 drops it, byte-identically to the same
+    //     handler without one, at BOTH trigger shapes.
+    for trigger in ["hits > 0", "w.note"] {
+        let ctl = scoreboard(&handler(trigger, ""));
+        let v1_ctl = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits");
+        assert_ne!(
+            v1_ctl, v1_none,
+            "`on {trigger}` must contribute, or the identity below is vacuous"
+        );
+        let hooked = scoreboard(&handler(trigger, " pre"));
+        let msg = assert_not_implemented(
+            &lower_src(&hooked).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("on scoreboard `Board`"), "{msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
+            v1_ctl,
+            "v1 drops the hook on `on {trigger} pre`"
+        );
+    }
+
+    // (b) An unhooked METHOD PATH — v1 edge-detects on it and emits a
+    //     member access `struct Watcher` does not have.
+    let path = scoreboard(&handler("w.note", ""));
+    let msg = assert_not_implemented(
+        &lower_src(&path).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("`on <obj>.<method>` handler"), "{msg}");
+    let v1_path = cpp_tb::emit(&merged_src(&path)).expect("v1 emits");
+    assert!(
+        v1_path.contains("(bool)(w.note)"),
+        "v1 edge-detects the path"
+    );
+    let watcher = v1_path
+        .split_once("struct Watcher {")
+        .and_then(|(_, rest)| rest.split_once("};"))
+        .map(|(body, _)| body.to_string())
+        .expect("v1 emits a `Watcher` struct");
+    assert!(
+        !watcher.contains("note"),
+        "no `note` member, so `(bool)(w.note)` cannot compile: {watcher}"
+    );
+
+    // (c) An unhooked BOOL EXPRESSION — v1 emits a cycle trigger that
+    //     compiles, so this one keeps the `--codegen v1` suggestion.
+    let expr = scoreboard(&handler("hits > 0", ""));
+    let msg = assert_unsupported(&lower_src(&expr).unwrap_err());
+    assert!(msg.contains("event wiring"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&expr))
+            .expect("v1 emits")
+            .contains("(bool)(_tb.b.hits > 0)"),
+        "v1 lowers a bool-expression trigger against real members"
+    );
+}
+
+/// A period does not change what v1 does with a hooked method path: its
+/// hook branch never consults `h.periodic`. An earlier `!h.periodic`
+/// conjunct in the predicate made `on s.send cycles pre` `Rejects` in
+/// statement position while the test-scope arm lowered the same source.
+#[test]
+fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
+    let stmt = hook_positions("", "", &pre_hook_on("s.send cycles", "        "));
+    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
+    assert!(msg.contains("statement position"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&stmt))
+            .expect("v1 emits")
+            .contains("Sender_send_pre.push_back"),
+        "v1 wires it, so the suggestion is honest"
+    );
+    lower_src(&hook_positions(
+        "",
+        &pre_hook_on("s.send cycles", "    "),
+        "",
+    ))
+    .expect("and the test-scope arm lowers the same source");
 }

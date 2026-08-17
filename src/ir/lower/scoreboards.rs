@@ -96,6 +96,36 @@ pub(crate) fn lower_scoreboard(
                      mutate scoreboard fields directly from the test body instead",
                 ));
             }
+            // A hooked `on` in a scoreboard body is the same construct as
+            // the hook arms in `components.rs`, and v1 does the same
+            // thing to it: drops the hook and lowers the trigger alone,
+            // byte-identically to the handler written without a hook
+            // side. (Anchored: deleting the handler does change v1's
+            // output, at both trigger shapes below.) So the requested
+            // ordering is silently lost and `--codegen v1` is not an
+            // escape hatch.
+            ComponentItem::OnHandler(h) if h.hook.is_some() => {
+                return Err(super::not_implemented(
+                    &format!("a `pre`/`post` hook on an `on` handler on scoreboard `{sb}`"),
+                    "scoreboards take no method hooks; v1 accepts a hook side, drops it and \
+                     lowers the trigger as a plain handler",
+                    super::V1Status::SilentlyMisLowers,
+                ));
+            }
+            // An unhooked `on <obj>.<method>` — v1 emits
+            // `(bool)(w.note)` against a `struct Watcher` that has no
+            // `note` member (methods emit as free lambdas), so the C++
+            // does not compile. A bool-expression trigger is different:
+            // v1 emits `(bool)(_tb.b.hits > 0)`, which compiles and
+            // works, so that one keeps the suggestion below.
+            ComponentItem::OnHandler(h) if super::is_v1_method_hook_shape(h) && !h.periodic => {
+                return Err(super::not_implemented(
+                    &format!("an `on <obj>.<method>` handler on scoreboard `{sb}`"),
+                    "a method path is not a cycle-trigger expression; v1 edge-detects on it \
+                     and emits a member access against a struct that has no such member",
+                    super::V1Status::EmitsUncompilable,
+                ));
+            }
             ComponentItem::Connect(_) | ComponentItem::OnHandler(_) => {
                 return Err(unsupported(
                     &format!("event wiring (`connect`/`on`) on scoreboard `{sb}`"),
