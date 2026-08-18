@@ -547,6 +547,11 @@ pub struct TransactorMethodSchema {
     pub param_names: Vec<String>,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
+    /// True only when the source declaration used `hookable` rather than
+    /// plain `function`. Both forms share the same method-body IR, but only
+    /// a hookable method may be targeted by `on ... pre/post` handlers or
+    /// hook-triggered covergroups.
+    pub hookable: bool,
     /// True when this method is declared inside the transactor's `when
     /// active` block (as opposed to the always-on body). A method that is
     /// active-only is NOT callable on a `passive` instance — the call site

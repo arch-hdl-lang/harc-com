@@ -109,6 +109,13 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
                         p.method, p.cov_field
                     )));
                 };
+                if !prog.transactors[xid.index()].methods[midx].hookable {
+                    return Err(LowerError::Invalid(format!(
+                        "covergroup `{cg_name}` hook trigger `{field}.{}` (cov field `{}`) \
+                     does not name a `hookable` method on transactor `{xname}`",
+                        p.method, p.cov_field
+                    )));
+                }
                 HookTarget::Transactor {
                     xid,
                     midx,

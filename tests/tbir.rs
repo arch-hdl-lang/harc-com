@@ -19326,3 +19326,96 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         assert!(msg.contains("names no `hookable`"), "{what}: {msg}");
     }
 }
+
+/// A transactor `function` is callable but is not a hook target.
+///
+/// The dedicated transactor IR used to discard `HookableMethod::is_hookable`
+/// when it built `TransactorMethodSchema`. That made a plain function declared
+/// in `when active` indistinguishable from a real `hookable`: TB-IR accepted
+/// the pre-hook below and emitted hook fan-out, while v1 correctly rejected it.
+#[test]
+fn a_plain_transactor_function_is_not_a_hook_target() {
+    let src = r#"transactor Drv
+    dut : Top
+    when active
+        function plain(n: uint<8>)
+            log(info, "plain ${n}")
+        end function plain
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    on drv.plain pre
+        log(info, "must not register")
+    end on
+
+    run
+        drv.dut = dut
+        drv.plain(1)
+    end run
+end impl T"#;
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect_err("v1 refuses a hook on `function`");
+    assert!(
+        format!("{v1}").contains("must resolve to a `hookable`"),
+        "v1 establishes the language contract: {v1}"
+    );
+
+    let err = lower_src(src).expect_err("TB-IR must also refuse a hook on `function`");
+    assert!(
+        assert_invalid(&err).contains("does not name a `hookable`"),
+        "the diagnostic must distinguish a plain function from a hookable: {err}"
+    );
+}
+
+/// Hook-triggered covergroups obey the same `hookable` provenance rule as
+/// test-scope pre/post handlers; a plain transactor function must not acquire
+/// an implicit coverage subscription merely because it shares the method IR.
+#[test]
+fn a_plain_transactor_function_is_not_a_covergroup_hook_target() {
+    let src = r#"covergroup C @(drv.plain(n) post)
+    cp : cover dut.count_out
+        bins
+            zero = {0}
+        end bins
+end covergroup C
+
+transactor Drv
+    dut : Top
+    when active
+        function plain(n: uint<8>)
+            log(info, "plain ${n}")
+        end function plain
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+    cov : C
+end testbench Tb
+
+impl T for Tb
+    run
+        drv.dut = dut
+        drv.plain(1)
+    end run
+end impl T"#;
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect_err("v1 refuses a cover hook on `function`");
+    assert!(
+        format!("{v1}").contains("must resolve to a `hookable`"),
+        "v1 establishes the language contract: {v1}"
+    );
+
+    let err = lower_src(src).expect_err("TB-IR must refuse a cover hook on `function`");
+    assert!(
+        assert_invalid(&err).contains("does not name a `hookable`"),
+        "the diagnostic must distinguish a plain function from a hookable: {err}"
+    );
+}

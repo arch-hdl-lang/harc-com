@@ -4339,9 +4339,16 @@ fn lower_test(
             }
         })?;
         let xschema = prog.transactor(xid);
-        if xschema.method(&method).is_none() {
+        let Some(target_method) = xschema.method(&method) else {
             return Err(LowerError::Invalid(format!(
                 "`on {xfield}.{method}` hook: transactor `{}` declares no method `{method}`",
+                xschema.name
+            )));
+        };
+        if !target_method.hookable {
+            return Err(LowerError::Invalid(format!(
+                "`on {xfield}.{method}` hook: `{xfield}.{method}` does not name a `hookable` \
+                 method on transactor `{}`",
                 xschema.name
             )));
         }
@@ -4354,10 +4361,8 @@ fn lower_test(
         // method's param names (a test-let sharing a param name resolves to
         // the param, not the promoted cell).
         let mut hook_scope = HashSet::new();
-        if let Some(m) = xschema.method(&method) {
-            for p in &prog.function(m.function).params {
-                hook_scope.insert(p.name.clone());
-            }
+        for p in &prog.function(target_method.function).params {
+            hook_scope.insert(p.name.clone());
         }
         collect_promotable_check_reads(&h.body, &test_let_names, &hook_scope, &mut promoted_lets);
         resolved_hooks.push((xid, method, *side, h));
