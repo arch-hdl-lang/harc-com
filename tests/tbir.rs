@@ -1250,76 +1250,6 @@ fn event_driven_transactor_fixture_lowers() {
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
-/// An event-driven consumer with NO DUT handle keeps the event-driven
-/// mode contract: `active` required, `passive` a loud rejection.
-///
-/// Regression: `transactor_is_analysis_source` counted any `event<...>`
-/// field, `in` included, so this shape was classified as an
-/// analysis SOURCE. The analysis-source mode gate runs ahead of the
-/// event-driven one, which inverted both answers — `active` (the form
-/// the event-driven gate REQUIRES) became `Invalid`, and `passive`
-/// (which it rejects, since the `on` handler never registers, leaving
-/// `emit drv.req(..)` with no subscriber) was silently accepted.
-///
-/// `event_driven_transactor_fixture_lowers` above does not cover it:
-/// every event-driven FIXTURE also holds a DUT handle, and the
-/// classifier's `has_named_field` arm already excluded those. The
-/// distinguishing shape is a consumer with a bare `in event` and
-/// nothing else.
-#[test]
-fn dutless_event_driven_consumer_keeps_the_event_driven_mode_contract() {
-    let src = |mode: &str| {
-        format!(
-            r#"
-transactor Consumer
-    req : in event<uint<8>>
-    got : uint<32> default 0
-
-    on req(v)
-        got = got + 1
-    end on
-end transactor Consumer
-
-testbench ConsTb
-    dut : Top
-    drv : Consumer {mode}
-end testbench ConsTb
-
-impl ConsumerModeTest for ConsTb
-    run
-        emit drv.req(1)
-    end run
-end impl ConsumerModeTest
-"#
-        )
-    };
-
-    let prog = lower_src(&src("active")).expect("an active dutless consumer lowers");
-    verify::verify_program(&prog).expect("verifies");
-    let comp = prog
-        .components
-        .iter()
-        .find(|c| c.name == "Consumer")
-        .expect("Consumer component");
-    assert!(
-        comp.fields
-            .iter()
-            .any(|f| matches!(f.kind, ir::ComponentFieldKind::Event { .. })),
-        "the `in event` pipe survives as a subscriber vector"
-    );
-    assert_eq!(comp.on_handlers.len(), 1, "the consumer's `on` handler registers");
-
-    // Not `Invalid`: this is the event-driven gate's own rejection, and
-    // it must name the inert-passive reason rather than the
-    // analysis-source mode policy.
-    let err = lower_src(&src("passive")).expect_err("a passive consumer is rejected");
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("passive event-driven transactor field"),
-        "rejection should come from the event-driven gate: {msg}"
-    );
-}
-
 /// The *bound-to* event-driven transactor (`transactor X bound to
 /// BusAxiLite` + `req : in event` + `on req` driving the bound bus's
 /// handshake channels) now lowers: it routes to the composite-component
@@ -3334,6 +3264,92 @@ end test MonTest
     let err = lower_src(&src("passive")).expect_err("a passive descendant still gates");
     let msg = assert_invalid(&err);
     assert!(msg.contains("activate"), "{msg}");
+}
+
+/// A consumer whose `on` handler is active-only cannot be bound
+/// `passive`: nothing would subscribe to its `in event`, so the `emit`
+/// runs its fan-out over an empty vector and the transaction vanishes.
+///
+/// The emitted C++ for the rejected form was the whole diagnosis — a
+/// `for (auto& _s : t.req) _s(1);` loop with no `push_back` anywhere.
+/// The analysis-source mode gates accept `passive` and run ahead of the
+/// event-driven one, and a consumer that also declares an `out event` is
+/// an analysis source, so they claimed the type first; this gate runs
+/// before them.
+///
+/// The `out event` axis is covered both ways because it decides which
+/// gate would otherwise claim the type, and the always-on rows are the
+/// control: an `on` handler in the ordinary body registers for EVERY
+/// mode, so `passive` keeps working there and must not be swept up.
+#[test]
+fn an_active_only_consumer_rejects_every_mode_but_active() {
+    let consumer = |out_event: bool, active_only: bool, mode: &str| {
+        let obs = if out_event {
+            "    obs : out event<uint<8>>\n"
+        } else {
+            ""
+        };
+        let handler = "on req(v)\n            n = n + 1\n        end on";
+        let body = if active_only {
+            format!("    when active\n        {handler}\n    end when\n")
+        } else {
+            format!("    {handler}\n")
+        };
+        format!(
+            r#"
+transactor T
+    req : in event<uint<8>>
+{obs}    n   : uint<32> default 0
+
+{body}end transactor T
+
+testbench Tb
+    dut : Top
+    t   : T {mode}
+end testbench Tb
+
+impl MTest for Tb
+    run
+        emit t.req(1)
+    end run
+end impl MTest
+"#
+        )
+    };
+
+    for out_event in [false, true] {
+        // Active-only handler: `active` is the only mode that subscribes.
+        let prog = lower_src(&consumer(out_event, true, "active"))
+            .unwrap_or_else(|e| panic!("out_event={out_event}: active lowers: {e:?}"));
+        verify::verify_program(&prog).expect("verifies");
+        let src = consumer(out_event, true, "active");
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("emits");
+        assert!(
+            cpp.contains("req.push_back"),
+            "out_event={out_event}: the active instance subscribes"
+        );
+
+        let err = lower_src(&consumer(out_event, true, "passive"))
+            .expect_err("a passive active-only consumer must be rejected");
+        let msg = assert_unsupported(&err);
+        assert!(
+            msg.contains("when active") && msg.contains("no subscriber"),
+            "out_event={out_event}: the diagnostic should say why: {msg}"
+        );
+
+        // Control: an always-on handler registers on every mode, so
+        // `passive` stays legal and stays wired.
+        let src = consumer(out_event, false, "passive");
+        let prog = lower_src(&src)
+            .unwrap_or_else(|e| panic!("out_event={out_event}: always-on passive lowers: {e:?}"));
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("emits");
+        assert!(
+            cpp.contains("req.push_back"),
+            "out_event={out_event}: an always-on handler wires a passive instance"
+        );
+    }
 }
 
 /// A testbench-owned `connect` edge is gated on instance mode, exactly

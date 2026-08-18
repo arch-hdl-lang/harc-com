@@ -1272,6 +1272,23 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
 
+    // Consumers whose subscribing `on` handler is active-only. Their
+    // `passive` instance registers no subscriber at all, so an `emit`
+    // into its `in event` is silently dropped — checked ahead of the
+    // analysis-source gates, which accept `passive` and would otherwise
+    // claim such a type first (a consumer that also declares an `out
+    // event` is an analysis source too).
+    let active_only_consumer_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t) if components::transactor_is_active_only_consumer(t) => {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
     // Preserve the source declaration kind after shape-based routing into the
     // component table. This distinguishes always-on transactor monitors (where
     // `passive` is a compatible ownership annotation) from actual structural
@@ -1464,6 +1481,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &component_type_names,
                         &mode_sensitive_analysis_source_names,
                         &always_on_analysis_source_names,
+                        &active_only_consumer_names,
                         &component_transactor_names,
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
@@ -2207,6 +2225,7 @@ fn validate_testbench_component(
     component_type_names: &HashSet<String>,
     mode_sensitive_analysis_source_names: &HashSet<String>,
     always_on_analysis_source_names: &HashSet<String>,
+    active_only_consumer_names: &HashSet<String>,
     component_transactor_names: &HashSet<String>,
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
@@ -2246,6 +2265,29 @@ fn validate_testbench_component(
                 if let TypeExpr::Named { name, mode, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
+                        continue;
+                    }
+                    // Ahead of the analysis-source gates: a consumer whose
+                    // `on` handler is active-only has no subscriber on any
+                    // other mode, and those gates would accept `passive`.
+                    if active_only_consumer_names.contains(simple) {
+                        if !matches!(mode, Some(TransactorMode::Active)) {
+                            return Err(unsupported(
+                                &format!(
+                                    "an event-driven transactor field `{}.{} : {simple}` whose \
+                                     `on` handler is declared inside `when active`, bound \
+                                     {}",
+                                    c.name.name,
+                                    f.name.name,
+                                    match mode {
+                                        Some(TransactorMode::Passive) => "`passive`",
+                                        _ => "without a mode",
+                                    }
+                                ),
+                                "the handler registers only on an `active` instance, so an \
+                                 `emit` into this instance's `in event` reaches no subscriber",
+                            ));
+                        }
                         continue;
                     }
                     if mode_sensitive_analysis_source_names.contains(simple) {

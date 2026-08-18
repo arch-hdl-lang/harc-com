@@ -170,33 +170,18 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
     if t.bound_to.is_some() {
         return false;
     }
-    let mut has_out_event = false;
+    let mut has_event = false;
     let mut has_named_field = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         if let ComponentItem::Field(f) = it {
             if is_event_field(f) {
-                // An `in event<T>` is a CONSUMER pipe, not the "output
-                // event surface" above: it is the event-driven BFM's
-                // input, classified by `transactor_is_event_driven`.
-                // Counting it here made a pure consumer (`req : in
-                // event<T>` + `on req`, no DUT handle) an analysis
-                // source, and the analysis-source mode gate runs first —
-                // so `drv : Consumer active`, the form that gate
-                // REQUIRES, was rejected as invalid, and `drv : Consumer
-                // passive`, which it rejects as inert, was silently
-                // accepted into a component with no subscriber. The
-                // fixture corpus missed it because every event-driven
-                // fixture also holds a DUT handle, which the
-                // `has_named_field` arm already excluded.
-                if !matches!(f.direction, Some(crate::ast::Direction::In)) {
-                    has_out_event = true;
-                }
+                has_event = true;
             } else if matches!(&f.ty, TypeExpr::Named { .. }) {
                 has_named_field = true;
             }
         }
     }
-    has_out_event && !has_named_field
+    has_event && !has_named_field
 }
 
 /// Whether an analysis-source transactor has behavior or storage whose
@@ -335,6 +320,38 @@ pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
         }
     }
     has_in_event && has_on_handler
+}
+
+/// True when a consumer's subscribing `on <ev>` handler lives ONLY under
+/// `when active`, so it registers for an `active` instance and for no
+/// other. Such an instance bound `passive` (or mode-less, where the mode
+/// is not inherited as `active`) is inert in the one way that matters:
+/// nothing subscribes to its `in event`, so an `emit <inst>.<ev>(..)`
+/// runs its fan-out loop over an empty vector and the transaction is
+/// dropped on the floor.
+///
+/// That is what the emitter produced for `t : T passive` here — the
+/// `for (auto& _s : t.req) _s(1);` loop with no `push_back` anywhere —
+/// and no gate objected, because the analysis-source mode gates accept
+/// `passive` and run ahead of the event-driven one.
+///
+/// A consumer whose `on` handler sits in the ordinary body is NOT this:
+/// it registers regardless of mode, the emitter wires it on a passive
+/// instance, and it keeps accepting every mode the analysis-source
+/// policy allows.
+pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
+    if !transactor_is_event_driven(t) {
+        return false;
+    }
+    let subscribes = |items: &[ComponentItem]| {
+        items
+            .iter()
+            .any(|it| matches!(it, ComponentItem::OnHandler(h) if !h.periodic))
+    };
+    // An always-on handler anywhere means something registers for every
+    // mode, so the instance is not inert even if a second handler is
+    // active-only.
+    !subscribes(&t.items) && t.when_active.as_deref().is_some_and(subscribes)
 }
 
 /// True when a composite-component transactor is a *reactive monitor /
@@ -3391,11 +3408,24 @@ impl super::FuncBuilder<'_> {
 
     /// Activation check for a member reached through a SELF sub-component
     /// field (`relay.activate()` inside the env that declares `relay`).
-    /// The instance mode is the one declared on that field: a component
-    /// body is shared across every instance of its type, so there is no
-    /// test-scope binding name to resolve here — the field's own `Sub`
-    /// mode is the whole context, and a field with none exposes no
-    /// active-only member.
+    ///
+    /// Only a field declared `passive` is rejected here. A component body
+    /// is lowered ONCE and shared by every instance of its type, so the
+    /// mode of a field that declares none is whatever its holder was
+    /// bound as — `env Wrap { relay : ModeRelay }` is `active` under `let
+    /// wrap : Wrap active` and passive under another binding, and this
+    /// seam sees neither. A declared `passive` is decidable because a
+    /// declared mode WINS over the inherited one (`resolve_component_-
+    /// path_mode`: `declared.or(inherited)`), so it is passive at every
+    /// binding.
+    ///
+    /// Reading the declared mode as the whole context is what an earlier
+    /// version of this check did, and it rejected the mode-less field
+    /// above — reporting it as a "passive transactor" when it had no mode
+    /// at all — while the same call spelled `wrap.relay.activate()` was
+    /// still accepted. The inherited case stays uncaught here; catching
+    /// it needs per-instance body specialization, which is also why the
+    /// path form resolves it and this one cannot.
     fn require_self_sub_activation(
         &self,
         field: &str,
@@ -3414,7 +3444,7 @@ impl super::FuncBuilder<'_> {
             Some(ComponentFieldKind::Sub { mode, .. }) => *mode,
             _ => None,
         };
-        if !matches!(mode, Some(ComponentInstanceMode::Active)) {
+        if matches!(mode, Some(ComponentInstanceMode::Passive)) {
             return Err(LowerError::Invalid(format!(
                 "active-only {member_kind} `{member}` is used through passive transactor `{field}`"
             )));
