@@ -847,6 +847,38 @@ impl FuncBuilder<'_> {
                 }
             }
         }
+        // A `let` whose declared type names a REGBLOCK or ADDRMAP is an
+        // instantiation, and an instantiation without `= bind <helper>`
+        // has no bus for its registers to reach. v1 states that rule and
+        // refuses to emit at all — "regblock instantiation requires
+        // `= bind <helper>` (a transactor with write/read methods)" —
+        // for every spelling: at test scope, inside `run`, with no
+        // initializer, and with a same-typed mirror on the right.
+        //
+        // This ran BEFORE the record arm below because a regblock's
+        // mirror record shares the regblock's name, so without the guard
+        // the let landed on the ordinary record-local path and lowered
+        // clean. The emitted testbench then served every register access
+        // from that mirror and issued NO bus traffic at all: the control
+        // emits `AxilHelper_write(40, 64); v = AxilHelper_read(40);` and
+        // the unbound one emits `v = regs.MM2S_LEN;`. The test passes
+        // without ever touching the DUT.
+        //
+        // A properly bound `let regs : R = bind <helper>` never reaches
+        // here — the test-item walk in `mod.rs` consumes it — and a
+        // `= bind` written in statement position is rejected on its own
+        // before this. Divergence 103.
+        if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
+            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if self.ctx.regblock_instance_types.contains(simple) {
+                return Err(LowerError::Invalid(format!(
+                    "`let {} : {simple}` instantiates a register block without a bus: a \
+                     regblock/addrmap instantiation requires `= bind <helper>` (a \
+                     transactor with write/read methods)",
+                    l.name.name
+                )));
+            }
+        }
         // Record-typed local: `let t : TxnType` default-constructs (v1
         // declares the struct at the let site, so field defaults re-run
         // on every loop iteration — RecordInit mirrors that).

@@ -6418,6 +6418,68 @@ former `transaction` group lives in
      above the one that contradicted it.
 
 
+104. **Five copies of one `= bind` check, and a hole between them
+     (2026-08-18).**
+
+     A regblock, an addrmap, an initiator-BFM instance, a bound-to
+     event-driven transactor and a target-TLM responder all require a
+     bare identifier on the right of `= bind`, and each checked for it
+     with its own copy of the same four-line match:
+
+     ```rust
+     let x = match l.value.as_ref().map(|v| &*v.kind) {
+         Some(ExprKind::Ident(id)) => id.name.clone(),
+         _ => return Err(unsupported(…, "only `= bind <…>` is lowered")),
+     };
+     ```
+
+     All five said "re-run with `--codegen v1`". v1 refuses a
+     non-identifier RHS itself, with its own diagnostic — measured on
+     `bind helper.x`, `bind helper()`, `bind (helper)` and `bind 5` at
+     each of the five landings:
+
+     ```
+     let regs : DmaRegs = bind <expr>: regblock binding RHS must be a
+       helper transactor identifier
+     let helper : AxilHelper = bind <expr>: rhs must be a bare
+       bus-binding name in v0
+     ```
+
+     So all five are `NotImplemented { Rejects }`, and they now share one
+     `bind_rhs_ident`.
+
+     **The hole is the side all five copies were guarding the wrong way
+     round.** Each arm is gated on `l.bind`, so a `let` with NO `= bind`
+     reaches none of them — and a regblock's mirror record shares the
+     regblock's name, so `let regs : DmaRegs` landed on the ordinary
+     record-local path and lowered, verified and emitted clean. The
+     difference in the emitted testbench:
+
+     ```cpp
+     // let regs : DmaRegs = bind helper
+     AxilHelper_write(40, 64);
+     v = AxilHelper_read(40);
+     regs.MM2S_LEN = v;
+
+     // let regs : DmaRegs
+     v = regs.MM2S_LEN;
+     ```
+
+     Every register access served from the mirror, no bus traffic at
+     all, and the test passes without ever touching the DUT. v1 refuses
+     the same program outright — "regblock instantiation requires
+     `= bind <helper>` (a transactor with write/read methods)" — for
+     every spelling: at test scope, inside `run`, with no initializer,
+     and with a same-typed mirror on the right. TB-IR states that rule
+     now too, as `Invalid`, in v1's own words. `addrmap` had the same
+     hole reaching a different arm ("uninitialized `let chip` without a
+     scalar type", which named neither the construct nor the fix).
+
+     This is the first defect on this sweep that is not a
+     misclassification: TB-IR was ACCEPTING a program v1 rejects, and
+     tbir is the default backend.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

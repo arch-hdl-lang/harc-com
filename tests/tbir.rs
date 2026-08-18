@@ -61,6 +61,20 @@ fn lower_with_stdlib_bus(
     lower::lower_program(&merged)
 }
 
+/// `merge_for_sim` of one source string plus `stdlib/<Bus>.arch` — the
+/// source-string analogue of `lower_with_stdlib_bus`, for probes built
+/// by editing a bus-using fixture.
+fn merged_with_stdlib_bus(src: &str, bus_file: &str) -> harc::ast::SourceFile {
+    let fix = parse_source(src).expect("source parses");
+    let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("stdlib")
+        .join(bus_file);
+    let bus_src = std::fs::read_to_string(&bus_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
+    let bus = parse_source(&bus_src).expect("stdlib bus parses");
+    merge::merge_for_sim(vec![fix, bus], None).expect("merge")
+}
+
 /// Lower + verify + emit one registry fixture through the tbir backend
 /// with default options (the `--sv` Verilator path the equivalence
 /// harness exercises).
@@ -4439,6 +4453,143 @@ end impl T"#
                 .expect("v1 emits")
                 .contains(shape),
             "`{ty}`: v1 flattens it to `{shape}`"
+        );
+    }
+}
+
+/// The five `= bind <name>` arms, and the hole between them.
+///
+/// A regblock, an addrmap, an initiator-BFM instance, a bound-to
+/// event-driven transactor and a target-TLM responder all require a
+/// bare identifier on the right of `= bind`, and all five checked for
+/// it with their own copy of the same four-line match — each saying
+/// "re-run with `--codegen v1`". v1 REJECTS a non-identifier RHS itself,
+/// with its own diagnostic, so every one of those suggestions sent the
+/// user to an identical refusal.
+///
+/// The hole is what the five copies were all guarding the wrong side
+/// of: with NO `= bind` at all, `l.bind` is false, none of the five
+/// arms is reached, and a regblock's mirror record shares the
+/// regblock's name — so the `let` landed on the ordinary record-local
+/// path and lowered clean. The emitted testbench then served every
+/// register access from the mirror and issued no bus traffic at all.
+#[test]
+fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
+    let fixture_with = |name: &str, from: &str, to: &str| {
+        let src = fixture(name);
+        assert_eq!(src.matches(from).count(), 1, "`{from}` is unique in {name}");
+        src.replace(from, to)
+    };
+    let lower_bus =
+        |src: &str| lower::lower_program(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+
+    // Every non-identifier spelling, at every one of the five landings.
+    // v1 refuses each with its own message, so none may suggest it.
+    for (name, from, to, construct) in [
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind helper.x",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind 5",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind (helper)",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let helper : AxilHelper active = bind axil",
+            "let helper : AxilHelper active = bind axil.aw",
+            "initiator-BFM instance `helper` bound to a non-identifier",
+        ),
+        (
+            "regblock_addrmap_test.harc",
+            "let chip   : Soc = bind helper",
+            "let chip   : Soc = bind helper.x",
+            "addrmap binding `chip` to a non-identifier helper",
+        ),
+        (
+            "axilite_bound_mon_test.harc",
+            "let drv  : AxilXactor active  = bind axil",
+            "let drv  : AxilXactor active  = bind axil.aw",
+            "bound-to event-driven transactor `drv` bound to a non-identifier",
+        ),
+    ] {
+        let src = fixture_with(name, from, to);
+        let msg = assert_not_implemented(&lower_bus(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains(construct), "{msg}");
+        // The evidence: v1 refuses it too, rather than emitting.
+        let err = cpp_tb::emit(&merged_with_stdlib_bus(&src, "BusAxiLite.arch"))
+            .expect_err("v1 refuses a non-identifier bind RHS");
+        assert!(
+            format!("{err}").contains("bind <expr>"),
+            "v1's own refusal names the shape: {err}"
+        );
+    }
+    // The fifth landing lives in a different fixture and bus.
+    let tlm = {
+        let src = fixture("dma_engine_tlm_target_test.harc");
+        src.replace(
+            "let target : DmaMemTarget passive = bind mem",
+            "let target : DmaMemTarget passive = bind mem.x",
+        )
+    };
+    let merged =
+        merge::merge_for_sim(vec![parse_source(&tlm).expect("parses")], None).expect("merge");
+    let msg = assert_not_implemented(
+        &lower::lower_program(&merged).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("target-TLM responder `target`"), "{msg}");
+    assert!(
+        format!("{}", cpp_tb::emit(&merged).expect_err("v1 refuses")).contains("bind <expr>"),
+        "v1 refuses it too"
+    );
+
+    // The hole. All three spellings of a regblock-typed `let` with no
+    // `= bind` used to lower clean and drop every bus access.
+    for (name, from, to) in [
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs",
+        ),
+        (
+            "regblock_access_test.harc",
+            "        let v = regs.MM2S_LEN",
+            "        let snap : DmaRegs\n        let v = regs.MM2S_LEN",
+        ),
+        (
+            "regblock_access_test.harc",
+            "        let v = regs.MM2S_LEN",
+            "        let snap : DmaRegs = regs\n        let v = regs.MM2S_LEN",
+        ),
+        (
+            "regblock_addrmap_test.harc",
+            "let chip   : Soc = bind helper",
+            "let chip   : Soc",
+        ),
+    ] {
+        let src = fixture_with(name, from, to);
+        let err = lower_bus(&src).unwrap_err();
+        let lower::LowerError::Invalid(msg) = &err else {
+            panic!("`{to}` is Invalid, not `{err:?}`");
+        };
+        assert!(msg.contains("without a bus"), "{msg}");
+        // v1 states the same rule, which is where the wording came from.
+        let v1 = cpp_tb::emit(&merged_with_stdlib_bus(&src, "BusAxiLite.arch"))
+            .expect_err("v1 refuses an unbound regblock instantiation");
+        assert!(
+            format!("{v1}").contains("requires `= bind <helper>`"),
+            "v1's own rule: {v1}"
         );
     }
 }

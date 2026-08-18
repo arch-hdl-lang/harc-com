@@ -773,6 +773,39 @@ fn surface_constraint_lower_error(
     None
 }
 
+/// The bare identifier on the right of `= bind <name>`, for the five
+/// bindings that all require one: a regblock, an addrmap, an
+/// initiator-BFM instance, a bound-to event-driven transactor instance,
+/// and a target-TLM responder.
+///
+/// It was five copies of the same four-line match with five different
+/// messages, and all five said "re-run with `--codegen v1`". v1 REJECTS
+/// a non-identifier RHS itself, with its own diagnostic — measured on
+/// `bind helper.x`, `bind helper()`, `bind (helper)` and `bind 5` at
+/// each of the five landings:
+///
+///   "let regs : DmaRegs = bind <expr>: regblock binding RHS must be a
+///    helper transactor identifier"
+///   "let helper : AxilHelper = bind <expr>: rhs must be a bare
+///    bus-binding name in v0"
+///
+/// So none of them is an escape hatch; the suggestion sent the user to
+/// an identical refusal.
+fn bind_rhs_ident(
+    value: Option<&crate::ast::Expr>,
+    what: &str,
+    expected: &str,
+) -> Result<String, LowerError> {
+    match value.map(|v| &*v.kind) {
+        Some(ExprKind::Ident(id)) => Ok(id.name.clone()),
+        _ => Err(not_implemented(
+            what,
+            format!("only `= bind {expected}` is lowered, and v1 rejects the rest too"),
+            V1Status::Rejects,
+        )),
+    }
+}
+
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
@@ -1588,6 +1621,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1654,6 +1688,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1851,6 +1886,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: HashSet::new(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -2840,18 +2876,14 @@ fn lower_test(
                 let rbid = regblock_ids[rb_name];
                 // RHS must be a bare helper-instance identifier (the
                 // transactor field the frontdoor routes through).
-                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "regblock binding `{}` to a non-identifier helper",
-                                l.name.name
-                            ),
-                            "only `= bind <helper>` (a transactor instance) is lowered",
-                        ));
-                    }
-                };
+                let helper_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "regblock binding `{}` to a non-identifier helper",
+                        l.name.name
+                    ),
+                    "<helper>` (a transactor instance)",
+                )?;
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
             }
             // Addrmap binding: `let chip : Soc = bind <helper>`.
@@ -2877,18 +2909,14 @@ fn lower_test(
                 }
                 let amap_name = type_simple_name(l.ty.as_ref()).unwrap().to_string();
                 // RHS must be a bare helper-instance identifier.
-                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "addrmap binding `{}` to a non-identifier helper",
-                                l.name.name
-                            ),
-                            "only `= bind <helper>` (a transactor instance) is lowered",
-                        ));
-                    }
-                };
+                let helper_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "addrmap binding `{}` to a non-identifier helper",
+                        l.name.name
+                    ),
+                    "<helper>` (a transactor instance)",
+                )?;
                 addrmap_binds.push((l.name.name.clone(), amap_name, helper_field));
             }
             // Bound-to initiator-side BFM: `let helper : AxilHelper
@@ -2978,18 +3006,14 @@ fn lower_test(
                     }
                 }
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "initiator-BFM instance `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "initiator-BFM instance `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "<bus-binding>",
+                )?;
                 let xid = ir::TransactorId(
                     prog.transactors
                         .iter()
@@ -3082,18 +3106,14 @@ fn lower_test(
                     }
                 };
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "bound-to event-driven transactor `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "bound-to event-driven transactor `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "<bus-binding>",
+                )?;
                 let cid = component_ids[simple];
                 bound_event_component_binds.push((
                     l.name.name.clone(),
@@ -3169,18 +3189,14 @@ fn lower_test(
                     }
                 }
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "target-TLM responder `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "target-TLM responder `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "<bus-binding>",
+                )?;
                 let xid = ir::TransactorId(
                     prog.transactors
                         .iter()
@@ -4693,6 +4709,11 @@ fn lower_test(
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
         test_scope_lets: test_let_names,
+        regblock_instance_types: regblock_ids
+            .keys()
+            .chain(addrmap_decls.keys())
+            .cloned()
+            .collect(),
         regblock_bindings: regblock_bindings_map,
         regblock_init_order,
         addrmap_bindings: addrmap_bindings_map,
@@ -5687,6 +5708,20 @@ pub(crate) struct LowerCtx {
     /// and check are separate IR functions, so v1's shared-capture
     /// scoping is not representable.
     pub test_scope_lets: HashSet<String>,
+    /// Every `regblock` and `addrmap` DECLARATION name in the file.
+    ///
+    /// A `let` whose declared type names one of these is an
+    /// INSTANTIATION and requires `= bind <helper>`; without it there is
+    /// no bus for the registers to reach. v1 states that rule and
+    /// enforces it ("regblock instantiation requires `= bind <helper>`
+    /// (a transactor with write/read methods)"), refusing to emit at
+    /// all. TB-IR used to accept it silently, because a regblock's
+    /// mirror record shares its name and the let landed on the ordinary
+    /// record-local arm — the emitted testbench then served every
+    /// register access from the mirror and issued NO bus traffic, so
+    /// the test passed without ever touching the DUT. See divergence
+    /// 103.
+    pub regblock_instance_types: HashSet<String>,
     /// Register-block bindings (`let regs : R = bind <helper>`) →
     /// per-binding access context (mirror record, helper field,
     /// registers). Empty for helper/method/synthetic contexts.
