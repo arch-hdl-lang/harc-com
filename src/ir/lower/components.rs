@@ -2675,6 +2675,7 @@ impl super::FuncBuilder<'_> {
                     self.require_component_activation(
                         &path[0],
                         head_cid,
+                        self.binding_mode(&path[0]),
                         &recv[1..],
                         method_schema.activation,
                         "method",
@@ -2744,7 +2745,27 @@ impl super::FuncBuilder<'_> {
                             comp.field(&sub.name).map(|f| &f.kind)
                         {
                             let sub_comp = &self.ctx.components[component.index()];
-                            if sub_comp.method(&method.name).is_some() {
+                            if let Some(method_schema) = sub_comp.method(&method.name) {
+                                // This arm returned unconditionally, unlike
+                                // the path arm above and the self-call arm,
+                                // so an active-only method reached through a
+                                // `passive` sub-component field emitted its
+                                // call: `env Wrap { relay : ModeRelay
+                                // passive; hookable kick() relay.activate()
+                                // end kick }` emitted
+                                // `ModeRelay_activate(self.relay);`. The
+                                // receiver is a self-rooted field, so the
+                                // mode is the field's own — resolved by
+                                // `require_self_sub_activation` rather than
+                                // by the test-scope `component_modes` map,
+                                // which a component body is not keyed in.
+                                self.require_self_sub_activation(
+                                    &sub.name,
+                                    self_cid,
+                                    method_schema.activation,
+                                    "method",
+                                    &method.name,
+                                )?;
                                 return Ok(Some((
                                     ComponentBase::Path(vec!["self".to_string(), sub.name.clone()]),
                                     *component,
@@ -2839,6 +2860,7 @@ impl super::FuncBuilder<'_> {
         self.require_component_activation(
             &recv[0],
             head_cid,
+            self.binding_mode(&recv[0]),
             &recv[1..],
             field.activation,
             "queue",
@@ -3065,7 +3087,9 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(target) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some((head_cid, base_head, tail)) = self.component_path_head(&path) {
+                if let Some((head_cid, base_head, tail, head_mode)) =
+                    self.component_path_head(&path)
+                {
                     let (recv_tail, field) = tail.split_at(tail.len() - 1);
                     let field = field[0].clone();
                     // A receiver ending in a data-only scoreboard sub
@@ -3082,8 +3106,9 @@ impl super::FuncBuilder<'_> {
                             if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) =>
                         {
                             self.require_component_activation(
-                                &base_head[0],
+                                &path[0],
                                 head_cid,
+                                head_mode,
                                 recv_tail,
                                 schema.activation,
                                 "field",
@@ -3134,7 +3159,9 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(e) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some((head_cid, base_head, tail)) = self.component_path_head(&path) {
+                if let Some((head_cid, base_head, tail, head_mode)) =
+                    self.component_path_head(&path)
+                {
                     let (recv_tail, field) = tail.split_at(tail.len() - 1);
                     let field = field[0].clone();
                     // A receiver ending in a data-only scoreboard sub
@@ -3148,8 +3175,9 @@ impl super::FuncBuilder<'_> {
                     if let Some(schema) = comp.field(&field) {
                         if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) {
                             self.require_component_activation(
-                                &base_head[0],
+                                &path[0],
                                 head_cid,
+                                head_mode,
                                 recv_tail,
                                 schema.activation,
                                 "field",
@@ -3276,18 +3304,25 @@ impl super::FuncBuilder<'_> {
         &self,
         head_name: &str,
         head: ComponentId,
+        inherited: Option<ComponentInstanceMode>,
         segs: &[String],
     ) -> Result<Option<ComponentInstanceMode>, LowerError> {
-        let inherited = self.ctx.component_modes.get(head_name).copied().flatten();
-        if matches!(
-            self.ctx.components[head.index()].kind,
-            crate::ir::ComponentKindTag::Transactor
-        ) && inherited.is_none()
-        {
-            return Err(LowerError::Invalid(format!(
-                "transactor `{head_name}` has no effective active/passive mode"
-            )));
-        }
+        // The mode context in force AT the head is the caller's to supply:
+        // a test-scope binding reads it out of `component_modes` by name,
+        // while a self-relative head (`relay.acalls` inside the env that
+        // declares `relay : ModeRelay active`) carries it on the `Sub`
+        // field itself. Deriving it here from `head_name` got the second
+        // case wrong twice over — `component_path_head` hands back the
+        // literal `"self"`, which is in no binding map, so the lookup
+        // missed and a guard on the miss then rejected the access.
+        //
+        // That guard is gone with it. It fired whenever a transactor head
+        // had no mode of its own, which is legal for a head that does not
+        // require one (`mon : Mon`, a reactive monitor) and whose mode for
+        // THIS access comes from a descendant binding further down the
+        // path (`sub : Relay active`). The post-walk check below is the
+        // honest form of the same question: it asks whether the resolved
+        // TARGET requires a mode and lacks one.
         let resolved = crate::ir::resolve_component_path_mode(
             &self.ctx.components,
             head,
@@ -3321,10 +3356,18 @@ impl super::FuncBuilder<'_> {
         .flatten())
     }
 
+    /// The mode context a TEST-SCOPE binding name carries (`env.mon.x`,
+    /// rooted at the `env` local). A self-relative head is not keyed here
+    /// — see `component_path_head`.
+    fn binding_mode(&self, head_name: &str) -> Option<ComponentInstanceMode> {
+        self.ctx.component_modes.get(head_name).copied().flatten()
+    }
+
     fn require_component_activation(
         &self,
         head_name: &str,
         head: ComponentId,
+        inherited: Option<ComponentInstanceMode>,
         segs: &[String],
         activation: Activation,
         member_kind: &str,
@@ -3333,7 +3376,7 @@ impl super::FuncBuilder<'_> {
         if matches!(activation, Activation::Always) {
             return Ok(());
         }
-        let mode = self.resolve_component_mode(head_name, head, segs)?;
+        let mode = self.resolve_component_mode(head_name, head, inherited, segs)?;
         if !matches!(mode, Some(ComponentInstanceMode::Active)) {
             let path = std::iter::once(head_name)
                 .chain(segs.iter().map(String::as_str))
@@ -3341,6 +3384,39 @@ impl super::FuncBuilder<'_> {
                 .join(".");
             return Err(LowerError::Invalid(format!(
                 "active-only {member_kind} `{member}` is used through passive transactor `{path}`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Activation check for a member reached through a SELF sub-component
+    /// field (`relay.activate()` inside the env that declares `relay`).
+    /// The instance mode is the one declared on that field: a component
+    /// body is shared across every instance of its type, so there is no
+    /// test-scope binding name to resolve here — the field's own `Sub`
+    /// mode is the whole context, and a field with none exposes no
+    /// active-only member.
+    fn require_self_sub_activation(
+        &self,
+        field: &str,
+        self_cid: ComponentId,
+        activation: Activation,
+        member_kind: &str,
+        member: &str,
+    ) -> Result<(), LowerError> {
+        if matches!(activation, Activation::Always) {
+            return Ok(());
+        }
+        let mode = match self.ctx.components[self_cid.index()]
+            .field(field)
+            .map(|f| &f.kind)
+        {
+            Some(ComponentFieldKind::Sub { mode, .. }) => *mode,
+            _ => None,
+        };
+        if !matches!(mode, Some(ComponentInstanceMode::Active)) {
+            return Err(LowerError::Invalid(format!(
+                "active-only {member_kind} `{member}` is used through passive transactor `{field}`"
             )));
         }
         Ok(())
@@ -3363,20 +3439,38 @@ impl super::FuncBuilder<'_> {
     /// Resolve the first segment of a component path. Test-scope paths
     /// (`env.mon.x`) are rooted at `env`; self-relative method paths
     /// (`mon.x` inside `testbench Env`) are rooted at `self.mon`.
+    ///
+    /// The fourth element is the mode context in force at the returned
+    /// head — read from the test-scope binding for the first shape, and
+    /// from the `Sub` field's own declared mode for the second. It is
+    /// returned rather than re-derived from the base segments because
+    /// those start with the literal `"self"` in the second shape, which
+    /// names no binding.
     fn component_path_head<'a>(
         &self,
         path: &'a [String],
-    ) -> Option<(ComponentId, Vec<String>, &'a [String])> {
+    ) -> Option<(
+        ComponentId,
+        Vec<String>,
+        &'a [String],
+        Option<ComponentInstanceMode>,
+    )> {
         if let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) {
-            return Some((head_cid, vec![path[0].clone()], &path[1..]));
+            return Some((
+                head_cid,
+                vec![path[0].clone()],
+                &path[1..],
+                self.binding_mode(&path[0]),
+            ));
         }
         let self_cid = self.self_component?;
         let comp = &self.ctx.components[self_cid.index()];
         match comp.field(&path[0]).map(|f| &f.kind) {
-            Some(ComponentFieldKind::Sub { component, .. }) => Some((
+            Some(ComponentFieldKind::Sub { component, mode }) => Some((
                 *component,
                 vec!["self".to_string(), path[0].clone()],
                 &path[1..],
+                *mode,
             )),
             _ => None,
         }
@@ -3527,6 +3621,7 @@ impl super::FuncBuilder<'_> {
                         self.require_component_activation(
                             &head,
                             head_cid,
+                            self.binding_mode(&head),
                             &recv[1..],
                             field.activation,
                             "event",
