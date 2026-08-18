@@ -1250,6 +1250,76 @@ fn event_driven_transactor_fixture_lowers() {
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
+/// An event-driven consumer with NO DUT handle keeps the event-driven
+/// mode contract: `active` required, `passive` a loud rejection.
+///
+/// Regression: `transactor_is_analysis_source` counted any `event<...>`
+/// field, `in` included, so this shape was classified as an
+/// analysis SOURCE. The analysis-source mode gate runs ahead of the
+/// event-driven one, which inverted both answers — `active` (the form
+/// the event-driven gate REQUIRES) became `Invalid`, and `passive`
+/// (which it rejects, since the `on` handler never registers, leaving
+/// `emit drv.req(..)` with no subscriber) was silently accepted.
+///
+/// `event_driven_transactor_fixture_lowers` above does not cover it:
+/// every event-driven FIXTURE also holds a DUT handle, and the
+/// classifier's `has_named_field` arm already excluded those. The
+/// distinguishing shape is a consumer with a bare `in event` and
+/// nothing else.
+#[test]
+fn dutless_event_driven_consumer_keeps_the_event_driven_mode_contract() {
+    let src = |mode: &str| {
+        format!(
+            r#"
+transactor Consumer
+    req : in event<uint<8>>
+    got : uint<32> default 0
+
+    on req(v)
+        got = got + 1
+    end on
+end transactor Consumer
+
+testbench ConsTb
+    dut : Top
+    drv : Consumer {mode}
+end testbench ConsTb
+
+impl ConsumerModeTest for ConsTb
+    run
+        emit drv.req(1)
+    end run
+end impl ConsumerModeTest
+"#
+        )
+    };
+
+    let prog = lower_src(&src("active")).expect("an active dutless consumer lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let comp = prog
+        .components
+        .iter()
+        .find(|c| c.name == "Consumer")
+        .expect("Consumer component");
+    assert!(
+        comp.fields
+            .iter()
+            .any(|f| matches!(f.kind, ir::ComponentFieldKind::Event { .. })),
+        "the `in event` pipe survives as a subscriber vector"
+    );
+    assert_eq!(comp.on_handlers.len(), 1, "the consumer's `on` handler registers");
+
+    // Not `Invalid`: this is the event-driven gate's own rejection, and
+    // it must name the inert-passive reason rather than the
+    // analysis-source mode policy.
+    let err = lower_src(&src("passive")).expect_err("a passive consumer is rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("passive event-driven transactor field"),
+        "rejection should come from the event-driven gate: {msg}"
+    );
+}
+
 /// The *bound-to* event-driven transactor (`transactor X bound to
 /// BusAxiLite` + `req : in event` + `on req` driving the bound bus's
 /// handshake channels) now lowers: it routes to the composite-component

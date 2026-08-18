@@ -170,18 +170,33 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
     if t.bound_to.is_some() {
         return false;
     }
-    let mut has_event = false;
+    let mut has_out_event = false;
     let mut has_named_field = false;
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         if let ComponentItem::Field(f) = it {
             if is_event_field(f) {
-                has_event = true;
+                // An `in event<T>` is a CONSUMER pipe, not the "output
+                // event surface" above: it is the event-driven BFM's
+                // input, classified by `transactor_is_event_driven`.
+                // Counting it here made a pure consumer (`req : in
+                // event<T>` + `on req`, no DUT handle) an analysis
+                // source, and the analysis-source mode gate runs first —
+                // so `drv : Consumer active`, the form that gate
+                // REQUIRES, was rejected as invalid, and `drv : Consumer
+                // passive`, which it rejects as inert, was silently
+                // accepted into a component with no subscriber. The
+                // fixture corpus missed it because every event-driven
+                // fixture also holds a DUT handle, which the
+                // `has_named_field` arm already excluded.
+                if !matches!(f.direction, Some(crate::ast::Direction::In)) {
+                    has_out_event = true;
+                }
             } else if matches!(&f.ty, TypeExpr::Named { .. }) {
                 has_named_field = true;
             }
         }
     }
-    has_event && !has_named_field
+    has_out_event && !has_named_field
 }
 
 /// Whether an analysis-source transactor has behavior or storage whose
