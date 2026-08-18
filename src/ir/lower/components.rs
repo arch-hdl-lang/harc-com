@@ -2202,6 +2202,20 @@ fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
     )
 }
 
+/// The component predicates v1 and TB-IR both implement without them
+/// being DECLARED methods, so `comp.method(..).is_none()` is true for
+/// them and they reach the "has no method" arms.
+///
+/// `as_component_idle` lowers the first three in expression position and
+/// `quiesced` has its own resolver; a binding position reaches neither,
+/// which is a TB-IR gap rather than a bad program. Keeping this list
+/// beside those two resolvers is the point — if one grows a predicate,
+/// this has to grow with it or a working construct starts being reported
+/// as a program error.
+fn is_builtin_component_predicate(name: &str) -> bool {
+    matches!(name, "idle" | "idle_in" | "idle_out" | "quiesced")
+}
+
 /// Whether a hookable method's declared parameter has the same runtime
 /// callback shape as an analysis event payload. Narrow unsigned values,
 /// `bits`, and `bool` all widen to the unsigned callback representation;
@@ -2574,13 +2588,41 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if comp.method(&method).is_none() {
-                        // MEASURED: v1 emits the call verbatim —
-                        // `uint64_t x = c.nosuch(3);` — against a
-                        // struct with no such member. g++: "'struct
-                        // Calc' has no member named 'nosuch'". Naming a
-                        // method that does not exist is a program
-                        // error, and `exprs.rs`'s transactor-shaped
-                        // sibling has always said so.
+                        // "Not a declared method" is NOT the same set as
+                        // "does not exist", and a first pass made this
+                        // arm `Invalid` on that conflation.
+                        //
+                        // The built-in component predicates — `idle`,
+                        // `idle_in`, `idle_out`, `quiesced` — are not
+                        // declared methods and land here. v1 implements
+                        // all of them (`emit_idle_predicate`,
+                        // `resolve_component_quiesced_predicate`), and
+                        // TB-IR implements them too, one statement
+                        // position over: `assert c.idle(2)` lowers
+                        // through `as_component_idle` and emits, while
+                        // `let q = c.idle(2)` came through here and was
+                        // told its program was invalid. Both backends
+                        // run it; only this seam does not.
+                        //
+                        // So a built-in in a binding position is a real
+                        // TB-IR gap with a working escape hatch, and
+                        // anything else is the program error the first
+                        // pass measured: v1 emits `uint64_t x =
+                        // c.nosuch(3);` against a struct with no such
+                        // member — g++: "'struct Calc' has no member
+                        // named 'nosuch'".
+                        if is_builtin_component_predicate(&method) {
+                            return Err(unsupported(
+                                &format!(
+                                    "the built-in predicate `{}` in a binding position",
+                                    path.join(".")
+                                ),
+                                "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` in \
+                                 expression position (`assert c.idle(2)`, `while \
+                                 !c.idle_in(4)`) but not bound to a local; v1 emits it \
+                                 either way",
+                            ));
+                        }
                         return Err(LowerError::Invalid(format!(
                             "component `{}` has no method `{method}` (in `{}`)",
                             comp.name,
@@ -2616,14 +2658,32 @@ impl super::FuncBuilder<'_> {
                     if let Some(cid) = self.component_of_local(local) {
                         let comp = &self.ctx.components[cid.index()];
                         if comp.method(&method.name).is_none() {
-                            // Same program error as the path-shaped
-                            // sibling above, reached through a
-                            // component-typed local instead. NOT PROBED —
-                            // every source built for it was claimed by the
-                            // transactor-method arm first. It is on the
-                            // measured sibling's verdict because the
-                            // condition is identical, not because a probe
-                            // reached this arm.
+                            // Same condition as the path-shaped sibling
+                            // above, reached through a component-typed
+                            // PARAMETER instead — and reachable: a
+                            // `function observe(a: uint<8>, m: Model)`
+                            // calling `m.nosuch(a)` lands here directly.
+                            // (An earlier note said "not probed, every
+                            // source was claimed by the transactor-method
+                            // arm first"; that arm only fires for
+                            // transactor-typed params.) So this is a
+                            // SECOND landing for a missing method, not
+                            // the single one an earlier entry claimed.
+                            //
+                            // Same built-in carve-out, for the same
+                            // reason.
+                            if is_builtin_component_predicate(&method.name) {
+                                return Err(unsupported(
+                                    &format!(
+                                        "the built-in predicate `{}.{}` on a \
+                                         component-typed parameter",
+                                        recv.name, method.name
+                                    ),
+                                    "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` \
+                                     in expression position but not here; v1 emits it \
+                                     either way",
+                                ));
+                            }
                             return Err(LowerError::Invalid(format!(
                                 "component `{}` has no method `{}` (on parameter `{}`)",
                                 comp.name, method.name, recv.name

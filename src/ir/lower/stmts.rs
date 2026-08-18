@@ -880,14 +880,16 @@ impl FuncBuilder<'_> {
                                 ))
                             })?;
                             if !m.has_ret {
-                                // NOT PROBED. A typed `let` over a
-                                // component method call is claimed by the
-                                // untyped handler below before it reaches
-                                // here — `let x : uint<32> = c.noret(3)`
-                                // reports that arm's wording. Kept on the
-                                // same verdict as its measured sibling
-                                // because it is the same condition, not
-                                // because this landing was measured.
+                                // REACHED, contrary to an earlier note
+                                // here. A typed `let` over a SCALAR type
+                                // is claimed by the untyped handler
+                                // below, which is what that note
+                                // generalized from — but this arm is
+                                // guarded on a RECORD type, and
+                                // `let t : TinyTxn = c.noret(3)` lands
+                                // here first try. v1: "conversion from
+                                // 'void' to non-scalar type 'TinyTxn'
+                                // requested".
                                 return Err(LowerError::Invalid(format!(
                                     "`let {} : {simple} = {}.{method}(...)` — method \
                                      `{method}` returns no value",
@@ -1100,12 +1102,16 @@ impl FuncBuilder<'_> {
                     ))
                 })?;
                 if !m.has_ret {
-                    // MEASURED and reachable: `let x = c.noret(3)` lands
-                    // here, and v1 emits `uint64_t x = Calc_noret(c, 3);`
-                    // — g++: "void value not ignored as it ought to be".
-                    // Taking a value from something that produces none is
-                    // a program error, so `Invalid` rather than a
-                    // suggestion. Pinned by mutation.
+                    // MEASURED and reachable. `let x = c.noret(3)`
+                    // lands here, and v1 emits `auto x = Calc_noret(c,
+                    // 3);` — g++: "deduced type 'void' for 'x' is
+                    // incomplete". (The TYPED form emits `uint64_t x =
+                    // ...` and says "void value not ignored as it ought
+                    // to be"; a first version of this comment paired
+                    // this arm's source with that arm's emission.)
+                    // Taking a value from something that produces none
+                    // is a program error either way, so `Invalid` rather
+                    // than a suggestion. Pinned by mutation.
                     return Err(LowerError::Invalid(format!(
                         "`let {} = {}.{method}(...)` — method `{method}` returns no value",
                         l.name.name, comp.name
@@ -1531,10 +1537,12 @@ impl FuncBuilder<'_> {
                             ))
                         })?;
                         if !m.has_ret {
-                            // NOT PROBED, same as the typed-`let` landing:
-                            // kept on its measured sibling's verdict
-                            // because the condition is identical, not
-                            // because a probe reached this arm.
+                            // REACHED, contrary to an earlier note here:
+                            // `let x : uint<32> = 0` then
+                            // `x = c.noret(3)` lands on this arm, since
+                            // an assignment is not a `let` and nothing
+                            // claims it first. v1: "void value not
+                            // ignored as it ought to be".
                             return Err(LowerError::Invalid(format!(
                                 "assignment from `{}.{method}(...)` — method \
                                  `{method}` returns no value",
@@ -2664,11 +2672,22 @@ impl FuncBuilder<'_> {
             ));
         };
         let Some(channel) = self.lookup(&id.name) else {
-            // `lookup` failing means the name resolves to NOTHING here,
-            // not that it names the wrong kind of thing: a testbench
-            // `event` field is claimed by its own arm, and a local that
-            // is not an event falls to the `Invalid` just below. So this
-            // is an undefined identifier.
+            // `lookup` failing means the name is not a LOCAL here. It
+            // does NOT mean the name is undefined — an earlier version
+            // of this comment said so and was wrong. Measured, all of
+            // these land here: a testbench component field (`s`), a
+            // testbench scalar field (`seen`), the clock (`clk`), the
+            // DUT binding (`dut`), an agent TYPE name (`Src`), and a
+            // component METHOD name (`fire`). Every one is declared
+            // somewhere in the program.
+            //
+            // The verdict survives anyway, and that was measured too:
+            // v1 emits `<name>.push_back(...)` for each and g++ refuses
+            // all six ("'s' was not declared in this scope", "request
+            // for member 'push_back' in 'dut', which is of pointer type
+            // 'VTop*'", and so on). The message says "names no event
+            // channel in scope", which is true of all of them; it is
+            // the reasoning that was over-stated, not the wording.
             //
             // MEASURED: v1 emits `nosuch.push_back([&](int64_t v) {...})`
             // — g++: "'nosuch' was not declared in this scope". A

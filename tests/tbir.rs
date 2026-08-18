@@ -20219,10 +20219,17 @@ end impl SpTest"#
 ///     that returns `Ok(Some(..))`, so a caller holding a resolved
 ///     method always has one. Mutating any of them fails nothing.
 ///   * the typed-`let` and assignment "returns no value" arms, and the
-///     parameter-form resolver arm — NOT PROBED. Every source built for
-///     them was claimed by another arm first. They carry their measured
-///     sibling's verdict because the condition is identical, which is
-///     stated at each site rather than implied.
+///     parameter-form resolver arm — REACHED, each with a two-line
+///     probe, after an earlier version of this doc recorded all three
+///     as "not probed". They are covered below. The parameter-form arm
+///     in particular means a missing method has TWO landings, not the
+///     one that earlier version claimed.
+///
+/// And the set this arm fires on is "not a DECLARED method", which is
+/// wider than "does not exist": the built-in predicates `idle`,
+/// `idle_in`, `idle_out` and `quiesced` land here too, and BOTH backends
+/// implement those — TB-IR one statement position over. They are carved
+/// out to `Unsupported` and pinned below.
 #[test]
 fn a_missing_or_void_component_method_is_a_program_error() {
     let src = |call: &str| {
@@ -20289,6 +20296,76 @@ end test NmTest"#
         // the emitted C++ is what does not compile, one step later.
         cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
     }
+
+    // The three arms an earlier version of this test recorded as
+    // unreachable-by-probe. Each takes two lines.
+    //
+    // A RECORD-typed `let` is not claimed by the untyped handler — that
+    // arm is guarded on a record type name.
+    let rec = src("let t : TinyTxn = c.noret(3)").replacen(
+        "agent Calc",
+        "struct TinyTxn\n    a : uint<8> default 0\nend struct TinyTxn\n\nagent Calc",
+        1,
+    );
+    let msg = assert_invalid(&lower_src(&rec).unwrap_err());
+    assert!(msg.contains("returns no value"), "record let: {msg}");
+
+    // An ASSIGNMENT is not a `let`, so nothing claims it first.
+    let asg = src("let x : uint<32> = 0\n        x = c.noret(3)");
+    let msg = assert_invalid(&lower_src(&asg).unwrap_err());
+    assert!(msg.contains("returns no value"), "assignment: {msg}");
+
+    // A COMPONENT-typed parameter reaches the parameter-form resolver;
+    // the transactor-method arm that was blamed for claiming it only
+    // fires for transactor-typed params.
+    let param = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+    hookable get() -> uint<32>
+        return v
+    end get
+end agent Model
+
+scoreboard Obs
+    seen : uint<32> default 0
+    function observe(a: uint<8>, m: Model)
+        seen = seen + a
+    end observe
+end scoreboard Obs
+
+test PTest
+    let dut : Top
+    let m : Model
+    clock clk = SysDomain
+    run
+        wait 1 cycle
+    end run
+end test PTest"#;
+    let param = param.replacen(
+        "        seen = seen + a",
+        "        let r : uint<32> = m.nosuch(a)\n        seen = seen + r",
+        1,
+    );
+    let msg = assert_invalid(&lower_src(&param).unwrap_err());
+    assert!(
+        msg.contains("has no method `nosuch` (on parameter `m`)"),
+        "parameter form: {msg}"
+    );
+
+    // And the carve-out: a BUILT-IN predicate is not a declared method
+    // either, but both backends implement it — TB-IR in expression
+    // position, v1 anywhere. It keeps the suggestion.
+    let builtin = src("let q = c.idle(2)");
+    let msg = assert_unsupported(&lower_src(&builtin).unwrap_err());
+    assert!(msg.contains("built-in predicate"), "{msg}");
+    cpp_tb::emit(&merged_src(&builtin)).expect("v1 emits the built-in predicate");
+    // The same predicate one statement position over lowers under TB-IR,
+    // which is what makes `Invalid` false for it.
+    lower_src(&src("assert c.idle(2) else fail(\"q\")"))
+        .expect("TB-IR lowers the predicate in expression position");
 }
 
 /// Two statement-position `on <event>(...)` subscription arms, side by
@@ -20351,7 +20428,18 @@ end impl SubTest"#
 
     // A component's event field by path: TB-IR's subset gap, and v1
     // really is the way out.
-    let path = src("s.obs");
+    //
+    // The stimulus matters, and an earlier version of this test got it
+    // wrong: it subscribed to `s.obs` and then emitted on `ch`, so the
+    // handler could never fire and the "built and run, seen=3" claim
+    // recorded for it was measured on a different program. Firing
+    // `s.fire(3)` — which emits `observed` inside the agent — is what
+    // makes the subscription observable.
+    let path = src("s.obs").replacen("        emit ch(3)", "        s.fire(3)", 1);
+    assert!(
+        path.contains("s.fire(3)"),
+        "the stimulus must actually fire"
+    );
     let msg = assert_unsupported(&lower_src(&path).unwrap_err());
     assert!(
         msg.contains("`on <path>.<event>(arg)` subscription"),
@@ -20359,8 +20447,8 @@ end impl SubTest"#
     );
     let v1 = cpp_tb::emit(&merged_src(&path)).expect("v1 emits the path form");
     assert!(
-        v1.contains("_tb.s.obs.push_back("),
-        "v1 registers against the real member: {v1}"
+        v1.contains("_tb.s.obs.push_back(") && v1.contains("Src_fire("),
+        "v1 registers against the real member AND emits the stimulus: {v1}"
     );
 
     // A name that resolves to nothing: a program error, and v1's
@@ -20374,20 +20462,48 @@ end impl SubTest"#
         "v1 emits the undefined name verbatim: {v1}"
     );
 
-    // The two neighbouring shapes that make the arm above an undefined
-    // identifier and nothing else.
-    let tb_field = src("ch").replacen(
-        "    seen : uint<32> default 0",
-        "    seen : uint<32> default 0\n    tev  : event<uint<8>>",
-        1,
-    );
-    let tb_field = tb_field.replacen("on ch(v)", "on tev(v)", 1);
-    assert!(
-        !format!("{}", lower_src(&tb_field).unwrap_err())
-            .contains("names no event channel in scope"),
-        "a testbench `event` field must be claimed by its own arm"
-    );
+    // A local that is not an event falls to the `Invalid` just below
+    // the arm under test, not into it.
     let not_event = src("ch").replacen("    let ch : event<uint<8>>", "    let ch = 5", 1);
     let msg = assert_invalid(&lower_src(&not_event).unwrap_err());
     assert!(msg.contains("is not an event channel"), "{msg}");
+
+    // What the arm ACTUALLY catches, which an earlier version of this
+    // test described as "an undefined identifier and nothing else".
+    // Every name below is declared somewhere in the program; none is a
+    // local, so `lookup` misses and they all land here. v1 emits
+    // `<name>.push_back(...)` for each and refuses to compile it, so
+    // the verdict holds — but the set is not what the comment said.
+    for name in ["s", "seen", "clk", "dut", "Src", "fire"] {
+        let s = src(name);
+        let msg = assert_invalid(&lower_src(&s).unwrap_err());
+        assert!(
+            msg.contains("names no event channel in scope"),
+            "{name}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            v1.contains(&format!("{name}.push_back(")),
+            "{name}: v1 emits the name verbatim"
+        );
+    }
+
+    // A testbench `event` FIELD does not reach this arm — but not for
+    // the reason an earlier version of this test asserted. It dies at
+    // field-declaration lowering, long before the `run` body, so the
+    // old assertion passed for an unrelated reason and would have
+    // passed with the whole subscription arm deleted. Pin the real
+    // cause instead.
+    let tb_field = src("ch")
+        .replacen(
+            "    seen : uint<32> default 0",
+            "    seen : uint<32> default 0\n    tev  : event<uint<8>>",
+            1,
+        )
+        .replacen("on ch(v)", "on tev(v)", 1);
+    let msg = format!("{}", lower_src(&tb_field).unwrap_err());
+    assert!(
+        msg.contains("testbench field `tev`"),
+        "the field declaration is what refuses it: {msg}"
+    );
 }

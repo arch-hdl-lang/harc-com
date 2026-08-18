@@ -5159,32 +5159,52 @@ case and only locally-determinable `Assign` types are compared).
     | source | v1 emits | g++ |
     |---|---|---|
     | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
-    | `let x = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
+    | `let x = c.noret(3)` | `auto x = Calc_noret(c, 3);` | "deduced type 'void' for 'x' is incomplete" |
+    | `let x : uint<32> = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
 
     Both are type errors, and unlike the `connect` arms there is no
-    uninstantiated position for a statement in a run body to hide in, so
-    no backend runs either in any configuration. `Invalid`, which is
-    what `exprs.rs`'s transactor-shaped sibling has said all along.
+    uninstantiated position for a statement in a run body to hide in.
 
-    The part worth recording is the scoping. Six arms is not six
-    measurements, and mutating each in turn says which is which:
+    **But "has no DECLARED method" is a wider set than "does not
+    exist", and the first pass conflated them.** The built-in component
+    predicates — `idle`, `idle_in`, `idle_out`, `quiesced` — are not
+    declared methods, so they land on the same arm. v1 implements all
+    four, and so does TB-IR, one statement position over:
+    `assert c.idle(2)` lowers and emits, while `let q = c.idle(2)` came
+    through this arm and was told the program was invalid. `Invalid` was
+    false about BOTH backends — the same failure undone for `connect` a
+    few entries earlier, from the same reasoning error. Built-ins in a
+    binding position are carved out to `Unsupported`, which is what they
+    were before and should have stayed.
 
-      * the resolver's path-form arm in `components.rs` — reached, and
-        the ONLY landing a missing method ever gets to.
+    The rest of the arm is a genuine program error, and `Invalid` —
+    which is what `exprs.rs`'s transactor-shaped sibling has said all
+    along.
+
+    The scoping was wrong too. Mutating each arm says which is which:
+
+      * the resolver's path-form arm in `components.rs` — reached.
       * the untyped-`let` "returns no value" arm — reached.
       * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
         `as_component_method_call` validates the method on every path
         that returns `Ok(Some(..))`, so a caller holding a resolved
         method always has one. Neutering any of them fails nothing.
+        (This claim survived review; the next one did not.)
       * the typed-`let` and assignment "returns no value" arms, and the
-        parameter-form resolver arm — NOT PROBED. Every source built for
-        them was claimed by a different arm first.
+        parameter-form resolver arm — recorded as NOT PROBED, and all
+        three are reachable with a two-line probe. A typed `let` is
+        claimed by the untyped handler only for SCALAR types, and that
+        arm is guarded on a record: `let t : TinyTxn = c.noret(3)` lands
+        on it first try. An assignment is not a `let`, so nothing claims
+        it. The parameter-form arm fires for a COMPONENT-typed
+        parameter — the transactor-method arm blamed for claiming it
+        only handles transactor-typed ones. All three are pinned now,
+        which also means a missing method has TWO landings, not the one
+        this entry originally claimed.
 
-    All six carry the same verdict, because it is one condition. Only
-    two of them carry a measurement, and each site now says which it is.
-    The alternative — reverting the four — would leave one condition
-    with two verdicts in one file; the alternative to THAT is claiming
-    four measurements that were not made.
+    "Not probed" turned out to mean "I stopped building probes", and
+    writing it into the code made it read as a measured property of the
+    arm.
 
 80. **Two subscription arms, adjacent, opposite verdicts
     (2026-08-18).**
@@ -5198,18 +5218,31 @@ case and only locally-determinable `Assign` types are compared).
     | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
     | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
 
-    The first row was built and RUN, not just emitted: `seen=3`. So v1
-    implements it, the suggestion is honest, and the arm's advice —
-    subscribe from the component that owns the field — is about TB-IR's
-    subset rather than about v1 being unable. It stays.
+    The first row is a real escape hatch: v1 compiles AND runs it. That
+    was verified with a firing stimulus (`s.fire(3)`, which emits
+    `observed` inside the agent) — the test originally subscribed to
+    `s.obs` and then emitted on `ch`, a channel nobody subscribed to, so
+    the `seen=3` first recorded here came from a hand-built program and
+    not from the source the test names. Conclusion unchanged, evidence
+    corrected, and the test fires the right stimulus now.
 
-    The second is an undefined identifier, a program error under both
-    backends → `Invalid`. That it is ONLY that was checked rather than
-    assumed, because the arm's old detail conflated "unknown name" with
-    "known name of the wrong kind": a testbench `event` field is claimed
-    by its own arm before reaching here, and a local that is not an
-    event falls to the `Invalid` immediately below. Both neighbours are
-    pinned in the test so the arm cannot quietly widen.
+    The second is `Invalid` — but NOT because it is an undefined
+    identifier, which is what this entry first claimed. `lookup` failing
+    means the name is not a LOCAL. Measured, all of these land there and
+    every one is declared somewhere: a testbench component field, a
+    testbench scalar field, the clock, the DUT binding, an agent TYPE
+    name, and a component METHOD name. v1 emits `<name>.push_back(...)`
+    for each and g++ refuses all six, so the verdict holds and the
+    message ("names no event channel in scope") is accurate — the
+    REASONING was wrong, in the sentence that claimed to have checked
+    it. All six are pinned now.
+
+    One neighbour claim was not merely wrong but vacuous: the test
+    asserted that a testbench `event` field "is claimed by its own arm",
+    but that source dies at FIELD-DECLARATION lowering, long before the
+    `run` body — so the assertion passed for an unrelated reason and
+    would have passed with the whole subscription arm deleted. It pins
+    the real cause now.
 
     Worth noting for its own sake: these two arms are four lines apart,
     handle the same statement, and needed opposite verdicts. Proximity
