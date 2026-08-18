@@ -2211,7 +2211,7 @@ case and only locally-determinable `Assign` types are compared).
     | indexing a scalar record field, read or write | the subscript verbatim against a `uint64_t` member |
     | `for x in <scalar record field>` | `for (auto& x : rec.v)` over a `uint64_t` |
     | whole-record write with a non-matching RHS | `o.p = q;` between two unrelated structs |
-    | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines |
+    | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines — superseded by divergences 82 and 84, which split all ten arms on measurement |
     | a `default` on a queue field (2 sites) | `HarcQueue<uint64_t> q = 0;` — no such constructor |
 
     **One site, several outcomes.** Three reclassifications were made
@@ -5220,7 +5220,7 @@ case and only locally-determinable `Assign` types are compared).
 
     The first row is a real escape hatch: v1 compiles AND runs it. That
     was verified with a firing stimulus (`s.fire(3)`, which emits
-    `observed` inside the agent) — the test originally subscribed to
+    `obs` inside the agent) — the test originally subscribed to
     `s.obs` and then emitted on `ch`, a channel nobody subscribed to, so
     the `seen=3` first recorded here came from a hand-built program and
     not from the source the test names. Conclusion unchanged, evidence
@@ -5284,12 +5284,14 @@ case and only locally-determinable `Assign` types are compared).
 82. **A queue method in statement position splits on the runtime's own
     API (2026-08-18).**
 
-    Two arms — one for a scoreboard queue, one for a component queue —
-    catch every queue method in statement position that is not `push`
-    or `pop`, and both said `Unsupported`. v1 emits the call verbatim
-    (`_tb.sb.q.<method>();`, `errs.<method>();`) against
-    `harc_rt::HarcQueue`, whose entire API is `push`, `pop`, `size` and
-    `empty`:
+    FIVE arms catch a queue method in statement position that is not
+    `push` or `pop` — testbench-owned field, scoreboard queue,
+    component queue, bare target-state field, instance-qualified
+    target-state field. (The first pass said "two", split those two,
+    and left the other three carrying a hand-written
+    `EmitsUncompilable`; see the correction below.) v1 emits the call
+    against `harc_rt::HarcQueue`, whose entire API is `push`, `pop`,
+    `size` and `empty`:
 
     | statement | g++ |
     |---|---|
@@ -5300,22 +5302,41 @@ case and only locally-determinable `Assign` types are compared).
 
     So `size`/`empty` keep the suggestion — v1 genuinely runs those
     programs — and everything else is a program error no backend runs.
-    The discriminator is not a heuristic: it IS the runtime header, and
-    the helper says so beside the list, because v1 passes whatever name
-    is written straight through to `HarcQueue`.
+    The discriminator is the runtime header for every name except four:
+    `try_emit_width_method` claims `trunc`/`zext`/`sext`/`resize` by
+    name before the member-call path, so `sb.q.trunc(2)` comes out as
+    `((uint64_t)(((uint64_t)(_tb.sb.q) & 0x3ULL)));` and not as a
+    `.trunc(2)` call at all. The `Invalid` verdict survives for those
+    four — g++ rejects the cast — but for a different reason than the
+    one first recorded here, which said v1 "passes whatever name is
+    written straight through". It does, except where it does not.
 
-    Both landings were probed independently rather than one inferred
-    from the other, and the test scans `runtime/harc_queue_rt.h` for the
-    member declarations the split relies on — if `HarcQueue` grows a
-    `clear`, the test fails instead of a working call being reported as
-    a program error.
+    All five landings were probed independently rather than four
+    inferred from one, and the test enumerates the member declarations
+    in `runtime/harc_queue_rt.h` and compares the whole set — if
+    `HarcQueue` grows a `back`, the test fails instead of a working
+    call being reported as a program error.
 
     A footnote on that scan, because it repeated the sweep's own lesson
     at miniature scale: the first version asked whether the header
     `contains("front(")` and failed, because `pop`'s body calls
     `_d.front()` — and the second version failed too, because
     `_d.pop_front()` contains `front(`. A substring test is not a name
-    test, in the same way a shape test is not a resolution test.
+    test, in the same way a shape test is not a resolution test. The
+    third version fixed the boundary but still only spot-checked two
+    ABSENT names, which is a blacklist wearing an API check's clothes:
+    adding `T back() const` to the header left it green. Enumerating
+    the set is what finally made it the check it claimed to be.
+
+    **Correction, same day.** "Two arms" was wrong twice over. There
+    are five, and the three left untouched kept telling users that
+    `--codegen v1` "accepts it but emits C++ that does not compile" for
+    `pend.size()`, `pending.size()` and `model.pending.size()` — all
+    three of which v1 emits as `_tb.pend.size();`,
+    `self.pending.size();` and `_tb.model.pending.size();`, and g++
+    compiles all three. Grouping by construct found the sites; it did
+    not transfer the verdict, and three of the five were shipped with a
+    verdict nothing had measured. All five share the helper now.
 
 83. **Six covergroup hook-trigger arms, two of them reachable
     (2026-08-18).**
@@ -5357,6 +5378,83 @@ case and only locally-determinable `Assign` types are compared).
     rewrites both lines, so they were right by accident. Anchoring on
     the whole declaration fixes it — the probe measuring the wrong line,
     one more time, in miniature.
+
+84. **A queue method in EXPRESSION position is a program error, by two
+    different mechanisms (2026-08-18).**
+
+    Five more arms, siblings of the statement-position five, sit in the
+    `lower_*_queue_query_call` families. `size` and `empty` lower there
+    and `pop` has its own arm, so what reaches the fallback is either
+    `push` — a real `HarcQueue` member that returns void — or a name
+    the runtime never declares. All five said
+    `NotImplemented { v1: EmitsUncompilable }`, which is the right
+    shape for the wrong reason: "HARC does not implement this yet"
+    describes a gap, and `q.front()` is not a gap, it is a call to
+    something that does not exist.
+
+    Measured at all five landings, v1 emits `uint64_t z =
+    <recv>.<name>(...);` every time, and g++ rejects every one:
+
+    | call | g++ |
+    |---|---|
+    | `q.push(3)` | "void value not ignored as it ought to be" |
+    | `q.push()` | "no matching function for call to `HarcQueue<...>::push()`" |
+    | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+    | `q.size()` | compiles — which is why it never reaches this arm |
+
+    So all ten are `Invalid`, and the two halves carry different
+    messages because they fail for different reasons: `push` names the
+    mechanism (returns no value), everything else names the API.
+
+85. **`pop` ignored its argument list at all eight branches
+    (2026-08-18).**
+
+    Every `pop` branch checked the method NAME and dropped `args` on the
+    floor, so `q.pop(7, 9)` lowered and emitted cleanly under TB-IR
+    while v1 emitted `_tb.pend.pop(7, 9);` — g++: "no matching function
+    for call to `harc_rt::HarcQueue<long unsigned int>::pop(int, int)`".
+    The `push` branches three lines away have always matched
+    `[CallArg::Expr(arg)]` exactly, so this was an asymmetry nothing
+    had looked at, in the same functions the queue-method split had
+    just been written into. `Invalid`, and pinned at all five queue
+    flavours in both statement and `let`-RHS position.
+
+86. **The built-in component predicates are a DEFAULT, and TB-IR
+    treated them as reserved (2026-08-18).**
+
+    v1's `resolve_component_idle_predicate` and
+    `resolve_component_quiesced_predicate` both return `None` when the
+    receiver's component declares a `hookable` of that name, deferring
+    to the user's method — its comment names the shipped `buf_mgr_test`
+    fixture (a `hookable idle(n)` that holds bus valids low) as the
+    reason. TB-IR's `as_component_idle` had no such guard, and it runs
+    BEFORE component-method resolution, so the heartbeat won every
+    time.
+
+    Measured on an `agent Calc` declaring `hookable idle(n: uint<8>) ->
+    uint<32>` that returns 7, against `assert c.idle(2) == 7`:
+
+    | backend | emitted | outcome |
+    |---|---|---|
+    | v1 | `if (!(Calc_idle(c, 2) == 7))` | the method runs, assertion holds |
+    | TB-IR (before) | `if (!((((cycle_count - c._last_in_cycle) >= 2) && ((cycle_count - c._last_out_cycle) >= 2)) == 7))` | the heartbeat runs, assertion fails |
+
+    Both compile, both run, and they disagree with no diagnostic — the
+    worst shape a divergence takes, which is why this is a fix and not
+    a classification. All four names behave this way (`idle`,
+    `idle_in`, `idle_out`, `quiesced`).
+
+    With the guard, a declared name is an ordinary component-method
+    call and takes that path's pre-existing gap — value-returning
+    component methods do not lower in expression position for ANY name,
+    which the test pins by asserting the refusal is byte-identical to
+    the one an ordinary method gets. That gap is real and separate;
+    what is fixed here is TB-IR quietly answering a different question.
+
+    Found by review, not by the sweep: the previous commit added a note
+    that `is_builtin_component_predicate` "has to grow when
+    `as_component_idle` grows" and never checked the other direction,
+    which is where the live bug was.
 
 ### The probe method
 

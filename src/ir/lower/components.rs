@@ -2212,6 +2212,10 @@ fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
 /// beside those two resolvers is the point — if one grows a predicate,
 /// this has to grow with it or a working construct starts being reported
 /// as a program error.
+///
+/// The list is also what [`super::FuncBuilder::user_override_wins`]
+/// consults, so a name only counts as built-in on a component that has
+/// not declared it.
 fn is_builtin_component_predicate(name: &str) -> bool {
     matches!(name, "idle" | "idle_in" | "idle_out" | "quiesced")
 }
@@ -2564,9 +2568,23 @@ impl super::FuncBuilder<'_> {
     /// dotted path rooted at a test-scope component local) or a bare
     /// `publish` self-call inside a method body. Returns
     /// `(base, component, method)` when the receiver resolves to a
-    /// component and `method` is one of its methods; `None` otherwise.
-    /// An error is reserved for a malformed path that clearly INTENDED a
-    /// component (head segment is a component local) but does not resolve.
+    /// component and `method` is one of its methods.
+    ///
+    /// `None` means "not a component-method call" — a callee this
+    /// resolver has no claim on, which the caller passes to the next
+    /// lowering path.
+    ///
+    /// Two different errors come out of it, and they are not the same
+    /// verdict:
+    ///
+    ///   * `Invalid` — a receiver that clearly INTENDED a component
+    ///     (head segment is a component local) naming a method nothing
+    ///     declares. v1 emits `c.nosuch(3)` against a struct with no
+    ///     such member and g++ rejects it, so no backend runs it.
+    ///   * `Unsupported` — a well-formed call to one of the built-in
+    ///     predicates outside expression position. Nothing declares
+    ///     those either, so they reach the same arm, but both backends
+    ///     implement them; see `is_builtin_component_predicate`.
     pub(crate) fn as_component_method_call(
         &self,
         callee: &AstExpr,
@@ -2612,15 +2630,24 @@ impl super::FuncBuilder<'_> {
                         // member — g++: "'struct Calc' has no member
                         // named 'nosuch'".
                         if is_builtin_component_predicate(&method) {
+                            // THREE landings share this arm, not the two
+                            // an earlier version named: `let q =
+                            // c.idle(2)`, `x = c.idle(2)`, and the bare
+                            // statement `c.idle(2)`, which has neither a
+                            // binding nor a local. So the construct
+                            // names the predicate and the detail names
+                            // what IS lowered, rather than describing
+                            // one landing's syntax as if it were all of
+                            // them.
                             return Err(unsupported(
                                 &format!(
-                                    "the built-in predicate `{}` in a binding position",
+                                    "the built-in predicate `{}` outside expression position",
                                     path.join(".")
                                 ),
-                                "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` in \
-                                 expression position (`assert c.idle(2)`, `while \
-                                 !c.idle_in(4)`) but not bound to a local; v1 emits it \
-                                 either way",
+                                "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` where \
+                                 their value is USED (`assert c.idle(2)`, `while \
+                                 !c.idle_in(4)`), but not as a `let`/assignment right-hand \
+                                 side or a bare statement; v1 emits it in all of them",
                             ));
                         }
                         return Err(LowerError::Invalid(format!(
@@ -3523,11 +3550,39 @@ impl super::FuncBuilder<'_> {
         Ok(())
     }
 
+    /// Whether the receiver's own declaration beats the built-in
+    /// predicate of the same name. The built-ins are a DEFAULT, not a
+    /// reserved word: a component that declares `hookable idle(n)`
+    /// means its own method, and v1 has said so since before TB-IR
+    /// existed — both `resolve_component_idle_predicate` and
+    /// `resolve_component_quiesced_predicate` return `None` on a
+    /// declared hookable of the same name, naming the shipped
+    /// `buf_mgr_test` fixture as the reason.
+    ///
+    /// TB-IR had no such guard, and `as_component_idle` runs BEFORE
+    /// component-method resolution, so the heartbeat won every time.
+    /// Measured on an `agent Calc` with `hookable idle(n) -> uint<32>`
+    /// returning 7, against `assert c.idle(2) == 7`:
+    ///
+    /// * v1 — `if (!(Calc_idle(c, 2) == 7))`: the method runs, the
+    ///   assertion holds.
+    /// * TB-IR, before this guard — `if (!((((cycle_count -
+    ///   c._last_in_cycle) >= 2) && ((cycle_count - c._last_out_cycle)
+    ///   >= 2)) == 7))`: the heartbeat runs, the assertion fails.
+    ///
+    /// Both compile and run, and they disagree — the worst shape a
+    /// divergence takes, and the reason this is a fix rather than a
+    /// classification.
+    fn user_override_wins(&self, cid: ComponentId, method: &str) -> bool {
+        self.ctx.components[cid.index()].method(method).is_some()
+    }
+
     /// Lower `<comp>.idle(N)` / `.idle_in(N)` / `.idle_out(N)` to an
     /// `Expr::ComponentIdle` when the callee resolves to a component
     /// instance path. Returns `None` when the callee is not an idle
     /// predicate on a known component (caller falls through to other
-    /// call-lowering paths).
+    /// call-lowering paths), and — see `user_override_wins` — when the
+    /// receiver's component declares a method of that name itself.
     pub(crate) fn as_component_idle(
         &mut self,
         callee: &AstExpr,
@@ -3555,7 +3610,10 @@ impl super::FuncBuilder<'_> {
         };
         // Walk sub-component segments to confirm the path resolves to a
         // component (the idle stamps live on every component struct).
-        self.resolve_component_recv(head_cid, &path[1..])?;
+        let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        if self.user_override_wins(recv_cid, &name.name) {
+            return Ok(None);
+        }
         if args.len() != 1 {
             return Err(unsupported(
                 &format!("`{}(...)` with {} arguments", name.name, args.len()),
@@ -3623,6 +3681,9 @@ impl super::FuncBuilder<'_> {
         // Resolve the receiver to its component (errors if a mid-path
         // segment is not a sub-component).
         let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        if self.user_override_wins(recv_cid, &name.name) {
+            return Ok(None);
+        }
         if args.len() != 1 {
             return Err(unsupported(
                 &format!("`quiesced(...)` with {} arguments", args.len()),

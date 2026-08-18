@@ -12810,12 +12810,25 @@ end impl T"#,
 }
 
 /// A queue method that is not `push`/`pop`/`size`/`empty` is not a v1
-/// escape hatch: `HarcQueue` implements exactly those four, so v1 emits
-/// a call to a method the runtime never defines.
+/// escape hatch, and in EXPRESSION position it is not a subset gap
+/// either: `size`/`empty` lower and `pop` has its own arm, so what
+/// reaches the fallback is `push` (which returns void) or a name
+/// `harc_rt::HarcQueue` never declares. v1 emits `uint64_t z =
+/// <recv>.<name>(...);` for all of them and g++ rejects all of them:
+///
+/// | call | g++ |
+/// |---|---|
+/// | `q.push(3)` | "void value not ignored as it ought to be" |
+/// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+///
+/// So they are `Invalid`, which is what separates them from the same
+/// names in STATEMENT position — there the value is discarded, so
+/// `size`/`empty` become a legal no-op v1 runs and they keep the
+/// suggestion.
 #[test]
 fn an_unknown_queue_method_does_not_point_at_v1() {
-    for stmt in ["q.front()", "let v = q.front()"] {
-        let err = lower_src(&format!(
+    let tb = |stmt: &str| {
+        format!(
             r#"testbench Tb
     dut : Top
     q : queue<uint<8>>
@@ -12826,11 +12839,181 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#
-        ))
-        .unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-        assert!(msg.contains("front"), "`{stmt}`: {msg}");
+        )
+    };
+    // Statement position: a program error, and the message names the API.
+    let msg = assert_invalid(&lower_src(&tb("q.front()")).unwrap_err());
+    assert!(
+        msg.contains("in statement position") && msg.contains("has only"),
+        "{msg}"
+    );
+    // Expression position: also a program error, by a different route.
+    let msg = assert_invalid(&lower_src(&tb("let v = q.front()")).unwrap_err());
+    assert!(
+        msg.contains("in expression position") && msg.contains("has only"),
+        "{msg}"
+    );
+    // And v1's own attempt, which is what makes both `Invalid`.
+    for stmt in ["q.front()", "let v = q.front()"] {
+        let v1 = cpp_tb::emit(&merged_src(&tb(stmt)))
+            .unwrap_or_else(|e| panic!("`{stmt}`: v1 emits: {e}"));
+        assert!(
+            v1.contains(".q.front();"),
+            "`{stmt}`: v1 emits the call `HarcQueue` has no member for"
+        );
     }
+}
+
+/// `pop` removes and returns the front element, so it takes nothing —
+/// and every `pop` branch used to check only the METHOD NAME and drop
+/// the argument list. `q.pop(7, 9)` lowered and emitted cleanly under
+/// TB-IR while v1 emitted `_tb.pend.pop(7, 9);`, which g++ rejects with
+/// "no matching function for call to `harc_rt::HarcQueue<long unsigned
+/// int>::pop(int, int)`". The `push` branches next to them have always
+/// matched `[CallArg::Expr(arg)]` exactly; this is that check's mirror.
+#[test]
+fn a_queue_pop_takes_no_arguments() {
+    let tb = |stmt: &str| {
+        format!(
+            r#"testbench Tb
+    dut : Top
+    q : queue<uint<8>>
+end testbench Tb
+impl T for Tb
+    run
+        q.push(1)
+        {stmt}
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    // Statement position and `let`-RHS position are separate branches.
+    for stmt in ["q.pop(7, 9)", "let v : uint<8> = q.pop(7, 9)"] {
+        let msg = assert_invalid(&lower_src(&tb(stmt)).unwrap_err());
+        assert!(
+            msg.contains("`pop` takes no arguments") && msg.contains("but 2 were passed"),
+            "`{stmt}`: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&tb(stmt)))
+            .unwrap_or_else(|e| panic!("`{stmt}`: v1 emits: {e}"));
+        assert!(
+            v1.contains(".q.pop(7, 9)"),
+            "`{stmt}`: v1 emits the over-applied call: {v1}"
+        );
+    }
+    // The zero-argument form still lowers — the guard must not have
+    // swallowed the ordinary case.
+    lower_src(&tb("q.pop()")).expect("a bare pop still lowers");
+    lower_src(&tb("let v : uint<8> = q.pop()")).expect("a bound pop still lowers");
+
+    // The other queue flavours reach the same guard through their own
+    // branches, so each is checked rather than inferred from the
+    // testbench one.
+    let state = fixture("queue_state_hookable_test.harc");
+    let cases = [
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        model.pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "scoreboard queue",
+            r#"scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    run
+        sb.q.push(3)
+        sb.q.pop(7, 9)
+        wait 1 cycle
+    end run
+end impl QTest"#
+                .to_string(),
+        ),
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        errs.pop(7, 9)
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+    ];
+    for (what, src) in cases {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("`pop` takes no arguments"), "{what}: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".pop(7, 9)"),
+            "{what}: v1 emits the over-applied call"
+        );
+    }
+}
+
+/// `push` in expression position is the other half of that fallback,
+/// and it is a program error for a DIFFERENT reason: `push` is a real
+/// `HarcQueue` member, it just returns void, so v1's `uint64_t z =
+/// _tb.sb.q.push(3);` gets "void value not ignored as it ought to be"
+/// rather than "has no member named". One arm, two mechanisms, two
+/// messages.
+#[test]
+fn a_queue_push_in_expression_position_is_a_program_error() {
+    let src = r#"scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    run
+        sb.q.push(3)
+        let z : uint<32> = sb.q.push(3)
+        wait 1 cycle
+    end run
+end impl QTest"#;
+    let msg = assert_invalid(&lower_src(src).unwrap_err());
+    assert!(
+        msg.contains("`push` returns no value"),
+        "the message must name the mechanism, not the member list: {msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    assert!(
+        v1.contains("z = _tb.sb.q.push(3);"),
+        "v1 binds the void result, which is what does not compile: {v1}"
+    );
 }
 
 /// A `default` on a queue field: v1 emits it into the member
@@ -20355,17 +20538,82 @@ end test PTest"#;
         "parameter form: {msg}"
     );
 
+    // The carve-out through the PARAMETER form, pinned separately from
+    // the path form. Without this the arm is unguarded: turning its
+    // `is_builtin_component_predicate` call into `if false &&` passed
+    // the entire suite, so the one arm the carve-out exists to create
+    // was the one nothing measured.
+    let param_builtin = param.replacen("m.nosuch(a)", "m.idle(a)", 1);
+    let msg = assert_unsupported(&lower_src(&param_builtin).unwrap_err());
+    assert!(
+        msg.contains("on a component-typed parameter"),
+        "parameter-form carve-out: {msg}"
+    );
+    cpp_tb::emit(&merged_src(&param_builtin))
+        .expect("v1 emits the built-in predicate on a parameter");
+
     // And the carve-out: a BUILT-IN predicate is not a declared method
     // either, but both backends implement it — TB-IR in expression
     // position, v1 anywhere. It keeps the suggestion.
-    let builtin = src("let q = c.idle(2)");
-    let msg = assert_unsupported(&lower_src(&builtin).unwrap_err());
-    assert!(msg.contains("built-in predicate"), "{msg}");
-    cpp_tb::emit(&merged_src(&builtin)).expect("v1 emits the built-in predicate");
+    //
+    // THREE landings reach the path-form arm, not the two an earlier
+    // version of this test checked. A bare statement has no binding and
+    // no local, so a message about "a binding position" described the
+    // wrong one of them.
+    for stmt in ["let q = c.idle(2)", "c.idle(2)", "x = c.idle(2)"] {
+        let builtin = if stmt.starts_with("x =") {
+            src(&format!("let x : uint<32> = 0\n        {stmt}"))
+        } else {
+            src(stmt)
+        };
+        let msg = assert_unsupported(&lower_src(&builtin).unwrap_err());
+        assert!(msg.contains("built-in predicate"), "{stmt}: {msg}");
+        cpp_tb::emit(&merged_src(&builtin))
+            .unwrap_or_else(|e| panic!("{stmt}: v1 emits the built-in predicate: {e}"));
+    }
     // The same predicate one statement position over lowers under TB-IR,
     // which is what makes `Invalid` false for it.
     lower_src(&src("assert c.idle(2) else fail(\"q\")"))
         .expect("TB-IR lowers the predicate in expression position");
+
+    // A component that DECLARES the name gets its own method, on both
+    // backends — the built-in is a default, not a reserved word. TB-IR
+    // used to reach `as_component_idle` first and emit the heartbeat
+    // against a program whose `idle` returns 7, silently disagreeing
+    // with v1's `Calc_idle(c, 2)`. Now the declaration wins, so the
+    // call is an ordinary component-method call and takes that path's
+    // (pre-existing, name-independent) expression-position gap.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let declared = src(&format!("assert c.{name}(2) == 7 else fail(\"o\")")).replacen(
+            "agent Calc",
+            &format!(
+                "agent Calc\n    hookable {name}(n: uint<8>) -> uint<32>\n        return 7\n    \
+                 end {name}"
+            ),
+            1,
+        );
+        let msg = format!("{}", lower_src(&declared).unwrap_err());
+        assert!(
+            msg.contains(&format!("`.{name}(...)`")),
+            "{name}: the declaration must win, leaving the ordinary method-call gap: {msg}"
+        );
+        // The same refusal an ordinary name gets — the point is that it
+        // is name-independent now.
+        let ordinary = declared.replacen(name, "ordinary", 4);
+        let plain = format!("{}", lower_src(&ordinary).unwrap_err());
+        assert_eq!(
+            msg.replace(name, "ordinary"),
+            plain,
+            "{name}: a declared built-in name must refuse exactly like any other method"
+        );
+        // v1 dispatches to the user's method, which is the behaviour
+        // TB-IR now declines to contradict.
+        let v1 = cpp_tb::emit(&merged_src(&declared)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            v1.contains(&format!("Calc_{name}(c, 2)")),
+            "{name}: v1 calls the declared method"
+        );
+    }
 }
 
 /// Two statement-position `on <event>(...)` subscription arms, side by
@@ -20433,7 +20681,7 @@ end impl SubTest"#
     // wrong: it subscribed to `s.obs` and then emitted on `ch`, so the
     // handler could never fire and the "built and run, seen=3" claim
     // recorded for it was measured on a different program. Firing
-    // `s.fire(3)` — which emits `observed` inside the agent — is what
+    // `s.fire(3)` — which emits `obs` inside the agent — is what
     // makes the subscription observable.
     let path = src("s.obs").replacen("        emit ch(3)", "        s.fire(3)", 1);
     assert!(
@@ -20482,8 +20730,19 @@ end impl SubTest"#
             "{name}: {msg}"
         );
         let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // A NAME, not a substring: every generated testbench contains
+        // `sched.slots.push_back(&_run_slot);`, so `contains("s.push_back(")`
+        // passed for `name = "s"` on any output at all — including one
+        // with the subscription emission deleted. Require the character
+        // before the name to be a non-identifier, non-`.` boundary.
+        let needle = format!("{name}.push_back(");
         assert!(
-            v1.contains(&format!("{name}.push_back(")),
+            v1.lines().any(|l| l.match_indices(&needle).any(|(i, _)| {
+                l[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+            })),
             "{name}: v1 emits the name verbatim"
         );
     }
@@ -20523,8 +20782,15 @@ end impl SubTest"#
 /// So `size`/`empty` keep the suggestion — v1 runs those programs — and
 /// everything else is a program error no backend runs.
 ///
-/// Both landings were probed independently rather than one inferred
-/// from the other, and both behave this way.
+/// All FIVE landings were probed independently rather than four
+/// inferred from one — testbench-owned field, scoreboard queue,
+/// component queue, bare target-state field, instance-qualified
+/// target-state field — and all five behave this way. Three of them
+/// used to carry a hand-written `EmitsUncompilable` instead, which
+/// measurement contradicts: `pend.size()` emits `_tb.pend.size();`,
+/// `pending.size()` emits `self.pending.size();` and
+/// `model.pending.size()` emits `_tb.model.pending.size();`, and g++
+/// compiles all three.
 #[test]
 fn a_queue_method_in_statement_position_splits_on_the_runtime_api() {
     let sb = |method: &str| {
@@ -20578,9 +20844,49 @@ end test CqTest"#
         )
     };
 
+    let tb_field = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TbQ
+    dut  : Top
+    pend : queue<uint<32>>
+end testbench TbQ
+
+impl TbQTest for TbQ
+    clock clk = SysDomain
+    run
+        pend.push(3)
+        pend.{method}()
+        wait 1 cycle
+    end run
+end impl TbQTest"#
+        )
+    };
+    let state = fixture("queue_state_hookable_test.harc");
+    let bare_state = |method: &str| {
+        state.replacen(
+            "            pending.push(value)",
+            &format!("            pending.push(value)\n            pending.{method}()"),
+            1,
+        )
+    };
+    let inst_state = |method: &str| {
+        state.replacen(
+            "        model.enqueue(7)",
+            &format!("        model.enqueue(7)\n        model.pending.{method}()"),
+            1,
+        )
+    };
+
     for (what, src) in [
         ("scoreboard queue", &sb as &dyn Fn(&str) -> String),
         ("component queue", &comp),
+        ("testbench queue field", &tb_field),
+        ("bare target-state field", &bare_state),
+        ("instance-qualified target-state field", &inst_state),
     ] {
         // `size`/`empty` — v1 emits a legal no-op and runs the program.
         for method in ["size", "empty"] {
@@ -20650,12 +20956,52 @@ end test CqTest"#
     for name in ["push", "pop", "empty", "size"] {
         assert!(declares(name), "HarcQueue must still declare `{name}`");
     }
-    for name in ["clear", "front"] {
-        assert!(
-            !declares(name),
-            "HarcQueue must still lack `{name}`, or the `Invalid` rows above are wrong"
-        );
-    }
+    // …and the set is CLOSED. Spot-checking two absent names made this a
+    // blacklist: adding `T back() const { return _d.back(); }` to the
+    // header left the test green while `errs.back()` kept being reported
+    // as a program error for a statement v1 compiles and runs. Enumerate
+    // what the struct declares and compare the whole set instead.
+    let body = {
+        let start = hdr
+            .find("struct HarcQueue")
+            .expect("struct HarcQueue present");
+        let open = hdr[start..].find('{').expect("struct body opens") + start;
+        let end = hdr[open..].find("\n};").expect("struct body closes") + open;
+        &hdr[open..end]
+    };
+    let mut members: Vec<String> = body
+        .lines()
+        .filter_map(|l| {
+            // `<return type> <name>(` at member indentation. The inner
+            // `_d.push_back(...)` calls sit inside a body and are
+            // preceded by `.`, which the boundary rule below rejects.
+            let paren = l.find('(')?;
+            let head = l[..paren].trim_end();
+            let name = head.rsplit(|c: char| c.is_whitespace()).next()?;
+            let before = head.strip_suffix(name)?;
+            if name.is_empty() || before.trim().is_empty() {
+                return None;
+            }
+            if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect();
+    members.sort();
+    members.dedup();
+    assert_eq!(
+        members,
+        vec![
+            "empty".to_string(),
+            "pop".to_string(),
+            "push".to_string(),
+            "size".to_string()
+        ],
+        "`HarcQueue`'s member set changed; `queue_method_in_statement_position` splits on \
+         `size`/`empty` and calls everything else a program error, so that list has to move \
+         with the header"
+    );
 }
 
 /// The six covergroup hook-trigger shape arms, of which exactly TWO are

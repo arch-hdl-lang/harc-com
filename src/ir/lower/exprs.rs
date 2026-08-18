@@ -47,6 +47,41 @@ pub(crate) struct TransactorStateRecordChain {
     pub leaf_vec_len: Option<usize>,
 }
 
+/// A queue method in EXPRESSION position that no query arm claimed.
+///
+/// `size` and `empty` lower here and `pop` has its own arm immediately
+/// above, so what reaches this is either `push` — which returns void —
+/// or a name `harc_rt::HarcQueue` never declares. Both are program
+/// errors rather than subset gaps, which is the difference from
+/// [`super::stmts::queue_method_in_statement_position`]: there the
+/// value is DISCARDED, so `size`/`empty` make a legal no-op that v1
+/// compiles and runs, and only they keep the `--codegen v1` suggestion.
+///
+/// Measured at all five landings — testbench-owned field, scoreboard
+/// queue, component queue, bare target-state field, instance-qualified
+/// target-state field — rather than four inferred from one. v1 emits
+/// `uint64_t z = <recv>.<name>(...);` at every one, and g++ rejects
+/// every one:
+///
+/// | call | g++ |
+/// |---|---|
+/// | `q.push(3)` | "void value not ignored as it ought to be" |
+/// | `q.push()` | "no matching function for call to `HarcQueue<...>::push()`" |
+/// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+///
+/// (`q.size()` compiles, which is why it never reaches this arm.)
+fn queue_method_in_expression_position(what: &str, method: &str) -> LowerError {
+    if method == "push" {
+        return LowerError::Invalid(format!(
+            "{what} in expression position: `push` returns no value"
+        ));
+    }
+    LowerError::Invalid(format!(
+        "{what} in expression position: `HarcQueue` has only `push`, `pop`, `size` and \
+         `empty`"
+    ))
+}
+
 impl FuncBuilder<'_> {
     /// Lower with `Expr::Port` allowed in the result.
     pub(crate) fn lower_expr(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
@@ -1586,10 +1621,9 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(not_implemented(
+                return Err(queue_method_in_expression_position(
                     &format!("scoreboard queue method `{field}.{queue}.{other}(...)`"),
-                    "only `push`/`pop`/`size`/`empty` are lowered",
-                    V1Status::EmitsUncompilable,
+                    other,
                 ));
             }
         };
@@ -1637,10 +1671,9 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(not_implemented(
+                return Err(queue_method_in_expression_position(
                     &format!("testbench queue method `{field}.{other}(...)`"),
-                    "only `push`/`pop`/`size`/`empty` are lowered",
-                    V1Status::EmitsUncompilable,
+                    other,
                 ));
             }
         };
@@ -1674,10 +1707,9 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(not_implemented(
+                return Err(queue_method_in_expression_position(
                     &format!("component queue method `{queue}.{other}(...)`"),
-                    "only `push`/`pop`/`size`/`empty` are lowered",
-                    V1Status::EmitsUncompilable,
+                    other,
                 ));
             }
         };
@@ -1734,10 +1766,9 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(not_implemented(
+                return Err(queue_method_in_expression_position(
                     &format!("target-state queue method `{field}.{other}(...)`"),
-                    "only `push`/`pop`/`size`/`empty` are lowered",
-                    V1Status::EmitsUncompilable,
+                    other,
                 ));
             }
         };
@@ -2145,10 +2176,9 @@ impl FuncBuilder<'_> {
                 ));
             }
             other => {
-                return Err(not_implemented(
+                return Err(queue_method_in_expression_position(
                     &format!("target-state queue method `{instance}.{field}.{other}(...)`"),
-                    "only `push`/`pop`/`size`/`empty` are lowered",
-                    V1Status::EmitsUncompilable,
+                    other,
                 ));
             }
         };

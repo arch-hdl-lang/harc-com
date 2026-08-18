@@ -301,15 +301,18 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("testbench queue `{field}`"),
+                                args,
+                            )?;
                             let elem = self.tb_queue_elem(&field)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::TbQueuePop { field, dest });
                             return Ok(());
                         }
-                        return Err(not_implemented(
-                            &format!("testbench queue method `{field}.{method}(...)` in statement position"),
-                            "only `push`/`pop`/`size`/`empty` are lowered",
-                            V1Status::EmitsUncompilable,
+                        return Err(queue_method_in_statement_position(
+                            &format!("testbench queue method `{field}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -360,6 +363,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("scoreboard queue `{field}.{queue}`"),
+                                args,
+                            )?;
                             let elem = self.scoreboard_queue_elem(sb, &queue)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::ScoreboardOp {
@@ -393,6 +400,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("component queue `{queue}`"),
+                                args,
+                            )?;
                             let elem = self.component_queue_elem(&base, &queue)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::ComponentQueuePop { base, queue, dest });
@@ -425,6 +436,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{field}`"),
+                                args,
+                            )?;
                             let crate::ir::StateFieldKind::Queue { elem } =
                                 self.target_state_fields[&field].clone()
                             else {
@@ -438,13 +453,9 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(not_implemented(
-                            &format!(
-                                "target-state queue method `{field}.{method}(...)` in statement \
-                                 position"
-                            ),
-                            "only `push`/`pop`/`size`/`empty` are lowered",
-                            V1Status::EmitsUncompilable,
+                        return Err(queue_method_in_statement_position(
+                            &format!("target-state queue method `{field}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -473,6 +484,10 @@ impl FuncBuilder<'_> {
                                     return Ok(());
                                 }
                                 if method == "pop" {
+                                    queue_pop_takes_no_arguments(
+                                        &format!("target-state queue `{instance}.{field}`"),
+                                        args,
+                                    )?;
                                     let crate::ir::StateFieldKind::Queue { elem } = kind else {
                                         unreachable!("the enclosing `matches!` gated on Queue");
                                     };
@@ -484,13 +499,12 @@ impl FuncBuilder<'_> {
                                     });
                                     return Ok(());
                                 }
-                                return Err(not_implemented(
+                                return Err(queue_method_in_statement_position(
                                     &format!(
-                                        "target-state queue method `{instance}.{field}.{method}\
-                                         (...)` in statement position"
+                                        "target-state queue method \
+                                         `{instance}.{field}.{method}(...)`"
                                     ),
-                                    "only `push`/`pop`/`size`/`empty` are lowered",
-                                    V1Status::EmitsUncompilable,
+                                    &method,
                                 ));
                             }
                         }
@@ -668,9 +682,10 @@ impl FuncBuilder<'_> {
         // `let v = _tb.pending.pop()` on a testbench-owned queue. This
         // precedes the generic scalar/record let paths so record-element
         // pops retain their record type.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((field, method)) = self.as_tb_queue_call(call) {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("testbench queue `{field}`"), args)?;
                     let elem = self.tb_queue_elem(&field)?;
                     let id = self.declare(&l.name.name);
                     match elem {
@@ -698,9 +713,10 @@ impl FuncBuilder<'_> {
         // which the record-local block below rejects). The popped local's
         // type comes from the queue element (record id from the field, or a
         // scalar width from the optional `let` annotation).
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((base, queue, method)) = self.as_component_queue_call(call)? {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("component queue `{queue}`"), args)?;
                     let elem = self.component_queue_elem(&base, &queue)?;
                     let id = self.declare(&l.name.name);
                     match elem {
@@ -761,9 +777,10 @@ impl FuncBuilder<'_> {
         // component/scoreboard pops above: a record-element pop is a
         // record-typed let WITH an initializer. The popped local's type
         // comes from the queue element.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((field, method)) = self.as_state_queue_call(call) {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("target-state queue `{field}`"), args)?;
                     let crate::ir::StateFieldKind::Queue { elem } =
                         self.target_state_fields[&field].clone()
                     else {
@@ -796,11 +813,15 @@ impl FuncBuilder<'_> {
         // `let v = target.pending.pop()` — TEST-SCOPE pop on a bound-to
         // responder queue state field (fully resolved instance). Same
         // ordering rationale as the responder-body state-queue pop above.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let ExprKind::Field { target, name } = &*call.kind {
                 if name.name == "pop" {
                     if let Some((instance, field, kind)) = self.as_transactor_state_any(target) {
                         if let crate::ir::StateFieldKind::Queue { elem } = kind {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{instance}.{field}`"),
+                                args,
+                            )?;
                             let id = self.declare(&l.name.name);
                             match elem {
                                 crate::ir::QueueElem::Record(rid) => {
@@ -3787,12 +3808,32 @@ fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
 
 /// The `callee` of a `let ... = <callee>(...)` initializer when the RHS is
 /// a call (the shape a `.pop()` access takes), or `None`.
-fn pop_call_callee(value: &Option<crate::ast::Expr>) -> Option<&crate::ast::Expr> {
+fn pop_call_parts(value: &Option<crate::ast::Expr>) -> Option<(&crate::ast::Expr, &[CallArg])> {
     let v = value.as_ref()?;
     match &*v.kind {
-        ExprKind::Call { callee, .. } => Some(callee),
+        ExprKind::Call { callee, args } => Some((callee, args.as_slice())),
         _ => None,
     }
+}
+
+/// `pop` removes and returns the front element, so it takes nothing.
+///
+/// Every `pop` branch used to check only the method NAME and drop the
+/// argument list on the floor, which let `q.pop(7, 9)` lower and emit
+/// cleanly while v1 emitted `_tb.pend.pop(7, 9);` — g++: "no matching
+/// function for call to `harc_rt::HarcQueue<long unsigned int>::pop(int,
+/// int)`". Neither backend runs it, so this is `Invalid`, and it is the
+/// mirror of the `push` branches' `[CallArg::Expr(arg)]` pattern, which
+/// has always been exact.
+fn queue_pop_takes_no_arguments(what: &str, args: &[CallArg]) -> Result<(), LowerError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(LowerError::Invalid(format!(
+        "{what}: `pop` takes no arguments (it removes and returns the front element), \
+         but {} were passed",
+        args.len()
+    )))
 }
 
 /// Explicit bit width of a typed scalar `let` annotation
@@ -3876,9 +3917,9 @@ fn is_log_severity(s: &str) -> bool {
 /// A queue method in STATEMENT position that is neither `push` nor
 /// `pop` — both of those are lowered above, so this is what is left.
 ///
-/// v1 emits the call verbatim (`_tb.sb.q.<method>();`, `errs.<method>();`)
-/// against `harc_rt::HarcQueue`, whose whole API is `push`, `pop`,
-/// `size` and `empty`. So the split is exact rather than a proxy:
+/// v1 emits the call against `harc_rt::HarcQueue`, whose whole API is
+/// `push`, `pop`, `size` and `empty`. So the split is exact rather than
+/// a proxy:
 ///
 ///   * `size` / `empty` — compile. The value is discarded, which makes
 ///     the statement a legal no-op, and v1 runs the program. That is a
@@ -3887,15 +3928,30 @@ fn is_log_severity(s: &str) -> bool {
 ///     harc_rt::HarcQueue<long unsigned int>' has no member named
 ///     'clear'". No backend runs it.
 ///
-/// Measured at BOTH landings independently rather than assumed from
-/// one: the scoreboard-queue arm and the component-queue arm each take
-/// their own probe, and both behave this way.
+/// The emission is verbatim for every name EXCEPT the four width-method
+/// intrinsics: `try_emit_width_method` claims `trunc`/`zext`/`sext`/
+/// `resize` by name before the member-call path, so `sb.q.trunc(2)`
+/// comes out as `((uint64_t)(((uint64_t)(_tb.sb.q) & 0x3ULL)));`, not as
+/// a `.trunc(2)` call. The `Invalid` verdict still holds for those four
+/// — g++ rejects the cast: "invalid cast from type
+/// `harc_rt::HarcQueue<long unsigned int>` to type `uint64_t`" — but it
+/// holds for a different reason, so the runtime header is the
+/// discriminator for every other name and not for these.
+///
+/// Measured at ALL FIVE landings independently rather than four inferred
+/// from one: testbench-owned field, scoreboard queue, component queue,
+/// bare target-state field, and instance-qualified target-state field
+/// each take their own probe. All five behave this way — which is why
+/// they now share this helper instead of three of them carrying a
+/// hand-written `EmitsUncompilable` that measurement contradicts.
 fn queue_method_in_statement_position(what: &str, method: &str) -> LowerError {
     // `HarcQueue`'s value-returning half. Kept beside the reason it
-    // matters: v1 emits whatever name is written straight through, so
-    // this list is the runtime's API, and it has to track
-    // `runtime/harc_queue_rt.h` or a working call starts being called a
-    // program error.
+    // matters: apart from the four width-method names noted above, v1
+    // emits whatever name is written straight through, so this list is
+    // the runtime's API, and it has to track `runtime/harc_queue_rt.h`
+    // or a working call starts being called a program error. The test
+    // enumerates the header's declared members and compares the whole
+    // set, so growing `HarcQueue` fails here rather than silently.
     if matches!(method, "size" | "empty") {
         return unsupported(
             &format!("{what} in statement position"),
