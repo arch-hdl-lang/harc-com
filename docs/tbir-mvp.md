@@ -6642,6 +6642,215 @@ former `transaction` group lives in
      far enough to produce it.
 
 
+108. **Five record-assignment arms, and a sixth spelling with no arm at
+     all (2026-08-18).**
+
+     Each of these rejected a whole family under one `Unsupported`, so
+     each promised `--codegen v1` for programs v1 cannot compile. Only
+     one family has a well-typed member:
+
+     | assignment | v1 emits | verdict |
+     |---|---|---|
+     | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | a real escape hatch |
+     | `b = sb.q.pop()`, `q : queue<uint<8>>` | the same line — "operand types are 'Beat' and 'long unsigned int'" | `Invalid` |
+     | `b = drv.get()` | `b = Drv_get(_tb.drv);` — "'Beat' and 'uint64_t'" | `Invalid` |
+     | `b = o` / `b = 5` | "'Beat' and 'Other'" / "'Beat' and 'int'" | `Invalid` |
+     | `rec = 5` in a method body | "'Beat' and 'int'" | `Invalid` |
+     | `drv.rec = 5` from test scope | the same — and TB-IR LOWERED it | `Invalid` |
+
+     The last row is the find. The bare-name spelling of a whole-record
+     state write was guarded; the dotted test-scope spelling was not. So
+     `drv.rec = 5` lowered, verified, and emitted `drv.rec = 5;` from the
+     DEFAULT backend — as uncompilable as v1's `_tb.drv.rec = 5;`. Test
+     scope is where a user writes that line; the guarded spelling is the
+     one they write less often. Same shape as divergence 104: one lane
+     of a construct checked, another not, and the unchecked lane is the
+     ordinary one.
+
+     **`Invalid` is only for a mismatch the compiler can SEE.** The
+     first version of these guards read the RHS with
+     `record_id_of_expr`, which answers `None` for two very different
+     things: an expression that is definitely not a record (a literal,
+     an arithmetic result), and one it could not type. It had no arm for
+     `Expr::ComponentField`, and record-typed composite-component fields
+     are first class (`ComponentFieldKind::Record`) — so
+     `drv.rec = src.cur`, a whole-record copy that BOTH backends
+     compile and that lowered cleanly before this commit, became a type
+     error. That is the same regression class as divergence 103's, one
+     divergence later.
+
+     `record_id_of_expr` types `Expr::ComponentField` now, so
+     `drv.rec = src.cur` and `b = src.cur` both lower and emit C++ that
+     compiles under both backends.
+
+     Re-review found a third member of the same class, then a fourth,
+     and the fix's own mechanism turned out to be the wrong shape:
+
+       * A record-valued TERNARY (`b = c ? x : y`) was untyped too, so
+         it was a false type error as well — v1 emits
+         `b = (c ? x : y);` and g++ accepts it. That one was
+         reconstructable from the repo: `expr_type` already types the
+         shape a hundred lines away, `expr_type(t).or_else(expr_type(e))`.
+       * `record_capable_expr` — the helper added to keep an escape
+         hatch for an RHS the compiler could not type — listed
+         `TbField` and `ComponentValue` among the shapes that might
+         hold a record. Neither can: a `TbField` is built only where
+         `ctx.tb_scalar_fields` matched (a RECORD testbench field is in
+         `tb_record_fields` and resolves to a `Local`), and a
+         `ComponentValue` is a whole component. So `b = count` and
+         `b = src` kept promising `--codegen v1` for programs v1
+         answers with "no match for 'operator='".
+
+     The hatch was the wrong shape because the untypability was not
+     real. Inside a component METHOD body `src.cur` lowered to
+     `ComponentField { base: Path(["self", "src"]) }` —
+     `component_path_head` builds a `"self"`-rooted path for a
+     sub-component of the method's own component — and
+     `component_base_id`, written as the inverse of that function,
+     resolved only its OTHER head form, the test-scope instance. One of
+     two head forms, so every component-field access in a method body
+     looked untypable and something had to catch it.
+
+     `component_base_id` inverts both head forms now, and a new
+     `component_field_record` walks the rest: `field` is not always a
+     single name — `as_component_record_field` returns a DOTTED one for
+     a nested subfield (`ComponentField { base: SelfField, field:
+     "cur.v" }`) — so it steps segment by segment exactly as that
+     function's own `validate` closure does, stopping at anything that
+     is not a traversable record. Answering the HEAD's record for a
+     dotted path would lower `b = self.mine.v;` on a scalar leaf;
+     answering `None` for every dotted path would reject `b = mine.inn`,
+     a nested-record struct copy both backends emit.
+
+     With that, every RHS shape types definitively and the hatch is
+     gone: `record_assign_mismatch` is `Invalid` in all cases, and
+     `b = src.cur`, `b = c ? x : src.cur`, `b = mine.inn` and
+     `let c = src.cur` all LOWER — none of which they did before.
+
+     Two more sites fell out. `lower_let`'s untyped tail typed its local
+     from `expr_type`, which has no arm for a record-valued component
+     field or transactor state field, so `let c = src.cur` declared
+     `uint64_t c = 0;` and the DEFAULT backend emitted C++ that does not
+     compile ("cannot convert 'Beat' to 'uint64_t'"); it asks
+     `record_id_of_expr` as a fallback now, and tbir emits `Beat c{}`
+     where v1 still emits an uncompilable `int64_t c = self.src.cur;`.
+     And the `Vec<Record, N>` ELEMENT write — the same rule stated a
+     third time — was still an `Unsupported`, promising v1 for
+     `tbl.entries[1] = 5`, which v1 emits against a
+     `std::array<Entry, 4>` and g++ refuses. It and its already-classified
+     sibling (the whole nested-record field write) both route through
+     `record_assign_mismatch` now.
+
+     The mirror of the find, one line away in the same guard: a SCALAR
+     state field assigned a record (`drv.st = b`) lowered, verified and
+     emitted `drv.st = b;` — g++ "cannot convert 'Beat' to 'uint64_t' in
+     assignment", the same failure v1 has. Also `Invalid` now.
+
+     A third review round found no false `Invalid` but four more
+     spellings of the same rule, plus one defect the `let` fix above had
+     just introduced:
+
+       * **The regression.** `record_ty` beats `declared_scalar_ty` in
+         `lower_let`'s type chain, so teaching `record_ty` the component
+         shapes made `let c : uint<8> = s.cur` type `c` as a `Beat` and
+         DISCARD the annotation — the default backend laundering a type
+         with no diagnostic, where v1 at least emitted
+         `uint64_t c = _tb.s.cur;` for g++ to reject. A disagreement
+         between a declared scalar type and a record RHS is `Invalid`
+         now; it is visible precisely because the RHS types
+         definitively. Keyed on the ANNOTATION'S PRESENCE, not on
+         `typed_let_ir_type` — that function answers `None` for `int`,
+         and `bit` parses as a `Named` type, so keying on its result
+         left both spellings laundering the type while v1 emitted
+         `uint64_t c = ...` and `Vbit* c = ...`.
+       * **Five queue-pop lanes** — testbench, component, scoreboard,
+         and the responder-body and test-scope spellings of a
+         target-state queue — each type the popped local from the queue
+         element and ignored the `let` annotation entirely, so
+         `let b : Other = sb.q.pop()` on a `queue<Beat>` declared `Beat`
+         and RAN, while v1's `Other b = _tb.sb.q.pop();` gets
+         "conversion from 'Beat' to non-scalar type 'Other' requested".
+         One shared `check_pop_let_type`, asked from all five. The first
+         pass wired it to three and left out the testbench-queue lane
+         and the TEST-SCOPE spelling of the same target-state queue
+         whose responder-body spelling it had just fixed — the same
+         one-lane-checked-one-not shape as the headline find, inside
+         the fix for it.
+       * A REGBLOCK name is in `record_ids` too (its mirror record is
+         filed under the regblock's own name) and the pop lanes run
+         BEFORE divergence 104's instantiation guard, so
+         `let z : DmaRegs = sb.q.pop()` reached a pop lane first. The
+         rule is stated once now — `regblock_instantiation_error` — and
+         asked from both places, so the actionable "requires
+         `= bind <helper>`" wins wherever the spelling lands.
+       * **The record-annotated INITIALIZER** — `let b : Beat = 5` — was
+         the `let` spelling of the write the assignment arms reject, and
+         it still promised `--codegen v1` for a program v1 answers with
+         "conversion from 'int' to non-scalar type 'Beat' requested".
+       * **A whole-record COMPONENT field** was not writable at all,
+         from either spelling, though v1 writes both. The dotted
+         test-scope one (`s.cur = y`) hit "not a scalar component
+         field", `Unsupported`; the bare method-body one (`cur = b`) hit
+         "assignment to unknown name `cur`" labelled
+         `EmitsUncompilable` — false in both halves, since `cur` is a
+         declared field of that very component and v1 emits
+         `self.cur = b;` and compiles. Both lower now, and a mismatched
+         RHS is `Invalid` through the same shared verdict.
+
+     A fifth round confirmed those and found the MIRROR of the whole
+     divergence missing at ten more sites. The record-DESTINATION
+     direction had been guarded arm by arm; the scalar-destination
+     direction was guarded at exactly one site (a scalar
+     transactor-state field), and everywhere else — a DUT port, a
+     testbench field, a scoreboard counter, a scalar component field at
+     both spellings, a scalar record field, a scalar `Vec` element, a
+     record-state scalar subfield, a scalar local, and the assignment
+     spelling of a record-queue pop — `x = <record>` LOWERED, VERIFIED
+     and emitted from the DEFAULT backend, where g++ answers "cannot
+     convert 'Beat' to 'uint64_t' in assignment". The scalar-local case
+     did not even reach a diagnostic: it tripped the VERIFIER's
+     `TypeMismatch`, which `main.rs` renders as "internal error: TB-IR
+     failed verification after lowering" — a compiler-bug report for a
+     program error. One shared `reject_record_into_scalar`, asked from
+     all ten, and callable only because `record_id_of_expr` now types
+     every record-carrying RHS. A sixth round found three more of the
+     same shape, so it is asked from fourteen: the BARE-NAME spelling
+     of a scalar state-field write (the polarity of that hole reversed
+     — there the dotted spelling was unguarded, here the bare one), and
+     all four RAL write spellings, which funnel through
+     `lower_reg_write` / `lower_field_write` and return from inside the
+     `try_lower_*` helpers, so none of `lower_assign`'s destination
+     guards ever saw them.
+
+     Deferred with its measurement: the same rule in ARGUMENT position
+     — a record pushed onto a scalar queue, passed to a scalar method
+     or hookable parameter, or emitted on a scalar-payload event. All
+     lower and emit today, and the testbench-queue push answers a
+     program error through the verifier's internal-compiler-error
+     channel. That is a different surface from assignment and gets its
+     own divergence.
+
+     One further arm was wrong in both directions at once. A
+     whole-record write of a TESTBENCH record field (`tbrec = b`) fell
+     through every lane to the catch-all, which claimed
+     `SilentlyMisLowers`. v1 emits `_tb.tbrec = b;` and g++ ACCEPTS it,
+     so a working escape hatch was being withheld; and `tbrec = 5`
+     emits a line g++ refuses, so that member is a type error. A
+     `tb_record_field_target` resolver splits it like every other
+     record destination.
+
+     `Invalid` rather than `EmitsUncompilable` for the rest, on the
+     distinction this sweep has been using: `EmitsUncompilable` is a
+     subset gap a future TB-IR could implement and v1 currently botches
+     (`Vec<uint<8>, 4> default 0` could sensibly zero-fill). A record
+     local assigned an integer is a type error — there is nothing to
+     implement, and no backend runs it.
+
+     The transactor-method arm has no well-typed member at all: a record
+     RETURN type is refused upstream, so every method reaching it
+     returns a scalar.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

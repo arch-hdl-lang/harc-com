@@ -3481,7 +3481,17 @@ impl super::FuncBuilder<'_> {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(field) = comp.field(&id.name) {
-                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                        // A whole-RECORD field is written the same way —
+                        // v1 emits `self.cur = b;` and g++ accepts it.
+                        // Accepting only `Scalar` here sent `cur = b`
+                        // down to "assignment to unknown name `cur`",
+                        // labelled `EmitsUncompilable`, which was wrong
+                        // on both halves: `cur` is a declared field of
+                        // this very component, and v1 compiles the file.
+                        if matches!(
+                            field.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some((ComponentBase::SelfField, id.name.clone())));
                         }
@@ -3506,8 +3516,22 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     match comp.field(&field) {
+                        // A whole-RECORD component field takes the same
+                        // path: v1 emits `_tb.s.cur = y;` for a
+                        // same-typed RHS and g++ accepts it. The caller
+                        // type-checks the RHS against the field's record
+                        // (`lower_assign`), so a mismatched one is a
+                        // precise `Invalid` rather than this arm's
+                        // blanket "not a scalar component field", which
+                        // promised `--codegen v1` for `s.cur = 5` —
+                        // "no match for 'operator=', operand types are
+                        // 'Beat' and 'int'".
                         Some(schema)
-                            if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) =>
+                            if matches!(
+                                schema.kind,
+                                ComponentFieldKind::Scalar { .. }
+                                    | ComponentFieldKind::Record { .. }
+                            ) =>
                         {
                             self.require_component_activation(
                                 &base_head[0],
@@ -3691,7 +3715,7 @@ impl super::FuncBuilder<'_> {
     /// Walk a sub-component receiver path from a head component down
     /// `segs` (each must name a `Sub` field), returning the final
     /// ComponentId. `segs` is the path AFTER the head local segment.
-    fn resolve_component_recv(
+    pub(crate) fn resolve_component_recv(
         &self,
         head: ComponentId,
         segs: &[String],

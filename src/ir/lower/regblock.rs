@@ -301,6 +301,16 @@ impl super::FuncBuilder<'_> {
         // DUT reads are side-effect-free, and there is no tick between
         // the two uses) and avoids re-hoisting a DUT read twice.
         let v = self.lower_expr_no_ports(value)?;
+        // A register (or register FIELD) is a scalar. All four RAL
+        // write spellings — `regs.REG`, `regs.REG.FIELD`,
+        // `chip.inst.REG`, `chip.inst.REG.FIELD` — funnel through this
+        // pair, and they return from inside the `try_*` helpers, so
+        // none of `lower_assign`'s destination guards ever sees them.
+        // Measured: `regs.DMACR = b` gets "cannot convert 'Beat' to
+        // 'uint64_t' in assignment" and the field-level ones "no match
+        // for 'operator&' (operand types are 'Beat' and 'int')", from
+        // BOTH backends.
+        self.reject_record_into_scalar(&v, "a register field")?;
         let writes_bus = reg.access.writes_to_bus();
         let v = if writes_bus && !matches!(v, Expr::Local(_) | Expr::Literal { .. }) {
             // Bind to a temp so the same value feeds both uses.
@@ -367,6 +377,16 @@ impl super::FuncBuilder<'_> {
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         let v = self.lower_expr_no_ports(value)?;
+        // A register (or register FIELD) is a scalar. All four RAL
+        // write spellings — `regs.REG`, `regs.REG.FIELD`,
+        // `chip.inst.REG`, `chip.inst.REG.FIELD` — funnel through this
+        // pair, and they return from inside the `try_*` helpers, so
+        // none of `lower_assign`'s destination guards ever sees them.
+        // Measured: `regs.DMACR = b` gets "cannot convert 'Beat' to
+        // 'uint64_t' in assignment" and the field-level ones "no match
+        // for 'operator&' (operand types are 'Beat' and 'int')", from
+        // BOTH backends.
+        self.reject_record_into_scalar(&v, "a register field")?;
         let mask = field_mask(fld.bit_width);
         let pos = fld.bit_pos as u64;
         let cur = Expr::RecordField {

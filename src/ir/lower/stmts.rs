@@ -689,6 +689,7 @@ impl FuncBuilder<'_> {
                 if method == "pop" {
                     queue_pop_takes_no_arguments(&format!("testbench queue `{field}`"), args)?;
                     let elem = self.tb_queue_elem(&field)?;
+                    self.check_pop_let_type(l, &elem, &format!("testbench queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
                     match elem {
                         crate::ir::QueueElem::Record(rid) => {
@@ -720,6 +721,7 @@ impl FuncBuilder<'_> {
                 if method == "pop" {
                     queue_pop_takes_no_arguments(&format!("component queue `{queue}`"), args)?;
                     let elem = self.component_queue_elem(&base, &queue)?;
+                    self.check_pop_let_type(l, &elem, &format!("component queue `{queue}`"))?;
                     let id = self.declare(&l.name.name);
                     match elem {
                         crate::ir::QueueElem::Record(rid) => {
@@ -751,6 +753,7 @@ impl FuncBuilder<'_> {
         if let Some(value) = &l.value {
             if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
                 let elem = self.scoreboard_queue_elem(sb, &queue)?;
+                self.check_pop_let_type(l, &elem, &format!("scoreboard queue `{queue}`"))?;
                 let id = self.declare(&l.name.name);
                 match elem {
                     crate::ir::QueueElem::Record(rid) => {
@@ -789,6 +792,7 @@ impl FuncBuilder<'_> {
                         // as_state_queue_call already gated on Queue kind.
                         unreachable!("state-queue pop on a non-queue field");
                     };
+                    self.check_pop_let_type(l, &elem, &format!("target-state queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
                     match elem {
                         crate::ir::QueueElem::Record(rid) => {
@@ -823,6 +827,11 @@ impl FuncBuilder<'_> {
                             queue_pop_takes_no_arguments(
                                 &format!("target-state queue `{instance}.{field}`"),
                                 args,
+                            )?;
+                            self.check_pop_let_type(
+                                l,
+                                &elem,
+                                &format!("target-state queue `{instance}.{field}`"),
                             )?;
                             let id = self.declare(&l.name.name);
                             match elem {
@@ -870,16 +879,8 @@ impl FuncBuilder<'_> {
         // here — the test-item walk in `mod.rs` consumes it — and a
         // `= bind` written in statement position is rejected on its own
         // before this. Divergence 104.
-        if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
-            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-            if self.ctx.regblock_instance_types.contains(simple) {
-                return Err(LowerError::Invalid(format!(
-                    "`let {} : {simple}` instantiates a register block without a bus: a \
-                     regblock/addrmap instantiation requires `= bind <helper>` (a \
-                     transactor with write/read methods)",
-                    l.name.name
-                )));
-            }
+        if let Some(e) = self.regblock_instantiation_error(l) {
+            return Err(e);
         }
         // Record-typed local: `let t : TxnType` default-constructs (v1
         // declares the struct at the let site, so field defaults re-run
@@ -986,13 +987,21 @@ impl FuncBuilder<'_> {
                         self.push(Stmt::Assign(id, e));
                         return Ok(());
                     }
-                    return Err(unsupported(
-                        &format!(
-                            "`let {} : {simple} = ...` with a non-`{simple}` initializer",
-                            l.name.name
-                        ),
-                        "transaction locals copy from a same-typed transaction local, or \
-                         default-construct and assign fields individually",
+                    // The INITIALIZER spelling of the write the
+                    // assignment arms below reject. It rejected the same
+                    // family under one `Unsupported`, so it promised
+                    // `--codegen v1` for `let b : Beat = 5` (v1:
+                    // `Beat b = 5;` — "conversion from 'int' to
+                    // non-scalar type 'Beat' requested"), `= x` on an
+                    // unrelated record, and `= s.n` on a scalar
+                    // component field. Now that the RHS types
+                    // definitively, so does the verdict.
+                    return Err(self.record_assign_mismatch(
+                        &e,
+                        rid,
+                        format!("transaction local `{}`", l.name.name),
+                        "copy from a same-typed transaction local, or default-construct \
+                         and assign the fields individually",
                     ));
                 }
                 let id = self.declare(&l.name.name);
@@ -1226,7 +1235,51 @@ impl FuncBuilder<'_> {
         // record-typed RHS opts in here).
         let record_ty = self
             .expr_type(&e)
-            .filter(|t| matches!(t, IrType::Record(_)));
+            .filter(|t| matches!(t, IrType::Record(_)))
+            // `expr_type` types only the record shapes it owns tables
+            // for (`Local`, `RecordField`). It has no arm for a
+            // record-valued COMPONENT field, transactor state field or
+            // nested state subfield — while `record_id_of_expr` has an
+            // arm for all of them — so `let c = src.cur` fell through
+            // to the scalar default and the DEFAULT backend emitted
+            // `uint64_t c = 0; ... c = src.cur;`: "cannot convert
+            // 'Beat' to 'uint64_t' in assignment". (v1 emitted
+            // `int64_t c = self.src.cur;`, uncompilable the same way.)
+            .or_else(|| self.record_id_of_expr(&e).map(IrType::Record));
+        // …but a record RHS under a DECLARED SCALAR type is a
+        // disagreement, not an inference. `record_ty` wins the `.or`
+        // chain below, so without this the annotation is discarded
+        // silently: `let c : uint<8> = s.cur` declared `Beat c{}` and
+        // the DEFAULT backend laundered the type with no diagnostic,
+        // while v1 emitted `uint64_t c = _tb.s.cur;` — "cannot convert
+        // 'Beat' to 'uint64_t' in initialization". Now that the RHS
+        // types definitively, the disagreement is visible and belongs
+        // to neither backend.
+        if let (Some(IrType::Record(rid)), Some(_)) = (&record_ty, &l.ty) {
+            // Reaching the untyped tail with an annotation still on the
+            // `let` means every annotation-specific path declined it —
+            // including the record-typed one above, which claims
+            // `let c : Beat = <Beat>` and rejects `let c : Beat = <not
+            // a Beat>`. So an annotation here disagrees with a record
+            // RHS by construction.
+            //
+            // Keyed on `l.ty`, not on `declared_scalar_ty`:
+            // `typed_let_ir_type` answers `None` for `int` and for
+            // `bit` (which parses as a `Named` type), and both spellings
+            // then kept discarding the annotation — tbir declared
+            // `Beat c{}` while v1 emitted `uint64_t c = _tb.s.cur;` and
+            // `Vbit* c = _tb.s.cur;`, neither of which compiles.
+            //
+            // The message does not re-render the annotation: this
+            // context holds an `IrType` at best, and `bits<16>`,
+            // `time` and `bit` all collapse into or past it, so any
+            // reconstruction would quote a type the user did not write.
+            return Err(LowerError::Invalid(format!(
+                "`let {}` is declared with a non-record type and initialised from a `{}`",
+                l.name.name,
+                self.ctx.records[rid.index()].name
+            )));
+        }
         // Untyped wide-scalar RHS (`let t96 = s128.trunc<96>()`): when the
         // RHS infers to a >64-bit `uint`/`sint`, propagate that width so the
         // local declares as `_harc_u128` (`local_scalar_cty`) rather than
@@ -1258,6 +1311,88 @@ impl FuncBuilder<'_> {
         self.check_scalar_assign_width(id, &e, &l.name.name)?;
         self.push(Stmt::Assign(id, e));
         Ok(())
+    }
+
+    /// Divergence 104's rule, stated once and asked from two places.
+    ///
+    /// A `let` whose declared type names a REGBLOCK or ADDRMAP is an
+    /// instantiation, and one without `= bind <helper>` has no bus for
+    /// its registers to reach. The declaration guard in `lower_let`
+    /// enforces it — but the queue-pop lanes run BEFORE that guard, so
+    /// `let z : DmaRegs = sb.q.pop()` reached a pop lane first. The
+    /// pop lanes ask here so the actionable message wins wherever the
+    /// spelling lands.
+    fn regblock_instantiation_error(&self, l: &crate::ast::LetStmt) -> Option<LowerError> {
+        let TypeExpr::Named { name, .. } = l.ty.as_ref()? else {
+            return None;
+        };
+        let simple = name.segments.last().map(|s| s.name.as_str())?;
+        self.ctx.regblock_instance_types.contains(simple).then(|| {
+            LowerError::Invalid(format!(
+                "`let {} : {simple}` instantiates a register block without a bus: a \
+                 regblock/addrmap instantiation requires `= bind <helper>` (a \
+                 transactor with write/read methods)",
+                l.name.name
+            ))
+        })
+    }
+
+    /// A `let <name> [: T] = <queue>.pop()` types its local from the
+    /// QUEUE ELEMENT, which is right — but only if the annotation
+    /// agrees. All three pop lanes (component queue, scoreboard queue,
+    /// target-state queue) discarded a disagreeing `T` in silence, so
+    /// `let b : Other = sb.q.pop()` on a `queue<Beat>` declared `Beat`
+    /// and RAN, while v1's `Other b = _tb.sb.q.pop();` gets "conversion
+    /// from 'Beat' to non-scalar type 'Other' requested". Same defect
+    /// as the untyped-`let` one a screen down, at the spelling that
+    /// already had a type to check against.
+    fn check_pop_let_type(
+        &self,
+        l: &crate::ast::LetStmt,
+        elem: &crate::ir::QueueElem,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let Some(ty) = l.ty.as_ref() else {
+            return Ok(());
+        };
+        // A REGBLOCK name is in `record_ids` too — its mirror record is
+        // filed under the regblock's own name — and these lanes run
+        // BEFORE divergence 104's instantiation guard. Answering from
+        // this function would replace its actionable message with a
+        // sentence about queue element types; declining outright would
+        // let the program lower. Ask the rule directly.
+        if let Some(e) = self.regblock_instantiation_error(l) {
+            return Err(e);
+        }
+        let declared_record = match ty {
+            TypeExpr::Named { name, .. } => name
+                .segments
+                .last()
+                .and_then(|seg| self.ctx.record_ids.get(seg.name.as_str()).copied()),
+            _ => None,
+        };
+        let got = match elem {
+            crate::ir::QueueElem::Record(rid) => {
+                if declared_record == Some(*rid) {
+                    return Ok(());
+                }
+                format!("a `{}`", self.ctx.records[rid.index()].name)
+            }
+            crate::ir::QueueElem::Scalar { .. } => {
+                if declared_record.is_none() {
+                    return Ok(());
+                }
+                "a scalar".to_string()
+            }
+        };
+        let want = match declared_record {
+            Some(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
+            None => "a scalar".to_string(),
+        };
+        Err(LowerError::Invalid(format!(
+            "`let {}` is declared as {want} and {what} yields {got}",
+            l.name.name
+        )))
     }
 
     /// Reject a narrowing scalar assignment at lowering, where it can
@@ -1351,6 +1486,72 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
+    /// The mirror of `record_assign_mismatch`: a SCALAR destination
+    /// whose RHS types to a record.
+    ///
+    /// The record-destination direction has been guarded arm by arm;
+    /// this direction was guarded at exactly one site (a scalar
+    /// transactor-state field). Everywhere else — a DUT port, a
+    /// testbench field, a scoreboard counter, a scalar component field,
+    /// a scalar record field or `Vec` element, a record-state scalar
+    /// subfield, a scalar local — `x = <record>` LOWERED, VERIFIED and
+    /// emitted from the DEFAULT backend, where g++ answers "cannot
+    /// convert 'Beat' to 'uint64_t' in assignment". v1 emits the same
+    /// line and fails the same way, so no backend runs it.
+    ///
+    /// Only callable now that `record_id_of_expr` types every
+    /// record-carrying RHS: before that a `None` here could mean
+    /// "could not tell".
+    pub(crate) fn reject_record_into_scalar(
+        &self,
+        e: &crate::ir::Expr,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        match self.record_id_of_expr(e) {
+            Some(rid) => Err(LowerError::Invalid(format!(
+                "{what} is a scalar and the value assigned to it is a `{}`",
+                self.ctx.records[rid.index()].name
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The verdict for a whole-record assignment whose RHS did not type
+    /// to the destination's record.
+    ///
+    /// Always `Invalid` — but only because every RHS shape that reaches
+    /// here now types DEFINITIVELY. The first version of this guard
+    /// read `record_id_of_expr`, whose `None` meant two different
+    /// things: an expression that is not a record (a literal, an
+    /// arithmetic result), and one this context could not type. That
+    /// made `drv.rec = src.cur` — a whole-record copy from a
+    /// record-typed component field, which BOTH backends compile — a
+    /// type error. The second version kept an escape hatch for the
+    /// shapes it could not type, which promised `--codegen v1` for
+    /// `b = src.n` and `b = count`, which v1 cannot compile either.
+    ///
+    /// The fix is upstream of the verdict: `record_id_of_expr` now
+    /// types every record-carrying shape (`component_field_record`
+    /// walks a dotted component-field path three-valued, `Ternary`
+    /// resolves to its arms' common record), so a `None` here really
+    /// does mean "not a record".
+    fn record_assign_mismatch(
+        &self,
+        e: &crate::ir::Expr,
+        want: crate::ir::RecordId,
+        what: String,
+        hint: &str,
+    ) -> LowerError {
+        let want_name = &self.ctx.records[want.index()].name;
+        let got = match self.record_id_of_expr(e) {
+            Some(other) => format!("a `{}`", self.ctx.records[other.index()].name),
+            None => "not a record".to_string(),
+        };
+        LowerError::Invalid(format!(
+            "{what}: it is a `{want_name}` and the value assigned to it is {got} — {hint}"
+        ))
+    }
+
     fn lower_assign(
         &mut self,
         target: &crate::ast::Expr,
@@ -1370,6 +1571,7 @@ impl FuncBuilder<'_> {
             }
             let e = self.lower_expr(value)?; // ports allowed in DutWrite values
             let e = self.hoist_transactor_calls(e);
+            self.reject_record_into_scalar(&e, &format!("`dut.{}`", port.port_path.join(".")))?;
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
@@ -1377,6 +1579,7 @@ impl FuncBuilder<'_> {
         if let Some(port) = self.as_bus_port_ref(target)? {
             let e = self.lower_expr(value)?;
             let e = self.hoist_transactor_calls(e);
+            self.reject_record_into_scalar(&e, &format!("`{}`", port.port_path.join(".")))?;
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
@@ -1384,12 +1587,14 @@ impl FuncBuilder<'_> {
         if let Some(port) = self.as_lane_port_ref(target)? {
             let e = self.lower_expr(value)?;
             let e = self.hoist_transactor_calls(e);
+            self.reject_record_into_scalar(&e, &format!("`{}`", port.port_path.join(".")))?;
             self.push(Stmt::DutWrite(port, e));
             return Ok(());
         }
         // Scalar testbench field write: `_tb.expected = 3`.
         if let Some(field) = self.as_tb_scalar_field(target) {
             let e = self.lower_expr_no_ports(value)?;
+            self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }
@@ -1400,6 +1605,7 @@ impl FuncBuilder<'_> {
             if self.lookup(&id.name).is_none() {
                 if let Some(field) = self.tb_scalar_field_in_capture_scope(&id.name) {
                     let e = self.lower_expr_no_ports(value)?;
+                    self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
                     self.push(Stmt::TbFieldWrite { field, value: e });
                     return Ok(());
                 }
@@ -1422,6 +1628,10 @@ impl FuncBuilder<'_> {
                 ));
             }
             let e = self.lower_expr_no_ports(value)?;
+            self.reject_record_into_scalar(
+                &e,
+                &format!("`{}.{}`", chain.field, chain.path.join(".")),
+            )?;
             self.push(Stmt::TransactorStateRecordFieldWrite {
                 instance: chain.instance,
                 field: chain.field,
@@ -1435,6 +1645,38 @@ impl FuncBuilder<'_> {
         // copy `target.last = <same-typed record>`.
         if let Some((instance, field)) = self.as_transactor_state(target) {
             let e = self.lower_expr_no_ports(value)?;
+            // The SAME record-type check the bare-name lane below makes,
+            // which this lane did not. Without it `drv.rec = 5` lowered,
+            // verified and emitted `drv.rec = 5;` — as uncompilable as
+            // v1's `_tb.drv.rec = 5;` ("no match for 'operator=', operand
+            // types are 'Beat' and 'int'"). The bare-name spelling of the
+            // same write was rejected, so the hole was reachable only
+            // from test scope, which is where a user writes it.
+            // The mirror of the same hole, one line away: a SCALAR
+            // state field assigned a record. v1 emits `drv.st = b;` and
+            // g++ refuses it ("cannot convert 'Beat' to 'uint64_t' in
+            // assignment"); TB-IR lowered, verified and emitted the same
+            // line.
+            if self.target_state_record(&instance, &field).is_none() {
+                if let Some(rid) = self.record_id_of_expr(&e) {
+                    return Err(LowerError::Invalid(format!(
+                        "`{instance}.{field}` is a scalar state field and the value \
+                         assigned to it is a `{}`",
+                        self.ctx.records[rid.index()].name
+                    )));
+                }
+            }
+            if let Some(record) = self.target_state_record(&instance, &field) {
+                if self.record_id_of_expr(&e) != Some(record) {
+                    return Err(self.record_assign_mismatch(
+                        &e,
+                        record,
+                        format!("`{instance}.{field}`"),
+                        "assign a value of the same record type, or set the record fields \
+                         individually (`<inst>.<field>.<sub> = ...`)",
+                    ));
+                }
+            }
             self.push(Stmt::TransactorStateWrite {
                 instance,
                 field,
@@ -1459,6 +1701,28 @@ impl FuncBuilder<'_> {
         // otherwise that resolver mistakes `current` for a `Sub` receiver.
         if let Some((base, field)) = self.as_component_field_target(target)? {
             let e = self.lower_expr_no_ports(value)?;
+            // A whole-record component field takes a record value. The
+            // same rule as the transactor-state write above, at the
+            // third spelling of it.
+            match self.component_field_record(&base, &field) {
+                Some(rid) => {
+                    if self.record_id_of_expr(&e) != Some(rid) {
+                        return Err(self.record_assign_mismatch(
+                            &e,
+                            rid,
+                            format!("component record field `{field}`"),
+                            "assign a value of the same record type, or set the record \
+                             fields individually (`<comp>.<field>.<sub> = ...`)",
+                        ));
+                    }
+                }
+                // …and the mirror: a SCALAR component field taking a
+                // record. Both directions of one rule; only the first
+                // had a guard.
+                None => {
+                    self.reject_record_into_scalar(&e, &format!("component field `{field}`"))?
+                }
+            }
             self.push(Stmt::ComponentFieldWrite {
                 base,
                 field,
@@ -1479,6 +1743,7 @@ impl FuncBuilder<'_> {
             if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
                 let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                 let e = self.lower_expr_no_ports(value)?;
+                self.reject_record_into_scalar(&e, &format!("scoreboard field `{}`", name.name))?;
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -1518,14 +1783,52 @@ impl FuncBuilder<'_> {
                 // below rejects it with a precise message.
                 // `v = sb.q.pop()` — pop into an existing local.
                 if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
-                    if self.record_of_local(local).is_some() {
+                    // The mirror, first: a SCALAR local taking a
+                    // RECORD element. v1 emits `x = _tb.sb.q.pop();`
+                    // under a `uint64_t x` — "cannot convert 'Beat' to
+                    // 'uint64_t' in assignment" — and so did tbir. The
+                    // `let` spelling of this exact program is already
+                    // rejected by `check_pop_let_type`; the assignment
+                    // spelling was the unchecked lane.
+                    if self.record_of_local(local).is_none() {
+                        if let crate::ir::QueueElem::Record(rid) =
+                            self.scoreboard_queue_elem(sb, &queue)?
+                        {
+                            return Err(LowerError::Invalid(format!(
+                                "local `{}` is a scalar and scoreboard queue `{queue}` \
+                                 yields a `{}`",
+                                id.name,
+                                self.ctx.records[rid.index()].name
+                            )));
+                        }
+                    }
+                    if let Some(rid) = self.record_of_local(local) {
+                        // Two very different programs under one arm.
+                        // `queue<Beat>` popped into a `Beat` local is
+                        // well typed, and v1 emits `b = _tb.sb.q.pop();`
+                        // which compiles — a real escape hatch. Popping
+                        // a `queue<uint<8>>` into the same local is a
+                        // type error, and v1's identical line then gets
+                        // "no match for 'operator=', operand types are
+                        // 'Beat' and 'long unsigned int'".
+                        if self.scoreboard_queue_elem(sb, &queue)?
+                            != crate::ir::QueueElem::Record(rid)
+                        {
+                            return Err(LowerError::Invalid(format!(
+                                "transaction local `{}` is a `{}`, and scoreboard queue \
+                                 `{queue}` does not hold that record type",
+                                id.name,
+                                self.ctx.records[rid.index()].name
+                            )));
+                        }
                         return Err(unsupported(
                             &format!(
                                 "assignment of a scoreboard `pop()` result to transaction \
                                  local `{}`",
                                 id.name
                             ),
-                            "",
+                            "pop into a fresh `let` instead; v1 emits the same struct copy \
+                             and it compiles",
                         ));
                     }
                     self.push(Stmt::ScoreboardOp {
@@ -1540,15 +1843,20 @@ impl FuncBuilder<'_> {
                 // local.
                 if let ExprKind::Call { callee, args } = &*value.kind {
                     if let Some(call) = self.lower_transactor_call(callee, args, true)? {
-                        if self.record_of_local(local).is_some() {
-                            return Err(unsupported(
-                                &format!(
-                                    "assignment of a transactor method result to \
-                                     transaction local `{}`",
-                                    id.name
-                                ),
-                                "",
-                            ));
+                        if let Some(rid) = self.record_of_local(local) {
+                            // Every method that reaches here returns a
+                            // SCALAR: a record return type is refused
+                            // upstream ("transactor method `<T>.<m>`
+                            // return type"), so there is no well-typed
+                            // program under this arm. v1 emits
+                            // `b = Drv_get(_tb.drv);` and g++ refuses it
+                            // ("operand types are 'Beat' and 'uint64_t'").
+                            return Err(LowerError::Invalid(format!(
+                                "transaction local `{}` is a `{}`, and a transactor method \
+                                 returns a scalar",
+                                id.name,
+                                self.ctx.records[rid.index()].name
+                            )));
                         }
                         self.push(Stmt::TransactorCall {
                             dest: Some(local),
@@ -1622,16 +1930,31 @@ impl FuncBuilder<'_> {
                 // assignment in both backends). Anything else would
                 // otherwise surface as a verifier TypeMismatch (the
                 // internal-bug channel) or a C++ compile error.
-                if let Some(rid) = self.record_of_local(local) {
-                    if self.record_id_of_expr(&e) != Some(rid) {
-                        return Err(unsupported(
-                            &format!(
-                                "assignment of a non-`{}` value to transaction local `{}`",
-                                self.ctx.records[rid.index()].name, id.name
-                            ),
-                            "assign fields individually, or copy from a same-typed transaction local",
-                        ));
+                match self.record_of_local(local) {
+                    Some(rid) => {
+                        if self.record_id_of_expr(&e) != Some(rid) {
+                            // A type error rather than a subset gap: v1
+                            // emits `b = o;` / `b = 5;` and g++ refuses
+                            // both ("no match for 'operator='"). Nothing
+                            // a future TB-IR could sensibly implement,
+                            // and `--codegen v1` does not run it either.
+                            return Err(self.record_assign_mismatch(
+                                &e,
+                                rid,
+                                format!("transaction local `{}`", id.name),
+                                "assign fields individually, or copy from a same-typed \
+                                 transaction local",
+                            ));
+                        }
                     }
+                    // …and the mirror. `x = b` on a scalar `x` reached
+                    // the VERIFIER's `TypeMismatch`, which `main.rs`
+                    // renders as "internal error: TB-IR failed
+                    // verification after lowering" — a compiler-bug
+                    // report for a program error. The comment above
+                    // named that channel as the thing this guard exists
+                    // to keep programs out of, in one direction only.
+                    None => self.reject_record_into_scalar(&e, &format!("local `{}`", id.name))?,
                 }
                 self.check_scalar_assign_width(local, &e, &id.name)?;
                 self.push(Stmt::Assign(local, e));
@@ -1646,6 +1969,13 @@ impl FuncBuilder<'_> {
                 match kind {
                     crate::ir::StateFieldKind::Scalar { .. } => {
                         let e = self.lower_expr_no_ports(value)?;
+                        // The bare-name spelling of the write whose
+                        // DOTTED spelling the mirror already guards.
+                        // The polarity of the hole is reversed from the
+                        // record direction — there the bare name was
+                        // guarded and the dotted one was not — but it
+                        // is the same one-lane-checked-one-not shape.
+                        self.reject_record_into_scalar(&e, &format!("state field `{}`", id.name))?;
                         self.push(Stmt::TransactorStateWrite {
                             instance: String::new(),
                             field: id.name.clone(),
@@ -1661,14 +1991,19 @@ impl FuncBuilder<'_> {
                     crate::ir::StateFieldKind::Record { record } => {
                         let e = self.lower_expr_no_ports(value)?;
                         if self.record_id_of_expr(&e) != Some(record) {
-                            return Err(unsupported(
-                                &format!(
-                                    "a whole-record write of state field `{}` with a \
-                                     non-matching RHS",
-                                    id.name
-                                ),
+                            // A type error, not a subset gap: v1 emits
+                            // the assignment and g++ refuses it ("no
+                            // match for 'operator=', operand types are
+                            // 'Beat' and 'int'"), so no backend runs it
+                            // and `--codegen v1` is no help. The
+                            // test-scope spelling of this write is
+                            // guarded by the same rule above.
+                            return Err(self.record_assign_mismatch(
+                                &e,
+                                record,
+                                format!("state field `{}`", id.name),
                                 "assign a value of the same record type, or set the record \
-                                 fields individually (`{field}.<sub> = ...`)",
+                                 fields individually (`<field>.<sub> = ...`)",
                             ));
                         }
                         self.push(Stmt::TransactorStateWrite {
@@ -1729,15 +2064,28 @@ impl FuncBuilder<'_> {
                 // local, a nested-record field read, or another element
                 // read). Reject any other RHS rather than emit
                 // `Entry = <scalar>` / a mismatched struct assignment.
+                if !matches!(chain.leaf_ty, IrType::Record(_)) {
+                    // The mirror: a SCALAR `Vec` element taking a
+                    // record. v1 and tbir both emit
+                    // `h.nums[1] = b;` — "cannot convert 'Beat' to
+                    // 'std::array<...>::value_type'".
+                    self.reject_record_into_scalar(
+                        &e,
+                        &format!("element of `Vec` field `{}`", chain.dotted),
+                    )?;
+                }
                 if let IrType::Record(elem_rid) = chain.leaf_ty {
                     if self.record_id_of_expr(&e) != Some(elem_rid) {
-                        return Err(unsupported(
-                            &format!(
-                                "an element write of `Vec` record field `{}` with a \
-                                 non-`{}` RHS",
-                                chain.dotted,
-                                self.ctx.records[elem_rid.index()].name
-                            ),
+                        // The same verdict its sibling one screen down
+                        // reaches for the same program: v1 emits
+                        // `tbl.entries[1] = 5;` against a
+                        // `std::array<Entry, 4>` and g++ refuses it
+                        // ("no match for 'operator='"). It had been an
+                        // `Unsupported`, so it promised `--codegen v1`.
+                        return Err(self.record_assign_mismatch(
+                            &e,
+                            elem_rid,
+                            format!("an element of `Vec` record field `{}`", chain.dotted),
                             "assign a value of the element's record type, or set the \
                              element's fields individually",
                         ));
@@ -1829,15 +2177,17 @@ impl FuncBuilder<'_> {
                     let rhs = self.lower_expr_no_ports(value)?;
                     if self.record_id_of_expr(&rhs) != Some(dst_rid) {
                         // v1 emits `o.p = q;` between two unrelated
-                        // structs, which has no conversion.
-                        return Err(not_implemented(
-                            &format!(
-                                "a whole-record write of field `{}` with a non-matching RHS",
-                                chain.dotted
-                            ),
+                        // structs, which has no conversion — and there
+                        // is nothing for a future TB-IR to implement,
+                        // so `Invalid` rather than the
+                        // `EmitsUncompilable` this arm carried before
+                        // the RHS could be typed definitively.
+                        return Err(self.record_assign_mismatch(
+                            &rhs,
+                            dst_rid,
+                            format!("record field `{}`", chain.dotted),
                             "assign a value of the same record type, or set the nested \
                              fields individually",
-                            V1Status::EmitsUncompilable,
                         ));
                     }
                     self.push(Stmt::RecordFieldWrite {
@@ -1851,8 +2201,10 @@ impl FuncBuilder<'_> {
                     return Ok(());
                 }
                 // Scalar field write: RHS is an ordinary scalar expression,
-                // lowered through the normal path.
+                // lowered through the normal path — and it must actually
+                // be one. The mirror of the record-leaf check above.
                 let e = self.lower_expr_no_ports(value)?;
+                self.reject_record_into_scalar(&e, &format!("record field `{}`", chain.dotted))?;
                 self.push(Stmt::RecordFieldWrite {
                     local: chain.local,
                     field: chain.field,
@@ -1863,6 +2215,36 @@ impl FuncBuilder<'_> {
                 });
                 return Ok(());
             }
+        }
+        // A whole-record TESTBENCH field write (`tbrec = b`). It is
+        // NOT the catch-all's business, and the catch-all's verdict is
+        // false for it in both directions: v1 emits `_tb.tbrec = b;`
+        // for a same-typed RHS and g++ ACCEPTS it (so a working escape
+        // hatch was being withheld under "silently emits something
+        // else"), and emits `_tb.tbrec = 5;` for a mismatched one,
+        // which g++ refuses (so it is a type error, not a silent
+        // mis-lowering). Same split as every other record destination.
+        if let Some(rid) = self.tb_record_field_target(target) {
+            let e = self.lower_expr_no_ports(value)?;
+            if self.record_id_of_expr(&e) != Some(rid) {
+                return Err(self.record_assign_mismatch(
+                    &e,
+                    rid,
+                    format!(
+                        "testbench record field `{}`",
+                        self.ctx.records[rid.index()].name
+                    ),
+                    "assign a value of the same record type, or set the record fields \
+                     individually (`<field>.<sub> = ...`)",
+                ));
+            }
+            // The copy itself is not lowered yet — but the suggestion
+            // is honest now, because v1 does compile this one.
+            return Err(unsupported(
+                "a whole-record write of a testbench record field",
+                "v1 emits the struct copy `_tb.<field> = <rhs>;` and it compiles; assign \
+                 the record's fields individually to stay in the TB-IR subset",
+            ));
         }
         // Two measured shapes, and they are not the same failure.
         //
