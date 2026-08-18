@@ -3934,8 +3934,7 @@ case and only locally-determinable `Assign` types are compared).
     `"t.log"`. Both backends accept both programs, so this is a live
     silent DIVERGENCE rather than a shared mis-lowering — the only one
     found in this batch. v1 takes the path positionally; matching that is
-    the fix, and it is recorded rather than made here because it changes
-    an extractor the equivalence corpus exercises heavily.
+    the fix. **Closed in divergence 64.**
 
 59. **Every constraint diagnostic was thrown away, and v1 crashes on
     one of them (2026-08-17).**
@@ -3981,14 +3980,14 @@ case and only locally-determinable `Assign` types are compared).
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
-    the third it **STACK-OVERFLOWS and aborts the process**.
-    `expand_relation_subtree` in `cpp_tb.rs` has no depth guard, so
-    `relation R(r) = R(r)` takes the compiler down. No `V1Status` fits a
+    the third it **STACK-OVERFLOWED and aborted the process**.
+    `expand_relation_subtree` in `cpp_tb.rs` had no depth guard, so
+    `relation R(r) = R(r)` took the compiler down. No `V1Status` fits a
     SIGABRT, which is part of why `Invalid` is the right verdict — and
-    the regression test asserts on TB-IR only and never calls
+    the regression test asserted on TB-IR only and never called
     `cpp_tb::emit` on that input, because a test cannot catch an abort.
-    A depth guard in v1 is a real fix and is NOT made here; it is
-    recorded so the next batch can take it deliberately.
+    **Closed in divergence 62**, which is why that test now does call
+    it.
 
     With the diagnostics surfacing, the misplaced-named-argument check
     from divergence 57 finally does something. Relation calls bind by
@@ -4008,15 +4007,10 @@ case and only locally-determinable `Assign` types are compared).
 
     * **Only Test and Tseq randomize sites are collected.** Closed in
       divergence 60 below.
-    * **`MAX_ERRORS = 5` can disable the refusal.** Five preceding
-      discarded errors (`r.addr == r.len` trips `WidthMismatch`, which is
-      deliberately not surfaced) hit `at_error_cap()` before the relation
-      clause is reached, and the program lowers. The cap is a
-      diagnostics-volume guard being load-bearing for correctness.
+    * **`MAX_ERRORS = 5` can disable the refusal.** Closed in
+      divergence 61 below.
     * **Every Ident-callee constraint call is treated as a relation
-      call**, so a v1-supported `sum(...)` records `UnknownRelation`.
-      Masked today only because TB-IR rejects `list<T>` fields earlier;
-      it becomes a false `Invalid` the moment list fields lower.
+      call.** Closed in divergence 63 below.
 
 60. **A constraint written in a component body reached C++ unchecked
     (2026-08-17).**
@@ -4112,6 +4106,528 @@ case and only locally-determinable `Assign` types are compared).
     watchdog arm is belt-and-braces, not a live filter — `watchdog
     disabled` takes no body at all, the parser refuses the first
     statement, so the body is empty there either way.
+
+61. **A diagnostics-volume guard was load-bearing for correctness
+    (2026-08-17).**
+
+    Divergence 59 recorded this as a known limit; this closes it.
+    `MAX_ERRORS = 5` bounds how many constraint-lowering errors are
+    collected, and `at_error_cap()` was doubling as the stop condition
+    for the whole clause walk. So five clauses tripping an error that is
+    *deliberately discarded* — `t.addr == t.value` trips
+    `WidthMismatch`, a capability gap, not a bad program — filled the
+    vector and stopped the walk before a later relation call was ever
+    expanded.
+
+    Measured on the exact boundary: four noise clauses refuse, **five
+    lower**, and at five both backends emit
+    `value > 2000 && value < 1000` from
+    `Band(t, hi = 2000, lo = 1000)`. A program was mis-lowered because
+    of how many *other*, unrelated, unreported things were wrong with
+    it.
+
+    The split is now explicit, and `MAX_ERRORS` is out of the
+    control-flow decision entirely. The walk stops exactly when a
+    relation error is in hand — that is the only class a caller acts on,
+    and only the first one is ever reported. A program with no relation
+    error is walked to the end and its diagnostics are capped by
+    `record_error` alone, which is what the cap was for.
+
+    The FIRST relation error is stored cap or no cap; dropping it as the
+    sixth error would convert a refusal into a mis-lowering just as
+    surely. Later ones are dropped rather than also exempted, and that
+    distinction is not cosmetic: a first draft exempted *every* relation
+    error, which made the vector unbounded. A depth-12 relation
+    fan-out over two unknown relations produced **8192** errors where
+    the cap had held it to 5. The bound is now `MAX_ERRORS + 1`, and in
+    practice 1 — the walk stops at the first one. Removing a bound while
+    fixing a bug the bound caused is not a fix.
+
+    The four relation variants live behind
+    `LowerError::is_relation_error`, next to the enum.
+    `surface_constraint_lower_error` still matches them by hand to word
+    each diagnostic, so the list really is written twice — an earlier
+    draft of this entry claimed the consumer read the predicate, and it
+    did not. What keeps the copies honest is a `debug_assert!` on that
+    function's skip arm: adding a fifth variant to the predicate alone
+    fails the suite with the variant named. Silent drift would
+    reintroduce this very bug — the walk stopping on an error nobody
+    acts on, or not stopping on one that matters.
+
+    Both halves are pinned by mutation: restoring `should_stop` to
+    `at_error_cap` fails the five-noise-clause case, and dropping the
+    exemption for the first relation error fails it too. Blast radius, measured across all
+    190 fixtures: the error sets are unchanged and no entry gains a
+    relation error, so the longer walk costs nothing and reports
+    nothing new.
+
+62. **The compiler died instead of complaining (2026-08-17).**
+
+    Divergence 59 measured this and left it open: `expand_relation_subtree`
+    in `cpp_tb.rs` had no guard of any kind, so `relation R(r) = R(r)`
+    recursed until the stack ran out. SIGABRT — no message, no exit code
+    a build system can interpret, nothing a user can act on. It was left
+    open on the reasoning that "a test cannot catch an abort", which is
+    true and is exactly why the guard had to come before the test.
+
+    **Three shapes ran away, and each defeated the guard written for the
+    one before it. The lesson is where the guard belongs, not how big
+    the number is.**
+
+    The first attempt was a work budget, on the argument that every step
+    which grows the expression passes through one choke point. Correct,
+    and it still aborted: the expander recurses once per level, so
+    10 000 levels overflow the stack long before a 10 000-unit budget is
+    spent. Depth got its own, smaller, limit.
+
+    The second attempt — depth 64 plus a budget counting EXPANSIONS —
+    was measured against `relation R(r: Req) = R(r + r)` and killed the
+    process by OOM instead: the argument is substituted into both
+    occurrences of `r`, so it doubles every level, and 64 expansions
+    build about 2^64 nodes. The budget was re-charged per node PRODUCED.
+
+    The third attempt was measured against
+    `relation R(r: Req) = R((((…r…))))` — 60 nested parens, **418 bytes
+    of source** — and **still aborted with a stack overflow**. The
+    argument does not get bigger, it gets DEEPER: 60x per level, until
+    the structural walk runs out of stack. Node count does not see
+    depth. That is the very SIGABRT the guard was written to prevent,
+    and two rounds of "the guard now covers X" had already been written
+    down as closed.
+
+    There is no end to that list, because **bounding the output of an
+    unbounded loop is the wrong place to stand.** The fix is a
+    relation-NAME stack: a relation already being expanded is expanding
+    into itself, and is refused before any tree is built, so it does not
+    matter how fast the body would have grown. Every shape above now
+    returns a diagnostic in under 4 ms.
+
+    `constraints::typed_lower` already guarded the same recursion this
+    way. Three attempts were spent inventing worse versions of a guard
+    that existed one module over — each one measured, each one shipped
+    as a fix, each one wrong. The reviewer's counter-example, not the
+    author's argument, ended each round.
+
+    The budget and depth limit stay as backstops for growth that is
+    finite but exponential — a chain of DISTINCT relations, each calling
+    the previous one twice. Both numbers are measured: the corpus passes
+    at a node budget of **96** and fails at **88**, so 8192 is about 90x
+    the deepest real need (wide because the budget is shared across a
+    whole constraint list, so it scales with program size); and a
+    63-deep chain still expands with its innermost bound reaching the
+    emitted C++, while at 64 the call is left unexpanded. That last one
+    does refuse a **finite, correct** program, with v1's generic
+    "constraint function call not supported in v0 solver path" — bought
+    cheaply, since the corpus's deepest real nest is 3.
+
+    Neither backstop is pinned by a test, and that is stated rather than
+    papered over: the non-cyclic doubling chain they exist for is
+    bottlenecked in `typed_lower`'s own un-budgeted expander (103 ms at
+    12 levels, 11.3 s at 18) long before v1's backstop is reached, so a
+    test would be measuring the other component. That blowup is
+    pre-existing — it reproduces on a clean `origin/main` worktree — and
+    budgeting that expander is a separate change.
+
+    The regression test steps over the boundary divergence 59 documented:
+    it calls `cpp_tb::emit` on five shapes: self-recursive, mutually
+    recursive, both of those with a growing argument, and the
+    paren-deepening one that defeated two earlier guards. Controls in
+    the same test keep the guard honest about what it is not: a 40-deep
+    chain of distinct relations and a 60-paren expression both still
+    emit with the innermost bound intact. Disabling the name stack
+    reproduces the SIGABRT and the test binary dies with signal 6.
+
+63. **Not every `name(...)` in a constraint is a relation call
+    (2026-08-17).**
+
+    Divergence 59 recorded this as the last of its three open limits.
+    Any `Ident`-callee call in a constraint went down the relation path,
+    and a name that is not a declared relation came back as
+    `UnknownRelation` — which divergence 59 had just promoted to a hard
+    `Invalid`. v1 handles a small set of these itself, so that is a
+    false refusal of a program v1 compiles, carrying a diagnostic that
+    sends the reader looking for a `relation` declaration they never
+    meant to write.
+
+    v1's whole list for this shape is one entry, read off
+    `cpp_tb::try_emit_constraint_list_call` rather than recalled:
+    `sum(<list>[lo..hi])`, one argument. (`<list>.len()` is the other
+    constraint builtin, but its callee is a `Field`, so it never reaches
+    the relation path.) Everything else with an `Ident` callee v1
+    rejects too — "constraint function call not supported in v0 solver
+    path" — so `nosuchfn(p.n)` keeps its refusal. The verdict is right
+    there even though the wording is about relations, because refusing
+    is what both backends do.
+
+    The builtin now records an ordinary capability gap, which
+    `lower_program` discards, so the program lowers and reaches the
+    shared emitter that knows how to emit it.
+
+    **Three call sites, one fix.** The search found `expand_relation_
+    subtree` already guarding correctly (`relation(name).is_some()`
+    before expanding), which made it look like the top-level path was
+    the only offender. The probe disagreed: a `sum(...)` nested inside
+    a `==` also produced `UnknownRelation`. The third site is
+    `lower_expr`'s `Call { Ident }` arm, and it reaches the same
+    `expand_top_level_relation_call` — so the fix lands once, in the
+    function all three funnel through. *Reading two of three call sites
+    and generalising is how the previous batch got a verdict wrong; the
+    probe is what found the third.*
+
+    **Only the FALSE-REFUSAL case is latent — the first draft of this
+    entry said the whole predicate was, and that was wrong.** TB-IR
+    refuses any transaction carrying a `list<T>` field before constraint
+    lowering runs (measured: the `sum` probe, an unknown-relation probe,
+    and a clause with no call in it at all are all refused with the same
+    "unsupported (non-scalar) leaf type" message), and every `sum` v1
+    ACCEPTS needs a list field. So no v1-compiling program reaches the
+    fix today, and the list-bearing assertions are on the constraint
+    table: end-to-end there would pass for the wrong reason, since the
+    list gate fires first and would keep passing however this were
+    classified.
+
+    But `sum` over a SCALAR reaches the fixed line right now, with no
+    list field anywhere. `randomize(p) with sum(p.n) == 1` used to be
+    refused as "`sum` names no `relation` declared in this file" and now
+    lowers — an improvement, since v1 refuses it too and the user now
+    gets v1's own accurate wording instead of a fiction about relations.
+    *"Nothing can reach this" was asserted from the shape that motivated
+    the fix, not from the predicate's actual domain.*
+
+    That case also exposes what makes the fix safe, which is **not** the
+    predicate. The check is on NAME and ARITY only, deliberately wider
+    than v1 — which also requires a range-sliced list field, so
+    `sum(p.n)` and `sum(items[0])` are v1 errors this predicate waves
+    through. They do not become accepted programs: `tbir::emit` routes
+    every constraint site back through v1's own emitter, which refuses
+    them in v1's own words. The scalar case is now asserted end to end,
+    because a predicate that is safe only because of what happens
+    downstream needs the downstream asserted.
+
+    What makes it worth fixing rather than filing as unreachable: the
+    list gate's `--codegen v1` suggestion is **honest**. Give the list a
+    bound (`items.len() <= 4`) and v1 emits the whole thing, `sum` call
+    included — verified in the test. The false `UnknownRelation` was
+    sitting directly in front of a form v1 compiles.
+
+    One shape further out, same bug, found by the same review: a
+    **relation whose name shadows the builtin at a different arity**.
+    v1's expander declines on the arity mismatch and its list-`sum`
+    builtin takes over, so v1 EMITS; TB-IR reported
+    `RelationArityMismatch`, a hard `Invalid`. The arity arm now defers
+    to the builtin the same way v1 does.
+
+    Both directions are pinned by mutation, because widening a gate is
+    as much a claim as narrowing one: emptying the builtin list makes
+    `sum` a relation error again, and dropping the NAME check so any
+    one-argument call counts makes `NoSuchRel(p)` stop being one.
+
+64. **`logf`'s message is positional, and now TB-IR agrees
+    (2026-08-17).**
+
+    Divergence 58 measured this and deferred it because it changes an
+    extractor the equivalence corpus exercises heavily. This closes it.
+
+    v1 **consumes** the path: `StmtKind::LogF` splits the first
+    positional string out of the argument list and hands `emit_log` what
+    is left, so the message is simply the next positional string.
+    TB-IR's `lower_log` instead searched for the first string whose
+    VALUE differs from the path — the same answer only while the message
+    happens not to equal the path. The fix is one line: take the first
+    positional string for `log`, the second for `logf`.
+
+    Measured on the two divergence-58 cases, comparing the emitted call
+    from both backends:
+
+    | source | v1 | TB-IR before | after |
+    |---|---|---|---|
+    | `logf("t.log", "t.log", error, "BOOM")` | `"t.log"` | `"BOOM"` | `"t.log"` |
+    | `logf("t.log", error, "t.log")` | `"t.log"` | `""` | `"t.log"` |
+
+    Five control shapes that already agreed still agree, `log`'s own
+    first-string rule included — the same line has to get both right,
+    which is why the plain-`log` controls are in the test rather than
+    assumed. Full suite green, the equivalence registry included.
+
+    Both directions are pinned by mutation: restoring the value
+    comparison fails the message-equals-path case, and dropping the
+    path-consumption so the first string is always taken fails the
+    ordinary-`logf` case.
+
+    One thing deliberately NOT moved: the named-argument guard above
+    still runs on the FULL argument list, before the path is consumed.
+    It exists to catch a named argument that leaves a positional slot
+    empty, and counting a list the path has already been removed from
+    would tell it there was one fewer slot to fill.
+
+65. **The worst argument, not the first (2026-08-17).**
+
+    Two loose ends on `reject_misplaced_named_args`, closed together
+    because they are the same function.
+
+    **`record_read` was unguarded.** It was the only record-API site
+    that accepted an unknown parameter name silently. One argument does
+    not make the check pointless: a name matching nothing is still a
+    program error no backend can honour. Its parameter list — `addr` —
+    comes from the compiler's own `Invalid` message two lines above the
+    guard and from `docs/ral-support.md`, not from memory, which is the
+    discipline `record_write` earned the hard way when it was given an
+    invented `["reg", "value"]`.
+
+    That lesson bit again while writing the test. The natural example
+    for an unknown name is `record_read(reg = 4)` — and `reg` is a lexer
+    keyword, so that program does not parse, and the assertion would
+    have been measuring the parser rather than the guard. The test now
+    asserts that it does not parse, and uses `nosuch` for the real case.
+    *The same trap, at the same site, caught twice.*
+
+    **The guard reported the first bad argument, not the worst.** Its
+    two verdicts are not equally bad — an unknown name is `Invalid` (v1
+    binds by position and emits exactly the right code), a misplaced
+    known name is `SilentlyMisLowers` (v1 emits working C++ with the
+    values swapped) — and the arguments are not examined in order of
+    badness. So in `record_write(nosuch = 0x18, addr = 305419896)` the
+    unknown name came first, its `Invalid` was returned, and the genuine
+    swap behind it was never reported. Fixing the typo would then
+    reveal a second error: exactly the experience a diagnostic should
+    not give. The unknown-name verdict is now held rather than returned,
+    so a swap anywhere in the list outranks it, and with no swap present
+    it is still reported.
+
+    Both are pinned by mutation: deleting the `record_read` call site
+    fails the guard test, and restoring first-wins ordering fails the
+    worst-argument case.
+
+    Not guarded, and deliberately: `bitbash(regs)`. Its single argument
+    has no declared parameter name anywhere — the compiler's message
+    calls it "the regblock binding" and the docs write `bitbash(regs)`,
+    where `regs` is the user's binding, not a parameter. Guarding it
+    would mean inventing a name to check against, which is the mistake
+    `record_write` already made once.
+
+66. **A named argument in its own position is inert (2026-08-17).**
+
+    Six arms answered `Unsupported` for any named argument, refusing the
+    whole construct. v1 drops argument names and binds strictly by
+    position, so the reordered form silently swaps values — already
+    classified in divergence 57 — but the IN-ORDER form is inert.
+    Measured per family, comparing emitted C++:
+
+    | call | v1 emits |
+    |---|---|
+    | `hlp(111, 222)` | `hlp(111, 222)` |
+    | `hlp(a = 111, b = 222)` | `hlp(111, 222)` |
+    | `hlp(b = 222, a = 111)` | `hlp(222, 111)` |
+
+    Byte-identical for the in-order form, in every family measured:
+    free-function helper, testbench method (`Tb_hlp(_tb, 111, 222)`),
+    extern fn (`ref_add(111, 222)`), transactor/component method
+    (`AxilXactor_axil_write(_tb.env.drv, t.addr, t.value)`), and tseq
+    (`mine(111, 222)`). Refusing the whole construct refused a form that
+    costs the user nothing.
+
+    Three of those families now route through
+    `reject_misplaced_named_args`, which splits the three cases: name in
+    its own position lowers, name in another position is
+    `SilentlyMisLowers`, name matching no parameter is `Invalid`. Each
+    parameter list is read off the DECLARATION the call resolves to.
+
+    **Three were not converted at first, for the same reason in each:
+    the seam had no parameter names to check against.** Divergence 67
+    supplies them and closes all three.
+
+    * The transactor-method sites in `stmts.rs` lower under a schema
+      SNAPSHOT. `TransactorMethodSchema` carries `n_params` and not the
+      names — its own doc comment says the count is "duplicated from the
+      function so call sites (which lower under a schema snapshot,
+      without the functions table) can check arity". Adding names to the
+      schema is the enabling change.
+    * `lower_component_call_args` serves **seven** callers, and some of
+      them have no parameter list at all — it also lowers the payload of
+      `emit <ev>(...)`. Its existing comment already recorded this
+      ("telling the two apart needs the callee's parameter list"); this
+      entry records that the measurement now exists, so only the
+      plumbing is missing.
+    * The covergroup helper target is reached from the covergroup
+      lowering path, which resolves helpers through a different
+      registry. Closed in divergence 68 — that registry turned out to
+      carry the declaration too.
+
+    That leaves the component-method arm still refusing an in-order
+    named argument v1 emits identically — a known, measured, un-closed
+    gap rather than an unexamined one.
+
+    Each of the three converted call sites is pinned by mutation:
+    deleting any one of them fails
+    `a_named_argument_in_its_own_position_lowers_for_the_families_that_
+    know_their_parameters`.
+
+    Two keyword traps turned up while writing the probes, both the same
+    class as the `reg` one from divergence 65: `seq` cannot name a
+    `tseq` and `reg` cannot name a variable, so an example using either
+    measures the parser rather than the thing under test.
+
+67. **Carrying a count where the names were needed (2026-08-17).**
+
+    Divergence 66 converted three call families and left three, each
+    blocked on the same thing: the seam had a parameter COUNT and not
+    the parameter NAMES, so it could not tell an inert named argument
+    from a reordered one and refused both. The names were available at
+    every construction site and thrown away.
+
+    * `TransactorMethodSchema::n_params` → `param_names`. Built from
+      `f.params`, which has the names.
+    * `self_transactor_methods`, the sibling-call map, carried
+      `(usize, bool, bool)` → `(Vec<String>, bool, bool)`. The same
+      information was dropped twice, in two places, for the same reason.
+    * `ComponentMethodSchema::n_params` → `param_names`.
+    * `lower_component_call_args` takes `Option<&[String]>`: the four
+      method callers pass the callee's names, the three
+      `emit <ev>(...)` payload callers pass `None`, because an event
+      payload genuinely has no declared name to check against and
+      inventing one is the `record_write` mistake.
+
+    Replacing the counts rather than adding a field beside them is
+    deliberate — arity is now `param_names.len()`, so the two cannot
+    disagree.
+
+    **Two defects this introduced, both caught by running it.**
+
+    The first: the new path lowered arguments with `lower_expr` where
+    the positional path uses `lower_expr_no_ports`. Four snapshot tests
+    failed with `PortInDisallowedPosition` on a `ComponentCall arg`. A
+    named argument has to lower through the SAME seam as a positional
+    one, or "the name is inert" stops being true. The line had been
+    copied from a grep of the new code and assumed to match the old.
+
+    The second is subtler and is the one worth remembering. With the
+    names in hand, `axil_write(data = t.value)` on a TWO-parameter
+    method reported a misplaced argument — "`data` is parameter 2 but
+    was written in position 1 … this silently swaps them". Nothing is
+    swapped. The call is UNDER-SUPPLIED, v1 emits the same
+    under-supplied call the positional `axil_write(t.value)` emits, and
+    TB-IR lowers that one. The guard was describing a pre-existing arity
+    gap as a swap — a false explanation, the exact failure mode it had
+    been rewritten to stop producing. `reject_misplaced_named_args` now
+    claims a swap only when `args.len() == declared.len()`, because that
+    is the only case where the positions correspond at all.
+
+    Three tests that pinned the old blanket refusals were rewritten
+    rather than deleted, and each now asserts v1's behaviour FIRST — the
+    in-order form byte-identical to positional, the reordered one
+    different — so the classification rests on a measurement instead of
+    the arm agreeing with itself. One of them,
+    `transactor_sibling_call_named_argument_is_rejected`, had pinned a
+    refusal of `inner(n = 5)`: a name in its own position, the inert
+    form. It was asserting that a working program was rejected.
+
+68. **The last named-argument family (2026-08-17).**
+
+    The covergroup helper call was the one site divergence 66 left and
+    divergence 67 did not reach. It was assumed to need a fourth
+    enabling change; it needed none. Both registries the site already
+    takes as parameters carry the declaration — `HelperRegistry` for a
+    file-level `function` (via `HelperEntry::decl`) and the extern map
+    for an `extern function` — so the parameter names were in scope the
+    whole time. *Checking beat assuming, again.*
+
+    Measured for this family specifically rather than inherited from its
+    five siblings, because variants sharing a shape do not share a
+    verdict. In a coverpoint target:
+
+    | call | v1 emits |
+    |---|---|
+    | `pick(<slice>, 1)` | `pick(<slice>, 1)` |
+    | `pick(a = <slice>, b = 1)` | `pick(<slice>, 1)` |
+    | `pick(b = 1, a = <slice>)` | `pick(1, <slice>)` |
+
+    The swap lands inside the sampler that decides which bin gets hit,
+    so a covergroup would report coverage against the wrong values with
+    nothing to show for it.
+
+    The first version of this also wrote a fallback refusing every
+    named argument when neither registry resolved. **That arm was dead
+    code**, and the commit message described a behaviour it did not
+    implement: both call sites are inside `if let Some(...)` on those
+    same registries, so the lookup could not fail. (A callee in neither
+    registry is refused earlier, by the coverpoint call classifier — so
+    the *program* behaviour the message claimed was real; the arm
+    written to produce it was not.) The names are passed IN now, which
+    makes the fact structural rather than accidental.
+
+    A **seventh** family turned up in the same review: the `tseq` call.
+    Measured — `RandomTxns(n = 5)` emits `RandomTxns(5)` under v1,
+    byte-identical to positional, against
+    `auto RandomTxns = [&](uint64_t n)` — and converted the same way, by
+    carrying `TseqDecl::params` names in the `tseqs` map beside the
+    element type.
+
+    Two sites stay unconverted, and both for the same stated reason:
+    `emit <ev>(...)` (an event payload has no parameter list) and
+    `idle(N)` / `quiesced(N)`. The second is worth spelling out because
+    it looks inconsistent with `record_read`, which WAS given a
+    hand-written one-element list. The difference is whether a name
+    exists to check against: `record_read`'s `addr` is stated by the
+    compiler's own diagnostic and by `docs/ral-support.md`, while
+    `idle`'s arity message says "exactly one cycle-count argument" and
+    the docs write `idle(N)` with `N` a value placeholder. No parameter
+    name is stated anywhere, so guarding it would mean inventing one —
+    the `record_write` mistake. It stays as `bitbash` does.
+
+    The `emit` arm's ≥2-argument diagnostic also said "named arguments
+    in a component METHOD call". Every method caller now takes the
+    guarded path, so that branch is reachable only from the three `emit`
+    callers, and it was measured saying "method call" about
+    `emit tagger.in_ev(a = 1, b = 2)`. Reworded to "component call", the
+    wording the adjacent single-argument arm had already been given for
+    exactly this reason.
+
+69. **Shape is not resolution (2026-08-17).**
+
+    The statement-position hooked-`on` arm asked
+    `is_v1_method_hook_shape`, which accepts any dotted path of the
+    right length. So `drv.send.x`, `nosuch.send`, `drv.plain` and
+    `dut.rst.x` all reached an `Unsupported` — and therefore a
+    "re-run with `--codegen v1`" suggestion.
+
+    Measured, one program per shape against the `axilite_hooks_test`
+    fixture:
+
+    | trigger | v1 | suggestion honest? |
+    |---|---|---|
+    | `drv.send` | **emits** | yes |
+    | `drv.send.x` | refuses | no |
+    | `nosuch.send` | refuses | no |
+    | `drv.plain` | refuses | no |
+    | `dut.rst.x` | refuses | no |
+
+    v1's message for all four is "obj.method must resolve to a
+    `hookable` on a known component type". So the suggestion was honest
+    for exactly ONE of the five, and the other four sent the user to a
+    second error.
+
+    A previous batch recorded this deliberately: the arm's comment said
+    such paths "keep the suggestion, and the user lands on v1's own
+    precise message rather than on silence". That is a defensible thing
+    to want and the wrong verdict to encode — `Unsupported` promises v1
+    is a way to run the program, and here it is not. The four now get
+    `Rejects`, whose rendering ends "`--codegen v1` does not implement
+    it either".
+
+    The gate is v1's own condition and the same one the test-scope arm
+    in `mod.rs` already applied: does `<obj>.<method>` name a `hookable`
+    on a transactor or component testbench field? Checked in the
+    recoverable direction — a miss yields the honest `Rejects`, a hit
+    only ever upgrades to the suggestion.
+
+    One implementation note, because it cost a wrong first attempt:
+    `strip_tb_prefix` does not strip the desugarer's `_tb` root here.
+    It only strips ahead of a COMPONENT field, and a hook target is
+    usually a TRANSACTOR field, so `_tb.drv.send` stayed three segments
+    long and every path failed the two-segment test — including the one
+    that should have passed. The strip is done locally instead;
+    widening the shared helper would change what its other callers
+    resolve.
 
 ### The probe method
 

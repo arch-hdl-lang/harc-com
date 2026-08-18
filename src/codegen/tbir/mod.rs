@@ -658,10 +658,7 @@ where
                             on_shard(&plan.shards[i], cpp, started.elapsed())
                         }));
                     match handed {
-                        Ok(Ok(())) => delivered
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(i),
+                        Ok(Ok(())) => delivered.lock().unwrap_or_else(|p| p.into_inner()).push(i),
                         // Also bounds the damage: workers stop claiming
                         // higher shards instead of emitting hundreds of MB
                         // that can no longer be written anywhere. The bound
@@ -2282,8 +2279,13 @@ fn emit_test(
                             return None;
                         }
                         let xs = prog.transactor(*xid);
-                        xs.method(method)
-                            .map(|m| (format!("{}_{}", xs.name, m.name), m.function, m.n_params))
+                        xs.method(method).map(|m| {
+                            (
+                                format!("{}_{}", xs.name, m.name),
+                                m.function,
+                                m.param_names.len(),
+                            )
+                        })
                     })
                     .or_else(|| {
                         tb.component_fields.iter().find_map(|binding| {
@@ -2295,7 +2297,7 @@ fn emit_test(
                                 (
                                     format!("{}._harc_cov_{}", binding.field, m.name),
                                     m.function,
-                                    m.n_params,
+                                    m.param_names.len(),
                                 )
                             })
                         })

@@ -490,7 +490,7 @@ fn component_method_param_ctypes(
     m: &crate::ir::ComponentMethodSchema,
 ) -> Vec<String> {
     let func = prog.function(m.function);
-    (0..m.n_params)
+    (0..m.param_names.len())
         .map(|i| match func.locals[i].ty {
             crate::ir::IrType::Record(r) => prog.records[r.index()].name.clone(),
             crate::ir::IrType::RecordSeq(r) => {

@@ -6155,8 +6155,17 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
     assert_eq!(x.methods.len(), 2);
     let pulse = x.method("pulse").expect("pulse");
     let readv = x.method("readv").expect("readv");
-    assert_eq!((pulse.n_params, pulse.has_ret), (1, false));
-    assert_eq!((readv.n_params, readv.has_ret), (0, true));
+    // The schema carries the declared parameter NAMES, not just a
+    // count — that is what lets a call site check a named argument
+    // against the declaration.
+    assert_eq!(
+        (pulse.param_names.as_slice(), pulse.has_ret),
+        (["n".to_string()].as_slice(), false)
+    );
+    assert_eq!(
+        (readv.param_names.as_slice(), readv.has_ret),
+        ([].as_slice(), true)
+    );
 
     let pf = prog.function(pulse.function);
     assert_eq!(
@@ -6961,22 +6970,35 @@ end impl XtVoidValueTest
     );
 }
 
-/// Named arguments in a sibling call are out of the TB-IR subset and
-/// rejected precisely at lowering.
+/// A named argument in a transactor sibling call is judged by WHERE it
+/// is written, not by the fact that it is named.
+///
+/// This test used to assert that any named argument was rejected, on a
+/// call — `inner(n = 5)` — whose name sits in its own position. That is
+/// the inert form: v1 drops the name and binds by position, so it emits
+/// exactly what the positional call emits. The old assertion pinned a
+/// refusal of a working program.
+///
+/// The seam could not tell the cases apart because
+/// `self_transactor_methods` carried a parameter COUNT. It carries the
+/// declared names now, the same fix as
+/// `TransactorMethodSchema::param_names`.
 #[test]
-fn transactor_sibling_call_named_argument_is_rejected() {
-    let src = r#"
+fn a_transactor_sibling_call_judges_a_named_argument_by_its_position() {
+    let src = |call: &str| {
+        format!(
+            r#"
 transactor Xt
     dut : Top
 
     when active
-        hookable inner(n: uint<8>)
-            dut.x = n
+        hookable inner(n: uint<8>, m: uint<8>)
+            dut.x = n + m
             wait 1 cycle
         end inner
 
         hookable outer()
-            inner(n = 5)
+            {call}
         end outer
     end when
 end transactor Xt
@@ -6992,13 +7014,51 @@ impl XtNamedArgTest for XtTb
         xt.outer()
     end run
 end impl XtNamedArgTest
-"#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("named arguments in transactor sibling method call"),
-        "diagnostic should name the named-argument rejection: {msg}"
+"#
+        )
+    };
+
+    // v1's behaviour is what the classification rests on: the in-order
+    // form is byte-identical to positional, the reordered one is not.
+    let emitted = |call: &str| -> String {
+        cpp_tb::emit(&merged_src(&src(call)))
+            .unwrap_or_else(|e| panic!("v1 emits `{call}`: {e}"))
+            .lines()
+            .filter(|l| l.contains("Xt_inner("))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+    let positional = emitted("inner(5, 6)");
+    assert_eq!(
+        emitted("inner(n = 5, m = 6)"),
+        positional,
+        "in-order is inert"
     );
+    assert_ne!(
+        emitted("inner(m = 6, n = 5)"),
+        positional,
+        "reordered swaps"
+    );
+
+    // TB-IR: positional and in-order lower.
+    lower_src(&src("inner(5, 6)")).expect("positional lowers");
+    lower_src(&src("inner(n = 5, m = 6)")).expect("an in-order name lowers");
+
+    // A reordered name is the silent mis-lowering.
+    let msg = assert_not_implemented(
+        &lower_src(&src("inner(m = 6, n = 5)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("transactor sibling method call")
+            && msg.contains("`m` is parameter 2 here but was written in position 1"),
+        "{msg}"
+    );
+
+    // A name matching no parameter is a program error under both.
+    let msg = assert_invalid(&lower_src(&src("inner(nosuch = 5, 6)")).unwrap_err());
+    assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
 }
 
 /// Locks the dump-ir text for the smallest corpus transactor fixture:
@@ -7119,7 +7179,7 @@ end impl DrvTest
     let rid = ir::RecordId(0);
     let x = &prog.transactors[0];
     let m = x.method("run_for").expect("run_for");
-    assert_eq!(m.n_params, 1);
+    assert_eq!(m.param_names, vec!["cmd".to_string()]);
     let mf = prog.function(m.function);
     assert_eq!(mf.params.len(), 1);
     assert_eq!(
@@ -16895,9 +16955,13 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
 /// that makes the order matter. It compiles and it runs.
 ///
 /// With ONE argument there is no other position for the value to land
-/// in, so v1 emits exactly the positional call and that arm keeps its
-/// `--codegen v1` suggestion. That is a claim about the call, not about
-/// the callee — see the under-supply case at the end.
+/// in, so v1 emits exactly the positional call. That is a claim about
+/// the call, not about the callee — see the under-supply case at the
+/// end.
+///
+/// TB-IR now splits the three cases rather than refusing all named
+/// arguments: in declaration order lowers, reordered is
+/// `SilentlyMisLowers`, and a name matching no parameter is `Invalid`.
 #[test]
 fn named_arguments_are_bound_by_position_by_v1() {
     let fixture = fixture("axilite_env_test.harc");
@@ -16935,18 +16999,32 @@ fn named_arguments_are_bound_by_position_by_v1() {
         "a misspelled parameter name produces no diagnostic at all"
     );
 
-    for args in [
-        "addr = t.addr, data = t.value",
-        "data = t.value, addr = t.addr",
-        "nosuch = t.addr, data = t.value",
-        "t.addr, data = t.value",
-    ] {
-        let msg = assert_not_implemented(
-            &lower_src(&call(args)).unwrap_err(),
-            lower::V1Status::SilentlyMisLowers,
-        );
-        assert!(msg.contains("named arguments"), "{msg}");
-    }
+    // TB-IR judges these by WHERE the name is written, not by the fact
+    // that it is named. This arm used to refuse all four alike, because
+    // `ComponentMethodSchema` carried a parameter COUNT and the seam had
+    // no names to compare against; it carries `param_names` now.
+    //
+    // In declaration order the name is inert — v1 emits the control call
+    // byte-for-byte, asserted above — so refusing it refused a working
+    // program.
+    lower_src(&call("addr = t.addr, data = t.value")).expect("names in order lower");
+    lower_src(&call("t.addr, data = t.value")).expect("a trailing in-order name lowers");
+
+    // Reordered is the silent swap.
+    let msg = assert_not_implemented(
+        &lower_src(&call("data = t.value, addr = t.addr")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`data` is parameter 2 here but was written in position 1"),
+        "{msg}"
+    );
+
+    // A name matching no parameter is a program error: v1 emits the
+    // control call, so nothing is mis-lowered — there is simply no
+    // backend that could honour the name.
+    let msg = assert_invalid(&lower_src(&call("nosuch = t.addr, data = t.value")).unwrap_err());
+    assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
 
     // Arity 1: no slot to swap with, so v1 is a real escape hatch.
     // `axil_read(addr)` lives in the same fixture.
@@ -16971,9 +17049,15 @@ fn named_arguments_are_bound_by_position_by_v1() {
             + 1,
         "the injected `axil_read` call must add a call site"
     );
+    // Arity 1, name in its own position: inert, and it lowers. v1 emits
+    // exactly the positional call, asserted below — so the old blanket
+    // refusal of "a named argument in a single-argument component call"
+    // was refusing a working program.
+    lower_src(&one("addr = t.addr")).expect("a correctly-named single argument lowers");
+    // A name matching no parameter is still a program error.
+    let msg = assert_invalid(&lower_src(&one("nosuch = t.addr")).unwrap_err());
+    assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
     for arg in ["addr = t.addr", "nosuch = t.addr"] {
-        let msg = assert_unsupported(&lower_src(&one(arg)).unwrap_err());
-        assert!(msg.contains("single-argument component call"), "{msg}");
         assert_eq!(
             cpp_tb::emit(&merged_src(&one(arg))).expect("v1 emits"),
             v1_one_ctl,
@@ -16988,8 +17072,13 @@ fn named_arguments_are_bound_by_position_by_v1() {
     // under-supplied and neither compiles, but that is a pre-existing
     // arity gap (tbir lowers `axil_write(t.value)` too) rather than
     // something naming the argument caused.
-    let msg = assert_unsupported(&lower_src(&call("data = t.value")).unwrap_err());
-    assert!(msg.contains("single-argument component call"), "{msg}");
+    // A single named argument to the TWO-parameter method is
+    // UNDER-SUPPLIED. `data` names a real parameter, but with one
+    // argument supplied the positions do not correspond, so there is no
+    // swap to describe — claiming one would be a false explanation of a
+    // pre-existing arity gap. It lowers, exactly as the positional
+    // under-supply does.
+    lower_src(&call("data = t.value")).expect("a named under-supply lowers");
     lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
     let v1_named_short = cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits");
     // Anchor first: the under-supplied call really is in v1's output,
@@ -18061,12 +18150,12 @@ fn relation_errors_in_randomize_with_now_reach_the_user() {
         assert!(msg.contains(needle), "{msg}");
     }
 
-    // A self-recursive relation. NOTE: this asserts on TB-IR only, and
-    // deliberately never calls `cpp_tb::emit` on it — v1 has no depth
-    // guard in `expand_relation_subtree` and STACK-OVERFLOWS, aborting
-    // the process. That is recorded in divergence 59; a test cannot
-    // catch a SIGABRT, so this one documents the boundary instead of
-    // stepping over it.
+    // A self-recursive relation. This used to assert on TB-IR only and
+    // deliberately never call `cpp_tb::emit`, because v1 had no guard
+    // in `expand_relation_subtree` and STACK-OVERFLOWED, aborting the
+    // process — a test cannot catch a SIGABRT. Divergence 62 added the
+    // guard; `v1_no_longer_aborts_on_a_relation_that_expands_forever`
+    // now steps over that boundary deliberately.
     let recursive = src.replacen(ALIAS, "relation HighAddr(r: Req) = HighAddr(r)", 1);
     let msg = assert_invalid(&lower_src(&recursive).unwrap_err());
     assert!(msg.contains("expands into itself"), "{msg}");
@@ -18434,4 +18523,806 @@ relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
         1,
         "a typed `let` shadowing a non-transaction field resolves"
     );
+}
+
+/// Five discarded errors used to disable the refusal entirely.
+///
+/// `MAX_ERRORS` is a diagnostics-VOLUME guard, and it was doubling as
+/// the stop condition for the whole constraint walk. Five clauses that
+/// trip a deliberately-discarded error — `t.addr == t.value` trips
+/// `WidthMismatch`, which divergence 59 records as a capability gap, not
+/// a bad program — filled the error vector, and the walk stopped before
+/// the `Band(t, hi = 2000, lo = 1000)` on the next line was ever
+/// expanded. TB-IR lowered, and both backends emitted the swapped,
+/// unsatisfiable constraint.
+///
+/// The cap now bounds only how many errors are STORED: a relation error
+/// is always kept, and scanning stops once one is in hand.
+#[test]
+fn a_run_of_discarded_errors_no_longer_hides_a_relation_error() {
+    let src = |pad: usize| {
+        let noise: String = (0..pad)
+            .map(|_| "            t.addr == t.value\n".to_string())
+            .collect();
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr  : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n\
+             relation Band(r: Req, lo: int, hi: int) = r.value > lo && r.value < hi\n\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n{noise}            Band(t, hi = 2000, lo = 1000)\n\
+             \x20       end randomize\n    end run\nend test T\n"
+        )
+    };
+
+    // Four noise clauses was under the cap and already refused; five was
+    // the exact point the refusal used to vanish. Both refuse now, and
+    // so does a run well past the cap.
+    for pad in [0usize, 4, 5, 9] {
+        let msg = assert_not_implemented(
+            &lower_src(&src(pad)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("misplaced named argument in a relation call"),
+            "{pad} noise clauses: {msg}"
+        );
+        // What the refusal is worth: v1 emits the swapped bounds at
+        // every one of these, and TB-IR did too at pad >= 5.
+        assert!(
+            cpp_tb::emit(&merged_src(&src(pad)))
+                .expect("v1 emits")
+                .contains("z3::ugt(_z_value, _ctx.bv_val((uint64_t)2000, 64))"),
+            "{pad} noise clauses: v1 binds lo := 2000"
+        );
+    }
+
+    // The cap still caps: the discarded errors are not multiplied by
+    // the longer walk, so a user does not get a wall of diagnostics for
+    // a class this backend deliberately stays quiet about.
+    let table = harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&src(9)));
+    let errs: Vec<usize> = table
+        .entries
+        .iter()
+        .filter_map(|e| match &e.build {
+            harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => {
+                Some(v.iter().filter(|x| !x.is_relation_error()).count())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        errs.iter().all(|n| *n <= 5),
+        "non-relation errors stay capped at MAX_ERRORS: {errs:?}"
+    );
+}
+
+/// v1 gives a diagnostic instead of taking the process down.
+///
+/// `expand_relation_subtree` had no guard of any kind, so
+/// `relation R(r) = R(r)` recursed until the stack ran out: SIGABRT,
+/// no message, no exit code a build system can interpret. Divergence 59
+/// recorded it and left it open because "a test cannot catch an abort"
+/// — which is true, and is exactly why the guard had to come before the
+/// test.
+///
+/// Three shapes ran away, and each defeated the guard written for the
+/// one before it. The fix is not a better bound on the RESULT; it is a
+/// relation-NAME stack, which stops the loop at its root:
+///
+///   * A per-expansion budget left `relation R(r) = R(r + r)` doubling
+///     the argument until the process was OOM-killed.
+///   * Charging per node PRODUCED fixed that, and left
+///     `relation R(r) = R((((…r…))))` — 60 nested parens, 418 bytes of
+///     source — multiplying the tree's DEPTH by 60 per level until the
+///     structural walk overflowed the stack. That is the very SIGABRT
+///     the guard was written to prevent.
+///   * A relation already being expanded is expanding into itself, so
+///     the name stack refuses it before any tree is built. It does not
+///     matter how fast the body would have grown.
+///
+/// There is no end to the first list, because bounding the output of an
+/// unbounded loop is the wrong place to stand.
+/// `constraints::typed_lower` already guarded the same recursion this
+/// way; reaching for it here took three tries.
+///
+/// The node budget and depth limit stay as backstops for growth that is
+/// not cyclic — a chain of DISTINCT relations each calling the previous
+/// one twice is finite and exponential. No such case appears below: it
+/// is bottlenecked in `typed_lower`'s own un-budgeted expander long
+/// before v1's backstop is reached, so a test here would be measuring
+/// something else.
+#[test]
+fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
+    let head = "domain D\n  freq_mhz: 100\nend domain D\n\n\
+                transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+                end transaction Req\n\n";
+    let test = |call: &str| {
+        format!(
+            "test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            {call}\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    let chain = |depth: usize| {
+        let mut rels = String::from("relation R0(r: Req) = r.value > 1000\n");
+        for i in 1..=depth {
+            rels += &format!("relation R{i}(r: Req) = R{}(r)\n", i - 1);
+        }
+        rels
+    };
+
+    // Reaching any of these lines at all is the assertion: on the old
+    // code the test binary died here with signal 6 (the first two) or
+    // was OOM-killed (the last two).
+    for (what, rels, call) in [
+        (
+            "a relation that calls itself",
+            "relation R(r: Req) = R(r)\n".to_string(),
+            "R(t)",
+        ),
+        (
+            "two relations that call each other",
+            "relation A(r: Req) = B(r)\nrelation B(r: Req) = A(r)\n".to_string(),
+            "A(t)",
+        ),
+        // The one a per-expansion budget missed: the ARGUMENT doubles,
+        // so the tree explodes at a depth the depth guard is nowhere
+        // near.
+        (
+            "a relation whose argument grows",
+            "relation R(r: Req) = R(r + r)\n".to_string(),
+            "R(t)",
+        ),
+        (
+            "two that call each other with a growing argument",
+            "relation A(r: Req) = B(r + r)\nrelation B(r: Req) = A(r + r)\n".to_string(),
+            "A(t)",
+        ),
+        // The one the node budget missed: the argument does not get
+        // BIGGER, it gets DEEPER, 60x per level, until the structural
+        // walk runs out of stack.
+        (
+            "a relation whose argument deepens",
+            format!(
+                "relation R(r: Req) = R({}r{})\n",
+                "(".repeat(60),
+                ")".repeat(60)
+            ),
+            "R(t)",
+        ),
+    ] {
+        let src = format!("{head}{rels}\n{}", test(call));
+        let err = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses");
+        assert!(
+            format!("{err}").contains("constraint function call not supported"),
+            "{what}: {err}"
+        );
+        // TB-IR names the actual problem rather than inheriting v1's
+        // generic message — its own cycle detector is unchanged.
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("expands into itself"), "{what}: {msg}");
+    }
+
+    // The guard is a limit, not a ban: a chain far deeper than anything
+    // real still expands, and the innermost bound survives to the
+    // emitted C++.
+    let deep = format!("{head}{}\n{}", chain(30), test("R30(t)"));
+    assert!(
+        cpp_tb::emit(&merged_src(&deep))
+            .expect("a 30-deep chain still emits")
+            .contains("(uint64_t)1000"),
+        "the innermost relation's bound reaches the output"
+    );
+
+    // The guard is a limit on RECURSION, not on size or nesting, and
+    // these controls say so: a chain of 40 distinct relations and an
+    // expression 60 parens deep both still emit with the innermost
+    // bound intact. The depth backstop is what would refuse the chain
+    // at 64 — deliberate, and the corpus's deepest real nest is 3.
+    for (what, src) in [
+        (
+            "a 40-deep chain of distinct relations",
+            format!("{head}{}\n{}", chain(40), test("R40(t)")),
+        ),
+        (
+            "a 60-paren expression",
+            format!(
+                "{head}relation R(r: Req) = {}r.value{} > 1000\n\n{}",
+                "(".repeat(60),
+                ")".repeat(60),
+                test("R(t)")
+            ),
+        ),
+    ] {
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .contains("(uint64_t)1000"),
+            "{what}: the innermost bound reaches the output"
+        );
+    }
+}
+
+/// A constraint BUILTIN is not an unknown relation.
+///
+/// Every `name(...)` with an `Ident` callee in a constraint was routed
+/// through the relation path, and a name that is not a declared
+/// relation was reported as one. v1 handles a small set of these
+/// itself — `sum(<list>[lo..hi])`, read off
+/// `cpp_tb::try_emit_constraint_list_call` — so calling it an unknown
+/// relation is a false refusal of a program v1 compiles, with a
+/// diagnostic that sends the reader looking for a `relation`
+/// declaration they never meant to write.
+///
+/// Only the FALSE-REFUSAL case is latent — an earlier version of this
+/// doc said the whole thing was. TB-IR refuses any transaction carrying
+/// a `list<T>` field before constraint lowering runs, and every `sum`
+/// v1 ACCEPTS needs a list field, so no v1-compiling program reaches
+/// the fix today. That is why the list-bearing cases are asserted on
+/// the constraint table: end-to-end there would pass for the wrong
+/// reason, since the list-field gate fires first and would keep passing
+/// however this were classified.
+///
+/// But `sum` over a SCALAR reaches the fixed line today, with no list
+/// field anywhere, and that case is asserted end to end — because the
+/// predicate checks NAME and ARITY only, deliberately wider than v1,
+/// which also requires a range-sliced list field. What keeps the
+/// widening safe is not the predicate but the shared emitter, and a
+/// predicate that is safe only because of what happens downstream needs
+/// the downstream asserted.
+#[test]
+fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
+    let src = |clause: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction P\n    n     : uint<8>\n    items : list<uint<8>>\n\
+             end transaction P\n\n\
+             test T\n    let dut : Top\n    let p : P\n    clock clk = D\n    run\n\
+             \x20       randomize(p) with\n            {clause}\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    // Every entry's errors, flattened, with the relation ones marked.
+    let errs = |clause: &str| -> Vec<(bool, String)> {
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&src(clause)))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect()
+    };
+
+    // The list-field gate really does fire first, for every one of
+    // these — including the clause with no call in it at all. That is
+    // the masking, stated as a measurement rather than assumed.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "NoSuchRel(p)",
+        "p.n > 3",
+    ] {
+        let err = lower_src(&src(clause)).unwrap_err();
+        assert!(
+            format!("{err}").contains("`P.items` with an unsupported (non-scalar) leaf type"),
+            "{clause}: expected the list-field gate, got {err}"
+        );
+    }
+
+    // And that gate's `--codegen v1` suggestion is honest, which is
+    // what makes this worth fixing rather than filing as unreachable:
+    // give the list a bound and v1 emits the whole thing, `sum` call
+    // included. So the false `UnknownRelation` sat directly in front of
+    // a form v1 compiles.
+    let bounded = src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100");
+    cpp_tb::emit(&merged_src(&bounded)).expect("v1 emits a bounded list with a `sum` constraint");
+
+    // `sum` is a v1 builtin: not a relation error, so it is discarded
+    // and the program would lower once list fields do.
+    for clause in [
+        "sum(items[0 .. items.len()]) == 100",
+        "sum(items[0 .. items.len()])",
+    ] {
+        let got = errs(clause);
+        assert!(
+            !got.is_empty() && got.iter().all(|(is_rel, _)| !is_rel),
+            "`{clause}` must produce no relation error: {got:?}"
+        );
+    }
+
+    // A name that is neither a relation nor a v1 builtin stays a
+    // relation error. v1 rejects it too ("constraint function call not
+    // supported in v0 solver path"), so refusing is the right verdict
+    // even when the name was never meant as a relation.
+    for clause in ["NoSuchRel(p)", "nosuchfn(p.n) == 1", "sum(p.n, p.n) == 1"] {
+        let got = errs(clause);
+        assert!(
+            got.iter().any(|(is_rel, _)| *is_rel),
+            "`{clause}` must still be a relation error: {got:?}"
+        );
+    }
+
+    // A relation whose name shadows the builtin but takes a different
+    // arity. v1's expander declines on the arity and its list-`sum`
+    // builtin takes over, so v1 EMITS — reporting an arity mismatch
+    // would be the same false refusal one shape further out.
+    let shadowed = format!(
+        "relation sum(a: P, b: P) = a.n > 1\n\n{}",
+        src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100")
+    );
+    cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits when a relation shadows `sum`");
+    let got: Vec<(bool, String)> =
+        harc::solver::problem_table::build_typed_solver_problem_table(&merged_src(&shadowed))
+            .entries
+            .iter()
+            .filter_map(|e| match &e.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::LowerError(v) => Some(v),
+                _ => None,
+            })
+            .flatten()
+            .map(|e| (e.is_relation_error(), format!("{e:?}")))
+            .collect();
+    assert!(
+        got.iter().all(|(is_rel, _)| !is_rel),
+        "a relation shadowing `sum` at the builtin's arity is not a relation error: {got:?}"
+    );
+
+    // END TO END, on a transaction with NO list field, which reaches
+    // the fixed line today. `sum` over a scalar is a v1 error this
+    // predicate deliberately waves through; what refuses it is the
+    // shared emitter, in v1's own words. Before the fix the user got
+    // "`sum` names no `relation` declared in this file" instead —
+    // accurate diagnostic, same verdict.
+    let scalar = "domain D\n  freq_mhz: 100\nend domain D\n\n\
+                  transaction Q\n    n : uint<8>\nend transaction Q\n\n\
+                  test T\n    let dut : Top\n    let q : Q\n    clock clk = D\n    run\n\
+                  \x20       randomize(q) with\n            sum(q.n) == 1\n        end randomize\n\
+                  \x20   end run\nend test T\n";
+    let merged = merged_src(scalar);
+    let v1 = cpp_tb::emit(&merged).expect_err("v1 refuses `sum` over a scalar");
+    assert!(
+        format!("{v1}").contains("constraint function call not supported in v0 solver path"),
+        "{v1}"
+    );
+    // TB-IR lowers it — the refusal has MOVED, not disappeared.
+    let program = lower_src(scalar).expect("`sum` over a scalar now lowers");
+    verify::verify_program(&program).expect("verifies");
+    let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("the shared emitter refuses it");
+    assert!(
+        format!("{tb}").contains("constraint function call not supported in v0 solver path"),
+        "TB-IR must refuse in v1's own words, not invent one about relations: {tb}"
+    );
+}
+
+/// `logf` finds its message positionally, the way v1 does.
+///
+/// v1 CONSUMES the path — `StmtKind::LogF` splits the first positional
+/// string out of the argument list and hands `emit_log` what is left —
+/// so its rule is positional. TB-IR compared each string's VALUE
+/// against the path instead, which gives the same answer only while the
+/// message happens to differ from the path.
+///
+/// This was divergence 58: a live silent DIVERGENCE, not a shared
+/// mis-lowering. Both backends accept both programs below and emitted
+/// different text.
+#[test]
+fn logf_takes_its_path_by_position_not_by_value() {
+    let src = |stmt: &str| {
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n\
+             \x20       {stmt}\n        wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+    // The emitted log call, for whichever backend. The `seed=` line is
+    // the harness preamble every test emits, not the statement under
+    // test — dropping it by name rather than by position so a change in
+    // preamble ordering fails loudly instead of silently selecting the
+    // wrong line.
+    let line = |out: &str| -> String {
+        out.lines()
+            .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
+            .filter(|l| !l.contains("seed="))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+
+    for (what, stmt, expected) in [
+        // Divergence 58's two cases. The message EQUALS the path, so a
+        // value comparison skips it and lands on the next string.
+        (
+            "a message equal to the path",
+            r#"logf("t.log", "t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        (
+            "the path repeated as the message",
+            r#"logf("t.log", error, "t.log")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "t.log");"#,
+        ),
+        // Controls: the shapes that already agreed must keep agreeing.
+        (
+            "an ordinary logf",
+            r#"logf("t.log", error, "BOOM")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a severity written after the message",
+            r#"logf("t.log", "BOOM", error)"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "ERROR", "BOOM");"#,
+        ),
+        (
+            "a third string, which is ignored",
+            r#"logf("t.log", "A", "B")"#,
+            r#"sim_logf_line(log_ctx.file("t.log"), "INFO", "A");"#,
+        ),
+        // Plain `log` consumes no path, so its message is the FIRST
+        // string — the same code now has to get both cases right.
+        (
+            "a plain log",
+            r#"log(error, "BOOM")"#,
+            r#"sim_log_line("ERROR", "BOOM");"#,
+        ),
+        (
+            "a plain log with a second string",
+            r#"log(error, "A", "B")"#,
+            r#"sim_log_line("ERROR", "A");"#,
+        ),
+    ] {
+        let merged = merged_src(&src(stmt));
+        let v1 = cpp_tb::emit(&merged).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        let program = lower_src(&src(stmt)).unwrap_or_else(|e| panic!("{what}: lowers: {e}"));
+        let tb = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("{what}: tbir emits: {e}"));
+        assert_eq!(line(&v1), expected, "{what}: v1's own output moved");
+        assert_eq!(line(&tb), line(&v1), "{what}: backends disagree");
+    }
+}
+
+/// The one-argument record API is guarded like every other, and the
+/// guard reports the WORST argument rather than the first.
+///
+/// `record_read` was the only record-API site that accepted an unknown
+/// parameter name silently. One argument does not make the check
+/// pointless: a name matching nothing is still a program error no
+/// backend can honour, and `record_read(reg = 4)` reads like it names
+/// something.
+///
+/// The worst-argument half is a separate claim. The two verdicts are
+/// not equally bad and the arguments are not examined in order of
+/// badness, so returning on the first one found let an unknown name
+/// hide a genuine swap behind it — the silent mis-lowering being the
+/// graver of the two.
+#[test]
+fn the_record_api_guard_reports_the_worst_argument_not_the_first() {
+    const READ: &str = "let sa  = regs.record_read(0x18)";
+    const WRITE: &str = "regs.record_write(0x18, 305419896)";
+    let fixture_src = fixture("regblock_record_api_test.harc");
+    assert!(
+        fixture_src.contains(READ) && fixture_src.contains(WRITE),
+        "fixture shape changed"
+    );
+    // The fixture `use`s a stdlib bus, so it only lowers alongside the
+    // bus declaration — same as the CLI's `resolve_use_imports`.
+    let bus_src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch"),
+    )
+    .expect("read stdlib bus");
+    let merge_with_bus = |src: &str| {
+        merge::merge_for_sim(
+            vec![
+                parse_source(src).expect("fixture parses"),
+                parse_source(&bus_src).expect("stdlib bus parses"),
+            ],
+            None,
+        )
+        .expect("merge")
+    };
+    let lower_it = |src: &str| lower::lower_program(&merge_with_bus(src));
+    let with = |old: &str, new: &str| fixture_src.replacen(old, new, 1);
+
+    // The fixture is a working program under both backends: the control
+    // that keeps every assertion below from passing for the wrong
+    // reason.
+    lower_it(&fixture_src).expect("the unmodified fixture lowers");
+
+    // `record_read`, one argument, name in its own position: inert, and
+    // must still lower.
+    lower_it(&with(READ, "let sa  = regs.record_read(addr = 0x18)"))
+        .expect("a correctly-named single argument lowers");
+
+    // A name matching no parameter is `Invalid` — v1 binds by position
+    // and emits exactly the right code, so claiming it mis-lowers would
+    // be a false explanation.
+    // NOT `reg = 0x18`: `reg` is a lexer keyword, so that program does
+    // not parse and the assertion would be measuring the parser. The
+    // same trap already cost this guard once, when `record_write` was
+    // given an invented `["reg", "value"]` list whose first entry could
+    // never match a parseable program.
+    assert!(
+        parse_source(&with(READ, "let sa  = regs.record_read(reg = 0x18)")).is_err(),
+        "`reg` is a keyword; if this starts parsing, the example below can use it"
+    );
+    let msg = assert_invalid(
+        &lower_it(&with(READ, "let sa  = regs.record_read(nosuch = 0x18)")).unwrap_err(),
+    );
+    assert!(
+        msg.contains("`nosuch` names no parameter of a `record_read(...)` call")
+            && msg.contains("expected `addr`"),
+        "{msg}"
+    );
+
+    // The worst-argument case, on the two-argument sibling: an unknown
+    // name FIRST and a genuine swap SECOND. The swap must win.
+    let msg = assert_not_implemented(
+        &lower_it(&with(
+            WRITE,
+            "regs.record_write(nosuch = 0x18, addr = 305419896)",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`addr` is parameter 1 here but was written in position 2"),
+        "the swap must outrank the unknown name: {msg}"
+    );
+
+    // With no swap present the unknown name is still reported, so
+    // preferring the swap did not silence it.
+    let msg = assert_invalid(
+        &lower_it(&with(WRITE, "regs.record_write(nosuch = 0x18, 305419896)")).unwrap_err(),
+    );
+    assert!(msg.contains("`nosuch` names no parameter"), "{msg}");
+
+    // And v1 accepts both named arguments and binds them by position,
+    // which is what makes the swap the graver verdict of the two.
+    cpp_tb::emit(&merge_with_bus(&with(
+        WRITE,
+        "regs.record_write(nosuch = 0x18, addr = 305419896)",
+    )))
+    .expect("v1 accepts both named arguments");
+}
+
+/// A named argument written in its own position is inert, and three
+/// call families now say so instead of refusing the whole construct.
+///
+/// v1 drops argument names and binds strictly by position. Measured for
+/// each family below, comparing emitted C++:
+///
+/// | call | v1 emits |
+/// |---|---|
+/// | `hlp(111, 222)` | `hlp(111, 222)` |
+/// | `hlp(a = 111, b = 222)` | `hlp(111, 222)` |
+/// | `hlp(b = 222, a = 111)` | `hlp(222, 111)` |
+///
+/// So the in-order form is byte-identical to the positional one — v1
+/// contributes nothing by dropping the name — and only the reordered
+/// form silently swaps the values. Refusing every named argument
+/// refused the inert form too.
+///
+/// Each parameter list is read off the DECLARATION the call resolves
+/// to, never written from memory: `record_write` was once given an
+/// invented `["reg", "value"]` and refused the documented form outright.
+#[test]
+fn a_named_argument_in_its_own_position_lowers_for_the_families_that_know_their_parameters() {
+    const D: &str = "domain D\n  freq_mhz: 100\nend domain D\n\n";
+    // (family, source template with {call}, the emitted text to match)
+    let helper = |call: &str| {
+        format!(
+            "{D}function hlp(a: uint<32>, b: uint<32>)\n    log(info, \"h ${{a}} ${{b}}\")\n\
+             end function hlp\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n        {call}\n\
+             \x20       wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+    let tb_method = |call: &str| {
+        format!(
+            "{D}testbench Tb\n    dut : Top\n    function hlp(a: uint<32>, b: uint<32>)\n\
+             \x20       log(info, \"h ${{a}} ${{b}}\")\n    end function hlp\nend testbench Tb\n\n\
+             impl T for Tb\n    run\n        {call}\n        wait 1 cycle\n    end run\nend impl T\n"
+        )
+    };
+    let extern_fn = |call: &str| {
+        format!(
+            "{D}extern function ref_add(a: uint<32>, b: uint<32>) -> uint<32>\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n        let v = {call}\n\
+             \x20       log(info, \"v ${{v}}\")\n        wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+
+    for (family, src, callee, needle) in [
+        (
+            "a helper",
+            &helper as &dyn Fn(&str) -> String,
+            "hlp",
+            "hlp(",
+        ),
+        ("a testbench method", &tb_method, "hlp", "Tb_hlp(_tb, "),
+        ("an extern fn", &extern_fn, "ref_add", "ref_add("),
+    ] {
+        let emitted = |call: &str| -> String {
+            cpp_tb::emit(&merged_src(&src(call)))
+                .unwrap_or_else(|e| panic!("{family}: v1 emits `{call}`: {e}"))
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(|l| l.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(" ;; ")
+        };
+
+        // v1's own behaviour, which is what the classification rests on.
+        let positional = emitted(&format!("{callee}(111, 222)"));
+        assert_eq!(
+            emitted(&format!("{callee}(a = 111, b = 222)")),
+            positional,
+            "{family}: the in-order form must be byte-identical to positional"
+        );
+        assert_ne!(
+            emitted(&format!("{callee}(b = 222, a = 111)")),
+            positional,
+            "{family}: the reordered form must differ — that is the swap"
+        );
+
+        // TB-IR: positional and in-order lower; only the swap is refused.
+        lower_src(&src(&format!("{callee}(111, 222)")))
+            .unwrap_or_else(|e| panic!("{family}: positional lowers: {e}"));
+        lower_src(&src(&format!("{callee}(a = 111, b = 222)")))
+            .unwrap_or_else(|e| panic!("{family}: an in-order name lowers: {e}"));
+        let msg = assert_not_implemented(
+            &lower_src(&src(&format!("{callee}(b = 222, a = 111)"))).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("`b` is parameter 2 here but was written in position 1"),
+            "{family}: {msg}"
+        );
+
+        // A name matching no parameter is `Invalid`: v1 binds by
+        // position and emits the right code, so it is a program error,
+        // not a mis-lowering.
+        let msg =
+            assert_invalid(&lower_src(&src(&format!("{callee}(nosuch = 111, 222)"))).unwrap_err());
+        assert!(
+            msg.contains("`nosuch` names no parameter of"),
+            "{family}: {msg}"
+        );
+    }
+}
+
+/// The covergroup helper call is the last named-argument family, and it
+/// resolves its parameter names through a different registry.
+///
+/// Measured for THIS family rather than inherited from its siblings: in
+/// a coverpoint target, `pick(a = .., b = 1)` emits the same
+/// `pick(<slice>, 1)` v1 emits positionally, and `pick(b = 1, a = ..)`
+/// emits `pick(1, <slice>)` — the values swapped, silently, inside the
+/// sampler that decides which bin gets hit.
+///
+/// The names come from whichever registry resolves the callee: a
+/// file-level `function` via `HelperRegistry`, or an `extern function`
+/// via the extern map. When neither resolves there is no parameter list
+/// to check against and the call keeps its blanket refusal, because
+/// refusing beats guessing a list.
+#[test]
+fn a_covergroup_helper_call_judges_a_named_argument_by_its_position() {
+    let fixture = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "    cp_low_nibble : cover dut.count_out[3:0]";
+    assert!(fixture.contains(CP), "fixture shape changed");
+    let src = |call: &str| {
+        format!(
+            "function pick(a: uint<8>, b: uint<8>) -> uint<8>\n    return a\n\
+             end function pick\n\n{}",
+            fixture.replacen(CP, &format!("    cp_low_nibble : cover {call}"), 1)
+        )
+    };
+    let emitted = |call: &str| -> String {
+        cpp_tb::emit(&merged_src(&src(call)))
+            .unwrap_or_else(|e| panic!("v1 emits `{call}`: {e}"))
+            .lines()
+            .filter(|l| l.contains("pick("))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ;; ")
+    };
+
+    // v1's behaviour, which the classification rests on.
+    let positional = emitted("pick(dut.count_out[3:0], 1)");
+    assert!(
+        positional.contains("pick("),
+        "the helper call reaches v1's output"
+    );
+    assert_eq!(
+        emitted("pick(a = dut.count_out[3:0], b = 1)"),
+        positional,
+        "in-order names emit the positional call byte-for-byte"
+    );
+    assert_ne!(
+        emitted("pick(b = 1, a = dut.count_out[3:0])"),
+        positional,
+        "reordered names swap the values inside the sampler"
+    );
+
+    // TB-IR: the inert forms lower.
+    lower_src(&src("pick(dut.count_out[3:0], 1)")).expect("positional lowers");
+    lower_src(&src("pick(a = dut.count_out[3:0], b = 1)")).expect("in-order names lower");
+
+    // The swap is the silent mis-lowering.
+    let msg = assert_not_implemented(
+        &lower_src(&src("pick(b = 1, a = dut.count_out[3:0])")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("covergroup helper call `pick(...)`")
+            && msg.contains("`b` is parameter 2 here but was written in position 1"),
+        "{msg}"
+    );
+
+    // A name matching no parameter is a program error.
+    let msg =
+        assert_invalid(&lower_src(&src("pick(nosuch = dut.count_out[3:0], b = 1)")).unwrap_err());
+    assert!(msg.contains("`nosuch` names no parameter of"), "{msg}");
+}
+
+/// A hooked `on` in statement position is judged by whether its path
+/// RESOLVES, not by its shape.
+///
+/// `is_v1_method_hook_shape` accepts any dotted path of the right
+/// length, so `drv.send.x`, `nosuch.send`, `drv.plain` and `dut.rst.x`
+/// all reached the `--codegen v1` suggestion. Measured: v1 refuses
+/// every one of them ("obj.method must resolve to a `hookable` on a
+/// known component type") while the resolving `drv.send` emits. The
+/// suggestion was honest for exactly one of the five.
+///
+/// The gate is v1's own condition and the same one the test-scope arm
+/// applies. It is checked in the recoverable direction: a miss yields
+/// the honest `Rejects`, a hit only ever upgrades to the suggestion.
+#[test]
+fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
+    let fixture = fixture("axilite_hooks_test.harc");
+    const ANCHOR: &str = "        log(info, \"AxiLiteRegs pre/post hooks test\")";
+    assert!(fixture.contains(ANCHOR), "fixture shape changed");
+    let with = |path: &str| {
+        fixture.replacen(
+            ANCHOR,
+            &format!(
+                "{ANCHOR}\n        on {path} pre\n            pre_count = pre_count + 1\n\
+                 \x20       end on"
+            ),
+            1,
+        )
+    };
+
+    // The one that resolves: v1 EMITS, so `--codegen v1` is a real
+    // escape hatch and the arm keeps its suggestion.
+    cpp_tb::emit(&merged_src(&with("drv.send"))).expect("v1 emits a resolving hook path");
+    let msg = assert_unsupported(&lower_src(&with("drv.send")).unwrap_err());
+    assert!(msg.contains("hook in statement position"), "{msg}");
+
+    // The four that do not. Same SHAPE, and v1 refuses each one, so a
+    // suggestion would send the user to a second error.
+    for (what, path) in [
+        ("a path one segment too long", "drv.send.x"),
+        ("an undeclared receiver", "nosuch.send"),
+        ("a real receiver with no such method", "drv.plain"),
+        ("a DUT port path", "dut.rst.x"),
+    ] {
+        let err = cpp_tb::emit(&merged_src(&with(path)))
+            .expect_err(&format!("{what}: v1 refuses `{path}`"));
+        assert!(
+            format!("{err}").contains("must resolve to a `hookable`"),
+            "{what}: {err}"
+        );
+        let msg = assert_not_implemented(
+            &lower_src(&with(path)).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains("names no `hookable`"), "{what}: {msg}");
+    }
 }

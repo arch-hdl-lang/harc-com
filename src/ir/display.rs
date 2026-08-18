@@ -209,8 +209,8 @@ impl Display for TbProgram {
                     f,
                     "    method {}({} arg{}){} = fn{}{hooks}",
                     m.name,
-                    m.n_params,
-                    if m.n_params == 1 { "" } else { "s" },
+                    m.param_names.len(),
+                    if m.param_names.len() == 1 { "" } else { "s" },
                     if m.has_ret { " -> ret" } else { "" },
                     m.function.0
                 )?;
@@ -309,8 +309,8 @@ impl Display for TbProgram {
                         crate::ir::Activation::Always => "",
                         crate::ir::Activation::ActiveOnly => " active-only",
                     },
-                    m.n_params,
-                    if m.n_params == 1 { "" } else { "s" },
+                    m.param_names.len(),
+                    if m.param_names.len() == 1 { "" } else { "s" },
                     if m.has_ret { " -> ret" } else { "" },
                     m.function.0
                 )?;

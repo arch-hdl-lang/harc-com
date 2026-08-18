@@ -574,7 +574,8 @@ pub(crate) fn lower_component_schema(
                     });
                 }
                 ComponentItem::Hookable(h) => {
-                    let n_params = h.params.len();
+                    let param_names: Vec<String> =
+                        h.params.iter().map(|p| p.name.name.clone()).collect();
                     let param_tys = h
                         .params
                         .iter()
@@ -591,7 +592,7 @@ pub(crate) fn lower_component_schema(
                         name: h.name.name.clone(),
                         function: fid,
                         param_tys,
-                        n_params,
+                        param_names,
                         has_ret,
                         ret_ty,
                         hookable: h.is_hookable,
@@ -2178,11 +2179,11 @@ where
                 "analysis sinks must be declared `hookable`",
             ));
         }
-        if sm.n_params != 1 {
+        if sm.param_names.len() != 1 {
             return Err(unsupported(
                 &format!(
                     "a `connect` sink method `{sink_name}` with {} parameters",
-                    sm.n_params
+                    sm.param_names.len()
                 ),
                 "analysis sinks take exactly one payload parameter",
             ));
@@ -3368,10 +3369,39 @@ impl super::FuncBuilder<'_> {
 
     /// Lower the args of a component method call (port-hoisted, like any
     /// host-side call).
+    /// `declared` is the callee's parameter names when the caller
+    /// resolved a method schema, and `None` for the `emit <ev>(...)`
+    /// payload callers — an event payload has no parameter list to
+    /// check against, and inventing one is the mistake `record_write`
+    /// already made.
     pub(crate) fn lower_component_call_args(
         &mut self,
         args: &[CallArg],
+        declared: Option<&[String]>,
     ) -> Result<Vec<IrExpr>, LowerError> {
+        if let Some(declared) = declared {
+            // With the parameter list in hand the three cases split:
+            // a name in its own position is inert (v1 drops names and
+            // binds by position, so it emits exactly the positional
+            // call), a name elsewhere silently swaps, and a name
+            // matching nothing is a program error. The arity-based
+            // approximation below is what this replaces — it could only
+            // ask "is there more than one argument?", so it refused the
+            // inert form too.
+            super::reject_misplaced_named_args(args, declared, "a component method call")?;
+            // `lower_expr_no_ports`, matching the positional path below
+            // exactly. An earlier draft used `lower_expr` here and the
+            // verifier caught it: `PortInDisallowedPosition` on a
+            // `ComponentCall arg`. A named argument must lower through
+            // the same seam as a positional one, or "the name is inert"
+            // stops being true.
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
+                out.push(self.lower_expr_no_ports(e)?);
+            }
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             let CallArg::Expr(e) = a else {
@@ -3409,10 +3439,21 @@ impl super::FuncBuilder<'_> {
                 // not something naming the argument caused, and the
                 // wording below does not pretend the call is well-formed.
                 //
-                // Arity ≥ 2 is NOT split further — same-order names emit
-                // correctly too, but telling the two apart needs the
-                // callee's parameter list, and an arm's status is the
-                // worst thing under it.
+                // Reached ONLY when the caller had no parameter list to
+                // pass — the `emit <ev>(...)` payload callers. An event
+                // payload has no declared names to check a written name
+                // against, so the arity split below is the best this
+                // seam can do.
+                //
+                // Method calls no longer land here: they pass
+                // `declared` and take the `reject_misplaced_named_args`
+                // path at the top, which splits in-order (inert, and it
+                // lowers) from reordered (a silent swap) from a name
+                // matching nothing (a program error). This comment used
+                // to say arity ≥ 2 could not be split because "telling
+                // the two apart needs the callee's parameter list" —
+                // true at the time, and the list is now carried in
+                // `ComponentMethodSchema::param_names`.
                 if args.len() == 1 {
                     // Not "method call": this helper also lowers the
                     // payload of `emit <ev>(...)`, so the construct name
@@ -3423,8 +3464,15 @@ impl super::FuncBuilder<'_> {
                          is no other position, so it emits exactly the positional form",
                     ));
                 }
+                // "component call", not "method call": every method
+                // caller now passes `declared` and takes the guarded
+                // path above, so this is reached ONLY from the
+                // `emit <ev>(...)` payload callers. The single-argument
+                // arm was already worded that way for the same reason;
+                // this one said "method call" and was measured saying
+                // it about `emit tagger.in_ev(a = 1, b = 2)`.
                 return Err(not_implemented(
-                    "named arguments in a component method call",
+                    "named arguments in a component call",
                     "v1 ignores argument names and binds strictly by position, so names \
                      written out of declaration order silently SWAP the values",
                     V1Status::SilentlyMisLowers,
@@ -3481,7 +3529,7 @@ impl super::FuncBuilder<'_> {
                         ));
                     }
                 }
-                let lowered = self.lower_component_call_args(args)?;
+                let lowered = self.lower_component_call_args(args, None)?;
                 self.push(IrStmt::ComponentEmit {
                     base: ComponentBase::Path(recv),
                     event,
@@ -3503,7 +3551,7 @@ impl super::FuncBuilder<'_> {
                             args.len()
                         )));
                     }
-                    let lowered = self.lower_component_call_args(args)?;
+                    let lowered = self.lower_component_call_args(args, None)?;
                     // Shape must agree: the channel renders as
                     // `std::function<void(uint64_t)>` or
                     // `std::function<void(<Record>)>`, and passing one
@@ -3573,7 +3621,7 @@ impl super::FuncBuilder<'_> {
                 ));
             }
         }
-        let lowered = self.lower_component_call_args(args)?;
+        let lowered = self.lower_component_call_args(args, None)?;
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
             event,
@@ -3628,6 +3676,16 @@ impl super::FuncBuilder<'_> {
             // positional binding lands the value in the only slot there
             // is and emits code identical to the positional form. No
             // reordering hazard exists here.
+            // Deliberately NOT name-checked, unlike `record_read`, which
+            // was given a hand-written `["addr"]` so that an unknown
+            // name becomes `Invalid`. The difference is whether there
+            // is a name to check AGAINST: the compiler's own arity
+            // message here says "exactly one cycle-count argument" and
+            // the docs write `idle(N)`, where `N` is a value
+            // placeholder — no parameter name is stated anywhere.
+            // `record_read`'s `addr` came from the compiler's own
+            // diagnostic AND the docs. Inventing one here is the
+            // `record_write` mistake, so this stays as `bitbash` does.
             return Err(unsupported(
                 &format!("a named argument to `{}`", name.name),
                 "v1 ignores the name and binds by position; with one parameter that is \

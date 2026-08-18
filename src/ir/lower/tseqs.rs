@@ -114,7 +114,7 @@ fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
-) -> Result<HashMap<String, TseqElem>, LowerError> {
+) -> Result<HashMap<String, (TseqElem, Vec<String>)>, LowerError> {
     let mut out = HashMap::new();
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
@@ -179,7 +179,11 @@ pub(crate) fn collect_tseq_records(
                  primitive scalar (`uint<N>`/`sint<N>`/`bool`)",
             ));
         };
-        if out.insert(decl.name.name.clone(), elem).is_some() {
+        let param_names: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();
+        if out
+            .insert(decl.name.name.clone(), (elem, param_names))
+            .is_some()
+        {
             return Err(LowerError::Invalid(format!(
                 "duplicate tseq declaration `{}`",
                 decl.name.name

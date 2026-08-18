@@ -10,6 +10,59 @@ use crate::ir::{
     Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, TbFunction, Terminator,
 };
 
+/// Does a hooked `on <obj>.<method>` path name a real `hookable`?
+///
+/// v1's own condition, and the same one the test-scope arm in `mod.rs`
+/// applies: the receiver must be a transactor or component testbench
+/// field, and the trailing segment must be a `hookable` method on it.
+/// A shape test cannot answer this — `drv.plain` and `nosuch.send` are
+/// the same SHAPE as `drv.send` and v1 refuses them.
+fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHandler) -> bool {
+    fn path(e: &crate::ast::Expr) -> Option<Vec<String>> {
+        match &*e.kind {
+            ExprKind::Ident(id) => Some(vec![id.name.clone()]),
+            ExprKind::Field { target, name } => {
+                let mut p = path(target)?;
+                p.push(name.name.clone());
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+    let Some(segs) = path(&h.event) else {
+        return false;
+    };
+    // Strip the desugarer's `_tb` root locally rather than through
+    // `strip_tb_prefix`, which only strips ahead of a COMPONENT field —
+    // the field here is usually a transactor (`_tb.drv.send`), so the
+    // shared helper leaves the path three segments long and every path
+    // then fails the two-segment test below. Widening the shared helper
+    // would change what its other callers resolve.
+    let segs: &[String] = if segs.len() >= 2
+        && Some(segs[0].as_str()) == b.ctx.tb_field.as_deref()
+        && (b.ctx.transactor_fields.contains_key(&segs[1])
+            || b.ctx.component_fields.contains_key(&segs[1]))
+    {
+        &segs[1..]
+    } else {
+        &segs
+    };
+    // Exactly `<field>.<method>`: a longer path (`drv.send.x`) is a
+    // nested reach v1's resolver does not walk here.
+    let [field, method] = segs else { return false };
+    let hookable_on = |methods: &[crate::ir::ComponentMethodSchema]| {
+        methods.iter().any(|m| m.name == *method && m.hookable)
+    };
+    if let Some(xid) = b.ctx.transactor_fields.get(field) {
+        let x = &b.ctx.transactors[xid.index()];
+        return x.methods.iter().any(|m| m.name == *method);
+    }
+    b.ctx
+        .component_fields
+        .get(field)
+        .is_some_and(|cid| hookable_on(&b.ctx.components[cid.index()].methods))
+}
+
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
         self.ensure_open_block();
@@ -456,7 +509,10 @@ impl FuncBuilder<'_> {
                     if let Some((base, component, method)) =
                         self.as_component_method_call(callee)?
                     {
-                        let lowered = self.lower_component_call_args(args)?;
+                        let declared = self.ctx.components[component.index()]
+                            .method(&method)
+                            .map(|m| m.param_names.clone());
+                        let lowered = self.lower_component_call_args(args, declared.as_deref())?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -826,7 +882,8 @@ impl FuncBuilder<'_> {
                                 &method,
                                 &l.name.name,
                             )?;
-                            let lowered = self.lower_component_call_args(args)?;
+                            let declared = m.param_names.clone();
+                            let lowered = self.lower_component_call_args(args, Some(&declared))?;
                             let id = self.declare(&l.name.name);
                             self.set_local_type(id, IrType::Record(rid));
                             self.push(Stmt::ComponentCall {
@@ -978,7 +1035,7 @@ impl FuncBuilder<'_> {
         // name and a transactor field are disjoint namespaces).
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some(elem) = self.ctx.tseqs.get(&name.name) {
+                if let Some((elem, _)) = self.ctx.tseqs.get(&name.name) {
                     let seq_ty = elem.seq_type();
                     let call = self.lower_tseq_call(&name.name, args)?;
                     let id = self.declare(&l.name.name);
@@ -1028,7 +1085,8 @@ impl FuncBuilder<'_> {
                         &l.name.name,
                     )?;
                 }
-                let lowered = self.lower_component_call_args(args)?;
+                let declared = m.param_names.clone();
+                let lowered = self.lower_component_call_args(args, Some(&declared))?;
                 let id = self.declare(&l.name.name);
                 if let Some(w) = declared_width {
                     self.let_widths.insert(id, w);
@@ -1439,7 +1497,8 @@ impl FuncBuilder<'_> {
                         self.check_component_method_result_assignable(
                             m, expected, &method, &id.name,
                         )?;
-                        let lowered = self.lower_component_call_args(args)?;
+                        let declared = m.param_names.clone();
+                        let lowered = self.lower_component_call_args(args, Some(&declared))?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -2077,11 +2136,11 @@ impl FuncBuilder<'_> {
                  should exist on passive instances"
             )));
         }
-        if args.len() != m.n_params {
+        if args.len() != m.param_names.len() {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",
                 schema.name,
-                m.n_params,
+                m.param_names.len(),
                 args.len()
             )));
         }
@@ -2091,20 +2150,22 @@ impl FuncBuilder<'_> {
                 schema.name
             )));
         }
+        // v1 drops argument names and binds by position, so a name in
+        // its own position is inert and only a reordered one swaps the
+        // values (measured: `axil_write(data = t.value, addr = t.addr)`
+        // emits `AxilXactor_axil_write(_tb.env.drv, t.value, t.addr)`).
+        // The names come from `TransactorMethodSchema::param_names`,
+        // which used to be a bare `n_params` count — the seam had
+        // nothing to check against, which is why this arm refused every
+        // named argument including the working form.
+        super::reject_misplaced_named_args(
+            args,
+            &m.param_names,
+            &format!("transactor method call `{tb_field}.{method}(...)`"),
+        )?;
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let e = match a {
-                CallArg::Expr(e) => e,
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!(
-                            "named arguments in transactor method call \
-                             `{tb_field}.{method}(...)`"
-                        ),
-                        "",
-                    ));
-                }
-            };
+            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Some(Expr::Call(
@@ -2132,10 +2193,12 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some(&(n_params, has_ret, callee_active_only)) = self.self_transactor_methods.get(name)
+        let Some((param_names, has_ret, callee_active_only)) =
+            self.self_transactor_methods.get(name).cloned()
         else {
             return Ok(None);
         };
+        let n_params = param_names.len();
         if self.in_fmt_args {
             return Err(unsupported(
                 &format!("transactor sibling method call `{name}(...)` inside a message"),
@@ -2169,20 +2232,15 @@ impl FuncBuilder<'_> {
                 ),
             ));
         }
+        // Same as the bound-instance arm above.
+        super::reject_misplaced_named_args(
+            args,
+            &param_names,
+            &format!("transactor sibling method call `{transactor}.{name}(...)`"),
+        )?;
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let e = match a {
-                CallArg::Expr(e) => e,
-                CallArg::Named { .. } => {
-                    return Err(unsupported(
-                        &format!(
-                            "named arguments in transactor sibling method call \
-                             `{transactor}.{name}(...)`"
-                        ),
-                        "",
-                    ));
-                }
-            };
+            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Some(Expr::Call(
@@ -2348,14 +2406,21 @@ impl FuncBuilder<'_> {
         name: &str,
         args: &[crate::ast::CallArg],
     ) -> Result<Expr, LowerError> {
+        // v1 drops argument names and binds by position here too:
+        // measured, `RandomTxns(n = 5)` emits `RandomTxns(5)` against
+        // `auto RandomTxns = [&](uint64_t n)` — byte-identical to the
+        // positional call. The names ride in `ctx.tseqs` for this.
+        if let Some((_, declared)) = self.ctx.tseqs.get(name) {
+            let declared = declared.clone();
+            super::reject_misplaced_named_args(
+                args,
+                &declared,
+                &format!("tseq call `{name}(...)`"),
+            )?;
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
-            let crate::ast::CallArg::Expr(e) = a else {
-                return Err(unsupported(
-                    &format!("named argument in tseq call `{name}`"),
-                    "tseq parameters are positional",
-                ));
-            };
+            let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
         }
         Ok(Expr::Call(
@@ -2663,6 +2728,32 @@ impl FuncBuilder<'_> {
                     "a hook side names a method to wrap; v1 routes every hooked `on` through \
                      its method-hook resolver and refuses a trigger that is not an \
                      `<obj>.<method>` path",
+                    V1Status::Rejects,
+                ));
+            }
+            // Shape is not resolution, and this arm used to stop at
+            // shape. `is_v1_method_hook_shape` accepts any dotted path
+            // of the right length, so `drv.send.x`, `nosuch.send`,
+            // `drv.plain` and `dut.rst.x` all reached the suggestion
+            // below — and MEASURED, v1 refuses every one of them with
+            // "obj.method must resolve to a `hookable` on a known
+            // component type", while the resolving `drv.send` emits.
+            // So the suggestion was honest for exactly one of the five
+            // and misdirection for the rest.
+            //
+            // This is v1's own condition, and it is the same check the
+            // test-scope arm in `mod.rs` makes: does `<obj>.<method>`
+            // name a `hookable` on a transactor or component testbench
+            // field? Checked in the recoverable direction — a miss
+            // yields the honest `Rejects`, and a hit only ever upgrades
+            // to the suggestion.
+            let resolves = hook_path_names_a_hookable(self, h);
+            if !resolves {
+                return Err(not_implemented(
+                    "a `pre`/`post` hook whose path names no `hookable` in statement position",
+                    "v1 routes every hooked `on` through its method-hook resolver and \
+                     refuses a path that does not resolve to a `hookable` on a known \
+                     component type, so it is not a way to run this program",
                     V1Status::Rejects,
                 ));
             }
@@ -3197,8 +3288,28 @@ impl FuncBuilder<'_> {
             ));
         }
         // Mirror v1's extraction rules: first bare ident is the
-        // severity (default info); first string literal that isn't the
-        // logf path is the message.
+        // severity (default info); the message is the first positional
+        // string AFTER the one `logf` consumes as its path.
+        //
+        // v1 CONSUMES the path (`StmtKind::LogF` splits the first
+        // positional string out of the list and hands `emit_log` what
+        // is left), so its rule is POSITIONAL. This used to compare
+        // each string's VALUE against the path instead, which is the
+        // same answer only while the message happens to differ from the
+        // path:
+        //
+        //   `logf("t.log", "t.log", error, "BOOM")` gave TB-IR "BOOM"
+        //   where v1 emits "t.log", and `logf("t.log", error, "t.log")`
+        //   gave TB-IR "" where v1 emits "t.log".
+        //
+        // Both backends accept both programs, so that was a live silent
+        // DIVERGENCE, not a shared mis-lowering.
+        //
+        // The named-argument guard above deliberately still runs on the
+        // FULL argument list, before the path is consumed: it exists to
+        // catch a named argument that leaves a positional slot empty,
+        // and counting a list the path has already been removed from
+        // would tell it there was one fewer slot to fill.
         let sev = args
             .iter()
             .find_map(|a| match a {
@@ -3218,7 +3329,7 @@ impl FuncBuilder<'_> {
                 },
                 _ => None,
             })
-            .find(|s| file.as_deref() != Some(s.as_str()))
+            .nth(usize::from(file.is_some()))
             .unwrap_or_default();
 
         let base = match sev.as_str() {

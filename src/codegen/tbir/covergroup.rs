@@ -742,7 +742,7 @@ pub(super) fn transactor_hook_vector_decls(
         &schema.name,
         &m.name,
         m.function,
-        m.n_params,
+        m.param_names.len(),
         pad,
     )
 }

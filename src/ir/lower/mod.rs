@@ -665,9 +665,11 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// Only the RELATION errors surface. Three of them are program errors
 /// under any backend: a relation that does not exist, one called with
 /// the wrong arity, and one that expands into itself. Measured against
-/// v1: it rejects the first two ("constraint function call not
-/// supported in v0 solver path") and STACK-OVERFLOWS on the third, so
-/// none of them is an escape hatch and `Invalid` is the honest verdict.
+/// v1: it rejects all three with "constraint function call not
+/// supported in v0 solver path", so none is an escape hatch and
+/// `Invalid` is the honest verdict. The third used to take the process
+/// down with a stack overflow instead; divergence 62 replaced that with
+/// the same diagnostic as the other two.
 ///
 /// The other variants stay discarded ON PURPOSE. They are capability
 /// gaps in the constraint IR, not bad programs:
@@ -732,7 +734,17 @@ fn surface_constraint_lower_error(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            _ => continue,
+            // Must stay in step with `LowerError::is_relation_error`,
+            // which decides when the constraint walk may stop. A
+            // relation variant that reaches here unhandled would be
+            // dropped silently, so it trips under `cargo test` instead.
+            _ => {
+                debug_assert!(
+                    !e.is_relation_error(),
+                    "relation error not handled by surface_constraint_lower_error: {e:?}"
+                );
+                continue;
+            }
         };
         // Not "`randomize ... with`": a relation call also appears in a
         // transaction-level `keep` (spec §4), and naming a `with` clause
@@ -949,7 +961,18 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
-    let extern_fns: HashSet<String> = extern_fn_decls.keys().cloned().collect();
+    // Name -> declared parameter names. The names are carried (not just
+    // membership) so `lower_extern_fn_call` can check a named argument
+    // against the DECLARATION rather than against an invented list.
+    let extern_fns: HashMap<String, Vec<String>> = extern_fn_decls
+        .iter()
+        .map(|(k, d)| {
+            (
+                k.clone(),
+                d.params.iter().map(|p| p.name.name.clone()).collect(),
+            )
+        })
+        .collect();
 
     // Enum names, so transaction fields of enum type lower as scalars
     // (v1 flattens them to `int64_t` members with index values).
@@ -1685,7 +1708,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
-        let elem = tseq_records[&decl.name.name].clone();
+        let elem = tseq_records[&decl.name.name].0.clone();
         let id = FunctionId(prog.functions.len() as u32);
         let f = tseqs::lower_tseq(id, decl, elem, &tseq_ctx, &helper_registry, &side_tables)?;
         prog.functions.push(f);
@@ -2616,11 +2639,11 @@ fn lower_test(
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
-    extern_fns: &HashSet<String>,
+    extern_fns: &HashMap<String, Vec<String>>,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
-    tseq_records: &HashMap<String, TseqElem>,
+    tseq_records: &HashMap<String, (TseqElem, Vec<String>)>,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
@@ -3925,12 +3948,13 @@ fn lower_test(
         let xschema = &prog.transactors[xid.index()];
         for (m, n) in [("write", 2usize), ("read", 1usize)] {
             match xschema.method(m) {
-                Some(ms) if ms.n_params == n => {}
+                Some(ms) if ms.param_names.len() == n => {}
                 Some(ms) => {
                     return Err(LowerError::Invalid(format!(
                         "regblock `via` helper `{}` method `{m}` takes {} argument(s), \
                          the frontdoor needs {n}",
-                        xschema.name, ms.n_params
+                        xschema.name,
+                        ms.param_names.len()
                     )));
                 }
                 None => {
@@ -4011,12 +4035,13 @@ fn lower_test(
         let xschema = &prog.transactors[xid.index()];
         for (m, n) in [("write", 2usize), ("read", 1usize)] {
             match xschema.method(m) {
-                Some(ms) if ms.n_params == n => {}
+                Some(ms) if ms.param_names.len() == n => {}
                 Some(ms) => {
                     return Err(LowerError::Invalid(format!(
                         "addrmap `via` helper `{}` method `{m}` takes {} argument(s), \
                          the frontdoor needs {n}",
-                        xschema.name, ms.n_params
+                        xschema.name,
+                        ms.param_names.len()
                     )));
                 }
                 None => {
@@ -5025,6 +5050,16 @@ pub(crate) fn reject_misplaced_named_args(
     declared: &[String],
     construct: &str,
 ) -> Result<(), LowerError> {
+    // Report the WORST argument, not the first. The two classes below
+    // are not equally bad and the arguments are not examined in order
+    // of badness, so returning on the first one found let the milder
+    // verdict hide the graver one: in
+    // `f(nosuch = 1, hi = 2, lo = 3)` the unknown name comes first and
+    // its `Invalid` was returned, so the genuine swap behind it — a
+    // SILENT mis-lowering, the thing this guard exists to catch — was
+    // never reported. Fixing the typo then revealed a second error,
+    // which is precisely the experience a diagnostic should not give.
+    let mut unknown: Option<LowerError> = None;
     for (i, a) in args.iter().enumerate() {
         let crate::ast::CallArg::Named { name, .. } = a else {
             continue;
@@ -5040,17 +5075,50 @@ pub(crate) fn reject_misplaced_named_args(
         // `SilentlyMisLowers` would claim v1 emits something else, and
         // for a typo sitting in a valid position v1 emits exactly the
         // right code — the same false-explanation class this guard was
-        // rewritten to stop producing.
+        // rewritten to stop producing. Held, not returned, so a swap
+        // later in the list still wins.
         if !declared.contains(&name.name) {
-            return Err(LowerError::Invalid(format!(
-                "`{}` names no parameter of {construct} (expected {})",
-                name.name,
-                declared
-                    .iter()
-                    .map(|d| format!("`{d}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )));
+            unknown.get_or_insert_with(|| {
+                LowerError::Invalid(format!(
+                    "`{}` names no parameter of {construct} (expected {})",
+                    name.name,
+                    declared
+                        .iter()
+                        .map(|d| format!("`{d}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            });
+            continue;
+        }
+        // A "swap" claim only makes sense when the positions
+        // correspond, i.e. when the call supplies exactly as many
+        // arguments as the callee declares. `axil_write(data = t.value)`
+        // on a two-parameter method is UNDER-SUPPLIED: v1 emits the same
+        // under-supplied call the positional `axil_write(t.value)`
+        // emits, so the name changes nothing and there is no swap to
+        // describe. Reporting one would be a false explanation of a
+        // pre-existing arity gap — the exact failure mode this guard was
+        // rewritten to stop producing.
+        //
+        // An earlier version of this comment claimed call sites check
+        // arity first so the branch is unreachable. That is false at
+        // exactly two of them: `lower_extern_fn_call` has no arity check
+        // anywhere in the pipeline, and TB-IR never checks
+        // component-method arity (`axil_write(t.value)` lowers). Both
+        // reach here, and both LOSE a diagnostic they used to give:
+        // `ref_add(b = 2, a = 1, 3)` reported a swap before and lowers
+        // now.
+        //
+        // Measured before accepting that: the two backends emit the same
+        // arguments in the same order for those calls
+        // (`ref_add(2, 1, 3)` under both), and both outputs are
+        // uncompilable against the emitted signature, so the C++
+        // compiler catches it and nothing runs silently wrong. The
+        // trade is a diagnostic for a pre-existing SHARED arity gap, not
+        // a new v1/TB-IR divergence.
+        if args.len() != declared.len() {
+            continue;
         }
         return Err(not_implemented(
             &format!("a misplaced named argument in {construct}"),
@@ -5065,7 +5133,10 @@ pub(crate) fn reject_misplaced_named_args(
             V1Status::SilentlyMisLowers,
         ));
     }
-    Ok(())
+    match unknown {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// True when a hooked `on` handler has the shape v1's method-hook
@@ -5668,7 +5739,14 @@ pub(crate) struct LowerCtx {
     /// `CallTarget::Tseq` whose result types the local as the element's
     /// `RecordSeq`/`Seq` (`TseqElem::seq_type`), and a `for t in txns` over
     /// such a local lowers to a counted loop over `txns`.
-    pub tseqs: HashMap<String, TseqElem>,
+    /// tseq name -> (element type, declared parameter NAMES).
+    ///
+    /// The names ride along for the same reason
+    /// `TransactorMethodSchema::param_names` carries them: the call site
+    /// lowers from this map alone, and without the names it could only
+    /// refuse every named argument — including the in-order form v1
+    /// emits byte-identically.
+    pub tseqs: HashMap<String, (TseqElem, Vec<String>)>,
     /// DUT-internal `probe` declarations on `let dut` (probe name →
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with
@@ -5684,7 +5762,7 @@ pub(crate) struct LowerCtx {
     /// helpers, methods) — an extern fn is a pure scalar C function, so
     /// it is callable wherever a pure helper is. Empty when the program
     /// declares no extern fns.
-    pub extern_fns: HashSet<String>,
+    pub extern_fns: HashMap<String, Vec<String>>,
 }
 
 impl LowerCtx {
@@ -5904,7 +5982,16 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) self_transactor: Option<String>,
     /// Full sibling method signature table for the current transactor,
     /// including methods declared later in source order.
-    pub(crate) self_transactor_methods: HashMap<String, (usize, bool, bool)>,
+    /// Sibling methods visible inside a transactor method body:
+    /// name -> (declared parameter NAMES, has_ret, active_only).
+    ///
+    /// The first slot was a bare `usize` count. Carrying the names lets
+    /// `lower_transactor_self_call` check a named argument against the
+    /// declaration instead of refusing every one of them; it is the
+    /// same information `TransactorMethodSchema::param_names` carries
+    /// for the bound-instance path, and it was dropped in both places
+    /// for the same reason.
+    pub(crate) self_transactor_methods: HashMap<String, (Vec<String>, bool, bool)>,
     /// True while lowering a transactor method declared under
     /// `when active`. Used to reject an always-on method that would
     /// backdoor-call an active-only sibling.
