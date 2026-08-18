@@ -8337,8 +8337,14 @@ fn lower_coroutine_tags_transactor_bodies() {
 
 /// A method param (or any local) that shadows the DUT field name is
 /// host state — `dut.x` through it must NOT silently lower to a DUT
-/// access (v1 surfaces the shadowing as a C++ compile error; the IR
-/// rejects at lowering).
+/// access.
+///
+/// The parenthetical here used to read "v1 surfaces the shadowing as a
+/// C++ compile error". It does not. v1 ignores the shadowing and emits
+/// `harc_rt::harc_assign(self.dut->en, 1)` — a write to the DUT PORT,
+/// which compiles and runs (built and run: `dut.en=1`, parameter never
+/// touched). That is what moved this arm to `SilentlyMisLowers`, and it
+/// is asserted below rather than described.
 #[test]
 fn local_shadowing_dut_name_does_not_mislower() {
     let src = r#"
@@ -8364,11 +8370,50 @@ impl ShTest for ShTb
     end run
 end impl ShTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(
+        &lower_src(src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(
-        msg.contains("assignment to a non-port, non-local target"),
+        msg.contains("neither a DUT port nor a local"),
         "shadowed name must not resolve to the DUT: {msg}"
+    );
+
+    // The doc above used to say v1 "surfaces the shadowing as a C++
+    // compile error". Measured, it does not: it ignores the shadowing
+    // and writes to the DUT handle. Built and run outside the suite —
+    // `dut.en=1`, with the `uint<8>` parameter never touched.
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the shadowed program");
+    assert!(
+        v1.contains("harc_rt::harc_assign(self.dut->en, 1);"),
+        "v1 resolves the shadowed name to the DUT handle: {v1}"
+    );
+
+    // The other shape under the same arm, which is the uncompilable
+    // one — both are why the arm carries the worse of the two.
+    let non_place = r#"
+testbench NpTb
+    dut : Top
+    n   : uint<32> default 0
+end testbench NpTb
+
+impl NpTest for NpTb
+    run
+        5 = n
+        wait 1 cycle
+    end run
+end impl NpTest
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(non_place).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("neither a DUT port nor a local"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(non_place))
+            .expect("v1 emits")
+            .contains("5 = _tb.n;"),
+        "v1 emits the assignment to a non-place"
     );
 }
 

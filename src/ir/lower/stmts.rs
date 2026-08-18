@@ -1805,9 +1805,27 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
-        Err(unsupported(
-            "assignment to a non-port, non-local target",
-            "",
+        // Two measured shapes, and they are not the same failure.
+        //
+        //   * `5 = n` — v1 emits `5 = _tb.n;`. g++: "lvalue required as
+        //     left operand of assignment".
+        //   * a method PARAMETER shadowing the transactor's `dut` field
+        //     (`hookable poke(dut: uint<8>)` with `dut.en = 1` in the
+        //     body) — v1 ignores the shadowing entirely and emits
+        //     `harc_rt::harc_assign(self.dut->en, 1)`, writing to the
+        //     DUT PORT. Built and run: `dut.en=1`, and the parameter
+        //     was never touched. The program says `dut` is a `uint<8>`
+        //     and v1 pokes hardware.
+        //
+        // The second is why this is not `Invalid`: v1 runs that program,
+        // just not the one that was written. Worst-under-arm, and a
+        // silent write to the DUT is the worst thing here.
+        Err(not_implemented(
+            "assignment to a target that is neither a DUT port nor a local",
+            "v1 either emits an assignment to a non-place, which does not compile, or — \
+             when the target NAME is shadowed by a local or parameter — resolves it to \
+             the shadowed DUT handle and writes to the port instead",
+            V1Status::SilentlyMisLowers,
         ))
     }
 
@@ -1819,9 +1837,12 @@ impl FuncBuilder<'_> {
     /// (`<mangled>_en = 0`).
     fn lower_release(&mut self, target: &crate::ast::Expr) -> Result<(), LowerError> {
         let Some(port) = self.as_port_ref(target)? else {
-            return Err(unsupported(
-                "`release` of a non-DUT target",
-                "`release` applies only to a `probe force` signal on the DUT",
+            // MEASURED: v1 refuses this too, with "`release` target must
+            // be `dut.<probe_name>`". Pointing at v1 was a dead end, and
+            // `release` naming something that is not a DUT probe is a
+            // program error under both backends.
+            return Err(LowerError::Invalid(
+                "`release` applies only to a `probe force` signal on the DUT".to_string(),
             ));
         };
         match port.access {

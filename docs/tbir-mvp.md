@@ -5183,6 +5183,39 @@ case and only locally-determinable `Assign` types are compared).
     handle the same statement, and needed opposite verdicts. Proximity
     is not evidence.
 
+81. **A shadowed name makes v1 write to the DUT (2026-08-18).**
+
+    Two arms, probed together because both looked like "the target is
+    not a thing you can assign to".
+
+    `release n`, where `n` is a testbench scalar rather than a DUT probe
+    force: v1 refuses too, with "`release` target must be
+    `dut.<probe_name>`". A program error under both backends →
+    `Invalid`.
+
+    The assignment arm looked the same and is not. It spans:
+
+    | source | v1 |
+    |---|---|
+    | `5 = n` | emits `5 = _tb.n;` — g++: "lvalue required as left operand of assignment" |
+    | `hookable poke(dut: uint<8>)` with `dut.en = 1` in the body | emits `harc_rt::harc_assign(self.dut->en, 1)` — **writes to the DUT port** |
+
+    The second row was built and RUN: `dut.en=1`, and the `uint<8>`
+    parameter was never touched. v1 ignores the shadowing entirely and
+    resolves `dut` to the transactor's own DUT handle. The source says
+    the name is a parameter; the program pokes hardware. That is the
+    worst thing under the arm, so `SilentlyMisLowers` — and it is the
+    reason this arm is not `Invalid` alongside its `release` neighbour,
+    since v1 does run that program, just not the one that was written.
+
+    The existing test over this arm carried the opposite claim in its
+    doc — "v1 surfaces the shadowing as a C++ compile error" — asserted,
+    never measured, and false. It now asserts the emitted line instead
+    of describing it.
+
+    Third time in this sweep that asking "what ELSE is under this arm"
+    changed a verdict rather than confirming one.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
