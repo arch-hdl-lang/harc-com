@@ -6,7 +6,10 @@
 //! inclusive ranges, plus declared `cross` items over those points.
 //! Hook triggers stay `Unsupported` — never silently mis-lowered.
 
-use super::{helpers::HelperRegistry, not_implemented, unsupported, LowerError, V1Status};
+use super::{
+    fold_const, helpers::HelperRegistry, not_implemented, unsupported, ConstFoldErr, ConstVal,
+    LowerError, V1Status,
+};
 use crate::ast::{
     CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl, UnaryOp,
 };
@@ -20,7 +23,7 @@ pub(crate) fn lower_covergroup(
     g: &CovergroupDecl,
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<CovgroupSchema, LowerError> {
     // v1's clock-sample registration ignores the trigger expression
     // entirely — any non-hook covergroup samples once per primary-clock
@@ -262,7 +265,7 @@ fn lower_hook_param_field(
     point: &str,
     target: &AstExpr,
     hook_params: &[String],
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<Option<Expr>, LowerError> {
     if hook_params.is_empty() {
         return Ok(None);
@@ -289,7 +292,7 @@ fn lower_hook_param_field(
         // Covergroup schemas lower before any runtime scope, so a Vec
         // lane index can only be a constant literal here (same rule as
         // DUT-port lanes). Represent it as a constant `Expr::Literal`.
-        let v = cover_const_u64(group, point, i, consts)?;
+        let v = cover_const_u64(group, point, ConstRole::LaneIndex, i, consts)?;
         index = Some(Box::new(Expr::Literal {
             value: v,
             ty: IrType::Unknown,
@@ -345,7 +348,7 @@ fn lower_point_target(
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<Expr, LowerError> {
     // Takes the node the walk FAILED on, not the top-level `target`.
     // The loop below unwraps `Paren` as it descends, so a closure over
@@ -370,7 +373,7 @@ fn lower_point_target(
         group: &str,
         point: &str,
         e: &AstExpr,
-        consts: &HashMap<String, u64>,
+        consts: &HashMap<String, ConstVal>,
     ) -> Result<Option<PortRef>, LowerError> {
         let mut cur = e;
         let mut lane = None;
@@ -380,7 +383,11 @@ fn lower_point_target(
             // constant is in subset (`cover_const_u64` rejects anything
             // else). Kept as `LaneIndex::Const`.
             lane = Some(crate::ir::LaneIndex::Const(cover_const_u64(
-                group, point, index, consts,
+                group,
+                point,
+                ConstRole::LaneIndex,
+                index,
+                consts,
             )?));
             cur = target;
         }
@@ -435,7 +442,7 @@ fn lower_point_target(
             // member.
             ExprKind::Ident(id) if consts.contains_key(&id.name) => {
                 return Ok(Expr::Literal {
-                    value: consts[&id.name],
+                    value: consts[&id.name].bits,
                     ty: IrType::Unknown,
                 });
             }
@@ -523,8 +530,8 @@ fn lower_point_target(
                 ));
             }
             ExprKind::BitSlice { target, hi, lo } => {
-                let hi = cover_const_u32(group, point, hi, consts)?;
-                let lo = cover_const_u32(group, point, lo, consts)?;
+                let hi = cover_const_u32(group, point, ConstRole::SliceBound, hi, consts)?;
+                let lo = cover_const_u32(group, point, ConstRole::SliceBound, lo, consts)?;
                 if hi < lo {
                     return Err(LowerError::Invalid(format!(
                         "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
@@ -925,7 +932,7 @@ fn lower_point_call_args(
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<Vec<Expr>, LowerError> {
     // `declared` is the callee's parameter names, passed in by the
     // caller that already resolved the declaration and checked arity.
@@ -966,50 +973,222 @@ fn lower_point_call_args(
     Ok(lowered)
 }
 
-/// A constant in a coverpoint target — a `Vec` lane index or a slice
-/// bound. Covergroup schemas lower before any runtime scope exists, so
-/// these reference no locals; a file-scope `const` or enum variant is
-/// still fair game, and v1 emits one as `(uint32_t)(K)` against its own
-/// `static constexpr K` — identical semantics to the literal. Verified
-/// by mutating `cov_expr_targets_test`, which BOTH backends pass, one
-/// bound at a time.
+/// What a folded constant is standing in for. The four roles do NOT
+/// share a v1 behaviour, so they cannot share a classification — this
+/// is the difference between naming the sites and measuring them.
+///
+/// Measured by mutating `cov_expr_targets_test` / `packed_vec_lane_test`
+/// (fixtures BOTH backends pass and the equivalence harness trace-diffs)
+/// one bound at a time, and compiling v1's emission against the runtime
+/// headers with a stub `VTop`:
+///
+/// | role | `[N:0]` / `<N>` with `N` undeclared | v1 emits |
+/// |---|---|---|
+/// | `Vec` lane index | `dut->lane_id_out[EOF]` — **compiles**, indexes at -1 | the name verbatim |
+/// | bit-slice bound | `harc_bits(v, (uint32_t)(EOF), 0)` — **compiles**, slices at 4294967295 | the name verbatim |
+/// | width-method arg | — | v1 REJECTS: "`.trunc<N>()` requires a constant integer width" |
+/// | cast width | `(uint64_t)(...)` — **compiles**, width ignored entirely | v1 never resolves a cast width |
+///
+/// `EOF` is the load-bearing input, and it is why the first two roles
+/// are `SilentlyMisLowers` rather than `EmitsUncompilable`: v1 pastes
+/// the HARC identifier into C++ unexamined, so a name that happens to
+/// be a macro or an object in scope compiles clean and samples a bound
+/// nobody wrote. A name that happens to be a `FILE*` (`stderr`) does
+/// fail to compile — but the arm's status is the worst thing v1 does
+/// anywhere under it, and silently sampling the wrong bit is worse
+/// than a compiler error.
+#[derive(Clone, Copy)]
+enum ConstRole {
+    LaneIndex,
+    SliceBound,
+    WidthArg,
+    CastWidth,
+}
+
+impl ConstRole {
+    fn name(self) -> &'static str {
+        match self {
+            ConstRole::LaneIndex => "`Vec` lane index",
+            ConstRole::SliceBound => "bit-slice bound",
+            ConstRole::WidthArg => "width-method width",
+            ConstRole::CastWidth => "cast width",
+        }
+    }
+}
+
+/// A constant in a coverpoint target — a `Vec` lane index, a slice
+/// bound, a `.trunc<N>()`-family width, or an `as uint<N>` cast width.
+///
+/// Covergroup schemas lower before any runtime scope exists, so these
+/// reference no locals; a file-scope `const` or enum variant is still
+/// fair game, and v1 emits one as `(uint32_t)(K)` against its own
+/// `static constexpr K` — identical semantics to the literal.
+///
+/// The whole initializer grammar folds, not just a bare name: `[1 + 2:0]`
+/// is emitted by v1 as `(uint32_t)(1 + 2)` and means exactly `[3:0]`, so
+/// refusing it was a subset gap with no reason behind it. `fold_const`
+/// is the same evaluator `const` declarations use, which is what keeps
+/// the two spellings in agreement.
 fn cover_const_u64(
     group: &str,
     point: &str,
+    role: ConstRole,
     e: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<u64, LowerError> {
+    match fold_const(e, consts, "") {
+        Ok(v) => Ok(v.bits),
+        Err(err) => Err(cover_const_refusal(group, point, role, e, consts, err)),
+    }
+}
+
+/// Classify a bound that did not fold, on the SHAPE that stopped it
+/// rather than on `fold_const`'s message — the message is written for
+/// `const` declarations and its verdicts do not carry over. Three
+/// shapes, and they take three different verdicts:
+///
+///   * a name nothing declares — v1 pastes it into C++; see
+///     [`ConstRole`] for the per-role measurement.
+///   * an integer literal outside the 64-bit domain — a SIZED literal
+///     (`4'd3`) is one v1 lowers correctly (`(uint32_t)(3)`), so that
+///     stays a plain subset gap; an over-wide decimal is one g++ takes
+///     with a warning ("integer constant is too large for its type")
+///     and truncates, so the coverpoint silently samples a bound
+///     nobody wrote.
+///   * anything else — a runtime expression like `[dut.en:0]`, which
+///     v1 emits as a genuinely dynamic bound that compiles and runs.
+///     TB-IR's cover model needs a static width, so this is a real
+///     subset gap with a working escape hatch.
+fn cover_const_refusal(
+    group: &str,
+    point: &str,
+    role: ConstRole,
+    e: &AstExpr,
+    consts: &HashMap<String, ConstVal>,
+    err: ConstFoldErr,
+) -> LowerError {
+    let what = format!("covergroup `{group}` point `{point}` {}", role.name());
+    if let Some(name) = first_unresolved_name(e, consts) {
+        return match role {
+            ConstRole::LaneIndex | ConstRole::SliceBound => not_implemented(
+                &format!("{what} `{name}`"),
+                format!(
+                    "`{name}` is not a file-scope const or enum variant, and v1 pastes the \
+                     name into its C++ unexamined — a name that also names a macro or an \
+                     object in scope (`EOF` is one) compiles clean and samples a bound \
+                     nobody wrote"
+                ),
+                V1Status::SilentlyMisLowers,
+            ),
+            ConstRole::WidthArg => not_implemented(
+                &format!("{what} `{name}`"),
+                format!(
+                    "`{name}` is not a file-scope const or enum variant; v1 refuses it too \
+                     (\"requires a constant integer width\")"
+                ),
+                V1Status::Rejects,
+            ),
+            ConstRole::CastWidth => not_implemented(
+                &format!("{what} `{name}`"),
+                format!(
+                    "`{name}` is not a file-scope const or enum variant; v1 never resolves \
+                     a cast width at all and emits a plain 64-bit cast, so the bad name \
+                     reaches no diagnostic"
+                ),
+                V1Status::SilentlyMisLowers,
+            ),
+        };
+    }
+    if let Some(lit) = first_unfoldable_int_literal(e) {
+        if lit.contains('\'') {
+            return unsupported(
+                &format!("{what} written as the sized literal `{lit}`"),
+                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
+            );
+        }
+        return not_implemented(
+            &format!("{what} written as the over-wide literal `{lit}`"),
+            "v1 emits the literal verbatim and g++ takes it with a warning — \"integer \
+             constant is too large for its type\" — so the coverpoint samples a truncated \
+             bound with no error",
+            V1Status::SilentlyMisLowers,
+        );
+    }
+    match err {
+        ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("{what}: {detail}")),
+        ConstFoldErr::Unsupported(_) => unsupported(
+            &format!("{what} that is not a compile-time constant"),
+            "the TB-IR cover model needs a static bound; v1 emits the expression as a \
+             RUNTIME bound, which compiles and samples a width that varies per cycle",
+        ),
+    }
+}
+
+/// The first identifier in `e` that is neither a file-scope `const` nor
+/// an enum variant, if any. Walks the whole expression, because a name
+/// buried in `[K + N:0]` is the reason the fold stopped just as much as
+/// a bare one is.
+fn first_unresolved_name(e: &AstExpr, consts: &HashMap<String, ConstVal>) -> Option<String> {
+    let mut found = None;
+    walk_expr(e, &mut |x| {
+        if found.is_none() {
+            if let ExprKind::Ident(id) = &*x.kind {
+                if !consts.contains_key(&id.name) {
+                    found = Some(id.name.clone());
+                }
+            }
+        }
+    });
+    found
+}
+
+/// The first integer literal in `e` that `parse_int_literal` cannot
+/// read — a Verilog-style sized literal, or a decimal past `u64`.
+fn first_unfoldable_int_literal(e: &AstExpr) -> Option<String> {
+    let mut found = None;
+    walk_expr(e, &mut |x| {
+        if found.is_none() {
+            if let ExprKind::Int(lit) = &*x.kind {
+                if super::exprs::parse_int_literal(lit).is_none() {
+                    found = Some(lit.clone());
+                }
+            }
+        }
+    });
+    found
+}
+
+/// Pre-order walk over the constant-expression subset `fold_const`
+/// accepts. Deliberately NOT a general AST walk: it visits exactly the
+/// node kinds that can appear inside a foldable bound, so a shape it
+/// does not know falls through to the "not a compile-time constant"
+/// arm rather than being mis-attributed to a name or a literal inside
+/// it.
+fn walk_expr(e: &AstExpr, f: &mut impl FnMut(&AstExpr)) {
+    f(e);
     match &*e.kind {
-        ExprKind::Paren(inner) => cover_const_u64(group, point, inner, consts),
-        ExprKind::Ident(id) => consts.get(&id.name).copied().ok_or_else(|| {
-            unsupported(
-                &format!("covergroup `{group}` point `{point}` non-constant index/slice bound"),
-                format!("`{}` is not a file-scope const or enum variant", id.name),
-            )
-        }),
-        ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-            unsupported(
-                &format!("covergroup `{group}` point `{point}` constant"),
-                format!("`{s}` is not a plain integer literal"),
-            )
-        }),
-        _ => Err(unsupported(
-            &format!("covergroup `{group}` point `{point}` non-constant index/slice bound"),
-            "",
-        )),
+        ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => walk_expr(inner, f),
+        ExprKind::Cast { expr, .. } => walk_expr(expr, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr(lhs, f);
+            walk_expr(rhs, f);
+        }
+        _ => {}
     }
 }
 
 fn cover_const_u32(
     group: &str,
     point: &str,
+    role: ConstRole,
     e: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<u32, LowerError> {
-    let v = cover_const_u64(group, point, e, consts)?;
+    let v = cover_const_u64(group, point, role, e, consts)?;
     u32::try_from(v).map_err(|_| {
         LowerError::Invalid(format!(
-            "covergroup `{group}` point `{point}` constant {v} does not fit in u32"
+            "covergroup `{group}` point `{point}` {} {v} does not fit in u32",
+            role.name()
         ))
     })
 }
@@ -1019,19 +1198,40 @@ fn cover_width_arg(
     point: &str,
     method: &str,
     e: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<u32, LowerError> {
-    let width = cover_const_u32(group, point, e, consts)?;
+    let width = cover_const_u32(group, point, ConstRole::WidthArg, e, consts)?;
     if width == 0 {
         return Err(LowerError::Invalid(format!(
             "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
         )));
     }
     if width > 64 {
-        return Err(unsupported(
-            &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
-            "the TB-IR covergroup expression model is 64-bit",
-        ));
+        // A coverpoint samples 64 bits, so widening PAST 64 and then
+        // narrowing back is the identity — and that is exactly what v1
+        // does: `.sext<128>()` comes out as `(uint64_t)(harc_sext_u128(
+        // v, 4, 128))` and `.zext<128>()` / `.resize<128>()` as
+        // `(uint64_t)((_harc_u128)(v))`, all of which equal the `<64>`
+        // form for any source the model can hold. So clamp rather than
+        // refuse; the test asserts the emitted sampler for `<128>` is
+        // byte-identical to `<64>`.
+        //
+        // `trunc` is NOT in that set. It narrows, so a width above the
+        // source width is a wrong-direction cast, and v1 says so:
+        // "`.trunc<128>()` on a 4-bit value: width must be strictly
+        // less than the source width". Every source this model can
+        // hold is at most 64 bits, so a `trunc` width above 64 is
+        // always that error — the one case where both backends refuse.
+        if method == "trunc" {
+            return Err(not_implemented(
+                &format!("covergroup `{group}` point `{point}` `.trunc<{width}>()`"),
+                "a coverpoint samples 64 bits, so no source here is wider than that and a \
+                 truncation to more bits is a wrong-direction cast; v1 refuses it too \
+                 (\"width must be strictly less than the source width\")",
+                V1Status::Rejects,
+            ));
+        }
+        return Ok(64);
     }
     Ok(width)
 }
@@ -1040,7 +1240,7 @@ fn cover_cast_width(
     group: &str,
     point: &str,
     ty: &crate::ast::TypeExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<Option<u32>, LowerError> {
     let width = match ty {
         crate::ast::TypeExpr::Builtin {
@@ -1049,7 +1249,13 @@ fn cover_cast_width(
             args,
             ..
         } => match args.first() {
-            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(group, point, e, consts)?),
+            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(
+                group,
+                point,
+                ConstRole::CastWidth,
+                e,
+                consts,
+            )?),
             Some(_) => None,
             None => Some(64),
         },
@@ -1062,10 +1268,16 @@ fn cover_cast_width(
             )));
         }
         if width > 64 {
-            return Err(unsupported(
-                &format!("covergroup `{group}` point `{point}` cast to {width} bits"),
-                "the TB-IR covergroup expression model is 64-bit",
-            ));
+            // Same identity as the width methods above, and the same
+            // measurement: v1 emits `(uint64_t)((_harc_u128)(v))` for
+            // `as uint<128>` and `(uint64_t)((HarcWide<7>)(v))` for
+            // `as uint<200>`. The first equals a 64-bit cast; the
+            // SECOND DOES NOT COMPILE — "no matching function for call
+            // to `harc_rt::HarcWide<7>::HarcWide(__int128 unsigned)`"
+            // — so refusing this would have pointed users at a v1 that
+            // cannot build it either. Clamping lowers it correctly
+            // under TB-IR instead of classifying v1's bug.
+            return Ok(Some(64));
         }
     }
     Ok(width)
@@ -1075,13 +1287,13 @@ fn cover_infer_expr_width(
     group: &str,
     point: &str,
     e: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
 ) -> Result<Option<u32>, LowerError> {
     match &*e.kind {
         ExprKind::Paren(inner) => cover_infer_expr_width(group, point, inner, consts),
         ExprKind::BitSlice { hi, lo, .. } => {
-            let hi = cover_const_u32(group, point, hi, consts)?;
-            let lo = cover_const_u32(group, point, lo, consts)?;
+            let hi = cover_const_u32(group, point, ConstRole::SliceBound, hi, consts)?;
+            let lo = cover_const_u32(group, point, ConstRole::SliceBound, lo, consts)?;
             if hi < lo {
                 return Err(LowerError::Invalid(format!(
                     "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
@@ -1132,7 +1344,7 @@ pub(crate) fn lower_bin_values(
     group: &str,
     bin: &str,
     spec: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
@@ -1234,7 +1446,7 @@ fn lower_bin_bound(
     group: &str,
     bin: &str,
     e: &AstExpr,
-    consts: &HashMap<String, u64>,
+    consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
@@ -1244,26 +1456,16 @@ fn lower_bin_bound(
             lower_bin_bound(group, bin, inner, consts, hook_params, helpers, extern_fns)
         }
         ExprKind::Int(s) => Ok(CovBinBound::Const(parse_bound(group, bin, s)?)),
-        // A bare ident that names a file-scope const/enum variant folds
-        // to a constant — but a HOOK PARAM of the same name wins, which
-        // is the precedence a coverpoint target already uses. Without
-        // this order, adding an unrelated `const cmd = 1` silently turns
-        // `one = {cmd}` into `_v == 1` while `cover cmd.ticks` in the
-        // same covergroup still means the hook argument: one name, two
-        // meanings, no diagnostic.
-        ExprKind::Ident(id) if consts.contains_key(&id.name) && !hook_params.contains(&id.name) => {
-            Ok(CovBinBound::Const(consts[&id.name]))
-        }
-        // A bare name that is neither is a TYPO, and gets a message that
-        // says so rather than `lower_point_target`'s generic subset
-        // list.
-        ExprKind::Ident(id) if !hook_params.contains(&id.name) => Err(unsupported(
-            &format!("covergroup `{group}` bin `{bin}` with a non-constant spec"),
-            format!(
-                "`{}` is not a file-scope const, enum variant, or hook parameter",
-                id.name
-            ),
-        )),
+        // A constant EXPRESSION over literals and file-scope names folds
+        // like a bare one — v1 emits `_v == 1 - 1`, which is `_v == 0`.
+        // Checked before the runtime arm so `{1 - 1}` becomes a `Const`
+        // bin rather than a per-sample expression, matching how the
+        // literal spelling lowers. A hook param anywhere inside keeps
+        // its precedence, so the fold is skipped when one appears.
+        _ if !mentions_hook_param(e, hook_params) => match fold_const(e, consts, "") {
+            Ok(v) => Ok(CovBinBound::Const(v.bits)),
+            Err(_) => bin_bound_fallback(group, bin, e, consts, hook_params, helpers, extern_fns),
+        },
         _ => {
             // Reuse the point-target expression lowerer for the runtime
             // case so the emitted per-sample value matches v1 (v1 renders
@@ -1278,11 +1480,110 @@ fn lower_bin_bound(
     }
 }
 
+/// Whether any bare identifier in `e` names a hook parameter. Bins and
+/// point targets share one precedence rule — a hook param beats a
+/// file-scope `const` of the same name — and this is what keeps the
+/// constant fold from breaking it. Without the check, adding an
+/// unrelated `const cmd = 1` would silently turn `one = {cmd}` into
+/// `_v == 1` while `cover cmd.ticks` in the same covergroup still meant
+/// the hook argument: one name, two meanings, no diagnostic.
+fn mentions_hook_param(e: &AstExpr, hook_params: &[String]) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| {
+        if let ExprKind::Ident(id) = &*x.kind {
+            if hook_params.contains(&id.name) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// A bin bound that did not fold. Three outcomes, and only one of them
+/// is an error, because "did not fold" covers a legitimate RUNTIME
+/// bound as well as two mistakes.
+///
+/// Measured by emitting the whole testbench under v1 and diffing
+/// against the literal spelling, which is how the comparison line
+/// (`if (((_v == <bound>)))`) was found rather than guessed:
+///
+/// | bound | v1 emits | outcome |
+/// |---|---|---|
+/// | `dut.en` | `_v == harc_rt::harc_read(dut->en)` | correct, per-sample — lowers as `Runtime` |
+/// | `N` (undeclared) | `_v == N` | "'N' was not declared in this scope" |
+/// | `EOF` | `_v == EOF` | **compiles**; the bin can never match, and nothing says so |
+/// | `4'd0` | folded to `0` | correct — v1 lowers sized literals here |
+/// | `99999999999999999999999` | verbatim | compiles with a warning, truncates |
+///
+/// So an unresolvable NAME is `SilentlyMisLowers` — `EOF` is the input
+/// that decides it, exactly as for a slice bound (divergence 87) — and
+/// an over-wide literal is too, while a sized literal keeps the v1
+/// suggestion because v1 folds it correctly.
+#[allow(clippy::too_many_arguments)]
+fn bin_bound_fallback(
+    group: &str,
+    bin: &str,
+    e: &AstExpr,
+    consts: &HashMap<String, ConstVal>,
+    hook_params: &[String],
+    helpers: &HelperRegistry<'_>,
+    extern_fns: &HashMap<String, &ExternFnDecl>,
+) -> Result<CovBinBound, LowerError> {
+    if let Some(name) = first_unresolved_name(e, consts) {
+        return Err(not_implemented(
+            &format!("covergroup `{group}` bin `{bin}` spec `{name}`"),
+            format!(
+                "`{name}` is not a file-scope const, enum variant, or hook parameter, and v1 \
+                 pastes the name into its `_v == {name}` comparison unexamined — a name that \
+                 also names a macro in scope (`EOF` is one) compiles and gives a bin that \
+                 can never match"
+            ),
+            V1Status::SilentlyMisLowers,
+        ));
+    }
+    if let Some(lit) = first_unfoldable_int_literal(e) {
+        if lit.contains('\'') {
+            return Err(unsupported(
+                &format!("covergroup `{group}` bin `{bin}` spec `{lit}`"),
+                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
+            ));
+        }
+        return Err(not_implemented(
+            &format!("covergroup `{group}` bin `{bin}` spec `{lit}`"),
+            "v1 emits the literal verbatim into `_v == <lit>` and g++ takes it with a \
+             warning — \"integer constant is too large for its type\" — so the bin compares \
+             against a truncated value with no error",
+            V1Status::SilentlyMisLowers,
+        ));
+    }
+    // A genuine runtime bound. Reuse the point-target expression
+    // lowerer so the emitted per-sample value matches v1 (v1 renders it
+    // with the same `emit_expr` it uses for point targets). It rejects
+    // anything outside the sampler subset with a precise diagnostic —
+    // but names it a "point", so relabel: the source declared a bin.
+    let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns, consts)
+        .map_err(|err| relabel_point_as_bin(err, bin))?;
+    Ok(CovBinBound::Runtime(expr))
+}
+
+/// A bin bound written as a bare integer literal. Splits the same way
+/// [`bin_bound_fallback`] does, and for the same measured reasons — it
+/// is reached first because `fold_const` is not consulted for a shape
+/// that is already a literal.
 fn parse_bound(group: &str, bin: &str, s: &str) -> Result<u64, LowerError> {
     super::exprs::parse_int_literal(s).ok_or_else(|| {
-        unsupported(
-            &format!("covergroup `{group}` bin `{bin}`"),
-            format!("`{s}` is not a plain integer literal"),
+        if s.contains('\'') {
+            return unsupported(
+                &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),
+                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
+            );
+        }
+        not_implemented(
+            &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),
+            "v1 emits the literal verbatim into `_v == <lit>` and g++ takes it with a \
+             warning — \"integer constant is too large for its type\" — so the bin compares \
+             against a truncated value with no error",
+            V1Status::SilentlyMisLowers,
         )
     })
 }

@@ -213,7 +213,7 @@ impl SideTables {
 #[derive(Clone, Copy)]
 pub(crate) struct ConstVal {
     pub(crate) bits: u64,
-    signed: bool,
+    pub(crate) signed: bool,
 }
 
 impl ConstVal {
@@ -1015,7 +1015,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for it in &file.items {
         if let Item::Covergroup(g) = it {
             let schema =
-                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &consts)?;
+                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &const_vals)?;
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }

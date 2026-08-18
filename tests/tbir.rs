@@ -14493,6 +14493,237 @@ impl T for Tb
 end impl T
 "#;
 
+/// The four things a coverpoint constant can BE, and the four different
+/// answers v1 gives when it is not a constant.
+///
+/// One helper folded `Vec` lane indices, bit-slice bounds,
+/// `.trunc<N>()`-family widths and `as uint<N>` cast widths, and gave
+/// all four the same refusal — including the same TEXT, so
+/// `.trunc<N>()` was reported as a "non-constant index/slice bound".
+/// Measured per role by mutating `cov_expr_targets_test` and
+/// `packed_vec_lane_test` (fixtures BOTH backends pass) one bound at a
+/// time, and compiling v1's emission against a stub `VTop`:
+///
+/// | role | v1 on an unresolvable name | verdict |
+/// |---|---|---|
+/// | `Vec` lane index | `dut->lane_id_out[EOF]` — compiles, indexes at -1 | `SilentlyMisLowers` |
+/// | bit-slice bound | `harc_bits(v, (uint32_t)(EOF), 0)` — compiles, slices at 4294967295 | `SilentlyMisLowers` |
+/// | width-method width | refuses: "requires a constant integer width" | `Rejects` |
+/// | cast width | `(uint64_t)(...)` — compiles, width ignored entirely | `SilentlyMisLowers` |
+///
+/// `EOF` is the load-bearing input. `N` alone would have said
+/// `EmitsUncompilable` ("'N' was not declared in this scope", measured),
+/// and so would `stderr` ("cast from 'FILE*' to 'uint32_t' loses
+/// precision") — but v1 pastes the HARC identifier into C++ without
+/// looking at it, so a name that also names a macro compiles clean and
+/// samples a bound nobody wrote. The arm's status is the worst thing v1
+/// does anywhere under it.
+#[test]
+fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "cov fixture shape changed");
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert!(lanes.contains(LANE), "lane fixture shape changed");
+    let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
+
+    // The two roles v1 mis-samples: it emits the name verbatim.
+    for (what, src, v1_needle) in [
+        (
+            "bit-slice bound",
+            slice("dut.count_out[EOF:0]"),
+            "(uint32_t)(EOF)",
+        ),
+        (
+            "`Vec` lane index",
+            lane("dut.lane_id_out[EOF]"),
+            "lane_id_out[EOF]",
+        ),
+    ] {
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains(what),
+            "{what}: the role must name itself: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(v1_needle),
+            "{what}: v1 pastes the name into C++: expected `{v1_needle}`"
+        );
+    }
+
+    // The role v1 refuses.
+    let width = slice("dut.count_out[3:0].trunc<N>()");
+    let msg = assert_not_implemented(&lower_src(&width).unwrap_err(), lower::V1Status::Rejects);
+    assert!(msg.contains("width-method width"), "{msg}");
+    let e = cpp_tb::emit(&merged_src(&width)).expect_err("v1 refuses a non-const width");
+    assert!(
+        e.to_string().contains("requires a constant integer width"),
+        "v1's own refusal is what makes this `Rejects`: {e}"
+    );
+
+    // The role v1 never even looks at.
+    let cast = slice("(dut.count_out as uint<N>)");
+    let msg = assert_not_implemented(
+        &lower_src(&cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&cast)).expect("v1 emits");
+    assert!(
+        !v1.contains("(uint32_t)(N)") && !v1.contains("uint<N>"),
+        "v1 drops the width rather than resolving it: {v1}"
+    );
+
+    // Two more shapes, two more verdicts, from the same helper.
+    let runtime = slice("dut.count_out[dut.en:0]");
+    let msg = assert_unsupported(&lower_src(&runtime).unwrap_err());
+    assert!(msg.contains("not a compile-time constant"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&runtime)).expect("v1 emits a dynamic bound");
+    assert!(
+        v1.contains("(uint32_t)(harc_rt::harc_read(dut->en))"),
+        "v1's bound varies per cycle, which is why the suggestion is honest: {v1}"
+    );
+
+    let huge = slice("dut.count_out[99999999999999999999999:0]");
+    let msg = assert_not_implemented(
+        &lower_src(&huge).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("over-wide literal"), "{msg}");
+
+    let sized = slice("dut.count_out[4'd3:0]");
+    let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
+    assert!(msg.contains("sized literal"), "{msg}");
+    // …and the reason that one keeps the suggestion: v1 folds it.
+    let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
+    assert!(
+        v1.contains("(uint32_t)(3)"),
+        "v1 folds `4'd3` to 3, so `--codegen v1` really is a way out: {v1}"
+    );
+}
+
+/// A coverpoint bound is a constant EXPRESSION, not just a literal or a
+/// name. v1 emits `[1 + 2:0]` as `harc_bits(v, (uint32_t)(1 + 2), 0)`,
+/// which means exactly `[3:0]`, so refusing it was a subset gap with
+/// nothing behind it. Folding through `fold_const` — the same evaluator
+/// `const` declarations use — closes it, and the test is equality with
+/// the literal spelling rather than a shape assertion.
+#[test]
+fn a_constant_expression_coverpoint_bound_folds() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice =
+        |prefix: &str, t: &str| format!("{prefix}{}", cov.replacen(CP, &format!("cover {t}\n"), 1));
+    let literal = emit_cpp_src(&cov);
+    for (what, prefix, t) in [
+        ("arithmetic", "", "dut.count_out[1 + 2:0]"),
+        (
+            "a const in an expression",
+            "const K = 1\n\n",
+            "dut.count_out[K + 2:0]",
+        ),
+        ("a shift", "", "dut.count_out[(1 << 2) - 1:0]"),
+        ("a hex literal", "", "dut.count_out[0x3:0]"),
+    ] {
+        assert_eq!(
+            emit_cpp_src(&slice(prefix, t)),
+            literal,
+            "{what} must lower exactly like the literal `[3:0]`"
+        );
+    }
+    // The lane-index role folds through the same helper.
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert_eq!(
+        emit_cpp_src(&lanes.replacen(LANE, "cover dut.lane_id_out[2 - 2]", 1)),
+        emit_cpp_src(&lanes),
+        "a folded lane index must lower exactly like the literal"
+    );
+}
+
+/// Widening past 64 bits inside a coverpoint is the identity, because
+/// the sample IS 64 bits — so TB-IR clamps instead of refusing.
+///
+/// v1 agrees for the shapes it can build: `.sext<128>()` comes out as
+/// `(uint64_t)(harc_sext_u128(v, 4, 128))`, `.zext<128>()` and
+/// `.resize<128>()` as `(uint64_t)((_harc_u128)(v))`, `as uint<128>` as
+/// `(uint64_t)((_harc_u128)(v))` — every one equal to the `<64>` form
+/// for any source this model holds.
+///
+/// It does not agree for `as uint<200>`: v1 emits
+/// `(uint64_t)((harc_rt::HarcWide<7>)(v))`, which g++ rejects — "no
+/// matching function for call to `harc_rt::HarcWide<7>::HarcWide(__int128
+/// unsigned)`". Refusing that with a `--codegen v1` suggestion would
+/// have pointed users at a backend that cannot build it either, which
+/// is the second reason to clamp rather than classify.
+///
+/// `trunc` is the exception and keeps refusing: it NARROWS, so a width
+/// above the source width is a wrong-direction cast, and v1 says so in
+/// its own words.
+#[test]
+fn a_coverpoint_width_above_64_clamps_because_the_sample_is_64_bits() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+    for (wide, narrow) in [
+        (
+            "dut.count_out[3:0].sext<128>()",
+            "dut.count_out[3:0].sext<64>()",
+        ),
+        (
+            "dut.count_out[3:0].zext<128>()",
+            "dut.count_out[3:0].zext<64>()",
+        ),
+        (
+            "dut.count_out[3:0].resize<128>()",
+            "dut.count_out[3:0].resize<64>()",
+        ),
+        (
+            "(dut.count_out as uint<128>)",
+            "(dut.count_out as uint<64>)",
+        ),
+        (
+            "(dut.count_out as uint<200>)",
+            "(dut.count_out as uint<64>)",
+        ),
+        (
+            "(dut.count_out as sint<128>)",
+            "(dut.count_out as sint<64>)",
+        ),
+    ] {
+        assert_eq!(
+            emit_cpp_src(&slice(wide)),
+            emit_cpp_src(&slice(narrow)),
+            "`{wide}` must lower exactly like `{narrow}` — the sample is 64 bits"
+        );
+    }
+
+    // `trunc` is not in that set, and v1 is why.
+    let t = slice("dut.count_out[3:0].trunc<128>()");
+    let msg = assert_not_implemented(&lower_src(&t).unwrap_err(), lower::V1Status::Rejects);
+    assert!(msg.contains("`.trunc<128>()`"), "{msg}");
+    let e = cpp_tb::emit(&merged_src(&t)).expect_err("v1 refuses a widening trunc");
+    assert!(
+        e.to_string()
+            .contains("width must be strictly less than the source width"),
+        "v1's own refusal is what makes this `Rejects`: {e}"
+    );
+
+    // And the one v1 cannot build, which is emitted rather than refused
+    // — so the clamp is a fix, not a workaround for a TB-IR limitation.
+    let wide = cpp_tb::emit(&merged_src(&slice("(dut.count_out as uint<200>)")))
+        .expect("v1 emits the 200-bit cast");
+    assert!(
+        wide.contains("HarcWide<7>"),
+        "v1 reaches for a type it cannot construct here: {wide}"
+    );
+}
+
 /// A file-scope `const` as a coverpoint slice bound. v1 emits one as
 /// `(uint32_t)(K)` against its own `static constexpr K` — identical
 /// semantics to the literal — while TB-IR refused anything but a plain
@@ -15112,29 +15343,126 @@ fn a_low_precedence_bin_value_is_a_place_v1_is_wrong() {
 }
 
 /// A bare name in a bin spec that is neither a `const`/enum variant nor
-/// a hook param is a typo, and keeps the message that says so. Routing
-/// every non-range member through `lower_bin_bound` would otherwise hand
-/// the user the generic sampler-subset list — less precise, and it
-/// labels a bin as a "point".
+/// a hook param keeps the message that says so — routing it through the
+/// generic sampler-subset list would be less precise and would label a
+/// bin as a "point" — but it does NOT keep the `--codegen v1`
+/// suggestion, which was never true.
+///
+/// v1 emits the name straight into its comparison: `if (((_v == NOPE)))`.
+/// For an undeclared name that is "'NOPE' was not declared in this
+/// scope"; for one that also names a macro it is worse, because
+/// `_v == EOF` COMPILES and yields a bin that can never match, with no
+/// diagnostic from either backend. The arm's status is the worst thing
+/// v1 does under it, so it is `SilentlyMisLowers`.
 #[test]
 fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     emit_cpp_src(&fixture);
 
     let err = lower_src(&fixture.replace("en0 = {0}", "en0 = {NOPE}")).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("bin `en0`"), "a bin is not a point: {msg}");
-    assert!(
-        msg.contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"),
-        "{msg}"
-    );
+    assert!(msg.contains("`NOPE` is not a file-scope const"), "{msg}");
 
-    // The escape hatches the message names all work, so it is accurate.
+    // What v1 does with it, which is what makes the suggestion wrong.
+    for (name, needle) in [("NOPE", "_v == NOPE"), ("EOF", "_v == EOF")] {
+        let v1 = cpp_tb::emit(&merged_src(
+            &fixture.replace("en0 = {0}", &format!("en0 = {{{name}}}")),
+        ))
+        .unwrap_or_else(|e| panic!("{name}: v1 emits: {e}"));
+        assert!(
+            v1.contains(needle),
+            "{name}: v1 pastes the name into the comparison"
+        );
+    }
+
+    // The escape hatches the message names all work, so the rest of it
+    // is accurate.
     lower_src(&format!(
         "const NOPE = 3\n\n{}",
         fixture.replace("en0 = {0}", "en0 = {NOPE}")
     ))
     .expect("a const name folds");
+}
+
+/// An integer literal a bin spec cannot fold splits the same way a
+/// slice bound does (divergence 87), and for the same measured
+/// reasons — but it is a SEPARATE arm, reached before `fold_const` is
+/// ever consulted, so it takes its own probe rather than the other
+/// one's verdict.
+///
+/// | spec | v1 emits | verdict |
+/// |---|---|---|
+/// | `4'd0` | folds to `_v == 0` — correct | `Unsupported`: v1 really is a way out |
+/// | `99999999999999999999999` | verbatim; g++ warns and truncates | `SilentlyMisLowers` |
+#[test]
+fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let spec = |b: &str| fixture.replace("en0 = {0}", &format!("en0 = {{{b}}}"));
+
+    let msg = assert_unsupported(&lower_src(&spec("4'd0")).unwrap_err());
+    assert!(msg.contains("sized literal"), "{msg}");
+    // …and the claim behind that suggestion: v1 folds it to the same
+    // comparison the plain literal produces.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&spec("4'd0"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&spec("0"))).expect("v1 emits"),
+        "v1 folds `4'd0` exactly like `0`, which is what makes `--codegen v1` honest here"
+    );
+
+    let msg = assert_not_implemented(
+        &lower_src(&spec("99999999999999999999999")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("too large for its type"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&spec("99999999999999999999999"))).expect("v1 emits");
+    assert!(
+        v1.contains("_v == 99999999999999999999999"),
+        "v1 pastes the over-wide literal into the comparison: {v1}"
+    );
+
+    // Both landings — a member and a range end — share one
+    // implementation, so both are checked.
+    let range = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [4'd1 .. 7]");
+    assert!(assert_unsupported(&lower_src(&range).unwrap_err()).contains("sized literal"));
+}
+
+/// A bin spec is a constant EXPRESSION, not just a literal or a name.
+/// v1 emits `{1 - 1}` as `if (((_v == 1 - 1)))`, which means `_v == 0`,
+/// so folding it is exact — and it makes the bin a `Const` rather than
+/// a per-sample expression, matching how the literal spells out.
+///
+/// The hook-param precedence survives the fold: a hook parameter beats
+/// a file-scope `const` of the same name, so the fold is skipped when
+/// one appears anywhere in the bound.
+#[test]
+fn a_constant_expression_bin_spec_folds() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let base = emit_cpp_src(&fixture.replace("en0 = {0}", "en0 = {0}"));
+    for (what, prefix, spec) in [
+        ("arithmetic", "", "1 - 1"),
+        ("a const in an expression", "const Z = 1\n\n", "Z - 1"),
+        ("a shift", "", "(1 << 3) - 8"),
+    ] {
+        let src = format!(
+            "{prefix}{}",
+            fixture.replace("en0 = {0}", &format!("en0 = {{{spec}}}"))
+        );
+        assert_eq!(
+            emit_cpp_src(&src),
+            base,
+            "{what} must lower exactly like the literal `{{0}}`"
+        );
+    }
+
+    // Precedence: a hook param of the same name still wins over a const.
+    let hooked = crate::fixture("covergroup_hook_param_test.harc");
+    let with_const = format!("const ticks = 99\n\n{hooked}");
+    assert_eq!(
+        emit_cpp_src(&with_const),
+        emit_cpp_src(&hooked),
+        "an unrelated `const` must not capture a hook-parameter name"
+    );
 }
 
 /// A record-typed hook parameter is rejected in a bin the same way it
@@ -15215,11 +15543,13 @@ fn a_rejected_bin_spec_is_reported_as_a_bin() {
         assert!(!msg.contains("point `"), "`{to}`: {msg}");
     }
 
-    // The typo message reaches a range end too.
+    // The typo message reaches a range end too, with the same verdict.
     let err = lower_src(&fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [NOPE .. 7]"))
         .unwrap_err();
-    assert!(assert_unsupported(&err)
-        .contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"));
+    assert!(
+        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers)
+            .contains("`NOPE` is not a file-scope const")
+    );
 
     // A rejected coverpoint TARGET still says "point", so the relabel is
     // scoped to the bin path rather than renaming the noun everywhere.

@@ -5456,6 +5456,106 @@ case and only locally-determinable `Assign` types are compared).
     `as_component_idle` grows" and never checked the other direction,
     which is where the live bug was.
 
+87. **One coverpoint-constant helper, four roles, four different v1
+    behaviours (2026-08-18).**
+
+    `cover_const_u64` folded `Vec` lane indices, bit-slice bounds,
+    `.trunc<N>()`-family widths and `as uint<N>` cast widths, and gave
+    all four the same refusal — including the same TEXT, so
+    `.trunc<N>()` came out as a "non-constant index/slice bound". Five
+    call sites, one message, one verdict, and the verdict was wrong for
+    three of them.
+
+    Measured per role by mutating `cov_expr_targets_test` and
+    `packed_vec_lane_test`, and compiling v1's emission against a stub
+    `VTop`:
+
+    | role | v1 on an unresolvable name | verdict |
+    |---|---|---|
+    | `Vec` lane index | `dut->lane_id_out[EOF]` — compiles, indexes at -1 | `SilentlyMisLowers` |
+    | bit-slice bound | `harc_bits(v, (uint32_t)(EOF), 0)` — compiles, slices at 4294967295 | `SilentlyMisLowers` |
+    | width-method width | refuses: "requires a constant integer width" | `Rejects` |
+    | cast width | `(uint64_t)(...)` — compiles, width ignored entirely | `SilentlyMisLowers` |
+
+    `EOF` is what makes the first two `SilentlyMisLowers` rather than
+    `EmitsUncompilable`. Probing with `N` says "'N' was not declared in
+    this scope" and probing with `stderr` says "cast from `FILE*` to
+    `uint32_t` loses precision" — both compiler errors, both the wrong
+    answer, because v1 pastes the HARC identifier into C++ without
+    looking at it. Enumerate the INPUTS, not the shapes: one input that
+    also names a macro turns the whole arm over.
+
+    Two things were implemented rather than classified:
+
+    * **Constant EXPRESSIONS fold.** `[1 + 2:0]` is emitted by v1 as
+      `harc_bits(v, (uint32_t)(1 + 2), 0)` and means exactly `[3:0]`.
+      Routing the helper through `fold_const` — the evaluator `const`
+      declarations already use — closes that with no new arithmetic,
+      and the test asserts byte-equality with the literal spelling
+      rather than a shape.
+    * **Widths above 64 clamp.** A coverpoint samples 64 bits, so
+      `.sext<128>()`, `.zext<128>()`, `.resize<128>()` and
+      `as uint<128>` are the identity on any source the model holds —
+      which v1's own output confirms: it emits `(uint64_t)(
+      harc_sext_u128(v, 4, 128))` and `(uint64_t)((_harc_u128)(v))`,
+      both equal to the `<64>` form. `as uint<200>` is the case that
+      settles it: v1 emits `(uint64_t)((harc_rt::HarcWide<7>)(v))`,
+      which g++ REJECTS — "no matching function for call to
+      `harc_rt::HarcWide<7>::HarcWide(__int128 unsigned)`". Refusing
+      that with a `--codegen v1` suggestion would have sent users to a
+      backend that cannot build it either.
+
+    `trunc` keeps refusing, and is the one arm here v1 also refuses: it
+    narrows, so a width above the source width is a wrong-direction
+    cast, and every source in a 64-bit sample model is at most 64 bits
+    wide. `Rejects`, in v1's own words.
+
+    Sized literals stay a plain subset gap — `[4'd3:0]` is folded
+    correctly by v1 to `(uint32_t)(3)`, and TB-IR does not lower sized
+    literals anywhere yet, so this is one face of a cross-cutting gap
+    rather than something to special-case here.
+
+88. **A bin spec is the same four roles again, and one of its arms was
+    promising an escape hatch that does not exist (2026-08-18).**
+
+    `lower_bin_bound` folded a bare literal and a bare `const` name and
+    sent everything else to the runtime path, with two hand-written
+    `Unsupported` arms in between. Measured by emitting the whole
+    testbench under v1 and diffing against the literal spelling — which
+    is how the comparison line was found rather than guessed; a filter
+    for "the bin's name" matched the counter DECLARATION (`uint64_t
+    zero = 0;`), identical across every case, and would have said
+    nothing at all:
+
+    | spec | v1 emits | outcome |
+    |---|---|---|
+    | `1 - 1` | `_v == 1 - 1` | correct |
+    | `Z` (a `const`) | folded | correct |
+    | `dut.en` | `_v == harc_rt::harc_read(dut->en)` | correct, per-sample |
+    | `N` (undeclared) | `_v == N` | "'N' was not declared in this scope" |
+    | `EOF` | `_v == EOF` | **compiles**; the bin can never match |
+    | `4'd0` | folded to `_v == 0` | correct |
+    | `99999999999999999999999` | verbatim | compiles with a warning, truncates |
+
+    The unresolvable-name arm said `Unsupported` — "re-run with
+    `--codegen v1`" — and v1 cannot build it. The test defending that
+    arm asserted "the escape hatches the message names all work", which
+    was true of the message's ADVICE and said nothing about the
+    suggestion attached to it. `SilentlyMisLowers` now, `EOF` being the
+    input that sets it, exactly as for a slice bound.
+
+    Constant expressions fold here too, so `{1 - 1}` becomes a `Const`
+    bin rather than a per-sample comparison, matching the literal
+    spelling byte for byte. The hook-parameter precedence survives it:
+    a hook param beats a file-scope `const` of the same name, so the
+    fold is skipped whenever one appears anywhere in the bound, and the
+    test pins that by adding an unrelated `const ticks = 99` to a
+    fixture whose hook parameter is named `ticks`.
+
+    The `parse_bound` literal arm is a SEPARATE landing, reached before
+    `fold_const` is consulted, so it took its own probe rather than the
+    other arm's verdict — same split, independently measured.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
