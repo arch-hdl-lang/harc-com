@@ -6850,6 +6850,136 @@ former `transaction` group lives in
      RETURN type is refused upstream, so every method reaching it
      returns a scalar.
 
+109. **Seven `bound to` arms, three files, one rule stated three times
+     (2026-08-18).**
+
+     A `bound to <Ty>` clause has two out-of-subset type shapes, and
+     the match resolving them was copied BYTE-IDENTICALLY into three
+     lowering paths — the event-driven consumer BFM
+     (`components.rs`), the bound TARGET responder and the bound
+     INITIATOR BFM (`transactors.rs`). All six copies said
+     `Unsupported`, so all six promised `--codegen v1`. Measured on
+     each of the three paths separately:
+
+     | clause | v1 | verdict |
+     |---|---|---|
+     | `bound to Bus#(ADDR_W=12, DATA_W=64)` | byte-identical C++ to `#(ADDR_W=32, DATA_W=32)`, and to the bare `bound to Bus` | `SilentlyMisLowers` |
+     | `bound to uint<8>`, and `bound to <named-non-bus>` | refused at every instantiation; an uninstantiated declaration emits an inert struct | `Rejects` |
+     | `bound to` on an `env`/`agent`/`sequencer`/`scoreboard` | three behaviours over nine cells; the worst COMPILES and silently drops the responder | `SilentlyMisLowers` |
+
+     The generic row's evidence is the byte-identity between two
+     parameterizations of the SAME textual length — so an identical
+     emission cannot be explained away as a shifted source offset.
+     v1's `type_simple_name` reads the last path segment and never
+     looks at the argument list, so a user who writes
+     `#(ADDR_W=12, DATA_W=64)` gets the bus declaration's defaults with
+     no diagnostic.
+
+     The second row is `Rejects`, not `Invalid`. v1 refuses it at both
+     instantiation positions, but a NEVER-INSTANTIATED declaration gets
+     through and emits an inert `struct T { … };`. Some configuration
+     of that program runs, so the arm has something to implement, which
+     is what separates `Rejects` from `Invalid` (divergence 108). The
+     same argument condemns the NAMED-non-bus spelling, which was
+     answering `Invalid` for a program shape one type-variant over —
+     in all THREE copies of that check (both in `transactors.rs`, and
+     the consumer-BFM one in `mod.rs` that the first correction missed
+     because the probe's data-only transactor never routed through it).
+
+     **The third row took three attempts, and the first two were wrong
+     in opposite directions.** Version one measured it on
+     `agent Watcher { hits : uint<32> default 0 }` — no event, no
+     handler, nothing to bind — found v1's output byte-identical with
+     and without the clause, and called the whole arm
+     `SilentlyMisLowers`. That withdrew a `--codegen v1` promise which
+     is, for one shape, honest: an `in event<T>` plus an `on <ev>`
+     handler writing `bus.<ch>.<sig>`, bound at a `let x : C = bind
+     <bus>` site, emits a complete working driver. Version two split on
+     "is there a non-periodic `on bus.<ch>.handshake(...)` handler",
+     which was over-promising again for three more shapes.
+
+     The measurement that settles it counts bare `bus` identifiers
+     outside comments in v1's emitted C++, over four handler shapes ×
+     two instantiation positions:
+
+     | shape | at a `= bind` | as a testbench field |
+     |---|---|---|
+     | `on <ev>` driver | **0 — resolved, compiles** | 4 |
+     | `hookable` body | **0 — resolved, compiles** | 4 |
+     | `on <bool-expr>` cycle trigger | 1 | 1 |
+     | `on N cycles` writing the bus | 1 | 1 |
+     | `on bus.<ch>.handshake(...)` | 1 | 1 |
+
+     TWO cells resolve the bus and emit a working driver — the
+     `on <ev>` handler body and, found a round later, the `hookable`
+     body, which behaves identically (0 bare `bus` at a bind, 4 as a
+     field). v1 REFUSES the transactor spelling of that same hookable
+     program ("drives a DUT signal from the always-on body … spec
+     §8.1"); the env/agent spelling bypasses that check. `bus` is
+     declared nowhere in the non-working cells, so g++ answers "'bus'
+     was not declared in this scope". Version two's predicate missed three of
+     them, including — because `parse_on_handler` reads the trigger
+     BEFORE the `cycles` decoration — `on bus.w.handshake(d) cycles`,
+     the canonical broken shape wearing one extra word.
+
+     A NINTH cell decides the label, and it is worse than either: a
+     `thread bus.<method>(...)` responder. v1 COMPILES that one — zero
+     bare `bus` references — because it drops the responder coroutine
+     outright. Against `tlm_target_thread_if_test`, changing only the
+     keyword `transactor` to `agent` deletes the whole
+     `_target_read_target_slot` block (300 emitted lines to 242); the
+     DUT's blocking read is then never answered and the fixture's own
+     assertions fail at run time. All four declaration kinds emit
+     byte-identically. `SilentlyMisLowers` outranks the seven
+     uncompilable cells, so that is the arm's label.
+
+     A third version justified the single label by claiming a predicate
+     could not name the working cell "because the deciding fact is the
+     INSTANTIATION POSITION and this code runs per DECLARATION". That
+     was false: `lower_program` pre-scans every
+     `TestItem::Let { bind: true }` before components lower and already
+     threads five whole-file pre-scans into `lower_component_schema`,
+     and v1 does exactly this pre-scan itself
+     (`driver_bus_for_hookables`). The real reason not to split is
+     simpler and survives the ninth cell: a position split does not
+     help, because the `thread` case is silent in BOTH columns.
+
+     The scoreboard spelling in `scoreboards.rs` is a FOURTH copy of
+     the same rule, and it carried the same wrong verdict from the same
+     degenerate measurement — `on bus.w.handshake(d)` on a bound
+     scoreboard emits `(bool)(bus.w.handshake(d))` too, and a `thread`
+     responder on one is dropped just as silently. A scoreboard WITH a
+     `hookable` is a component, so it routes through `components.rs`
+     instead — a lane nothing covered until a mutation survived there.
+
+     A FIFTH copy of the rule sits on the per-FIELD spelling
+     (`seen : uint<32> bound to Drv` on an env/agent/sequencer/
+     transactor, sibling of the scoreboard one). It was the last arm in
+     the family still promising `--codegen v1`, and v1 discards the
+     clause: with the bound and unbound sources padded to the SAME byte
+     length — so no source-offset residue can explain it — v1's output
+     is byte-identical. Its per-FIELD
+     sibling (`seen : uint<32> bound to Drv`) is a different construct
+     and keeps `SilentlyMisLowers`, which the byte-identity does
+     measure.
+
+     The six copies are now one `bound_bus_name(bound_to, subject)` in
+     `lower/mod.rs`. The consolidation has its own finding: the bus is
+     the LAST path segment, and nothing tested that. A dotted
+     `bound to arc.stdlib.BusAxiLite` lowers today and v1 emits it;
+     resolving the FIRST segment instead would look up a bus named
+     `arc`, find none, and return `Invalid` — divergence 108's bug
+     class again, this time reachable through a refactor rather than a
+     new guard. Eighteen mutations, all caught — including that one, one
+     that reads the generic guard as `generics.len() > 1` (every probe
+     passed two arguments, so arity-1 was unexercised), one per label on
+     the two `bound to`-clause arms, one on the bound-INITIATOR non-bus
+     arm (its byte-identical twin on the target path was covered and it
+     was not, because a data-only probe transactor routes to the target
+     path), and one that drops the per-site `subject`, which review
+     found unpinned: the only thing the three call sites pass
+     differently was never asserted.
+
 
 ## Next steps
 

@@ -809,6 +809,67 @@ fn regblock_instance_names(
         .collect()
 }
 
+/// Resolve a `bound to <Ty>` clause to the bus name, classifying the
+/// two out-of-subset type shapes.
+///
+/// `subject` is the complete phrase naming the declaration, backticks
+/// included — "transactor `AxilHelper`", "event-driven transactor
+/// `AxilXactor`". Three call sites held byte-identical copies of this
+/// match — the event-driven consumer BFM in `components.rs`, and the
+/// bound TARGET responder and bound INITIATOR BFM in `transactors.rs`
+/// — so each of its two arms made the same wrong promise three times,
+/// six copies in all.
+pub(crate) fn bound_bus_name(bound_to: &TypeExpr, subject: &str) -> Result<String, LowerError> {
+    match bound_to {
+        TypeExpr::Named { name, generics, .. } => {
+            if !generics.is_empty() {
+                // Measured on all three paths (event-driven consumer,
+                // bound initiator, bound target): v1's `type_simple_name`
+                // reads the LAST PATH SEGMENT and never looks at the
+                // argument list, so
+                //
+                //   bound to BusAxiLite#(ADDR_W=12, DATA_W=64)
+                //   bound to BusAxiLite#(ADDR_W=32, DATA_W=32)
+                //
+                // emit BYTE-IDENTICAL C++ — and identical to the bare
+                // `bound to BusAxiLite` modulo the source byte offset in
+                // an auto-coverage solver-site id. The transactor gets
+                // the bus decl's DEFAULT widths, and nothing says so.
+                return Err(not_implemented(
+                    &format!("{subject} bound to a generic-applied bus type"),
+                    "v1 drops the argument list: `bound to BusAxiLite#(ADDR_W=12, DATA_W=64)` \
+                     emits byte-identical C++ to `#(ADDR_W=32, DATA_W=32)` and to the bare \
+                     `bound to BusAxiLite`, so the transactor silently gets the bus \
+                     declaration's default widths",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            Ok(name
+                .segments
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default())
+        }
+        // A `Builtin` bound type (`bound to uint<8>`). `type_simple_name`
+        // answers `None` for it, so every v1 instantiation path
+        // diagnoses it: `let h : T = bind axil` reports "transactor is
+        // bound to `?`, but `axil` is a `BusAxiLite`", and a testbench
+        // field reports the `bound to` clause itself. Only a
+        // NEVER-INSTANTIATED declaration gets through v1, and there it
+        // emits an inert `struct T { … };` that harms nothing — so
+        // `Rejects` is the worst thing v1 does under this arm, and the
+        // arm is not `Invalid`.
+        _ => Err(not_implemented(
+            &format!("{subject} bound to a non-named bus type"),
+            "v1 rejects it at every instantiation — \"transactor is bound to `?`, but \
+             `axil` is a `BusAxiLite`\" at a `= bind` site, and the `bound to` clause \
+             itself at a testbench field; only a never-instantiated declaration gets \
+             through, and there v1 emits an inert struct",
+            V1Status::Rejects,
+        )),
+    }
+}
+
 fn bind_rhs_ident(
     value: Option<&crate::ast::Expr>,
     what: &str,
@@ -2032,11 +2093,23 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         let bound_ctx;
         let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
             let Some(bus) = buses.get(bus_name) else {
-                return Err(LowerError::Invalid(format!(
-                    "event-driven transactor `{}` is bound to `{bus_name}`, which is not a \
-                     `bus` declaration",
-                    schema.name
-                )));
+                // The THIRD copy of this check — the consumer-BFM path.
+                // Same verdict as the two in `transactors.rs`: a
+                // NEVER-INSTANTIATED `transactor T bound to RegOp`
+                // emits an inert struct under v1 and the file compiles,
+                // so `Invalid` is too strong. Measured: v1's output for
+                // `bound to RegOp` and `bound to uint<8>` differ only in
+                // an auto-coverage solver-site id, and both compile.
+                return Err(not_implemented(
+                    &format!(
+                        "event-driven transactor `{}` bound to `{bus_name}`, which is \
+                         not a `bus` declaration",
+                        schema.name
+                    ),
+                    "v1 rejects it at every instantiation; only a never-instantiated \
+                     declaration gets through, and there it emits an inert struct",
+                    V1Status::Rejects,
+                ));
             };
             let mut bb = method_ctx.clone();
             bb.bus_bindings.insert(

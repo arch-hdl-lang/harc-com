@@ -5485,6 +5485,457 @@ end impl T"#
     );
 }
 
+/// Seven `bound to` arms across three files, all promising `--codegen
+/// v1` for programs v1 either mis-lowers or refuses. Three dimensions:
+/// the type shape (generic-applied / non-named), the lowering path
+/// (event-driven consumer, bound initiator, bound target), and the
+/// declaration kind (transactor vs env/agent/sequencer).
+#[test]
+fn the_bound_to_arms_split_on_what_v1_does_with_the_clause() {
+    let bus_lower =
+        |src: &str| lower::lower_program(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+    let bus_emit = |src: &str| cpp_tb::emit(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+    let sub = |src: &str, from: &str, to: &str| {
+        assert_eq!(src.matches(from).count(), 1, "`{from}` is unique");
+        src.replace(from, to)
+    };
+
+    // ---- A generic-applied bound type, on all three lowering paths.
+    //
+    // v1's `type_simple_name` reads the last path segment and never
+    // looks at the argument list, so DIFFERENT arguments emit the SAME
+    // C++. That byte-identity is the whole finding: the transactor
+    // silently gets the bus declaration's default widths.
+    for (name, decl, bus_file, subject) in [
+        // event-driven consumer BFM (`on <ev>` driving the bound bus)
+        (
+            "axilite_bound_mon_test.harc",
+            "transactor AxilXactor bound to BusAxiLite",
+            Some("BusAxiLite.arch"),
+            "event-driven transactor `AxilXactor`",
+        ),
+        // bound INITIATOR BFM (`hookable` methods driving the bus)
+        (
+            "regblock_fields_test.harc",
+            "transactor AxilHelper bound to BusAxiLite",
+            Some("BusAxiLite.arch"),
+            "transactor `AxilHelper`",
+        ),
+        // bound TARGET responder (`thread bus.<method>`)
+        (
+            "tlm_target_thread_if_test.harc",
+            "transactor TlmMemTarget bound to TlmMemBus",
+            None,
+            "transactor `TlmMemTarget`",
+        ),
+    ] {
+        let src = fixture(name);
+        let emit = |s: &str| match bus_file {
+            Some(b) => cpp_tb::emit(&merged_with_stdlib_bus(s, b)),
+            None => cpp_tb::emit(&merged_src(s)),
+        };
+        let lower = |s: &str| match bus_file {
+            Some(b) => lower::lower_program(&merged_with_stdlib_bus(s, b)),
+            None => lower::lower_program(&merged_src(s)),
+        };
+
+        // Same textual LENGTH, different values — so an identical
+        // emission cannot be explained by a shifted source offset.
+        let same = sub(&src, decl, &format!("{decl}#(ADDR_W=32, DATA_W=32)"));
+        let diff = sub(&src, decl, &format!("{decl}#(ADDR_W=12, DATA_W=64)"));
+        assert_eq!(
+            emit(&same).expect("v1 emits the parameterized form"),
+            emit(&diff).expect("v1 emits the other parameterization"),
+            "{name}: v1 emits byte-identical C++ for #(32,32) and #(12,64)"
+        );
+        let msg = assert_not_implemented(
+            &lower(&same).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("generic-applied bus type"), "{msg}");
+        // ONE argument too — every probe here passes two, so a guard
+        // reading `generics.len() > 1` instead of `!is_empty()` would
+        // let `#(ADDR_W=12)` through unnoticed, and that is exactly the
+        // program the arm exists to catch.
+        let one = sub(&src, decl, &format!("{decl}#(ADDR_W=12)"));
+        assert_not_implemented(
+            &lower(&one).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        // The SUBJECT half too — it is the only thing the three call
+        // sites pass differently, so without this the per-site
+        // parameter is unpinned.
+        assert!(msg.contains(subject), "names its own site: {msg}");
+
+        // ---- A non-named bound type (`bound to uint<8>`), same three
+        // paths. Every INSTANTIATION is refused by v1, so this one is
+        // `Rejects`, not a silent mis-lowering.
+        let nn_decl = format!(
+            "{} bound to uint<8>",
+            decl.split(" bound to ")
+                .next()
+                .expect("the decl names a bus")
+        );
+        let nn = sub(&src, decl, &nn_decl);
+        let err = format!("{}", emit(&nn).expect_err("v1 refuses the instantiation"));
+        assert!(
+            err.contains("bound to `?`"),
+            "v1's own diagnostic names the unresolvable bound type: {err}"
+        );
+        let msg = assert_not_implemented(&lower(&nn).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-named bus type"), "{msg}");
+
+        // ---- Between the two arms sits the resolution itself: the bus
+        // is the LAST path segment. A dotted `bound to
+        // arc.stdlib.BusAxiLite` names the same bus and both backends
+        // handle it; reading the FIRST segment would look up a bus
+        // called `arc` and call the program invalid.
+        let bus_seg = decl
+            .split(" bound to ")
+            .nth(1)
+            .expect("the decl names a bus");
+        let dotted = sub(
+            &src,
+            decl,
+            &decl.replace(bus_seg, &format!("arc.stdlib.{bus_seg}")),
+        );
+        lower(&dotted).unwrap_or_else(|e| panic!("{name}: a dotted bound-to path lowers: {e:?}"));
+        emit(&dotted).unwrap_or_else(|e| panic!("{name}: and v1 emits it: {e}"));
+    }
+
+    // …but `Rejects`, not `Invalid`: a NEVER-INSTANTIATED declaration
+    // does get through v1, which emits an inert struct for it. Some
+    // configuration of this program runs, so the arm has something to
+    // implement.
+    let base = fixture("axilite_bound_mon_test.harc");
+    let uninst = sub(
+        &base,
+        "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+        "transactor Unused bound to uint<8>\n    n : uint<32> default 0\nend transactor Unused\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>",
+    );
+    let cpp = bus_emit(&uninst).expect("v1 emits an uninstantiated bogus-bound transactor");
+    assert!(cpp.contains("struct Unused {"), "and it is inert");
+    let msg = assert_not_implemented(&bus_lower(&uninst).unwrap_err(), lower::V1Status::Rejects);
+    // A NAMED type that is not a bus is the same program one variant
+    // over, and used to get `Invalid` while the builtin got `Rejects`.
+    // Both emit the same inert struct when never instantiated.
+    for ty in ["RegOp", "AxilSb"] {
+        let src = sub(
+            &base,
+            "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+            &format!(
+                "transactor Unbussed bound to {ty}\n    n : uint<32> default 0\n\
+                 end transactor Unbussed\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>"
+            ),
+        );
+        let m = assert_not_implemented(&bus_lower(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(m.contains(&format!("bound to `{ty}`")), "{m}");
+        assert!(
+            bus_emit(&src)
+                .expect("v1 emits")
+                .contains("struct Unbussed {"),
+            "v1 emits the same inert struct as the builtin case"
+        );
+        // …and the CONSUMER path has its own copy of the same check.
+        // The data-only shape above routes to `transactors.rs`; give it
+        // an `in event` + `on <ev>` and it lands in `mod.rs` instead,
+        // where the third copy was still answering `Invalid`.
+        let consumer = sub(
+            &base,
+            "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+            &format!(
+                "transactor Consumer bound to {ty}\n    req : in event<RegOp>\n\n\
+                 \x20   on req(t)\n        wait 1 cycle\n    end on\n\
+                 end transactor Consumer\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>"
+            ),
+        );
+        let m =
+            assert_not_implemented(&bus_lower(&consumer).unwrap_err(), lower::V1Status::Rejects);
+        assert!(m.contains("event-driven transactor `Consumer`"), "{m}");
+        // …and the bound-INITIATOR path has the third copy. A data-only
+        // transactor routes to the TARGET path, so nothing reached this
+        // one: it takes a `hookable` inside `when active`.
+        let init = fixture("regblock_fields_test.harc").replace(
+            "transactor AxilHelper bound to BusAxiLite",
+            &format!("transactor AxilHelper bound to {ty}"),
+        );
+        let m = assert_not_implemented(
+            &lower::lower_program(&merged_with_stdlib_bus(&init, "BusAxiLite.arch")).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(
+            m.contains("transactor `AxilHelper`") && m.contains(&format!("bound to `{ty}`")),
+            "{m}"
+        );
+    }
+    assert!(
+        msg.contains("transactor `Unused` bound to a non-named"),
+        "{msg}"
+    );
+
+    // ---- A `bound to` clause on an env / agent / sequencer DECL.
+    //
+    // This arm took three attempts. v1 resolves the bound-bus
+    // placeholder `bus` in exactly ONE of eight configurations and
+    // emits it verbatim in the other seven, where nothing declares it.
+    // The table is the measurement: for each cell, count bare `bus`
+    // identifiers outside comments in v1's emitted C++.
+    let bare_bus = |cpp: &str| -> usize {
+        cpp.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| {
+                l.match_indices("bus").any(|(k, _)| {
+                    let before = l[..k].chars().next_back();
+                    let after = l[k + 3..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .count()
+    };
+    let driver_body = "    req : in event<RegOp>\n\n    on req(t)\n        \
+                       bus.aw.addr = t.addr\n        bus.aw.valid = 1\n        \
+                       bus.w.send(t.value, 15)\n        bus.aw.valid = 0\n        \
+                       wait 1 cycle\n    end on";
+    for (shape, body) in [
+        ("on <ev> driver", driver_body),
+        (
+            "cycle trigger reading the bus",
+            "    hits : uint<32> default 0\n\n    on bus.w.valid == 1\n        \
+             hits = hits + 1\n    end on",
+        ),
+        (
+            "periodic handler writing the bus",
+            "    hits : uint<32> default 0\n\n    on 5 cycles\n        \
+             bus.aw.valid = 1\n    end on",
+        ),
+        // `parse_on_handler` reads the trigger BEFORE the `cycles`
+        // decoration, so this is a PERIODIC handler carrying the
+        // handshake-call trigger — the arm's own canonical uncompilable
+        // shape wearing one extra word, and the reason a predicate
+        // keyed on "non-periodic handshake handler" was wrong.
+        (
+            "handshake monitor with `cycles`",
+            "    hits : uint<32> default 0\n\n    on bus.w.handshake(d) cycles\n        \
+             hits = hits + 1\n    end on",
+        ),
+    ] {
+        for kind in ["agent", "env", "sequencer"] {
+            let decl =
+                format!("\n{kind} Watcher bound to BusAxiLite\n{body}\nend {kind} Watcher\n\n");
+            let with_decl = sub(
+                &base,
+                "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+                &format!("{decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs"),
+            );
+            let at_bind = sub(
+                &with_decl,
+                "    let mon  : AxilXactor passive = bind axil",
+                "    let mon  : AxilXactor passive = bind axil\n    let w    : Watcher = bind axil",
+            );
+            let at_field = sub(
+                &with_decl,
+                "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+                "testbench AxiLiteBoundMonTb\n    w   : Watcher\n    dut : AxiLiteRegs",
+            );
+
+            // Every cell carries the same verdict, and it promises
+            // nothing — the detail names the working one instead.
+            for src in [&at_bind, &at_field] {
+                let msg = assert_not_implemented(
+                    &bus_lower(src).unwrap_err(),
+                    lower::V1Status::SilentlyMisLowers,
+                );
+                assert!(
+                    msg.contains(&format!("a `bound to` clause on {kind} `Watcher`")),
+                    "{msg}"
+                );
+            }
+
+            // …and here is why: seven of the eight leave `bus`
+            // undeclared in v1's output. The ONE that does not is the
+            // `on <ev>` driver at a `= bind` site.
+            let n_bind = bare_bus(&bus_emit(&at_bind).expect("v1 emits"));
+            let n_field = bare_bus(&bus_emit(&at_field).expect("v1 emits"));
+            if shape == "on <ev> driver" {
+                assert_eq!(n_bind, 0, "{kind}/{shape} at a bind: v1 resolves the bus");
+                assert!(
+                    bus_emit(&at_bind)
+                        .expect("v1 emits")
+                        .contains("harc_rt::harc_assign(dut->axil_aw_addr, t.addr);"),
+                    "{kind}: and emits a working driver"
+                );
+                assert!(
+                    n_field > 0,
+                    "{kind}/{shape} as a testbench field: v1 emits `bus` verbatim"
+                );
+            } else {
+                assert!(
+                    n_bind > 0,
+                    "{kind}/{shape} at a bind leaves `bus` undeclared"
+                );
+                assert!(
+                    n_field > 0,
+                    "{kind}/{shape} as a field leaves `bus` undeclared"
+                );
+            }
+        }
+    }
+
+    // The NINTH cell, and the one that sets the label: a
+    // `thread bus.<method>(...)` responder. v1 COMPILES this one — zero
+    // bare `bus` references — because it drops the responder coroutine
+    // outright, so the target never answers and the fixture's own
+    // assertions fail at run time. Silently mis-lowering outranks
+    // failing to compile.
+    let thr = fixture("tlm_target_thread_if_test.harc");
+    let thr_ctl = cpp_tb::emit(&merged_src(&thr)).expect("v1 emits the transactor control");
+    for kind in ["agent", "env", "sequencer", "scoreboard"] {
+        let src = thr
+            .replace(
+                "transactor TlmMemTarget bound to TlmMemBus",
+                &format!("{kind} TlmMemTarget bound to TlmMemBus"),
+            )
+            .replace(
+                "end transactor TlmMemTarget",
+                &format!("end {kind} TlmMemTarget"),
+            );
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("silently dropped"), "{kind}: {msg}");
+        let cpp = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        // The evidence, both halves: the responder is GONE, and what is
+        // left has no undeclared `bus` to fail on.
+        assert!(
+            thr_ctl.contains("_target_read_target_slot")
+                && !cpp.contains("_target_read_target_slot"),
+            "{kind}: v1 drops the responder coroutine the transactor form emits"
+        );
+        assert!(
+            !cpp.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("bus.")
+            }),
+            "{kind}: and emits no undeclared `bus` — this cell COMPILES"
+        );
+    }
+
+    // A `hookable` body is a SECOND working shape, and the detail
+    // string used to deny it. It also matters for routing: a
+    // scoreboard WITH a hookable is a component
+    // (`scoreboard_is_component`), so it reaches the `components.rs`
+    // arm rather than the `scoreboards.rs` one — a lane nothing
+    // covered.
+    for kind in ["agent", "env", "sequencer", "scoreboard"] {
+        let decl = format!(
+            "\n{kind} Watcher bound to BusAxiLite\n    hits : uint<32> default 0\n\n    \
+             hookable poke(v: uint<32>)\n        bus.aw.addr = v\n        \
+             bus.aw.valid = 1\n        bus.w.send(v, 15)\n        bus.aw.valid = 0\n    \
+             end hookable\nend {kind} Watcher\n\n"
+        );
+        let with_decl = sub(
+            &base,
+            "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+            &format!("{decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs"),
+        );
+        let at_bind = sub(
+            &with_decl,
+            "    let mon  : AxilXactor passive = bind axil",
+            "    let mon  : AxilXactor passive = bind axil\n    let w    : Watcher = bind axil",
+        );
+        let msg = assert_not_implemented(
+            &bus_lower(&at_bind).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("`hookable` body"),
+            "the detail names it: {msg}"
+        );
+        // The evidence: v1 emits a real BFM lambda that drives the DUT,
+        // with no undeclared `bus` anywhere.
+        let v1 = bus_emit(&at_bind).expect("v1 emits");
+        assert!(
+            v1.contains("auto Watcher_poke = [&](Watcher& self, uint64_t v) -> void {")
+                && v1.contains("harc_rt::harc_assign(dut->axil_aw_addr, v);"),
+            "{kind}: v1 emits a working hookable BFM"
+        );
+        assert_eq!(
+            bare_bus(&v1),
+            0,
+            "{kind}: and leaves no undeclared `bus` — this cell COMPILES"
+        );
+    }
+
+    // The FIFTH copy of the rule: the per-FIELD spelling on an
+    // env/agent/sequencer. It was the last arm in the family still
+    // promising `--codegen v1`, and v1 discards the clause — proven
+    // with the two sources padded to the SAME byte length, so no
+    // source-offset residue can explain the identity.
+    for kind in ["env", "agent", "sequencer"] {
+        let bound = sub(
+            &base,
+            "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+            &format!(
+                "\n{kind} C\n    seen : uint<32> bound to AxilXactor default 0\n\n    \
+                 on 3 cycles\n        seen = seen + 1\n    end on\nend {kind} C\n\n\
+                 testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs\n    c   : C"
+            ),
+        );
+        let unbound = sub(
+            &bound,
+            "    seen : uint<32> bound to AxilXactor default 0",
+            "    seen : uint<32>                     default 0",
+        );
+        assert_eq!(
+            bound.len(),
+            unbound.len(),
+            "{kind}: the two sources must be the same length for the identity to mean \
+             anything"
+        );
+        let msg = assert_not_implemented(
+            &bus_lower(&bound).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("a `bound to` clause on field `C.seen`"),
+            "{msg}"
+        );
+        assert_eq!(
+            bus_emit(&bound).expect("v1 emits the bound form"),
+            bus_emit(&unbound).expect("v1 emits the unbound form"),
+            "{kind}: v1's output is byte-identical, so the clause is discarded"
+        );
+    }
+
+    // The scoreboard spelling is the fourth copy of the same rule, and
+    // it carried the same "byte-identical, discarded" verdict from the
+    // same degenerate measurement.
+    let sb_decl = "\nscoreboard Watcher bound to BusAxiLite\n    hits : uint<32> default 0\n\n\
+                       on bus.w.handshake(d)\n        hits = hits + 1\n    end on\n\
+                   end scoreboard Watcher\n\n";
+    let sb_src = sub(
+        &base,
+        "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+        &format!("{sb_decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs\n    wsb : Watcher"),
+    );
+    let msg = assert_not_implemented(
+        &bus_lower(&sb_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("a `bound to` clause on scoreboard `Watcher`"),
+        "{msg}"
+    );
+    assert!(
+        bus_emit(&sb_src)
+            .expect("v1 emits")
+            .contains("(bool)(bus.w.handshake(d))"),
+        "v1 emits the trigger verbatim for a scoreboard too"
+    );
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
@@ -6159,7 +6610,13 @@ end impl T"#
     let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits the control");
     lower_src(&control).expect("the control lowers");
 
-    // Both `bound to` spellings are discarded — byte-identically.
+    // On a DEGENERATE scoreboard — one scalar field, no handler —
+    // both `bound to` spellings are discarded byte-identically. That
+    // is a true measurement and a misleading one: it shows only that a
+    // declaration with nothing to bind has no binding to perform, and
+    // reading the DECLARATION arm's label off it was wrong (see the
+    // `bound to` arms test, where the handler-carrying shape emits
+    // `bus` into a scope that declares no such name).
     for (what, src) in [
         (
             "declaration",
@@ -6170,18 +6627,36 @@ end impl T"#
             prog("scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb"),
         ),
     ] {
-        let msg = assert_not_implemented(
-            &lower_src(&src).unwrap_err(),
-            lower::V1Status::SilentlyMisLowers,
-        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = err.to_string();
         assert!(msg.contains("`bound to`"), "{what}: {msg}");
+        assert!(
+            !msg.contains("re-run with `--codegen v1`"),
+            "{what}: neither spelling may promise v1: {msg}"
+        );
         assert_eq!(
             cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
             control_cpp,
-            "{what}: v1's output must be byte-identical to the unbound control — that is \
-             the whole evidence that the clause is discarded"
+            "{what}: on THIS shape v1's output is byte-identical to the unbound control"
         );
     }
+    // The FIELD spelling keeps `SilentlyMisLowers` — it is a different
+    // construct (a per-instance binding) and the byte-identity above is
+    // its whole measurement. The DECLARATION spelling does not.
+    assert_not_implemented(
+        &lower_src(&prog(
+            "scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert_not_implemented(
+        &lower_src(&prog(
+            "scoreboard Sb bound to Drv\n    seen : uint<32> default 0\nend scoreboard Sb",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
 
     // A port field keeps its name and loses everything else.
     let port = prog("scoreboard Sb\n    p : in uint<8>\nend scoreboard Sb");

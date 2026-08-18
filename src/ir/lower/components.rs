@@ -493,33 +493,10 @@ pub(crate) fn lower_component_schema(
             ));
         }
         if let Some(bt) = t.bound_to.as_ref() {
-            match bt {
-                TypeExpr::Named {
-                    name: bn, generics, ..
-                } => {
-                    if !generics.is_empty() {
-                        return Err(unsupported(
-                            &format!(
-                                "event-driven transactor `{name}` bound to a generic-applied \
-                                 bus type"
-                            ),
-                            "",
-                        ));
-                    }
-                    bound_bus = Some(
-                        bn.segments
-                            .last()
-                            .map(|s| s.name.clone())
-                            .unwrap_or_default(),
-                    );
-                }
-                _ => {
-                    return Err(unsupported(
-                        &format!("event-driven transactor `{name}` bound to a non-named bus type"),
-                        "",
-                    ));
-                }
-            }
+            bound_bus = Some(super::bound_bus_name(
+                bt,
+                &format!("event-driven transactor `{name}`"),
+            )?);
         }
     }
     if let CompSource::Env(c)
@@ -540,7 +517,72 @@ pub(crate) fn lower_component_schema(
             ));
         }
         if c.bound_to.is_some() {
-            return Err(unsupported(&format!("a `bound to` clause on `{name}`"), ""));
+            // ONE label, after three wrong verdicts. v1 does three
+            // different things here, and the arm carries the worst.
+            //
+            // Measured, `agent Watcher bound to BusAxiLite` in eight
+            // cells — four handler shapes across the two instantiation
+            // positions, counting bare `bus` identifiers outside
+            // comments in v1's output:
+            //
+            //                                = bind    tb field
+            //   on <ev> driver                  0          4
+            //   on <bool-expr> cycle trigger    1          1
+            //   on N cycles + a bus write       1          1
+            //   on bus.<ch>.handshake(...)      1          1
+            //
+            // A `hookable` body behaves exactly like the `on <ev>`
+            // driver — 0 bare `bus` at a bind, 4 as a field — so the
+            // working column has two entries, not one. (v1 REFUSES the
+            // transactor spelling of that same program, "drives a DUT
+            // signal from the always-on body … spec §8.1"; the
+            // env/agent spelling bypasses that check.)
+            //
+            // `bus` is declared nowhere in the non-working cells, so
+            // g++ answers "'bus' was not declared in this scope".
+            //
+            // And a NINTH cell is worse than either: a
+            // `thread bus.<method>(...)` responder. v1 COMPILES that
+            // one — zero bare `bus` references — because it drops the
+            // responder coroutine entirely. Against
+            // `tlm_target_thread_if_test`, changing only the keyword
+            // `transactor` to `agent` deletes the whole
+            // `_target_read_target_slot` block (300 emitted lines to
+            // 242); the DUT's blocking read is then never answered and
+            // the test's own assertions fail at run time. All four
+            // declaration kinds emit byte-identically. That is
+            // `SilentlyMisLowers`, and it outranks the seven
+            // uncompilable cells.
+            //
+            // Two earlier versions tried to name the working cell with
+            // a predicate here. The first keyed on "is there a
+            // non-periodic `on bus.<ch>.handshake` handler", which
+            // misses a cycle trigger that reads the bus, a periodic
+            // handler that writes it, and — because `parse_on_handler`
+            // reads the trigger before the `cycles` decoration —
+            // `on bus.w.handshake(d) cycles`, the canonical broken
+            // shape wearing one extra word. The instantiation position
+            // IS knowable here (`lower_program` pre-scans every
+            // `TestItem::Let { bind: true }` before components lower,
+            // and already threads five whole-file pre-scans into this
+            // function), so an earlier note claiming otherwise was
+            // wrong — but a position split does not help either, since
+            // the `thread` cell is silent in BOTH columns.
+            //
+            // So: one label, the worst one, and a detail that names
+            // both the working cell and the silent one.
+            return Err(not_implemented(
+                &format!("a `bound to` clause on {} `{name}`", kind.keyword()),
+                "v1 does three different things with this clause. A \
+                 `thread bus.<method>(...)` responder COMPILES and is silently dropped — \
+                 the target never answers. An `on <ev>` handler body OR a `hookable` \
+                 body, on an instance bound at a `let x : C = bind <bus>` site, emits a \
+                 working driver. A cycle trigger, a periodic handler, an \
+                 `on bus.<ch>.handshake(...)` monitor, or either working shape \
+                 instantiated as a plain testbench field, emit `bus` verbatim into a \
+                 scope that declares no such name",
+                V1Status::SilentlyMisLowers,
+            ));
         }
     }
 
@@ -1258,9 +1300,18 @@ fn lower_field(
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
-        return Err(unsupported(
+        // The FIFTH copy of the `bound to` rule — the per-FIELD
+        // spelling on an env/agent/sequencer/transactor, sibling of the
+        // scoreboard one in `scoreboards.rs`. It was the last arm in
+        // the family still promising `--codegen v1`, and v1 discards
+        // the clause: with the bound and unbound sources padded to the
+        // SAME byte length (so no source-offset residue can explain
+        // it), v1's output is byte-identical.
+        return Err(not_implemented(
             &format!("a `bound to` clause on field `{comp}.{fname}`"),
-            "",
+            "v1 discards the clause — with the bound and unbound sources padded to equal \
+             length its output is byte-identical, so the binding silently does not happen",
+            V1Status::SilentlyMisLowers,
         ));
     }
     match &f.ty {
