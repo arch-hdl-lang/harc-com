@@ -5955,49 +5955,98 @@ case and only locally-determinable `Assign` types are compared).
     two missing checks, all localized. Reverting would have traded a
     small, identified residue for a larger diffuse one.
 
-97. **Seven `records.rs` arms, and six were false escape hatches
-    (2026-08-18).**
+97. **Seven `records.rs` arms — and the first two passes at them were
+    both wrong, in opposite directions (2026-08-18, corrected
+    2026-08-18).**
 
-    Every one said `Unsupported` — "re-run with `--codegen v1`". v1
-    emits for all seven, so a shallow probe would have confirmed them
-    all. Reading the emitted C++ says otherwise:
+    ~~Every one said `Unsupported` and six were false escape hatches.~~
+    Struck: two of those six reclassifications were themselves wrong,
+    and the leaf table below was wrong in both directions at once. The
+    corrected reading:
 
-    | construct | v1 emits | verdict |
+    | construct | v1 does | verdict |
     |---|---|---|
-    | `when` subtype in a transaction | `field addr u32 random=true` unconditionally; the guard `op == 1` appears NOWHERE | `SilentlyMisLowers` |
+    | `when` subtype in a transaction | emits `if (q.op == 1) { … q.addr = _val_addr; }` — the guard is honoured | a real escape hatch |
     | `when` subtype in a struct | a struct byte-identical to the same struct without the block — the field is gone | `SilentlyMisLowers` |
-    | `keep` in a struct | nothing; the expression appears zero times | `SilentlyMisLowers` |
+    | `keep` in a struct | `_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)))` — it reaches the solver | a real escape hatch |
     | `default` on a nested-record field | `Inner i = 0;` — "could not convert '0' from 'int' to 'Inner'" | `EmitsUncompilable` |
     | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same conversion error | `EmitsUncompilable` |
-    | `default 4'd3` | `uint64_t a = 3;` — folded correctly | a real escape hatch |
-    | `default 999…` | the literal verbatim; compiles with a warning, truncates | `SilentlyMisLowers` |
+    | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+    | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits into a 64-bit member; `-Woverflow`, truncates | `SilentlyMisLowers` |
 
-    The non-scalar-leaf arm is the interesting one, because it is a
-    single arm serving ten shapes that split two ways, and the split is
-    not the one the type name suggests:
+    **Both wrong verdicts were measured on a program that never
+    randomizes the record.** The `when` probe's run body was `wait 1
+    cycle`, so there was no solve site for a guard to appear in; what it
+    read instead — an unconditional `static void randomize_Req(Req*)` —
+    is only ever called from an OUTER record's randomize. The struct
+    `keep` probe checked for a randomize METADATA entry, which a struct
+    does not get, and concluded the constraint never reaches the solver;
+    the solver lambda emits it directly. `tests/fixtures/axi_agent.harc`
+    is a `when` subtype with `keep`s, and spec §714 / §2787 describe
+    when-subtypes as shipped, both of which would have contradicted the
+    verdict before any probe ran.
+
+    The sized-literal split was right about the outcomes and wrong about
+    the line: it tested `lit.contains('\'')`, but the width prefix is
+    not the value. `4'd3` folds to a correct `3` and
+    `128'hFFFFFFFFFFFFFFFFFFFF` folds to a `_harc_u128` composite the
+    64-bit member truncates. The guard now normalizes through
+    `cpp_tb::normalized_int_literal` — the same rewrite v1 folds with —
+    and asks whether the result fits.
+
+    The non-scalar-leaf arm is the one worth the space. It is a single
+    arm serving a dozen shapes that take THREE verdicts:
 
     | field type | v1 emits | |
     |---|---|---|
-    | `list<uint<8>>` | `std::vector<uint64_t>` + resize + per-element randomize + Z3 length vars | real |
-    | `Vec<uint, 4>` | `std::array<uint64_t, 4>` — a widthless `uint` is 64-bit, which TB-IR itself accepts outside a `Vec` | real |
-    | `Vec<uint<128>, 4>` | `std::array<_harc_u128, 4>` | real |
-    | `Vec<Vec<uint<8>, 2>, 4>` | `std::array<std::array<uint64_t, 2>, 4>` | real |
+    | `uint<65>` … `uint<256>` | `_harc_u128` / `harc_rt::HarcWide<n>`, with a matching pack, unpack and draw | real |
+    | `list<uint<8>>`, `list<sint<8>>`, `list<uint<256>>`, `list<bool>` | `std::vector<T>` + resize + per-element draw | real |
+    | `Vec<uint, 4>`, `Vec<uint<128>, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | real |
+    | `list<Vec<uint<8>, 2>>` | `std::vector<std::array<uint64_t, 2>>` and then `[_i] = 0` | **does not compile** |
+    | `list<Inner>`, `list<string>` | `std::vector<uint64_t>`, and randomize writes `// data : list (named, not yet supported)` | silent |
+    | `list<queue<uint<8>>>`, `list<event<T>>`, `list<int>`, `list<Vec<uint<8>, N>>` | `std::vector<uint64_t>` + `[_i] = 0` | silent |
     | `Vec<queue<uint<8>>, 4>` | `std::array<uint64_t, 4>` — the array survives, the element does not | silent |
-    | `Vec<string, 4>` | `uint64_t data = 0;` — the whole array collapses | silent |
-    | `Vec<uint<8>, N>` | `uint64_t data = 0;` — a non-literal length collapses it | silent |
-    | `queue` / `string` / `event` | a scalar | silent |
+    | `Vec<string, 4>`, `Vec<uint<8>, N>` | `uint64_t data = 0;` — the whole array collapses | silent |
+    | `queue` / `string` / `event` / `object` | a bare scalar | silent |
 
-    The first version of this classified the whole arm from a single
-    `queue` probe. That broke `the_escape_hatch_phrases_the_parity_gate_greps_are_stable`,
-    whose fixture is a `list<uint<8>>` — the one leaf type v1 genuinely
-    implements. The test caught a real regression rather than a stale
-    expectation, which is the difference between a test that pins
-    behaviour and one that pins a message.
+    Three versions of this arm got it wrong. A single `queue` probe
+    generalised to everything denied `list` its working hatch and broke
+    `the_escape_hatch_phrases_the_parity_gate_greps_are_stable`, whose
+    fixture is a `list<uint<8>>`. Then a hand-written copy of v1's type
+    rules called a 128-bit field a flattening — v1 gives it a correct
+    `_harc_u128` — while calling `list<Inner>` a working hatch, and it
+    was self-contradictory inside one file: the same `uint<128>` counted
+    as modelling when it was a `Vec` element and as flattening when it
+    was the leaf, thirty lines apart. Neither noticed the third outcome
+    at all.
 
-    `is_list_type` is now `pub(crate)` in `cpp_tb.rs` and shared rather
-    than paraphrased — the direct application of the previous entry's
-    lesson, which is that every place this codebase has written a type
-    predicate twice, the copies have drifted.
+    So the rules are not restated in the lowering any more.
+    `cpp_tb::record_leaf_fate` sits next to `txn_field_c_type` and
+    `emit_field_random` — the two functions that actually choose the
+    member and the draw — recurses through the same `list_elem_type` /
+    `fixed_vec_type_args` helpers, and returns
+    `Models` / `Flattens` / `Uncompilable`. `emit_field_random`'s
+    per-element draw was extracted into `list_elem_random_expr` so both
+    the emitter and the predicate read one copy of it; v1's output over
+    all 184 fixtures is byte-identical across that refactor.
+
+    The two consumers map the same fate differently, and that difference
+    is measured too: a scoreboard emits no `randomize_*` body, so the
+    leaf whose randomize body is what stops compiling keeps a correct
+    member there. `list<Vec<uint<8>, 2>>` is `EmitsUncompilable` as a
+    transaction field and a working escape hatch as a scoreboard field.
+
+    A zero-width leaf (`uint<0>`, `Vec<uint<0>, 4>`) is `Invalid`, not a
+    gap: v1 panics — `attempt to subtract with overflow` in
+    `emit_unpack_bits` — for any program that merely DECLARES the
+    record, so there is no configuration in which `--codegen v1` helps.
+    `Vec<uint<8>, 0>` is a zero-LENGTH array, a different thing, and
+    stays a suggestion v1 honours (`std::array<uint64_t, 0>`).
+
+    An unresolved type name (`data : Unknown`) stays `SilentlyMisLowers`
+    rather than becoming `Invalid`: v1 emits `int64_t data = 0;` and
+    runs it, and `Invalid` on this branch means no backend runs it in
+    any configuration.
 
 98. **Four `helpers.rs` arms, and the routing gate decided which
     probe even reached them (2026-08-18).**

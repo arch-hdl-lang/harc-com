@@ -26,6 +26,7 @@
 
 use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
+use crate::codegen::cpp_tb::RecordLeafFate;
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
 
@@ -300,10 +301,10 @@ fn scoreboard_field_kind(
     }
     let ty = scalar_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same
-        // predicate rather than a second copy of it: does v1 emit a
-        // CONTAINER for this type, or flatten it? Measured here too,
-        // because a scoreboard's supported set differs (a `queue<T>`
-        // IS a scoreboard field) even though the flatten rule does not:
+        // predicate rather than a second copy of it: what does v1 do
+        // with this leaf? Measured here too, because a scoreboard's
+        // supported set differs (a `queue<T>` IS a scoreboard field)
+        // even though the rule does not:
         //
         //   list<uint<8>>  ->  std::vector<uint64_t> l;   a real hatch
         //   string         ->  int64_t s;                 uninitialized
@@ -312,11 +313,19 @@ fn scoreboard_field_kind(
         // The two flattened forms compile and read indeterminate, which
         // is worse than not compiling and is why they lose the
         // suggestion.
+        //
+        // Only `Flattens` does, though. A scoreboard emits no
+        // `randomize_*` body, so the third fate — a container v1 keeps
+        // and then assigns `0` to — cannot arise on this path, and that
+        // leaf's MEMBER is correct, which is all a scoreboard field
+        // uses. Measured: `list<Vec<uint<8>, 2>>` gives
+        // `std::vector<std::array<uint64_t, 2>> l;` and compiles, while
+        // the same leaf in a transaction does not.
         const SUBSET: &str = "only scalar uint/sint/bits/bool fields up to 64 bits and \
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
-        if super::records::record_leaf_flattens(t) {
+        if crate::codegen::cpp_tb::record_leaf_fate(t) == RecordLeafFate::Flattens {
             return not_implemented(
                 &what,
                 format!(

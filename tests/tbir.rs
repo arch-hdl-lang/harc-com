@@ -3918,40 +3918,80 @@ end test MismatchCopyTest
     );
 }
 
-/// Every non-scalar record leaf, against what v1 emits for it. The arm
-/// serves ten shapes and they split two ways, so one probe cannot
-/// classify it — which is exactly how the first version of this work
-/// went wrong: a `queue` probe was generalised to the whole arm, which
-/// denied `list` its working escape hatch and broke the parity test.
+/// Every non-scalar record leaf, against what v1 emits for it — the
+/// member declaration AND, where it exists, the randomize body.
 ///
-/// The question is whether v1 emits a CONTAINER or flattens the field
-/// to a scalar. Rows one to four keep the `--codegen v1` suggestion;
-/// the rest are silent mis-lowerings that no backend gets right.
+/// The arm serves a dozen shapes and they split two ways, so one probe
+/// cannot classify it. Two rounds of this went wrong in opposite
+/// directions: a `queue` probe generalised to the whole arm denied
+/// `list` its working escape hatch, and then a hand-written copy of
+/// v1's type rules called a 128-bit field a flattening (v1 gives it a
+/// correct `_harc_u128`) while calling `list<Inner>` a working hatch
+/// (v1 gives it a `std::vector<uint64_t>` it never randomizes).
+///
+/// So each row carries the exact C++ v1 emits, and the verdict follows
+/// from that rather than from the type name. Both wrong versions redden
+/// here: the table is the measurement.
 #[test]
 fn a_non_scalar_record_leaf_is_classified_by_what_v1_emits_for_it() {
     let field = |ty: &str| {
         format!(
-            r#"struct Resp
+            r#"struct Inner
+    x : uint<8>
+end struct Inner
+
+transaction Resp
     data : {ty}
-end struct Resp
+end transaction Resp
 
 test T
     let dut : Top
     run
         let r : Resp
+        randomize(r)
         log(info, "x")
     end run
 end test T"#
         )
     };
-    // v1 emits a real container — a working escape hatch.
-    for (ty, shape) in [
-        ("list<uint<8>>", "std::vector<uint64_t> data"),
-        ("Vec<uint, 4>", "std::array<uint64_t, 4> data"),
-        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data"),
+    // v1 gives the leaf a member that means what was written AND a
+    // draw that fills it — a working escape hatch. A scalar row is
+    // width-correct at any width; a container row keeps its shape.
+    for (ty, shape, draw) in [
+        ("uint<65>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("uint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("sint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("bits<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("uint<200>", "harc_rt::HarcWide<7> data = 0;", "harc_rng_wide<7>"),
+        ("uint<256>", "harc_rt::HarcWide<8> data = 0;", "harc_rng_wide<8>"),
+        ("list<uint<8>>", "std::vector<uint64_t> data", "data[_i] = harc_rt::random::harc_rng_uint"),
+        (
+            "list<uint<256>>",
+            "std::vector<harc_rt::HarcWide<8>> data",
+            "data[_i] = harc_rt::random::harc_rng_wide<8>",
+        ),
+        ("list<bool>", "std::vector<bool> data", "data[_i] = harc_rt::random::harc_rng_range"),
+        (
+            "list<sint<8>>",
+            "std::vector<int64_t> data",
+            "data[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << 7), (1LL << 7) - 1)",
+        ),
+        (
+            "list<sint<64>>",
+            "std::vector<int64_t> data",
+            "data[_i] = harc_rt::random::harc_rng_uint(harc_rng_next, 64)",
+        ),
+        ("Vec<uint, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data", "data = {}"),
+        (
+            "Vec<uint<256>, 4>",
+            "std::array<harc_rt::HarcWide<8>, 4> data",
+            "data = {}",
+        ),
         (
             "Vec<Vec<uint<8>, 2>, 4>",
             "std::array<std::array<uint64_t, 2>, 4> data",
+            "data = {}",
         ),
     ] {
         let src = field(ty);
@@ -3962,16 +4002,43 @@ end test T"#
             v1.contains(shape),
             "`{ty}`: v1 must emit `{shape}` for the suggestion to be honest"
         );
+        assert!(v1.contains(draw), "`{ty}`: v1 must emit `{draw}`");
     }
-    // v1 flattens it to a scalar — the field means something else.
+    // v1 keeps the container but has no per-element draw for it, so the
+    // loop body is `[_i] = 0` into a `std::array` — the emitted C++
+    // does not compile, for any program that declares the record.
+    for ty in ["list<Vec<uint<8>, 2>>", "list<Vec<Vec<uint<8>, 2>, 2>>"] {
+        let src = field(ty);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(
+            v1.contains("std::vector<std::array<") && v1.contains("t->data[_i] = 0;"),
+            "`{ty}`: v1 assigns 0 into an array member: {v1}"
+        );
+    }
+    // v1 flattens it — the field means something else, and the program
+    // still compiles and runs. The `list` rows are the ones a
+    // non-recursive carve-out gets backwards.
     for (ty, shape) in [
         ("queue<uint<8>>", "uint64_t data = 0;"),
         ("string", "int64_t data = 0;"),
         ("event<uint<8>>", "uint64_t data = 0;"),
+        ("object", "int64_t data = 0;"),
         ("Vec<string, 4>", "uint64_t data = 0;"),
         ("Vec<uint<8>, N>", "uint64_t data = 0;"),
-        // The subtle one: the ARRAY survives, its element does not.
+        // The subtle ones: the CONTAINER survives, its element does not.
         ("Vec<queue<uint<8>>, 4>", "std::array<uint64_t, 4> data"),
+        ("list<Inner>", "std::vector<uint64_t> data"),
+        ("list<string>", "std::vector<uint64_t> data"),
+        ("list<queue<uint<8>>>", "std::vector<uint64_t> data"),
+        ("list<event<uint<8>>>", "std::vector<uint64_t> data"),
+        ("list<Vec<uint<8>, N>>", "std::vector<uint64_t> data"),
+        // `int` is 32-bit signed in HARC and 64-bit unsigned here, and
+        // `emit_field_random`'s list arm has no draw for it either.
+        ("list<int>", "std::vector<uint64_t> data"),
     ] {
         let src = field(ty);
         let msg = assert_not_implemented(
@@ -3982,46 +4049,106 @@ end test T"#
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains(shape), "`{ty}`: v1 flattens it to `{shape}`");
     }
+    // The flattening `list` rows lose their per-element draw one of two
+    // ways — a skipped field or a bare `0` — and the working ones keep
+    // it. That is the second half of the same rule.
+    for (ty, marker) in [
+        ("list<Inner>", "// data : list (named, not yet supported)"),
+        ("list<string>", "// data : list (named, not yet supported)"),
+        ("list<queue<uint<8>>>", "t->data[_i] = 0;"),
+        ("list<int>", "t->data[_i] = 0;"),
+    ] {
+        let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(marker), "`{ty}`: v1 emits `{marker}`");
+    }
 }
 
-/// The other five `records.rs` arms, each measured on its own.
+/// A zero-width record leaf is `Invalid`, not a gap: v1 PANICS on it
+/// (`attempt to subtract with overflow` in `emit_unpack_bits`) for any
+/// program that merely DECLARES the record, so there is no
+/// configuration in which `--codegen v1` helps. `Vec<uint<8>, 0>` is a
+/// zero-LENGTH array, which is a different thing and still lowers to a
+/// suggestion v1 honours.
+#[test]
+fn a_zero_width_record_leaf_is_invalid_because_v1_crashes_on_it() {
+    let field = |ty: &str| {
+        format!(
+            r#"struct Resp
+    data : {ty}
+end struct Resp
+
+test T
+    let dut : Top
+    run
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for ty in ["uint<0>", "sint<0>", "bits<0>", "Vec<uint<0>, 4>"] {
+        let err = lower_src(&field(ty)).unwrap_err();
+        let lower::LowerError::Invalid(msg) = &err else {
+            panic!("`{ty}` is Invalid, not `{err:?}`");
+        };
+        assert!(msg.contains("zero-width"), "`{ty}`: {msg}");
+        assert!(
+            std::panic::catch_unwind(|| cpp_tb::emit(&merged_src(&field(ty)))).is_err(),
+            "`{ty}`: v1 must be the thing that crashes, or this is not Invalid"
+        );
+    }
+    // The length, not the width — v1 emits `std::array<uint64_t, 0>`.
+    let src = field("Vec<uint<8>, 0>");
+    assert_unsupported(&lower_src(&src).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+    assert!(v1.contains("std::array<uint64_t, 0> data"), "{v1}");
+}
+
+/// The other `records.rs` arms, each measured on its own.
 ///
 /// | construct | v1 | verdict |
 /// |---|---|---|
-/// | `keep` in a struct | discards it — the expression appears nowhere | `SilentlyMisLowers` |
+/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
 /// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
 /// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
-/// | `default 4'd3` | folds to `uint64_t a = 3;` | a real escape hatch |
-/// | `default 999…` | the literal verbatim, truncated with a warning | `SilentlyMisLowers` |
+/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+/// | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits and truncates | `SilentlyMisLowers` |
+///
+/// The literal rows do not split on the apostrophe — the width prefix
+/// is not the value. `4'd3` folds to `3` and `128'hFF…` folds to a
+/// `_harc_u128` composite that the 64-bit member truncates, and an
+/// unsized decimal past `u64` does the same thing with a different
+/// diagnostic. The guard normalizes through `cpp_tb`'s own folder and
+/// asks whether the result fits.
 ///
 /// Compiled with `-std=gnu++20`, the standard `src/main.rs` passes.
 #[test]
 fn the_record_field_arms_split_on_measured_v1_behaviour() {
     let prog = |decls: &str| {
         format!(
-            "{decls}\ntest T\n    let dut : Top\n    run\n        log(info, \"x\")\n    \
-             end run\nend test T"
+            "{decls}\ntest T\n    let dut : Top\n    run\n        let r : Rec\n        \
+             randomize(r)\n        log(info, \"x\")\n    end run\nend test T"
         )
     };
 
-    // A `keep` on a struct is discarded — a struct carries no
-    // randomize metadata for it to reach.
+    // A `keep` on a struct DOES reach the solver — the absence of a
+    // randomize metadata entry, which is what the first pass measured,
+    // says nothing about the generated solver lambda.
     let keep = prog("struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n");
-    assert_not_implemented(
-        &lower_src(&keep).unwrap_err(),
-        lower::V1Status::SilentlyMisLowers,
-    );
+    assert_unsupported(&lower_src(&keep).unwrap_err());
     let v1 = cpp_tb::emit(&merged_src(&keep)).expect("v1 emits");
-    assert!(!v1.contains("a < 10"), "v1 discards the constraint: {v1}");
+    assert!(
+        v1.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
+        "v1 emits the constraint into the solver: {v1}"
+    );
 
     // Both `default` shapes make v1 emit an initializer g++ rejects.
     for (decls, needle) in [
         (
-            "struct Inner\n    x : uint<8>\nend struct Inner\n\nstruct Outer\n    i : Inner default 0\nend struct Outer\n",
+            "struct Inner\n    x : uint<8>\nend struct Inner\n\nstruct Rec\n    i : Inner default 0\nend struct Rec\n",
             "Inner i = 0;",
         ),
         (
-            "struct VecRec\n    v : Vec<uint<8>, 4> default 0\nend struct VecRec\n",
+            "struct Rec\n    v : Vec<uint<8>, 4> default 0\nend struct Rec\n",
             "std::array<uint64_t, 4> v = 0;",
         ),
     ] {
@@ -4034,25 +4161,47 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         assert!(v1.contains(needle), "v1 emits `{needle}`: {v1}");
     }
 
-    // The literal-default arm splits like every other one, and was
-    // probed on its own rather than assumed from the coverpoint and
-    // bin-spec versions of the same question.
-    let sized = prog("struct SzRec\n    a : uint<8> default 4'd3\nend struct SzRec\n");
-    assert_unsupported(&lower_src(&sized).unwrap_err());
-    let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
-    assert!(v1.contains("uint64_t a = 3;"), "v1 folds `4'd3`: {v1}");
-
-    let wide =
-        prog("struct BigRec\n    a : uint<8> default 99999999999999999999999\nend struct BigRec\n");
-    assert_not_implemented(
-        &lower_src(&wide).unwrap_err(),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits");
-    assert!(
-        v1.contains("uint64_t a = 99999999999999999999999;"),
-        "v1 pastes the over-wide literal in: {v1}"
-    );
+    // A literal whose VALUE fits the 64-bit member folds correctly,
+    // whatever its spelling — a real escape hatch.
+    for (lit, folded) in [
+        ("4'd3", "uint64_t a = 3;"),
+        ("8'hFF", "uint64_t a = 0xFF;"),
+        ("4'b1010", "uint64_t a = 0b1010;"),
+    ] {
+        let src = prog(&format!(
+            "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
+        ));
+        assert_unsupported(&lower_src(&src).unwrap_err());
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+    }
+    // One that does not fit truncates into the member with only a
+    // warning — and a SIZED literal is on this side of the line too,
+    // which is what splitting on the apostrophe got wrong.
+    for (lit, folded) in [
+        (
+            "128'hFFFFFFFFFFFFFFFFFFFF",
+            "uint64_t a = (((_harc_u128)0xFFFFULL << 64) | (_harc_u128)0xFFFFFFFFFFFFFFFFULL);",
+        ),
+        (
+            "0xFFFFFFFFFFFFFFFFF",
+            "uint64_t a = (((_harc_u128)0xFULL << 64) | (_harc_u128)0xFFFFFFFFFFFFFFFFULL);",
+        ),
+        (
+            "99999999999999999999999",
+            "uint64_t a = 99999999999999999999999;",
+        ),
+    ] {
+        let src = prog(&format!(
+            "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
+        ));
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+    }
 }
 
 /// The `scoreboards.rs` arms, measured against v1's emitted struct.
@@ -4063,7 +4212,8 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
 /// | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
 /// | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
 /// | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
-/// | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+/// | `list<uint<8>>` / `uint<128>` field | `std::vector<uint64_t> l;` / `_harc_u128 l;` | a real escape hatch |
+/// | `list<Vec<uint<8>, 2>>` field | `std::vector<std::array<uint64_t, 2>> l;` | likewise — no randomize body to break |
 /// | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
 ///
 /// The `bound to` rows are the load-bearing measurement: "v1 emits" is
@@ -4150,16 +4300,28 @@ end impl T"#
         "v1 emits an initializer `HarcQueue` has no constructor for"
     );
 
-    // The field-type arm splits exactly like the record one, through
-    // the SAME predicate rather than a second copy of it.
-    let list = prog("scoreboard Sb\n    l : list<uint<8>>\nend scoreboard Sb");
-    assert_unsupported(&lower_src(&list).unwrap_err());
-    assert!(
-        cpp_tb::emit(&merged_src(&list))
-            .expect("v1 emits")
-            .contains("std::vector<uint64_t> l;"),
-        "v1 models a `list` properly, which is what keeps the suggestion honest"
-    );
+    // The field-type arm asks the SAME predicate as the record one
+    // rather than a second copy of it — but maps its third outcome
+    // differently, and that difference is measured, not assumed. A
+    // scoreboard emits no randomize body, so the leaf whose randomize
+    // body is what stops compiling keeps a correct member here.
+    for (ty, shape) in [
+        ("list<uint<8>>", "std::vector<uint64_t> l;"),
+        ("uint<128>", "_harc_u128 l;"),
+        (
+            "list<Vec<uint<8>, 2>>",
+            "std::vector<std::array<uint64_t, 2>> l;",
+        ),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
+        );
+    }
     for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {
         let src = prog(&format!("scoreboard Sb\n    s : {ty}\nend scoreboard Sb"));
         assert_not_implemented(
@@ -4303,46 +4465,74 @@ end impl T"#;
     );
 }
 
-/// `when` subtype blocks stay outside the lowered record shape — and
-/// v1 does not implement them either, so this is not an escape hatch.
+/// `when` subtype blocks stay outside the lowered record shape, and the
+/// two spellings do NOT share a verdict.
 ///
-/// Measured: with `when op == 1 { addr }`, v1's randomize metadata
-/// carries `field addr u32 random=true` UNCONDITIONALLY and the guard
-/// `op == 1` appears nowhere in the emitted C++. It randomizes the
-/// conditional field on every draw whatever the discriminant says, and
-/// the program compiles and runs. In a struct it is worse: the
-/// conditional field is dropped from the C++ struct entirely, so the
-/// declaration silently loses it.
+/// In a transaction it is a real escape hatch: v1 implements the
+/// subtype, guard included. The measurement that said otherwise ran on
+/// a program whose run body was `wait 1 cycle` — with no `randomize`
+/// there is no solve site for a guard to appear in, and the
+/// unconditional `static void randomize_Req(Req*)` it read instead is
+/// only ever called from an OUTER record's randomize.
+///
+/// In a struct the field really is dropped: the emitted struct is
+/// byte-identical to the same struct without the block, even with
+/// `randomize` present.
 #[test]
 fn record_when_subtype_is_unsupported() {
-    let src = r#"
-transaction Req
-    op : uint<2>
-    when op == 1
-        addr : uint<32>
-    end when
-end transaction Req
+    let prog = |decl: &str, kind: &str| {
+        format!(
+            r#"{decl}
 
 test WhenTest
     let dut : Top
     run
-        wait 1 cycle
+        let q : {kind}
+        randomize(q)
+        log(info, "x")
     end run
 end test WhenTest
-"#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+"#
+        )
+    };
+    let txn = prog(
+        "transaction Req\n    op : uint<2>\n    when op == 1\n        addr : uint<32>\n    \
+         end when\nend transaction Req",
+        "Req",
+    );
+    let msg = assert_unsupported(&lower_src(&txn).unwrap_err());
     assert!(msg.contains("`when` subtype"), "names the construct: {msg}");
-    // The evidence for that verdict, asserted rather than described:
-    // the guard is gone and the conditional field is randomized anyway.
-    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    // The evidence for THAT verdict: v1 emits the guard and gates the
+    // conditional field's assignment on it.
+    let v1 = cpp_tb::emit(&merged_src(&txn)).expect("v1 emits");
     assert!(
-        !v1.contains("op == 1"),
-        "v1 drops the subtype guard entirely: {v1}"
+        v1.contains("if (q.op == 1) {   // active when-subtype field addr"),
+        "v1 emits the subtype guard: {v1}"
     );
     assert!(
-        v1.contains("field addr u32 random=true"),
-        "…and randomizes the conditional field unconditionally"
+        v1.contains("q.addr = _val_addr;"),
+        "…and assigns the conditional field only under it: {v1}"
+    );
+
+    // The struct spelling loses the field, which no `--codegen v1` run
+    // recovers. Diffing against the control is the whole measurement.
+    let st = prog(
+        "struct Rec\n    a : uint<8>\n    when a == 1\n        b : uint<8>\n    end when\n\
+         end struct Rec",
+        "Rec",
+    );
+    let ctl = prog("struct Rec\n    a : uint<8>\nend struct Rec", "Rec");
+    assert_not_implemented(
+        &lower_src(&st).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let with_when = cpp_tb::emit(&merged_src(&st)).expect("v1 emits");
+    let without = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+    let structs = |src: &str| src.split("struct Rec {").nth(1).unwrap_or("")[..80].to_string();
+    assert_eq!(
+        structs(&with_when),
+        structs(&without),
+        "the conditional field is gone from v1's struct"
     );
 }
 

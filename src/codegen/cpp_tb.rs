@@ -12928,56 +12928,10 @@ impl Emitter {
                 f.name.name
             )
             .ok();
-            let elem_ty = list_elem_type(&f.ty);
-            match elem_ty {
-                Some(TypeExpr::Builtin { name, args, .. }) => match name {
-                    BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
-                        let w = type_arg_width(args).unwrap_or(32);
-                        writeln!(
-                            self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = {};",
-                            f.name.name,
-                            emit_random_unsigned_expr(w)
-                        )
-                        .ok();
-                    }
-                    BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                        let w = type_arg_width(args).unwrap_or(32);
-                        if w < 63 {
-                            writeln!(
-                                self.out,
-                                "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1);",
-                                f.name.name,
-                                w.saturating_sub(1),
-                                w.saturating_sub(1)
-                            )
-                            .ok();
-                        } else {
-                            writeln!(
-                                self.out,
-                                "{INDENT}{INDENT}t->{}[_i] = {};",
-                                f.name.name,
-                                emit_random_unsigned_expr(w)
-                            )
-                            .ok();
-                        }
-                    }
-                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                        writeln!(
-                            self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, 0, 1);",
-                            f.name.name
-                        )
-                        .ok();
-                    }
-                    _ => {
-                        writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
-                    }
-                },
-                _ => {
-                    writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
-                }
-            }
+            let draw = list_elem_type(&f.ty)
+                .and_then(list_elem_random_expr)
+                .unwrap_or_else(|| "0".to_string());
+            writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = {draw};", f.name.name).ok();
             writeln!(self.out, "{INDENT}}}").ok();
             return;
         }
@@ -19640,19 +19594,14 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     })
 }
 
-pub(crate) fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {
+fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {
     match t {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
     }
 }
 
-/// `list<T>`, the one non-scalar record leaf v1 genuinely implements
-/// (`std::vector<T>` + per-element randomization + Z3 length vars).
-/// `pub(crate)` so the TB-IR lowering can ask the same question rather
-/// than writing a fourth copy of the rule — every place this codebase
-/// has paraphrased a type predicate instead of sharing it has drifted.
-pub(crate) fn is_list_type(t: &TypeExpr) -> bool {
+fn is_list_type(t: &TypeExpr) -> bool {
     matches!(named_type_last_segment(t), Some("list") | Some("List"))
 }
 
@@ -19774,17 +19723,137 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
         return format!("std::array<{inner}, {len}>");
     }
     match t {
-        TypeExpr::Builtin { name, args, .. } => match name {
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-                cpp_uint_for_width(int_width_from_args(args))
-            }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)),
-            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
-            _ => "uint64_t".into(),
-        },
+        TypeExpr::Builtin { name, args, .. } => {
+            scalar_leaf_c_type(name, args).unwrap_or_else(|| "uint64_t".into())
+        }
         // Enums (and other named user types) lower to int64_t. Real type
         // emission lands when we have a proper type system.
         TypeExpr::Named { .. } => "int64_t".into(),
+    }
+}
+
+/// The builtin leaves this backend gives a real, width-correct C++ value
+/// type. `txn_field_c_type` is the only caller that picks a member type,
+/// and everything NOT matched here falls through its `_ =>` arms to a
+/// bare `uint64_t` / `int64_t` — a member that does not mean what was
+/// written. Splitting the decision out is what lets
+/// `record_leaf_models` ask the question instead of restating it.
+fn scalar_leaf_c_type(name: &BuiltinTy, args: &[TypeArg]) -> Option<String> {
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
+            Some(cpp_uint_for_width(int_width_from_args(args)))
+        }
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(cpp_sint_for_width(int_width_from_args(args))),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some("bool".into()),
+        _ => None,
+    }
+}
+
+/// The per-element random draw `emit_field_random` writes inside a
+/// `list<T>` loop, or `None` when this backend has none for `T` and
+/// writes a bare `t->f[_i] = 0;` instead.
+///
+/// A `None` here is not merely a weak draw. The member is
+/// `std::vector<T'>` for whatever `T'` `txn_field_c_type` picked, and
+/// `= 0` only compiles when `T'` is a scalar — for
+/// `list<Vec<uint<8>, 2>>` it is `std::array<uint64_t, 2>` and g++
+/// rejects the assignment, for EVERY program that declares the record.
+/// `record_leaf_fate` asks this rather than restating the arm.
+fn list_elem_random_expr(elem: &TypeExpr) -> Option<String> {
+    let TypeExpr::Builtin { name, args, .. } = elem else {
+        return None;
+    };
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(emit_random_unsigned_expr(
+            type_arg_width(args).unwrap_or(32),
+        )),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => {
+            let w = type_arg_width(args).unwrap_or(32);
+            Some(if w < 63 {
+                format!(
+                    "harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1)",
+                    w.saturating_sub(1),
+                    w.saturating_sub(1)
+                )
+            } else {
+                emit_random_unsigned_expr(w)
+            })
+        }
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
+            Some("harc_rt::random::harc_rng_range(harc_rng_next, 0, 1)".into())
+        }
+        _ => None,
+    }
+}
+
+/// What this backend does with a record-field leaf it is handed.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum RecordLeafFate {
+    /// The member means what was written, at any width.
+    Models,
+    /// The member is a bare scalar — the field silently means something
+    /// else, and the program still compiles and runs.
+    Flattens,
+    /// The member keeps its container shape but the randomize body then
+    /// assigns `0` to it; the emitted C++ does not compile.
+    Uncompilable,
+}
+
+/// What this backend does with a record-field leaf — the whole basis on
+/// which the TB-IR lowering decides whether its rejection may suggest
+/// `--codegen v1`.
+///
+/// TB-IR lowers a narrower record subset than this backend does, so a
+/// rejection for a leaf outside that subset has to say which of three
+/// things is true, and none of them is a property of the type NAME:
+///
+///   * `list<T>` → `std::vector<T'>`, and `emit_field_random` draws the
+///     element only for a scalar `T`. A `T` that models as a CONTAINER
+///     keeps its `std::vector<std::array<…>>` member and then gets
+///     `[_i] = 0`, which does not compile; any other undrawn `T` gets a
+///     `uint64_t` element, which does.
+///   * `Vec<T, N>` → `std::array<T', N>`, but only when
+///     `fixed_vec_type_args` reads it — a non-literal `N` or an element
+///     it cannot type collapses the whole member. There is no
+///     per-element assignment on this path, so it cannot go
+///     uncompilable.
+///   * a scalar → a width-correct type at ANY width, including
+///     `_harc_u128` above 64 bits and `HarcWide<n>` above 128.
+///   * everything else (`queue`, `string`, `event`, `object`, an
+///     unresolved name) → a bare scalar.
+///
+/// Consulted by the TB-IR lowering (`ir::lower::records`). Writing a
+/// second copy of these rules there is what produced divergence 97's
+/// first version, which called a 128-bit field a flattening and a
+/// `list<Inner>` a working escape hatch — both backwards.
+pub(crate) fn record_leaf_fate(t: &TypeExpr) -> RecordLeafFate {
+    if is_list_type(t) {
+        let Some(elem) = list_elem_type(t) else {
+            return RecordLeafFate::Flattens;
+        };
+        if list_elem_random_expr(elem).is_some() {
+            return RecordLeafFate::Models;
+        }
+        // No draw: the loop body is `t->f[_i] = 0;`. Whether that
+        // compiles is decided by the element type this backend picked,
+        // so ask it rather than guess which HARC types are containers.
+        let elem_c = txn_field_c_type(elem);
+        if elem_c.starts_with("std::vector<") || elem_c.starts_with("std::array<") {
+            return RecordLeafFate::Uncompilable;
+        }
+        return RecordLeafFate::Flattens;
+    }
+    if let Some((elem, _)) = fixed_vec_type_args(t) {
+        return match record_leaf_fate(elem) {
+            RecordLeafFate::Models => RecordLeafFate::Models,
+            _ => RecordLeafFate::Flattens,
+        };
+    }
+    match t {
+        TypeExpr::Builtin { name, args, .. } if scalar_leaf_c_type(name, args).is_some() => {
+            RecordLeafFate::Models
+        }
+        _ => RecordLeafFate::Flattens,
     }
 }
 
@@ -22033,10 +22102,18 @@ fn c_int_literal_from(k: &ExprKind) -> String {
     }
 }
 
-fn c_int_literal(s: &str) -> String {
-    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`. Then the
-    // unsized-literal post-pass below catches any >64-bit cases.
-    let normalized = if let Some(idx) = s.find('\'') {
+/// An ARCH-style sized literal (`8'hAB`, `4'd3`, `1'b1`) rewritten as
+/// the plain C++ spelling this backend folds it to (`0xAB`, `3`, `0b1`)
+/// — width prefix dropped, base letter turned into a C prefix,
+/// underscores stripped. An unsized literal only loses its underscores.
+///
+/// `pub(crate)` because the width prefix is NOT the value: `4'd3` folds
+/// to a correct `3`, while `128'hFF..FF` folds to a 128-bit composite
+/// that a 64-bit member truncates. The TB-IR lowering classifies a
+/// default it cannot read by asking what this produces and whether the
+/// result fits, rather than by splitting on the apostrophe.
+pub(crate) fn normalized_int_literal(s: &str) -> String {
+    if let Some(idx) = s.find('\'') {
         let (_, tail) = s.split_at(idx + 1);
         let kind = tail.chars().next().unwrap_or('d');
         let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
@@ -22047,7 +22124,13 @@ fn c_int_literal(s: &str) -> String {
         }
     } else {
         s.replace('_', "")
-    };
+    }
+}
+
+fn c_int_literal(s: &str) -> String {
+    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`. Then the
+    // unsized-literal post-pass below catches any >64-bit cases.
+    let normalized = normalized_int_literal(s);
 
     // Hex literals wider than 64 bits (>16 hex digits) overflow C++'s
     // unsigned long long. Lower as a composite `_harc_u128` shifted-OR
