@@ -19669,3 +19669,127 @@ fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
     let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
     assert!(used < lt, "the `let` is emitted after the use");
 }
+
+/// Two bound-to instance arms each answered BOTH ways of getting the
+/// mode annotation wrong with one `Unsupported`, and v1 answers them
+/// very differently.
+///
+/// | instance | v1 |
+/// |---|---|
+/// | no annotation at all | refuses: "transactor instantiation requires a mode annotation" |
+/// | initiator BFM declared `passive` | emits, byte-identical to the `active` program |
+/// | target responder declared `active` | emits, byte-identical to the `passive` program |
+///
+/// So a missing annotation is a program error under both backends, and
+/// the WRONG annotation is v1 dropping it — the user asks for a passive
+/// instance and gets a driver, or asks for an active responder and gets
+/// a passive one, with nothing said either way.
+///
+/// The anti-vacuity check matters here, because "byte-identical" could
+/// mean v1 has no notion of mode at all: for a transactor that HAS both
+/// halves, flipping the mode changes 67 lines of v1's output. It is
+/// specifically the hookable-only and thread-only shapes whose
+/// annotation v1 drops.
+///
+/// The two cases are told apart by the AST exactly — `mode: None`
+/// versus `mode: Some(wrong)` — so this is a split on the real
+/// distinction rather than a shape heuristic.
+#[test]
+fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
+    // The stdlib-bus fixtures need the bus decl merged in, exactly as
+    // `lower_with_stdlib_bus` does for a fixture NAME — these take a
+    // modified source string instead.
+    let with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch");
+        let bus_src = std::fs::read_to_string(&bus_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
+        let b = parse_source(&bus_src).expect("stdlib bus parses");
+        merge::merge_for_sim(vec![f, b], None).expect("merge")
+    };
+    let lower_bus = |src: &str| lower::lower_program(&with_bus(src));
+
+    // Initiator BFM: `active` is required.
+    let bfm = fixture("regblock_basic_test.harc");
+    const BFM_LET: &str = "let helper : AxilHelper active = bind axil";
+    assert!(bfm.contains(BFM_LET), "fixture shape changed");
+    lower_bus(&bfm).expect("the `active` control lowers");
+
+    // Target responder: `passive` is required.
+    let tgt = fixture("tlm_target_thread_if_test.harc");
+    const TGT_LET: &str = "let target : TlmMemTarget passive = bind mem";
+    assert!(tgt.contains(TGT_LET), "fixture shape changed");
+    lower_src(&tgt).expect("the `passive` control lowers");
+
+    // No annotation: `Invalid` at both sites, and v1 refuses too.
+    for (what, src, v1_lower) in [
+        (
+            "initiator BFM",
+            bfm.replacen(BFM_LET, "let helper : AxilHelper = bind axil", 1),
+            true,
+        ),
+        (
+            "target responder",
+            tgt.replacen(TGT_LET, "let target : TlmMemTarget = bind mem", 1),
+            false,
+        ),
+    ] {
+        let err = if v1_lower {
+            lower_bus(&src).unwrap_err()
+        } else {
+            lower_src(&src).unwrap_err()
+        };
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("needs an `active`/`passive` mode annotation"),
+            "{what}: {msg}"
+        );
+    }
+
+    // The WRONG annotation: v1 takes it and drops it.
+    let bfm_passive = bfm.replacen(BFM_LET, "let helper : AxilHelper passive = bind axil", 1);
+    let msg = assert_not_implemented(
+        &lower_bus(&bfm_passive).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("initiator-BFM instance") && msg.contains("declared `passive`"),
+        "{msg}"
+    );
+
+    let tgt_active = tgt.replacen(TGT_LET, "let target : TlmMemTarget active = bind mem", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&tgt_active).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("target-TLM responder instance") && msg.contains("declared `active`"),
+        "{msg}"
+    );
+
+    // And the measurement the status rests on, for the site whose
+    // fixture needs no stdlib bus: v1 emits the wrong-mode program
+    // byte-identically to the right-mode one.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&tgt_active)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&tgt)).expect("v1 emits"),
+        "v1 drops the mode annotation on a target responder"
+    );
+
+    // Anti-vacuity: v1 does honour the mode where it means something.
+    let both_halves = fixture("axilite_bound_mon_test.harc");
+    const MON: &str = "let mon  : AxilXactor passive = bind axil";
+    assert!(both_halves.contains(MON), "fixture shape changed");
+    assert_ne!(
+        cpp_tb::emit(&with_bus(&both_halves)).expect("v1 emits"),
+        cpp_tb::emit(&with_bus(&both_halves.replacen(
+            MON,
+            &MON.replace("passive", "active"),
+            1
+        )))
+        .expect("v1 emits"),
+        "for a transactor with both halves the mode must change v1's output"
+    );
+}

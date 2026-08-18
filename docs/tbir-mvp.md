@@ -4997,6 +4997,39 @@ case and only locally-determinable `Assign` types are compared).
     read as the same sentence as three arms already measured in another
     file. The measurement then took one probe rather than a batch.
 
+76. **A missing mode annotation and a wrong one are not the same
+    failure (2026-08-18).**
+
+    Two bound-to instance arms — the initiator BFM, which must be
+    `active`, and the target-TLM responder, which must be `passive` —
+    each answered BOTH ways of getting the annotation wrong with one
+    `Unsupported`. v1 answers them very differently:
+
+    | instance | v1 |
+    |---|---|
+    | no annotation at all | refuses: "let helper: transactor instantiation requires a mode annotation (`AxilHelper active` or `AxilHelper passive`)" |
+    | initiator BFM declared `passive` | emits, byte-identical to the `active` program |
+    | target responder declared `active` | emits, byte-identical to the `passive` program |
+
+    A missing annotation is a program error under both backends, so
+    `Invalid` and no suggestion. The WRONG annotation is v1 dropping it:
+    the user asks for a passive instance and gets one that drives the
+    bus, or asks for an active responder and gets a passive one, with
+    nothing said either way. That is `SilentlyMisLowers`.
+
+    "Byte-identical" needs its anti-vacuity check here, because it could
+    just mean v1 has no notion of mode: for a transactor that HAS both
+    halves — `axilite_bound_mon_test`'s `AxilXactor`, an active driver
+    plus an always-on monitor — flipping the instance's mode changes 67
+    lines of v1's output. It is specifically the hookable-only and
+    thread-only shapes whose annotation v1 drops.
+
+    The split is on `mode: None` versus `mode: Some(wrong)` in the AST,
+    which is the exact distinction rather than a proxy for it. That
+    matters because the sweep has twice tried to split an arm on
+    something that merely correlated with the discriminator, and both
+    times the split was backwards.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

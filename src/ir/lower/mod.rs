@@ -2877,19 +2877,49 @@ fn lower_test(
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
                 // The BFM host must be `active` — its methods are
                 // test-called (via the regblock frontdoor or directly).
+                //
+                // One arm used to answer both ways of failing that, and
+                // v1 answers them very differently:
+                //
+                //   * NO mode annotation — v1 refuses too, with "let
+                //     helper: transactor instantiation requires a mode
+                //     annotation (`AxilHelper active` or `AxilHelper
+                //     passive`)". A program error under both backends.
+                //   * `passive` — v1 ACCEPTS it and emits output
+                //     byte-identical to the `active` program. It
+                //     ignores the mode entirely, so the user asks for a
+                //     passive instance and gets a driver. (Anti-vacuity:
+                //     for a transactor that HAS both halves the mode
+                //     changes 67 lines of v1's output, so this is v1
+                //     dropping the annotation for a hookable-only
+                //     transactor, not v1 having no notion of mode.)
+                //
+                // The two are told apart by the AST exactly — `None`
+                // versus `Some(wrong)` — so this is a split on the real
+                // distinction, not a shape heuristic.
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
                         ..
                     }) => {}
+                    Some(TypeExpr::Named { mode: None, .. }) | None => {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `let {} : {simple}` needs an \
+                             `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
+                    }
                     _ => {
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
-                                "initiator-BFM instance `let {} : {simple}` must be declared \
-                                 `active`",
+                                "initiator-BFM instance `let {} : {simple}` declared \
+                                 `passive`",
                                 l.name.name
                             ),
-                            "its hookable methods are test-called, not request-served",
+                            "its hookable methods are test-called, not request-served; v1 \
+                             drops the annotation and emits the same code it emits for \
+                             `active`, so the instance drives the bus anyway",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                 }
@@ -3051,20 +3081,36 @@ fn lower_test(
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
                 // The responder host must be `passive` — its methods are
-                // request-served, never test-called.
+                // request-served, never test-called. Split for the same
+                // reason as the initiator-BFM arm above, and measured
+                // the same way: with no annotation v1 refuses ("let
+                // target: transactor instantiation requires a mode
+                // annotation"); with `active` it emits output
+                // byte-identical to the `passive` program, dropping the
+                // annotation.
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Passive),
                         ..
                     }) => {}
+                    Some(TypeExpr::Named { mode: None, .. }) | None => {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `let {} : {simple}` needs an \
+                             `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
+                    }
                     _ => {
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
-                                "target-TLM responder instance `let {} : {simple}` must be \
-                                 declared `passive`",
+                                "target-TLM responder instance `let {} : {simple}` declared \
+                                 `active`",
                                 l.name.name
                             ),
-                            "the responder serves bus requests; its methods are not test-called",
+                            "the responder serves bus requests; its methods are not \
+                             test-called, and v1 drops the annotation and emits the same \
+                             code it emits for `passive`",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                 }
