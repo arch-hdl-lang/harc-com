@@ -1045,7 +1045,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
     for it in record_order {
         let schema = match it {
-            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?,
+            Item::Transaction(t) => {
+                records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?
+            }
             Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids, &const_vals)?,
             _ => unreachable!("record_order holds only transactions and structs"),
         };
@@ -1164,7 +1166,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // A pure analysis-source transactor (event port + no DUT
             // field) routes to the composite-component table instead of
             // the DUT-poking `TransactorSchema` (classified below).
-            if components::transactor_is_component(t, env_held(t)) {
+            if components::transactor_is_component(t, env_held(t), &record_ids) {
                 continue;
             }
             if transactor_ids
@@ -1224,7 +1226,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 Some(c.name.name.clone())
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -1246,7 +1250,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .filter_map(|it| match it {
             Item::Transactor(t)
-                if components::transactor_has_mode_sensitive_analysis_surface(t) =>
+                if components::transactor_has_mode_sensitive_analysis_surface(t, &record_ids) =>
             {
                 Some(t.name.name.clone())
             }
@@ -1263,8 +1267,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .filter_map(|it| match it {
             Item::Transactor(t)
-                if components::transactor_is_analysis_source(t)
-                    && !components::transactor_has_mode_sensitive_analysis_surface(t) =>
+                if components::transactor_is_analysis_source(t, &record_ids)
+                    && !components::transactor_has_mode_sensitive_analysis_surface(
+                        t,
+                        &record_ids,
+                    ) =>
             {
                 Some(t.name.name.clone())
             }
@@ -1280,7 +1287,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             _ => None,
@@ -1720,7 +1729,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
-        if components::transactor_is_component(t, env_held(t)) {
+        if components::transactor_is_component(t, env_held(t), &record_ids) {
             continue;
         }
         let id = TransactorId(prog.transactors.len() as u32);
@@ -1757,7 +1766,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 (&c.name.name, components::CompSource::Scoreboard(c))
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 (&t.name.name, components::CompSource::Transactor(t))
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -6763,9 +6774,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
             ir::Expr::BitSlice { target, .. } => in_expr(target),
-            ir::Expr::BitSliceDyn { target, hi, lo } => {
-                in_expr(target).or_else(|| in_expr(hi)).or_else(|| in_expr(lo))
-            }
+            ir::Expr::BitSliceDyn { target, hi, lo } => in_expr(target)
+                .or_else(|| in_expr(hi))
+                .or_else(|| in_expr(lo)),
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.
