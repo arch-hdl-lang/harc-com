@@ -4634,14 +4634,25 @@ end test T"#
     }
 }
 
-/// A zero-width record leaf is `Invalid`, not a gap: v1 PANICS on it
-/// (`attempt to subtract with overflow` in `emit_unpack_bits`) for any
-/// program that merely DECLARES the record, so there is no
-/// configuration in which `--codegen v1` helps. `Vec<uint<8>, 0>` is a
-/// zero-LENGTH array, which is a different thing and still lowers to a
-/// suggestion v1 honours.
+/// A zero-width record leaf, and the build profile that decides it.
+///
+/// This arm was `Invalid` on the grounds that v1 PANICS on it —
+/// "attempt to subtract with overflow" in `emit_unpack_bits`. That
+/// panic is a DEBUG-build artifact: Rust turns integer overflow checks
+/// off under `--release`, which is how CI builds and how the `harc`
+/// binary ships. CI caught it; no amount of debug-profile `cargo test`
+/// could have.
+///
+/// In release v1 emits a complete testbench that compiles clean, with
+/// the zero-width field as a full 64-bit member packed at width 0 — it
+/// carries no bits and nothing says so. `Invalid` claims no backend
+/// runs it in ANY configuration, and a release-built v1 runs it.
+///
+/// The assertions hold in BOTH profiles: the verdict is
+/// profile-independent, and the emitted evidence is checked only where
+/// v1 got far enough to produce it.
 #[test]
-fn a_zero_width_record_leaf_is_invalid_because_v1_crashes_on_it() {
+fn a_zero_width_record_leaf_is_a_silent_mis_lowering_in_the_shipped_profile() {
     let field = |ty: &str| {
         format!(
             r#"struct Resp
@@ -4656,27 +4667,40 @@ test T
 end test T"#
         )
     };
-    for ty in ["uint<0>", "sint<0>", "bits<0>", "Vec<uint<0>, 4>"] {
-        let err = lower_src(&field(ty)).unwrap_err();
-        let lower::LowerError::Invalid(msg) = &err else {
-            panic!("`{ty}` is Invalid, not `{err:?}`");
-        };
-        assert!(msg.contains("zero-width"), "`{ty}`: {msg}");
-        assert!(
-            std::panic::catch_unwind(|| cpp_tb::emit(&merged_src(&field(ty)))).is_err(),
-            "`{ty}`: v1 must be the thing that crashes, or this is not Invalid"
+    for (ty, member) in [
+        ("uint<0>", "uint64_t data = 0;"),
+        ("sint<0>", "int64_t data = 0;"),
+        ("bits<0>", "uint64_t data = 0;"),
+        ("Vec<uint<0>, 4>", "std::array<uint64_t, 4> data = {};"),
+    ] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
         );
+        assert!(msg.contains("zero-width"), "`{ty}`: {msg}");
+        // Debug panics on the width arithmetic; release does not. Check
+        // the emission only where there is one — and where there is, it
+        // must be the silent full-width member, not a diagnostic.
+        if let Ok(Ok(v1)) = std::panic::catch_unwind(|| cpp_tb::emit(&merged_src(&field(ty)))) {
+            assert!(v1.contains(member), "`{ty}`: v1 emits `{member}`: {v1}");
+            assert!(
+                v1.contains("harc_wide_write_bits(_packed, 0, 0, value.data"),
+                "`{ty}`: …and packs it at width zero: {v1}"
+            );
+        }
     }
-    // The length, not the width — v1 emits `std::array<uint64_t, 0>`.
+    // The length, not the width — `std::array<uint64_t, 0>`, in either
+    // profile.
     let src = field("Vec<uint<8>, 0>");
     assert_unsupported(&lower_src(&src).unwrap_err());
     let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
     assert!(v1.contains("std::array<uint64_t, 0> data"), "{v1}");
 
     // A zero-width PAYLOAD under a container is not this rule at all:
-    // v1 never reads a width there, does not panic, and its output
-    // compiles. The first version of the guard recursed through every
-    // type argument and made all three `Invalid`.
+    // v1 never reads a width there and its output compiles. The first
+    // version of the guard recursed through every type argument and
+    // made all three `Invalid`.
     for (ty, shape) in [
         ("list<uint<0>>", "std::vector<uint64_t> data"),
         ("queue<uint<0>>", "uint64_t data = 0;"),

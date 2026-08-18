@@ -401,18 +401,33 @@ fn lower_record_field(
         )));
     }
     if zero_width_leaf(&f.ty) {
-        // NOT a subset gap in either direction, so it must not suggest
-        // `--codegen v1`: v1 PANICS on a zero-width record leaf —
+        // NOT `Invalid`, and the reason is a lesson about the whole
+        // sweep. The first version rested on v1 PANICKING here —
         // "attempt to subtract with overflow" in `emit_unpack_bits`,
-        // reached from `emit_record_pack_helpers` — for any program
-        // that declares the record, instantiated or not. No backend
-        // runs it in any configuration, which is the same rule the
-        // width methods already state (`exprs::width_method_violation`:
-        // "width must be greater than zero").
-        return Err(LowerError::Invalid(format!(
-            "{kind} `{owner}` field `{fname}` has a zero-width type; \
-             a scalar width must be greater than zero"
-        )));
+        // reached from `emit_record_pack_helpers`. That panic is a
+        // DEBUG-BUILD artifact: Rust turns integer overflow checks off
+        // under `--release`, which is how CI builds and how the `harc`
+        // binary ships. In release v1 does not panic at all — it emits
+        // a complete testbench that compiles clean:
+        //
+        //   uint<0>          uint64_t data = 0;
+        //                    harc_wide_write_bits(_packed, 0, 0, value.data)
+        //   Vec<uint<0>, 4>  std::array<uint64_t, 4> data = {};
+        //                    …the same zero-width write, per element
+        //
+        // So the field is a full 64-bit member that carries no packed
+        // bits, silently. `Invalid` claims no backend runs it in any
+        // configuration, and a release-built v1 runs it.
+        return Err(not_implemented(
+            &format!(
+                "{kind} `{owner}` field `{fname}` has a zero-width type; \
+                 a scalar width must be greater than zero"
+            ),
+            "v1 emits a full-width member for it that carries no packed bits — a debug \
+             build panics on the width arithmetic, but a release build, which is how it \
+             ships, compiles and runs",
+            V1Status::SilentlyMisLowers,
+        ));
     }
     // A nested-record field: the field's type names another transaction or
     // struct. Lower it to `IrType::Record(rid)` with `vec_len = None` — a
@@ -589,13 +604,14 @@ fn fixed_vec_field(
 }
 
 /// A zero-width scalar (`uint<0>`) in a field's own type, or under a
-/// `Vec` element. Those are the shapes v1 PANICS on; nothing else here
-/// is `Invalid`, and the first version of this reached much further:
+/// `Vec` element. Those are the shapes whose width arithmetic v1 gets
+/// wrong; nothing else here belongs to this arm, and the first version
+/// reached much further:
 ///
 /// | field | v1 | |
 /// |---|---|---|
-/// | `uint<0>`, `sint<0>`, `bits<0>` | panics in `emit_unpack_bits` | `Invalid` |
-/// | `Vec<uint<0>, 4>` | panics likewise | `Invalid` |
+/// | `uint<0>`, `sint<0>`, `bits<0>` | a full-width member packed at width 0 (a DEBUG build panics in `emit_unpack_bits`; release does not) | `SilentlyMisLowers` |
+/// | `Vec<uint<0>, 4>` | the same, per element | `SilentlyMisLowers` |
 /// | `list<uint<0>>`, `queue<uint<0>>`, `event<uint<0>>` | `std::vector<uint64_t>` / `uint64_t`, and it COMPILES | not this arm's business |
 /// | `uint<0x0>`, `uint<0b0>` | `uint64_t data = 0;`, and it COMPILES | likewise |
 ///

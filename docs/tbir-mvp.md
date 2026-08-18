@@ -6037,10 +6037,10 @@ case and only locally-determinable `Assign` types are compared).
     member there. `list<Vec<uint<8>, 2>>` is `EmitsUncompilable` as a
     transaction field and a working escape hatch as a scoreboard field.
 
-    A zero-width leaf (`uint<0>`, `Vec<uint<0>, 4>`) is `Invalid`, not a
-    gap: v1 panics — `attempt to subtract with overflow` in
-    `emit_unpack_bits` — for any program that merely DECLARES the
-    record, so there is no configuration in which `--codegen v1` helps.
+    ~~A zero-width leaf (`uint<0>`, `Vec<uint<0>, 4>`) is `Invalid`~~ —
+    struck, see divergence 107. The panic it rested on is a debug-build
+    artifact; a release build, which is how `harc` ships, emits and runs
+    the program.
     `Vec<uint<8>, 0>` is a zero-LENGTH array, a different thing, and
     stays a suggestion v1 honours (`std::array<uint64_t, 0>`).
 
@@ -6349,7 +6349,7 @@ former `transaction` group lives in
 
      **`zero_width_leaf` recursed through every type argument.** A
      zero-width scalar under a `list`/`queue`/`event` PAYLOAD is not the
-     shape v1 panics on: it emits `std::vector<uint64_t>` /
+     shape this arm is about: it emits `std::vector<uint64_t>` /
      `uint64_t` and compiles clean. Only the type's own width slot and a
      `Vec` element count. Three constructs went from `Invalid` back to
      an honest verdict.
@@ -6600,6 +6600,46 @@ former `transaction` group lives in
      the divergence-104 hole with the suite still green), and
      `bind_rhs_ident`'s rendered phrase, whose unbalanced backtick no
      test noticed.
+
+
+107. **A verdict that rested on a debug-only panic, and the CI run that
+     caught it (2026-08-18).**
+
+     The zero-width record leaf was `Invalid` (divergences 103, 105) on
+     the grounds that v1 PANICS on it — "attempt to subtract with
+     overflow" in `emit_unpack_bits`.
+
+     Rust turns integer overflow checks OFF under `--release`. CI builds
+     `cargo build --release --all-targets` and runs `cargo test
+     --release`; the shipped `harc` binary is a release build. So the
+     panic never happens for a user. In release v1 emits a complete
+     testbench that compiles clean:
+
+     | field | v1 emits | packed as |
+     |---|---|---|
+     | `uint<0>` | `uint64_t data = 0;` | `harc_wide_write_bits(_packed, 0, 0, value.data)` |
+     | `Vec<uint<0>, 4>` | `std::array<uint64_t, 4> data = {};` | the same zero-width write, per element |
+
+     A full-width member carrying no packed bits, silently. `Invalid`
+     claims no backend runs it in ANY configuration, and a release-built
+     v1 runs it — so the arm is `SilentlyMisLowers`.
+
+     Two things worth keeping from how this was found:
+
+     * **Every local check on this branch has been a debug build.** The
+       first CI run the branch got in hours failed on this within ninety
+       seconds. Nothing in the local loop — `cargo test`, the mutation
+       harness, five review passes, all debug — could have caught it,
+       because they all observe the panic the release build does not
+       have. The full-suite check now runs `--release` as well.
+     * **A panic is not evidence about v1 without naming the profile.**
+       It was the only verdict on this branch resting on one; the rest
+       rest on emitted text or g++ exit codes, which do not vary this
+       way.
+
+     The test is written to hold in both profiles: the verdict is
+     asserted unconditionally and the emitted member only where v1 got
+     far enough to produce it.
 
 
 ## Next steps
