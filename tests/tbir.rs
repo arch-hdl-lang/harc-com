@@ -3119,6 +3119,338 @@ fn active_mode_on_analysis_monitor_field_is_rejected() {
     assert!(msg.contains("active") && msg.contains("LargeTb.lifecycle"), "{msg}");
 }
 
+/// A relay type with an always-on analysis surface and an active-only
+/// half, for the three activation-gating seams below.
+fn mode_relay_src() -> &'static str {
+    r#"
+transactor ModeRelay
+    observed  : out event<uint<8>>
+    published : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        published = published + 1
+        emit observed(v)
+    end publish
+
+    when active
+        acalls : uint<32> default 0
+        aev    : out event<uint<8>>
+
+        hookable activate()
+            acalls = acalls + 1
+            emit aev(1)
+        end activate
+    end when
+end transactor ModeRelay
+
+scoreboard ModeSink
+    count : uint<32> default 0
+    hookable accept(v: uint<8>)
+        count = count + 1
+    end accept
+end scoreboard ModeSink
+"#
+}
+
+/// An active-only member reached through a SELF sub-component field is
+/// gated by that field's declared mode.
+///
+/// The self-relative arm of `as_component_method_call` returned without
+/// any activation check, so `relay.activate()` inside an env holding
+/// `relay : ModeRelay passive` lowered to a `ComponentCall` and emitted
+/// `ModeRelay_activate(self.relay);` — active-only behavior running on a
+/// passive instance. The path arm and the bare-self arm both checked;
+/// only this one did not.
+#[test]
+fn active_only_method_through_a_passive_self_sub_component_is_rejected() {
+    let src = |mode: &str| {
+        format!(
+            r#"{}
+env Wrap
+    relay : ModeRelay {mode}
+
+    hookable kick()
+        relay.activate()
+    end kick
+end env Wrap
+
+test WrapTest
+    let dut : Top
+    let wrap : Wrap
+    run
+        wrap.kick()
+    end run
+end test WrapTest
+"#,
+            mode_relay_src()
+        )
+    };
+
+    let err = lower_src(&src("passive")).expect_err("active-only through passive is invalid");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("active-only method `activate`") && msg.contains("relay"),
+        "diagnostic should name the member and the passive field: {msg}"
+    );
+
+    // The control: the same body through an `active` field lowers, so
+    // the rejection above is the MODE and not the self-relative shape.
+    let prog = lower_src(&src("active")).expect("active sub-component lowers");
+    verify::verify_program(&prog).expect("verifies");
+}
+
+/// A self-relative path reads its mode from the field it names, not from
+/// the `"self"` root the emitter re-roots at.
+///
+/// `component_path_head` hands back `["self", <field>]` as the base
+/// segments, and the mode lookup used `base_head[0]` — the literal
+/// `"self"`, which names no test-scope binding. Reading an active-only
+/// field of an `active` sub-component from its holder's own body was
+/// therefore rejected with ``transactor `self` has no effective
+/// active/passive mode``.
+#[test]
+fn self_relative_field_access_resolves_the_mode_from_its_own_binding() {
+    let src = |mode: &str| {
+        format!(
+            r#"{}
+env Wrap
+    relay : ModeRelay {mode}
+    seen  : uint<32> default 0
+
+    hookable peek()
+        seen = relay.acalls
+    end peek
+end env Wrap
+
+test WrapTest
+    let dut : Top
+    let wrap : Wrap
+    run
+        wrap.peek()
+    end run
+end test WrapTest
+"#,
+            mode_relay_src()
+        )
+    };
+
+    let prog = lower_src(&src("active")).expect("an active sub-component's field reads");
+    verify::verify_program(&prog).expect("verifies");
+
+    // And the gate still bites on the same access through `passive` —
+    // the fix restores the resolution, it does not remove the check.
+    let err = lower_src(&src("passive")).expect_err("active-only field through passive is invalid");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("acalls"), "{msg}");
+}
+
+/// A mode-less head whose descendant binding carries the mode resolves
+/// through the descendant, rather than being rejected at the head.
+///
+/// `resolve_component_mode` rejected any transactor head with no mode of
+/// its own, before walking the path at all. A reactive monitor is
+/// legitimately mode-less, so `mon.sub.activate()` — where `sub : Relay
+/// active` supplies the mode one segment down — failed with ``transactor
+/// `mon` has no effective active/passive mode``, though the same tree
+/// passes binding validation. The post-walk check on the resolved TARGET
+/// is what actually answers the question.
+#[test]
+fn a_modeless_head_resolves_its_mode_from_the_descendant_binding() {
+    let src = |sub_mode: &str| {
+        format!(
+            r#"
+transactor Relay
+    obs : out event<uint<8>>
+
+    when active
+        hookable activate()
+            emit obs(1)
+        end activate
+    end when
+end transactor Relay
+
+transactor Mon
+    seen  : out event<uint<8>>
+    sub   : Relay {sub_mode}
+    beats : uint<32> default 0
+
+    on 1 cycles
+        beats = beats + 1
+    end on
+end transactor Mon
+
+test MonTest
+    let dut : Top
+    let mon : Mon
+    run
+        mon.sub.activate()
+    end run
+end test MonTest
+"#
+        )
+    };
+
+    let prog = lower_src(&src("active")).expect("the descendant's `active` supplies the mode");
+    verify::verify_program(&prog).expect("verifies");
+
+    let err = lower_src(&src("passive")).expect_err("a passive descendant still gates");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("activate"), "{msg}");
+}
+
+/// A consumer whose `on` handler is active-only cannot be bound
+/// `passive`: nothing would subscribe to its `in event`, so the `emit`
+/// runs its fan-out over an empty vector and the transaction vanishes.
+///
+/// The emitted C++ for the rejected form was the whole diagnosis — a
+/// `for (auto& _s : t.req) _s(1);` loop with no `push_back` anywhere.
+/// The analysis-source mode gates accept `passive` and run ahead of the
+/// event-driven one, and a consumer that also declares an `out event` is
+/// an analysis source, so they claimed the type first; this gate runs
+/// before them.
+///
+/// The `out event` axis is covered both ways because it decides which
+/// gate would otherwise claim the type, and the always-on rows are the
+/// control: an `on` handler in the ordinary body registers for EVERY
+/// mode, so `passive` keeps working there and must not be swept up.
+#[test]
+fn an_active_only_consumer_rejects_every_mode_but_active() {
+    let consumer = |out_event: bool, active_only: bool, mode: &str| {
+        let obs = if out_event {
+            "    obs : out event<uint<8>>\n"
+        } else {
+            ""
+        };
+        let handler = "on req(v)\n            n = n + 1\n        end on";
+        let body = if active_only {
+            format!("    when active\n        {handler}\n    end when\n")
+        } else {
+            format!("    {handler}\n")
+        };
+        format!(
+            r#"
+transactor T
+    req : in event<uint<8>>
+{obs}    n   : uint<32> default 0
+
+{body}end transactor T
+
+testbench Tb
+    dut : Top
+    t   : T {mode}
+end testbench Tb
+
+impl MTest for Tb
+    run
+        emit t.req(1)
+    end run
+end impl MTest
+"#
+        )
+    };
+
+    for out_event in [false, true] {
+        // Active-only handler: `active` is the only mode that subscribes.
+        let prog = lower_src(&consumer(out_event, true, "active"))
+            .unwrap_or_else(|e| panic!("out_event={out_event}: active lowers: {e:?}"));
+        verify::verify_program(&prog).expect("verifies");
+        let src = consumer(out_event, true, "active");
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("emits");
+        assert!(
+            cpp.contains("req.push_back"),
+            "out_event={out_event}: the active instance subscribes"
+        );
+
+        let err = lower_src(&consumer(out_event, true, "passive"))
+            .expect_err("a passive active-only consumer must be rejected");
+        let msg = assert_unsupported(&err);
+        assert!(
+            msg.contains("when active") && msg.contains("no subscriber"),
+            "out_event={out_event}: the diagnostic should say why: {msg}"
+        );
+
+        // Control: an always-on handler registers on every mode, so
+        // `passive` stays legal and stays wired.
+        let src = consumer(out_event, false, "passive");
+        let prog = lower_src(&src)
+            .unwrap_or_else(|e| panic!("out_event={out_event}: always-on passive lowers: {e:?}"));
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("emits");
+        assert!(
+            cpp.contains("req.push_back"),
+            "out_event={out_event}: an always-on handler wires a passive instance"
+        );
+    }
+}
+
+/// A testbench-owned `connect` edge is gated on instance mode, exactly
+/// as a component-owned one is.
+///
+/// The `tb.connects` loop called `emit_one_connect` unconditionally
+/// while the `component_fields` loop ten lines below gated on
+/// `edge_is_enabled`. An edge off an active-only `out event` on a
+/// `passive` instance therefore still emitted its registration:
+/// `relay.aev.push_back([&](auto _t) { ModeSink_accept(sink, _t); });`.
+#[test]
+fn a_testbench_connect_edge_is_gated_on_the_instance_mode() {
+    let src = |mode: &str| {
+        format!(
+            r#"{}
+testbench ModeTb
+    dut   : Top
+    relay : ModeRelay {mode}
+    sink  : ModeSink
+
+    connect
+        relay.aev -> sink.accept
+    end connect
+end testbench ModeTb
+
+impl ModeConnectTest for ModeTb
+    run
+        relay.publish(1)
+    end run
+end impl ModeConnectTest
+"#,
+            mode_relay_src()
+        )
+    };
+
+    let passive_src = src("passive");
+    let prog = lower_src(&passive_src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let cpp = tbir::emit(
+        &prog,
+        &merged_src(&passive_src),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("emits");
+    assert!(
+        !cpp.contains("aev.push_back"),
+        "an active-only event on a passive instance must not be wired: {}",
+        cpp.lines()
+            .filter(|l| l.contains("aev"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The anchor: the same edge on an `active` instance IS wired, so the
+    // assertion above is the mode gate and not a renamed field.
+    let active_src = src("active");
+    let active = lower_src(&active_src).expect("lowers");
+    let active_cpp = tbir::emit(
+        &active,
+        &merged_src(&active_src),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("emits");
+    assert!(
+        active_cpp.contains("aev.push_back"),
+        "an active instance keeps its connect registration"
+    );
+}
+
 /// The always-on analysis-monitor rule applies at every component binding
 /// seam, not just a reusable testbench field. A structural root may carry an
 /// inherited mode for a mode-sensitive descendant, but an explicit `active`
