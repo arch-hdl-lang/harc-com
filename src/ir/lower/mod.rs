@@ -4145,6 +4145,48 @@ fn lower_test(
         Vec::new()
     };
 
+    for edge in &tb_connects {
+        let endpoint_mode = |path: &[String]| -> Result<_, LowerError> {
+            let (root, tail) = path.split_first().ok_or_else(|| {
+                LowerError::Invalid("empty testbench `connect` component path".to_string())
+            })?;
+            let binding = component_field_bindings
+                .iter()
+                .find(|field| field.field == *root)
+                .ok_or_else(|| {
+                    LowerError::Invalid(format!(
+                        "testbench `connect` endpoint `{}` has no component binding",
+                        path.join(".")
+                    ))
+                })?;
+            ir::resolve_component_path_mode(
+                &prog.components,
+                binding.component,
+                binding.mode,
+                tail,
+            )
+            .map(|resolved| resolved.effective_mode)
+            .map_err(|err| LowerError::Invalid(format!("invalid testbench `connect`: {err}")))
+        };
+        let source_mode = endpoint_mode(&edge.src_path)?;
+        let sink_mode = endpoint_mode(&edge.sink_path)?;
+        if !ir::component_mode_includes_activation(source_mode, edge.src_activation)
+            || !ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
+        {
+            let sink_name = match &edge.sink {
+                ir::ConnectSink::Method { method } => method,
+                ir::ConnectSink::Event { event } => event,
+            };
+            return Err(LowerError::Invalid(format!(
+                "testbench `connect` edge `{}.{} -> {}.{}` uses a mode-disabled endpoint",
+                edge.src_path.join("."),
+                edge.src_event,
+                edge.sink_path.join("."),
+                sink_name,
+            )));
+        }
+    }
+
     // Bus bindings (test-scope `let`s) and transactor fields (testbench
     // component fields) share the `CallTarget::TransactorMethod`
     // bus_field namespace; a name living in both would dispatch

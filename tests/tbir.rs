@@ -3384,16 +3384,13 @@ end impl MTest
     }
 }
 
-/// A testbench-owned `connect` edge is gated on instance mode, exactly
-/// as a component-owned one is.
+/// A testbench-owned `connect` edge must be valid for the endpoint modes.
 ///
-/// The `tb.connects` loop called `emit_one_connect` unconditionally
-/// while the `component_fields` loop ten lines below gated on
-/// `edge_is_enabled`. An edge off an active-only `out event` on a
-/// `passive` instance therefore still emitted its registration:
-/// `relay.aev.push_back([&](auto _t) { ModeSink_accept(sink, _t); });`.
+/// Silently dropping a declared edge during emission leaves a valid-looking
+/// but incomplete testbench, so reject the statically known mismatch while
+/// lowering instead.
 #[test]
-fn a_testbench_connect_edge_is_gated_on_the_instance_mode() {
+fn a_testbench_connect_edge_rejects_a_mode_disabled_endpoint() {
     let src = |mode: &str| {
         format!(
             r#"{}
@@ -3418,27 +3415,17 @@ end impl ModeConnectTest
     };
 
     let passive_src = src("passive");
-    let prog = lower_src(&passive_src).expect("lowers");
-    verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(
-        &prog,
-        &merged_src(&passive_src),
-        &cpp_tb::EmitOpts::default(),
-    )
-    .expect("emits");
+    let err = lower_src(&passive_src).expect_err("mode-disabled wiring must be rejected");
+    let msg = assert_invalid(&err);
     assert!(
-        !cpp.contains("aev.push_back"),
-        "an active-only event on a passive instance must not be wired: {}",
-        cpp.lines()
-            .filter(|l| l.contains("aev"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        msg.contains("connect") && msg.contains("relay.aev") && msg.contains("mode-disabled"),
+        "{msg}"
     );
 
     // The anchor: the same edge on an `active` instance IS wired, so the
     // assertion above is the mode gate and not a renamed field.
     let active_src = src("active");
-    let active = lower_src(&active_src).expect("lowers");
+    let mut active = lower_src(&active_src).expect("lowers");
     let active_cpp = tbir::emit(
         &active,
         &merged_src(&active_src),
@@ -3448,6 +3435,19 @@ end impl ModeConnectTest
     assert!(
         active_cpp.contains("aev.push_back"),
         "an active instance keeps its connect registration"
+    );
+
+    // Verification independently owns the invariant for transformed or
+    // deserialized IR that did not come directly from lowering.
+    active.testbenches[0]
+        .component_fields
+        .iter_mut()
+        .find(|field| field.field == "relay")
+        .expect("relay binding exists")
+        .mode = Some(ir::ComponentInstanceMode::Passive);
+    assert!(
+        verify::verify_program(&active).is_err(),
+        "the verifier must reject a mode-disabled connect endpoint"
     );
 }
 

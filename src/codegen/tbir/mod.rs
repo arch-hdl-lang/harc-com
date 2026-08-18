@@ -1667,49 +1667,6 @@ fn edge_is_enabled(
         && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
 }
 
-/// `edge_is_enabled` for a TESTBENCH-owned `connect` edge, whose paths
-/// are rooted at a testbench component FIELD rather than at one owning
-/// component. Each root binding carries its own mode, so the two
-/// endpoints of a single edge can sit under different instances (and
-/// different modes) — resolve each from its own root.
-///
-/// The testbench loop had no gate at all while the component-owned loop
-/// ten lines below did, so an active-only endpoint on a `passive`
-/// instance still had its subscriber registered: `relay.aev` declared
-/// under `when active`, bound `relay : ModeRelay passive`, emitted
-/// `relay.aev.push_back(...)`. An unresolvable root answers `false`
-/// rather than panicking: emission must not be the seam that reports a
-/// malformed path, and `verify_testbench_connect` has already resolved
-/// both endpoints of every edge that reaches here.
-fn tb_edge_is_enabled(
-    prog: &TbProgram,
-    tb: &ir::TestbenchSchema,
-    edge: &ir::ConnectEdgeSchema,
-) -> bool {
-    let endpoint_mode = |path: &[String]| -> Option<Option<ir::ComponentInstanceMode>> {
-        let (root, tail) = path.split_first()?;
-        let binding = tb.component_fields.iter().find(|f| f.field == *root)?;
-        Some(
-            ir::resolve_component_path_mode(
-                &prog.components,
-                binding.component,
-                binding.mode,
-                tail,
-            )
-            .ok()?
-            .effective_mode,
-        )
-    };
-    let (Some(source_mode), Some(sink_mode)) = (
-        endpoint_mode(&edge.src_path),
-        endpoint_mode(&edge.sink_path),
-    ) else {
-        return false;
-    };
-    ir::component_mode_includes_activation(source_mode, edge.src_activation)
-        && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
-}
-
 /// Register every `on <ev>(arg)` handler on `component` (and nested
 /// sub-components) as a subscriber closure on the corresponding event
 /// field of the instance reached by `inst_path`. The closure bumps the
@@ -2504,9 +2461,7 @@ fn emit_test(
     // declared above. Keep this after component method lambdas so connect
     // closures can call `<SinkComp>_<method>(...)`.
     for edge in &tb.connects {
-        if tb_edge_is_enabled(prog, tb, edge) {
-            emit_one_connect(out, prog, "", edge);
-        }
+        emit_one_connect(out, prog, "", edge);
     }
     for cf in &tb.component_fields {
         // The top component's own `connect` edges (an env's source→sink, or
