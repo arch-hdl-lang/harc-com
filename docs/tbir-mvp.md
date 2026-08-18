@@ -5030,6 +5030,46 @@ case and only locally-determinable `Assign` types are compared).
     something that merely correlated with the discriminator, and both
     times the split was backwards.
 
+77. **The same split at the FIELD position, and the half that does not
+    move (2026-08-18).**
+
+    Divergence 76 split missing-annotation from wrong-annotation at two
+    instance (`let`) arms. The field arms have the same two halves, and
+    already had them as separate arms — both `Unsupported`.
+
+    | field | v1 |
+    |---|---|
+    | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
+    | `p : Poker` — no mode, plain transactor | refuses, same message |
+    | `drv : CounterDrv passive` | emits, and correctly drops the `when active` handler registration |
+
+    So the two halves part company. A missing annotation is a program
+    error under both backends → `Invalid`. The `passive` one is a legal
+    program v1 runs FAITHFULLY: the `on req` handler lives inside `when
+    active`, so v1 omitting its registration on a passive instance is
+    the language's own rule and not a mis-lowering. It keeps its
+    suggestion for exactly that reason, and the test asserts the
+    omission plus an anti-vacuity check that the active program does
+    register it.
+
+    The mode-less arm's own comment has always said the rules "mirror
+    v1". This one does — which is precisely why pointing at v1 was
+    never going to help.
+
+    Two arms alongside these were NOT reclassified: the DUT-poking-BFM
+    pair. Reaching them needs the transactor held by an `env` (they gate
+    on `dut_poking_bfm_names`, which is the by-value-in-a-component
+    routing), and no probe here builds that. They keep their verdict
+    rather than inheriting one by analogy, because variants sharing a
+    code path do not share a verdict — this batch is itself an example,
+    with the `passive` half staying put while the mode-less half moved.
+
+    One probe went wrong in a way worth recording: the first attempt
+    edited the fixture's FIRST `drv : CounterDrv active`, which is an
+    `env` field, and all three variants lowered. An env-held mode-less
+    field never reaches these arms at all. The arm being measured has to
+    be the arm the probe actually hits.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

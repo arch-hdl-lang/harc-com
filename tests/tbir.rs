@@ -7047,8 +7047,14 @@ fn transactor_call_in_message_rejected() {
 /// (its passive surface — persistent state + always-on handlers — is
 /// lowered; #494 P0a/P1b), but calling one of its `when active` methods
 /// on the passive instance is rejected at the call site as `Invalid`
-/// (the method structurally does not exist there). A mode-less field has
-/// nothing to inherit from at testbench scope, so it stays rejected.
+/// (the method structurally does not exist there).
+///
+/// A mode-less field has nothing to inherit from at testbench scope, so
+/// it stays rejected — and as `Invalid`, not with a v1 suggestion.
+/// Measured: v1 refuses it too, with "transactor field `_tb.p : Poker`
+/// has no mode and ...". The comment at the arm has always said the
+/// mode rules "mirror v1"; this one does, so pointing at v1 was never
+/// going to help.
 #[test]
 fn transactor_instance_mode_rules() {
     // `XACTOR_SRC` calls `xt.pulse(...)` / `xt.readv()` — both `when
@@ -7067,8 +7073,15 @@ fn transactor_instance_mode_rules() {
     );
 
     let modeless = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt");
-    let msg = assert_unsupported(&lower_src(&modeless).unwrap_err());
-    assert!(msg.contains("without an `active`/`passive` mode"), "{msg}");
+    let msg = assert_invalid(&lower_src(&modeless).unwrap_err());
+    assert!(
+        msg.contains("needs an `active`/`passive` mode annotation"),
+        "{msg}"
+    );
+    // The half that makes `Invalid` honest rather than merely tidier.
+    let v1 = cpp_tb::emit(&merged_src(&modeless))
+        .expect_err("v1 refuses a mode-less transactor field too");
+    assert!(format!("{v1}").contains("has no mode"), "{v1}");
 }
 
 /// A `passive` instance whose `when active` methods are never CALLED is
@@ -19791,5 +19804,71 @@ fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
         )))
         .expect("v1 emits"),
         "for a transactor with both halves the mode must change v1's output"
+    );
+}
+
+/// The event-driven flavour of the mode-less transactor FIELD, and the
+/// `passive` sibling that does NOT change with it.
+///
+/// | field | v1 |
+/// |---|---|
+/// | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
+/// | `drv : CounterDrv passive` | emits, and correctly drops the `when active` handler registration |
+///
+/// So the two halves of one construct part company: a missing
+/// annotation is a program error under both backends, and a `passive`
+/// one is a legal program v1 runs faithfully and TB-IR does not lower.
+/// The second keeps its suggestion for exactly that reason.
+///
+/// Only these two arms were measured. The parallel DUT-poking-BFM pair
+/// alongside them needs the transactor held by an `env` to be reached
+/// at all, which no probe here builds, so it is left alone rather than
+/// reclassified by analogy.
+#[test]
+fn a_mode_less_transactor_field_is_a_program_error_but_a_passive_one_is_not() {
+    let base = fixture("event_driven_transactor_test.harc");
+    // The TESTBENCH field, not the env one — an env-held field with no
+    // mode lowers under TB-IR and never reaches this arm.
+    let tb_at = base
+        .find("testbench EventDrivenTransactorTb")
+        .expect("fixture shape changed");
+    let (head, tail) = base.split_at(tb_at);
+    const FIELD: &str = "    drv : CounterDrv active";
+    assert!(tail.contains(FIELD), "fixture shape changed");
+    let with = |repl: &str| format!("{head}{}", tail.replacen(FIELD, repl, 1));
+
+    lower_src(&base).expect("the `active` control lowers");
+
+    // No mode: `Invalid`, and v1 refuses too.
+    let modeless = with("    drv : CounterDrv");
+    let msg = assert_invalid(&lower_src(&modeless).unwrap_err());
+    assert!(
+        msg.contains("needs an `active`/`passive` mode annotation"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&modeless)).expect_err("v1 refuses it too");
+    assert!(format!("{v1}").contains("has no mode"), "{v1}");
+
+    // Passive: still `Unsupported`, because v1 really does run it —
+    // and runs it RIGHT. The `on req` handler lives inside `when
+    // active`, so v1 omitting its registration on a passive instance is
+    // the language's own rule, not a mis-lowering.
+    let passive = with("    drv : CounterDrv passive");
+    let msg = assert_unsupported(&lower_src(&passive).unwrap_err());
+    assert!(
+        msg.contains("passive event-driven transactor field"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&passive)).expect("v1 emits the passive program");
+    assert!(
+        !v1.contains("_tb.drv.req.push_back("),
+        "v1 must omit the `when active` handler registration on a passive instance"
+    );
+    // Anti-vacuity: the active program does register it.
+    assert!(
+        cpp_tb::emit(&merged_src(&base))
+            .expect("v1 emits")
+            .contains("_tb.drv.req.push_back("),
+        "the active control must register the handler, or the check above is empty"
     );
 }

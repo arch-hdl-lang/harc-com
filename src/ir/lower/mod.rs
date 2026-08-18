@@ -2252,14 +2252,27 @@ fn validate_testbench_component(
                                 ));
                             }
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "an event-driven transactor field `{}.{} : {simple}` \
-                                         without an `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "annotate the instance `active`",
-                                ));
+                                // MEASURED: v1 refuses this too, with
+                                // "transactor field `_tb.drv :
+                                // CounterDrv` has no mode and ...", so
+                                // the old `Unsupported` sent the user to
+                                // a second error. A missing annotation
+                                // is a program error under both
+                                // backends.
+                                //
+                                // The `Passive` arm above is NOT the
+                                // same and stays `Unsupported`: v1 emits
+                                // that program and honours it correctly,
+                                // dropping the `when active` handler
+                                // registration exactly as the language
+                                // says. It is a legal program TB-IR does
+                                // not lower, which is what `Unsupported`
+                                // is for.
+                                return Err(LowerError::Invalid(format!(
+                                    "event-driven transactor field `{}.{} : {simple}` needs \
+                                     an `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
@@ -2352,14 +2365,18 @@ fn validate_testbench_component(
                         match mode {
                             Some(TransactorMode::Active) | Some(TransactorMode::Passive) => continue,
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "transactor field `{}.{} : {simple}` without an \
-                                         `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "",
-                                ));
+                                // MEASURED, same as the event-driven
+                                // arm above: v1 refuses too, with
+                                // "transactor field `_tb.p : Poker` has
+                                // no mode and ...". The comment above
+                                // already says the mode rules "mirror
+                                // v1" — including this one, so pointing
+                                // at v1 was never going to help.
+                                return Err(LowerError::Invalid(format!(
+                                    "transactor field `{}.{} : {simple}` needs an \
+                                     `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
