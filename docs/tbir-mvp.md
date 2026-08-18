@@ -5371,9 +5371,12 @@ case and only locally-determinable `Assign` types are compared).
     the first time in this sweep that a code comment's reachability
     claim turned out to be right.
 
-    Both reachable arms are `Invalid`: v1 refuses each with its own
-    "covergroup `StepCov` hook trigger must resolve to a `hookable` on a
-    known component type", so no backend runs them. The four
+    ~~Both reachable arms are `Invalid`~~ — **retracted, see divergence
+    89.** They are `Unsupported`: v1's refusal only fires where the
+    covergroup is INSTANTIATED, and an uninstantiated one builds. The
+    sentence is left standing with this marker because the reasoning
+    that produced it ("v1 refuses each with its own …") is the
+    instructive part — it was true of the only configuration probed. The four
     parser-guarded arms take the same verdict as invariant guards —
     an unreachable arm cannot emit a false `--codegen v1` suggestion,
     and if one ever did fire the program would be malformed.
@@ -5422,7 +5425,7 @@ case and only locally-determinable `Assign` types are compared).
     verdict, different message, and the test pins that rather than
     letting the sentence above be read as covering all five.
 
-85. **`pop` ignored its argument list at all eight branches
+85. **`pop` ignored its argument list at all nine branches
     (2026-08-18).**
 
     Every `pop` branch checked the method NAME and dropped `args` on the
@@ -5563,8 +5566,13 @@ case and only locally-determinable `Assign` types are compared).
     spelling byte for byte. The hook-parameter precedence survives it:
     a hook param beats a file-scope `const` of the same name, so the
     fold is skipped whenever one appears anywhere in the bound, and the
-    test pins that by adding an unrelated `const ticks = 99` to a
-    fixture whose hook parameter is named `ticks`.
+    ~~test pins that by adding an unrelated `const ticks = 99` to a
+    fixture whose hook parameter is named `ticks`~~ — **wrong, see
+    divergence 92.** That fixture's hook PARAMETER is `cmd`; `ticks` is
+    a field of the record it carries and never appears as a bare
+    identifier in a bound, so the assertion passed under every mutation
+    including deleting the guard. It compares a real hook-parameter bin
+    now.
 
     The `parse_bound` literal arm is a SEPARATE landing, reached before
     `fold_const` is consulted, so it took its own probe rather than the
@@ -5739,6 +5747,81 @@ case and only locally-determinable `Assign` types are compared).
       "visit the top node only" left 482 tests green, while
       `[1 + EOF:0]` silently fell through to the wrong arm and
       `{k + 0}` lost hook-parameter precedence. Both are pinned.
+
+93. **Retracting a bad verdict is not the same as reaching a good one
+    (2026-08-18).**
+
+    Divergence 91 retracted the width clamp. Review round three found
+    that the retraction had converted a silent acceptance into a FALSE
+    ESCAPE HATCH rather than into an honest verdict — the same defect
+    class, one step along.
+
+    `067d632` threaded a source width into `cover_width_arg` and then
+    consulted it only inside `if method == "trunc"`. Everything else
+    fell through to `Unsupported`:
+
+    | coverpoint | TB-IR said | v1 |
+    |---|---|---|
+    | `dut.count_out[100:0].zext<70>()` | re-run with `--codegen v1` | error: "width must be ≥ the source width" |
+    | `dut.count_out[100:0].sext<70>()` | same | same |
+    | `(dut.count_out as uint<128>).zext<100>()` | same | same |
+
+    The third row is the exact input the retraction's own commit
+    message names as the bug it was fixing. The direction check lives
+    in `cover_width_arg` now and runs for every width, phrased in v1's
+    own words so a user who re-runs reads the same sentence twice.
+
+    A second, quieter one: `cover_infer_expr_width` passed `None` for
+    the receiver width of a NESTED width method, with a comment saying
+    the receiver "is not yet known at this call". It is —it is the
+    callee's own target. So `[3:0].trunc<128>()` was `Invalid` alone
+    and `Unsupported` the moment anything wrapped it, for the same
+    inner program v1 refuses either way. A slice or a cast wrapper kept
+    the right answer; only the width-method path lost it. Comments that
+    assert an absence are worth checking: this one was wrong and it was
+    load-bearing.
+
+    Making the cast width available to that check needed a policy
+    split. `cover_cast_width` refuses a `>64` width where the cast is
+    LOWERED, which is right — TB-IR cannot model the value — but the
+    direction check needs the same width as a NUMBER, and refusing
+    there hid the more accurate error behind a less accurate one.
+
+94. **Two guards written to answer a review, neither measured
+    (2026-08-18).**
+
+    Third occurrence on this branch, and this time in the commits
+    written to answer the first two:
+
+    * the hook-parameter guard on the four constant roles — the
+      headline of divergence 92 — survived `.filter(|_| false)` with
+      482 tests green;
+    * the negative-fold rejection survived `&& false` likewise.
+
+    The pattern is stable enough to name: a guard added in response to
+    review gets the care that went into finding it and none of the care
+    that goes into pinning it, because the finding feels like the work.
+    Both are pinned now, along with three expression-position queue
+    landings and the transactor built-in carve-out, all of which
+    "measured at all N landings" covered at the CLI and no test covered
+    at all.
+
+    The negative-fold verdict was also wrong, and wrong in a way the
+    document already contained the answer to. `EOF` is `(-1)` on glibc,
+    so `dut.lane_id_out[0 - 1]` and `dut.lane_id_out[EOF]` are the same
+    C++ after preprocessing; v1 emits both and both index at -1. The
+    role table two entries earlier calls the `EOF` form
+    `SilentlyMisLowers` precisely because v1 compiles it. Calling the
+    arithmetic spelling `Invalid` contradicted that at a distance of
+    twenty lines.
+
+    Same for the hook-parameter guard, which returned a flat
+    `Unsupported` before `role` was consulted, bypassing the four-way
+    split built for exactly this question: `cover cmd.ticks.trunc<k>()`
+    is something v1 refuses outright, and `(cmd.ticks as uint<k>)` is
+    one it accepts while dropping the width. Both now take their role's
+    verdict, from a single `ConstRole::v1_on_unfoldable` the refusal
+    paths share, because keeping them in step by hand did not work.
 
 ### The probe method
 

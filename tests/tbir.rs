@@ -13102,6 +13102,63 @@ end impl T"#;
         msg.contains("takes no arguments"),
         "the testbench landing is claimed by its arity check first: {msg}"
     );
+
+    // The other three landings, each reached on its own. Neutralising
+    // the component / bare-target-state / instance-target-state calls
+    // one at a time left the whole suite green — "measured at all five
+    // landings" was true of the probing and false of the regression
+    // tests, which is the same gap the `pop` guards had.
+    let state = fixture("queue_state_hookable_test.harc");
+    let cases = [
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        let z : uint<32> = errs.front()
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            let z : uint<8> = pending.front()",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        let z : uint<8> = model.pending.front()",
+                1,
+            ),
+        ),
+    ];
+    for (what, src) in cases {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("in expression position") && msg.contains("has only"),
+            "{what}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".front();"),
+            "{what}: v1 emits the call `HarcQueue` has no member for"
+        );
+    }
 }
 
 /// A `default` on a queue field: v1 emits it into the member
@@ -14764,6 +14821,228 @@ fn a_constant_expression_coverpoint_bound_folds() {
     );
 }
 
+/// The built-in predicates on a TRANSACTOR receiver. v1 resolves them
+/// there as well as on a component — `resolve_component_idle_predicate`
+/// walks `self.transactors` through `synth_component_from_transactor`,
+/// and both backends stamp `_last_in_cycle`/`_last_out_cycle` on
+/// transactor state structs — so a flat `Invalid` was calling twelve
+/// working programs (4 names x assert / bare statement / `let`) errors.
+///
+/// The carve-out that fixed it shipped with no test: `&& false` on it
+/// left the whole suite green.
+#[test]
+fn a_built_in_predicate_on_a_transactor_is_a_gap_not_an_error() {
+    let src = |stmt: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+    when active
+        hookable go()
+            wait 1 cycle
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    d   : Drv active
+end testbench Tb
+
+impl TT for Tb
+    clock clk = SysDomain
+    run
+        d.dut = dut
+        {stmt}
+        wait 1 cycle
+    end run
+end impl TT"#
+        )
+    };
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        for stmt in [
+            format!("assert d.{name}(2) else fail(\"o\")"),
+            format!("d.{name}(2)"),
+            format!("let v = d.{name}(2)"),
+        ] {
+            let s = src(&stmt);
+            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains(&format!("`d.{name}` on a transactor")),
+                "`{stmt}`: {msg}"
+            );
+            // The half that makes the suggestion honest: v1 emits the
+            // heartbeat against the transactor's own stamps.
+            let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
+            // `idle_out` reads only the out stamp; the other three read
+            // the in stamp (`idle` and `quiesced` read both).
+            let stamp = if name == "idle_out" {
+                "_tb.d._last_out_cycle"
+            } else {
+                "_tb.d._last_in_cycle"
+            };
+            assert!(
+                v1.contains(stamp),
+                "`{stmt}`: v1 resolves the predicate on the transactor (`{stamp}`)"
+            );
+        }
+    }
+    // …and a name nothing implements is still the program error the
+    // surrounding arm was written for.
+    let s = src("assert d.nosuch(2) else fail(\"o\")");
+    let msg = assert_invalid(&lower_src(&s).unwrap_err());
+    assert!(msg.contains("has no method `nosuch`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&s)).expect("v1 emits it");
+    assert!(
+        v1.contains("_tb.d.nosuch(2)"),
+        "v1 emits a call `Drv` has no member for: {v1}"
+    );
+}
+
+/// The hook-parameter guard on the four constant ROLES, and the
+/// negative-fold verdict — both added in response to review and
+/// neither pinned by anything, which review round three caught by
+/// deleting each and watching 482 tests stay green. That is the third
+/// time on this branch a guard has shipped unmeasured, in a commit
+/// written to answer a review that said exactly that.
+///
+/// A hook parameter beats a file-scope `const` of the same name. What
+/// v1 does with a per-call bound then depends on the ROLE, and a flat
+/// `Unsupported` for all four was a false escape hatch at two of them:
+///
+/// | coverpoint | v1 | verdict |
+/// |---|---|---|
+/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | `Unsupported` |
+/// | `cmd.ticks.trunc<k>()` | refuses: "requires a constant integer width" | `Rejects` |
+/// | `cmd.ticks.zext<k>()` | same refusal | `Rejects` |
+/// | `(cmd.ticks as uint<k>)` | `(uint64_t)(cmd.ticks)` — width dropped | `SilentlyMisLowers` |
+#[test]
+fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
+    let hooked = fixture("covergroup_hook_param_test.harc")
+        .replacen(
+            "        hookable run_for(cmd: RunCmd)",
+            "        hookable run_for(cmd: RunCmd, k: uint<8>)",
+            1,
+        )
+        .replacen(
+            "covergroup RunCmdCov @(drv.run_for(cmd) post)",
+            "covergroup RunCmdCov @(drv.run_for(cmd, k) post)",
+            1,
+        )
+        .replacen(
+            "            drv.run_for(cmd)",
+            "            drv.run_for(cmd, 3)",
+            1,
+        );
+    assert!(
+        hooked.contains("cmd: RunCmd, k: uint<8>") && hooked.contains("run_for(cmd, 3)"),
+        "the scalar hook parameter must actually be added"
+    );
+    let point = |t: &str| {
+        hooked.replacen(
+            "cp_ticks : cover cmd.ticks",
+            &format!("cp_ticks : cover {t}"),
+            1,
+        )
+    };
+
+    // The role v1 gets right keeps the suggestion…
+    let slice = point("cmd.ticks[k:0]");
+    let msg = assert_unsupported(&lower_src(&slice).unwrap_err());
+    assert!(msg.contains("bit-slice bound `k`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&slice)).expect("v1 emits the per-call bound");
+    assert!(
+        v1.contains("harc_bits(cmd.ticks, (uint32_t)(k)"),
+        "v1 emits the hook ARGUMENT as the bound: {v1}"
+    );
+    // …and it is a real hazard, not a hypothetical: an unrelated const
+    // of the same name must not capture it.
+    let msg = assert_unsupported(&lower_src(&format!("const k = 7\n\n{slice}")).unwrap_err());
+    assert!(
+        msg.contains("is a hook parameter"),
+        "a file-scope `const k` must not fold the bound to [7:0]: {msg}"
+    );
+
+    // The two roles v1 refuses…
+    for t in ["cmd.ticks.trunc<k>()", "cmd.ticks.zext<k>()"] {
+        let src = point(t);
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("width-method width `k`"), "`{t}`: {msg}");
+        let e = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses a non-const width");
+        assert!(
+            e.to_string().contains("requires a constant integer width"),
+            "`{t}`: {e}"
+        );
+    }
+
+    // …and the one it accepts while dropping the width on the floor.
+    let cast = point("(cmd.ticks as uint<k>)");
+    let msg = assert_not_implemented(
+        &lower_src(&cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width `k`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&cast)).expect("v1 emits it, width and all");
+    assert!(
+        !v1.contains("(uint32_t)(k)"),
+        "v1 never resolves a cast width: {v1}"
+    );
+}
+
+/// A NEGATIVE folded bound, which the constant fold made reachable
+/// (`[0 - 1]` was not a constant expression before it) and which a
+/// first version called `Invalid` — twenty lines above a table saying
+/// v1 compiles the equivalent.
+///
+/// `EOF` is `(-1)` on glibc, so `dut.lane_id_out[0 - 1]` and
+/// `dut.lane_id_out[EOF]` are the same C++ after preprocessing. v1
+/// emits both, both compile, both index at -1. One cannot be a program
+/// error while the other is a silent mis-lowering.
+#[test]
+fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert!(lanes.contains(LANE), "fixture shape changed");
+    let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
+
+    let mut v1_forms = Vec::new();
+    for (t, want) in [
+        ("dut.lane_id_out[0 - 1]", "lane_id_out[0 - 1]"),
+        ("dut.lane_id_out[EOF]", "lane_id_out[EOF]"),
+    ] {
+        let src = lane(t);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: {e}"));
+        assert!(v1.contains(want), "`{t}`: v1 emits `{want}`");
+        v1_forms.push(v1);
+    }
+    assert_eq!(
+        v1_forms[0].replace("[0 - 1]", "[EOF]"),
+        v1_forms[1],
+        "the two spellings differ only in the token, which is why they share a verdict"
+    );
+
+    // A negative WIDTH is a different role and takes that role's
+    // verdict, not the lane one.
+    let cov = fixture("cov_expr_targets_test.harc");
+    let msg = format!(
+        "{}",
+        lower_src(&cov.replacen(
+            "cover dut.count_out[3:0]\n",
+            "cover dut.count_out[3:0].sext<0 - 8>()\n",
+            1
+        ))
+        .unwrap_err()
+    );
+    assert!(msg.contains("width-method width -8"), "{msg}");
+}
+
 /// A width above 64 bits is REFUSED, not clamped — and an earlier
 /// version of this test asserted the clamp, on the argument that "a
 /// coverpoint samples 64 bits, so widening past it is the identity".
@@ -14831,7 +15110,10 @@ fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
     // input.
     let t = slice("dut.count_out[3:0].trunc<128>()");
     let msg = assert_invalid(&lower_src(&t).unwrap_err());
-    assert!(msg.contains("FEWER bits than its source"), "{msg}");
+    assert!(
+        msg.contains("width must be strictly less than the source width"),
+        "{msg}"
+    );
     let e = cpp_tb::emit(&merged_src(&t)).expect_err("v1 refuses it too");
     assert!(
         e.to_string()

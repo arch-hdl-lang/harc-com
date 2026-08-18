@@ -229,9 +229,15 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
                 // the covergroup is instantiated.
                 return Err(unsupported(
                     &format!("covergroup `{group}` hook trigger receiver"),
-                    "the receiver must be a field-access path (`drv` or `env.drv`); v1 only \
-                     checks the trigger where the covergroup is instantiated, so an \
-                     uninstantiated one builds under `--codegen v1`",
+                    // NOT "`drv` or `env.drv`", which the first
+                    // version suggested: a nested receiver is refused
+                    // by `covergroup_hooks` ("nested receiver paths are
+                    // not supported by the tbir backend") and by
+                    // `tbir::emit`'s single-segment rule. Advice has to
+                    // be something the compiler accepts.
+                    "the receiver must be a single component name (`drv`); v1 only checks \
+                     the trigger where the covergroup is instantiated, so an uninstantiated \
+                     one builds under `--codegen v1`",
                 ));
             }
         }
@@ -577,8 +583,15 @@ fn lower_point_target(
                 });
             }
             ExprKind::Cast { expr, ty } => {
-                let width = cover_cast_width(group, point, ty, consts, hook_params)?
-                    .ok_or_else(|| unsupported_target(cur))?;
+                let width = cover_cast_width(
+                    group,
+                    point,
+                    ty,
+                    consts,
+                    hook_params,
+                    CastWidthPolicy::Refuse,
+                )?
+                .ok_or_else(|| unsupported_target(cur))?;
                 let inner = lower_point_target(
                     group,
                     point,
@@ -719,22 +732,10 @@ fn lower_point_target(
                             "resize" => WidthCastKind::Resize,
                             _ => unreachable!(),
                         };
-                        if let Some(sw) = src_width {
-                            match kind {
-                                WidthCastKind::Trunc if width >= sw => {
-                                    return Err(LowerError::Invalid(format!(
-                                        "covergroup `{group}` point `{point}` `.trunc<{width}>()` on a {sw}-bit value: width must be strictly less than the source width"
-                                    )));
-                                }
-                                WidthCastKind::Zext | WidthCastKind::Sext if width < sw => {
-                                    return Err(LowerError::Invalid(format!(
-                                        "covergroup `{group}` point `{point}` `.{method}<{width}>()` on a {sw}-bit value: width must be >= the source width",
-                                        method = name.name
-                                    )));
-                                }
-                                _ => {}
-                            }
-                        }
+                        // (The direction check lives in
+                        // `cover_width_arg` now, so it runs for every
+                        // width rather than only the ones that get past
+                        // the 64-bit refusal.)
                         return Ok(Expr::WidthCast {
                             kind,
                             width,
@@ -1054,6 +1055,27 @@ impl ConstRole {
             ConstRole::CastWidth => "cast width",
         }
     }
+
+    /// What v1 does with a bound at this role that TB-IR cannot fold —
+    /// `None` when v1 handles it correctly and `--codegen v1` is a real
+    /// way out.
+    ///
+    /// Shared by every refusal path, because they kept drifting: the
+    /// unresolved-name path was role-aware from the start, and the
+    /// hook-parameter guard added later returned a flat `Unsupported`
+    /// for all four, which is a false escape hatch at two of them —
+    /// `cover cmd.ticks.trunc<k>()` is something v1 refuses outright.
+    fn v1_on_unfoldable(self) -> Option<V1Status> {
+        match self {
+            // v1 emits the bound verbatim and it works.
+            ConstRole::LaneIndex | ConstRole::SliceBound => None,
+            // "`.trunc<N>()` requires a constant integer width".
+            ConstRole::WidthArg => Some(V1Status::Rejects),
+            // v1 never resolves a cast width; it emits a plain 64-bit
+            // cast and the bad width reaches no diagnostic.
+            ConstRole::CastWidth => Some(V1Status::SilentlyMisLowers),
+        }
+    }
 }
 
 /// A constant in a coverpoint target — a `Vec` lane index, a slice
@@ -1095,32 +1117,77 @@ fn cover_const_u64(
     // cannot be folded at all — it refuses, and says which name it is
     // deferring to.
     if let Some(name) = first_hook_param(e, hook_params) {
-        return Err(unsupported(
-            &format!(
-                "covergroup `{group}` point `{point}` {} `{name}`",
-                role.name()
+        let what = format!(
+            "covergroup `{group}` point `{point}` {} `{name}`",
+            role.name()
+        );
+        return Err(match role.v1_on_unfoldable() {
+            None => unsupported(
+                &what,
+                format!(
+                    "`{name}` is a hook parameter, so the bound is only known per call; the \
+                     TB-IR cover model needs a static one, and v1 emits the argument"
+                ),
             ),
-            "`{name}` is a hook parameter, so the bound is only known per call; the TB-IR \
-             cover model needs a static one, and v1 emits the argument"
-                .replace("{name}", &name),
-        ));
+            Some(V1Status::Rejects) => not_implemented(
+                &what,
+                format!(
+                    "`{name}` is a hook parameter, so the width is only known per call; v1 \
+                     refuses it too (\"requires a constant integer width\")"
+                ),
+                V1Status::Rejects,
+            ),
+            Some(status) => not_implemented(
+                &what,
+                format!(
+                    "`{name}` is a hook parameter, so the width is only known per call; v1 \
+                     never resolves a cast width at all and emits a plain 64-bit cast, so \
+                     the per-call width reaches no diagnostic"
+                ),
+                status,
+            ),
+        });
     }
     match fold_const(e, consts, "") {
-        // A NEGATIVE fold is not a bound, at any of the four roles —
+        // A NEGATIVE fold is not a bound at any of the four roles —
         // there is no lane -1, no bit -1, and no cast to -1 bits. Left
         // unchecked, `[0 - 1]` folded to `u64::MAX` and TB-IR emitted
         // `dut->lane_id_out[18446744073709551615]` with no diagnostic
         // and a clean `verify_program`. Before the fold went in, `0 -
-        // 1` was not a constant expression at all and the user got an
-        // error, so this is the fold's own hole and it closes here.
+        // 1` was not a constant expression at all, so this is the
+        // fold's own hole.
         //
         // This is also the only reader of `ConstVal::signed` on this
         // path: the bit pattern alone cannot tell -1 from `u64::MAX`.
-        Ok(v) if v.is_negative() => Err(LowerError::Invalid(format!(
-            "covergroup `{group}` point `{point}` {} is negative ({})",
-            role.name(),
-            v.as_i64()
-        ))),
+        //
+        // NOT `Invalid`, though a first version said so — and it said
+        // so 20 lines above a table recording that v1 COMPILES the
+        // equivalent. `EOF` is `(-1)` on glibc, so `[0 - 1]` and
+        // `[EOF]` are the same C++ after preprocessing: v1 emits
+        // `dut->lane_id_out[0 - 1]` and `dut->lane_id_out[EOF]`, both
+        // compile, both index at -1. Calling one a program error and
+        // the other a silent mis-lowering could not both be right.
+        Ok(v) if v.is_negative() => Err(match role.v1_on_unfoldable() {
+            None => not_implemented(
+                &format!(
+                    "covergroup `{group}` point `{point}` {} {}",
+                    role.name(),
+                    v.as_i64()
+                ),
+                "v1 emits the negative bound verbatim and compiles, so the point samples at \
+                 a position nobody wrote",
+                V1Status::SilentlyMisLowers,
+            ),
+            Some(status) => not_implemented(
+                &format!(
+                    "covergroup `{group}` point `{point}` {} {}",
+                    role.name(),
+                    v.as_i64()
+                ),
+                "a width is never negative",
+                status,
+            ),
+        }),
         Ok(v) => Ok(v.bits),
         Err(err) => Err(cover_const_refusal(group, point, role, e, consts, err)),
     }
@@ -1153,6 +1220,8 @@ fn cover_const_refusal(
 ) -> LowerError {
     let what = format!("covergroup `{group}` point `{point}` {}", role.name());
     if let Some(name) = first_unresolved_name(e, consts) {
+        // Same per-role table as `v1_on_unfoldable`, spelled out here
+        // because each row also carries its own DETAIL.
         return match role {
             ConstRole::LaneIndex | ConstRole::SliceBound => not_implemented(
                 &format!("{what} `{name}`"),
@@ -1309,6 +1378,35 @@ fn cover_width_arg(
             "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
         )));
     }
+    // DIRECTION FIRST, for every width. This check used to live at the
+    // lowering site below the `>64` refusal, so it was unreachable for
+    // exactly the widths that need it most: `[100:0].zext<70>()` is a
+    // narrowing `zext`, v1 refuses it in plain words ("width must be
+    // ≥ the source width"), and TB-IR was answering "re-run with
+    // `--codegen v1`". Retracting the clamp turned a silent acceptance
+    // into a false escape hatch rather than into an honest verdict —
+    // the same defect class the retraction was written to remove.
+    if let Some(sw) = src_width {
+        let wrong_direction = match method {
+            "trunc" => width >= sw,
+            "zext" | "sext" | "resize" => width < sw,
+            _ => false,
+        };
+        if wrong_direction {
+            // Phrased as v1 phrases it, so a user who re-runs under
+            // `--codegen v1` reads the same sentence twice rather than
+            // wondering whether the two backends disagree.
+            let rule = if method == "trunc" {
+                "width must be strictly less than the source width"
+            } else {
+                "width must be >= the source width"
+            };
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{group}` point `{point}` `.{method}<{width}>()` on a \
+                 {sw}-bit value: {rule}"
+            )));
+        }
+    }
     if width > 64 {
         // NOT clamped, and an earlier version of this arm clamped it —
         // "a coverpoint samples 64 bits, so widening past it is the
@@ -1327,40 +1425,34 @@ fn cover_width_arg(
         // every value whose low nibble has bit 3 set. So the honest
         // answer is the one the arm gave before: refuse, and point at
         // the backend that gets it right.
-        // `trunc` narrows, so whether v1 accepts it at all depends on
-        // the SOURCE width, not on 64: "width must be strictly less
-        // than the source width (otherwise it's a no-op or
-        // wrong-direction)". With a known narrower source that is a
-        // program error under both backends — measured on
-        // `dut.count_out[3:0].trunc<128>()`, which v1 refuses in those
-        // words. With an unknown or wider source v1 emits
-        // `harc_trunc_u128` and compiles, so the suggestion holds.
-        //
-        // The first version of this arm said `Rejects` for every
-        // `trunc` above 64, on the strength of the 4-bit probe alone —
-        // one input standing in for a rule it does not cover.
-        if method == "trunc" {
-            if let Some(sw) = src_width {
-                if width >= sw {
-                    return Err(LowerError::Invalid(format!(
-                        "covergroup `{group}` point `{point}` `.trunc<{width}>()` on a \
-                         {sw}-bit value: a truncation must name FEWER bits than its source"
-                    )));
-                }
-            }
-            return Err(unsupported(
-                &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
-                "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \
-                 intermediate",
-            ));
-        }
+        // What is left after the direction check is a cast v1 really
+        // does build: `harc_trunc_u128` / `harc_sext_u128` /
+        // `(_harc_u128)`, all of which compile and keep the extra bits.
         return Err(unsupported(
             &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
-            "the TB-IR covergroup expression model is 64-bit; v1 widens through \
-             `_harc_u128` and keeps the extra bits",
+            "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \
+             intermediate and keeps the extra bits",
         ));
     }
     Ok(width)
+}
+
+/// Whether a `>64` cast width is a refusal or just a number.
+///
+/// It has to be both. Refusing is right where the cast is LOWERED —
+/// TB-IR cannot model the value. But `cover_infer_expr_width` asks the
+/// same question to feed the width-method DIRECTION check, and
+/// refusing there hid the more accurate error: `(dut.count_out as
+/// uint<128>).zext<100>()` reported the 128-bit cast with "re-run with
+/// `--codegen v1`", when v1 refuses that program outright for
+/// narrowing a `zext`. Reporting a construct v1 does support, on a
+/// program v1 rejects, is a false escape hatch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastWidthPolicy {
+    /// Lowering: a width TB-IR cannot model is an error here.
+    Refuse,
+    /// Width inference: report the number and let the caller judge.
+    Report,
 }
 
 fn cover_cast_width(
@@ -1369,6 +1461,7 @@ fn cover_cast_width(
     ty: &crate::ast::TypeExpr,
     consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
+    policy: CastWidthPolicy,
 ) -> Result<Option<u32>, LowerError> {
     let width = match ty {
         crate::ast::TypeExpr::Builtin {
@@ -1396,7 +1489,7 @@ fn cover_cast_width(
                 "covergroup `{group}` point `{point}` cast width must be greater than zero"
             )));
         }
-        if width > 64 {
+        if width > 64 && policy == CastWidthPolicy::Refuse {
             // Same reason the width methods above refuse rather than
             // clamp: v1 keeps the extra bits and a slice can read them.
             //
@@ -1443,24 +1536,38 @@ fn cover_infer_expr_width(
             }
             Ok(Some(hi - lo + 1))
         }
-        ExprKind::Cast { ty, .. } => cover_cast_width(group, point, ty, consts, hook_params),
+        ExprKind::Cast { ty, .. } => cover_cast_width(
+            group,
+            point,
+            ty,
+            consts,
+            hook_params,
+            CastWidthPolicy::Report,
+        ),
         ExprKind::Call { callee, args } => {
-            if let ExprKind::Field { name, .. } = &*callee.kind {
+            if let ExprKind::Field { target, name } = &*callee.kind {
                 if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
                     let width_expr = match args.first() {
                         Some(crate::ast::CallArg::Expr(e)) if args.len() == 1 => e,
                         _ => return Ok(None),
                     };
-                    // No source width here: `cover_infer_expr_width`
-                    // is asking what this node's width IS, so the
-                    // receiver's is not yet known at this call. The
-                    // direction check belongs to the lowering site
-                    // above, which has both.
+                    // The receiver's width IS available here — it is
+                    // `callee`'s own target — and passing `None`
+                    // instead meant a NESTED width method lost the
+                    // direction check: `[3:0].trunc<128>()` is
+                    // `Invalid` on its own and became "re-run with
+                    // `--codegen v1`" the moment anything wrapped it
+                    // (`.trunc<128>().zext<128>()`), for the same inner
+                    // program v1 refuses either way. A slice or a cast
+                    // wrapper kept the right answer; only this path
+                    // lost it.
+                    let recv_width =
+                        cover_infer_expr_width(group, point, target, consts, hook_params)?;
                     return Ok(Some(cover_width_arg(
                         group,
                         point,
                         &name.name,
-                        None,
+                        recv_width,
                         width_expr,
                         consts,
                         hook_params,
