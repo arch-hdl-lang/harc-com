@@ -1,0 +1,99 @@
+// Issue #534: direct analysis-source transactor bindings retain their
+// active/passive mode. The active-only surface runs/registers only for the
+// active instance; the always-on analysis port still fans out for both.
+
+transactor ModeRelay
+    observed     : out event<uint<8>>
+    published    : uint<32> default 0
+    active_calls : uint<32> default 0
+    active_ticks : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        published = published + 1
+        emit observed(v)
+    end publish
+
+    when active
+        hookable activate()
+            active_calls = active_calls + 1
+        end activate
+
+        on 1 cycles
+            active_ticks = active_ticks + 1
+        end on
+    end when
+end transactor ModeRelay
+
+scoreboard ModeSink
+    count : uint<32> default 0
+    sum   : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+        sum = sum + v
+    end accept
+end scoreboard ModeSink
+
+testbench AnalysisSourceModeTb
+    dut           : Top
+    active_relay  : ModeRelay active
+    passive_a     : ModeRelay passive
+    passive_b     : ModeRelay passive
+    active_sink   : ModeSink
+    passive_a_one : ModeSink
+    passive_a_two : ModeSink
+    passive_b_sink : ModeSink
+
+    connect
+        active_relay.observed -> active_sink.accept
+        passive_a.observed -> passive_a_one.accept
+        passive_a.observed -> passive_a_two.accept
+        passive_b.observed -> passive_b_sink.accept
+    end connect
+end testbench AnalysisSourceModeTb
+
+impl AnalysisSourceModeTest for AnalysisSourceModeTb
+    run
+        active_relay.activate()
+        active_relay.publish(3)
+        passive_a.publish(5)
+        passive_b.publish(7)
+        wait 3 cycles
+
+        assert active_relay.published == 1
+        assert passive_a.published == 1
+        assert passive_b.published == 1
+        assert active_relay.active_calls == 1
+        assert active_relay.active_ticks > 0
+        assert passive_a.active_calls == 0
+        assert passive_b.active_calls == 0
+        assert passive_a.active_ticks == 0
+        assert passive_b.active_ticks == 0
+        assert active_sink.count == 1
+        assert active_sink.sum == 3
+        assert passive_a_one.count == 1
+        assert passive_a_two.count == 1
+        assert passive_a_one.sum == 5
+        assert passive_a_two.sum == 5
+        assert passive_b_sink.count == 1
+        assert passive_b_sink.sum == 7
+        log(info, "ALL TESTS PASSED - analysis-source mode contract")
+    end run
+end impl AnalysisSourceModeTest
+
+// A second implementation proves the reusable testbench gets fresh state.
+impl AnalysisSourceModeFreshTest for AnalysisSourceModeTb
+    run
+        assert active_relay.published == 0
+        assert passive_a.published == 0
+        assert passive_b.published == 0
+        assert active_relay.active_calls == 0
+        assert passive_a.active_calls == 0
+        assert passive_b.active_calls == 0
+        assert active_sink.count == 0
+        assert passive_a_one.count == 0
+        assert passive_a_two.count == 0
+        assert passive_b_sink.count == 0
+        log(info, "ALL TESTS PASSED - analysis-source mode state starts fresh")
+    end run
+end impl AnalysisSourceModeFreshTest

@@ -23,12 +23,12 @@
 use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, Direction, ExprKind,
-    HookableMethod, TransactorDecl, TypeArg, TypeExpr,
+    HookableMethod, TransactorDecl, TransactorMode, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentKindTag, ComponentMethodSchema,
-    ComponentSchema, ConnectEdgeSchema, EventPayload, FunctionId, FunctionKind, IrType, RecordId,
-    ScoreboardId, TbFunction, Terminator, TypedParam,
+    Activation, ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentInstanceMode,
+    ComponentKindTag, ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload,
+    FunctionId, FunctionKind, IrType, RecordId, ScoreboardId, TbFunction, Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -160,6 +160,37 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
     // lockstep with `transactor_is_dut_poking_bfm` (the classifier that
     // feeds the `active`-mode gate).
     env_held && has_hookable && has_module_field && !has_event
+}
+
+/// True for the reusable analysis-source form addressed by issue #534:
+/// an unbound transactor with an output event surface and no module/DUT
+/// handle. It is stored as a `ComponentSchema`, but its instance mode is
+/// still a source-language transactor property.
+pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
+    if t.bound_to.is_some() {
+        return false;
+    }
+    let mut has_event = false;
+    let mut has_named_field = false;
+    for it in t.items.iter().chain(t.when_active.iter().flatten()) {
+        if let ComponentItem::Field(f) = it {
+            if is_event_field(f) {
+                has_event = true;
+            } else if matches!(&f.ty, TypeExpr::Named { .. }) {
+                has_named_field = true;
+            }
+        }
+    }
+    has_event && !has_named_field
+}
+
+/// Whether an analysis-source transactor has behavior or storage whose
+/// availability depends on the instance mode.
+pub(crate) fn transactor_has_mode_sensitive_analysis_surface(t: &TransactorDecl) -> bool {
+    transactor_is_analysis_source(t)
+        && t.when_active
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
 }
 
 /// True when a transactor routes to the COMPONENT path purely as a
@@ -488,8 +519,8 @@ pub(crate) fn lower_component_schema(
     // subscribes to (field lookup needs the full field set). Event-
     // subscription (`on ev(arg)`) and periodic (`on N cycles`) forms are
     // split so each reserves its FunctionId in the right contiguous block.
-    let mut on_asts: Vec<&crate::ast::OnHandler> = Vec::new();
-    let mut periodic_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    let mut on_asts: Vec<(&crate::ast::OnHandler, Activation)> = Vec::new();
+    let mut periodic_asts: Vec<(&crate::ast::OnHandler, Activation)> = Vec::new();
     // Cycle-trigger handlers (`on <bool-expr> ... end on`) — the monitor
     // half. Distinguished from event-subscription `on ev(arg)` by the
     // trigger expression shape (a non-`Call`, or a `Call` whose callee is
@@ -498,9 +529,9 @@ pub(crate) fn lower_component_schema(
     // bus.<ch>.handshake(arg)` handshake-monitor (`None` for an agent-mode
     // raw-signal `on <bool-expr>`); a monitor handler synthesizes its
     // `valid && ready` trigger + payload capture in pass 2.
-    let mut cycle_asts: Vec<(&crate::ast::OnHandler, Option<String>)> = Vec::new();
+    let mut cycle_asts: Vec<(&crate::ast::OnHandler, Option<String>, Activation)> = Vec::new();
     // At most one `watchdog` per component (the second is rejected).
-    let mut watchdog_ast: Option<&crate::ast::WatchdogDecl> = None;
+    let mut watchdog_ast: Option<(&crate::ast::WatchdogDecl, Activation)> = None;
     // An event-driven transactor may carry a module-typed DUT handle field
     // (`dut : AxiLiteRegs`); a Named non-component type is then a DUT
     // pointer rather than an unknown sub-component. Only transactors host
@@ -512,139 +543,170 @@ pub(crate) fn lower_component_schema(
     // serves it — v1 emits the target actor for that shape, and the
     // component arms must not claim otherwise.
     let is_bound_transactor = matches!(src, CompSource::Transactor(t) if t.bound_to.is_some());
-    for it in items.iter().chain(when_active.into_iter().flatten()) {
-        match it {
-            ComponentItem::Field(f) => {
-                let fk = lower_field(
-                    name,
-                    f,
-                    ids,
-                    scoreboard_ids,
-                    record_ids,
-                    is_transactor,
-                    consts,
-                    declared_types,
-                )?;
-                if fields.iter().any(|x| x.name == f.name.name) {
-                    return Err(LowerError::Invalid(format!(
-                        "component `{name}` declares field `{}` more than once",
-                        f.name.name
-                    )));
+    for (activation, body) in std::iter::once((Activation::Always, items)).chain(
+        when_active
+            .iter()
+            .map(|active_items| (Activation::ActiveOnly, *active_items)),
+    ) {
+        for it in body {
+            match it {
+                ComponentItem::Field(f) => {
+                    let fk = lower_field(
+                        name,
+                        f,
+                        ids,
+                        scoreboard_ids,
+                        record_ids,
+                        is_transactor,
+                        consts,
+                        declared_types,
+                    )?;
+                    if fields.iter().any(|x| x.name == f.name.name) {
+                        return Err(LowerError::Invalid(format!(
+                            "component `{name}` declares field `{}` more than once",
+                            f.name.name
+                        )));
+                    }
+                    fields.push(ComponentFieldSchema {
+                        name: f.name.name.clone(),
+                        kind: fk,
+                        activation,
+                    });
                 }
-                fields.push(ComponentFieldSchema {
-                    name: f.name.name.clone(),
-                    kind: fk,
-                });
-            }
-            ComponentItem::Hookable(h) => {
-                let param_names: Vec<String> =
-                    h.params.iter().map(|p| p.name.name.clone()).collect();
-                let param_tys = h
-                    .params
-                    .iter()
-                    .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids))
-                    .collect();
-                let has_ret = h.return_ty.is_some();
-                let ret_ty = h
-                    .return_ty
-                    .as_ref()
-                    .map(|t| method_schema_ir_type(Some(t), ids, record_ids));
-                let fid = FunctionId(*next_fn);
-                *next_fn += 1;
-                methods.push(ComponentMethodSchema {
-                    name: h.name.name.clone(),
-                    function: fid,
-                    param_tys,
-                    param_names,
-                    has_ret,
-                    ret_ty,
-                    hookable: h.is_hookable,
-                    cov_hook_subs: Vec::new(),
-                });
-            }
-            // Connect blocks are resolved separately (env-binding stage).
-            ComponentItem::Connect(_) => {}
-            ComponentItem::Lifecycle(..) => {}
-            ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push(h),
-            // `on bus.<ch>.handshake(arg)` — the passive bus-monitor half
-            // of a bound transactor (v1's `emit_bound_monitor_actors`).
-            // Collected into `on_asts` like every other non-periodic
-            // handler; the classification loop below desugars it into a
-            // cycle-trigger handler. Keeping all non-periodic handlers in
-            // one source-ordered list is what lets pass-1 FunctionId
-            // reservation and pass-2 body lowering re-classify identically.
-            ComponentItem::OnHandler(h) => on_asts.push(h),
-            ComponentItem::Watchdog(w) => {
-                if watchdog_ast.is_some() {
+                ComponentItem::Hookable(h) => {
+                    let param_names: Vec<String> =
+                        h.params.iter().map(|p| p.name.name.clone()).collect();
+                    let param_tys = h
+                        .params
+                        .iter()
+                        .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids))
+                        .collect();
+                    let has_ret = h.return_ty.is_some();
+                    let ret_ty = h
+                        .return_ty
+                        .as_ref()
+                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids));
+                    let fid = FunctionId(*next_fn);
+                    *next_fn += 1;
+                    methods.push(ComponentMethodSchema {
+                        name: h.name.name.clone(),
+                        function: fid,
+                        param_tys,
+                        param_names,
+                        has_ret,
+                        ret_ty,
+                        hookable: h.is_hookable,
+                        cov_hook_subs: Vec::new(),
+                        activation,
+                    });
+                }
+                // Connect ownership is modeled only for env/agent and
+                // reusable-testbench composition. A transactor-owned block
+                // used to be silently discarded here, including inside
+                // `when active`; reject it until that ownership has an IR
+                // representation with activation provenance.
+                ComponentItem::Connect(_) if is_transactor => {
+                    let placement = if matches!(activation, Activation::ActiveOnly) {
+                        " inside `when active`"
+                    } else {
+                        ""
+                    };
                     return Err(unsupported(
-                        &format!("a second `watchdog` on `{name}`"),
-                        "a component may declare at most one `watchdog`",
+                        &format!("a `connect` declaration{placement} on transactor `{name}`"),
+                        "connect declarations are supported on env, agent, and testbench composition, not on analysis-source transactors",
                     ));
                 }
-                watchdog_ast = Some(w);
-            }
+                // Testbench lifecycle blocks are parser-restricted already;
+                // retain a precise lowerer guard for malformed AST input.
+                ComponentItem::Lifecycle(..) if is_transactor => {
+                    return Err(unsupported(
+                        &format!("a lifecycle declaration on transactor `{name}`"),
+                        "lifecycle declarations are supported only on testbench composition",
+                    ));
+                }
+                // Connect blocks are resolved separately (env-binding stage).
+                ComponentItem::Connect(_) | ComponentItem::Lifecycle(..) => {}
+                ComponentItem::OnHandler(h) if h.periodic => periodic_asts.push((h, activation)),
+                // `on bus.<ch>.handshake(arg)` — the passive bus-monitor half
+                // of a bound transactor (v1's `emit_bound_monitor_actors`).
+                // Collected into `on_asts` like every other non-periodic
+                // handler; the classification loop below desugars it into a
+                // cycle-trigger handler. Keeping all non-periodic handlers in
+                // one source-ordered list is what lets pass-1 FunctionId
+                // reservation and pass-2 body lowering re-classify identically.
+                ComponentItem::OnHandler(h) => on_asts.push((h, activation)),
+                ComponentItem::Watchdog(w) => {
+                    if watchdog_ast.is_some() {
+                        return Err(unsupported(
+                            &format!("a second `watchdog` on `{name}`"),
+                            "a component may declare at most one `watchdog`",
+                        ));
+                    }
+                    watchdog_ast = Some((w, activation));
+                }
 
-            // Two variants shared one message and one classification.
-            // Only the first is probed at THIS landing, so only the first
-            // is reclassified — the second keeps what it had rather than
-            // inheriting a verdict it did not earn.
-            // A `thread` on a BOUND transactor is the construct working
-            // as designed — `emit_bound_tlm_target_actors` emits the
-            // target actor for it, and this component path is reached
-            // only because the transactor also has a non-periodic `on`
-            // handler. v1 is a real escape hatch, so it keeps
-            // `Unsupported` and the `--codegen v1` pointer with it.
-            //
-            // The first version of this split reclassified the whole arm
-            // from a probe that only ever put a `thread` on an env.
-            ComponentItem::TargetTlmThread(_) if is_bound_transactor => {
-                return Err(unsupported(
-                    &format!(
-                        "a `thread` item on bound transactor `{name}` reached through the \
-                         component path"
-                    ),
-                    "the target actor lowers on the transactor path; this component path is \
-                     taken because the transactor also has a non-periodic `on` handler",
-                ));
-            }
-            ComponentItem::TargetTlmThread(_) => {
-                // v1 accepts a `thread` on an env/agent/scoreboard and
-                // emits the component struct WITHOUT it: no
-                // `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no
-                // serving coroutine. The target never serves, silently.
+                // Two variants shared one message and one classification.
+                // Only the first is probed at THIS landing, so only the first
+                // is reclassified — the second keeps what it had rather than
+                // inheriting a verdict it did not earn.
+                // A `thread` on a BOUND transactor is the construct working
+                // as designed — `emit_bound_tlm_target_actors` emits the
+                // target actor for it, and this component path is reached
+                // only because the transactor also has a non-periodic `on`
+                // handler. v1 is a real escape hatch, so it keeps
+                // `Unsupported` and the `--codegen v1` pointer with it.
                 //
-                // Anchored in both directions, because "v1's output did
-                // not change" is not by itself evidence of dropping —
-                // an unbound `thread` emits nothing under v1 wherever it
-                // sits, so the first probe proved nothing. Against
-                // `tlm_target_thread_test`, where the transactor IS
-                // bus-bound, removing the thread DOES change v1's output
-                // (it loses the ThreadSlot and the coroutine); moving
-                // that same thread into an `env` adds only an empty
-                // `struct WrapEnv { ... }`.
-                return Err(not_implemented(
-                    &format!("a `thread` item in component `{name}`"),
-                    "a target-serving `thread` belongs on a `transactor ... bound to <bus>`; on \
-                     an env/agent/scoreboard v1 emits the component without it, so the target \
-                     silently never serves",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            // NOT probed at this landing. v1's handling of `apply`
-            // differs by position and by whether the named package is
-            // declared — in a test body a declared package is rejected
-            // while an undeclared name is accepted — so the component
-            // landing needs its own anchored probe before any claim
-            // about v1 is made here.
-            ComponentItem::Apply(_) => {
-                // Detail deliberately says nothing about WHERE to put it:
-                // test scope rejects `apply` too (`TestItem::Apply` in
-                // `mod.rs`), so naming that scope would send the user
-                // somewhere that also fails.
-                return Err(unsupported(
-                    &format!("an `apply` item in component `{name}`"),
-                    "",
-                ));
+                // The first version of this split reclassified the whole arm
+                // from a probe that only ever put a `thread` on an env.
+                ComponentItem::TargetTlmThread(_) if is_bound_transactor => {
+                    return Err(unsupported(
+                        &format!(
+                            "a `thread` item on bound transactor `{name}` reached through the \
+                             component path"
+                        ),
+                        "the target actor lowers on the transactor path; this component path is \
+                         taken because the transactor also has a non-periodic `on` handler",
+                    ));
+                }
+                ComponentItem::TargetTlmThread(_) => {
+                    // v1 accepts a `thread` on an env/agent/scoreboard and
+                    // emits the component struct WITHOUT it: no
+                    // `harc_rt::ThreadSlot`, no `sched.slots.push_back`, no
+                    // serving coroutine. The target never serves, silently.
+                    //
+                    // Anchored in both directions, because "v1's output did
+                    // not change" is not by itself evidence of dropping —
+                    // an unbound `thread` emits nothing under v1 wherever it
+                    // sits, so the first probe proved nothing. Against
+                    // `tlm_target_thread_test`, where the transactor IS
+                    // bus-bound, removing the thread DOES change v1's output
+                    // (it loses the ThreadSlot and the coroutine); moving
+                    // that same thread into an `env` adds only an empty
+                    // `struct WrapEnv { ... }`.
+                    return Err(not_implemented(
+                        &format!("a `thread` item in component `{name}`"),
+                        "a target-serving `thread` belongs on a `transactor ... bound to <bus>`; on \
+                         an env/agent/scoreboard v1 emits the component without it, so the target \
+                         silently never serves",
+                        V1Status::SilentlyMisLowers,
+                    ));
+                }
+                // NOT probed at this landing. v1's handling of `apply`
+                // differs by position and by whether the named package is
+                // declared — in a test body a declared package is rejected
+                // while an undeclared name is accepted — so the component
+                // landing needs its own anchored probe before any claim
+                // about v1 is made here.
+                ComponentItem::Apply(_) => {
+                    // Detail deliberately says nothing about WHERE to put it:
+                    // test scope rejects `apply` too (`TestItem::Apply` in
+                    // `mod.rs`), so naming that scope would send the user
+                    // somewhere that also fails.
+                    return Err(unsupported(
+                        &format!("an `apply` item in component `{name}`"),
+                        "",
+                    ));
+                }
             }
         }
     }
@@ -700,7 +762,7 @@ pub(crate) fn lower_component_schema(
     // The first form reserves a FunctionId here; cycle-triggers reserve
     // theirs AFTER the periodic block (kept contiguous for pass 2).
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
-    for h in &on_asts {
+    for (h, activation) in &on_asts {
         if is_bus_handshake_monitor(h) {
             // `on bus.<ch>.handshake(arg)` — desugars to a cycle-trigger
             // handler (valid && ready, rising edge) observing the bound
@@ -721,7 +783,7 @@ pub(crate) fn lower_component_schema(
                     "the trigger must be `bus.<channel>.handshake(<arg>)`",
                 )
             })?;
-            cycle_asts.push((h, Some(channel)));
+            cycle_asts.push((h, Some(channel), *activation));
         } else if is_event_subscription(h, &fields) {
             let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
             let fid = FunctionId(*next_fn);
@@ -730,9 +792,10 @@ pub(crate) fn lower_component_schema(
                 event,
                 arg_payload,
                 function: fid,
+                activation: *activation,
             });
         } else {
-            cycle_asts.push((h, None));
+            cycle_asts.push((h, None, *activation));
         }
     }
 
@@ -742,7 +805,7 @@ pub(crate) fn lower_component_schema(
     // The period expression lowers in pass 2 (it may reference component
     // fields); pass 1 records a placeholder.
     let mut periodic_handlers: Vec<crate::ir::PeriodicHandlerSchema> = Vec::new();
-    for h in &periodic_asts {
+    for (h, activation) in &periodic_asts {
         validate_periodic_handler(name, h)?;
         let fid = FunctionId(*next_fn);
         *next_fn += 1;
@@ -750,6 +813,7 @@ pub(crate) fn lower_component_schema(
             period: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
             function: fid,
             phase: crate::ir::HandlerPhase::from_ast(h.phase),
+            activation: *activation,
         });
     }
 
@@ -759,7 +823,7 @@ pub(crate) fn lower_component_schema(
     // cycle-trigger → watchdog). The trigger predicate lowers in pass 2
     // (it reads DUT/component fields); pass 1 records a placeholder.
     let mut cycle_handlers: Vec<crate::ir::CycleTriggerHandlerSchema> = Vec::new();
-    for (h, monitor_channel) in &cycle_asts {
+    for (h, monitor_channel, activation) in &cycle_asts {
         validate_cycle_handler(name, h)?;
         let fid = FunctionId(*next_fn);
         *next_fn += 1;
@@ -776,6 +840,7 @@ pub(crate) fn lower_component_schema(
             edge,
             function: fid,
             monitor_channel: monitor_channel.clone(),
+            activation: *activation,
         });
     }
 
@@ -784,21 +849,33 @@ pub(crate) fn lower_component_schema(
     // return). The body FunctionId is reserved LAST; period/max_idle
     // lower in pass 2.
     let watchdog = match watchdog_ast {
-        Some(w) if !w.disabled => {
+        Some((w, activation)) if !w.disabled => {
             let fid = FunctionId(*next_fn);
             *next_fn += 1;
             Some(crate::ir::WatchdogSchema {
                 period: None,   // pass 2 fills from `w.period`
                 max_idle: None, // pass 2 fills from `w.max_idle`
                 function: fid,
+                activation,
             })
         }
         _ => None,
     };
 
+    let instance_mode_policy = match src {
+        CompSource::Transactor(t)
+            if transactor_is_analysis_source(t)
+                && !transactor_has_mode_sensitive_analysis_surface(t) =>
+        {
+            crate::ir::ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+        }
+        _ => crate::ir::ComponentInstanceModePolicy::Standard,
+    };
+
     Ok(ComponentSchema {
         name: name.to_string(),
         kind,
+        instance_mode_policy,
         fields,
         methods,
         // Connects resolved in a third pass once all schemas exist.
@@ -809,6 +886,73 @@ pub(crate) fn lower_component_schema(
         watchdog,
         bound_bus,
     })
+}
+
+/// Reject source shapes whose parsed mode annotation would otherwise be
+/// representable in TB-IR but meaningless: only transactor children may carry
+/// an explicit active/passive override, and only transactors may declare a
+/// `when active` member. The verifier repeats these checks for mutated IR.
+pub(crate) fn validate_mode_metadata(components: &[ComponentSchema]) -> Result<(), LowerError> {
+    for component in components {
+        let active_member = component
+            .fields
+            .iter()
+            .any(|field| matches!(field.activation, Activation::ActiveOnly))
+            || component
+                .methods
+                .iter()
+                .any(|method| matches!(method.activation, Activation::ActiveOnly))
+            || component
+                .on_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || component
+                .periodic_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || component
+                .cycle_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || component
+                .watchdog
+                .as_ref()
+                .is_some_and(|handler| matches!(handler.activation, Activation::ActiveOnly));
+        if active_member && !matches!(component.kind, ComponentKindTag::Transactor) {
+            return Err(LowerError::Invalid(format!(
+                "{} `{}` declares active-only members, but only transactors have an active surface",
+                component.kind.keyword(),
+                component.name
+            )));
+        }
+        for field in &component.fields {
+            let ComponentFieldKind::Sub {
+                component: child,
+                mode: Some(_),
+            } = &field.kind
+            else {
+                continue;
+            };
+            let child_schema = components.get(child.index()).ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "{} `{}` field `{}` references missing component c{}",
+                    component.kind.keyword(),
+                    component.name,
+                    field.name,
+                    child.0
+                ))
+            })?;
+            if !matches!(child_schema.kind, ComponentKindTag::Transactor) {
+                return Err(LowerError::Invalid(format!(
+                    "a transactor mode on {} field `{}.{}`",
+                    child_schema.kind.keyword(),
+                    component.name,
+                    field.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True when `h` is an `on <event>(arg)` self-event subscription: its
@@ -1138,7 +1282,7 @@ fn lower_field(
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
         }
-        TypeExpr::Named { name, .. } => {
+        TypeExpr::Named { name, mode, .. } => {
             if f.direction.is_some() {
                 return Err(unsupported(
                     &format!("a directional named-type field `{comp}.{fname}`"),
@@ -1152,12 +1296,25 @@ fn lower_field(
             // sub-component (a quiesce leaf) — mirrors v1, which holds the
             // board struct inside the env by value.
             if let Some(sid) = scoreboard_ids.get(simple) {
+                if mode.is_some() {
+                    return Err(LowerError::Invalid(format!(
+                        "a transactor mode on data scoreboard field `{comp}.{fname}`"
+                    )));
+                }
                 return Ok(ComponentFieldKind::ScoreboardSub { scoreboard: *sid });
             }
             // A known component type is a nested sub-component (`source :
             // AnalysisSource`).
             if let Some(cid) = ids.get(simple) {
-                return Ok(ComponentFieldKind::Sub { component: *cid });
+                let mode = match mode {
+                    Some(TransactorMode::Active) => Some(ComponentInstanceMode::Active),
+                    Some(TransactorMode::Passive) => Some(ComponentInstanceMode::Passive),
+                    None => None,
+                };
+                return Ok(ComponentFieldKind::Sub {
+                    component: *cid,
+                    mode,
+                });
             }
             // A record type held BY VALUE. The standalone-transactor
             // path lowers this to `StateFieldKind::Record`, but a
@@ -1277,6 +1434,7 @@ pub(crate) fn lower_component_bodies(
             funcs.push(lower_method_body(
                 h,
                 m.function,
+                m.activation,
                 cid,
                 ctx,
                 helpers,
@@ -1316,8 +1474,15 @@ pub(crate) fn lower_component_bodies(
             }
             let ph = &schema.periodic_handlers[per_idx];
             per_idx += 1;
-            let (body, period) =
-                lower_periodic_body(h, ph.function, cid, ctx, helpers, side_tables)?;
+            let (body, period) = lower_periodic_body(
+                h,
+                ph.function,
+                ph.activation,
+                cid,
+                ctx,
+                helpers,
+                side_tables,
+            )?;
             funcs.push(body);
             periodic_periods.push(period);
         }
@@ -1339,13 +1504,22 @@ pub(crate) fn lower_component_bodies(
                     h,
                     channel,
                     ch.function,
+                    ch.activation,
                     cid,
                     ctx,
                     helpers,
                     side_tables,
                 )?
             } else {
-                lower_cycle_body(h, ch.function, cid, ctx, helpers, side_tables)?
+                lower_cycle_body(
+                    h,
+                    ch.function,
+                    ch.activation,
+                    cid,
+                    ctx,
+                    helpers,
+                    side_tables,
+                )?
             };
             funcs.push(body);
             cycle_triggers.push(trigger);
@@ -1360,8 +1534,15 @@ pub(crate) fn lower_component_bodies(
                 if w.disabled {
                     continue;
                 }
-                let (body, period, max_idle) =
-                    lower_watchdog_body(w, ws.function, cid, ctx, helpers, side_tables)?;
+                let (body, period, max_idle) = lower_watchdog_body(
+                    w,
+                    ws.function,
+                    ws.activation,
+                    cid,
+                    ctx,
+                    helpers,
+                    side_tables,
+                )?;
                 funcs.push(body);
                 watchdog_clauses = Some((period, max_idle));
                 break;
@@ -1384,6 +1565,7 @@ pub(crate) fn lower_component_bodies(
 fn lower_cycle_body(
     h: &crate::ast::OnHandler,
     fid: FunctionId,
+    activation: Activation,
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1391,6 +1573,7 @@ fn lower_cycle_body(
 ) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(activation, Activation::ActiveOnly);
     // `lower_expr` (NOT `_no_ports`): the trigger renders standalone in the
     // per-instance `_checkers` closure, never appended to this body, so it
     // must not hoist a port read into a body-only temp local (that local
@@ -1448,6 +1631,7 @@ fn lower_monitor_handshake_body(
     h: &crate::ast::OnHandler,
     channel: &str,
     fid: FunctionId,
+    activation: Activation,
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1485,6 +1669,7 @@ fn lower_monitor_handshake_body(
 
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(activation, Activation::ActiveOnly);
 
     // Capture the channel payload BEFORE the user body (the payload is
     // valid in the cycle valid && ready holds). The bound `arg` local is
@@ -1535,6 +1720,7 @@ fn lower_monitor_handshake_body(
 fn lower_periodic_body(
     h: &crate::ast::OnHandler,
     fid: FunctionId,
+    activation: Activation,
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1542,6 +1728,7 @@ fn lower_periodic_body(
 ) -> Result<(TbFunction, crate::ir::Expr), LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(activation, Activation::ActiveOnly);
     // The period is `h.event` in the periodic form (parser stashes the
     // cycle count there). Lower with `lower_expr` (NOT `_no_ports`): the
     // period is rendered standalone in the per-instance `_checkers`
@@ -1572,6 +1759,7 @@ fn lower_periodic_body(
 fn lower_watchdog_body(
     w: &crate::ast::WatchdogDecl,
     fid: FunctionId,
+    activation: Activation,
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1579,6 +1767,7 @@ fn lower_watchdog_body(
 ) -> Result<(TbFunction, Option<crate::ir::Expr>, Option<crate::ir::Expr>), LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(activation, Activation::ActiveOnly);
     // `lower_expr` (NOT `_no_ports`): period/max_idle render standalone in
     // the per-instance `_checkers` closure, never appended to this body —
     // hoisting a port read into a body-only temp would dangle in the
@@ -1619,6 +1808,7 @@ fn lower_on_handler_body(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(oh.activation, Activation::ActiveOnly);
     // The handler's single argument (from `on <event>(<arg>)`). The
     // param type mirrors the subscribed event's payload: a scalar
     // (signed per the schema) or a value-record (so `t.field` reads in
@@ -1787,6 +1977,7 @@ fn method_schema_ir_type(
 fn lower_method_body(
     h: &HookableMethod,
     fid: FunctionId,
+    activation: Activation,
     cid: ComponentId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
@@ -1794,6 +1985,7 @@ fn lower_method_body(
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
+    b.self_component_active_only = matches!(activation, Activation::ActiveOnly);
     // Bind parameters as the first locals (the run/check convention: a
     // LocalId < params.len() *is* the i-th param). Same shape as a
     // transactor method body.
@@ -1956,11 +2148,11 @@ where
     // Resolve the source sub-component and verify it exposes `src_event`.
     let src_cid = resolve_path(src_path)?;
     let src_comp = &components[src_cid.index()];
-    let src_payload = match src_comp.field(&src_event) {
+    let (src_payload, src_activation) = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { payload },
+            kind: ComponentFieldKind::Event { payload }, activation,
             ..
-        }) => *payload,
+        }) => (*payload, *activation),
         _ => {
             return Err(unsupported(
                 &format!(
@@ -1977,7 +2169,7 @@ where
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
     let sink_cid = resolve_path(sink_path)?;
     let sink_comp = &components[sink_cid.index()];
-    let sink = if let Some(sm) = sink_comp.method(&sink_name) {
+    let (sink, sink_activation) = if let Some(sm) = sink_comp.method(&sink_name) {
         if !sm.hookable {
             return Err(unsupported(
                 &format!(
@@ -2015,9 +2207,12 @@ where
                 "source and sink payloads must have the same signed scalar shape or record type",
             ));
         }
-        crate::ir::ConnectSink::Method { method: sink_name }
+        (
+            crate::ir::ConnectSink::Method { method: sink_name },
+            sm.activation,
+        )
     } else if let Some(ComponentFieldSchema {
-        kind: ComponentFieldKind::Event { payload },
+        kind: ComponentFieldKind::Event { payload }, activation,
         ..
     }) = sink_comp.field(&sink_name)
     {
@@ -2031,7 +2226,10 @@ where
                 "source and sink event payloads must have the same signed scalar shape or record type",
             ));
         }
-        crate::ir::ConnectSink::Event { event: sink_name }
+        (
+            crate::ir::ConnectSink::Event { event: sink_name },
+            *activation,
+        )
     } else {
         return Err(unsupported(
             &format!(
@@ -2046,9 +2244,11 @@ where
     Ok(ConnectEdgeSchema {
         src_path: src_path.to_vec(),
         src_event,
+        src_activation,
         sink_path: sink_path.to_vec(),
         sink_component: sink_cid,
         sink,
+        sink_activation,
     })
 }
 
@@ -2058,7 +2258,10 @@ fn resolve_testbench_path(
     path: &[String],
 ) -> Result<ComponentId, LowerError> {
     let Some((root, tail)) = path.split_first() else {
-        return Err(unsupported("an empty testbench `connect` component path", ""));
+        return Err(unsupported(
+            "an empty testbench `connect` component path",
+            "",
+        ));
     };
     let cid = roots.get(root).copied().ok_or_else(|| {
         unsupported(
@@ -2108,7 +2311,7 @@ fn resolve_sub_path(
             )
         })?;
         match &f.kind {
-            ComponentFieldKind::Sub { component } => {
+            ComponentFieldKind::Sub { component, .. } => {
                 cid = Some(*component);
                 cur = &components[component.index()];
             }
@@ -2444,7 +2647,7 @@ impl super::FuncBuilder<'_> {
                     }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
-                    if comp.method(&method).is_none() {
+                    let Some(method_schema) = comp.method(&method) else {
                         return Err(unsupported(
                             &format!(
                                 "component `{}` has no method `{method}` (in `{}`)",
@@ -2453,7 +2656,15 @@ impl super::FuncBuilder<'_> {
                             ),
                             "",
                         ));
-                    }
+                    };
+                    self.require_component_activation(
+                        &path[0],
+                        head_cid,
+                        &recv[1..],
+                        method_schema.activation,
+                        "method",
+                        &method,
+                    )?;
                     return Ok(Some((ComponentBase::Path(recv.to_vec()), cid, method)));
                 }
             }
@@ -2462,7 +2673,8 @@ impl super::FuncBuilder<'_> {
         if let ExprKind::Ident(id) = &*callee.kind {
             if let Some(cid) = self.self_component {
                 let comp = &self.ctx.components[cid.index()];
-                if comp.method(&id.name).is_some() {
+                if let Some(method) = comp.method(&id.name) {
+                    self.require_self_activation(method.activation, "method", &id.name)?;
                     return Ok(Some((ComponentBase::SelfField, cid, id.name.clone())));
                 }
             }
@@ -2513,7 +2725,7 @@ impl super::FuncBuilder<'_> {
                 if self.lookup(&sub.name).is_none() {
                     if let Some(self_cid) = self.self_component {
                         let comp = &self.ctx.components[self_cid.index()];
-                        if let Some(ComponentFieldKind::Sub { component }) =
+                        if let Some(ComponentFieldKind::Sub { component, .. }) =
                             comp.field(&sub.name).map(|f| &f.kind)
                         {
                             let sub_comp = &self.ctx.components[component.index()];
@@ -2568,15 +2780,15 @@ impl super::FuncBuilder<'_> {
             if self.lookup(&qid.name).is_none() {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
-                    if matches!(
-                        comp.field(&qid.name).map(|f| &f.kind),
-                        Some(ComponentFieldKind::Queue { .. })
-                    ) {
-                        return Ok(Some((
-                            ComponentBase::SelfField,
-                            qid.name.clone(),
-                            method.name.clone(),
-                        )));
+                    if let Some(field) = comp.field(&qid.name) {
+                        if matches!(field.kind, ComponentFieldKind::Queue { .. }) {
+                            self.require_self_activation(field.activation, "queue", &qid.name)?;
+                            return Ok(Some((
+                                ComponentBase::SelfField,
+                                qid.name.clone(),
+                                method.name.clone(),
+                            )));
+                        }
                     }
                 }
             }
@@ -2603,12 +2815,20 @@ impl super::FuncBuilder<'_> {
         }
         let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
         let comp = &self.ctx.components[cid.index()];
-        if !matches!(
-            comp.field(&queue).map(|f| &f.kind),
-            Some(ComponentFieldKind::Queue { .. })
-        ) {
+        let Some(field) = comp.field(&queue) else {
+            return Ok(None);
+        };
+        if !matches!(field.kind, ComponentFieldKind::Queue { .. }) {
             return Ok(None);
         }
+        self.require_component_activation(
+            &recv[0],
+            head_cid,
+            &recv[1..],
+            field.activation,
+            "queue",
+            &queue,
+        )?;
         Ok(Some((
             ComponentBase::Path(recv.to_vec()),
             queue,
@@ -2647,7 +2867,7 @@ impl super::FuncBuilder<'_> {
         }
         let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
         let comp = &self.ctx.components[cid.index()];
-        let Some(ComponentFieldKind::Sub { component }) = comp.field(&field).map(|f| &f.kind)
+        let Some(ComponentFieldKind::Sub { component, .. }) = comp.field(&field).map(|f| &f.kind)
         else {
             return Ok(false);
         };
@@ -2758,7 +2978,7 @@ impl super::FuncBuilder<'_> {
             } else if let Some(self_cid) = self.self_component {
                 let comp = &self.ctx.components[self_cid.index()];
                 match comp.field(&path[0]).map(|f| &f.kind) {
-                    Some(ComponentFieldKind::Sub { component }) => (
+                    Some(ComponentFieldKind::Sub { component, .. }) => (
                         *component,
                         vec!["self".to_string(), path[0].clone()],
                         &path[1..],
@@ -2817,11 +3037,11 @@ impl super::FuncBuilder<'_> {
             if self.lookup(&id.name).is_none() {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
-                    if matches!(
-                        comp.field(&id.name).map(|f| &f.kind),
-                        Some(ComponentFieldKind::Scalar { .. })
-                    ) {
-                        return Ok(Some((ComponentBase::SelfField, id.name.clone())));
+                    if let Some(field) = comp.field(&id.name) {
+                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                            self.require_self_activation(field.activation, "field", &id.name)?;
+                            return Ok(Some((ComponentBase::SelfField, id.name.clone())));
+                        }
                     }
                 }
             }
@@ -2842,8 +3062,18 @@ impl super::FuncBuilder<'_> {
                     }
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
-                    match comp.field(&field).map(|f| &f.kind) {
-                        Some(ComponentFieldKind::Scalar { .. }) => {
+                    match comp.field(&field) {
+                        Some(schema)
+                            if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) =>
+                        {
+                            self.require_component_activation(
+                                &base_head[0],
+                                head_cid,
+                                recv_tail,
+                                schema.activation,
+                                "field",
+                                &field,
+                            )?;
                             let mut base = base_head;
                             base.extend_from_slice(recv_tail);
                             return Ok(Some((ComponentBase::Path(base), field)));
@@ -2874,14 +3104,14 @@ impl super::FuncBuilder<'_> {
             if self.lookup(&id.name).is_none() {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
-                    if matches!(
-                        comp.field(&id.name).map(|f| &f.kind),
-                        Some(ComponentFieldKind::Scalar { .. })
-                    ) {
-                        return Ok(Some(IrExpr::ComponentField {
-                            base: ComponentBase::SelfField,
-                            field: id.name.clone(),
-                        }));
+                    if let Some(field) = comp.field(&id.name) {
+                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                            self.require_self_activation(field.activation, "field", &id.name)?;
+                            return Ok(Some(IrExpr::ComponentField {
+                                base: ComponentBase::SelfField,
+                                field: id.name.clone(),
+                            }));
+                        }
                     }
                 }
             }
@@ -2900,16 +3130,23 @@ impl super::FuncBuilder<'_> {
                     }
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
-                    if matches!(
-                        comp.field(&field).map(|f| &f.kind),
-                        Some(ComponentFieldKind::Scalar { .. })
-                    ) {
-                        let mut base = base_head;
-                        base.extend_from_slice(recv_tail);
-                        return Ok(Some(IrExpr::ComponentField {
-                            base: ComponentBase::Path(base),
-                            field,
-                        }));
+                    if let Some(schema) = comp.field(&field) {
+                        if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) {
+                            self.require_component_activation(
+                                &base_head[0],
+                                head_cid,
+                                recv_tail,
+                                schema.activation,
+                                "field",
+                                &field,
+                            )?;
+                            let mut base = base_head;
+                            base.extend_from_slice(recv_tail);
+                            return Ok(Some(IrExpr::ComponentField {
+                                base: ComponentBase::Path(base),
+                                field,
+                            }));
+                        }
                     }
                 }
             }
@@ -2982,7 +3219,7 @@ impl super::FuncBuilder<'_> {
         for (i, seg) in segs.iter().enumerate() {
             let comp = &self.ctx.components[cid.index()];
             match comp.field(seg).map(|f| &f.kind) {
-                Some(ComponentFieldKind::Sub { component }) => cid = *component,
+                Some(ComponentFieldKind::Sub { component, .. }) => cid = *component,
                 Some(ComponentFieldKind::ScoreboardSub { .. }) => {
                     return i == segs.len() - 1;
                 }
@@ -3004,7 +3241,7 @@ impl super::FuncBuilder<'_> {
         for seg in segs {
             let comp = &self.ctx.components[cid.index()];
             match comp.field(seg).map(|f| &f.kind) {
-                Some(ComponentFieldKind::Sub { component }) => cid = *component,
+                Some(ComponentFieldKind::Sub { component, .. }) => cid = *component,
                 _ => {
                     return Err(unsupported(
                         &format!("`{seg}` is not a sub-component of `{}`", comp.name),
@@ -3014,6 +3251,98 @@ impl super::FuncBuilder<'_> {
             }
         }
         Ok(cid)
+    }
+
+    /// Resolve the inherited/overridden transactor mode at a component
+    /// receiver. Structural components preserve inherited context while a
+    /// transactor field consumes an explicit override or requires one from
+    /// its parent/root.
+    fn resolve_component_mode(
+        &self,
+        head_name: &str,
+        head: ComponentId,
+        segs: &[String],
+    ) -> Result<Option<ComponentInstanceMode>, LowerError> {
+        let inherited = self.ctx.component_modes.get(head_name).copied().flatten();
+        if matches!(
+            self.ctx.components[head.index()].kind,
+            crate::ir::ComponentKindTag::Transactor
+        ) && inherited.is_none()
+        {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{head_name}` has no effective active/passive mode"
+            )));
+        }
+        let resolved = crate::ir::resolve_component_path_mode(
+            &self.ctx.components,
+            head,
+            inherited,
+            segs,
+        )
+        .map_err(|err| match err {
+            crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
+                unsupported(&err.to_string(), "")
+            }
+            _ => LowerError::Invalid(err.to_string()),
+        })?;
+        let target = &self.ctx.components[resolved.component.index()];
+        if matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
+            && target.requires_instance_mode()
+            && resolved.effective_mode.is_none()
+        {
+            let path = std::iter::once(head_name)
+                .chain(segs.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(LowerError::Invalid(format!(
+                "transactor path `{path}` has no effective active/passive mode"
+            )));
+        }
+        Ok(matches!(
+            target.kind,
+            crate::ir::ComponentKindTag::Transactor
+        )
+        .then_some(resolved.effective_mode)
+        .flatten())
+    }
+
+    fn require_component_activation(
+        &self,
+        head_name: &str,
+        head: ComponentId,
+        segs: &[String],
+        activation: Activation,
+        member_kind: &str,
+        member: &str,
+    ) -> Result<(), LowerError> {
+        if matches!(activation, Activation::Always) {
+            return Ok(());
+        }
+        let mode = self.resolve_component_mode(head_name, head, segs)?;
+        if !matches!(mode, Some(ComponentInstanceMode::Active)) {
+            let path = std::iter::once(head_name)
+                .chain(segs.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(".");
+            return Err(LowerError::Invalid(format!(
+                "active-only {member_kind} `{member}` is used through passive transactor `{path}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_self_activation(
+        &self,
+        activation: Activation,
+        member_kind: &str,
+        member: &str,
+    ) -> Result<(), LowerError> {
+        if matches!(activation, Activation::ActiveOnly) && !self.self_component_active_only {
+            return Err(LowerError::Invalid(format!(
+                "always-on component body cannot access active-only {member_kind} `{member}`"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve the first segment of a component path. Test-scope paths
@@ -3029,7 +3358,7 @@ impl super::FuncBuilder<'_> {
         let self_cid = self.self_component?;
         let comp = &self.ctx.components[self_cid.index()];
         match comp.field(&path[0]).map(|f| &f.kind) {
-            Some(ComponentFieldKind::Sub { component }) => Some((
+            Some(ComponentFieldKind::Sub { component, .. }) => Some((
                 *component,
                 vec!["self".to_string(), path[0].clone()],
                 &path[1..],
@@ -3178,8 +3507,17 @@ impl super::FuncBuilder<'_> {
                 let event = segs.last().unwrap().clone();
                 let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                 let comp = &self.ctx.components[cid.index()];
-                match comp.field(&event).map(|f| &f.kind) {
-                    Some(ComponentFieldKind::Event { .. }) => {}
+                match comp.field(&event) {
+                    Some(field) if matches!(field.kind, ComponentFieldKind::Event { .. }) => {
+                        self.require_component_activation(
+                            &head,
+                            head_cid,
+                            &recv[1..],
+                            field.activation,
+                            "event",
+                            &event,
+                        )?;
+                    }
                     _ => {
                         return Err(unsupported(
                             &format!(
@@ -3272,8 +3610,10 @@ impl super::FuncBuilder<'_> {
         }
         let event = name.segments[0].name.clone();
         let comp = &self.ctx.components[cid.index()];
-        match comp.field(&event).map(|f| &f.kind) {
-            Some(ComponentFieldKind::Event { .. }) => {}
+        match comp.field(&event) {
+            Some(field) if matches!(field.kind, ComponentFieldKind::Event { .. }) => {
+                self.require_self_activation(field.activation, "event", &event)?;
+            }
             _ => {
                 return Err(unsupported(
                     &format!("`emit {event}` — not an `event` field of `{}`", comp.name),
@@ -3453,7 +3793,7 @@ impl super::FuncBuilder<'_> {
         let mut found_sub = false;
         for f in &comp.fields {
             match &f.kind {
-                ComponentFieldKind::Sub { component } => {
+                ComponentFieldKind::Sub { component, .. } => {
                     found_sub = true;
                     let mut sub_path = inst_path.clone();
                     sub_path.push(f.name.clone());

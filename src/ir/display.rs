@@ -82,6 +82,18 @@ impl Display for TbProgram {
             for (field, x) in &tb.transactor_fields {
                 write!(f, " xactor {field}=x{}", x.0)?;
             }
+            for binding in &tb.component_fields {
+                let mode = match binding.mode {
+                    Some(ComponentInstanceMode::Active) => " active",
+                    Some(ComponentInstanceMode::Passive) => " passive",
+                    None => "",
+                };
+                write!(
+                    f,
+                    " component {}=c{}{}",
+                    binding.field, binding.component.0, mode
+                )?;
+            }
             for b in &tb.regblock_bindings {
                 write!(
                     f,
@@ -268,19 +280,35 @@ impl Display for TbProgram {
                         };
                         format!("out event<{inner}>")
                     }
-                    ComponentFieldKind::Sub { component } => format!("sub c{}", component.0),
+                    ComponentFieldKind::Sub { component, mode } => format!(
+                        "sub c{}{}",
+                        component.0,
+                        match mode {
+                            Some(ComponentInstanceMode::Active) => " active",
+                            Some(ComponentInstanceMode::Passive) => " passive",
+                            None => "",
+                        }
+                    ),
                     ComponentFieldKind::Dut { dut_type } => format!("dut {dut_type}"),
                     ComponentFieldKind::ScoreboardSub { scoreboard } => {
                         format!("sub scoreboard sb{}", scoreboard.0)
                     }
                 };
-                writeln!(f, "    field {} : {desc}", fld.name)?;
+                let activation = match fld.activation {
+                    crate::ir::Activation::Always => "",
+                    crate::ir::Activation::ActiveOnly => " active-only",
+                };
+                writeln!(f, "    field {}{activation} : {desc}", fld.name)?;
             }
             for m in &c.methods {
                 writeln!(
                     f,
-                    "    method {}({} arg{}){} = fn{}",
+                    "    method {}{}({} arg{}){} = fn{}",
                     m.name,
+                    match m.activation {
+                        crate::ir::Activation::Always => "",
+                        crate::ir::Activation::ActiveOnly => " active-only",
+                    },
                     m.param_names.len(),
                     if m.param_names.len() == 1 { "" } else { "s" },
                     if m.has_ret { " -> ret" } else { "" },
@@ -311,8 +339,12 @@ impl Display for TbProgram {
                 };
                 writeln!(
                     f,
-                    "    on {} cycles{phase} = fn{}",
+                    "    on {} cycles{phase}{} = fn{}",
                     expr_str_for_component(self, ph.function, &ph.period),
+                    match ph.activation {
+                        crate::ir::Activation::Always => "",
+                        crate::ir::Activation::ActiveOnly => " active-only",
+                    },
                     ph.function.0
                 )?;
             }
@@ -325,15 +357,23 @@ impl Display for TbProgram {
                 if let Some(channel) = &ch.monitor_channel {
                     writeln!(
                         f,
-                        "    on bus.{channel}.handshake [{}] ({edge}) = fn{}",
+                        "    on bus.{channel}.handshake [{}] ({edge}){} = fn{}",
                         expr_str_for_component(self, ch.function, &ch.trigger),
+                        match ch.activation {
+                            crate::ir::Activation::Always => "",
+                            crate::ir::Activation::ActiveOnly => " active-only",
+                        },
                         ch.function.0
                     )?;
                 } else {
                     writeln!(
                         f,
-                        "    on {} ({edge}) = fn{}",
+                        "    on {} ({edge}){} = fn{}",
                         expr_str_for_component(self, ch.function, &ch.trigger),
+                        match ch.activation {
+                            crate::ir::Activation::Always => "",
+                            crate::ir::Activation::ActiveOnly => " active-only",
+                        },
                         ch.function.0
                     )?;
                 }
@@ -351,7 +391,11 @@ impl Display for TbProgram {
                     .unwrap_or_else(|| "default".to_string());
                 writeln!(
                     f,
-                    "    watchdog period {period} max_idle {max_idle} = fn{}",
+                    "    watchdog period {period} max_idle {max_idle}{} = fn{}",
+                    match w.activation {
+                        crate::ir::Activation::Always => "",
+                        crate::ir::Activation::ActiveOnly => " active-only",
+                    },
                     w.function.0
                 )?;
             }

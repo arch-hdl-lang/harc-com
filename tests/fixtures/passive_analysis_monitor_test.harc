@@ -36,10 +36,10 @@
 // the assertions below.
 //
 // It does NOT prove the annotation is otherwise observable, and no test
-// could: `passive` and no-mode-at-all lower byte-identically here (the
-// gate at `src/ir/lower/mod.rs` accepts both and records neither), so
-// nothing downstream can distinguish them. `passive` is an ownership
-// annotation for the reader and for v1 parity, not a lowering input.
+// could: `passive` and no-mode-at-all select identical behavior here.
+// TB-IR retains the annotation as diagnostic binding metadata, but no
+// method, state, fanout, or emitted runtime behavior depends on it.
+// `passive` is an ownership annotation for the reader and for v1 parity.
 // The mode rules themselves are pinned in `tests/tbir.rs`, including
 // that `active` is still rejected.
 

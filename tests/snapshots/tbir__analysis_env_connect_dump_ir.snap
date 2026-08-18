@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 AnalysisSinkConnectTest_tb (synthetic) { dut: Top }
+  testbench tb0 AnalysisSinkConnectTest_tb (synthetic) { dut: Top } component env=c3
   test AnalysisSinkConnectTest tb=tb0 run=fn3 check=-
   component c0 AnalysisSource (transactor)
     field observed : out event<uint>
@@ -17,7 +17,7 @@ tb-ir program
     field sum : scalar = 0
     method sample_obs(1 arg) = fn2
   component c3 AnalysisEnv (env)
-    field source : sub c0
+    field source : sub c0 passive
     field sb : sub c1
     field cov : sub c2
     connect source.observed -> sb.write_obs (method) (c1)

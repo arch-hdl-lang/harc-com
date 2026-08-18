@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 HeartbeatIdleTb { dut: Top }
+  testbench tb0 HeartbeatIdleTb { dut: Top } component prod=c0
   test HeartbeatIdleTest tb=tb0 run=fn1 check=- clock=clk@10000ps(SysDomain)
   record r0 TinyTxn
     tag : uint<8>

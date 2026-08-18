@@ -734,6 +734,10 @@ pub struct ComponentSchema {
     /// Source keyword, for diagnostics + dump-ir (`env`/`scoreboard`/
     /// `transactor`).
     pub kind: ComponentKindTag,
+    /// Binding rule that remains meaningful even when the schema has no
+    /// active-only member. In particular, an always-on analysis monitor may
+    /// be modeless or passive, but an explicitly active monitor is invalid.
+    pub instance_mode_policy: ComponentInstanceModePolicy,
     pub fields: Vec<ComponentFieldSchema>,
     /// Methods in declaration order. Each has one lowered `TbFunction`
     /// (`kind: ComponentMethod`) whose body addresses fields self-
@@ -786,6 +790,46 @@ pub struct ComponentSchema {
     pub bound_bus: Option<String>,
 }
 
+/// The source-level ownership mode of a component-path transactor binding.
+/// Structural components may carry this only as inherited context for a nested
+/// transactor; they never gain an active surface themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComponentInstanceMode {
+    Active,
+    Passive,
+}
+
+/// Per-schema rule for explicit instance-mode annotations. Most component
+/// schemas use `Standard`; only always-on analysis monitors reject an
+/// explicitly active binding because it selects no source-level behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentInstanceModePolicy {
+    Standard,
+    AlwaysOnAnalysisMonitor,
+}
+
+impl ComponentInstanceMode {
+    pub fn includes(self, activation: Activation) -> bool {
+        matches!(activation, Activation::Always) || matches!(self, ComponentInstanceMode::Active)
+    }
+}
+
+/// Whether an optional effective instance mode exposes a member with this
+/// activation. A missing mode never exposes an active-only member.
+pub fn component_mode_includes_activation(
+    mode: Option<ComponentInstanceMode>,
+    activation: Activation,
+) -> bool {
+    matches!(activation, Activation::Always) || mode.is_some_and(|mode| mode.includes(activation))
+}
+
+/// Whether a component member came from the ordinary body or `when active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    Always,
+    ActiveOnly,
+}
+
 /// One `on <N> cycles ... end on` periodic handler (spec §7.10). Fires
 /// its body once every `period` primary-clock cycles. The codegen
 /// installs a `_checkers` closure that compares `cycle_count` against a
@@ -804,6 +848,8 @@ pub struct PeriodicHandlerSchema {
     /// dispatches from `_post_eval_services` (after the DUT posedge eval, so
     /// the body observes freshly-clocked DUT outputs in the same cycle).
     pub phase: HandlerPhase,
+    /// `when active` provenance for per-instance registration.
+    pub activation: Activation,
 }
 
 /// One `on <bool-expr> ... end on` cycle-trigger handler (spec §7.x
@@ -844,6 +890,8 @@ pub struct CycleTriggerHandlerSchema {
     /// latch (see `mod::emit_lifecycle_checkers`), NOT the `edge` field — for
     /// a monitor channel the stored `edge` (`Rising`) is vestigial.
     pub monitor_channel: Option<String>,
+    /// `when active` provenance for per-instance registration.
+    pub activation: Activation,
 }
 
 /// Edge mode for a cycle-trigger handler — mirrors `ast::EdgeMode` in the
@@ -913,6 +961,8 @@ pub struct WatchdogSchema {
     /// Lowered watchdog body (`kind: ComponentMethod`, zero params —
     /// `self` only), run before the idle check on each firing.
     pub function: FunctionId,
+    /// `when active` provenance for per-instance registration.
+    pub activation: Activation,
 }
 
 impl ComponentSchema {
@@ -922,6 +972,232 @@ impl ComponentSchema {
     pub fn method(&self, name: &str) -> Option<&ComponentMethodSchema> {
         self.methods.iter().find(|m| m.name == name)
     }
+
+    /// Whether this schema contains behavior or storage selected by an
+    /// instance's active/passive mode.
+    pub fn has_active_surface(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| matches!(field.activation, Activation::ActiveOnly))
+            || self
+                .methods
+                .iter()
+                .any(|method| matches!(method.activation, Activation::ActiveOnly))
+            || self
+                .on_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .periodic_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .cycle_handlers
+                .iter()
+                .any(|handler| matches!(handler.activation, Activation::ActiveOnly))
+            || self
+                .watchdog
+                .as_ref()
+                .is_some_and(|handler| matches!(handler.activation, Activation::ActiveOnly))
+    }
+
+    /// Whether an instance binding must carry a resolved mode. Connect edges
+    /// are included for transactors because an active-only endpoint changes
+    /// per-instance registration, even when no owned field/function is active.
+    pub fn requires_instance_mode(&self) -> bool {
+        matches!(self.kind, ComponentKindTag::Transactor)
+            && (self.has_active_surface()
+                || self.connects.iter().any(|edge| {
+                    matches!(edge.src_activation, Activation::ActiveOnly)
+                        || matches!(edge.sink_activation, Activation::ActiveOnly)
+                }))
+    }
+}
+
+/// The component and effective transactor mode reached by a path through
+/// by-value component fields. Structural components preserve their inherited
+/// context; a transactor field may replace it with its declared mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedComponentPath {
+    pub component: ComponentId,
+    pub effective_mode: Option<ComponentInstanceMode>,
+}
+
+/// A malformed component path or illegal structural mode encountered while
+/// resolving an instance path. Lowering maps these to source diagnostics;
+/// verification and codegen use the same policy to protect mutated IR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentPathResolutionError {
+    MissingComponent(ComponentId),
+    NotSubcomponent { component: String, segment: String },
+    StructuralMode { kind: ComponentKindTag, segment: String },
+    UnresolvedMode { path: String },
+    ForbiddenActiveMode { path: String },
+}
+
+impl std::fmt::Display for ComponentPathResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingComponent(component) => write!(f, "missing component c{}", component.0),
+            Self::NotSubcomponent { component, segment } => {
+                write!(f, "`{segment}` is not a sub-component of `{component}`")
+            }
+            Self::StructuralMode { kind, segment } => {
+                write!(f, "a transactor mode on {} field `{segment}`", kind.keyword())
+            }
+            Self::UnresolvedMode { path } => {
+                write!(f, "transactor path `{path}` has no effective active/passive mode")
+            }
+            Self::ForbiddenActiveMode { path } => write!(
+                f,
+                "an explicit `active` mode on always-on analysis monitor `{path}` is invalid"
+            ),
+        }
+    }
+}
+
+/// Resolve one component instance path for every consumer of mode metadata.
+/// This is the sole traversal policy for lowering access checks, verifier
+/// integrity checks, and TB-IR registration emission.
+pub fn resolve_component_path_mode(
+    components: &[ComponentSchema],
+    start: ComponentId,
+    inherited: Option<ComponentInstanceMode>,
+    path: &[String],
+) -> Result<ResolvedComponentPath, ComponentPathResolutionError> {
+    let mut component = start;
+    let mut effective_mode = inherited;
+    for segment in path {
+        let schema = components
+            .get(component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(component))?;
+        let field = schema.field(segment).ok_or_else(|| {
+            ComponentPathResolutionError::NotSubcomponent {
+                component: schema.name.clone(),
+                segment: segment.clone(),
+            }
+        })?;
+        let ComponentFieldKind::Sub {
+            component: child,
+            mode: declared_mode,
+        } = &field.kind
+        else {
+            return Err(ComponentPathResolutionError::NotSubcomponent {
+                component: schema.name.clone(),
+                segment: segment.clone(),
+            });
+        };
+        let child_schema = components
+            .get(child.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(*child))?;
+        if matches!(child_schema.kind, ComponentKindTag::Transactor) {
+            effective_mode = (*declared_mode).or(effective_mode);
+        } else if declared_mode.is_some() {
+            return Err(ComponentPathResolutionError::StructuralMode {
+                kind: child_schema.kind,
+                segment: segment.clone(),
+            });
+        }
+        component = *child;
+    }
+    if components.get(component.index()).is_none() {
+        return Err(ComponentPathResolutionError::MissingComponent(component));
+    }
+    Ok(ResolvedComponentPath {
+        component,
+        effective_mode,
+    })
+}
+
+/// Validate that every reachable transactor with a mode-sensitive surface has
+/// an effective mode. The traversal is type/mode memoized so malformed
+/// recursive schemas cannot make verifier or lowering validation recurse
+/// forever.
+pub fn validate_component_binding_modes(
+    components: &[ComponentSchema],
+    bindings: &[ComponentFieldBinding],
+) -> Result<(), ComponentPathResolutionError> {
+    fn visit(
+        components: &[ComponentSchema],
+        component: ComponentId,
+        inherited: Option<ComponentInstanceMode>,
+        path: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<(ComponentId, Option<ComponentInstanceMode>)>,
+    ) -> Result<(), ComponentPathResolutionError> {
+        let schema = components
+            .get(component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(component))?;
+        if schema.requires_instance_mode() && inherited.is_none() {
+            return Err(ComponentPathResolutionError::UnresolvedMode {
+                path: path.join("."),
+            });
+        }
+        if !visited.insert((component, inherited)) {
+            return Ok(());
+        }
+        for field in &schema.fields {
+            let ComponentFieldKind::Sub {
+                component: child,
+                mode: declared_mode,
+            } = &field.kind
+            else {
+                continue;
+            };
+            path.push(field.name.clone());
+            let child_schema = components
+                .get(child.index())
+                .ok_or(ComponentPathResolutionError::MissingComponent(*child))?;
+            if matches!(
+                child_schema.instance_mode_policy,
+                ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+            ) && matches!(declared_mode, Some(ComponentInstanceMode::Active))
+            {
+                return Err(ComponentPathResolutionError::ForbiddenActiveMode {
+                    path: path.join("."),
+                });
+            }
+            let resolved = resolve_component_path_mode(
+                components,
+                component,
+                inherited,
+                std::slice::from_ref(&field.name),
+            )?;
+            visit(
+                components,
+                resolved.component,
+                resolved.effective_mode,
+                path,
+                visited,
+            )?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    for binding in bindings {
+        let schema = components
+            .get(binding.component.index())
+            .ok_or(ComponentPathResolutionError::MissingComponent(binding.component))?;
+        if matches!(
+            schema.instance_mode_policy,
+            ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
+        ) && matches!(binding.mode, Some(ComponentInstanceMode::Active))
+        {
+            return Err(ComponentPathResolutionError::ForbiddenActiveMode {
+                path: binding.field.clone(),
+            });
+        }
+        let mut path = vec![binding.field.clone()];
+        visit(
+            components,
+            binding.component,
+            binding.mode,
+            &mut path,
+            &mut visited,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,6 +1233,8 @@ impl ComponentKindTag {
 pub struct ComponentFieldSchema {
     pub name: String,
     pub kind: ComponentFieldKind,
+    /// The source body that declared this field.
+    pub activation: Activation,
 }
 
 #[derive(Debug, Clone)]
@@ -977,7 +1255,11 @@ pub enum ComponentFieldKind {
     /// `source : AnalysisSource passive` / `sb : AnalysisSb` — a nested
     /// by-value sub-component. `component` indexes
     /// `TbProgram::components`.
-    Sub { component: ComponentId },
+    Sub {
+        component: ComponentId,
+        /// Explicit nested transactor override, if present in source.
+        mode: Option<ComponentInstanceMode>,
+    },
     /// `dut : AxiLiteRegs` — the module-typed DUT handle field on an
     /// event-driven transactor (consumer side). Lowers to a
     /// `V<dut_type>* <name> = nullptr;` pointer member; the test binds it
@@ -1035,6 +1317,8 @@ pub struct ComponentMethodSchema {
     /// Covergroup auto-samplers that subscribe to this component method's
     /// pre/post hook boundary (`covergroup G @(sb.observe(t) post)`).
     pub cov_hook_subs: Vec<(CovgroupId, crate::ast::HookSide)>,
+    /// `when active` provenance for call validation and hook registration.
+    pub activation: Activation,
 }
 
 /// One `on <event>(arg) ... end on` handler on an agent (or other
@@ -1053,6 +1337,8 @@ pub struct OnHandlerSchema {
     /// Lowered handler body (`kind: ComponentMethod`, exactly one param
     /// = the event argument).
     pub function: FunctionId,
+    /// `when active` provenance for subscriber registration.
+    pub activation: Activation,
 }
 
 /// One `connect <src>.<event> -> <sink>.<method|event>` edge inside an
@@ -1073,12 +1359,16 @@ pub struct ConnectEdgeSchema {
     pub src_path: Vec<String>,
     /// `out event<T>` field on the source sub-component.
     pub src_event: String,
+    /// Activation provenance of the source event endpoint.
+    pub src_activation: Activation,
     /// Dotted path to the sink sub-component (`["sb"]`).
     pub sink_path: Vec<String>,
     /// Sink sub-component's component schema (to name `<Comp>_<method>`).
     pub sink_component: ComponentId,
     /// What the edge feeds on the sink sub-component.
     pub sink: ConnectSink,
+    /// Activation provenance of the sink endpoint.
+    pub sink_activation: Activation,
 }
 
 /// The sink end of a `connect` edge.
@@ -1299,15 +1589,10 @@ pub struct ComponentFieldBinding {
     /// `connect` edges from the env declaration, resolved to paths. Empty
     /// for non-env components (only `env` carries a `connect` block).
     pub connects: Vec<ConnectEdgeSchema>,
-    /// `true` when this instance is an `active` mode bound event-driven
-    /// transactor (`let drv : AxilXactor active = bind axil`) — its
-    /// `when active` `on <ev>` driver fires on `emit <inst>.<ev>`. `false`
-    /// for a `passive` bound instance (monitor-only) and for every
-    /// non-transactor composite component (env/agent/scoreboard), which
-    /// take no mode. Used by the `--mt` codegen to decide which bound
-    /// instances re-lower their `on <ev>` driver into a queue-fed worker
-    /// coroutine actor; the cooperative-default path ignores it.
-    pub active: bool,
+    /// Explicit mode on this root binding. On a transactor this is its
+    /// effective mode; on a structural root it is inheritance context for
+    /// nested transactors.
+    pub mode: Option<ComponentInstanceMode>,
 }
 
 /// One bound-to target-side TLM responder instance (`let target :
