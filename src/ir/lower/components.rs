@@ -1009,11 +1009,21 @@ fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<()
 /// |---|---|---|
 /// | `on in_ev(t) pre` | the handler with the hook side dropped, byte-identically | `SilentlyMisLowers` |
 /// | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
-/// | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped; a body that reads `u` gets "'u' was not declared in this scope" | `EmitsUncompilable` |
+/// | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `SilentlyMisLowers` |
 ///
 /// The two arity halves were one arm until they were measured
 /// separately. Zero arguments is the one shape v1 gets right: the
 /// payload is unbound, which is what was written.
+///
+/// The multi-argument half was first labelled `EmitsUncompilable`, on a
+/// body whose `u` had nothing else to resolve to. That is the LESSER of
+/// the two things v1 does here, and an arm's status is the worst one.
+/// Give `u` something to bind to — a component field `u : uint<8>
+/// default 7`, or a file-scope `const u = 9` — and v1 emits
+/// `tagger.seen = tagger.seen + tagger.u;` or `... + u;`, compiles
+/// clean, and runs to a value the source never asked for.
+/// `validate_cycle_handler`, a hundred lines above, is the same
+/// two-shape arm and resolves it the other way round.
 fn validate_event_handler(
     comp: &str,
     h: &crate::ast::OnHandler,
@@ -1044,8 +1054,10 @@ fn validate_event_handler(
                 args.len()
             ),
             "event handlers take exactly one payload argument; v1 emits the lambda with \
-             only the first parameter, so a body that reads any later one does not compile",
-            V1Status::EmitsUncompilable,
+             only the first parameter and says nothing, so a body naming a later one \
+             either fails to resolve or silently picks up a same-named component field \
+             or file-scope `const`",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if args.is_empty() {

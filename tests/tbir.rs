@@ -4489,6 +4489,9 @@ end impl T"#
 /// is what this test pins: if the routing predicate ever loosens, these
 /// stop matching and the dead arms are dead no longer.
 ///
+/// This pins where each lands, NOT that the arm it lands on is itself
+/// correctly classified — those arms are outside this one's scope.
+///
 /// | trigger | where it actually lands |
 /// |---|---|
 /// | `on 3 cycles` | lowers — a periodic handler |
@@ -4499,8 +4502,7 @@ end impl T"#
 ///
 /// The two live arms split on measurement: `on in_ev()` compiles and
 /// runs (v1 synthesizes `_v` for a payload the body cannot name anyway),
-/// while `on in_ev(t, u)` drops the extra parameter and a body that
-/// reads it does not compile.
+/// while `on in_ev(t, u)` drops the extra parameter without a word.
 #[test]
 fn the_event_subscription_arms_are_two_live_ones_and_five_dead() {
     let agent = |trigger: &str, body: &str| {
@@ -4563,19 +4565,70 @@ end test T"#
         "v1 synthesizes a payload name: {v1}"
     );
 
-    // A second payload name: v1 drops it, and a body that reads it
-    // names an undeclared variable. The status is the worst thing v1
-    // does anywhere under the arm, so the unused spelling shares it.
+    // A second payload name: v1 drops it without a word. Naming it in
+    // the body does NOT reliably fail to compile — that was this arm's
+    // first verdict and it is the lesser of the two things v1 does.
+    // Give `u` something else to bind to and v1 compiles and runs to a
+    // value the source never asked for, which is the worse one and so
+    // the arm's label.
     for body in ["seen = seen + 1", "seen = seen + u"] {
         let two = agent("in_ev(t, u)", body);
         assert_not_implemented(
             &lower_src(&two).unwrap_err(),
-            lower::V1Status::EmitsUncompilable,
+            lower::V1Status::SilentlyMisLowers,
         );
         let v1 = cpp_tb::emit(&merged_src(&two)).expect("v1 emits");
         assert!(
             v1.contains("tagger.in_ev.push_back([&](uint64_t t) {") && !v1.contains("uint64_t u"),
             "v1 emits the lambda with only the first parameter: {v1}"
+        );
+    }
+    // The two shapes that make the drop silent rather than loud. Each
+    // resolves `u` to something that is NOT the payload, and the whole
+    // point is that v1 says nothing about it.
+    let shadowed = |extra_decl: &str, extra_field: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+{extra_decl}
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+{extra_field}
+    on in_ev(t, u)
+        seen = seen + u
+    end on
+end agent Tagger
+
+test T
+    let dut    : Top
+    let tagger : Tagger
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+        emit tagger.in_ev(1)
+        wait 2 cycles
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for (src, resolves_to) in [
+        (
+            shadowed("", "    u     : uint<8>  default 7"),
+            "tagger.seen + tagger.u;",
+        ),
+        (shadowed("\nconst u = 9\n", ""), "tagger.seen + u;"),
+    ] {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            v1.contains(resolves_to),
+            "v1 silently binds `u` to `{resolves_to}`: {v1}"
         );
     }
     // …and the one-argument control really does bind the name, so the

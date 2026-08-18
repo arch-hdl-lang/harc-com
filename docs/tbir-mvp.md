@@ -6205,10 +6205,12 @@ former `transaction` group lives in
      `event_subscription` is the predicate that ROUTES an `on` handler
      to the subscription path, and it already establishes three facts:
      the trigger is a `Call`, its callee is a bare identifier, and that
-     identifier names an `event` field. The resolver it routed into then
-     re-derived all three and carried a rejection arm for each failure,
-     plus one for `h.periodic` — which the item split at the top of the
-     function has already sent to `periodic_asts`.
+     identifier names an `event` field — which is FOUR ways to fail,
+     because the last one splits into "no such field" and "a field of
+     another kind". The resolver it routed into re-derived all of them
+     and carried a rejection arm for each, plus one for `h.periodic` —
+     which the item split at the top of the function has already sent to
+     `periodic_asts`.
 
      All five are unreachable. Replacing each with `unreachable!()`
      leaves the whole suite green, and each of the five shapes lands on
@@ -6235,12 +6237,25 @@ former `transaction` group lives in
      | trigger | v1 emits | verdict |
      |---|---|---|
      | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
-     | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `EmitsUncompilable` |
+     | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `SilentlyMisLowers` |
 
-     A body that reads `u` gets "'u' was not declared in this scope". A
-     body that does not is byte-identical to the one-argument form, so
-     the declared name is silently gone; the arm takes the worse of the
-     two.
+     The multi-argument half was first labelled `EmitsUncompilable`, on
+     a body whose `u` had nothing else to resolve to. That is the LESSER
+     of the two things v1 does here. Give `u` something to bind to and
+     v1 compiles clean and runs to a value the source never asked for:
+
+     | the handler's sibling | v1 emits | result |
+     |---|---|---|
+     | a component field `u : uint<8> default 7` | `tagger.seen = tagger.seen + tagger.u;` | 0 errors, runs |
+     | a file-scope `const u = 9` | `tagger.seen = tagger.seen + u;` | 0 errors, runs |
+
+     A body with nothing named `u` in scope does fail to compile, and a
+     body that never names it is byte-identical to the one-argument
+     form. An arm's status is the WORST of what v1 does under it, so it
+     is `SilentlyMisLowers`; `validate_cycle_handler`, a hundred lines
+     above, is the same two-shape arm and had already resolved it that
+     way. Reconstructing the rule instead of copying the neighbour that
+     states it is the same mistake as divergence 97's leaf table.
 
 
 102. **The unbound-transactor item walk was written twice, and none of
@@ -6299,7 +6314,6 @@ former `transaction` group lives in
      The second-DUT-handle row is the branch's first `SilentlyMisLowers`
      whose runtime failure is a null dereference rather than a wrong
      value: v1 compiles the poke against a handle it never binds.
-
 
 ## Next steps
 
