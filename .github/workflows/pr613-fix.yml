@@ -1,0 +1,175 @@
+name: Apply PR 613 review fix
+
+on:
+  push:
+    branches:
+      - claude/pr-555-merge-issue-77gfrx
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Patch active-only consumer classification
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/ir/lower/components.rs')
+          text = path.read_text()
+          start_marker = "/// True when a consumer's subscribing `on <ev>` handler lives ONLY under"
+          end_marker = "/// True when a composite-component transactor is a *reactive monitor /"
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          replacement = r'''/// True when an always-visible consumer input has subscribers only under
+/// `when active`. A `passive` binding would still expose that `in event`,
+/// but register no subscriber for it, so `emit <inst>.<event>(...)` would
+/// silently fan out over an empty vector.
+///
+/// This is intentionally checked PER INPUT EVENT. A transactor may have an
+/// always-on handler for `req1` and an active-only handler for `req2`; the
+/// former must not make a passive binding look safe when `req2` would still
+/// drop every transaction. Conversely, an input field that is itself declared
+/// under `when active` is not exposed by a passive instance and is not a dead
+/// always-visible input.
+pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
+    if !transactor_is_event_driven(t) {
+        return false;
+    }
+
+    fn subscription_event(h: &crate::ast::OnHandler) -> Option<&str> {
+        if h.periodic {
+            return None;
+        }
+        let ExprKind::Call { callee, .. } = &*h.event.kind else {
+            return None;
+        };
+        let ExprKind::Ident(id) = &*callee.kind else {
+            return None;
+        };
+        Some(id.name.as_str())
+    }
+
+    let is_always_input = |event: &str| {
+        t.items.iter().any(|it| {
+            matches!(
+                it,
+                ComponentItem::Field(f)
+                    if is_event_field(f)
+                        && matches!(f.direction, Some(Direction::In))
+                        && f.name.name.as_str() == event
+            )
+        })
+    };
+    let has_always_subscriber = |event: &str| {
+        t.items.iter().any(|it| {
+            matches!(
+                it,
+                ComponentItem::OnHandler(h)
+                    if subscription_event(h) == Some(event)
+            )
+        })
+    };
+
+    t.when_active
+        .as_deref()
+        .into_iter()
+        .flatten()
+        .any(|it| {
+            let ComponentItem::OnHandler(h) = it else {
+                return false;
+            };
+            let Some(event) = subscription_event(h) else {
+                return false;
+            };
+            is_always_input(event) && !has_always_subscriber(event)
+        })
+}
+
+'''
+          path.write_text(text[:start] + replacement + text[end:])
+
+          test = Path('tests/tbir_active_only_consumer_multi_event.rs')
+          test.write_text(r'''use harc::codegen::merge;
+use harc::ir::{self, lower, verify};
+use harc::parser::parse_source;
+
+fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
+    let parsed = parse_source(src).expect("source parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    lower::lower_program(&merged)
+}
+
+#[test]
+fn unrelated_always_on_handler_does_not_mask_dead_active_only_input() {
+    let passive = r#"
+transactor T
+    req1 : in event<uint<8>>
+    req2 : in event<uint<8>>
+    seen : out event<uint<8>>
+    n    : uint<32> default 0
+
+    on req1(v)
+        n = n + 1
+    end on
+
+    when active
+        on req2(v)
+            n = n + 1
+        end on
+    end when
+end transactor T
+
+testbench Tb
+    dut : Top
+    t : T passive
+end testbench Tb
+
+impl MultiInputTest for Tb
+    run
+        emit t.req2(1)
+    end run
+end impl MultiInputTest
+"#;
+
+    let err = lower_src(passive).expect_err(
+        "req1's always-on subscriber must not hide req2's passive dead emit",
+    );
+    assert!(
+        matches!(err, lower::LowerError::Unsupported { .. }),
+        "expected the event-driven passive-binding diagnostic, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("when active") && msg.contains("no subscriber"), "{msg}");
+
+    let active = passive.replace("t : T passive", "t : T active");
+    let prog = lower_src(&active).expect("the same multi-input consumer is valid when active");
+    verify::verify_program(&prog).expect("active control verifies");
+}
+''')
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Run focused regression
+        run: cargo test --test tbir_active_only_consumer_multi_event
+
+      - name: Commit validated fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr613-fix.yml
+          git add src/ir/lower/components.rs tests/tbir_active_only_consumer_multi_event.rs
+          git commit -m "fix(tbir): gate active-only consumers per input event"
+          git push origin HEAD:${{ github.ref_name }}
