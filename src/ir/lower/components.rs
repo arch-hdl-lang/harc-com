@@ -2063,7 +2063,7 @@ where
                 &src_event,
                 &sink_path.join("."),
                 &sink_name,
-                scalar_shapes_agree(src_payload, &sm.param_tys[0]),
+                both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
         crate::ir::ConnectSink::Method { method: sink_name }
@@ -2078,10 +2078,7 @@ where
                 &src_event,
                 &sink_path.join("."),
                 &sink_name,
-                matches!(
-                    (src_payload, payload),
-                    (EventPayload::Scalar { .. }, EventPayload::Scalar { .. })
-                ),
+                both_scalar_payloads(src_payload, *payload),
             ));
         }
         crate::ir::ConnectSink::Event { event: sink_name }
@@ -2128,10 +2125,6 @@ fn resolve_testbench_path(
     }
 }
 
-/// Whether a hookable method's declared parameter has the same runtime
-/// callback shape as an analysis event payload. Narrow unsigned values,
-/// `bits`, and `bool` all widen to the unsigned callback representation;
-/// signed values and value records retain distinct shapes.
 /// A `connect` payload mismatch, split on the one distinction that
 /// decides whether v1 runs the program.
 ///
@@ -2145,9 +2138,13 @@ fn resolve_testbench_path(
 ///     the sink's `int64_t` parameter. Built and run: `count=2 sum=8`,
 ///     exactly what the program asks for. v1 implements it, so the
 ///     suggestion is honest.
-///   * a RECORD against a scalar (either direction) — the same
-///     conversion has nothing to convert. g++: "no match for call to
-///     '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'".
+///   * anything else — a RECORD against a scalar in either direction,
+///     two DIFFERENT records, or a component-typed sink parameter
+///     (`method_schema_ir_type` can produce `IrType::Component`). The
+///     same conversion has nothing to convert. g++: "no match for call
+///     to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'". A
+///     first version of this comment named only the record-vs-scalar
+///     row, which is one of three.
 ///
 /// `scalars` is the caller's answer to "are both sides scalars?", which
 /// is the exact discriminator rather than a proxy for it.
@@ -2171,16 +2168,31 @@ fn connect_payload_mismatch(
     } else {
         not_implemented(
             &construct,
-            "a record payload and a scalar one cannot be bridged; v1 emits the generic \
+            "the payload shapes cannot be bridged — a record against a scalar, two \
+             different records, or a component-typed parameter; v1 emits the generic \
              bridge anyway and the emitted C++ does not compile",
             V1Status::EmitsUncompilable,
         )
     }
 }
 
-/// Whether a `connect` source payload and a sink PARAMETER type are both
-/// scalars — the discriminator `connect_payload_mismatch` splits on.
-fn scalar_shapes_agree(payload: EventPayload, ty: &IrType) -> bool {
+/// Whether a `connect` source payload and a sink EVENT payload are both
+/// scalars — the discriminator `connect_payload_mismatch` splits on,
+/// for the event-sink branch.
+fn both_scalar_payloads(src: EventPayload, sink: EventPayload) -> bool {
+    matches!(
+        (src, sink),
+        (EventPayload::Scalar { .. }, EventPayload::Scalar { .. })
+    )
+}
+
+/// The same discriminator for the METHOD-sink branch, where the sink
+/// side is a declared parameter type rather than an event payload.
+///
+/// Named for what it answers, not for the branch it is called from: it
+/// is only ever consulted once the payloads are known NOT to match, so
+/// a `true` here means "both scalars, and the mismatch is signedness".
+fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
     matches!(
         (payload, ty),
         (
@@ -2190,6 +2202,10 @@ fn scalar_shapes_agree(payload: EventPayload, ty: &IrType) -> bool {
     )
 }
 
+/// Whether a hookable method's declared parameter has the same runtime
+/// callback shape as an analysis event payload. Narrow unsigned values,
+/// `bits`, and `bool` all widen to the unsigned callback representation;
+/// signed values and value records retain distinct shapes.
 fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,

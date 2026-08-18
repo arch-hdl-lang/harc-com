@@ -2857,13 +2857,36 @@ impl FuncBuilder<'_> {
         }
 
         let kind = if h.periodic {
+            // `tb_periodic_literal` answers `None` for a NON-POSITIVE
+            // literal as well as a non-literal, so this arm has two
+            // inputs and they do not share a verdict source:
+            //
+            //   * a named period — v1 registers the closure where the
+            //     statement is WRITTEN, after the impl's `let`s, so it
+            //     resolves correctly. Built and run: 10 firings in 21
+            //     cycles at period 2, with a shadowing `const` present.
+            //     That is the escape hatch this arm's suggestion offers,
+            //     and it is real. (Divergence 78 — the same construct
+            //     mis-lowers at four other landings precisely because
+            //     they register ABOVE the `let`s.)
+            //   * `on 0 cycles` — v1 emits the handler and its own
+            //     `period > 0` guard never lets it fire. Built and run:
+            //     0 firings in 21 cycles. The program asked for a
+            //     handler and got a no-op, silently.
+            //
+            // Worst-under-arm, so the arm is `SilentlyMisLowers` even
+            // though the row that motivated its old `Unsupported` is
+            // still a genuine escape hatch. Splitting on
+            // `parse_int_literal_expr(..) == Some(0)` would recover it
+            // and is not done here — the detail names both instead.
             let period = super::tb_periodic_literal(&h.event).ok_or_else(|| {
-                unsupported(
-                    "an `on <N> cycles` handler with a non-literal period",
-                    "the TB-IR backend requires a positive integer-literal cycle count \
-                     (e.g. `on 100 cycles`); a variable period is re-read every cycle \
-                     under v1, which needs host state the registration closure does not \
-                     carry here",
+                not_implemented(
+                    "an `on <N> cycles` handler with a non-literal or non-positive period",
+                    "`on 0 cycles` makes v1 emit a handler its own `period > 0` guard \
+                     never fires, so the registration is a silent no-op; a NAMED period \
+                     does work here, because a statement-position handler is registered \
+                     after the impl's `let` bindings",
+                    V1Status::SilentlyMisLowers,
                 )
             })?;
             CycleHandlerKind::Periodic { period }

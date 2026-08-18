@@ -11119,10 +11119,16 @@ end impl T"#,
 end test T"#,
     )
     .expect_err("a non-literal period must be rejected");
+    // `SilentlyMisLowers` rather than a v1 suggestion: the arm also
+    // catches `on 0 cycles`, where v1 emits a handler its own
+    // `period > 0` guard never fires. For the NAMED period written
+    // here v1 is a real escape hatch — see
+    // `a_statement_position_periodic_period_resolves_correctly_under_v1`,
+    // which measures both rows.
+    let msg = assert_not_implemented(&period, lower::V1Status::SilentlyMisLowers);
     assert!(
-        assert_unsupported(&period).contains("non-literal period"),
-        "got: {}",
-        assert_unsupported(&period)
+        msg.contains("non-literal or non-positive period"),
+        "got: {msg}"
     );
 }
 
@@ -13436,8 +13442,10 @@ end impl T"#
 /// program error under every backend" is false.
 ///
 /// Measured, both halves. Instantiated, v1 raises its own error:
-/// "connect: hookable sink `sb.two` must take exactly one payload
-/// argument, got 2" and "must return void". Uninstantiated, v1 runs the
+/// "connect: hookable sink `sink.two` must take exactly one payload
+/// argument, got 2" and "connect: hookable sink `sink.ret` must return
+/// void" — the env field here is `sink`, and an earlier version of this
+/// doc wrote `sb`. Uninstantiated, v1 runs the
 /// program. Worst-under-arm over those two is `Rejects` — v1 does not
 /// implement the construct, and saying so is honest without claiming
 /// the program is malformed everywhere.
@@ -13500,7 +13508,16 @@ end impl T"#
         // `Rejects`.
         let v1 = cpp_tb::emit(&merged_src(&src(sink, method)))
             .expect_err("v1 refuses an instantiated bad sink signature");
-        assert!(format!("{v1}").contains("connect: hookable sink"), "{v1}");
+        // Pin the whole clause, not just the prefix: the arm's detail
+        // quotes v1's wording, and a prefix match would not notice it
+        // drifting.
+        let v1 = format!("{v1}");
+        assert!(
+            v1.contains("connect: hookable sink `sink.")
+                && (v1.contains("must take exactly one payload argument, got 2")
+                    || v1.contains("must return void")),
+            "{v1}"
+        );
 
         // And the row that rules `Invalid` out: with nothing
         // instantiating the env, v1 emits no wiring and the program is
@@ -19755,7 +19772,10 @@ fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
             &lower_src(&src).unwrap_err(),
             lower::V1Status::SilentlyMisLowers,
         );
-        assert!(msg.contains("non-literal period"), "{what}: {msg}");
+        assert!(
+            msg.contains("non-literal or non-positive period"),
+            "{what}: {msg}"
+        );
     }
 
     // The row that sets the status. v1 emits the const at namespace
@@ -19890,13 +19910,19 @@ fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
         "{msg}"
     );
 
-    // And the measurement the status rests on, for the site whose
-    // fixture needs no stdlib bus: v1 emits the wrong-mode program
-    // byte-identically to the right-mode one.
+    // The measurement the status rests on, at BOTH sites. An earlier
+    // version did only the target, "for the site whose fixture needs no
+    // stdlib bus" — but this same test merges a stdlib bus a few lines
+    // below, so the reason did not hold.
     assert_eq!(
         cpp_tb::emit(&merged_src(&tgt_active)).expect("v1 emits"),
         cpp_tb::emit(&merged_src(&tgt)).expect("v1 emits"),
         "v1 drops the mode annotation on a target responder"
+    );
+    assert_eq!(
+        cpp_tb::emit(&with_bus(&bfm_passive)).expect("v1 emits"),
+        cpp_tb::emit(&with_bus(&bfm)).expect("v1 emits"),
+        "v1 drops the mode annotation on an initiator BFM"
     );
 
     // Anti-vacuity: v1 does honour the mode where it means something.
@@ -20096,9 +20122,18 @@ end impl SpTest"#
         ("shadowed by a const", "const per = 7\n\n"),
     ] {
         let s = src("per", extra);
-        // TB-IR still refuses — a subset gap, not a correctness one.
-        let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-        assert!(msg.contains("non-literal period"), "{what}: {msg}");
+        // TB-IR refuses. The arm carries `SilentlyMisLowers` for the
+        // sake of its OTHER input (`on 0 cycles`, below); for the named
+        // period measured here v1 is a genuine escape hatch, which is
+        // what the rest of this test shows.
+        let msg = assert_not_implemented(
+            &lower_src(&s).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("non-literal or non-positive period"),
+            "{what}: {msg}"
+        );
 
         // And the reason the suggestion is honest: v1 emits the `let`
         // BEFORE the registration, so the closure reads the `let` and
@@ -20131,6 +20166,28 @@ end impl SpTest"#
         .find("_period = (int64_t)(per);")
         .expect("v1 emits the named period");
     assert!(konst < lt && lt < used, "const, then `let`, then the use");
+
+    // The arm's OTHER input, and the reason it is not `Unsupported`
+    // despite everything above: `tb_periodic_literal` answers `None` for
+    // a non-positive literal too, so `on 0 cycles` lands here. v1 emits
+    // the handler and its own `period > 0` guard never lets it fire —
+    // built and run, 0 firings in 21 cycles. The program asked for a
+    // handler and got a silent no-op.
+    let zero = src("0", "");
+    let msg = assert_not_implemented(
+        &lower_src(&zero).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("non-positive period"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&zero)).expect("v1 emits the zero-period handler");
+    assert!(
+        v1.contains("_period = (int64_t)(0);"),
+        "v1 emits the zero period verbatim"
+    );
+    assert!(
+        v1.contains("_period > 0 &&"),
+        "and guards it, so the handler never runs"
+    );
 }
 
 /// Naming a component method that does not exist, and using a `void`

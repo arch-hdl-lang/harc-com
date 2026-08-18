@@ -4948,9 +4948,13 @@ case and only locally-determinable `Assign` types are compared).
     | payload mismatch, RECORD vs scalar | g++: "no match for call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'" | `EmitsUncompilable` |
     | payload mismatch, SIGNEDNESS only | **compiles and runs correctly** | `Unsupported` |
 
-    The payload rows are one arm covering two shapes, because
+    The payload rows are one arm covering several shapes, because
     `event_payload_matches_ir_type` compares signedness and record
-    identity only — width is irrelevant to it. v1's bridge lambda is
+    identity only — width is irrelevant to it. The non-signedness side
+    is not just record-vs-scalar either: two DIFFERENT records, and a
+    component-typed sink parameter (`method_schema_ir_type` can produce
+    `IrType::Component`), land there too, and the arm's detail named
+    only the first until review pointed at the others. v1's bridge lambda is
     GENERIC (`push_back([&](auto _t) { ... })`) and looks type-agnostic;
     converting it to the source's `std::function<void(uint64_t)>`
     instantiates it at the wiring line. A record cannot survive that. A
@@ -5077,13 +5081,20 @@ case and only locally-determinable `Assign` types are compared).
     v1". This one does — which is precisely why pointing at v1 was
     never going to help.
 
-    Two arms alongside these were NOT reclassified: the DUT-poking-BFM
-    pair. Reaching them needs the transactor held by an `env` (they gate
-    on `dut_poking_bfm_names`, which is the by-value-in-a-component
-    routing), and no probe here builds that. They keep their verdict
-    rather than inheriting one by analogy, because variants sharing a
-    code path do not share a verdict — this batch is itself an example,
-    with the `passive` half staying put while the mode-less half moved.
+    Two arms alongside these were initially left alone — the
+    DUT-poking-BFM pair — on the grounds that reaching them needs the
+    transactor held by an `env` (they gate on `dut_poking_bfm_names`,
+    the by-value-in-a-component routing) and no probe here built that.
+    Review built it in ten lines: a `when active` hookable transactor
+    with a `dut` field, held by an `env`, plus a mode-less testbench
+    field of the same type. v1 refuses it with the same "has no mode and
+    no parent specifies one" that made the two siblings `Invalid`, so
+    the mode-less half is now `Invalid` too. "Not probed" is a reason to
+    go and probe, not a reason to leave a false suggestion standing.
+
+    The `passive` half of that pair does stay put, for the reason the
+    rest of this entry gives: variants sharing a code path do not share
+    a verdict.
 
     One probe went wrong in a way worth recording: the first attempt
     edited the fixture's FIRST `drv : CounterDrv active`, which is an
@@ -5116,6 +5127,27 @@ case and only locally-determinable `Assign` types are compared).
 
     That is the honest form of the rule. Group by what a construct DOES
     to find the sites; measure each site anyway.
+
+    **And then measure each INPUT.** This entry originally closed there,
+    leaving the fifth arm on `Unsupported`, and that was one question
+    short again. `tb_periodic_literal` answers `None` for a NON-POSITIVE
+    literal as well as for a non-literal, so `on 0 cycles` lands on the
+    same arm — and there v1 emits the handler and its own `period > 0`
+    guard never lets it fire. Built and run: 0 firings in 21 cycles. The
+    program asked for a handler and got a silent no-op.
+
+    Worst-under-arm makes the fifth arm `SilentlyMisLowers` after all —
+    not because the row this entry measured mis-lowers, but because a
+    row it never looked at does. The named-period row remains a genuine
+    escape hatch and the detail says so; splitting on
+    `parse_int_literal_expr(..) == Some(0)` would recover the suggestion
+    for it and is not done here.
+
+    The same `on 0 cycles` input reaches the testbench-scoped arm
+    (divergence 75), where it only confirms an existing
+    `SilentlyMisLowers`. Both arms' CONSTRUCT text said "with a
+    non-literal period", which is false for `0`; both now say
+    "non-literal or non-positive".
 
 79. **Six arms, two measurements (2026-08-18).**
 

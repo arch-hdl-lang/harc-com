@@ -2324,14 +2324,28 @@ fn validate_testbench_component(
                                 ));
                             }
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "a DUT-poking transactor field `{}.{} : {simple}` \
-                                         without an `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "annotate the instance `active`",
-                                ));
+                                // MEASURED, after a previous batch left
+                                // this arm alone saying its shape had
+                                // "no probe built for it". The probe is
+                                // ten lines: a `when active` hookable
+                                // transactor with a `dut` field, held by
+                                // an `env` (which is what puts it in
+                                // `dut_poking_bfm_names`), plus a
+                                // mode-less testbench field of the same
+                                // type. v1 refuses it with "transactor
+                                // field `_tb.p : Poker` has no mode and
+                                // no parent specifies one" — the exact
+                                // error that made its two siblings
+                                // above `Invalid`.
+                                //
+                                // "Not probed" is a reason to go and
+                                // probe, not a reason to leave a false
+                                // suggestion in place.
+                                return Err(LowerError::Invalid(format!(
+                                    "DUT-poking transactor field `{}.{} : {simple}` needs \
+                                     an `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
@@ -4878,13 +4892,14 @@ fn lower_test(
                 not_implemented(
                     &format!(
                         "a testbench-scoped `on <N> cycles` handler in `{}` with a \
-                         non-literal period",
+                         non-literal or non-positive period",
                         t.name.name
                     ),
-                    "v1 emits the period expression into a checker closure registered \
-                     ahead of the impl's own `let` bindings, so a period naming one of \
-                     those either fails to compile or silently picks up a same-named \
-                     file-scope `const` and runs at the wrong rate",
+                    "`on 0 cycles` makes v1 emit a handler its own `period > 0` guard \
+                     never fires; a period naming one of the impl's own `let` bindings \
+                     either fails to compile or silently picks up a same-named file-scope \
+                     `const` and runs at the wrong rate. A period naming only a file-scope \
+                     `const` does work under v1",
                     V1Status::SilentlyMisLowers,
                 )
             })?;
