@@ -19591,3 +19591,81 @@ end impl T"#,
         assert!(msg.contains(want), "{what}: {msg}");
     }
 }
+
+/// The FOURTH landing of the non-literal periodic period — a
+/// testbench-scoped `on <N> cycles` handler — after the three bound-to
+/// transactor arms. It was `Unsupported` and untested, and it behaves
+/// exactly like the other three, which is the point of grouping by
+/// what a construct DOES rather than where it is spelled.
+///
+/// v1 emits the period expression verbatim into a `_checkers` closure
+/// registered ahead of the impl's own `let`s:
+///
+/// | period | v1 |
+/// |---|---|
+/// | `2` — a literal | fine, and the registered fixture proves it |
+/// | `per`, an impl-scope `let` | used at line 161, declared at 175 — does not compile |
+/// | `per`, with a file-scope `const per = 7` too | resolves to the const: compiles, and runs at 7 |
+///
+/// The last row was built and RUN: 2 firings in 21 cycles where the
+/// source asks for a period of 2. Hence `SilentlyMisLowers`.
+#[test]
+fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
+    let base = fixture("testbench_periodic_period2_test.harc");
+    const LITERAL: &str = "    on 2 cycles";
+    assert!(base.contains(LITERAL), "fixture shape changed");
+
+    // The control: the literal period lowers, so the rows below are
+    // about the EXPRESSION and not about the fixture.
+    lower_src(&base).expect("the literal period lowers");
+
+    let named = base.replacen(LITERAL, "    on per cycles", 1).replacen(
+        "\n    run\n",
+        "\n    let per = 2\n\n    run\n",
+        1,
+    );
+    assert!(named.contains("let per = 2"), "the `let` must be inserted");
+
+    for (what, src) in [
+        ("bare `let`", named.clone()),
+        ("shadowed by a const", format!("const per = 7\n\n{named}")),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("non-literal period"), "{what}: {msg}");
+    }
+
+    // The row that sets the status. v1 emits the const at namespace
+    // scope BEFORE the closure and the `let` after it, so the closure
+    // reads 7 while the run body reads 2 — same name, two values,
+    // decided by emission position.
+    let shadowed = format!("const per = 7\n\n{named}");
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let konst = v1
+        .find("static constexpr int64_t per = 7;")
+        .expect("v1 emits the const at namespace scope");
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    assert!(
+        konst < used && used < lt,
+        "the const must precede the use and the `let` follow it, or the closure \
+         does not pick up the wrong value"
+    );
+
+    // And without the const, the same ordering leaves the name
+    // undeclared at the point of use.
+    let v1 = cpp_tb::emit(&merged_src(&named)).expect("v1 emits");
+    assert!(
+        !v1.contains("constexpr int64_t per"),
+        "no const in this one"
+    );
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    assert!(used < lt, "the `let` is emitted after the use");
+}

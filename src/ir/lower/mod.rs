@@ -4766,15 +4766,40 @@ fn lower_test(
             .expect("tb_periodic_asts is only populated for an impl-bound testbench");
         let mut periodic_services: Vec<ir::TbPeriodicServiceSchema> = Vec::new();
         for h in &tb_periodic_asts {
+            // The FOURTH landing of the non-literal periodic period,
+            // after the three bound-to transactor arms in
+            // `transactors.rs`, and it behaves identically — which is
+            // the point of grouping by what a construct DOES rather
+            // than where it is spelled.
+            //
+            // v1 emits the period expression verbatim into a
+            // `_checkers` closure registered near the top of the run
+            // function, ahead of the impl's own `let`s:
+            //
+            //   * `on per cycles` with `let per = 2` — `(int64_t)(per)`
+            //     at line 161, `int64_t per = 2;` at line 175. Does not
+            //     compile.
+            //   * the same with a file-scope `const per = 7` as well —
+            //     the closure resolves to the `constexpr` at namespace
+            //     scope, so it COMPILES, and the rest of the run body
+            //     sees the `let` that shadows it. Built and run: 2
+            //     firings in 21 cycles where the source asks for a
+            //     period of 2.
+            //
+            // Worst-under-arm, and a silent drop in rate is the worst
+            // of the two, so `SilentlyMisLowers`.
             let period = tb_periodic_literal(&h.event).ok_or_else(|| {
-                unsupported(
+                not_implemented(
                     &format!(
                         "a testbench-scoped `on <N> cycles` handler in `{}` with a \
                          non-literal period",
                         t.name.name
                     ),
-                    "the TB-IR backend requires a positive integer-literal cycle count \
-                     (e.g. `on 1 cycles`); a field-backed period is not yet lowered",
+                    "v1 emits the period expression into a checker closure registered \
+                     ahead of the impl's own `let` bindings, so a period naming one of \
+                     those either fails to compile or silently picks up a same-named \
+                     file-scope `const` and runs at the wrong rate",
+                    V1Status::SilentlyMisLowers,
                 )
             })?;
             let fid = FunctionId(prog.functions.len() as u32);

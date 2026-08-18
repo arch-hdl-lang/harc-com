@@ -4968,6 +4968,35 @@ case and only locally-determinable `Assign` types are compared).
     ever built the instantiated case, which is the half that disproves
     it. It builds both now. Four of the six arms had no test at all.
 
+75. **The same period expression, a fourth landing (2026-08-18).**
+
+    Divergence 71 measured the non-literal `on <N> cycles` period at
+    three bound-to transactor arms. Grouping by what a construct DOES
+    rather than where it is spelled turned up a fourth: the
+    testbench-scoped periodic handler in `mod.rs`, still `Unsupported`
+    and untested.
+
+    It behaves identically, because v1 emits it through the same
+    machinery — the period expression verbatim into a `_checkers`
+    closure registered near the top of the run function, ahead of the
+    impl's own `let`s:
+
+    | period | v1 |
+    |---|---|
+    | `2` — a literal | fine, and a registered fixture proves it |
+    | `per`, an impl-scope `let` | used at line 161, declared at 175 — does not compile |
+    | `per`, with a file-scope `const per = 7` too | resolves to the const: compiles, runs at 7 |
+
+    The last row was built and RUN: two firings in 21 cycles where the
+    source asks for a period of 2. Same verdict as the other three,
+    `SilentlyMisLowers`, and it now has the test the arm never had.
+
+    Worth noting what found it. Not a probe of this arm — a survey of
+    `mod.rs`'s remaining sites by CONSTRUCT, in which "a
+    testbench-scoped `on <N> cycles` handler with a non-literal period"
+    read as the same sentence as three arms already measured in another
+    file. The measurement then took one probe rather than a batch.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
