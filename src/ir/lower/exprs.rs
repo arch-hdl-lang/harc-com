@@ -2449,41 +2449,12 @@ impl FuncBuilder<'_> {
                 "`.{kind_name}<N>()` requires a constant integer width"
             )));
         };
-        if width == 0 {
-            return Err(LowerError::Invalid(format!(
-                "`.{kind_name}<{width}>()`: width must be greater than zero"
-            )));
-        }
-        if width > crate::MAX_WIDTH_METHOD_BITS {
-            return Err(LowerError::Invalid(format!(
-                "`.{kind_name}<{width}>()`: destination width exceeds the {}-bit \
-                 language limit",
-                crate::MAX_WIDTH_METHOD_BITS
-            )));
-        }
         // Best-effort receiver-width inference (v1's
         // `infer_expr_width_best_effort`) for the direction check and
         // the sext shift-fill shape.
         let src_width = self.infer_expr_width(target);
-        if let Some(sw) = src_width {
-            match kind {
-                WidthCastKind::Trunc if width >= sw => {
-                    return Err(LowerError::Invalid(format!(
-                        "`.trunc<{width}>()` on a {sw}-bit value: width must be strictly \
-                         less than the source width (otherwise it's a no-op or \
-                         wrong-direction). Use `.zext<{width}>()` to widen, or remove \
-                         the cast if you meant a no-op."
-                    )));
-                }
-                WidthCastKind::Zext | WidthCastKind::Sext if width < sw => {
-                    return Err(LowerError::Invalid(format!(
-                        "`.{kind_name}<{width}>()` on a {sw}-bit value: width must be \
-                         ≥ the source width (otherwise it narrows, wrong direction). \
-                         Use `.trunc<{width}>()` to narrow."
-                    )));
-                }
-                _ => {}
-            }
+        if let Some(why) = width_method_violation(kind_name, width, src_width) {
+            return Err(LowerError::Invalid(why));
         }
         // The direction check above wants the raw inferred width (a
         // zero-width receiver is still a wrong-direction `.trunc<N>()`),
@@ -2778,6 +2749,58 @@ pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
 /// (optionally parenthesized). Used by the target-side `out_of_order
 /// tags N` responder lowering to range-check the literal tag count;
 /// mirrors v1's `fold_int_literal` over the same surface.
+/// The width-method rules — zero width, the language limit, and the
+/// direction check — stated ONCE, because they were previously stated
+/// three times and the third copy drifted from the other two.
+///
+/// `cpp_tb.rs` has v1's copy and `lower_width_method` below had TB-IR's;
+/// the covergroup path grew a third from intuition and got `resize`
+/// wrong (it is direction-agnostic — spec.md says so, and so do the
+/// other two copies), omitted the 1024-bit limit entirely, and inferred
+/// receiver widths through a constant fold where v1 uses literals only.
+/// Each of those was a separate review finding. A rule this codebase
+/// states more than once has drifted every time.
+///
+/// Returns the canonical sentence when a rule is violated, so both
+/// callers render identical text and only prepend their own context.
+/// `None` means the width is admissible — NOT that it lowers; a width
+/// above 64 is still outside the covergroup value model, which is that
+/// caller's own concern.
+pub(crate) fn width_method_violation(
+    kind_name: &str,
+    width: u32,
+    src_width: Option<u32>,
+) -> Option<String> {
+    if width == 0 {
+        return Some(format!(
+            "`.{kind_name}<{width}>()`: width must be greater than zero"
+        ));
+    }
+    if width > crate::MAX_WIDTH_METHOD_BITS {
+        return Some(format!(
+            "`.{kind_name}<{width}>()`: destination width exceeds the {}-bit language limit",
+            crate::MAX_WIDTH_METHOD_BITS
+        ));
+    }
+    // `resize` is deliberately absent from the direction check: it
+    // narrows or widens as asked. Stated here so the exception lives in
+    // one place too.
+    let sw = src_width?;
+    match kind_name {
+        "trunc" if width >= sw => Some(format!(
+            "`.trunc<{width}>()` on a {sw}-bit value: width must be strictly less than \
+             the source width (otherwise it's a no-op or wrong-direction). Use \
+             `.zext<{width}>()` to widen, or remove the cast if you meant a no-op."
+        )),
+        "zext" | "sext" if width < sw => Some(format!(
+            "`.{kind_name}<{width}>()` on a {sw}-bit value: width must be ≥ the source \
+             width (otherwise it narrows, wrong direction). Use `.trunc<{width}>()` to \
+             narrow."
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_int_literal_expr(e: &crate::ast::Expr) -> Option<u64> {
     match &*e.kind {
         crate::ast::ExprKind::Int(s) => parse_int_literal(s),

@@ -1397,69 +1397,19 @@ fn cover_width_arg(
              plain integer literal (v1: \"requires a constant integer width\")"
         )));
     }
-    if width == 0 {
+    // The zero-width, 1024-bit-limit and direction rules come from
+    // `exprs::width_method_violation` — the SAME function the general
+    // expression path uses — rather than being restated here. Three
+    // separate statements of these rules is what this file had, and
+    // the third drifted on every one of them: `resize` wrongly in the
+    // direction set, the language limit missing, the receiver width
+    // inferred through a fold where v1 uses literals only.
+    //
+    // Only the prefix is this path's own.
+    if let Some(why) = super::exprs::width_method_violation(method, width, src_width) {
         return Err(LowerError::Invalid(format!(
-            "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
+            "covergroup `{group}` point `{point}` {why}"
         )));
-    }
-    // The language limit, checked by v1 (`cpp_tb.rs`) and by TB-IR's
-    // general expression path (`exprs.rs`) and stated by the spec in
-    // the same sentence this file quotes for `resize` — "Width `N`
-    // must be a positive constant integer literal in `1..=1024`". The
-    // covergroup copy of the rule checked `0` and stopped, so
-    // `.zext<2000>()` was told to re-run under a v1 that refuses it.
-    if width > crate::MAX_WIDTH_METHOD_BITS {
-        return Err(LowerError::Invalid(format!(
-            "covergroup `{group}` point `{point}` `.{method}<{width}>()`: destination \
-             width exceeds the {}-bit language limit",
-            crate::MAX_WIDTH_METHOD_BITS
-        )));
-    }
-    // DIRECTION FIRST, for every width. This check used to live at the
-    // lowering site below the `>64` refusal, so it was unreachable for
-    // exactly the widths that need it most: `[100:0].zext<70>()` is a
-    // narrowing `zext`, v1 refuses it in plain words ("width must be
-    // ≥ the source width"), and TB-IR was answering "re-run with
-    // `--codegen v1`". Retracting the clamp turned a silent acceptance
-    // into a false escape hatch rather than into an honest verdict —
-    // the same defect class the retraction was written to remove.
-    if let Some(sw) = src_width {
-        // `resize` is NOT in this set. A first version put it here and
-        // made `dut.count_out[7:0].resize<4>()` `Invalid` — a program
-        // both backends previously compiled to identical C++. Three
-        // places already said so and none of them was read: the spec
-        // ("`.resize<N>()` remains direction-agnostic"), v1's own check
-        // (`"zext" | "sext" if width < sw`), and TB-IR's general
-        // expression lowering, which excludes it for the same reason.
-        // The rule was invented rather than looked up.
-        let wrong_direction = match method {
-            "trunc" => width >= sw,
-            "zext" | "sext" => width < sw,
-            _ => false,
-        };
-        if wrong_direction {
-            // v1's sentence, verbatim — including the `≥` and the
-            // suggestion, which carry the actionable half. Saying
-            // "phrased as v1 phrases it" while printing a paraphrase
-            // left the docs quoting one string and the code printing
-            // another.
-            let rule = if method == "trunc" {
-                format!(
-                    "width must be strictly less than the source width (otherwise it's a \
-                     no-op or wrong-direction). Use `.zext<{width}>()` to widen, or remove \
-                     the cast if you meant a no-op."
-                )
-            } else {
-                format!(
-                    "width must be ≥ the source width (otherwise it narrows, wrong \
-                     direction). Use `.trunc<{width}>()` to narrow."
-                )
-            };
-            return Err(LowerError::Invalid(format!(
-                "covergroup `{group}` point `{point}` `.{method}<{width}>()` on a \
-                 {sw}-bit value: {rule}"
-            )));
-        }
     }
     if width > 64 {
         // NOT clamped, and an earlier version of this arm clamped it —

@@ -6031,6 +6031,37 @@ case and only locally-determinable `Assign` types are compared).
     testbench-method sibling probed on its own rather than inferred
     from the helper — they agree, which is a result, not an assumption.
 
+99. **The width rules now have one statement per backend, which is the
+    minimum (2026-08-18).**
+
+    Round five's root-cause finding, acted on rather than patched
+    around: the covergroup path was a THIRD implementation of rules
+    that `cpp_tb.rs` (v1's) and `exprs.rs` (TB-IR's general path)
+    already stated, and it drifted from both on every one of them —
+    `resize` wrongly in the direction set, the 1024-bit language limit
+    missing entirely, the receiver width inferred through a constant
+    fold where v1 uses literals only. Three separate review findings,
+    one cause.
+
+    `exprs::width_method_violation` is now the single TB-IR statement of
+    zero-width, the language limit, and the direction check (with
+    `resize`'s exemption written once, beside the rule it is exempt
+    from). Both the general path and the covergroup path call it; only
+    the diagnostic PREFIX is per-caller, so the sentences stay
+    identical and there is nothing left to drift.
+
+    Two statements remain — one per backend — and that is irreducible:
+    v1 has its own copy because it is a different compiler. What is
+    gone is the third.
+
+    The check that this is real rather than cosmetic is a mutation on
+    the SHARED function: breaking the `trunc` direction rule now turns
+    six tests red and breaking the 1024-bit limit turns four, across
+    both paths. Before, breaking either in one place left the other
+    silently disagreeing — which is precisely how `resize` shipped as
+    `Invalid` for a construct both backends compile. The 352-cell grid
+    stays at 0 disagreements with v1.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
