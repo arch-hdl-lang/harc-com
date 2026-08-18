@@ -5999,6 +5999,38 @@ case and only locally-determinable `Assign` types are compared).
     lesson, which is that every place this codebase has written a type
     predicate twice, the copies have drifted.
 
+98. **Four `helpers.rs` arms, and the routing gate decided which
+    probe even reached them (2026-08-18).**
+
+    | arm | v1 | verdict |
+    |---|---|---|
+    | a DUT/sync-touching helper call in a message | compiles; calls it AT the failure site | `Unsupported` — correct already |
+    | a testbench method call in a message | compiles; same | `Unsupported` — correct already |
+    | a helper param of module type, non-DUT argument | "no match for call to `<lambda(VTop*)>` (Model&)" | `EmitsUncompilable` |
+    | a testbench method param of module type, non-DUT argument | "no match for call to `<lambda(Tb&, VTop*)>` (Tb&, Model&)" | `EmitsUncompilable` |
+
+    The first two are a negative result, and recording them is the
+    point: two of four arms on this branch turning out to be right is
+    only worth anything if the measurement happened.
+
+    Getting to them took three failed probes. A `log(...)` message
+    HOISTS a CFG-inlined call ahead of the statement and lowers fine
+    (#494 P2d), so probing with a `log` measures nothing — the arms
+    fire only for a CONDITIONALLY-evaluated message, an assert's `else
+    fail(...)`, where hoisting would run the inlined body even when the
+    message never fires. The gate is `lower_fmt` vs
+    `lower_fmt_hoisting`, one call level up, and no amount of reading
+    the arm would have shown that. Adding a `wait` to the helper to
+    make it "sync-touching" was the wrong lever twice before the gate
+    was read.
+
+    The module-param pair is the familiar shape: v1 types the emitted
+    lambda on the MODULE (`[&](VTop* d)`) and passes through whatever
+    was written, so the DUT spelling compiles clean and the component
+    spelling does not. Both measured with `-std=gnu++20`, and the
+    testbench-method sibling probed on its own rather than inferred
+    from the helper — they agree, which is a result, not an assumption.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

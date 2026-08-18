@@ -4055,6 +4055,134 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
     );
 }
 
+/// The four `helpers.rs` arms, and two of them were right already —
+/// which is worth a test precisely because it was measured rather than
+/// assumed.
+///
+/// | arm | v1 | verdict |
+/// |---|---|---|
+/// | a DUT/sync-touching helper call in a message | compiles; calls it at the failure site | `Unsupported` |
+/// | a testbench method call in a message | compiles; same | `Unsupported` |
+/// | a helper param of module type, non-DUT arg | `no match for call to <lambda(VTop*)> (Model&)` | `EmitsUncompilable` |
+/// | a testbench method param of module type, non-DUT arg | `no match for call to <lambda(Tb&, VTop*)> (Tb&, Model&)` | `EmitsUncompilable` |
+///
+/// The first two only fire for a CONDITIONALLY-evaluated message — an
+/// assert's `else fail(...)`. An unconditional `log(...)` hoists the
+/// call ahead of the statement and lowers fine, so probing with a
+/// `log` measures nothing at all; the routing gate is `lower_fmt` vs
+/// `lower_fmt_hoisting`, not the arm.
+#[test]
+fn the_helper_arms_split_between_a_real_hatch_and_an_uncompilable_call() {
+    let base = fixture("msg_call_hoist_test.harc");
+    const LOG: &str = "        log(info, \"dbl=${dbl(v)}\")";
+    assert!(base.contains(LOG), "fixture shape changed");
+
+    // Conditionally-evaluated message: v1 evaluates the call at the
+    // failure site, which is exactly the laziness TB-IR cannot inline.
+    for (what, msg, needle) in [
+        (
+            "impure helper",
+            "assert dut.count_out >= 0 else fail(\"cur=${cur_plus(dut, 1)}\")",
+            "cur_plus(dut, 1)",
+        ),
+        (
+            "testbench method",
+            "assert dut.count_out >= 0 else fail(\"dbl=${dbl(v)}\")",
+            "MsgCallHoistTb_dbl(_tb, v)",
+        ),
+    ] {
+        let src = base.replacen(LOG, &format!("        {msg}"), 1);
+        assert_ne!(src, base, "{what}: the message must actually change");
+        let m = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(m.contains("inside a message"), "{what}: {m}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(&format!("sim_log_line(\"FAIL\"")) && v1.contains(needle),
+            "{what}: v1 calls it at the failure site, which is what makes the suggestion honest"
+        );
+    }
+    // A PURE helper in the same position lowers — the arm is about
+    // CFG-inlined calls, not about messages.
+    lower_src(&base.replacen(
+        LOG,
+        "        assert dut.count_out >= 0 else fail(\"inc=${inc(v)}\")",
+        1,
+    ))
+    .expect("a pure helper in a conditional message still lowers");
+
+    // A module-typed parameter given something that is not the DUT:
+    // v1 types the lambda on the module and passes the argument
+    // through, so the call does not compile.
+    let helper = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+end agent Model
+
+function touch(d: Top) -> uint<32>
+    return d.count_out
+end function touch
+
+test T
+    let dut : Top
+    let m : Model
+    clock clk = SysDomain
+    run
+        let s : uint<32> = touch(ARG)
+        wait 1 cycle
+    end run
+end test T"#;
+    lower_src(&helper.replace("ARG", "dut")).expect("the DUT argument lowers");
+    let msg = assert_not_implemented(
+        &lower_src(&helper.replace("ARG", "m")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("helper parameter `d`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&helper.replace("ARG", "m"))).expect("v1 emits");
+    assert!(
+        v1.contains("auto touch = [&](VTop* d)") && v1.contains("touch(m)"),
+        "v1 passes a component to a `VTop*` lambda: {v1}"
+    );
+
+    // The testbench-method sibling, measured on its own.
+    let method = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+end agent Model
+
+testbench Tb
+    dut : Top
+    m   : Model
+    function peek(d: Top) -> uint<32>
+        return d.count_out
+    end peek
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : uint<32> = peek(ARG)
+        wait 1 cycle
+    end run
+end impl T"#;
+    lower_src(&method.replace("ARG", "dut")).expect("the DUT argument lowers");
+    let msg = assert_not_implemented(
+        &lower_src(&method.replace("ARG", "m")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("testbench method parameter `d`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&method.replace("ARG", "m"))).expect("v1 emits");
+    assert!(
+        v1.contains("Tb_peek(_tb, _tb.m)"),
+        "v1 passes the component field through: {v1}"
+    );
+}
+
 /// `when` subtype blocks stay outside the lowered record shape — and
 /// v1 does not implement them either, so this is not an escape hatch.
 ///
