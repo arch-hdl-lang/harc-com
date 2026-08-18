@@ -55,7 +55,9 @@ fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHand
     };
     if let Some(xid) = b.ctx.transactor_fields.get(field) {
         let x = &b.ctx.transactors[xid.index()];
-        return x.methods.iter().any(|m| m.name == *method);
+        return x.methods
+            .iter()
+            .any(|m| m.name == *method && m.hookable);
     }
     b.ctx
         .component_fields
