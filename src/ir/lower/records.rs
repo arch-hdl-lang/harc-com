@@ -58,7 +58,49 @@ use std::collections::HashMap;
 /// flattening and `list<Inner>` a working hatch, both backwards; and
 /// neither noticed that `list<Vec<…>>` makes v1's output stop
 /// compiling.
-fn non_scalar_record_leaf(kind: &str, owner: &str, fname: &str, ty: &TypeExpr) -> LowerError {
+/// A scalar leaf whose width slot holds something this compiler cannot
+/// read as a plain decimal — a non-decimal literal (`uint<0x8>`,
+/// `uint<0b1000>`) or a named constant (`uint<W>` against
+/// `const W = 8`).
+///
+/// v1 cannot read it either, but it does not say so — it substitutes a
+/// DIFFERENT fallback in each place that needs the width, so the field
+/// means three things at once. Measured on `uint<0x8>` against `uint<8>`:
+///
+/// | site | `uint<8>` | `uint<0x8>` |
+/// |---|---|---|
+/// | pack | `harc_wide_write_bits(_packed, 0, 8, …)` | `…, 0, 64, …` |
+/// | unpack | `harc_bits(_packed, 7, 0)` | `harc_bits(_packed, 63, 0)` |
+/// | randomize | `harc_rng_uint(harc_rng_next, 8)` | `…, 32)` |
+/// | problem table | `field data u8` | `field data u8` |
+///
+/// `uint<W>` behaves identically — v1 does not fold the constant into
+/// the width either, and packs 64 while drawing 32.
+///
+/// It compiles and runs. That is a silent mis-lowering, so the leaf
+/// must not carry a `--codegen v1` suggestion even though its MEMBER
+/// type (`uint64_t`) is one v1 gets right.
+fn unreadable_width_leaf(ty: &TypeExpr) -> bool {
+    let TypeExpr::Builtin { name, args, .. } = ty else {
+        return false;
+    };
+    if matches!(name, BuiltinTy::Vec) {
+        return false;
+    }
+    // A width SLOT that is present and unreadable. `Some(TypeArg::Expr)`
+    // is what makes it a width slot at all: a `queue<T>` / `event<T>` /
+    // `list<T>` payload arrives as `TypeArg::Type` and is a different
+    // arm's business.
+    matches!(args.first(), Some(TypeArg::Expr(_))) && declared_scalar_width(args).is_none()
+}
+
+fn non_scalar_record_leaf(
+    kind: &str,
+    owner: &str,
+    fname: &str,
+    ty: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> LowerError {
     use crate::codegen::cpp_tb::RecordLeafFate;
     const SUBSET: &str = "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
                           `Vec<T, N>` arrays of such scalars or of supported \
@@ -68,7 +110,18 @@ fn non_scalar_record_leaf(kind: &str, owner: &str, fname: &str, ty: &TypeExpr) -
         "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) leaf type `{}`",
         type_expr_label(ty)
     );
-    match crate::codegen::cpp_tb::record_leaf_fate(ty) {
+    if unreadable_width_leaf(ty) {
+        return not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; a width must be a plain decimal literal — v1 cannot read this \
+                 one either and silently substitutes a different fallback in the pack, \
+                 the unpack and the random draw"
+            ),
+            V1Status::SilentlyMisLowers,
+        );
+    }
+    match crate::codegen::cpp_tb::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
         RecordLeafFate::Models => unsupported(&what, SUBSET),
         RecordLeafFate::Flattens => not_implemented(
             &what,
@@ -182,25 +235,42 @@ pub(crate) fn lower_transaction(
                 keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
-                // A real escape hatch, and the one arm on this pass
-                // that was reclassified on a program which never
-                // randomized the transaction. With `randomize(q)` in
-                // the run body, v1 emits the guard and honours it:
+                // This arm has now been measured three times and the
+                // first two both looked at one shape each.
                 //
-                //     if (q.op == 1) {   // active when-subtype field addr
-                //         ... q.addr = _val_addr;
-                //     }
+                // Round one probed a program with `wait 1 cycle` for a
+                // run body. With no `randomize` there is no solve site
+                // for a guard to appear in, so it concluded v1 drops the
+                // guard — right label, no evidence.
                 //
-                // `cpp_tb.rs` carries dedicated when-subtype solve
-                // paths (`emit_txn_randomize`'s discriminator-first
-                // ordering, and three branch-local constraint sites),
-                // and `tests/fixtures/axi_agent.harc` is a `when`
-                // subtype with `keep`s. The unconditional
-                // `static void randomize_Req(Req*)` I read instead is
-                // only ever called from an OUTER record's randomize.
-                return Err(unsupported(
+                // Round two added `randomize(q)` and found v1 emitting
+                // `if (q.op == 1) { … q.addr = _val_addr; }` — the guard
+                // honoured — and flipped the arm to a real escape hatch.
+                // That is true of the DIRECT shape only.
+                //
+                // Round three is the shape round two's own comment named
+                // and did not run. Put the subtype inside another record
+                // (`transaction Outer { tag : uint<8>; inner : Req }`)
+                // and randomize the OUTER one, and v1 reaches `Req`
+                // through `static void randomize_Req(Req*)`:
+                //
+                //     t->op   = harc_rng_uint(harc_rng_next, 8);
+                //     t->addr = harc_rng_uint(harc_rng_next, 16);
+                //
+                // No guard — `op == 1` appears zero times in the whole
+                // file — and the solver's problem table lists `tag` and
+                // `inner.op` but not `inner.addr`, so the conditional
+                // field is not in the solve at all. It compiles and
+                // runs.
+                //
+                // An arm's status is the worst thing v1 does anywhere
+                // under it, and that is this.
+                return Err(not_implemented(
                     &format!("`when` subtype blocks in transaction `{txn}`"),
-                    "only flat records lower; v1 implements when-subtypes, guard included",
+                    "v1 honours the guard when the transaction is randomized directly, but \
+                     reaches a NESTED one through an unconditional `randomize_<T>` that \
+                     drops the guard and leaves the conditional field out of the solve",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -374,7 +444,7 @@ fn lower_record_field(
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
             let scalar = field_ir_type(&f.ty, enum_names)
-                .ok_or_else(|| non_scalar_record_leaf(kind, owner, fname, &f.ty))?;
+                .ok_or_else(|| non_scalar_record_leaf(kind, owner, fname, &f.ty, record_ids))?;
             (scalar, None)
         }
     };
@@ -500,31 +570,69 @@ fn fixed_vec_field(
     }
 }
 
+/// A zero-width scalar (`uint<0>`) in a field's own type, or under a
+/// `Vec` element. Those are the shapes v1 PANICS on; nothing else here
+/// is `Invalid`, and the first version of this reached much further:
+///
+/// | field | v1 | |
+/// |---|---|---|
+/// | `uint<0>`, `sint<0>`, `bits<0>` | panics in `emit_unpack_bits` | `Invalid` |
+/// | `Vec<uint<0>, 4>` | panics likewise | `Invalid` |
+/// | `list<uint<0>>`, `queue<uint<0>>`, `event<uint<0>>` | `std::vector<uint64_t>` / `uint64_t`, and it COMPILES | not this arm's business |
+/// | `uint<0x0>`, `uint<0b0>` | `uint64_t data = 0;`, and it COMPILES | likewise |
+///
+/// The `list`/`queue`/`event` rows were `Invalid` because this recursed
+/// through every `TypeArg::Type`, including a payload argument v1 never
+/// reads a width from. The hex and binary rows were `Invalid` because
+/// this read the width with `parse_int_literal_expr`, which understands
+/// `0x`/`0b`, while v1's `int_width_from_args` and TB-IR's own
+/// `field_ir_type` both do a plain decimal `parse::<u32>()` — so `0x0`
+/// is not a width to either of them and both fall back to 64 bits. The
+/// rule was already written down twice and got reconstructed a third
+/// time; it now reads through `declared_scalar_width`, which IS
+/// `field_ir_type`'s reader.
+///
+/// Only the WIDTH slot counts: `Vec<uint<8>, 0>` is a zero-LENGTH
+/// array, which v1 emits as `std::array<uint64_t, 0>` and g++ accepts.
+fn zero_width_leaf(ty: &TypeExpr) -> bool {
+    match ty {
+        // A named generic list (`list<T>`) carries no width slot, and v1
+        // does not panic on a zero-width payload under one.
+        TypeExpr::Named { .. } => false,
+        TypeExpr::Builtin { name, args, .. } => {
+            if matches!(name, BuiltinTy::Vec) {
+                // `Vec`'s first argument is its element; the second is a
+                // length, not a width.
+                return matches!(args.first(), Some(TypeArg::Type(elem)) if zero_width_leaf(elem));
+            }
+            // A `queue<T>` / `event<T>` payload is not a width slot
+            // either, so only this type's own first argument is read.
+            declared_scalar_width(args) == Some(0)
+        }
+    }
+}
+
+/// The declared bit width in a scalar builtin's type arguments, read the
+/// way BOTH backends read it: a plain decimal integer literal with
+/// underscores stripped. v1's `int_width_from_args` / `type_arg_width`
+/// do exactly this, so `uint<0x0>` has no width to either backend and
+/// falls back to 64 bits rather than being a zero-width type.
+fn declared_scalar_width(args: &[TypeArg]) -> Option<u32> {
+    match args.first() {
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Scalar field-type mapping, mirroring v1's `txn_field_c_type` C-type
 /// choices for the ≤64-bit subset: uint/bits/int → unsigned, sint →
 /// signed, bool/bit → bool. `None` for anything this slice does not
-/// lower (nested records, enums, lists, vecs, >64-bit widths).
-/// A zero-width scalar (`uint<0>`) anywhere in a field's type, including
-/// under a `Vec` element or a `list`/`queue`/`event` argument. Only the
-/// WIDTH slot counts: `Vec<uint<8>, 0>` is a zero-LENGTH array, which v1
-/// emits as `std::array<uint64_t, 0>` and g++ accepts.
-fn zero_width_leaf(ty: &TypeExpr) -> bool {
-    // `Vec`'s first argument is its element and a named generic list
-    // carries no width, so neither of those has a width slot to read.
-    let (has_width_slot, args) = match ty {
-        TypeExpr::Named { generics, .. } => (false, generics.as_slice()),
-        TypeExpr::Builtin { name, args, .. } => (!matches!(name, BuiltinTy::Vec), args.as_slice()),
-    };
-    if has_width_slot
-        && matches!(args.first(), Some(TypeArg::Expr(e))
-            if super::exprs::parse_int_literal_expr(e) == Some(0))
-    {
-        return true;
-    }
-    args.iter()
-        .any(|a| matches!(a, TypeArg::Type(t) if zero_width_leaf(t)))
-}
-
+/// lower (nested records, enums, lists, vecs, >64-bit widths), and for
+/// a width this compiler cannot read as a plain decimal — the same
+/// reader `zero_width_leaf` uses, so the two cannot drift.
 fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         // Enum-typed field: v1 lowers it to an `int64_t` struct member
@@ -539,10 +647,7 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
         return None;
     };
     let width = match args.first() {
-        Some(TypeArg::Expr(e)) => match &*e.kind {
-            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
-            _ => return None,
-        },
+        Some(TypeArg::Expr(_)) => Some(declared_scalar_width(args)?),
         Some(_) => return None,
         None => None,
     };

@@ -5972,7 +5972,8 @@ case and only locally-determinable `Assign` types are compared).
     | `default` on a nested-record field | `Inner i = 0;` — "could not convert '0' from 'int' to 'Inner'" | `EmitsUncompilable` |
     | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same conversion error | `EmitsUncompilable` |
     | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
-    | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits into a 64-bit member; `-Woverflow`, truncates | `SilentlyMisLowers` |
+    | `default 128'hFF…`, `0xFF…` | folds to a `_harc_u128` composite the 64-bit member truncates (`-Woverflow`) | `SilentlyMisLowers` |
+    | `default 999…` | pasted verbatim; "integer constant is too large for its type", truncates | `SilentlyMisLowers` |
 
     **Both wrong verdicts were measured on a program that never
     randomizes the record.** The `when` probe's run body was `wait 1
@@ -6028,7 +6029,7 @@ case and only locally-determinable `Assign` types are compared).
     `Models` / `Flattens` / `Uncompilable`. `emit_field_random`'s
     per-element draw was extracted into `list_elem_random_expr` so both
     the emitter and the predicate read one copy of it; v1's output over
-    all 184 fixtures is byte-identical across that refactor.
+    the whole fixture corpus is byte-identical across that refactor (190 fixtures parse; 160 emit).
 
     The two consumers map the same fate differently, and that difference
     is measured too: a scoreboard emits no `randomize_*` body, so the
@@ -6105,7 +6106,7 @@ case and only locally-determinable `Assign` types are compared).
 
     The check that this is real rather than cosmetic is a mutation on
     the SHARED function: breaking the `trunc` direction rule now turns
-    six tests red and breaking the 1024-bit limit turns four, across
+    five tests red and breaking the 1024-bit limit turns three, across
     both paths. Before, breaking either in one place left the other
     silently disagreeing — which is precisely how `resize` shipped as
     `Invalid` for a construct both backends compile. The 352-cell grid
@@ -6140,7 +6141,7 @@ case and only locally-determinable `Assign` types are compared).
 
      The field-type arm asks the same flatten question as the record
      one and now asks it through the SAME predicate —
-     `records::record_leaf_flattens` — rather than a second copy. The
+     `cpp_tb::record_leaf_fate` — rather than a second copy. The
      supported SETS differ (a `queue<T>` is a legal scoreboard field and
      not a legal record leaf) but the rule about what v1 does with the
      rest does not, and this file has already paid twice for
@@ -6314,6 +6315,84 @@ former `transaction` group lives in
      The second-DUT-handle row is the branch's first `SilentlyMisLowers`
      whose runtime failure is a null dereference rather than a wrong
      value: v1 compiles the poke against a handle it never binds.
+
+103. **Four corrections from review, three of them `Invalid` on programs
+     v1 runs (2026-08-18).**
+
+     The branch's own rule — `Invalid` means no backend runs it in ANY
+     configuration — was broken three ways by one guard and one
+     predicate.
+
+     **`zero_width_leaf` recursed through every type argument.** A
+     zero-width scalar under a `list`/`queue`/`event` PAYLOAD is not the
+     shape v1 panics on: it emits `std::vector<uint64_t>` /
+     `uint64_t` and compiles clean. Only the type's own width slot and a
+     `Vec` element count. Three constructs went from `Invalid` back to
+     an honest verdict.
+
+     **It read the width with the wrong parser.** It used
+     `parse_int_literal_expr`, which understands `0x`/`0b`; v1's
+     `int_width_from_args` and TB-IR's own `field_ir_type` both do a
+     plain decimal `parse::<u32>()`. So `uint<0x0>` was `Invalid` while
+     v1 compiled it. The width reader is now one function
+     (`declared_scalar_width`) that `field_ir_type` also calls.
+
+     That measurement turned up a real gap the old code had papered
+     over. v1 cannot read a hex width either, and it does not say so —
+     it substitutes a DIFFERENT fallback everywhere it needs one:
+
+     | site | `uint<8>` | `uint<0x8>` |
+     |---|---|---|
+     | pack | `harc_wide_write_bits(_packed, 0, 8, …)` | `…, 0, 64, …` |
+     | unpack | `harc_bits(_packed, 7, 0)` | `harc_bits(_packed, 63, 0)` |
+     | randomize | `harc_rng_uint(harc_rng_next, 8)` | `…, 32)` |
+     | problem table | `field data u8` | `field data u8` |
+
+     It compiles and runs, so an unreadable width is now
+     `SilentlyMisLowers` rather than the escape hatch its member type
+     would suggest.
+
+     **`record_leaf_fate` asked the wrong member-picker.** It consulted
+     the free `txn_field_c_type`, which maps every `TypeExpr::Named` to
+     `int64_t`. The function that actually picks members for scoreboard
+     and record fields is the METHOD `Emitter::record_field_c_type`,
+     which adds one layer: a named type that IS a declared record gets
+     the record's own name. So `scoreboard Sb { l : Inner }` was
+     `SilentlyMisLowers` with the detail "v1 emits an UNINITIALIZED
+     plain scalar", and v1 emits `Inner l;` and compiles. The predicate
+     now takes an `is_record` callback and reproduces that layer.
+
+     Divergence 97's claim that "`txn_field_c_type` is the only caller
+     that picks a member type" was simply false.
+
+     **The `when`-subtype arm needed a third measurement.** Round one
+     probed a program with no `randomize` and concluded the guard was
+     dropped — right label, no evidence. Round two added `randomize(q)`,
+     found `if (q.op == 1) { … }` honoured, and flipped the arm to an
+     escape hatch. Round three is the shape round two's own comment
+     named and did not run: nest the subtype in another record and
+     randomize the OUTER one, and v1 reaches it through
+
+     ```cpp
+     static void randomize_Req(Req* t) {
+         t->op   = harc_rng_uint(harc_rng_next, 8);
+         t->addr = harc_rng_uint(harc_rng_next, 16);   // no guard
+     }
+     ```
+
+     `op == 1` appears zero times in the file and `inner.addr` is absent
+     from the solver's problem table. Worst-thing-anywhere makes the arm
+     `SilentlyMisLowers`.
+
+     Also corrected from the same review: divergence 100 named the
+     shared predicate `records::record_leaf_flattens` (it is
+     `cpp_tb::record_leaf_fate`); divergence 99 claimed six and four
+     tests redden on the shared width mutations (it is five and three);
+     a `scalar_leaf_c_type` doc referenced a function that never
+     existed; inserting `zero_width_leaf` had orphaned `field_ir_type`'s
+     doc comment onto it; and a stale scoreboard comment sat directly
+     above the one that contradicted it.
+
 
 ## Next steps
 

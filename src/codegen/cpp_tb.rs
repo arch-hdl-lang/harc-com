@@ -19736,8 +19736,8 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
 /// type. `txn_field_c_type` is the only caller that picks a member type,
 /// and everything NOT matched here falls through its `_ =>` arms to a
 /// bare `uint64_t` / `int64_t` — a member that does not mean what was
-/// written. Splitting the decision out is what lets
-/// `record_leaf_models` ask the question instead of restating it.
+/// written. Splitting the decision out is what lets `record_leaf_fate`
+/// ask the question instead of restating it.
 fn scalar_leaf_c_type(name: &BuiltinTy, args: &[TypeArg]) -> Option<String> {
     match name {
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
@@ -19822,11 +19822,17 @@ pub(crate) enum RecordLeafFate {
 ///   * everything else (`queue`, `string`, `event`, `object`, an
 ///     unresolved name) → a bare scalar.
 ///
-/// Consulted by the TB-IR lowering (`ir::lower::records`). Writing a
-/// second copy of these rules there is what produced divergence 97's
-/// first version, which called a 128-bit field a flattening and a
-/// `list<Inner>` a working escape hatch — both backwards.
-pub(crate) fn record_leaf_fate(t: &TypeExpr) -> RecordLeafFate {
+/// `is_record` answers `Emitter::is_record_type` — the extra layer
+/// `record_field_c_type` puts on top of `txn_field_c_type`, and the one
+/// that actually serves scoreboard and record members. Asking only the
+/// free function missed it (divergence 103).
+///
+/// Consulted by the TB-IR lowering (`ir::lower::records` and
+/// `ir::lower::scoreboards`). Writing a second copy of these rules there
+/// is what produced divergence 97's first version, which called a
+/// 128-bit field a flattening and a `list<Inner>` a working escape
+/// hatch — both backwards.
+pub(crate) fn record_leaf_fate(t: &TypeExpr, is_record: &dyn Fn(&str) -> bool) -> RecordLeafFate {
     if is_list_type(t) {
         let Some(elem) = list_elem_type(t) else {
             return RecordLeafFate::Flattens;
@@ -19844,10 +19850,20 @@ pub(crate) fn record_leaf_fate(t: &TypeExpr) -> RecordLeafFate {
         return RecordLeafFate::Flattens;
     }
     if let Some((elem, _)) = fixed_vec_type_args(t) {
-        return match record_leaf_fate(elem) {
+        return match record_leaf_fate(elem, is_record) {
             RecordLeafFate::Models => RecordLeafFate::Models,
             _ => RecordLeafFate::Flattens,
         };
+    }
+    // The layer `record_field_c_type` adds on top of `txn_field_c_type`:
+    // a named type that IS a declared record gets the record's own name
+    // as its member type, not `int64_t`. Asking only `txn_field_c_type`
+    // missed it and called `scoreboard Sb { l : Inner }` a flattening,
+    // when v1 emits `Inner l;` and compiles.
+    if let TypeExpr::Named { name, .. } = t {
+        if name.segments.last().is_some_and(|seg| is_record(&seg.name)) {
+            return RecordLeafFate::Models;
+        }
     }
     match t {
         TypeExpr::Builtin { name, args, .. } if scalar_leaf_c_type(name, args).is_some() => {

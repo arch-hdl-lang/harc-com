@@ -3982,6 +3982,12 @@ end test T"#
             "data[_i] = harc_rt::random::harc_rng_uint(harc_rng_next, 64)",
         ),
         ("Vec<uint, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        // `int` is 32-bit signed in HARC and this backend maps it
+        // through the UNSIGNED width helper, so a `Vec<int, N>` member
+        // is `std::array<uint64_t, N>` — which is also what TB-IR
+        // mirrors. Pinned because the `Int` arm of `scalar_leaf_c_type`
+        // had nothing measuring it.
+        ("Vec<int, 4>", "std::array<uint64_t, 4> data", "data = {}"),
         ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data", "data = {}"),
         (
             "Vec<uint<256>, 4>",
@@ -4046,6 +4052,14 @@ end test T"#
             lower::V1Status::SilentlyMisLowers,
         );
         assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        // These flatten; they do NOT have an unreadable width. A
+        // `queue<T>` / `event<T>` payload arrives in the same argument
+        // POSITION a width would, so the two arms are only told apart
+        // by which kind of type argument it is.
+        assert!(
+            msg.contains("flattens the field to a plain scalar") && !msg.contains("plain decimal"),
+            "`{ty}` is the flatten arm, not the unreadable-width one: {msg}"
+        );
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains(shape), "`{ty}`: v1 flattens it to `{shape}`");
     }
@@ -4060,6 +4074,70 @@ end test T"#
     ] {
         let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains(marker), "`{ty}`: v1 emits `{marker}`");
+    }
+}
+
+/// A width slot this compiler cannot read as a plain decimal.
+///
+/// It is NOT a zero-width type — `uint<0x0>` does not panic v1 — and it
+/// is NOT an escape hatch either: v1 cannot read the width and says
+/// nothing, substituting a different fallback in every place that needs
+/// one. `uint<0x8>` against `uint<8>` is the whole measurement.
+#[test]
+fn an_unreadable_width_is_a_silent_mis_lowering_not_a_hatch() {
+    let field = |ty: &str| {
+        format!(
+            r#"const W = 8
+
+transaction Req
+    op : uint<8>
+    data : {ty}
+end transaction Req
+
+test T
+    let dut : Top
+    run
+        let r : Req
+        randomize(r)
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for ty in [
+        "uint<0x0>",
+        "uint<0b0>",
+        "uint<0x8>",
+        "uint<0b1000>",
+        "uint<W>",
+    ] {
+        let src = field(ty);
+        let err = lower_src(&src).unwrap_err();
+        assert!(
+            !matches!(err, lower::LowerError::Invalid(_)),
+            "`{ty}` is not Invalid — v1 does not panic on it: {err:?}"
+        );
+        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains("uint64_t data = 0;"), "`{ty}`: {v1}");
+    }
+    // The three widths v1 substitutes, none of them the declared 8.
+    let hex = cpp_tb::emit(&merged_src(&field("uint<0x8>"))).expect("v1 emits");
+    for needle in [
+        "harc_rt::harc_wide_write_bits(_packed, 0, 64, value.data);",
+        "value.data = (uint64_t)harc_rt::harc_bits(_packed, 63, 0);",
+        "t->data = harc_rt::random::harc_rng_uint(harc_rng_next, 32);",
+    ] {
+        assert!(hex.contains(needle), "v1 emits `{needle}`: {hex}");
+    }
+    // …against the decimal spelling, which is consistent at 8.
+    let dec = cpp_tb::emit(&merged_src(&field("uint<8>"))).expect("v1 emits");
+    for needle in [
+        "harc_rt::harc_wide_write_bits(_packed, 0, 8, value.data);",
+        "value.data = (uint64_t)harc_rt::harc_bits(_packed, 7, 0);",
+        "t->data = harc_rt::random::harc_rng_uint(harc_rng_next, 8);",
+    ] {
+        assert!(dec.contains(needle), "v1 emits `{needle}`: {dec}");
     }
 }
 
@@ -4101,6 +4179,25 @@ end test T"#
     assert_unsupported(&lower_src(&src).unwrap_err());
     let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
     assert!(v1.contains("std::array<uint64_t, 0> data"), "{v1}");
+
+    // A zero-width PAYLOAD under a container is not this rule at all:
+    // v1 never reads a width there, does not panic, and its output
+    // compiles. The first version of the guard recursed through every
+    // type argument and made all three `Invalid`.
+    for (ty, shape) in [
+        ("list<uint<0>>", "std::vector<uint64_t> data"),
+        ("queue<uint<0>>", "uint64_t data = 0;"),
+        ("event<uint<0>>", "uint64_t data = 0;"),
+    ] {
+        let src = field(ty);
+        let err = lower_src(&src).unwrap_err();
+        assert!(
+            !matches!(err, lower::LowerError::Invalid(_)),
+            "`{ty}` is not Invalid: {err:?}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(shape), "`{ty}`: v1 emits `{shape}`");
+    }
 }
 
 /// The other `records.rs` arms, each measured on its own.
@@ -4231,6 +4328,10 @@ transactor Drv
     dut : Top
 end transactor Drv
 
+struct Inner
+    x : uint<8>
+end struct Inner
+
 {sb}
 
 testbench Tb
@@ -4312,6 +4413,11 @@ end impl T"#
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
         ),
+        // A record-typed field. `txn_field_c_type` alone maps every
+        // named type to `int64_t`, and asking only it called this a
+        // flattening — but the member picker these fields actually go
+        // through adds one layer, and v1 emits the record itself.
+        ("Inner", "Inner l;"),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
         assert_unsupported(&lower_src(&src).unwrap_err());
@@ -4770,21 +4876,22 @@ end impl T"#;
     );
 }
 
-/// `when` subtype blocks stay outside the lowered record shape, and the
-/// two spellings do NOT share a verdict.
+/// `when` subtype blocks stay outside the lowered record shape, and
+/// this arm took three rounds of measurement because each of the first
+/// two looked at exactly one shape.
 ///
-/// In a transaction it is a real escape hatch: v1 implements the
-/// subtype, guard included. The measurement that said otherwise ran on
-/// a program whose run body was `wait 1 cycle` — with no `randomize`
-/// there is no solve site for a guard to appear in, and the
-/// unconditional `static void randomize_Req(Req*)` it read instead is
-/// only ever called from an OUTER record's randomize.
+/// | shape | v1 |
+/// |---|---|
+/// | `randomize(q)` on the transaction itself | emits the guard and gates the conditional field on it |
+/// | the same subtype nested in another record, outer randomized | reaches it through an unconditional `randomize_Req` — no guard anywhere, and the field is not in the solve |
+/// | in a struct | the field is gone from the emitted struct entirely |
 ///
-/// In a struct the field really is dropped: the emitted struct is
-/// byte-identical to the same struct without the block, even with
-/// `randomize` present.
+/// The first round measured a program with no `randomize` at all, so
+/// nothing about the guard was observable; the second measured the
+/// direct path and called the arm an escape hatch. The nested path is
+/// the worst of the three and so is the arm's label.
 #[test]
-fn record_when_subtype_is_unsupported() {
+fn record_when_subtype_splits_by_where_it_is_randomized_from() {
     let prog = |decl: &str, kind: &str| {
         format!(
             r#"{decl}
@@ -4805,10 +4912,14 @@ end test WhenTest
          end when\nend transaction Req",
         "Req",
     );
-    let msg = assert_unsupported(&lower_src(&txn).unwrap_err());
+    let msg = assert_not_implemented(
+        &lower_src(&txn).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(msg.contains("`when` subtype"), "names the construct: {msg}");
-    // The evidence for THAT verdict: v1 emits the guard and gates the
-    // conditional field's assignment on it.
+    // DIRECTLY randomized, v1 emits the guard and gates the conditional
+    // field on it. This half is why the arm was once called an escape
+    // hatch, and it is real — it is just not the whole arm.
     let v1 = cpp_tb::emit(&merged_src(&txn)).expect("v1 emits");
     assert!(
         v1.contains("if (q.op == 1) {   // active when-subtype field addr"),
@@ -4817,6 +4928,34 @@ end test WhenTest
     assert!(
         v1.contains("q.addr = _val_addr;"),
         "…and assigns the conditional field only under it: {v1}"
+    );
+    // Reached through an OUTER record, the same subtype loses the guard
+    // entirely. `randomize_Req` assigns the conditional field
+    // unconditionally and the solver's problem table never mentions it.
+    // That is the worst thing v1 does under this arm, so it is the
+    // arm's label.
+    let nested = prog(
+        "transaction Req\n    op : uint<8>\n    when op == 1\n        addr : uint<16>\n    \
+         end when\nend transaction Req\n\ntransaction Outer\n    tag : uint<8>\n    \
+         inner : Req\nend transaction Outer",
+        "Outer",
+    );
+    assert_not_implemented(
+        &lower_src(&nested).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&nested)).expect("v1 emits");
+    assert!(
+        !v1.contains("op == 1"),
+        "v1 drops the guard on the nested path: {v1}"
+    );
+    assert!(
+        v1.contains("t->addr = harc_rt::random::harc_rng_uint(harc_rng_next, 16);"),
+        "…and draws the conditional field unconditionally: {v1}"
+    );
+    assert!(
+        !v1.contains("inner.addr"),
+        "…and leaves it out of the solve entirely: {v1}"
     );
 
     // The struct spelling loses the field, which no `--codegen v1` run

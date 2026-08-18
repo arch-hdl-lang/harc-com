@@ -139,11 +139,6 @@ pub(crate) fn lower_scoreboard(
                 });
             }
             ComponentItem::Hookable(h) => {
-                // Scoreboard methods mutate scoreboard instance state,
-                // which the v0 subset does not materialize. Reject the
-                // declaration so a method-bearing scoreboard never lowers
-                // to a struct missing its methods (it would mis-lower at
-                // a call site otherwise).
                 // UNREACHABLE, and provably so: `lower_program` routes a
                 // scoreboard to the composite-component table when
                 // `components::scoreboard_is_component` holds, and that
@@ -151,10 +146,11 @@ pub(crate) fn lower_scoreboard(
                 // exact condition of this arm. Replacing the body with
                 // `unreachable!()` leaves the whole suite green.
                 //
-                // The comment this replaces described an intent ("reject
-                // the declaration so a method-bearing scoreboard never
-                // lowers to a struct missing its methods") that the
-                // routing gate has since made moot. Kept as an invariant
+                // The comment that used to sit here described an intent
+                // ("reject the declaration so a method-bearing scoreboard
+                // never lowers to a struct missing its methods") that the
+                // routing gate has since made moot; it is deleted rather
+                // than kept above this one. Kept as an invariant
                 // guard, and `Invalid` rather than a v1 suggestion: if it
                 // ever did fire, the routing above would be broken, which
                 // is not something `--codegen v1` can help with.
@@ -325,7 +321,8 @@ fn scoreboard_field_kind(
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
-        if crate::codegen::cpp_tb::record_leaf_fate(t) == RecordLeafFate::Flattens {
+        let fate = crate::codegen::cpp_tb::record_leaf_fate(t, &|n| record_ids.contains_key(n));
+        if fate == RecordLeafFate::Flattens {
             return not_implemented(
                 &what,
                 format!(
