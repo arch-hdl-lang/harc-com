@@ -6199,6 +6199,50 @@ deeper as slices land. The per-fixture residual map for the whole
 former `transaction` group lives in
 [tbir-coverage.md](tbir-coverage.md).
 
+101. **Six `on <event>(arg)` arms in `components.rs`, five of them
+     provably dead (2026-08-18).**
+
+     `event_subscription` is the predicate that ROUTES an `on` handler
+     to the subscription path, and it already establishes three facts:
+     the trigger is a `Call`, its callee is a bare identifier, and that
+     identifier names an `event` field. The resolver it routed into then
+     re-derived all three and carried a rejection arm for each failure,
+     plus one for `h.periodic` — which the item split at the top of the
+     function has already sent to `periodic_asts`.
+
+     All five are unreachable. Replacing each with `unreachable!()`
+     leaves the whole suite green, and each of the five shapes lands on
+     a different diagnostic entirely:
+
+     | trigger | where it lands |
+     |---|---|
+     | `on 3 cycles` | lowers — a periodic handler |
+     | `on clk` | the unresolved-name arm |
+     | `on tagger.in_ev(t)` | "transactor/method call `.in_ev(...)`" |
+     | `on other(t)` (a scalar field) | "helper call `other(...)`" |
+     | `on nosuch(t)` | "helper call `nosuch(...)`" |
+
+     So the resolution moved into the routing predicate, which now
+     returns what it found rather than a bool. This is the same shape of
+     defect as divergence 97's leaf table and divergence 100's dead
+     scoreboard arm: a fact established in one place, restated in
+     another, and the restatement kept for shapes the first place had
+     already excluded.
+
+     The two arms that survive split on measurement, and they had been
+     one arm:
+
+     | trigger | v1 emits | verdict |
+     |---|---|---|
+     | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
+     | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `EmitsUncompilable` |
+
+     A body that reads `u` gets "'u' was not declared in this scope". A
+     body that does not is byte-identical to the one-argument form, so
+     the declared name is silently gone; the arm takes the worse of the
+     two.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

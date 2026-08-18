@@ -4337,6 +4337,117 @@ end impl T"#
     }
 }
 
+/// The `on <event>(arg)` subscription arms in `components.rs`.
+///
+/// Six sites; five were provably dead. `event_subscription` — the
+/// predicate that ROUTES a handler here — already establishes that the
+/// trigger is a `Call` on a bare identifier naming an `event` field, and
+/// a periodic handler never reaches the loop at all. The resolver then
+/// re-derived all four facts and carried a rejection arm for each. Every
+/// one of those shapes lands on a different diagnostic entirely, which
+/// is what this test pins: if the routing predicate ever loosens, these
+/// stop matching and the dead arms are dead no longer.
+///
+/// | trigger | where it actually lands |
+/// |---|---|
+/// | `on 3 cycles` | lowers — a periodic handler |
+/// | `on clk` | the unresolved-name arm |
+/// | `on tagger.in_ev(t)` | the transactor/method-call arm |
+/// | `on other(t)` (a scalar field) | the helper-call arm |
+/// | `on nosuch(t)` | the helper-call arm |
+///
+/// The two live arms split on measurement: `on in_ev()` compiles and
+/// runs (v1 synthesizes `_v` for a payload the body cannot name anyway),
+/// while `on in_ev(t, u)` drops the extra parameter and a body that
+/// reads it does not compile.
+#[test]
+fn the_event_subscription_arms_are_two_live_ones_and_five_dead() {
+    let agent = |trigger: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    other : uint<8>  default 0
+
+    on {trigger}
+        {body}
+    end on
+end agent Tagger
+
+test T
+    let dut    : Top
+    let tagger : Tagger
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+        emit tagger.in_ev(1)
+        wait 2 cycles
+        log(info, "seen={{}}", tagger.seen)
+    end run
+end test T"#
+        )
+    };
+
+    // The five shapes the routing predicate excludes. None of them may
+    // reach the subscription arms — each is claimed elsewhere first.
+    lower_src(&agent("3 cycles", "seen = seen + 1")).expect("a periodic handler lowers");
+    for (trigger, elsewhere) in [
+        ("clk", "the unresolved name `clk`"),
+        ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
+        ("other(t)", "helper call `other(...)`"),
+        ("nosuch(t)", "helper call `nosuch(...)`"),
+    ] {
+        let msg = match lower_src(&agent(trigger, "seen = seen + 1")) {
+            Ok(_) => panic!("`on {trigger}` unexpectedly lowered"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(
+            msg.contains(elsewhere),
+            "`on {trigger}` lands on `{elsewhere}`, not a subscription arm: {msg}"
+        );
+    }
+
+    // No payload name: v1 synthesizes one and the handler runs, which
+    // is what was written — the payload is simply unbound.
+    let none = agent("in_ev()", "seen = seen + 1");
+    let msg = assert_unsupported(&lower_src(&none).unwrap_err());
+    assert!(msg.contains("no payload argument"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
+    assert!(
+        v1.contains("tagger.in_ev.push_back([&](uint64_t _v) {"),
+        "v1 synthesizes a payload name: {v1}"
+    );
+
+    // A second payload name: v1 drops it, and a body that reads it
+    // names an undeclared variable. The status is the worst thing v1
+    // does anywhere under the arm, so the unused spelling shares it.
+    for body in ["seen = seen + 1", "seen = seen + u"] {
+        let two = agent("in_ev(t, u)", body);
+        assert_not_implemented(
+            &lower_src(&two).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&two)).expect("v1 emits");
+        assert!(
+            v1.contains("tagger.in_ev.push_back([&](uint64_t t) {") && !v1.contains("uint64_t u"),
+            "v1 emits the lambda with only the first parameter: {v1}"
+        );
+    }
+    // …and the one-argument control really does bind the name, so the
+    // difference above is the dropped parameter and nothing else.
+    let one = agent("in_ev(t)", "seen = seen + t");
+    lower_src(&one).expect("the control lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&one)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&agent("in_ev(t, u)", "seen = seen + t"))).expect("v1 emits"),
+        "the extra parameter leaves no trace in v1's output"
+    );
+}
+
 /// The four `helpers.rs` arms, and two of them were right already —
 /// which is worth a test precisely because it was measured rather than
 /// assumed.

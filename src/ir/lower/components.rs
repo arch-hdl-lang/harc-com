@@ -722,8 +722,8 @@ pub(crate) fn lower_component_schema(
                 )
             })?;
             cycle_asts.push((h, Some(channel)));
-        } else if is_event_subscription(h, &fields) {
-            let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
+        } else if let Some((event, arg_payload, args)) = event_subscription(h, &fields) {
+            validate_event_handler(name, h, &event, args)?;
             let fid = FunctionId(*next_fn);
             *next_fn += 1;
             on_handlers.push(crate::ir::OnHandlerSchema {
@@ -815,16 +815,21 @@ pub(crate) fn lower_component_schema(
 /// trigger is a `Call` whose callee is a bare identifier naming a self
 /// `event<...>` field. Everything else (a bare bool predicate, a `Call`
 /// on a non-event name) is a cycle-trigger monitor handler.
-fn is_event_subscription(h: &crate::ast::OnHandler, fields: &[ComponentFieldSchema]) -> bool {
-    let ExprKind::Call { callee, .. } = &*h.event.kind else {
-        return false;
+fn event_subscription<'a>(
+    h: &'a crate::ast::OnHandler,
+    fields: &[ComponentFieldSchema],
+) -> Option<(String, EventPayload, &'a [crate::ast::CallArg])> {
+    let ExprKind::Call { callee, args } = &*h.event.kind else {
+        return None;
     };
     let ExprKind::Ident(id) = &*callee.kind else {
-        return false;
+        return None;
     };
-    fields
-        .iter()
-        .any(|f| f.name == id.name && matches!(f.kind, ComponentFieldKind::Event { .. }))
+    let ComponentFieldKind::Event { payload } = fields.iter().find(|f| f.name == id.name)?.kind
+    else {
+        return None;
+    };
+    Some((id.name.clone(), payload, args.as_slice()))
 }
 
 /// True when `h` is an `on bus.<ch>.handshake(arg)` passive bus-monitor
@@ -976,15 +981,39 @@ fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<()
     Ok(())
 }
 
-/// Validate an `on <event>(arg) ... end on` handler: it must be a bare
-/// event-subscription (`on in_ev(t)`) to a self `event<scalar>` field,
-/// with no `pre`/`post` hook side, no edge/periodic trigger. Returns the
-/// `(event_field_name, arg_payload)`.
-fn resolve_on_handler_event(
+/// Validate an `on <event>(arg) ... end on` self-event subscription.
+///
+/// This used to also RESOLVE the subscription — re-deriving the three
+/// facts `event_subscription` had already established to route the
+/// handler here, and carrying a rejection arm for each: a non-`Call`
+/// trigger, a dotted callee, a field that is not an `event`, and no such
+/// field. All four were unreachable, as was the `h.periodic` check (a
+/// periodic handler goes into `periodic_asts` at the item split and
+/// never reaches this loop). Replacing each of the five with
+/// `unreachable!()` left the whole suite green, and probing all five
+/// shapes shows them landing on other diagnostics entirely — a dotted
+/// `on tagger.in_ev(t)` on "transactor/method call `.in_ev(...)`", an
+/// `on other(t)` naming a scalar field on "helper call `other(...)`".
+///
+/// So the resolution moved INTO the routing predicate, which now
+/// returns what it found instead of a bool, and only the two checks
+/// that a routed handler can still fail are left:
+///
+/// | trigger | v1 emits | verdict |
+/// |---|---|---|
+/// | `on in_ev(t) pre` | the handler with the hook side dropped, byte-identically | `SilentlyMisLowers` |
+/// | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
+/// | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped; a body that reads `u` gets "'u' was not declared in this scope" | `EmitsUncompilable` |
+///
+/// The two arity halves were one arm until they were measured
+/// separately. Zero arguments is the one shape v1 gets right: the
+/// payload is unbound, which is what was written.
+fn validate_event_handler(
     comp: &str,
     h: &crate::ast::OnHandler,
-    fields: &[ComponentFieldSchema],
-) -> Result<(String, EventPayload), LowerError> {
+    event: &str,
+    args: &[crate::ast::CallArg],
+) -> Result<(), LowerError> {
     if h.hook.is_some() {
         // The third member of the hook family, and it probes exactly
         // like the periodic one: v1 emits the subscription handler with
@@ -1002,46 +1031,24 @@ fn resolve_on_handler_event(
             V1Status::SilentlyMisLowers,
         ));
     }
-    if h.periodic {
-        return Err(unsupported(
-            &format!("an `on <N> cycles` periodic handler on `{comp}`"),
-            "periodic/cycle-trigger handlers gate on a later slice",
+    if args.len() > 1 {
+        return Err(not_implemented(
+            &format!(
+                "an `on {event}(...)` handler with {} arguments on `{comp}`",
+                args.len()
+            ),
+            "event handlers take exactly one payload argument; v1 emits the lambda with \
+             only the first parameter, so a body that reads any later one does not compile",
+            V1Status::EmitsUncompilable,
         ));
     }
-    // Event-subscription shape: `on <event>(<arg>)`.
-    let ExprKind::Call { callee, args } = &*h.event.kind else {
+    if args.is_empty() {
         return Err(unsupported(
-            &format!("a cycle-trigger `on <expr>` handler on `{comp}`"),
-            "only `on <event>(arg)` self-subscriptions are lowered",
-        ));
-    };
-    let event = match &*callee.kind {
-        ExprKind::Ident(id) => id.name.clone(),
-        _ => {
-            return Err(unsupported(
-                &format!("a dotted-path `on` handler event on `{comp}`"),
-                "only a bare self-event name is lowered",
-            ));
-        }
-    };
-    if args.len() != 1 {
-        return Err(unsupported(
-            &format!("an `on {event}(...)` handler with {} arguments", args.len()),
-            "event handlers take exactly one payload argument",
+            &format!("an `on {event}()` handler with no payload argument on `{comp}`"),
+            "event handlers bind the payload to exactly one name; v1 synthesizes one",
         ));
     }
-    // The event must name a self `event<...>` field.
-    match fields.iter().find(|f| f.name == event).map(|f| &f.kind) {
-        Some(ComponentFieldKind::Event { payload }) => Ok((event, *payload)),
-        Some(_) => Err(unsupported(
-            &format!("`on {event}` — `{comp}.{event}` is not an `event` field"),
-            "",
-        )),
-        None => Err(unsupported(
-            &format!("`on {event}` — `{comp}` has no field `{event}`"),
-            "",
-        )),
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1289,7 +1296,7 @@ pub(crate) fn lower_component_bodies(
         // Only EVENT-subscription handlers live in `schema.on_handlers`;
         // periodic (`on N cycles`) handlers are a separate block.
         if let ComponentItem::OnHandler(h) = it {
-            if h.periodic || !is_event_subscription(h, fields) {
+            if h.periodic || event_subscription(h, fields).is_none() {
                 continue;
             }
             let oh = &schema.on_handlers[on_idx];
@@ -1329,7 +1336,7 @@ pub(crate) fn lower_component_bodies(
     let mut cyc_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         if let ComponentItem::OnHandler(h) = it {
-            if h.periodic || is_event_subscription(h, fields) {
+            if h.periodic || event_subscription(h, fields).is_some() {
                 continue;
             }
             let ch = &schema.cycle_handlers[cyc_idx];
