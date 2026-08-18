@@ -11,6 +11,7 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[allow(dead_code)]
 #[path = "components_impl.rs"]
 mod implementation;
 
@@ -21,7 +22,7 @@ pub(crate) use implementation::{
     transactor_has_mode_sensitive_analysis_surface, transactor_is_analysis_source,
     transactor_is_component, transactor_is_dut_poking_bfm, transactor_is_event_driven,
     transactor_is_function_library, transactor_is_passive_helper, transactor_is_reactive_monitor,
-    validate_mode_metadata, CompSource, ComponentBodies,
+    validate_mode_metadata, CompSource,
 };
 
 /// Return the bare self-event name subscribed by a non-periodic
