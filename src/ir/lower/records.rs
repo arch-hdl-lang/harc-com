@@ -59,7 +59,7 @@ use std::collections::HashMap;
 /// `list` and broke the escape-hatch parity test. That is how the
 /// split was found, and it is the reason each row above is a separate
 /// measurement rather than one verdict wearing four hats.
-fn record_leaf_flattens(ty: &TypeExpr) -> bool {
+pub(crate) fn record_leaf_flattens(ty: &TypeExpr) -> bool {
     if crate::codegen::cpp_tb::is_list_type(ty) {
         return false;
     }

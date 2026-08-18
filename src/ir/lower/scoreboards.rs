@@ -24,7 +24,7 @@
 //!   - `connect` / `on` event wiring, which v1 drops in a transactor
 //!     container. See the measurement at each arm.
 
-use super::{unsupported, LowerError};
+use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
@@ -68,9 +68,15 @@ pub(crate) fn lower_scoreboard(
         ));
     }
     if c.bound_to.is_some() {
-        return Err(unsupported(
+        // Measured: v1's output with `scoreboard Sb bound to Drv` is
+        // BYTE-IDENTICAL to the same scoreboard without the clause. It
+        // is discarded, and the program runs with no binding and no
+        // diagnostic.
+        return Err(not_implemented(
             &format!("a `bound to` clause on scoreboard `{sb}`"),
-            "",
+            "v1 discards the clause — its emitted struct is byte-identical to the \
+             unbound one, so the binding silently does not happen",
+            V1Status::SilentlyMisLowers,
         ));
     }
     let mut fields: Vec<ScoreboardFieldSchema> = Vec::new();
@@ -79,15 +85,24 @@ pub(crate) fn lower_scoreboard(
             ComponentItem::Field(f) => {
                 let fname = &f.name.name;
                 if f.direction.is_some() {
-                    return Err(unsupported(
+                    // v1 emits `uint64_t p;` — no direction, and no
+                    // initializer either, so the field reads
+                    // indeterminate rather than as a port.
+                    return Err(not_implemented(
                         &format!("a directional (port) field `{sb}.{fname}`"),
-                        "scoreboards hold host-state data, not DUT ports",
+                        "scoreboards hold host-state data, not DUT ports; v1 emits an \
+                         UNINITIALIZED plain scalar and drops the direction",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 if f.bound_to.is_some() {
-                    return Err(unsupported(
+                    // Same measurement as the declaration-level clause
+                    // above, taken separately: byte-identical output.
+                    return Err(not_implemented(
                         &format!("a `bound to` clause on scoreboard field `{sb}.{fname}`"),
-                        "",
+                        "v1 discards the clause — its emitted struct is byte-identical to \
+                         the unbound one, so the binding silently does not happen",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 if fields.iter().any(|x| x.name == *fname) {
@@ -103,9 +118,15 @@ pub(crate) fn lower_scoreboard(
                     }
                     other => {
                         if f.default.is_some() {
-                            return Err(unsupported(
+                            // v1 emits `harc_rt::HarcQueue<uint64_t> q = 0;`
+                            // and g++ rejects it: "could not convert '0'
+                            // from 'int' to 'harc_rt::HarcQueue<long
+                            // unsigned int>'" (`-std=gnu++20`).
+                            return Err(not_implemented(
                                 &format!("a default on scoreboard queue field `{sb}.{fname}`"),
-                                "queues default-construct empty",
+                                "queues default-construct empty; v1 emits \
+                                 `HarcQueue<T> q = 0;`, which has no such constructor",
+                                V1Status::EmitsUncompilable,
                             ));
                         }
                         other
@@ -122,11 +143,25 @@ pub(crate) fn lower_scoreboard(
                 // declaration so a method-bearing scoreboard never lowers
                 // to a struct missing its methods (it would mis-lower at
                 // a call site otherwise).
-                return Err(unsupported(
-                    &format!("a method (`{}`) on scoreboard `{sb}`", h.name.name),
-                    "scoreboard methods need per-instance state materialization; \
-                     mutate scoreboard fields directly from the test body instead",
-                ));
+                // UNREACHABLE, and provably so: `lower_program` routes a
+                // scoreboard to the composite-component table when
+                // `components::scoreboard_is_component` holds, and that
+                // predicate is `any(ComponentItem::Hookable(_))` — the
+                // exact condition of this arm. Replacing the body with
+                // `unreachable!()` leaves the whole suite green.
+                //
+                // The comment this replaces described an intent ("reject
+                // the declaration so a method-bearing scoreboard never
+                // lowers to a struct missing its methods") that the
+                // routing gate has since made moot. Kept as an invariant
+                // guard, and `Invalid` rather than a v1 suggestion: if it
+                // ever did fire, the routing above would be broken, which
+                // is not something `--codegen v1` can help with.
+                return Err(LowerError::Invalid(format!(
+                    "internal: method-bearing scoreboard `{sb}` reached the data-only \
+                     lowering path (method `{}`)",
+                    h.name.name
+                )));
             }
             // A hooked `on` in a scoreboard body is the same construct as
             // the hook arms in `components.rs`, and v1 does the same
@@ -264,12 +299,34 @@ fn scoreboard_field_kind(
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
     let ty = scalar_ir_type(t).ok_or_else(|| {
-        unsupported(
-            &format!("scoreboard field `{sb}.{fname}` of an unsupported type"),
-            "only scalar uint/sint/bits/bool fields up to 64 bits and \
-             `queue<T>` of such a scalar element type or a `queue<transaction|struct>` \
-             are lowered",
-        )
+        // Same question as the record-field arm, asked with the same
+        // predicate rather than a second copy of it: does v1 emit a
+        // CONTAINER for this type, or flatten it? Measured here too,
+        // because a scoreboard's supported set differs (a `queue<T>`
+        // IS a scoreboard field) even though the flatten rule does not:
+        //
+        //   list<uint<8>>  ->  std::vector<uint64_t> l;   a real hatch
+        //   string         ->  int64_t s;                 uninitialized
+        //   event<uint<8>> ->  uint64_t e;                uninitialized
+        //
+        // The two flattened forms compile and read indeterminate, which
+        // is worse than not compiling and is why they lose the
+        // suggestion.
+        const SUBSET: &str = "only scalar uint/sint/bits/bool fields up to 64 bits and \
+                              `queue<T>` of such a scalar element type or a \
+                              `queue<transaction|struct>` are lowered";
+        let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
+        if super::records::record_leaf_flattens(t) {
+            return not_implemented(
+                &what,
+                format!(
+                    "{SUBSET}; v1 emits an UNINITIALIZED plain scalar for it, so the \
+                     field reads indeterminate rather than as what was written"
+                ),
+                V1Status::SilentlyMisLowers,
+            );
+        }
+        unsupported(&what, SUBSET)
     })?;
     Ok(ScoreboardFieldKind::Scalar { ty, default: 0 })
 }

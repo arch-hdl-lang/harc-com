@@ -4055,6 +4055,126 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
     );
 }
 
+/// The `scoreboards.rs` arms, measured against v1's emitted struct.
+///
+/// | construct | v1 emits | verdict |
+/// |---|---|---|
+/// | `bound to` on the scoreboard | output BYTE-IDENTICAL to the unbound one | `SilentlyMisLowers` |
+/// | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
+/// | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+/// | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
+/// | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+/// | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
+///
+/// The `bound to` rows are the load-bearing measurement: "v1 emits" is
+/// true for both, and diffing against the unbound control is what shows
+/// the clause left no trace at all.
+#[test]
+fn the_scoreboard_arms_split_on_what_v1_emits() {
+    let prog = |sb: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+end transactor Drv
+
+{sb}
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    let control = prog("scoreboard Sb\n    seen : uint<32> default 0\nend scoreboard Sb");
+    let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits the control");
+    lower_src(&control).expect("the control lowers");
+
+    // Both `bound to` spellings are discarded — byte-identically.
+    for (what, src) in [
+        (
+            "declaration",
+            prog("scoreboard Sb bound to Drv\n    seen : uint<32> default 0\nend scoreboard Sb"),
+        ),
+        (
+            "field",
+            prog("scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb"),
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("`bound to`"), "{what}: {msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            control_cpp,
+            "{what}: v1's output must be byte-identical to the unbound control — that is \
+             the whole evidence that the clause is discarded"
+        );
+    }
+
+    // A port field keeps its name and loses everything else.
+    let port = prog("scoreboard Sb\n    p : in uint<8>\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&port).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&port))
+            .expect("v1 emits")
+            .contains("uint64_t p;"),
+        "v1 emits an uninitialized scalar with no direction"
+    );
+
+    // A queue default is the one that does not compile.
+    let qd = prog("scoreboard Sb\n    q : queue<uint<32>> default 0\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&qd).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&qd))
+            .expect("v1 emits")
+            .contains("harc_rt::HarcQueue<uint64_t> q = 0;"),
+        "v1 emits an initializer `HarcQueue` has no constructor for"
+    );
+
+    // The field-type arm splits exactly like the record one, through
+    // the SAME predicate rather than a second copy of it.
+    let list = prog("scoreboard Sb\n    l : list<uint<8>>\nend scoreboard Sb");
+    assert_unsupported(&lower_src(&list).unwrap_err());
+    assert!(
+        cpp_tb::emit(&merged_src(&list))
+            .expect("v1 emits")
+            .contains("std::vector<uint64_t> l;"),
+        "v1 models a `list` properly, which is what keeps the suggestion honest"
+    );
+    for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {
+        let src = prog(&format!("scoreboard Sb\n    s : {ty}\nend scoreboard Sb"));
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 flattens it to `{shape}`"
+        );
+    }
+}
+
 /// The four `helpers.rs` arms, and two of them were right already —
 /// which is worth a test precisely because it was measured rather than
 /// assumed.

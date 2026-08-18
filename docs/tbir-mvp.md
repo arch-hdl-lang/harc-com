@@ -6062,6 +6062,41 @@ case and only locally-determinable `Assign` types are compared).
     `Invalid` for a construct both backends compile. The 352-cell grid
     stays at 0 disagreements with v1.
 
+100. **Seven `scoreboards.rs` arms, one of them provably dead
+     (2026-08-18).**
+
+     | construct | v1 emits | verdict |
+     |---|---|---|
+     | `bound to` on the scoreboard | output BYTE-IDENTICAL to the unbound one | `SilentlyMisLowers` |
+     | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
+     | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+     | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
+     | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+     | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
+     | a method on the scoreboard | — | UNREACHABLE |
+
+     The `bound to` rows show why "v1 emits" is never the measurement.
+     It emits for both, and diffing against an unbound control is what
+     shows the clause left no trace whatsoever — the binding silently
+     does not happen.
+
+     The method arm is dead code, and provably: `lower_program` routes
+     a scoreboard to the composite-component table when
+     `components::scoreboard_is_component` holds, and that predicate is
+     `any(ComponentItem::Hookable(_))` — the exact condition of the arm.
+     Replacing its body with `unreachable!()` leaves the whole suite
+     green. Its comment described an intent the routing gate had since
+     made moot, which is a thing to look for: an arm whose justification
+     is written in the past tense of a design that moved.
+
+     The field-type arm asks the same flatten question as the record
+     one and now asks it through the SAME predicate —
+     `records::record_leaf_flattens` — rather than a second copy. The
+     supported SETS differ (a `queue<T>` is a legal scoreboard field and
+     not a legal record leaf) but the rule about what v1 does with the
+     rest does not, and this file has already paid twice for
+     paraphrasing shared rules.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
