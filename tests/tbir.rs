@@ -14978,28 +14978,50 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
     cpp_tb::emit(&merged_src(&eq_trunc)).expect_err("v1 refuses a no-op trunc");
     emit_cpp_src(&slice("dut.count_out[7:0].zext<8>()"));
 
-    // Above 128 the receiver's CAST is what v1 cannot build, and the
-    // width method has to say so — `CastWidthPolicy::Report` suppresses
-    // the cast's own refusal to feed the direction check, so this arm
-    // carries it instead.
-    let wide = slice("(dut.count_out as uint<300>).trunc<200>()");
-    let msg = assert_not_implemented(
-        &lower_src(&wide).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("`.trunc<200>()`"), "{msg}");
-    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it, badly");
-    assert!(v1.contains("HarcWide<10>"), "{v1}");
-    // …while a wide width method over a NARROW receiver is fine under
-    // v1, so it keeps the suggestion. The condition is the source
-    // width, not this one.
+    // Wide receivers and wide widths alike keep the suggestion: v1
+    // builds all of them under `-std=gnu++20`, which is what
+    // `src/main.rs` passes to the emitted testbench. An
+    // `EmitsUncompilable` split at 128 used to live here and in
+    // `cover_cast_width`, measured with `-std=c++20`, where
+    // `HarcWide`'s `is_integral_v` gate rejects `__int128`.
     for t in [
+        "(dut.count_out as uint<300>).trunc<200>()",
         "dut.count_out[3:0].zext<200>()",
         "dut.count_out[3:0].sext<200>()",
+        // A slice-derived source width above 128, which the `>128`
+        // machinery reported as a problem with "the receiver's own
+        // cast" when there is no cast at all.
+        "dut.count_out[200:0].trunc<65>()",
     ] {
         assert_unsupported(&lower_src(&slice(t)).unwrap_err());
         cpp_tb::emit(&merged_src(&slice(t))).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
     }
+
+    // The direction check must fire exactly where v1's does, which
+    // means inferring a receiver width only from LITERALS — v1 uses
+    // `eval_const_width` and so does TB-IR's general path. Folding the
+    // bound made these `Invalid` while the identical program compiled
+    // under v1, decided purely by whether the bound had a name.
+    for (pre, t) in [
+        ("const W8 = 8\n\n", "dut.count_out[W8 - 1:0].zext<4>()"),
+        ("", "dut.count_out[1 + 2:0].trunc<4>()"),
+    ] {
+        let src = format!("{pre}{}", slice(t));
+        emit_cpp_src(&src);
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
+    }
+    // A folded bound with a width ABOVE 64 is still refused, but for
+    // the 64-bit model rather than for direction — `Unsupported`, not
+    // the `Invalid` the folding inference used to produce.
+    let folded_wide = format!(
+        "const HI = 100\n\n{}",
+        slice("dut.count_out[HI:0].zext<70>()")
+    );
+    assert_unsupported(&lower_src(&folded_wide).unwrap_err());
+    cpp_tb::emit(&merged_src(&folded_wide)).expect("v1 builds it");
+    // …while the literal spelling of the same program stays `Invalid`
+    // under both backends.
+    assert_invalid(&lower_src(&slice("dut.count_out[100:0].zext<70>()")).unwrap_err());
 }
 
 /// The hook-parameter guard on the four constant ROLES, and the
@@ -15243,18 +15265,45 @@ fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
         "v1's own rule is what makes it a program error: {e}"
     );
 
-    // Above 128 v1 stops working, so the suggestion goes away.
+    // Above 128 v1 keeps working too, so the suggestion stays.
+    //
+    // This asserted `EmitsUncompilable` for four rounds on the strength
+    // of g++ rejecting `HarcWide<7>::HarcWide(__int128 unsigned)`. That
+    // rejection is an artifact of the flag the probe used: `HarcWide`'s
+    // converting constructor is gated on `std::is_integral_v<T>`, which
+    // libstdc++ reports FALSE for `__int128` under `-std=c++20` and
+    // TRUE under `-std=gnu++20` — and `src/main.rs` builds the emitted
+    // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`.
+    // `tests/wide_cast_cpp.rs` already said so in a comment.
     let wide = slice("(dut.count_out as uint<200>)");
-    let msg = assert_not_implemented(
-        &lower_src(&wide).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
-    );
+    let msg = assert_unsupported(&lower_src(&wide).unwrap_err());
     assert!(msg.contains("cast to 200 bits"), "{msg}");
-    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it, badly");
-    assert!(
-        v1.contains("HarcWide<7>"),
-        "v1 reaches for a type it cannot construct here: {v1}"
-    );
+    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it");
+    assert!(v1.contains("HarcWide<7>"), "{v1}");
+
+    // The language limit is the one width rule that IS a program error,
+    // and this path checked `0` and stopped — so `.zext<2000>()` was
+    // told to re-run under a v1 that refuses it.
+    for t in [
+        "dut.count_out[3:0].zext<2000>()",
+        "dut.count_out[3:0].resize<2000>()",
+    ] {
+        let msg = assert_invalid(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains("1024-bit language limit"), "`{t}`: {msg}");
+        let e = cpp_tb::emit(&merged_src(&slice(t))).expect_err("v1 refuses it too");
+        assert!(e.to_string().contains("1024-bit language limit"), "{e}");
+    }
+
+    // And the width argument must be a plain literal, which the fold
+    // had quietly widened: `.zext<1 + 7>()` lowered while v1 refused it.
+    for t in [
+        "dut.count_out[3:0].zext<1 + 7>()",
+        "dut.count_out[3:0].trunc<1 + 1>()",
+    ] {
+        let msg = assert_invalid(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains("plain integer literal"), "`{t}`: {msg}");
+        cpp_tb::emit(&merged_src(&slice(t))).expect_err("v1 refuses a non-literal width");
+    }
 
     // Widths AT or below 64 are untouched — the refusal is not a
     // blanket one.

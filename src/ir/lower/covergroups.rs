@@ -583,15 +583,8 @@ fn lower_point_target(
                 });
             }
             ExprKind::Cast { expr, ty } => {
-                let width = cover_cast_width(
-                    group,
-                    point,
-                    ty,
-                    consts,
-                    hook_params,
-                    CastWidthPolicy::Refuse,
-                )?
-                .ok_or_else(|| unsupported_target(cur))?;
+                let width = cover_cast_width(group, point, ty, consts, hook_params)?
+                    .ok_or_else(|| unsupported_target(cur))?;
                 let inner = lower_point_target(
                     group,
                     point,
@@ -1387,9 +1380,39 @@ fn cover_width_arg(
     hook_params: &[String],
 ) -> Result<u32, LowerError> {
     let width = cover_const_u32(group, point, ConstRole::WidthArg, e, consts, hook_params)?;
+    // The spec says LITERAL — "Width `N` must be a positive constant
+    // integer literal in `1..=1024`" — and v1 enforces it with
+    // `eval_const_width`, refusing anything else with "requires a
+    // constant integer width (saw a non-const expression)". The fold
+    // above accepts a `const` name and arithmetic over one, so
+    // `.zext<1 + 7>()` and `.trunc<KW - 8>()` LOWERED here while v1
+    // refused them.
+    //
+    // Placed AFTER the fold so a name that resolves to nothing, or to a
+    // hook parameter, still reaches its own role-classified arm — those
+    // say something more useful than "not a literal".
+    if literal_width(e).is_none() {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` `.{method}<...>()`: the width must be a \
+             plain integer literal (v1: \"requires a constant integer width\")"
+        )));
+    }
     if width == 0 {
         return Err(LowerError::Invalid(format!(
             "covergroup `{group}` point `{point}` `.{method}<0>()`: width must be greater than zero"
+        )));
+    }
+    // The language limit, checked by v1 (`cpp_tb.rs`) and by TB-IR's
+    // general expression path (`exprs.rs`) and stated by the spec in
+    // the same sentence this file quotes for `resize` — "Width `N`
+    // must be a positive constant integer literal in `1..=1024`". The
+    // covergroup copy of the rule checked `0` and stopped, so
+    // `.zext<2000>()` was told to re-run under a v1 that refuses it.
+    if width > crate::MAX_WIDTH_METHOD_BITS {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` `.{method}<{width}>()`: destination \
+             width exceeds the {}-bit language limit",
+            crate::MAX_WIDTH_METHOD_BITS
         )));
     }
     // DIRECTION FIRST, for every width. This check used to live at the
@@ -1466,27 +1489,28 @@ fn cover_width_arg(
         // That is the very leak `CastWidthPolicy` was introduced to
         // close, reappearing one arm over: `Report` suppresses the
         // cast's own refusal, so this arm has to carry it.
-        // The `>128` failure belongs to the CAST, not to this method:
-        // measured, `[3:0].zext<200>()` and `[3:0].sext<200>()` emit v1
-        // output that COMPILES (the `harc_wide_*` helpers take a
-        // narrow argument), while `as uint<300>` gives "no matching
-        // function for call to `harc_rt::HarcWide<10>::HarcWide(__int128
-        // unsigned)`" whether or not a width method wraps it. So the
-        // condition is the SOURCE width, not this one — a first version
-        // used `max(width, src_width)` and reported `.zext<200>()` on a
-        // 4-bit slice as uncompilable when it is not.
-        if src_width.is_some_and(|sw| sw > 128) {
-            return Err(not_implemented(
-                &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
-                "the TB-IR covergroup expression model is 64-bit, and the receiver's own \
-                 cast is one v1 cannot build: above 128 bits it reaches for a \
-                 `harc_rt::HarcWide<N>` with no constructor from a 128-bit temporary",
-                V1Status::EmitsUncompilable,
-            ));
-        }
-        // What is left is a cast v1 really does build — `_harc_u128`
-        // and the `harc_*_u128` helpers — which compile and keep the
-        // extra bits.
+        // v1 builds all of these — `_harc_u128`, the `harc_*_u128`
+        // helpers, and `HarcWide<N>` above 128 — and keeps the extra
+        // bits, which is why the suggestion is honest.
+        //
+        // There used to be an `EmitsUncompilable` split at 128 here,
+        // on the strength of g++ rejecting `HarcWide<10>::HarcWide(
+        // __int128 unsigned)`. That rejection is an artifact of the
+        // flag I probed with: `HarcWide`'s converting constructor is
+        // gated on `std::is_integral_v<T>`, which libstdc++ reports
+        // FALSE for `__int128` under `-std=c++20` and TRUE under
+        // `-std=gnu++20` — and `src/main.rs` builds the emitted
+        // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`. Under the
+        // real flags every one of those programs compiles.
+        //
+        // `tests/wide_cast_cpp.rs` already carried a comment saying
+        // exactly this ("Match the real build: `run_verilator`
+        // (`src/main.rs`) sets `CFG_CXXFLAGS_STD=-std=gnu++20`"), so
+        // this is the same failure as `resize`: a fact written down in
+        // the repo, re-derived wrongly from a local experiment. Four
+        // rounds of machinery — the 128 split, `CastWidthPolicy`'s
+        // second reason to exist, the `src_width > 128` arm — were
+        // built on one mis-set compiler flag.
         return Err(unsupported(
             &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
             "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \
@@ -1496,22 +1520,36 @@ fn cover_width_arg(
     Ok(width)
 }
 
-/// Whether a `>64` cast width is a refusal or just a number.
-///
-/// It has to be both. Refusing is right where the cast is LOWERED —
-/// TB-IR cannot model the value. But `cover_infer_expr_width` asks the
-/// same question to feed the width-method DIRECTION check, and
-/// refusing there hid the more accurate error: `(dut.count_out as
-/// uint<128>).zext<100>()` reported the 128-bit cast with "re-run with
-/// `--codegen v1`", when v1 refuses that program outright for
-/// narrowing a `zext`. Reporting a construct v1 does support, on a
-/// program v1 rejects, is a false escape hatch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CastWidthPolicy {
-    /// Lowering: a width TB-IR cannot model is an error here.
-    Refuse,
-    /// Width inference: report the number and let the caller judge.
-    Report,
+/// A width written as a plain integer LITERAL, the only spelling v1's
+/// `eval_const_width` reads. Used for width INFERENCE so TB-IR's
+/// direction check fires exactly where v1's does; the folding
+/// `cover_const_u32` still lowers the bound itself.
+fn literal_width(e: &AstExpr) -> Option<u32> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => literal_width(inner),
+        ExprKind::Int(s) => super::exprs::parse_int_literal(s).and_then(|v| u32::try_from(v).ok()),
+        _ => None,
+    }
+}
+
+/// The literal width of an `as uint<N>` / `sint<N>` / `bits<N>` cast,
+/// on the same literal-only rule as [`literal_width`]. A bare `as uint`
+/// with no argument is 64, matching `cover_cast_width`.
+fn cast_literal_width(ty: &crate::ast::TypeExpr) -> Option<u32> {
+    let crate::ast::TypeExpr::Builtin {
+        name:
+            crate::ast::BuiltinTy::UInt | crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::Bits,
+        args,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    match args.first() {
+        Some(crate::ast::TypeArg::Expr(e)) => literal_width(e),
+        Some(_) => None,
+        None => Some(64),
+    }
 }
 
 fn cover_cast_width(
@@ -1520,7 +1558,6 @@ fn cover_cast_width(
     ty: &crate::ast::TypeExpr,
     consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
-    policy: CastWidthPolicy,
 ) -> Result<Option<u32>, LowerError> {
     let width = match ty {
         crate::ast::TypeExpr::Builtin {
@@ -1548,28 +1585,18 @@ fn cover_cast_width(
                 "covergroup `{group}` point `{point}` cast width must be greater than zero"
             )));
         }
-        if width > 64 && policy == CastWidthPolicy::Refuse {
-            // Same reason the width methods above refuse rather than
-            // clamp: v1 keeps the extra bits and a slice can read them.
-            //
-            // Split at 128, because that is where v1 stops working:
-            //
-            //   as uint<128> -> `(_harc_u128)(v)`      — compiles
-            //   as uint<200> -> `(HarcWide<7>)(v)`     — g++: "no matching
-            //                   function for call to
-            //                   `HarcWide<7>::HarcWide(__int128 unsigned)`"
-            if width > 128 {
-                return Err(not_implemented(
-                    &format!("covergroup `{group}` point `{point}` cast to {width} bits"),
-                    "the TB-IR covergroup expression model is 64-bit, and v1 reaches for a \
-                     `harc_rt::HarcWide<N>` it cannot construct from a 128-bit temporary",
-                    V1Status::EmitsUncompilable,
-                ));
-            }
+        if width > 64 {
+            // No split at 128. v1 emits `(_harc_u128)(v)` up to 128 and
+            // `(HarcWide<N>)(v)` above it, and BOTH compile under the
+            // `-std=gnu++20` the product builds with — see the note in
+            // `cover_width_arg`. The `EmitsUncompilable` arm that used
+            // to live here was measured with `-std=c++20`, where
+            // `HarcWide`'s `is_integral_v` gate rejects `__int128`.
             return Err(unsupported(
                 &format!("covergroup `{group}` point `{point}` cast to {width} bits"),
-                "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \
-                 intermediate and keeps the extra bits",
+                "the TB-IR covergroup expression model is 64-bit; v1 widens through \
+                 `_harc_u128` (or `harc_rt::HarcWide<N>` above 128) and keeps the extra \
+                 bits",
             ));
         }
     }
@@ -1586,8 +1613,22 @@ fn cover_infer_expr_width(
     match &*e.kind {
         ExprKind::Paren(inner) => cover_infer_expr_width(group, point, inner, consts, hook_params),
         ExprKind::BitSlice { hi, lo, .. } => {
-            let hi = cover_const_u32(group, point, ConstRole::SliceBound, hi, consts, hook_params)?;
-            let lo = cover_const_u32(group, point, ConstRole::SliceBound, lo, consts, hook_params)?;
+            // LITERAL-only, deliberately, and not the folding
+            // `cover_const_u32` that lowers the slice itself.
+            //
+            // This feeds the direction check, which has to fire exactly
+            // where v1's does or it invents program errors. v1 infers a
+            // receiver width with `eval_const_width` (literal only), as
+            // does TB-IR's own general expression path with
+            // `const_eval_width`. Folding here made `const HI = 100` +
+            // `[HI:0].zext<70>()` an `Invalid` that v1 compiles and
+            // runs, while the literal spelling `[100:0].zext<70>()` is
+            // correctly `Invalid` under both — the same program, two
+            // verdicts, decided by whether the bound was written with a
+            // name.
+            let (Some(hi), Some(lo)) = (literal_width(hi), literal_width(lo)) else {
+                return Ok(None);
+            };
             if hi < lo {
                 return Err(LowerError::Invalid(format!(
                     "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
@@ -1595,14 +1636,10 @@ fn cover_infer_expr_width(
             }
             Ok(Some(hi - lo + 1))
         }
-        ExprKind::Cast { ty, .. } => cover_cast_width(
-            group,
-            point,
-            ty,
-            consts,
-            hook_params,
-            CastWidthPolicy::Report,
-        ),
+        // Same rule for a cast width: v1 reads it with
+        // `eval_const_width`, so a `const K = 128` receiver has no
+        // inferred width under v1 and must have none here either.
+        ExprKind::Cast { ty, .. } => Ok(cast_literal_width(ty)),
         ExprKind::Call { callee, args } => {
             if let ExprKind::Field { target, name } = &*callee.kind {
                 if matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {

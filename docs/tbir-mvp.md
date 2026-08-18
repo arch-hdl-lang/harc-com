@@ -5692,10 +5692,12 @@ case and only locally-determinable `Assign` types are compared).
       direction check never fired. v1 calls it a program error in
       plain words. TB-IR was accepting a program the language rejects.
 
-    What the refusals split on now is where v1 stops working: 65..=128
-    is `Unsupported` (v1 carries a `_harc_u128` and keeps the bits),
-    above 128 is `EmitsUncompilable` (v1 reaches for a
-    `harc_rt::HarcWide<N>` it cannot construct).
+    ~~What the refusals split on now is where v1 stops working:
+    65..=128 is `Unsupported`, above 128 is `EmitsUncompilable`~~ —
+    **the 128 split was measured with the wrong compiler flag and is
+    retracted; see divergence 96.** Every width above 64 is
+    `Unsupported`: v1 builds all of them under the `-std=gnu++20` the
+    product uses.
 
     The lesson is narrower than "measure v1", which had been done —
     every direct-sample form really is byte-identical between the two
@@ -5887,6 +5889,72 @@ case and only locally-determinable `Assign` types are compared).
     unrelated reasons, which the comment now records as measured rather
     than structural.
 
+96. **Four rounds of machinery on one mis-set compiler flag
+    (2026-08-18).**
+
+    Round five enumerated the width/cast space mechanically — four
+    methods × seven receiver widths × eight widths — instead of by
+    example, and the first thing that fell out was that every
+    `EmitsUncompilable` verdict in this file was measured wrongly.
+
+    `harc_rt::HarcWide<N>`'s converting constructor is gated on
+    `std::is_integral_v<T>`. libstdc++ reports that FALSE for
+    `__int128` under `-std=c++20` and TRUE under `-std=gnu++20`, and
+    `src/main.rs` builds the emitted testbench with
+    `CFG_CXXFLAGS_STD=-std=gnu++20`. Every probe here used
+    `-std=c++20`. So `(dut.count_out as uint<300>).trunc<200>()` — the
+    flagship case for the whole `>128` family — compiles fine under the
+    flags the product uses, and the honest verdict is `Unsupported`,
+    which is what the code said before any of this work.
+
+    `tests/wide_cast_cpp.rs` already carried a comment naming the right
+    standard. Same failure as `resize`: a fact written down in the
+    repo, re-derived wrongly from a local experiment. The probe-method
+    section now states the flag, because nothing else in this document
+    did.
+
+    So the fifth commit is subtractive. Gone: the `>128`
+    `EmitsUncompilable` arms in `cover_width_arg` and
+    `cover_cast_width`, the `src_width > 128` condition, and
+    `CastWidthPolicy` — which existed only to keep that verdict
+    reachable, and whose `Report` mode had in the meantime introduced
+    its own regression (a slice-derived source width above 128 was
+    reported as a problem with "the receiver's own cast" on programs
+    containing no cast).
+
+    Three real holes the enumeration found alongside it:
+
+    * **The 1024-bit language limit was missing.** v1 checks it, TB-IR's
+      general expression path checks it, and the spec states it in the
+      same sentence this file quotes for `resize` — "a positive
+      constant integer literal in `1..=1024`". The covergroup copy
+      checked `0` and stopped, so `.zext<2000>()` was told to re-run
+      under a v1 that refuses it.
+    * **The direction check reached spellings v1's never does.** v1
+      infers a receiver width with `eval_const_width` (literal only), as
+      does TB-IR's general path with `const_eval_width`; the covergroup
+      copy inferred through the folding `cover_const_u32`. So
+      `const HI = 100` + `[HI:0].zext<70>()` was `Invalid` while the
+      identical program compiled and ran under v1 — the verdict decided
+      by whether the bound was written with a name. Inference is
+      literal-only now; the bound itself still folds.
+    * **The width argument accepted non-literals.** `.zext<1 + 7>()`
+      lowered while v1 refused it. The spec says literal.
+
+    The pattern across all three: this file is a THIRD implementation
+    of rules that `cpp_tb.rs` and `exprs.rs` already state, and every
+    place it was written from intuition rather than copied is a place
+    it drifted. That is the argument for the covergroup path consulting
+    the same helpers rather than paraphrasing them, which is the next
+    piece of work here and is deliberately not being done in a fifth
+    consecutive fix commit.
+
+    On whether to revert the line of work: measured against v1 across
+    224 cells, the state before it had 72 wrong verdicts and the state
+    after has none. It converged; the residue was one wrong idea and
+    two missing checks, all localized. Reverting would have traded a
+    small, identified residue for a larger diffuse one.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
@@ -5897,6 +5965,19 @@ first sweep flagged as gaps, five turned out to be v1 emitting code that
 does not compile or silently means something else. Only the ones where
 v1's output is genuinely usable are worth mirroring; the rest want an
 honest `NotImplemented` diagnostic instead.
+
+**Compile with `-std=gnu++20`, which is what `src/main.rs` passes to
+the emitted testbench (`CFG_CXXFLAGS_STD`).** This is not a detail. An
+`EmitsUncompilable` family spanning two divergence entries and four
+commits rested on g++ rejecting
+`harc_rt::HarcWide<N>::HarcWide(__int128 unsigned)` — a rejection that
+exists only under `-std=c++20`, where libstdc++ reports
+`is_integral_v<__int128>` false. Under the flags the product actually
+uses, v1 compiles every one of those programs, and the verdict should
+have been `Unsupported` throughout. `tests/wide_cast_cpp.rs` already
+carried a comment saying which standard to match; the probe did not
+read it. "It does not compile" is a claim about a specific compiler
+invocation, and the invocation has to be the real one.
 
 ## Negative tests: where rejection actually fires
 
