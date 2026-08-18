@@ -717,7 +717,7 @@ fn surface_constraint_lower_error(
                      previous one more than once doubles at every level"
                 )
             }
-            // NOT `Invalid`, unlike its three siblings. v1 ACCEPTS a
+            // NOT `Invalid`, unlike its four siblings. v1 ACCEPTS a
             // misplaced name — it emits working C++ with the arguments
             // silently swapped — so "a program error under every
             // backend" is literally false here. This is the sweep's

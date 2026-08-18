@@ -2142,26 +2142,35 @@ test T
     end run
 end test T
 "#;
-    // `Invalid`, not a gap: once both endpoints resolve, an edge whose
-    // sink cannot receive the source's payload is a type error that no
-    // backend executes. v1 emits `for (auto& _s : sink.accept)` over a
-    // `function` method, which is not a struct member — g++: "'struct
-    // Sink' has no member named 'accept'". See the arm's comment for
-    // the other five rows.
+    // v1 emits `for (auto& _s : sink.accept)` over a `function` method,
+    // which is not a struct member — g++: "'struct Sink' has no member
+    // named 'accept'". So v1 is no escape hatch. It is not `Invalid`
+    // either: an env nothing instantiates emits no wiring, and that
+    // program runs fine under v1.
     let err = lower_src(non_hookable).expect_err("must reject non-hookable sink");
-    let msg = assert_invalid(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("not `hookable`"),
         "unexpected diagnostic: {msg}"
     );
 
+    // This second case is a SIGNEDNESS-only mismatch, and v1 RUNS it:
+    // the generic bridge converts `uint64_t` into the sink's `int64_t`
+    // parameter and the program behaves as written (built and run:
+    // count=2 sum=8). So it keeps the suggestion. It sat under
+    // `assert_invalid` for one commit — the counterexample to that
+    // verdict was inside the suite asserting it.
     let mismatched_payload = non_hookable.replace(
         "function accept(v: uint<8>)\n    end accept",
         "hookable accept(v: sint<8>)\n    end accept",
     );
     let err = lower_src(&mismatched_payload).expect_err("must reject incompatible payloads");
-    let msg = assert_invalid(&err);
-    assert!(msg.contains("payload"), "unexpected diagnostic: {msg}");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("payload mismatch"),
+        "unexpected diagnostic: {msg}"
+    );
+    cpp_tb::emit(&merged_src(&mismatched_payload)).expect("v1 emits the sign mismatch");
 }
 
 /// An omitted hookable-parameter annotation leaves the front-end type as
@@ -13371,26 +13380,24 @@ end impl T"#
     }
 }
 
-/// The sink SIGNATURE checks are `Invalid`, and this is the test that
-/// once claimed the opposite. Its doc used to say they "keep the
-/// suggestion too, for the same reason" as the endpoint-shape arms —
-/// asserted, never measured, and it only ever built the INSTANTIATED
-/// case, which is the half that disproves it.
+/// The sink SIGNATURE checks carry `Rejects`, and this test has had
+/// two wrong verdicts written into it.
+///
+/// It first said they "keep the suggestion too, for the same reason" as
+/// the endpoint-shape arms — asserted, never measured, and it only ever
+/// built the INSTANTIATED case. Then it said `Invalid`, which is the
+/// opposite over-correction: an env nothing instantiates emits no
+/// wiring, and THAT program v1 compiles and runs to completion, so "a
+/// program error under every backend" is false.
 ///
 /// Measured, both halves. Instantiated, v1 raises its own error:
-/// "connect: hookable sink `sink.two` must take exactly one payload
-/// arg" and "must return void". Uninstantiated, v1 emits no wiring and
-/// succeeds — which is v1 not looking at the edge, not v1 running the
-/// program. An edge whose sink cannot receive the payload is a type
-/// error either way, so no backend executes it and naming one would be
-/// false.
-///
-/// That is NOT the endpoint-shape arms' situation, and the difference
-/// is why they keep their suggestion: a malformed PATH can still mean
-/// something to v1, because a single-segment endpoint resolves against
-/// the owner's own hookable and works.
+/// "connect: hookable sink `sb.two` must take exactly one payload
+/// argument, got 2" and "must return void". Uninstantiated, v1 runs the
+/// program. Worst-under-arm over those two is `Rejects` — v1 does not
+/// implement the construct, and saying so is honest without claiming
+/// the program is malformed everywhere.
 #[test]
-fn a_bad_connect_sink_signature_is_a_program_error() {
+fn a_bad_connect_sink_signature_is_not_implemented_by_v1_either() {
     let src = |sink: &str, method: &str| {
         format!(
             r#"transactor Src
@@ -13430,30 +13437,41 @@ end impl T"#
         (
             "two",
             "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
-            "takes 2 parameters",
+            "with 2 parameters",
         ),
         (
             "ret",
             "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
-            "returns a value",
+            "that returns a value",
         ),
     ] {
-        let msg = assert_invalid(&lower_src(&src(sink, method)).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&src(sink, method)).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
         assert!(msg.contains(want), "{msg}");
 
-        // The half the old test never built: v1 emits the same edge
-        // without complaint when nothing instantiates the env, because
-        // it emits no wiring there at all. The verdict has to hold for
-        // both, and `Invalid` does — the edge is ill-formed wherever it
-        // sits.
+        // v1 refuses the instantiated form — the row that earns
+        // `Rejects`.
+        let v1 = cpp_tb::emit(&merged_src(&src(sink, method)))
+            .expect_err("v1 refuses an instantiated bad sink signature");
+        assert!(format!("{v1}").contains("connect: hookable sink"), "{v1}");
+
+        // And the row that rules `Invalid` out: with nothing
+        // instantiating the env, v1 emits no wiring and the program is
+        // fine. TB-IR still refuses it, which is a real strictness gap
+        // — but not a claim that no backend runs it.
         let uninstantiated = src(sink, method).replacen("    top : E\n", "", 1);
         assert!(
             !uninstantiated.contains("top : E"),
             "the instantiation must actually be gone"
         );
         cpp_tb::emit(&merged_src(&uninstantiated))
-            .unwrap_or_else(|e| panic!("v1 ignores an uninstantiated bad edge: {e}"));
-        let msg = assert_invalid(&lower_src(&uninstantiated).unwrap_err());
+            .unwrap_or_else(|e| panic!("v1 runs an uninstantiated bad edge: {e}"));
+        let msg = assert_not_implemented(
+            &lower_src(&uninstantiated).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
         assert!(msg.contains(want), "{msg}");
     }
 }
@@ -19149,15 +19167,33 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
 
         // The mirror-image row, and the reason the detail names a
         // POSITION rather than a category: move the same `let` above
-        // the transactor's own binding and v1 emits it three lines
-        // BEFORE the registration, so the output compiles and the
-        // handler runs at the right rate. `--codegen v1` is a genuine
-        // escape hatch for that program, and a detail claiming "the
-        // test's own `let` bindings" would be lying about it.
+        // the transactor's own binding and v1 emits it BEFORE the
+        // registration, so the output compiles and the handler runs at
+        // the right rate. `--codegen v1` is a genuine escape hatch for
+        // that program, and a detail claiming "the test's own `let`
+        // bindings" would be lying about it.
+        //
+        // Inserted between the BUS binding and the TRANSACTOR binding,
+        // not above both — the detail names the transactor's binding,
+        // so that is the boundary the row has to straddle. A first
+        // version put the `let` above everything, which demonstrates
+        // something weaker.
+        // Anchored on the transactor binding whatever its mode — two
+        // of the three rows rewrite `passive` to `active`.
+        let binding = src
+            .lines()
+            .find(|l| l.contains("let target : TlmMemTarget") && l.contains("bind mem"))
+            .unwrap_or_else(|| panic!("{what}: the transactor binding must be present"))
+            .to_string();
         let early = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
-            "    let mem : TlmMemBus = bind dut",
-            "    let limit = 5\n    let mem : TlmMemBus = bind dut",
+            &binding,
+            &format!("    let limit = 5\n{binding}"),
             1,
+        );
+        assert!(
+            early.find("let limit").expect("inserted")
+                > early.find("bind dut").expect("the bus binding is above it"),
+            "the `let` must sit BELOW the bus binding, or the row tests the wrong boundary"
         );
         let v1 = cpp_tb::emit(&merged_src(&early))
             .unwrap_or_else(|e| panic!("{what}: v1 emits the early `let`: {e}"));
@@ -19497,25 +19533,30 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
 }
 
 /// The remaining `connect` SEMANTIC arms, none of which had a test.
-/// Each is a type error once both endpoints resolve, and each was
-/// measured against v1 on an instantiated env — the only place v1 looks
+/// Measured against v1 on an instantiated env — the only place v1 looks
 /// at the edge at all.
 ///
-/// | edge | v1 |
-/// |---|---|
-/// | sink is a plain `function` | `for (auto& _s : sink.plain)` — not a struct member |
-/// | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` |
-/// | payload mismatch, method sink | bridge lambda instantiates against the wrong type |
-/// | payload mismatch, event sink | same |
+/// | edge | v1 | verdict |
+/// |---|---|---|
+/// | sink is a plain `function` | `for (auto& _s : sink.plain)` — not a struct member | `EmitsUncompilable` |
+/// | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` | `EmitsUncompilable` |
+/// | payload mismatch, RECORD vs scalar | bridge lambda instantiates against the wrong type | `EmitsUncompilable` |
+/// | payload mismatch, SIGNEDNESS only | implicit conversion — compiles and runs correctly | `Unsupported` |
 ///
 /// The uncompilable rows are compiler-measured, not read off the text.
-/// The payload rows matter because the bridge lambda is GENERIC — it
-/// looks type-agnostic, and would be, except that converting it to the
-/// source's `std::function<void(uint64_t)>` instantiates it right
-/// there, so the mismatch bites at the wiring line rather than at the
-/// first `emit`.
+///
+/// The payload rows are one arm covering two shapes, because
+/// `event_payload_matches_ir_type` compares signedness and record
+/// identity only. v1's bridge lambda is GENERIC and looks
+/// type-agnostic; converting it to the source's
+/// `std::function<void(uint64_t)>` instantiates it at the wiring line,
+/// which a record cannot survive and a sign difference passes through
+/// as an ordinary implicit conversion. A first pass measured only the
+/// record shape and called the whole arm `Invalid` — wrong twice over,
+/// since v1 both runs the sign case and runs any of these inside an env
+/// nothing instantiates.
 #[test]
-fn a_connect_sink_that_cannot_receive_the_payload_is_a_program_error() {
+fn a_connect_sink_that_cannot_receive_the_payload_is_split_by_what_v1_does() {
     let src = |sink_decl: &str, target: &str, extra: &str| {
         format!(
             r#"struct Beat
@@ -19586,22 +19627,44 @@ end impl T"#,
             "neither a `hookable` sink method nor an `event` field",
         ),
         (
-            "method payload mismatch",
+            "method payload mismatch, record",
             "    hookable take(v: Beat)\n        seen = seen + 1\n    end take",
             "sink.take",
             "".to_string(),
             "payload mismatch",
         ),
         (
-            "event payload mismatch",
+            "event payload mismatch, record",
             hookable,
             "dst.incoming",
             dst("Beat"),
             "payload mismatch",
         ),
     ] {
-        let msg = assert_invalid(&lower_src(&src(sink_decl, target, &extra)).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&src(sink_decl, target, &extra)).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
         assert!(msg.contains(want), "{what}: {msg}");
+    }
+
+    // The SIGNEDNESS row, which is the same arm and the opposite
+    // verdict: v1's implicit conversion carries the payload through
+    // intact, so it keeps the suggestion.
+    for (what, sink_decl, target, extra) in [
+        (
+            "method sink",
+            "    hookable take(v: sint<8>)\n        seen = seen + 1\n    end take",
+            "sink.take",
+            "".to_string(),
+        ),
+        ("event sink", hookable, "dst.incoming", dst("sint<8>")),
+    ] {
+        let s = src(sink_decl, target, &extra);
+        let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+        assert!(msg.contains("payload mismatch"), "{what}: {msg}");
+        cpp_tb::emit(&merged_src(&s))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits a sign mismatch: {e}"));
     }
 }
 

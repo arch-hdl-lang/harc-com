@@ -1977,65 +1977,94 @@ where
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
     let sink_cid = resolve_path(sink_path)?;
     let sink_comp = &components[sink_cid.index()];
-    // The SEMANTIC sink checks below are a different family from the
-    // endpoint-shape ones above, and take a different verdict. Those
-    // are mixed because a malformed PATH can still mean something to v1
-    // (a single-segment endpoint resolves against the owner's own
-    // hookable). These are not: once both endpoints resolve to real
-    // sub-components, an edge whose sink cannot receive the source's
-    // payload is a type error, and no backend executes it. Measured on
-    // an INSTANTIATED env, which is the only place v1 looks:
+    // The SEMANTIC sink checks below. Measured on an INSTANTIATED env,
+    // which is the only place v1 looks at the edge at all:
     //
     //   * not `hookable` — v1 emits `for (auto& _s : sink.plain)`, and
-    //     a `function` method is not a struct member at all. g++:
-    //     "'struct Sink' has no member named 'plain'".
-    //   * wrong parameter count / returns a value — v1 raises its OWN
-    //     error ("connect: hookable sink `sink.two` must take exactly
-    //     one payload arg", "must return void").
-    //   * payload mismatch, either sink shape — the bridge lambda is
-    //     generic, but converting it to the source's
-    //     `std::function<void(uint64_t)>` instantiates it, so the
-    //     mismatch bites at the wiring line itself. g++: "no match for
-    //     call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned
-    //     int&)'".
+    //     a `function` method is not a struct member. g++: "'struct
+    //     Sink' has no member named 'plain'".
     //   * neither a method nor an event field — `for (auto& _s :
     //     sink.other)` over a `uint64_t`. g++: "there are no arguments
     //     to 'begin' that depend on a template parameter".
+    //   * wrong parameter count / returns a value — v1 raises its OWN
+    //     error: "connect: hookable sink `sink.two` must take exactly
+    //     one payload argument, got 2" and "connect: hookable sink
+    //     `sink.ret` must return void".
+    //   * payload mismatch — MIXED, and this is the row a first pass
+    //     got wrong. `event_payload_matches_ir_type` compares
+    //     signedness and record identity only, so one arm covers two
+    //     very different shapes:
+    //       - record vs scalar (`event<uint<8>>` into a `Beat` sink) —
+    //         the bridge lambda is generic, but converting it to the
+    //         source's `std::function<void(uint64_t)>` instantiates it,
+    //         so it bites at the wiring line. g++: "no match for call
+    //         to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'".
+    //       - SIGNEDNESS only (`event<uint<8>>` into a `sint<8>` sink)
+    //         — v1 emits `Sink_write_obs(e.sb, _t)` from a
+    //         `void(uint64_t)` channel into an `int64_t` parameter.
+    //         That is an implicit conversion, and it COMPILES AND RUNS
+    //         CORRECTLY: built and run, count=2 sum=8, exactly what the
+    //         program asks for. So v1 implements that program and the
+    //         suggestion is honest for it.
     //
-    // In an UNINSTANTIATED env v1 emits no wiring and succeeds, for all
-    // six. That is v1 not looking, not v1 running the program, so it
-    // does not make `--codegen v1` a way out: anyone who instantiates
-    // the env gets one of the rows above.
+    // These are therefore NOT `Invalid`. An earlier pass made them so on
+    // the grounds that an uninstantiated env is "v1 not looking, not v1
+    // running the program" — but v1 emits, compiles and RUNS such a
+    // program to completion, so "a program error under every backend"
+    // is false for every one of these arms, and it was the same
+    // observation the endpoint-shape arms above cite for keeping their
+    // suggestion. One observation cannot reach opposite verdicts in one
+    // function.
+    //
+    // What separates these from the endpoint arms is narrower: an
+    // instantiated malformed PATH can still mean something to v1 (a
+    // single-segment endpoint resolves against the owner's own
+    // hookable), while an instantiated bad SINK never does — except the
+    // signedness row, which is split out below precisely because it
+    // does.
     let sink = if let Some(sm) = sink_comp.method(&sink_name) {
         if !sm.hookable {
-            return Err(LowerError::Invalid(format!(
-                "`connect` sink method `{}.{sink_name}` is not `hookable`; analysis sinks \
-                 must be declared `hookable`",
-                sink_path.join(".")
-            )));
+            return Err(not_implemented(
+                &format!(
+                    "a `connect` sink method `{}.{sink_name}` that is not `hookable`",
+                    sink_path.join(".")
+                ),
+                "analysis sinks must be declared `hookable`; v1 emits a fan-out over the \
+                 method name as if it were an event vector, which is not a member of the \
+                 emitted struct at all",
+                V1Status::EmitsUncompilable,
+            ));
         }
         if sm.param_names.len() != 1 {
-            return Err(LowerError::Invalid(format!(
-                "`connect` sink method `{sink_name}` takes {} parameters; analysis sinks \
-                 take exactly one payload parameter",
-                sm.param_names.len()
-            )));
+            return Err(not_implemented(
+                &format!(
+                    "a `connect` sink method `{sink_name}` with {} parameters",
+                    sm.param_names.len()
+                ),
+                "analysis sinks take exactly one payload parameter; v1 refuses it too, \
+                 with \"must take exactly one payload argument\"",
+                V1Status::Rejects,
+            ));
         }
         if sm.has_ret {
-            return Err(LowerError::Invalid(format!(
-                "`connect` sink method `{}.{sink_name}` returns a value; analysis sinks \
-                 must not",
-                sink_path.join(".")
-            )));
+            return Err(not_implemented(
+                &format!(
+                    "a `connect` sink method `{}.{sink_name}` that returns a value",
+                    sink_path.join(".")
+                ),
+                "analysis sinks must not return a value; v1 refuses it too, with \"must \
+                 return void\"",
+                V1Status::Rejects,
+            ));
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
-            return Err(LowerError::Invalid(format!(
-                "`connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`; \
-                 source and sink payloads must have the same signed scalar shape or \
-                 record type",
-                src_path.join("."),
-                sink_path.join("."),
-            )));
+            return Err(connect_payload_mismatch(
+                &src_path.join("."),
+                &src_event,
+                &sink_path.join("."),
+                &sink_name,
+                scalar_shapes_agree(src_payload, &sm.param_tys[0]),
+            ));
         }
         crate::ir::ConnectSink::Method { method: sink_name }
     } else if let Some(ComponentFieldSchema {
@@ -2044,21 +2073,29 @@ where
     }) = sink_comp.field(&sink_name)
     {
         if *payload != src_payload {
-            return Err(LowerError::Invalid(format!(
-                "`connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`; \
-                 source and sink event payloads must have the same signed scalar shape \
-                 or record type",
-                src_path.join("."),
-                sink_path.join("."),
-            )));
+            return Err(connect_payload_mismatch(
+                &src_path.join("."),
+                &src_event,
+                &sink_path.join("."),
+                &sink_name,
+                matches!(
+                    (src_payload, payload),
+                    (EventPayload::Scalar { .. }, EventPayload::Scalar { .. })
+                ),
+            ));
         }
         crate::ir::ConnectSink::Event { event: sink_name }
     } else {
-        return Err(LowerError::Invalid(format!(
-            "`connect` sink `{}.{sink_name}` is neither a `hookable` sink method nor an \
-             `event` field",
-            sink_path.join(".")
-        )));
+        return Err(not_implemented(
+            &format!(
+                "a `connect` sink `{}.{sink_name}` that is neither a `hookable` sink \
+                 method nor an `event` field",
+                sink_path.join(".")
+            ),
+            "v1 emits a fan-out over the name as if it were an event vector; on a scalar \
+             field that does not compile",
+            V1Status::EmitsUncompilable,
+        ));
     };
 
     Ok(ConnectEdgeSchema {
@@ -2095,6 +2132,64 @@ fn resolve_testbench_path(
 /// callback shape as an analysis event payload. Narrow unsigned values,
 /// `bits`, and `bool` all widen to the unsigned callback representation;
 /// signed values and value records retain distinct shapes.
+/// A `connect` payload mismatch, split on the one distinction that
+/// decides whether v1 runs the program.
+///
+/// `event_payload_matches_ir_type` compares signedness and record
+/// identity, so one check covers two shapes that behave completely
+/// differently under v1:
+///
+///   * both sides SCALAR, differing only in signedness — v1's bridge
+///     lambda is generic, and converting it to the source's
+///     `std::function<void(uint64_t)>` gives an implicit conversion into
+///     the sink's `int64_t` parameter. Built and run: `count=2 sum=8`,
+///     exactly what the program asks for. v1 implements it, so the
+///     suggestion is honest.
+///   * a RECORD against a scalar (either direction) — the same
+///     conversion has nothing to convert. g++: "no match for call to
+///     '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'".
+///
+/// `scalars` is the caller's answer to "are both sides scalars?", which
+/// is the exact discriminator rather than a proxy for it.
+fn connect_payload_mismatch(
+    src_path: &str,
+    src_event: &str,
+    sink_path: &str,
+    sink_name: &str,
+    scalars: bool,
+) -> LowerError {
+    let construct = format!(
+        "a `connect` payload mismatch from `{src_path}.{src_event}` to \
+         `{sink_path}.{sink_name}`"
+    );
+    if scalars {
+        unsupported(
+            &construct,
+            "source and sink scalar payloads must agree in signedness; v1 lets the \
+             implicit conversion through and the program runs",
+        )
+    } else {
+        not_implemented(
+            &construct,
+            "a record payload and a scalar one cannot be bridged; v1 emits the generic \
+             bridge anyway and the emitted C++ does not compile",
+            V1Status::EmitsUncompilable,
+        )
+    }
+}
+
+/// Whether a `connect` source payload and a sink PARAMETER type are both
+/// scalars — the discriminator `connect_payload_mismatch` splits on.
+fn scalar_shapes_agree(payload: EventPayload, ty: &IrType) -> bool {
+    matches!(
+        (payload, ty),
+        (
+            EventPayload::Scalar { .. },
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
+        )
+    )
+}
+
 fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,

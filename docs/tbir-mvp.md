@@ -4758,7 +4758,7 @@ case and only locally-determinable `Assign` types are compared).
     | `NPER`, a file-scope `const` | `(int64_t)(NPER)`, declared at namespace scope ~80 lines earlier | yes |
     | `read_count`, a state field | `(int64_t)(target.read_count)`, instance declared 3 lines earlier | yes |
     | `limit`, a `let` declared AFTER the transactor's binding | `(int64_t)(limit)`, declared **64 lines later** | **no** |
-    | the same `let`, moved one line ABOVE that binding | same, declared 3 lines earlier | yes, and correct |
+    | the same `let`, moved between the BUS binding and that one | same, declared before the registration | yes, and correct |
     | `limit`, with a file-scope `const limit = 7` as well | same, and it RESOLVES — to the const | yes, **and runs at the wrong rate** |
 
     The fourth row is compiler-measured, not read off the text: g++ on
@@ -4923,7 +4923,7 @@ case and only locally-determinable `Assign` types are compared).
     there is no arity but one to be right about, and neither
     alternative spelling is an escape hatch.
 
-74. **Six `connect` arms were program errors wearing a suggestion
+74. **Six `connect` arms, and two wrong verdicts before the right ones
     (2026-08-18).**
 
     `lower_connect_edge` refuses malformed edges at two quite different
@@ -4935,38 +4935,53 @@ case and only locally-determinable `Assign` types are compared).
     because a single-segment endpoint resolves against the owner's own
     hookable and works. Those keep their suggestion.
 
-    The SEMANTIC arms are not mixed. Once both endpoints resolve to
-    real sub-components, an edge whose sink cannot receive the source's
-    payload is a type error, and no backend executes it. Measured on an
-    INSTANTIATED env, which is the only place v1 looks:
+    The SEMANTIC arms are different, and getting them right took two
+    passes. Measured on an INSTANTIATED env, which is the only place v1
+    looks at the edge:
 
-    | edge | v1 |
-    |---|---|
-    | sink is a plain `function` | `for (auto& _s : sink.plain)` — g++: "'struct Sink' has no member named 'plain'" |
-    | sink method takes 2 parameters | v1's OWN error: "must take exactly one payload arg" |
-    | sink method returns a value | v1's OWN error: "must return void" |
-    | payload mismatch, method sink | g++: "no match for call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'" |
-    | payload mismatch, event sink | same |
-    | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` |
+    | edge | v1 | verdict |
+    |---|---|---|
+    | sink is a plain `function` | `for (auto& _s : sink.plain)` — g++: "'struct Sink' has no member named 'plain'" | `EmitsUncompilable` |
+    | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` | `EmitsUncompilable` |
+    | sink method takes 2 parameters | "connect: hookable sink `sink.two` must take exactly one payload argument, got 2" | `Rejects` |
+    | sink method returns a value | "connect: hookable sink `sink.ret` must return void" | `Rejects` |
+    | payload mismatch, RECORD vs scalar | g++: "no match for call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'" | `EmitsUncompilable` |
+    | payload mismatch, SIGNEDNESS only | **compiles and runs correctly** | `Unsupported` |
 
-    The payload rows are the interesting ones, because v1's bridge
-    lambda is GENERIC — `push_back([&](auto _t) { ... })` — and looks
-    type-agnostic. It would be, except that converting it to the
-    source's `std::function<void(uint64_t)>` instantiates it right
-    there, so the mismatch bites at the wiring line rather than at the
-    first `emit`.
+    The payload rows are one arm covering two shapes, because
+    `event_payload_matches_ir_type` compares signedness and record
+    identity only — width is irrelevant to it. v1's bridge lambda is
+    GENERIC (`push_back([&](auto _t) { ... })`) and looks type-agnostic;
+    converting it to the source's `std::function<void(uint64_t)>`
+    instantiates it at the wiring line. A record cannot survive that. A
+    sign difference passes straight through as an ordinary implicit
+    conversion: built and run, an `event<uint<8>>` into a `sint<8>` sink
+    gives `count=2 sum=8`, exactly what the program asks for.
 
-    In an UNINSTANTIATED env v1 emits no wiring and succeeds, for all
-    six. That is what the old verdict rested on, and it does not hold
-    the weight: v1 is not running the program, it is not looking at the
-    edge. The edge is ill-formed wherever it sits, so all six are
-    `Invalid`.
+    The first pass called all six `Invalid`, on the argument that an
+    uninstantiated env is "v1 not looking, not v1 running the program".
+    Both halves of that are wrong. v1 emits, compiles and RUNS an
+    uninstantiated malformed env to completion, so "a program error
+    under every backend" is false for all six; and it was the same
+    observation the endpoint-shape arms cite for KEEPING their
+    suggestion, so one observation was reaching opposite verdicts in one
+    function. The narrower true difference is that an instantiated
+    malformed PATH can still mean something to v1, while an instantiated
+    bad SINK never does — except the signedness row, which is why it is
+    split out.
 
-    One of the two tests over this family had already written the
-    conclusion down without measuring it — its doc said the signature
+    A test in the suite was the counterexample the whole time: the
+    pre-existing `analysis_connect_rejects_non_hookable_and_payload_
+    mismatched_sinks` builds `hookable accept(v: sint<8>)` against a
+    `uint<8>` source, and the first pass changed it from
+    `assert_unsupported` to `assert_invalid` — moving the one row that
+    disproved the verdict under the verdict.
+
+    Separately, one of the two tests over this family had written its
+    conclusion down without measuring it: its doc said the signature
     checks "keep the suggestion too, for the same reason", and it only
-    ever built the instantiated case, which is the half that disproves
-    it. It builds both now. Four of the six arms had no test at all.
+    ever built the instantiated case. It builds both now. Four of the
+    six arms had no test at all.
 
 75. **The same period expression, a fourth landing (2026-08-18).**
 
