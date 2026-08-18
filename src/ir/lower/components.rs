@@ -11,7 +11,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[allow(dead_code)]
 #[path = "components_impl.rs"]
 mod implementation;
 
@@ -58,6 +57,14 @@ pub(crate) fn transactor_is_active_only_consumer(t: &crate::ast::TransactorDecl)
         return false;
     }
 
+    // The implementation module's original classifier is intentionally only
+    // a coarse fast path here. When it returns true there are no ordinary-body
+    // non-periodic handlers at all, so any active-only subscription found below
+    // certainly lacks an always-on subscriber. Its false result is NOT enough
+    // to classify the transactor: mixed req1/req2 cases still require the
+    // event-specific check below.
+    let no_always_nonperiodic_handlers = implementation::transactor_is_active_only_consumer(t);
+
     let is_always_input = |event: &str| {
         t.items.iter().any(|item| {
             matches!(
@@ -87,5 +94,8 @@ pub(crate) fn transactor_is_active_only_consumer(t: &crate::ast::TransactorDecl)
             crate::ast::ComponentItem::OnHandler(handler) => subscription_event(handler),
             _ => None,
         })
-        .any(|event| is_always_input(event) && !has_always_subscriber(event))
+        .any(|event| {
+            is_always_input(event)
+                && (no_always_nonperiodic_handlers || !has_always_subscriber(event))
+        })
 }
