@@ -19993,3 +19993,97 @@ end impl ConsTest"#;
         "and it does register the handler"
     );
 }
+
+/// The FIFTH landing of the non-literal `on <N> cycles` period, and the
+/// one that does NOT move — which is what makes the other four's
+/// verdict mean something.
+///
+/// A statement-position `on <N> cycles` is registered where it is
+/// WRITTEN, inside the run body, after the impl's `let`s have been
+/// emitted. So the period expression resolves to what the source says:
+///
+/// | landing | registration sits | `on per cycles` with `let per = 2` |
+/// |---|---|---|
+/// | three bound-to transactor arms, and the testbench-scoped one | near the top of the run function, before the `let`s | uncompilable, or resolves to a same-named `const` |
+/// | statement position (this one) | at the statement, after the `let`s | resolves to 2 — correct |
+///
+/// Built and run with a file-scope `const per = 7` present as well —
+/// the case that makes the other four `SilentlyMisLowers` — this one
+/// fires 10 times in 21 cycles at period 2, exactly right, because the
+/// `let` shadows the const at the point of use.
+///
+/// So the arm keeps `Unsupported`: v1 implements it. Applying the other
+/// landings' verdict here by analogy would have been wrong, and the
+/// construct is identical — only the emission position differs.
+#[test]
+fn a_statement_position_periodic_period_resolves_correctly_under_v1() {
+    let src = |on: &str, extra: &str| {
+        format!(
+            r#"{extra}domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench SpTb
+    dut : Top
+    n   : uint<32> default 0
+end testbench SpTb
+
+impl SpTest for SpTb
+    clock clk = SysDomain
+    let per = 2
+
+    run
+        on {on} cycles
+            n = n + 1
+        end on
+        wait 8 cycles
+        assert n > 0 else fail("n=${{n}}")
+    end run
+end impl SpTest"#
+        )
+    };
+
+    // The literal control lowers under TB-IR.
+    lower_src(&src("2", "")).expect("the literal period lowers");
+
+    for (what, extra) in [
+        ("bare `let`", ""),
+        ("shadowed by a const", "const per = 7\n\n"),
+    ] {
+        let s = src("per", extra);
+        // TB-IR still refuses — a subset gap, not a correctness one.
+        let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+        assert!(msg.contains("non-literal period"), "{what}: {msg}");
+
+        // And the reason the suggestion is honest: v1 emits the `let`
+        // BEFORE the registration, so the closure reads the `let` and
+        // not anything else.
+        let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        let lt = v1
+            .find("int64_t per = 2;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        let used = v1
+            .find("_period = (int64_t)(per);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        assert!(
+            lt < used,
+            "{what}: the `let` must precede the use here — that is the whole difference \
+             from the four landings that mis-lower"
+        );
+    }
+
+    // And the contrast made explicit: with the const present, it is
+    // emitted at namespace scope AHEAD of the `let`, and the `let`
+    // still wins because it is nearer. That is the opposite of what
+    // happens when the registration sits above the `let`.
+    let shadowed = src("per", "const per = 7\n\n");
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let konst = v1
+        .find("static constexpr int64_t per = 7;")
+        .expect("v1 emits the const");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    assert!(konst < lt && lt < used, "const, then `let`, then the use");
+}

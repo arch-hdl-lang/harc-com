@@ -5091,6 +5091,32 @@ case and only locally-determinable `Assign` types are compared).
     field never reaches these arms at all. The arm being measured has to
     be the arm the probe actually hits.
 
+78. **The fifth landing is the one that does not move (2026-08-18).**
+
+    Four arms now carry `SilentlyMisLowers` for a non-literal
+    `on <N> cycles` period. The fifth — a statement-position `on <N>
+    cycles`, in `stmts.rs` — keeps `Unsupported`, and measuring it is
+    what makes the other four's verdict mean anything.
+
+    | landing | v1 registers the closure | `on per cycles` with `let per = 2` |
+    |---|---|---|
+    | three bound-to transactor arms, plus the testbench-scoped one | near the top of the run function, ahead of the impl's `let`s | uncompilable, or silently resolves to a same-named file-scope `const` |
+    | statement position | at the statement, after the `let`s | resolves to 2 |
+
+    Built and run with `const per = 7` present as well — the exact
+    program that makes the other four mis-lower — this one fires 10
+    times in 21 cycles at period 2. Correct, because the `let` shadows
+    the const at the point of use rather than the other way round.
+
+    So the construct is identical at all five sites and the verdict is
+    not, and what separates them is nothing about the construct: it is
+    where v1 happens to emit the registration. Applying the other
+    landings' verdict here by analogy — which the grouping-by-construct
+    rule might have invited — would have been wrong.
+
+    That is the honest form of the rule. Group by what a construct DOES
+    to find the sites; measure each site anyway.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
