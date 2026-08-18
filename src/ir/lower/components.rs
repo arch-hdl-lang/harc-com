@@ -1977,43 +1977,65 @@ where
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
     let sink_cid = resolve_path(sink_path)?;
     let sink_comp = &components[sink_cid.index()];
+    // The SEMANTIC sink checks below are a different family from the
+    // endpoint-shape ones above, and take a different verdict. Those
+    // are mixed because a malformed PATH can still mean something to v1
+    // (a single-segment endpoint resolves against the owner's own
+    // hookable). These are not: once both endpoints resolve to real
+    // sub-components, an edge whose sink cannot receive the source's
+    // payload is a type error, and no backend executes it. Measured on
+    // an INSTANTIATED env, which is the only place v1 looks:
+    //
+    //   * not `hookable` — v1 emits `for (auto& _s : sink.plain)`, and
+    //     a `function` method is not a struct member at all. g++:
+    //     "'struct Sink' has no member named 'plain'".
+    //   * wrong parameter count / returns a value — v1 raises its OWN
+    //     error ("connect: hookable sink `sink.two` must take exactly
+    //     one payload arg", "must return void").
+    //   * payload mismatch, either sink shape — the bridge lambda is
+    //     generic, but converting it to the source's
+    //     `std::function<void(uint64_t)>` instantiates it, so the
+    //     mismatch bites at the wiring line itself. g++: "no match for
+    //     call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned
+    //     int&)'".
+    //   * neither a method nor an event field — `for (auto& _s :
+    //     sink.other)` over a `uint64_t`. g++: "there are no arguments
+    //     to 'begin' that depend on a template parameter".
+    //
+    // In an UNINSTANTIATED env v1 emits no wiring and succeeds, for all
+    // six. That is v1 not looking, not v1 running the program, so it
+    // does not make `--codegen v1` a way out: anyone who instantiates
+    // the env gets one of the rows above.
     let sink = if let Some(sm) = sink_comp.method(&sink_name) {
         if !sm.hookable {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` sink method `{}.{sink_name}` that is not hookable",
-                    sink_path.join(".")
-                ),
-                "analysis sinks must be declared `hookable`",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "`connect` sink method `{}.{sink_name}` is not `hookable`; analysis sinks \
+                 must be declared `hookable`",
+                sink_path.join(".")
+            )));
         }
         if sm.param_names.len() != 1 {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` sink method `{sink_name}` with {} parameters",
-                    sm.param_names.len()
-                ),
-                "analysis sinks take exactly one payload parameter",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "`connect` sink method `{sink_name}` takes {} parameters; analysis sinks \
+                 take exactly one payload parameter",
+                sm.param_names.len()
+            )));
         }
         if sm.has_ret {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` sink method `{}.{sink_name}` that returns a value",
-                    sink_path.join(".")
-                ),
-                "analysis sinks must not return a value",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "`connect` sink method `{}.{sink_name}` returns a value; analysis sinks \
+                 must not",
+                sink_path.join(".")
+            )));
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
-                    src_path.join("."),
-                    sink_path.join("."),
-                ),
-                "source and sink payloads must have the same signed scalar shape or record type",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "`connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`; \
+                 source and sink payloads must have the same signed scalar shape or \
+                 record type",
+                src_path.join("."),
+                sink_path.join("."),
+            )));
         }
         crate::ir::ConnectSink::Method { method: sink_name }
     } else if let Some(ComponentFieldSchema {
@@ -2022,25 +2044,21 @@ where
     }) = sink_comp.field(&sink_name)
     {
         if *payload != src_payload {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
-                    src_path.join("."),
-                    sink_path.join("."),
-                ),
-                "source and sink event payloads must have the same signed scalar shape or record type",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "`connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`; \
+                 source and sink event payloads must have the same signed scalar shape \
+                 or record type",
+                src_path.join("."),
+                sink_path.join("."),
+            )));
         }
         crate::ir::ConnectSink::Event { event: sink_name }
     } else {
-        return Err(unsupported(
-            &format!(
-                "a `connect` sink `{}.{sink_name}` that is neither a sink method nor an \
-                 `event` field",
-                sink_path.join(".")
-            ),
-            "",
-        ));
+        return Err(LowerError::Invalid(format!(
+            "`connect` sink `{}.{sink_name}` is neither a `hookable` sink method nor an \
+             `event` field",
+            sink_path.join(".")
+        )));
     };
 
     Ok(ConnectEdgeSchema {

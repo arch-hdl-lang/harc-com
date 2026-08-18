@@ -4908,6 +4908,51 @@ case and only locally-determinable `Assign` types are compared).
     there is no arity but one to be right about, and neither
     alternative spelling is an escape hatch.
 
+74. **Six `connect` arms were program errors wearing a suggestion
+    (2026-08-18).**
+
+    `lower_connect_edge` refuses malformed edges at two quite different
+    points, and an earlier batch gave both the same `Unsupported`.
+
+    The ENDPOINT-SHAPE arms — a non-path endpoint, a one-segment path,
+    an unresolvable segment — are genuinely mixed, and that batch
+    measured why: a malformed PATH can still mean something to v1,
+    because a single-segment endpoint resolves against the owner's own
+    hookable and works. Those keep their suggestion.
+
+    The SEMANTIC arms are not mixed. Once both endpoints resolve to
+    real sub-components, an edge whose sink cannot receive the source's
+    payload is a type error, and no backend executes it. Measured on an
+    INSTANTIATED env, which is the only place v1 looks:
+
+    | edge | v1 |
+    |---|---|
+    | sink is a plain `function` | `for (auto& _s : sink.plain)` — g++: "'struct Sink' has no member named 'plain'" |
+    | sink method takes 2 parameters | v1's OWN error: "must take exactly one payload arg" |
+    | sink method returns a value | v1's OWN error: "must return void" |
+    | payload mismatch, method sink | g++: "no match for call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'" |
+    | payload mismatch, event sink | same |
+    | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` |
+
+    The payload rows are the interesting ones, because v1's bridge
+    lambda is GENERIC — `push_back([&](auto _t) { ... })` — and looks
+    type-agnostic. It would be, except that converting it to the
+    source's `std::function<void(uint64_t)>` instantiates it right
+    there, so the mismatch bites at the wiring line rather than at the
+    first `emit`.
+
+    In an UNINSTANTIATED env v1 emits no wiring and succeeds, for all
+    six. That is what the old verdict rested on, and it does not hold
+    the weight: v1 is not running the program, it is not looking at the
+    edge. The edge is ill-formed wherever it sits, so all six are
+    `Invalid`.
+
+    One of the two tests over this family had already written the
+    conclusion down without measuring it — its doc said the signature
+    checks "keep the suggestion too, for the same reason", and it only
+    ever built the instantiated case, which is the half that disproves
+    it. It builds both now. Four of the six arms had no test at all.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

@@ -2142,16 +2142,25 @@ test T
     end run
 end test T
 "#;
+    // `Invalid`, not a gap: once both endpoints resolve, an edge whose
+    // sink cannot receive the source's payload is a type error that no
+    // backend executes. v1 emits `for (auto& _s : sink.accept)` over a
+    // `function` method, which is not a struct member — g++: "'struct
+    // Sink' has no member named 'accept'". See the arm's comment for
+    // the other five rows.
     let err = lower_src(non_hookable).expect_err("must reject non-hookable sink");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("not hookable"), "unexpected diagnostic: {msg}");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("not `hookable`"),
+        "unexpected diagnostic: {msg}"
+    );
 
     let mismatched_payload = non_hookable.replace(
         "function accept(v: uint<8>)\n    end accept",
         "hookable accept(v: sint<8>)\n    end accept",
     );
     let err = lower_src(&mismatched_payload).expect_err("must reject incompatible payloads");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("payload"), "unexpected diagnostic: {msg}");
 }
 
@@ -13349,11 +13358,26 @@ end impl T"#
     }
 }
 
-/// The sink SIGNATURE checks keep the suggestion too, for the same
-/// reason: v1 raises its own error for a bad arity or a non-void return
-/// only when the owning env is instantiated.
+/// The sink SIGNATURE checks are `Invalid`, and this is the test that
+/// once claimed the opposite. Its doc used to say they "keep the
+/// suggestion too, for the same reason" as the endpoint-shape arms —
+/// asserted, never measured, and it only ever built the INSTANTIATED
+/// case, which is the half that disproves it.
+///
+/// Measured, both halves. Instantiated, v1 raises its own error:
+/// "connect: hookable sink `sink.two` must take exactly one payload
+/// arg" and "must return void". Uninstantiated, v1 emits no wiring and
+/// succeeds — which is v1 not looking at the edge, not v1 running the
+/// program. An edge whose sink cannot receive the payload is a type
+/// error either way, so no backend executes it and naming one would be
+/// false.
+///
+/// That is NOT the endpoint-shape arms' situation, and the difference
+/// is why they keep their suggestion: a malformed PATH can still mean
+/// something to v1, because a single-segment endpoint resolves against
+/// the owner's own hookable and works.
 #[test]
-fn a_bad_connect_sink_signature_keeps_its_v1_suggestion() {
+fn a_bad_connect_sink_signature_is_a_program_error() {
     let src = |sink: &str, method: &str| {
         format!(
             r#"transactor Src
@@ -13389,21 +13413,36 @@ end impl T"#
         )
     };
 
-    let err = lower_src(&src(
-        "two",
-        "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
-    ))
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("with 2 parameters"), "{msg}");
+    for (sink, method, want) in [
+        (
+            "two",
+            "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
+            "takes 2 parameters",
+        ),
+        (
+            "ret",
+            "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
+            "returns a value",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&src(sink, method)).unwrap_err());
+        assert!(msg.contains(want), "{msg}");
 
-    let err = lower_src(&src(
-        "ret",
-        "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
-    ))
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("that returns a value"), "{msg}");
+        // The half the old test never built: v1 emits the same edge
+        // without complaint when nothing instantiates the env, because
+        // it emits no wiring there at all. The verdict has to hold for
+        // both, and `Invalid` does — the edge is ill-formed wherever it
+        // sits.
+        let uninstantiated = src(sink, method).replacen("    top : E\n", "", 1);
+        assert!(
+            !uninstantiated.contains("top : E"),
+            "the instantiation must actually be gone"
+        );
+        cpp_tb::emit(&merged_src(&uninstantiated))
+            .unwrap_or_else(|e| panic!("v1 ignores an uninstantiated bad edge: {e}"));
+        let msg = assert_invalid(&lower_src(&uninstantiated).unwrap_err());
+        assert!(msg.contains(want), "{msg}");
+    }
 }
 
 /// Record state is legal in BOTH transactor declaration positions —
@@ -19388,4 +19427,113 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
         !v1.contains(", 2);"),
         "and drops the second payload rather than carrying it"
     );
+}
+
+/// The remaining `connect` SEMANTIC arms, none of which had a test.
+/// Each is a type error once both endpoints resolve, and each was
+/// measured against v1 on an instantiated env — the only place v1 looks
+/// at the edge at all.
+///
+/// | edge | v1 |
+/// |---|---|
+/// | sink is a plain `function` | `for (auto& _s : sink.plain)` — not a struct member |
+/// | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` |
+/// | payload mismatch, method sink | bridge lambda instantiates against the wrong type |
+/// | payload mismatch, event sink | same |
+///
+/// The uncompilable rows are compiler-measured, not read off the text.
+/// The payload rows matter because the bridge lambda is GENERIC — it
+/// looks type-agnostic, and would be, except that converting it to the
+/// source's `std::function<void(uint64_t)>` instantiates it right
+/// there, so the mismatch bites at the wiring line rather than at the
+/// first `emit`.
+#[test]
+fn a_connect_sink_that_cannot_receive_the_payload_is_a_program_error() {
+    let src = |sink_decl: &str, target: &str, extra: &str| {
+        format!(
+            r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Src
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen  : uint<32> default 0
+    other : uint<32> default 0
+{sink_decl}
+end scoreboard Sink
+
+{extra}
+env E
+    src  : Src passive
+    sink : Sink
+{extra_field}
+    connect
+        src.observed -> {target}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#,
+            extra_field = if extra.is_empty() {
+                ""
+            } else {
+                "    dst  : Dst passive\n"
+            }
+        )
+    };
+    let hookable = "    hookable take(v: uint<8>)\n        seen = seen + 1\n    end take";
+    let dst = |payload: &str| {
+        format!("transactor Dst\n    incoming : event<{payload}>\nend transactor Dst\n")
+    };
+
+    // The control: a well-formed edge of each sink shape lowers.
+    lower_src(&src(hookable, "sink.take", "")).expect("method sink lowers");
+    lower_src(&src(hookable, "dst.incoming", &dst("uint<8>"))).expect("event sink lowers");
+
+    for (what, sink_decl, target, extra, want) in [
+        (
+            "plain function",
+            "    function plain(v: uint<8>)\n        seen = seen + 1\n    end plain",
+            "sink.plain",
+            "".to_string(),
+            "not `hookable`",
+        ),
+        (
+            "scalar field",
+            hookable,
+            "sink.other",
+            "".to_string(),
+            "neither a `hookable` sink method nor an `event` field",
+        ),
+        (
+            "method payload mismatch",
+            "    hookable take(v: Beat)\n        seen = seen + 1\n    end take",
+            "sink.take",
+            "".to_string(),
+            "payload mismatch",
+        ),
+        (
+            "event payload mismatch",
+            hookable,
+            "dst.incoming",
+            dst("Beat"),
+            "payload mismatch",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&src(sink_decl, target, &extra)).unwrap_err());
+        assert!(msg.contains(want), "{what}: {msg}");
+    }
 }
