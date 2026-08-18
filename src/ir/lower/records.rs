@@ -32,6 +32,129 @@ use crate::ast::{
 use crate::ir::{IrType, RecordFieldSchema, RecordId, RecordSchema};
 use std::collections::HashMap;
 
+/// A record field whose leaf type TB-IR does not model. The arm serves
+/// several shapes and they do NOT share a verdict, so each was measured
+/// on its own — v1's emitted member declaration is the whole evidence:
+///
+/// | field type | v1 emits | means what was written? |
+/// |---|---|---|
+/// | `list<uint<8>>` | `std::vector<uint64_t> data = {};` | yes — plus resize, per-element randomize, Z3 length vars |
+/// | `Vec<uint, 4>` | `std::array<uint64_t, 4> data = {};` | yes — a widthless `uint` is 64-bit, which TB-IR itself accepts outside a `Vec` |
+/// | `Vec<uint<128>, 4>` | `std::array<_harc_u128, 4> data = {};` | yes |
+/// | `Vec<Vec<uint<8>, 2>, 4>` | `std::array<std::array<uint64_t, 2>, 4>` | yes |
+/// | `Vec<queue<uint<8>>, 4>` | `std::array<uint64_t, 4> data = {};` | **no** — the queue element became a scalar |
+/// | `Vec<string, 4>` | `uint64_t data = 0;` | **no** — the whole array collapsed |
+/// | `Vec<uint<8>, N>` | `uint64_t data = 0;` | **no** — a non-literal length collapses it |
+/// | `queue<uint<8>>` | `uint64_t data = 0;` | **no** |
+/// | `string` | `int64_t data = 0;` | **no** |
+/// | `event<uint<8>>` | `uint64_t data = 0;` | **no** |
+///
+/// So the rule is one question asked recursively: does v1 emit a
+/// CONTAINER, or does it flatten? `list` never flattens; a `Vec`
+/// flattens when its length is not a literal or when its element
+/// flattens; everything else here flattens.
+///
+/// Classifying the arm from a single `queue` probe — which is what the
+/// first version of this did — denied the working suggestion for
+/// `list` and broke the escape-hatch parity test. That is how the
+/// split was found, and it is the reason each row above is a separate
+/// measurement rather than one verdict wearing four hats.
+fn record_leaf_flattens(ty: &TypeExpr) -> bool {
+    if crate::codegen::cpp_tb::is_list_type(ty) {
+        return false;
+    }
+    let TypeExpr::Builtin { name, args, .. } = ty else {
+        // A named type that is not `list` — a record — never reaches
+        // this arm; the nested-record branch claims it first.
+        return true;
+    };
+    if !matches!(name, BuiltinTy::Vec) {
+        return true;
+    }
+    // `Vec<Elem, Len>` keeps its array shape under v1 only when the
+    // length is a literal AND the element is something v1 gives a real
+    // C++ type. Either failing collapses the whole member to a scalar.
+    let elem_ok = matches!(args.first(), Some(TypeArg::Type(elem)) if vec_element_models(elem));
+    let len_literal = matches!(
+        args.get(1),
+        Some(TypeArg::Expr(e)) if super::exprs::parse_int_literal_expr(e).is_some()
+    );
+    !(elem_ok && len_literal)
+}
+
+/// Whether v1 gives a `Vec` ELEMENT a real C++ type rather than
+/// flattening it. Scalars do (including a widthless `uint`, which is
+/// 64-bit and which TB-IR itself accepts outside a `Vec`); a nested
+/// `Vec` does when it is itself well-formed; a record does; `queue`,
+/// `string` and `event` do not.
+fn vec_element_models(ty: &TypeExpr) -> bool {
+    match ty {
+        // A record element — v1 emits the nested struct.
+        TypeExpr::Named { .. } => !crate::codegen::cpp_tb::is_list_type(ty),
+        TypeExpr::Builtin { name, .. } => match name {
+            BuiltinTy::UInt
+            | BuiltinTy::SInt
+            | BuiltinTy::Bits
+            | BuiltinTy::UIntCap
+            | BuiltinTy::SIntCap
+            | BuiltinTy::Bool
+            | BuiltinTy::BoolLower
+            | BuiltinTy::Bit
+            | BuiltinTy::Int => true,
+            BuiltinTy::Vec => !record_leaf_flattens(ty),
+            _ => false,
+        },
+    }
+}
+
+fn non_scalar_record_leaf(kind: &str, owner: &str, fname: &str, ty: &TypeExpr) -> LowerError {
+    const SUBSET: &str = "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
+                          `Vec<T, N>` arrays of such scalars or of supported \
+                          struct/transaction records, and nested struct/transaction fields \
+                          (whose leaves are themselves supported) are lowered";
+    let what = format!(
+        "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) leaf type `{}`",
+        type_expr_label(ty)
+    );
+    if record_leaf_flattens(ty) {
+        return not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; v1 flattens the field to a plain scalar and runs, so it means \
+                 something other than what was written"
+            ),
+            V1Status::SilentlyMisLowers,
+        );
+    }
+    unsupported(&what, SUBSET)
+}
+
+/// A field `default` written as an integer literal this compiler cannot
+/// read — a Verilog-style sized literal, or a decimal past `u64`. The
+/// two take opposite verdicts, measured rather than assumed a third
+/// time (the same split appears on coverpoint bounds and bin specs, and
+/// each was probed on its own):
+///
+/// | default | v1 emits | outcome |
+/// |---|---|---|
+/// | `4'd3` | `uint64_t a = 3;` | folds correctly — a real escape hatch |
+/// | `99999999999999999999999` | the literal verbatim | compiles with "integer constant is too large for its type" and truncates |
+fn record_default_literal(kind: &str, owner: &str, fname: &str, lit: &str) -> LowerError {
+    if lit.contains('\'') {
+        return unsupported(
+            &format!("{kind} field default `{owner}.{fname} default {lit}`"),
+            "TB-IR does not lower sized literals yet; v1 folds this one correctly",
+        );
+    }
+    not_implemented(
+        &format!("{kind} field default `{owner}.{fname} default {lit}`"),
+        "v1 emits the literal verbatim and g++ takes it with a warning — \"integer \
+         constant is too large for its type\" — so the field defaults to a truncated \
+         value with no error",
+        V1Status::SilentlyMisLowers,
+    )
+}
+
 pub(crate) fn lower_transaction(
     t: &TransactionDecl,
     enum_names: &std::collections::HashSet<String>,
@@ -89,9 +212,18 @@ pub(crate) fn lower_transaction(
                 keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
-                return Err(unsupported(
+                // v1 FLATTENS the subtype: measured on `when addr == 0
+                // { value }`, its randomize metadata carries
+                // `field value u8 random=true` unconditionally and the
+                // guard `addr == 0` appears nowhere in the output at
+                // all. So v1 randomizes the conditional field on every
+                // draw, whatever the discriminant says, and the program
+                // compiles and runs.
+                return Err(not_implemented(
                     &format!("`when` subtype blocks in transaction `{txn}`"),
-                    "",
+                    "v1 flattens the subtype — it randomizes the conditional fields \
+                     unconditionally and drops the guard, with no diagnostic",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -146,15 +278,30 @@ pub(crate) fn lower_struct(
         match item {
             TxnBodyItem::Field(_) => {}
             TxnBodyItem::Keep(_) => {
-                return Err(unsupported(
+                // Measured: the constraint expression appears ZERO
+                // times in v1's output. A struct carries no randomize
+                // metadata, so the `keep` is discarded and the program
+                // runs unconstrained.
+                return Err(not_implemented(
                     &format!("`keep` constraints in struct `{sname}`"),
-                    "constraint metadata lands with `randomize`",
+                    "v1 discards it — a struct carries no randomize metadata, so the \
+                     constraint never reaches the solver and nothing says so",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             TxnBodyItem::When(_) => {
-                return Err(unsupported(
+                // Measured: v1's `struct Rec` is BYTE-IDENTICAL to the
+                // same struct without the `when` block — the
+                // conditional field is dropped entirely. Reading it
+                // (`r.b`) then fails to compile ("'struct Rec' has no
+                // member named 'b'"), but a program that only declares
+                // it loses a field silently, and that is the worse of
+                // the two.
+                return Err(not_implemented(
                     &format!("`when` subtype blocks in struct `{sname}`"),
-                    "",
+                    "v1 drops the conditional fields from the struct entirely — a program \
+                     that declares one and never reads it loses it with no diagnostic",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -197,9 +344,15 @@ fn lower_record_field(
     // `std::array<Inner, N>` member).
     if let Some(rid) = named_record_id(&f.ty, record_ids) {
         if f.default.is_some() {
-            return Err(unsupported(
+            // v1 emits the initializer straight into the member:
+            // `Inner i = 0;`, which g++ rejects — "could not convert
+            // '0' from 'int' to 'Inner'". Measured with `-std=gnu++20`,
+            // the standard `src/main.rs` builds with.
+            return Err(not_implemented(
                 &format!("a `default` on the nested-record field `{owner}.{fname}`"),
-                "a record-typed field defaults to its own field defaults",
+                "a record-typed field defaults to its own field defaults; v1 emits \
+                 `Inner i = 0;` and g++ rejects the conversion",
+                V1Status::EmitsUncompilable,
             ));
         }
         let mut attr_src = Vec::with_capacity(f.attrs.len());
@@ -227,28 +380,23 @@ fn lower_record_field(
     let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids) {
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
-            let scalar = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
-                unsupported(
-                    &format!(
-                        "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) \
-                         leaf type `{}`",
-                        type_expr_label(&f.ty)
-                    ),
-                    "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
-                     `Vec<T, N>` arrays of such scalars or of supported \
-                     struct/transaction records, and nested struct/transaction \
-                     fields (whose leaves are themselves supported) are lowered",
-                )
-            })?;
+            let scalar = field_ir_type(&f.ty, enum_names)
+                .ok_or_else(|| non_scalar_record_leaf(kind, owner, fname, &f.ty))?;
             (scalar, None)
         }
     };
     // A `Vec<T, N>` field has no scalar `default <lit>` form (its zero
     // value is the empty-brace array); reject a literal default on one.
     if vec_len.is_some() && f.default.is_some() {
-        return Err(unsupported(
+        // Same shape as the nested-record default: v1 emits
+        // `std::array<uint64_t, 4> v = 0;` and g++ rejects it —
+        // "could not convert '0' from 'int' to
+        // 'std::array<long unsigned int, 4>'".
+        return Err(not_implemented(
             &format!("a `default` on the `Vec` field `{owner}.{fname}`"),
-            "Vec record fields default to a zero-filled array",
+            "Vec record fields default to a zero-filled array; v1 emits \
+             `std::array<T, N> v = 0;` and g++ rejects the conversion",
+            V1Status::EmitsUncompilable,
         ));
     }
     // Folded through the file's constant table, like the component /
@@ -261,12 +409,8 @@ fn lower_record_field(
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!("{kind} field default `{owner}.{fname} default {s}`"),
-                    "not a plain integer literal",
-                )
-            })?,
+            ExprKind::Int(s) => super::exprs::parse_int_literal(s)
+                .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
             ExprKind::Bool(b) => *b as u64,
             _ => super::components::fold_field_default(
                 d,

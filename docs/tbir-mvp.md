@@ -5955,6 +5955,50 @@ case and only locally-determinable `Assign` types are compared).
     two missing checks, all localized. Reverting would have traded a
     small, identified residue for a larger diffuse one.
 
+97. **Seven `records.rs` arms, and six were false escape hatches
+    (2026-08-18).**
+
+    Every one said `Unsupported` — "re-run with `--codegen v1`". v1
+    emits for all seven, so a shallow probe would have confirmed them
+    all. Reading the emitted C++ says otherwise:
+
+    | construct | v1 emits | verdict |
+    |---|---|---|
+    | `when` subtype in a transaction | `field addr u32 random=true` unconditionally; the guard `op == 1` appears NOWHERE | `SilentlyMisLowers` |
+    | `when` subtype in a struct | a struct byte-identical to the same struct without the block — the field is gone | `SilentlyMisLowers` |
+    | `keep` in a struct | nothing; the expression appears zero times | `SilentlyMisLowers` |
+    | `default` on a nested-record field | `Inner i = 0;` — "could not convert '0' from 'int' to 'Inner'" | `EmitsUncompilable` |
+    | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same conversion error | `EmitsUncompilable` |
+    | `default 4'd3` | `uint64_t a = 3;` — folded correctly | a real escape hatch |
+    | `default 999…` | the literal verbatim; compiles with a warning, truncates | `SilentlyMisLowers` |
+
+    The non-scalar-leaf arm is the interesting one, because it is a
+    single arm serving ten shapes that split two ways, and the split is
+    not the one the type name suggests:
+
+    | field type | v1 emits | |
+    |---|---|---|
+    | `list<uint<8>>` | `std::vector<uint64_t>` + resize + per-element randomize + Z3 length vars | real |
+    | `Vec<uint, 4>` | `std::array<uint64_t, 4>` — a widthless `uint` is 64-bit, which TB-IR itself accepts outside a `Vec` | real |
+    | `Vec<uint<128>, 4>` | `std::array<_harc_u128, 4>` | real |
+    | `Vec<Vec<uint<8>, 2>, 4>` | `std::array<std::array<uint64_t, 2>, 4>` | real |
+    | `Vec<queue<uint<8>>, 4>` | `std::array<uint64_t, 4>` — the array survives, the element does not | silent |
+    | `Vec<string, 4>` | `uint64_t data = 0;` — the whole array collapses | silent |
+    | `Vec<uint<8>, N>` | `uint64_t data = 0;` — a non-literal length collapses it | silent |
+    | `queue` / `string` / `event` | a scalar | silent |
+
+    The first version of this classified the whole arm from a single
+    `queue` probe. That broke `the_escape_hatch_phrases_the_parity_gate_greps_are_stable`,
+    whose fixture is a `list<uint<8>>` — the one leaf type v1 genuinely
+    implements. The test caught a real regression rather than a stale
+    expectation, which is the difference between a test that pins
+    behaviour and one that pins a message.
+
+    `is_list_type` is now `pub(crate)` in `cpp_tb.rs` and shared rather
+    than paraphrased — the direct application of the previous entry's
+    lesson, which is that every place this codebase has written a type
+    predicate twice, the copies have drifted.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

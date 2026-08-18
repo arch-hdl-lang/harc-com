@@ -19640,14 +19640,19 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
     })
 }
 
-fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {
+pub(crate) fn named_type_last_segment(t: &TypeExpr) -> Option<&str> {
     match t {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
     }
 }
 
-fn is_list_type(t: &TypeExpr) -> bool {
+/// `list<T>`, the one non-scalar record leaf v1 genuinely implements
+/// (`std::vector<T>` + per-element randomization + Z3 length vars).
+/// `pub(crate)` so the TB-IR lowering can ask the same question rather
+/// than writing a fourth copy of the rule — every place this codebase
+/// has paraphrased a type predicate instead of sharing it has drifted.
+pub(crate) fn is_list_type(t: &TypeExpr) -> bool {
     matches!(named_type_last_segment(t), Some("list") | Some("List"))
 }
 

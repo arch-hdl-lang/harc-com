@@ -3918,7 +3918,153 @@ end test MismatchCopyTest
     );
 }
 
-/// `when` subtype blocks stay outside the lowered record shape.
+/// Every non-scalar record leaf, against what v1 emits for it. The arm
+/// serves ten shapes and they split two ways, so one probe cannot
+/// classify it — which is exactly how the first version of this work
+/// went wrong: a `queue` probe was generalised to the whole arm, which
+/// denied `list` its working escape hatch and broke the parity test.
+///
+/// The question is whether v1 emits a CONTAINER or flattens the field
+/// to a scalar. Rows one to four keep the `--codegen v1` suggestion;
+/// the rest are silent mis-lowerings that no backend gets right.
+#[test]
+fn a_non_scalar_record_leaf_is_classified_by_what_v1_emits_for_it() {
+    let field = |ty: &str| {
+        format!(
+            r#"struct Resp
+    data : {ty}
+end struct Resp
+
+test T
+    let dut : Top
+    run
+        let r : Resp
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    // v1 emits a real container — a working escape hatch.
+    for (ty, shape) in [
+        ("list<uint<8>>", "std::vector<uint64_t> data"),
+        ("Vec<uint, 4>", "std::array<uint64_t, 4> data"),
+        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data"),
+        (
+            "Vec<Vec<uint<8>, 2>, 4>",
+            "std::array<std::array<uint64_t, 2>, 4> data",
+        ),
+    ] {
+        let src = field(ty);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(
+            v1.contains(shape),
+            "`{ty}`: v1 must emit `{shape}` for the suggestion to be honest"
+        );
+    }
+    // v1 flattens it to a scalar — the field means something else.
+    for (ty, shape) in [
+        ("queue<uint<8>>", "uint64_t data = 0;"),
+        ("string", "int64_t data = 0;"),
+        ("event<uint<8>>", "uint64_t data = 0;"),
+        ("Vec<string, 4>", "uint64_t data = 0;"),
+        ("Vec<uint<8>, N>", "uint64_t data = 0;"),
+        // The subtle one: the ARRAY survives, its element does not.
+        ("Vec<queue<uint<8>>, 4>", "std::array<uint64_t, 4> data"),
+    ] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(shape), "`{ty}`: v1 flattens it to `{shape}`");
+    }
+}
+
+/// The other five `records.rs` arms, each measured on its own.
+///
+/// | construct | v1 | verdict |
+/// |---|---|---|
+/// | `keep` in a struct | discards it — the expression appears nowhere | `SilentlyMisLowers` |
+/// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
+/// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
+/// | `default 4'd3` | folds to `uint64_t a = 3;` | a real escape hatch |
+/// | `default 999…` | the literal verbatim, truncated with a warning | `SilentlyMisLowers` |
+///
+/// Compiled with `-std=gnu++20`, the standard `src/main.rs` passes.
+#[test]
+fn the_record_field_arms_split_on_measured_v1_behaviour() {
+    let prog = |decls: &str| {
+        format!(
+            "{decls}\ntest T\n    let dut : Top\n    run\n        log(info, \"x\")\n    \
+             end run\nend test T"
+        )
+    };
+
+    // A `keep` on a struct is discarded — a struct carries no
+    // randomize metadata for it to reach.
+    let keep = prog("struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n");
+    assert_not_implemented(
+        &lower_src(&keep).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&keep)).expect("v1 emits");
+    assert!(!v1.contains("a < 10"), "v1 discards the constraint: {v1}");
+
+    // Both `default` shapes make v1 emit an initializer g++ rejects.
+    for (decls, needle) in [
+        (
+            "struct Inner\n    x : uint<8>\nend struct Inner\n\nstruct Outer\n    i : Inner default 0\nend struct Outer\n",
+            "Inner i = 0;",
+        ),
+        (
+            "struct VecRec\n    v : Vec<uint<8>, 4> default 0\nend struct VecRec\n",
+            "std::array<uint64_t, 4> v = 0;",
+        ),
+    ] {
+        let src = prog(decls);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(needle), "v1 emits `{needle}`: {v1}");
+    }
+
+    // The literal-default arm splits like every other one, and was
+    // probed on its own rather than assumed from the coverpoint and
+    // bin-spec versions of the same question.
+    let sized = prog("struct SzRec\n    a : uint<8> default 4'd3\nend struct SzRec\n");
+    assert_unsupported(&lower_src(&sized).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
+    assert!(v1.contains("uint64_t a = 3;"), "v1 folds `4'd3`: {v1}");
+
+    let wide =
+        prog("struct BigRec\n    a : uint<8> default 99999999999999999999999\nend struct BigRec\n");
+    assert_not_implemented(
+        &lower_src(&wide).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits");
+    assert!(
+        v1.contains("uint64_t a = 99999999999999999999999;"),
+        "v1 pastes the over-wide literal in: {v1}"
+    );
+}
+
+/// `when` subtype blocks stay outside the lowered record shape — and
+/// v1 does not implement them either, so this is not an escape hatch.
+///
+/// Measured: with `when op == 1 { addr }`, v1's randomize metadata
+/// carries `field addr u32 random=true` UNCONDITIONALLY and the guard
+/// `op == 1` appears nowhere in the emitted C++. It randomizes the
+/// conditional field on every draw whatever the discriminant says, and
+/// the program compiles and runs. In a struct it is worse: the
+/// conditional field is dropped from the C++ struct entirely, so the
+/// declaration silently loses it.
 #[test]
 fn record_when_subtype_is_unsupported() {
     let src = r#"
@@ -3937,8 +4083,19 @@ test WhenTest
 end test WhenTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("`when` subtype"), "names the construct: {msg}");
+    // The evidence for that verdict, asserted rather than described:
+    // the guard is gone and the conditional field is randomized anyway.
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    assert!(
+        !v1.contains("op == 1"),
+        "v1 drops the subtype guard entirely: {v1}"
+    );
+    assert!(
+        v1.contains("field addr u32 random=true"),
+        "…and randomizes the conditional field unconditionally"
+    );
 }
 
 /// Record locals cannot live in *pure* helpers (they emit as
