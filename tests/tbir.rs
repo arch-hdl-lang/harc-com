@@ -13937,15 +13937,12 @@ end impl T"#,
 }
 
 /// A record-typed field on a transactor reached through an `env` comes
-/// through the COMPONENT-field machinery, which has no record kind. It
-/// used to fall through to the DUT-handle arm and report "more than one
-/// DUT handle field (dut, cur)" — a diagnostic that names the wrong
-/// problem entirely. v1 emits a plain member here and it works, so the
-/// `--codegen v1` suggestion is honest; only the wording was wrong.
+/// through the component-field machinery. It is persistent by-value
+/// state, not a second DUT handle, and must remain usable from the
+/// transactor method body.
 #[test]
-fn an_env_held_transactor_record_field_names_the_real_problem() {
-    let err = lower_src(
-        r#"struct Beat
+fn an_env_held_transactor_record_field_lowers() {
+    let src = r#"struct Beat
     tag : uint<8> default 0
 end struct Beat
 
@@ -13972,17 +13969,15 @@ impl T for Tb
     run
         wait 2 cycles
     end run
-end impl T"#,
-    )
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
+end impl T"#;
+    let cpp = emit_cpp_src(src);
     assert!(
-        msg.contains("a record-typed field `Xt.cur` of type `Beat`"),
-        "{msg}"
+        cpp.contains("Beat cur{};"),
+        "record member is emitted:\n{cpp}"
     );
     assert!(
-        !msg.contains("DUT handle"),
-        "the old wording blamed the DUT handle: {msg}"
+        cpp.contains("self.cur.tag = 5;"),
+        "method write keeps the record receiver:\n{cpp}"
     );
 }
 
@@ -19371,6 +19366,263 @@ end impl T"#;
         assert_invalid(&err).contains("does not name a `hookable`"),
         "the diagnostic must distinguish a plain function from a hookable: {err}"
     );
+}
+
+/// A value-record field is persistent host-side transactor state, not evidence
+/// that an output-event analysis source owns a DUT handle.  The record must not
+/// divert this source away from composite-component lowering.
+#[test]
+fn analysis_source_with_record_state_lowers_and_emits() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+
+    when active
+        hookable publish(v: uint<8>)
+            current.value = v
+            emit observed(v)
+        end publish
+    end when
+end transactor RecordSource
+
+test RecordSourceTest
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish(7)
+        assert src.current.value == 7 else fail("record state lost")
+    end run
+end test RecordSourceTest
+"#;
+
+    let prog = lower_src(src).expect("record state must preserve analysis-source routing");
+    verify::verify_program(&prog).expect("record-state analysis source verifies");
+    tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("record-state analysis source emits");
+}
+
+/// Record state is a first-class value, not only a collection of independently
+/// addressable leaves. An analysis source can publish its current record on a
+/// record-payload event, as the legacy backend does.
+#[test]
+fn analysis_source_can_emit_whole_record_state() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<Sample>
+    current  : Sample
+    when active
+        hookable publish(v: uint<8>)
+            current.value = v
+            emit observed(current)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish(7)
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// A component-routed transactor's record state remains externally writable,
+/// matching an ordinary unbound transactor record field and the legacy backend.
+#[test]
+fn analysis_source_record_leaf_is_writable_from_test_scope() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+    when active
+        hookable publish()
+            emit observed(current.value)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.current.value = 3
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// The same external write must survive a structural component path; routing
+/// through an env cannot turn the record field into a sub-component receiver.
+#[test]
+fn nested_analysis_source_record_leaf_is_writable_from_test_scope() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+    when active
+        hookable publish()
+            emit observed(current.value)
+        end publish
+    end when
+end transactor RecordSource
+
+env Wrapper
+    src : RecordSource active
+end env Wrapper
+
+test T
+    let dut : Top
+    let env : Wrapper
+    run
+        env.src.current.value = 4
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// Signedness follows the terminal record leaf through a component field path.
+/// Otherwise `sint<8> >> 1` silently becomes a logical right shift in TBIR C++.
+#[test]
+fn component_record_signed_leaf_uses_arithmetic_right_shift() {
+    let src = r#"
+struct SignedSample
+    bias : sint<8> default 0
+end struct SignedSample
+
+transactor ShiftSource
+    observed : out event<sint<8>>
+    current  : SignedSample
+    shifted  : sint<8> default 0
+    when active
+        on 1 cycles
+            current.bias = -8
+            shifted = current.bias >> 1
+        end on
+    end when
+end transactor ShiftSource
+
+test T
+    let dut : Top
+    let src : ShiftSource active
+    run
+        wait 2 cycles
+        assert src.shifted == -4 else fail("signed shift")
+    end run
+end test T
+"#;
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.current.bias)) >> 1"),
+        "signed record leaf must get an arithmetic shift:\n{cpp}"
+    );
+}
+
+/// Non-periodic cycle-trigger bodies own the same self-relative component
+/// state as methods and periodic handlers. Signedness must therefore resolve
+/// through the cycle-handler function id as well.
+#[test]
+fn component_record_signed_leaf_in_cycle_trigger_uses_arithmetic_right_shift() {
+    let src = r#"
+struct SignedSample
+    bias : sint<8> default -8
+end struct SignedSample
+
+transactor ShiftSource
+    observed : out event<sint<8>>
+    current  : SignedSample
+    shifted  : sint<8> default 0
+    when active
+        on current.bias < 0
+            shifted = current.bias >> 1
+        end on
+    end when
+end transactor ShiftSource
+
+test T
+    let dut : Top
+    let src : ShiftSource active
+    run
+        wait 2 cycles
+        assert src.shifted == -4 else fail("signed shift lost")
+    end run
+end test T
+"#;
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.current.bias)) >> 1"),
+        "signed record leaf must get an arithmetic shift in a cycle handler:\n{cpp}"
+    );
+}
+
+/// A diagnostic must not recommend element-wise `Vec` access while indexed
+/// component-record members are themselves still outside the TBIR subset.
+#[test]
+fn component_record_vec_diagnostic_does_not_promise_an_unsupported_workaround() {
+    let whole = r#"
+struct Inner
+    bytes : Vec<uint<8>, 2>
+end struct Inner
+struct Outer
+    inner : Inner
+end struct Outer
+
+transactor VecSource
+    observed : out event<uint<8>>
+    current  : Outer
+    when active
+        hookable touch()
+            current.inner.bytes = current.inner.bytes
+        end touch
+    end when
+end transactor VecSource
+
+test T
+    let dut : Top
+    let src : VecSource active
+    run
+        src.touch()
+    end run
+end test T
+"#;
+    let indexed = whole.replace(
+        "current.inner.bytes = current.inner.bytes",
+        "current.inner.bytes[0] = 1",
+    );
+
+    let whole_err = lower_src(whole).expect_err("whole Vec state is outside this subset");
+    if let Err(indexed_err) = lower_src(&indexed) {
+        assert!(
+            !whole_err.to_string().contains("element-wise"),
+            "diagnostic recommends indexed access that also fails ({indexed_err}): {whole_err}"
+        );
+    }
 }
 
 /// Hook-triggered covergroups obey the same `hookable` provenance rule as

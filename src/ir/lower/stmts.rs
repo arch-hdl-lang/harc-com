@@ -1154,9 +1154,9 @@ impl FuncBuilder<'_> {
         // expression, so the local must carry signedness or `d >> 1` /
         // `d / 2` silently go unsigned (#524 adversarial-review finding
         // 6). A declared type still wins via the `.or` chain below.
-        let signed_scalar_ty = self
-            .expr_type(&e)
-            .filter(|t| matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64));
+        let signed_scalar_ty = self.expr_type(&e).filter(|t| {
+            matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64)
+        });
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
@@ -1365,17 +1365,11 @@ impl FuncBuilder<'_> {
         if self.lower_component_dut_bind(target, value)? {
             return Ok(());
         }
-        // Composite-component whole-value copy of a sub-component:
-        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
-        // field is a `Sub` component field; the RHS is a test-scope
-        // component value. Checked before the scalar-field write (whose
-        // resolver would reject the non-scalar `Sub` field).
-        if self.lower_component_sub_assign(target, value)? {
-            return Ok(());
-        }
-        // Composite-component scalar field write — self-relative inside a
-        // method body (`count = ...`) or a dotted path from a test-scope
-        // component local (`env.sb.errors = ...`).
+        // Composite-component scalar/record-leaf field write — self-relative
+        // inside a method body (`count = ...`) or a dotted path from a
+        // test-scope component local (`env.src.current.value = ...`). Record
+        // leaves must be claimed before whole-sub-component assignment:
+        // otherwise that resolver mistakes `current` for a `Sub` receiver.
         if let Some((base, field)) = self.as_component_field_target(target)? {
             let e = self.lower_expr_no_ports(value)?;
             self.push(Stmt::ComponentFieldWrite {
@@ -1383,6 +1377,13 @@ impl FuncBuilder<'_> {
                 field,
                 value: e,
             });
+            return Ok(());
+        }
+        // Composite-component whole-value copy of a sub-component:
+        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
+        // field is a `Sub` component field; the RHS is a test-scope
+        // component value.
+        if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
@@ -1631,7 +1632,8 @@ impl FuncBuilder<'_> {
                             &format!(
                                 "an element write of `Vec` record field `{}` with a \
                                  non-`{}` RHS",
-                                chain.dotted, self.ctx.records[elem_rid.index()].name
+                                chain.dotted,
+                                self.ctx.records[elem_rid.index()].name
                             ),
                             "assign a value of the element's record type, or set the \
                              element's fields individually",
@@ -1864,14 +1866,19 @@ impl FuncBuilder<'_> {
 
     /// Recognize a testbench-owned queue call after impl-form desugaring:
     /// `_tb.pending.push(x)` / `.pop()` / `.size()` / `.empty()`.
-    pub(crate) fn as_tb_queue_call(
-        &self,
-        callee: &crate::ast::Expr,
-    ) -> Option<(String, String)> {
-        let ExprKind::Field { target, name: method } = &*callee.kind else {
+    pub(crate) fn as_tb_queue_call(&self, callee: &crate::ast::Expr) -> Option<(String, String)> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target, name: field } = &*target.kind else {
+        let ExprKind::Field {
+            target,
+            name: field,
+        } = &*target.kind
+        else {
             return None;
         };
         let ExprKind::Ident(root) = &*target.kind else {
@@ -1882,10 +1889,7 @@ impl FuncBuilder<'_> {
             .then(|| (field.name.clone(), method.name.clone()))
     }
 
-    pub(crate) fn tb_queue_elem(
-        &self,
-        field: &str,
-    ) -> Result<crate::ir::QueueElem, LowerError> {
+    pub(crate) fn tb_queue_elem(&self, field: &str) -> Result<crate::ir::QueueElem, LowerError> {
         self.ctx.tb_queue_fields.get(field).cloned().ok_or_else(|| {
             unsupported(
                 &format!("an unknown testbench queue field `{field}`"),
@@ -3494,10 +3498,7 @@ impl FuncBuilder<'_> {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
             // context so the impure/tb-method inline emits its statements
             // into the current block ahead of the message.
-            let call = std::mem::replace(
-                e,
-                AstExpr::new(ExprKind::Bool(false), e.span),
-            );
+            let call = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
             let span = call.span;
             let lowered = self.lower_expr(&call)?;
             let ty = self.expr_type(&lowered).unwrap_or(IrType::Unknown);
@@ -3562,7 +3563,10 @@ impl FuncBuilder<'_> {
             // handshake, and binds the response into that local — the same
             // lowering as `let name = bind.method(...)`.
             let lowered = self.try_lower_bus_call(e, super::bus::BusCallDest::Declare(&name))?;
-            debug_assert!(lowered, "bus tlm_method call failed to lower after classification");
+            debug_assert!(
+                lowered,
+                "bus tlm_method call failed to lower after classification"
+            );
         } else {
             // Transactor method call edge with a result destination — the
             // same lowering as `let name = xact.method(...)`.

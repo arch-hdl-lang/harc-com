@@ -262,6 +262,9 @@ impl Display for TbProgram {
                     ComponentFieldKind::Scalar { default, .. } => {
                         format!("scalar = {default}")
                     }
+                    ComponentFieldKind::Record { record } => {
+                        format!("record {}", self.records[record.index()].name)
+                    }
                     ComponentFieldKind::Queue { elem } => {
                         use crate::ir::QueueElem;
                         let inner = match elem {

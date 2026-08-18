@@ -70,7 +70,11 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 /// path (its standalone testbench-field placement), and routes to the
 /// composite-component table ONLY when an env must hold it by value — see
 /// the trailing arm's comment.
-pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> bool {
+pub(crate) fn transactor_is_component(
+    t: &TransactorDecl,
+    env_held: bool,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
     let mut has_event = false;
     let mut has_in_event = false;
     let mut has_on_handler = false;
@@ -85,8 +89,14 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
                     if matches!(f.direction, Some(crate::ast::Direction::In)) {
                         has_in_event = true;
                     }
-                } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                    has_module_field = true;
+                } else if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    // Declared records are persistent host-side state, not
+                    // DUT handles. Only an otherwise-unclassified named type
+                    // is evidence that this transactor owns a module field.
+                    if !record_ids.contains_key(simple) {
+                        has_module_field = true;
+                    }
                 }
             }
             ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
@@ -166,7 +176,10 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
 /// an unbound transactor with an output event surface and no module/DUT
 /// handle. It is stored as a `ComponentSchema`, but its instance mode is
 /// still a source-language transactor property.
-pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
+pub(crate) fn transactor_is_analysis_source(
+    t: &TransactorDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
     if t.bound_to.is_some() {
         return false;
     }
@@ -176,8 +189,11 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
         if let ComponentItem::Field(f) = it {
             if is_event_field(f) {
                 has_event = true;
-            } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                has_named_field = true;
+            } else if let TypeExpr::Named { name, .. } = &f.ty {
+                let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                if !record_ids.contains_key(simple) {
+                    has_named_field = true;
+                }
             }
         }
     }
@@ -186,8 +202,11 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
 
 /// Whether an analysis-source transactor has behavior or storage whose
 /// availability depends on the instance mode.
-pub(crate) fn transactor_has_mode_sensitive_analysis_surface(t: &TransactorDecl) -> bool {
-    transactor_is_analysis_source(t)
+pub(crate) fn transactor_has_mode_sensitive_analysis_surface(
+    t: &TransactorDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
+    transactor_is_analysis_source(t, record_ids)
         && t.when_active
             .as_ref()
             .is_some_and(|items| !items.is_empty())
@@ -864,8 +883,8 @@ pub(crate) fn lower_component_schema(
 
     let instance_mode_policy = match src {
         CompSource::Transactor(t)
-            if transactor_is_analysis_source(t)
-                && !transactor_has_mode_sensitive_analysis_surface(t) =>
+            if transactor_is_analysis_source(t, record_ids)
+                && !transactor_has_mode_sensitive_analysis_surface(t, record_ids) =>
         {
             crate::ir::ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
         }
@@ -1316,19 +1335,17 @@ fn lower_field(
                     mode,
                 });
             }
-            // A record type held BY VALUE. The standalone-transactor
-            // path lowers this to `StateFieldKind::Record`, but a
-            // transactor reached through an `env` comes through the
-            // component-field machinery, which has no record kind — so
-            // it must not fall through to the DUT-handle arm below and
-            // report a second DUT handle, which is what it used to do.
-            // v1 emits a plain `Beat cur;` member here and it works.
-            if record_ids.contains_key(simple) {
-                return Err(unsupported(
-                    &format!("a record-typed field `{comp}.{fname}` of type `{simple}`"),
-                    "record state lowers on a standalone `transactor`; through an \
-                     `env` the component-field schema has no record kind yet",
-                ));
+            // A record type held by value is persistent host-side state,
+            // not a DUT handle. This is the component-routed counterpart
+            // of `StateFieldKind::Record` on a standalone transactor.
+            if let Some(record) = record_ids.get(simple) {
+                if f.default.is_some() {
+                    return Err(unsupported(
+                        &format!("a default value on record field `{comp}.{fname}`"),
+                        "record fields use their type-derived default initialization",
+                    ));
+                }
+                return Ok(ComponentFieldKind::Record { record: *record });
             }
             // On a transactor, an unknown named type is the module-typed
             // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
@@ -2150,7 +2167,8 @@ where
     let src_comp = &components[src_cid.index()];
     let (src_payload, src_activation) = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { payload }, activation,
+            kind: ComponentFieldKind::Event { payload },
+            activation,
             ..
         }) => (*payload, *activation),
         _ => {
@@ -2212,7 +2230,8 @@ where
             sm.activation,
         )
     } else if let Some(ComponentFieldSchema {
-        kind: ComponentFieldKind::Event { payload }, activation,
+        kind: ComponentFieldKind::Event { payload },
+        activation,
         ..
     }) = sink_comp.field(&sink_name)
     {
@@ -2532,7 +2551,12 @@ fn scalar_default(
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
     let Some(d) = default else { return Ok(0) };
-    fold_field_default(d, Some(ty), consts, &format!("component field `{comp}.{fname}`"))
+    fold_field_default(
+        d,
+        Some(ty),
+        consts,
+        &format!("component field `{comp}.{fname}`"),
+    )
 }
 
 /// Shared by the component, scoreboard and transactor-state field
@@ -2996,7 +3020,19 @@ impl super::FuncBuilder<'_> {
         if self.recv_is_scoreboard_sub(head_cid, &tail[..recv_tail_len]) {
             return Ok(false);
         }
-        let cid = self.resolve_component_recv(head_cid, &tail[..recv_tail_len])?;
+        // This is a speculative recognizer, so a non-`Sub` receiver segment
+        // means "not a DUT bind" rather than an error. In particular,
+        // `src.current.value = ...` traverses record state, not a component
+        // receiver; the record-field assignment resolver below must claim it.
+        let mut cid = head_cid;
+        for seg in &tail[..recv_tail_len] {
+            let comp = &self.ctx.components[cid.index()];
+            let Some(ComponentFieldKind::Sub { component, .. }) = comp.field(seg).map(|f| &f.kind)
+            else {
+                return Ok(false);
+            };
+            cid = *component;
+        }
         let comp = &self.ctx.components[cid.index()];
         if !matches!(
             comp.field(field).map(|f| &f.kind),
@@ -3027,10 +3063,117 @@ impl super::FuncBuilder<'_> {
         Ok(true)
     }
 
+    /// Resolve a subfield of a record-valued component field. The IR's
+    /// component member access stores the validated C++ member suffix as
+    /// one string (`current.value`); emission already renders it after the
+    /// resolved component base.
+    fn as_component_record_field(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+        let Some(path) = dotted_path(e) else {
+            return Ok(None);
+        };
+        let path = self.strip_tb_prefix(&path);
+        if path.len() < 2 {
+            return Ok(None);
+        }
+
+        let validate = |record: RecordId, sub: &[String]| -> Result<(), LowerError> {
+            let mut rid = record;
+            for (i, seg) in sub.iter().enumerate() {
+                let schema = &self.ctx.records[rid.index()];
+                let Some(field) = schema.field(seg) else {
+                    return Err(LowerError::Invalid(format!(
+                        "record `{}` has no field `{seg}`",
+                        schema.name
+                    )));
+                };
+                if i + 1 < sub.len() {
+                    match field.ty {
+                        IrType::Record(next) if field.vec_len.is_none() => rid = next,
+                        _ => {
+                            return Err(unsupported(
+                                &format!(
+                                    "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                                    schema.name,
+                                    sub[i + 1]
+                                ),
+                                "only nested struct/transaction fields can be traversed further",
+                            ));
+                        }
+                    }
+                } else if field.vec_len.is_some() {
+                    return Err(unsupported(
+                        &format!("a whole-`Vec` component record field `{}`", path.join(".")),
+                        "indexed component-record `Vec` access is not lowered by TB-IR yet",
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        // Method-body form: `current.value`, where `current` is a field
+        // on the implicit `self` component.
+        if self.lookup(&path[0]).is_none() {
+            if let Some(cid) = self.self_component {
+                let comp = &self.ctx.components[cid.index()];
+                if let Some(schema) = comp.field(&path[0]) {
+                    if let ComponentFieldKind::Record { record } = schema.kind {
+                        self.require_self_activation(schema.activation, "field", &path[0])?;
+                        validate(record, &path[1..])?;
+                        return Ok(Some((ComponentBase::SelfField, path.join("."))));
+                    }
+                }
+            }
+        }
+
+        // Test/nested-component form: `env.source.current.value`. Walk
+        // through zero or more `Sub` fields until the record field is
+        // reached, then validate the remainder against its record schema.
+        let Some((head_cid, mut base, tail)) = self.component_path_head(&path) else {
+            return Ok(None);
+        };
+        for recv_len in 0..tail.len() {
+            let Ok(cid) = self.resolve_component_recv(head_cid, &tail[..recv_len]) else {
+                break;
+            };
+            let comp = &self.ctx.components[cid.index()];
+            let Some(schema) = comp.field(&tail[recv_len]) else {
+                continue;
+            };
+            let ComponentFieldKind::Record { record } = schema.kind else {
+                continue;
+            };
+            let sub = &tail[recv_len + 1..];
+            if sub.is_empty() {
+                return Ok(None);
+            }
+            self.require_component_activation(
+                &base[0],
+                head_cid,
+                &tail[..recv_len],
+                schema.activation,
+                "field",
+                &tail[recv_len],
+            )?;
+            validate(record, sub)?;
+            base.extend_from_slice(&tail[..recv_len]);
+            return Ok(Some((
+                ComponentBase::Path(base),
+                tail[recv_len..].join("."),
+            )));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn as_component_field_target(
         &self,
         target: &AstExpr,
     ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+        if let Some(record_field) = self.as_component_record_field(target)? {
+            return Ok(Some(record_field));
+        }
         // Self-relative bare field (only inside a method body, and only
         // when the name is NOT a shadowing local).
         if let ExprKind::Ident(id) = &*target.kind {
@@ -3078,6 +3221,12 @@ impl super::FuncBuilder<'_> {
                             base.extend_from_slice(recv_tail);
                             return Ok(Some((ComponentBase::Path(base), field)));
                         }
+                        // A whole sub-component copy is resolved after field
+                        // writes. Decline here so `checker.sb = sb` reaches
+                        // that dedicated, type-checking resolver.
+                        Some(schema) if matches!(schema.kind, ComponentFieldKind::Sub { .. }) => {
+                            return Ok(None);
+                        }
                         _ => {
                             return Err(unsupported(
                                 &format!(
@@ -3094,18 +3243,25 @@ impl super::FuncBuilder<'_> {
         Ok(None)
     }
 
-    /// Resolve a component scalar-field READ as an `Expr::ComponentField`:
-    /// bare `count` (self) or path `env.sb.count`.
+    /// Resolve a component scalar or whole-record field READ as an
+    /// `Expr::ComponentField`: bare `count` / `current` (self), or paths
+    /// `env.sb.count` / `env.source.current`.
     pub(crate) fn as_component_field_read(
         &self,
         e: &AstExpr,
     ) -> Result<Option<IrExpr>, LowerError> {
+        if let Some((base, field)) = self.as_component_record_field(e)? {
+            return Ok(Some(IrExpr::ComponentField { base, field }));
+        }
         if let ExprKind::Ident(id) = &*e.kind {
             if self.lookup(&id.name).is_none() {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(field) = comp.field(&id.name) {
-                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                        if matches!(
+                            field.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some(IrExpr::ComponentField {
                                 base: ComponentBase::SelfField,
@@ -3131,7 +3287,10 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(schema) = comp.field(&field) {
-                        if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) {
+                        if matches!(
+                            schema.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_component_activation(
                                 &base_head[0],
                                 head_cid,
@@ -3273,18 +3432,14 @@ impl super::FuncBuilder<'_> {
                 "transactor `{head_name}` has no effective active/passive mode"
             )));
         }
-        let resolved = crate::ir::resolve_component_path_mode(
-            &self.ctx.components,
-            head,
-            inherited,
-            segs,
-        )
-        .map_err(|err| match err {
-            crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
-                unsupported(&err.to_string(), "")
-            }
-            _ => LowerError::Invalid(err.to_string()),
-        })?;
+        let resolved =
+            crate::ir::resolve_component_path_mode(&self.ctx.components, head, inherited, segs)
+                .map_err(|err| match err {
+                    crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
+                        unsupported(&err.to_string(), "")
+                    }
+                    _ => LowerError::Invalid(err.to_string()),
+                })?;
         let target = &self.ctx.components[resolved.component.index()];
         if matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
             && target.requires_instance_mode()
@@ -3298,12 +3453,11 @@ impl super::FuncBuilder<'_> {
                 "transactor path `{path}` has no effective active/passive mode"
             )));
         }
-        Ok(matches!(
-            target.kind,
-            crate::ir::ComponentKindTag::Transactor
+        Ok(
+            matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
+                .then_some(resolved.effective_mode)
+                .flatten(),
         )
-        .then_some(resolved.effective_mode)
-        .flatten())
     }
 
     fn require_component_activation(
