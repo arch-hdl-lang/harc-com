@@ -113,3 +113,5 @@ pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
           git add -A
           git commit -m "refactor(tbir): collapse component lowering cleanup"
           git push origin HEAD:main
+
+# Existing-on-main trigger for the one-shot cleanup above.
