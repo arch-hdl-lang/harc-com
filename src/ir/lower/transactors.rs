@@ -647,12 +647,22 @@ fn lower_bound_target_transactor(
                 //   * `on read_count cycles` for a transactor state
                 //     field — the instance is declared three lines
                 //     earlier, fine.
-                //   * `on limit cycles` for an impl-scope `let` —
-                //     emitted ~64 lines LATER. g++: "'limit' was not
-                //     declared in this scope". `<N>` is any integer
-                //     expression per spec §7.10, and the name resolver
-                //     does not visit a bound-to transactor's `on`
-                //     trigger, so this reaches here and type-checks.
+                //   * `on limit cycles` for a `let` declared AFTER the
+                //     transactor's own binding — emitted ~64 lines
+                //     LATER. g++: "'limit' was not declared in this
+                //     scope". `<N>` is any integer expression per spec
+                //     §7.10, and the name resolver does not visit a
+                //     bound-to transactor's `on` trigger, so this
+                //     reaches here and type-checks.
+                //   * the SAME `let` moved one line ABOVE that binding
+                //     — emitted three lines before the registration,
+                //     so it compiles and runs at the right rate (built
+                //     and run: 4 firings in 21 cycles at period 5).
+                //     The discriminator is the `let`'s position
+                //     relative to the binding, not "an impl-scope
+                //     `let`" as a category, and the detail below says
+                //     so; a first version asserted the whole category
+                //     and was false for this row.
                 //   * `on limit cycles` again, with a file-scope
                 //     `const limit` ALSO in the program — the worst
                 //     one, and why this arm is not merely
@@ -682,9 +692,10 @@ fn lower_bound_target_transactor(
                 return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` periodic `on <N> cycles` handlers"),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those either fails \
-                     to compile or silently picks up a same-named file-scope `const` and runs \
-                     at the wrong rate; a non-periodic `on` never reaches this path",
+                     transactor's own binding, so a period naming a `let` declared AFTER \
+                     that binding either fails to compile or silently picks up a same-named \
+                     file-scope `const` and runs at the wrong rate; a non-periodic `on` \
+                     never reaches this path",
                     V1Status::SilentlyMisLowers,
                 ));
             }
@@ -1127,9 +1138,10 @@ fn lower_bound_initiator_transactor(
                          `on <N> cycles` handlers"
                     ),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those either fails \
-                     to compile or silently picks up a same-named file-scope `const` and runs \
-                     at the wrong rate; a non-periodic `on` never reaches this path",
+                     transactor's own binding, so a period naming a `let` declared AFTER \
+                     that binding either fails to compile or silently picks up a same-named \
+                     file-scope `const` and runs at the wrong rate; a non-periodic `on` \
+                     never reaches this path",
                     V1Status::SilentlyMisLowers,
                 ));
             }
@@ -1221,9 +1233,10 @@ fn lower_bound_initiator_transactor(
                          `on <N> cycles` handlers"
                     ),
                     "v1 emits a cycle-stamped checker closure, but registers it ahead of the \
-                     test's own `let` bindings, so a period naming one of those either fails \
-                     to compile or silently picks up a same-named file-scope `const` and runs \
-                     at the wrong rate; a non-periodic `on` never reaches this path",
+                     transactor's own binding, so a period naming a `let` declared AFTER \
+                     that binding either fails to compile or silently picks up a same-named \
+                     file-scope `const` and runs at the wrong rate; a non-periodic `on` \
+                     never reaches this path",
                     V1Status::SilentlyMisLowers,
                 ));
             }

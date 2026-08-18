@@ -19030,10 +19030,17 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
 /// monitor and cycle-trigger routes to the composite table, and `on <N>
 /// cycles` is the sole shape that falls through to these arms.
 ///
-/// This pins both halves: the three positions that DO arrive, and two
-/// non-periodic shapes that provably do not. The verdict stays
-/// `Unsupported` because v1 really does implement it — measured below
-/// rather than assumed.
+/// This pins both halves: the three positions that DO arrive, and a
+/// non-periodic shape per position that provably does not.
+///
+/// The verdict is `SilentlyMisLowers`, and it took three tries to get
+/// there — `Unsupported` from the old code, then `EmitsUncompilable`
+/// once a period naming a late `let` turned out not to compile, then
+/// this once a file-scope `const` of the same name turned out to make
+/// it compile and run at the wrong rate. Divergence 71 has the six
+/// measured rows. What the test pins is the two that bound the
+/// verdict: the literal period, which works, and the shadowed one,
+/// which sets the status.
 #[test]
 fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     let base = fixture("tlm_target_thread_if_test.harc");
@@ -19122,11 +19129,38 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
             .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
         assert!(
             declared > used,
-            "{what}: the `let` must be emitted AFTER the use, or the C++ compiles"
+            "{what}: the `let` must be emitted AFTER the use — this is a byte-offset \
+             proxy for 'does not compile', and it is only that: the row below is the \
+             same ordering with a `const` added, and it compiles"
         );
 
-        // And the row that SETS the status, which is worse than that
-        // one: add a file-scope `const` of the same name. Now the
+        // The mirror-image row, and the reason the detail names a
+        // POSITION rather than a category: move the same `let` above
+        // the transactor's own binding and v1 emits it three lines
+        // BEFORE the registration, so the output compiles and the
+        // handler runs at the right rate. `--codegen v1` is a genuine
+        // escape hatch for that program, and a detail claiming "the
+        // test's own `let` bindings" would be lying about it.
+        let early = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
+            "    let mem : TlmMemBus = bind dut",
+            "    let limit = 5\n    let mem : TlmMemBus = bind dut",
+            1,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&early))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the early `let`: {e}"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let declared = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            declared < used,
+            "{what}: a `let` above the binding must be emitted BEFORE the use"
+        );
+
+        // And the row that SETS the status, which is worse than either
+        // of those: add a file-scope `const` of the same name. Now the
         // closure resolves — to the `constexpr` at namespace scope —
         // so v1's output compiles and the handler runs at 7 where the
         // program says 5. Built and run outside the suite: twice in 21
@@ -19170,20 +19204,33 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     // positive rows above with only the TRIGGER changed, so what moves
     // it is the gate and nothing else.
     let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
-    for (what, src) in [
+    // `lowers` says which branch the row is expected to take. Without
+    // it a row could silently switch branches — if the target row's
+    // `thread`-through-the-component-path arm were later implemented it
+    // would start lowering, take the `Ok` branch, and quietly stop
+    // asserting anything about where it went.
+    for (what, lowers, src) in [
         (
             "target",
+            false,
             base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
         ),
-        ("initiator items", active(initiator(non_periodic))),
+        ("initiator items", true, active(initiator(non_periodic))),
         (
             "initiator when active",
+            true,
             active(initiator(&format!(
                 "    when active\n{non_periodic}    end when\n"
             ))),
         ),
     ] {
-        match lower_src(&src) {
+        let got = lower_src(&src);
+        assert_eq!(
+            got.is_ok(),
+            lowers,
+            "{what}: expected lowers={lowers}, got the other branch"
+        );
+        match got {
             // The two initiator rows go further than "not here": the
             // composite table LOWERS them, and the trigger lands as a
             // cycle handler on the component. That is the positive
@@ -19384,9 +19431,16 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
             if arity == "under" {
                 assert!(v1.contains(") _s();"), "{what}: v1 emits a no-arg call");
             } else {
-                assert!(
-                    !v1.contains(", 2);"),
-                    "{what}: v1 must drop the extra payload silently"
+                // The POSITIVE fact, not just the absence of the second
+                // payload: v1 emits the one-argument call, so the whole
+                // file is the control's. `!contains(", 2);")` alone
+                // would also pass if v1 dropped the `emit` statement
+                // entirely, or refused — and "silently drops the extra
+                // payload" is the cell the `Invalid` verdict rests on.
+                assert_eq!(
+                    v1,
+                    cpp_tb::emit(&merged_src(&base)).expect("v1 emits the control"),
+                    "{what}: v1's over-supply output must equal the control's"
                 );
             }
         }

@@ -4757,7 +4757,8 @@ case and only locally-determinable `Assign` types are compared).
     | `5`, `2 + 3` | `(int64_t)(5)`, `(int64_t)(2 + 3)` | yes |
     | `NPER`, a file-scope `const` | `(int64_t)(NPER)`, declared at namespace scope ~80 lines earlier | yes |
     | `read_count`, a state field | `(int64_t)(target.read_count)`, instance declared 3 lines earlier | yes |
-    | `limit`, an impl-scope `let` | `(int64_t)(limit)`, declared **64 lines later** | **no** |
+    | `limit`, a `let` declared AFTER the transactor's binding | `(int64_t)(limit)`, declared **64 lines later** | **no** |
+    | the same `let`, moved one line ABOVE that binding | same, declared 3 lines earlier | yes, and correct |
     | `limit`, with a file-scope `const limit = 7` as well | same, and it RESOLVES — to the const | yes, **and runs at the wrong rate** |
 
     The fourth row is compiler-measured, not read off the text: g++ on
@@ -4766,7 +4767,17 @@ case and only locally-determinable `Assign` types are compared).
     bound-to transactor's `on` trigger at all — `on some_undefined_name
     cycles` also passes `harc check`.
 
-    The fifth is the one that sets the status, and it was BUILT AND
+    The fifth row is that same program with the `let` moved one line
+    up, above the transactor's binding, and it compiles and runs
+    correctly (built and run: 4 firings in 21 cycles at period 5). So
+    `--codegen v1` is a real escape hatch there, and the discriminator
+    is the `let`'s POSITION relative to the binding — not "an
+    impl-scope `let`" as a category, which is what the first version of
+    this entry and the user-facing detail both asserted. An arm whose
+    input space is an expression does not get to be described by the
+    category of one probe.
+
+    The sixth is the one that sets the status, and it was BUILT AND
     RUN, not just compiled: with `const limit = 7` at file scope and
     `let limit = 5` in the impl, the closure resolves to the
     `constexpr` at namespace scope while the rest of the run body sees
@@ -4783,11 +4794,13 @@ case and only locally-determinable `Assign` types are compared).
     case pays for that by losing a suggestion it would have deserved.
 
     A first pass at this entry stopped at the fourth row and labelled
-    the arms `EmitsUncompilable`. The fifth row was found by asking the
+    the arms `EmitsUncompilable`. The sixth row was found by asking the
     next question rather than the obvious one — not "does it compile?"
     but "is there a program where it compiles and is still wrong?" —
     and every arm whose input space is an EXPRESSION has that question
-    waiting in it.
+    waiting in it. The fifth row came from the mirror-image question,
+    "is there a program where the category I just named is fine?", and
+    the answer was yes.
 
     One row needed care in the other direction. A `when active`
     periodic handler on a `passive` instance produces v1 output
@@ -4893,7 +4906,9 @@ case and only locally-determinable `Assign` types are compared).
     wrong is a legal spelling where the arity is NOT one. Two candidates
     exist and both pass `harc check`: a bare `in_ev : event` with no
     type argument, and `in_ev : event<uint<8>, uint<8>>` with two. So
-    the rule was checked against v1 rather than read off spec §17.2,
+    the rule was checked against v1 rather than read off the spec's
+    `type event<T>` (§3.4 / §7.3; §17.2 is the PSS flow-object section
+    and defines no emit arity),
     and it holds for a reason stronger than the spec:
 
       * bare `event` — v1 emits the channel as
