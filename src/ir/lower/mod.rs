@@ -213,14 +213,14 @@ impl SideTables {
 #[derive(Clone, Copy)]
 pub(crate) struct ConstVal {
     pub(crate) bits: u64,
-    signed: bool,
+    pub(crate) signed: bool,
 }
 
 impl ConstVal {
     fn as_i64(self) -> i64 {
         self.bits as i64
     }
-    fn is_negative(self) -> bool {
+    pub(crate) fn is_negative(self) -> bool {
         self.signed && (self.bits as i64) < 0
     }
 }
@@ -662,14 +662,16 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// diagnostics entirely: a `randomize ... with NoSuchRelation(r)`
 /// lowered clean under TB-IR while v1 refused it outright.
 ///
-/// Only the RELATION errors surface. Three of them are program errors
+/// Only the RELATION errors surface. Four of them are program errors
 /// under any backend: a relation that does not exist, one called with
-/// the wrong arity, and one that expands into itself. Measured against
-/// v1: it rejects all three with "constraint function call not
+/// the wrong arity, one that expands into itself, and one whose
+/// expansion is finite but past the shared size limit. Measured against
+/// v1: it rejects all four with "constraint function call not
 /// supported in v0 solver path", so none is an escape hatch and
 /// `Invalid` is the honest verdict. The third used to take the process
 /// down with a stack overflow instead; divergence 62 replaced that with
-/// the same diagnostic as the other two.
+/// the same diagnostic as the other two, and divergence 72 gave the
+/// fourth its limit.
 ///
 /// The other variants stay discarded ON PURPOSE. They are capability
 /// gaps in the constraint IR, not bad programs:
@@ -701,7 +703,21 @@ fn surface_constraint_lower_error(
             CErr::RecursiveRelation { name, .. } => {
                 format!("`{name}` expands into itself, so the constraint has no finite form")
             }
-            // NOT `Invalid`, unlike its three siblings. v1 ACCEPTS a
+            // `Invalid` like its three siblings, and for the same
+            // reason: v1's expander charges the SAME budget out of the
+            // same constant, so it stops on the same programs and
+            // leaves the call unexpanded, and its translator then
+            // refuses it with "constraint function call not supported
+            // in v0 solver path". Neither backend runs this, so naming
+            // one as the way out would be false.
+            CErr::RelationExpansionTooLarge { name, .. } => {
+                format!(
+                    "expanding `{name}` exceeds the relation-expansion limit; the form \
+                     is finite but astronomical — a chain of relations each calling the \
+                     previous one more than once doubles at every level"
+                )
+            }
+            // NOT `Invalid`, unlike its four siblings. v1 ACCEPTS a
             // misplaced name — it emits working C++ with the arguments
             // silently swapped — so "a program error under every
             // backend" is literally false here. This is the sweep's
@@ -755,6 +771,61 @@ fn surface_constraint_lower_error(
         )));
     }
     None
+}
+
+/// The bare identifier on the right of `= bind <name>`, for the five
+/// bindings that all require one: a regblock, an addrmap, an
+/// initiator-BFM instance, a bound-to event-driven transactor instance,
+/// and a target-TLM responder.
+///
+/// It was five copies of the same four-line match with five different
+/// messages, and all five said "re-run with `--codegen v1`". v1 REJECTS
+/// a non-identifier RHS itself, with its own diagnostic — measured on
+/// `bind helper.x`, `bind helper()`, `bind (helper)` and `bind 5` at
+/// each of the five landings:
+///
+///   "let regs : DmaRegs = bind <expr>: regblock binding RHS must be a
+///    helper transactor identifier"
+///   "let helper : AxilHelper = bind <expr>: rhs must be a bare
+///    bus-binding name in v0"
+///
+/// So none of them is an escape hatch; the suggestion sent the user to
+/// an identical refusal.
+/// Every `regblock` and `addrmap` DECLARATION name in the file. A `let`
+/// whose declared type names one of these is an INSTANTIATION and
+/// requires `= bind <helper>` — see the guard in `stmts::lower_let`.
+///
+/// Every `LowerCtx` gets this, not just the test one: the hole it closes
+/// is reachable from a hookable method body and a `tseq` body too, and
+/// leaving those contexts with an empty set is what left it half open.
+fn regblock_instance_names(
+    regblock_ids: &HashMap<String, RegblockId>,
+    addrmap_decls: &HashMap<String, &AddrmapDecl>,
+) -> HashSet<String> {
+    regblock_ids
+        .keys()
+        .chain(addrmap_decls.keys())
+        .cloned()
+        .collect()
+}
+
+fn bind_rhs_ident(
+    value: Option<&crate::ast::Expr>,
+    what: &str,
+    // The COMPLETE phrase, backticks included — "`= bind <helper>` (a
+    // transactor instance)". Passing a fragment to be wrapped by the
+    // template is how the first version rendered an unbalanced
+    // backtick at two of the five call sites.
+    expected: &str,
+) -> Result<String, LowerError> {
+    match value.map(|v| &*v.kind) {
+        Some(ExprKind::Ident(id)) => Ok(id.name.clone()),
+        _ => Err(not_implemented(
+            what,
+            format!("only {expected} is lowered, and v1 rejects the rest too"),
+            V1Status::Rejects,
+        )),
+    }
 }
 
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
@@ -998,7 +1069,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for it in &file.items {
         if let Item::Covergroup(g) = it {
             let schema =
-                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &consts)?;
+                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &const_vals)?;
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }
@@ -1045,7 +1116,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
     for it in record_order {
         let schema = match it {
-            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?,
+            Item::Transaction(t) => {
+                records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?
+            }
             Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids, &const_vals)?,
             _ => unreachable!("record_order holds only transactions and structs"),
         };
@@ -1062,6 +1135,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // The regblock name doubles as the mirror record's name, so a
     // `let regs : R` resolves `R` to the synthetic record via
     // `record_ids` exactly like a transaction local.
+    // `record_ids` restricted to transactions and structs — exactly
+    // `Emitter::is_record_type`. Taken before the regblock loop below
+    // adds every regblock's mirror record to `record_ids`.
+    let declared_record_names: std::collections::HashSet<String> =
+        record_ids.keys().cloned().collect();
     let mut regblock_ids: HashMap<String, RegblockId> = HashMap::new();
     let mut regblock_schemas: Vec<ir::RegblockSchema> = Vec::new();
     for it in &file.items {
@@ -1074,6 +1152,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             let rec_id = RecordId(record_schemas.len() as u32);
             let (rec, schema) = regblock::lower_regblock(r, rec_id, &const_vals)?;
+            // A regblock's MIRROR record joins `record_ids` here, which
+            // makes that map a superset of `Emitter::is_record_type`
+            // (transactions ∪ structs) from this point on. Anything
+            // asking "is this a declared record?" the way v1 asks it —
+            // `record_leaf_fate`'s `is_record` — must use
+            // `declared_record_names`, captured above, or it answers yes
+            // for a regblock and calls a flattened `int64_t l;` a
+            // faithful member.
             record_ids.insert(name.clone(), rec_id);
             record_schemas.push(rec);
             regblock_ids.insert(name.clone(), RegblockId(regblock_schemas.len() as u32));
@@ -1105,6 +1191,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
         }
     }
+
+    // Every `regblock` and `addrmap` DECLARATION name. A `let` whose
+    // declared type names one of these is an INSTANTIATION and requires
+    // `= bind <helper>`; see the guard in `stmts::lower_let`. Built once
+    // and handed to EVERY `LowerCtx`, because the hole it closes is
+    // reachable from a hookable method and a `tseq` body, not just from
+    // test scope.
+    let regblock_instance_names = regblock_instance_names(&regblock_ids, &addrmap_decls);
 
     // `tseq` (transaction-sequence) declarations: name → element record
     // type. Validated up front (the element type must be a declared
@@ -1164,7 +1258,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // A pure analysis-source transactor (event port + no DUT
             // field) routes to the composite-component table instead of
             // the DUT-poking `TransactorSchema` (classified below).
-            if components::transactor_is_component(t, env_held(t)) {
+            if components::transactor_is_component(t, env_held(t), &record_ids) {
                 continue;
             }
             if transactor_ids
@@ -1194,7 +1288,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema = scoreboards::lower_scoreboard(c, &record_ids, &const_vals)?;
+            let schema =
+                scoreboards::lower_scoreboard(c, &record_ids, &declared_record_names, &const_vals)?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1224,7 +1319,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 Some(c.name.name.clone())
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -1246,7 +1343,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .filter_map(|it| match it {
             Item::Transactor(t)
-                if components::transactor_has_mode_sensitive_analysis_surface(t) =>
+                if components::transactor_has_mode_sensitive_analysis_surface(t, &record_ids) =>
             {
                 Some(t.name.name.clone())
             }
@@ -1263,8 +1360,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .iter()
         .filter_map(|it| match it {
             Item::Transactor(t)
-                if components::transactor_is_analysis_source(t)
-                    && !components::transactor_has_mode_sensitive_analysis_surface(t) =>
+                if components::transactor_is_analysis_source(t, &record_ids)
+                    && !components::transactor_has_mode_sensitive_analysis_surface(
+                        t,
+                        &record_ids,
+                    ) =>
             {
                 Some(t.name.name.clone())
             }
@@ -1297,7 +1397,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             _ => None,
@@ -1641,6 +1743,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1708,6 +1811,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1738,7 +1842,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
-        if components::transactor_is_component(t, env_held(t)) {
+        if components::transactor_is_component(t, env_held(t), &record_ids) {
             continue;
         }
         let id = TransactorId(prog.transactors.len() as u32);
@@ -1775,7 +1879,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 (&c.name.name, components::CompSource::Scoreboard(c))
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 (&t.name.name, components::CompSource::Transactor(t))
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -1856,6 +1962,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &mut next_fn,
             &const_vals,
             &declared_types,
+            &declared_record_names,
         )?;
         prog.components.push(schema);
     }
@@ -1907,6 +2014,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -2267,22 +2375,31 @@ fn validate_testbench_component(
                     if covgroup_ids.contains_key(simple) {
                         continue;
                     }
-                    // Ahead of the analysis-source gates: a consumer whose
-                    // `on` handler is active-only has no subscriber on any
-                    // other mode, and those gates would accept `passive`.
-                    if active_only_consumer_names.contains(simple) {
-                        if !matches!(mode, Some(TransactorMode::Active)) {
+                    // Ahead of the analysis-source gates, and ONLY for the
+                    // types they would otherwise claim: an analysis source
+                    // that is also an active-only consumer. Those gates
+                    // accept `passive`, which leaves such an instance with
+                    // no subscriber on its `in event`.
+                    //
+                    // Narrow on both axes deliberately. A consumer that is
+                    // NOT an analysis source (it holds a DUT handle, say)
+                    // already falls to the event-driven gate below, whose
+                    // wording #612 tuned against v1's own behaviour, and
+                    // preempting it here would replace that with this
+                    // arm's. And only `passive` is claimed: a mode-LESS
+                    // field is a program error that v1 refuses too, so it
+                    // belongs to the gate that says so, not to this one.
+                    if active_only_consumer_names.contains(simple)
+                        && (mode_sensitive_analysis_source_names.contains(simple)
+                            || always_on_analysis_source_names.contains(simple))
+                    {
+                        if matches!(mode, Some(TransactorMode::Passive)) {
                             return Err(unsupported(
                                 &format!(
-                                    "an event-driven transactor field `{}.{} : {simple}` whose \
-                                     `on` handler is declared inside `when active`, bound \
-                                     {}",
-                                    c.name.name,
-                                    f.name.name,
-                                    match mode {
-                                        Some(TransactorMode::Passive) => "`passive`",
-                                        _ => "without a mode",
-                                    }
+                                    "a passive event-driven transactor field `{}.{} : \
+                                     {simple} passive` whose `on` handler is declared inside \
+                                     `when active`",
+                                    c.name.name, f.name.name
                                 ),
                                 "the handler registers only on an `active` instance, so an \
                                  `emit` into this instance's `in event` reaches no subscriber",
@@ -2351,25 +2468,61 @@ fn validate_testbench_component(
                         match mode {
                             Some(TransactorMode::Active) => continue,
                             Some(TransactorMode::Passive) => {
+                                // `Unsupported` is right — v1 runs both
+                                // shapes of this and runs them
+                                // correctly — but the detail took one
+                                // of them for the whole construct.
+                                //
+                                //   * handler inside `when active` —
+                                //     v1 omits the registration on a
+                                //     passive instance, which is the
+                                //     language's own rule.
+                                //   * handler in the ALWAYS-ON body —
+                                //     v1 registers it, and its output
+                                //     is byte-identical to the `active`
+                                //     program. The handler fires.
+                                //
+                                // So "only registers on an `active`
+                                // instance" was false for the second,
+                                // and it is the sentence the reader
+                                // acts on. What is actually true of
+                                // both is narrower: TB-IR does not
+                                // lower a passive instance of this
+                                // shape at all.
                                 return Err(unsupported(
                                     &format!(
                                         "a passive event-driven transactor field `{}.{} : \
                                          {simple} passive`",
                                         c.name.name, f.name.name
                                     ),
-                                    "the consumer's `on` handler only registers on an \
-                                     `active` instance",
+                                    "TB-IR lowers the consumer only as an `active` \
+                                     instance; v1 runs a passive one, registering an \
+                                     always-on `on` handler and omitting a `when \
+                                     active`-scoped one",
                                 ));
                             }
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "an event-driven transactor field `{}.{} : {simple}` \
-                                         without an `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "annotate the instance `active`",
-                                ));
+                                // MEASURED: v1 refuses this too, with
+                                // "transactor field `_tb.drv :
+                                // CounterDrv` has no mode and ...", so
+                                // the old `Unsupported` sent the user to
+                                // a second error. A missing annotation
+                                // is a program error under both
+                                // backends.
+                                //
+                                // The `Passive` arm above is NOT the
+                                // same and stays `Unsupported`: v1 emits
+                                // that program and honours it correctly,
+                                // dropping the `when active` handler
+                                // registration exactly as the language
+                                // says. It is a legal program TB-IR does
+                                // not lower, which is what `Unsupported`
+                                // is for.
+                                return Err(LowerError::Invalid(format!(
+                                    "event-driven transactor field `{}.{} : {simple}` needs \
+                                     an `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
@@ -2398,14 +2551,28 @@ fn validate_testbench_component(
                                 ));
                             }
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "a DUT-poking transactor field `{}.{} : {simple}` \
-                                         without an `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "annotate the instance `active`",
-                                ));
+                                // MEASURED, after a previous batch left
+                                // this arm alone saying its shape had
+                                // "no probe built for it". The probe is
+                                // ten lines: a `when active` hookable
+                                // transactor with a `dut` field, held by
+                                // an `env` (which is what puts it in
+                                // `dut_poking_bfm_names`), plus a
+                                // mode-less testbench field of the same
+                                // type. v1 refuses it with "transactor
+                                // field `_tb.p : Poker` has no mode and
+                                // no parent specifies one" — the exact
+                                // error that made its two siblings
+                                // above `Invalid`.
+                                //
+                                // "Not probed" is a reason to go and
+                                // probe, not a reason to leave a false
+                                // suggestion in place.
+                                return Err(LowerError::Invalid(format!(
+                                    "DUT-poking transactor field `{}.{} : {simple}` needs \
+                                     an `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
@@ -2468,14 +2635,18 @@ fn validate_testbench_component(
                                 continue
                             }
                             None => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "transactor field `{}.{} : {simple}` without an \
-                                         `active`/`passive` mode",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "",
-                                ));
+                                // MEASURED, same as the event-driven
+                                // arm above: v1 refuses too, with
+                                // "transactor field `_tb.p : Poker` has
+                                // no mode and ...". The comment above
+                                // already says the mode rules "mirror
+                                // v1" — including this one, so pointing
+                                // at v1 was never going to help.
+                                return Err(LowerError::Invalid(format!(
+                                    "transactor field `{}.{} : {simple}` needs an \
+                                     `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
                             }
                         }
                     }
@@ -2906,18 +3077,14 @@ fn lower_test(
                 let rbid = regblock_ids[rb_name];
                 // RHS must be a bare helper-instance identifier (the
                 // transactor field the frontdoor routes through).
-                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "regblock binding `{}` to a non-identifier helper",
-                                l.name.name
-                            ),
-                            "only `= bind <helper>` (a transactor instance) is lowered",
-                        ));
-                    }
-                };
+                let helper_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "regblock binding `{}` to a non-identifier helper",
+                        l.name.name
+                    ),
+                    "`= bind <helper>` (a transactor instance)",
+                )?;
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
             }
             // Addrmap binding: `let chip : Soc = bind <helper>`.
@@ -2943,18 +3110,14 @@ fn lower_test(
                 }
                 let amap_name = type_simple_name(l.ty.as_ref()).unwrap().to_string();
                 // RHS must be a bare helper-instance identifier.
-                let helper_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "addrmap binding `{}` to a non-identifier helper",
-                                l.name.name
-                            ),
-                            "only `= bind <helper>` (a transactor instance) is lowered",
-                        ));
-                    }
-                };
+                let helper_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "addrmap binding `{}` to a non-identifier helper",
+                        l.name.name
+                    ),
+                    "`= bind <helper>` (a transactor instance)",
+                )?;
                 addrmap_binds.push((l.name.name.clone(), amap_name, helper_field));
             }
             // Bound-to initiator-side BFM: `let helper : AxilHelper
@@ -2997,35 +3160,61 @@ fn lower_test(
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
                 // The BFM host must be `active` — its methods are
                 // test-called (via the regblock frontdoor or directly).
+                //
+                // One arm used to answer both ways of failing that, and
+                // v1 answers them very differently:
+                //
+                //   * NO mode annotation — v1 refuses too, with "let
+                //     helper: transactor instantiation requires a mode
+                //     annotation (`AxilHelper active` or `AxilHelper
+                //     passive`)". A program error under both backends.
+                //   * `passive` — v1 ACCEPTS it and emits output
+                //     byte-identical to the `active` program. It
+                //     ignores the mode entirely, so the user asks for a
+                //     passive instance and gets a driver. (Anti-vacuity:
+                //     for a transactor that HAS both halves the mode
+                //     changes 67 lines of v1's output, so this is v1
+                //     dropping the annotation for a hookable-only
+                //     transactor, not v1 having no notion of mode.)
+                //
+                // The two are told apart by the AST exactly — `None`
+                // versus `Some(wrong)` — so this is a split on the real
+                // distinction, not a shape heuristic.
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
                         ..
                     }) => {}
+                    Some(TypeExpr::Named { mode: None, .. }) | None => {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `let {} : {simple}` needs an \
+                             `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
+                    }
                     _ => {
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
-                                "initiator-BFM instance `let {} : {simple}` must be declared \
-                                 `active`",
+                                "initiator-BFM instance `let {} : {simple}` declared \
+                                 `passive`",
                                 l.name.name
                             ),
-                            "its hookable methods are test-called, not request-served",
+                            "its hookable methods are test-called, not request-served; v1 \
+                             drops the annotation and emits the same code it emits for \
+                             `active`, so the instance drives the bus anyway",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                 }
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "initiator-BFM instance `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "initiator-BFM instance `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "`= bind <bus-binding>`",
+                )?;
                 let xid = ir::TransactorId(
                     prog.transactors
                         .iter()
@@ -3118,18 +3307,14 @@ fn lower_test(
                     }
                 };
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "bound-to event-driven transactor `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "bound-to event-driven transactor `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "`= bind <bus-binding>`",
+                )?;
                 let cid = component_ids[simple];
                 bound_event_component_binds.push((
                     l.name.name.clone(),
@@ -3171,36 +3356,48 @@ fn lower_test(
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
                 // The responder host must be `passive` — its methods are
-                // request-served, never test-called.
+                // request-served, never test-called. Split for the same
+                // reason as the initiator-BFM arm above, and measured
+                // the same way: with no annotation v1 refuses ("let
+                // target: transactor instantiation requires a mode
+                // annotation"); with `active` it emits output
+                // byte-identical to the `passive` program, dropping the
+                // annotation.
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Passive),
                         ..
                     }) => {}
+                    Some(TypeExpr::Named { mode: None, .. }) | None => {
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `let {} : {simple}` needs an \
+                             `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
+                    }
                     _ => {
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
-                                "target-TLM responder instance `let {} : {simple}` must be \
-                                 declared `passive`",
+                                "target-TLM responder instance `let {} : {simple}` declared \
+                                 `active`",
                                 l.name.name
                             ),
-                            "the responder serves bus requests; its methods are not test-called",
+                            "the responder serves bus requests; its methods are not \
+                             test-called, and v1 drops the annotation and emits the same \
+                             code it emits for `passive`",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                 }
                 // RHS must be a bare bus-binding identifier.
-                let bus_field = match l.value.as_ref().map(|v| &*v.kind) {
-                    Some(ExprKind::Ident(id)) => id.name.clone(),
-                    _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "target-TLM responder `{}` bound to a non-identifier",
-                                l.name.name
-                            ),
-                            "only `= bind <bus-binding>` is lowered",
-                        ));
-                    }
-                };
+                let bus_field = bind_rhs_ident(
+                    l.value.as_ref(),
+                    &format!(
+                        "target-TLM responder `{}` bound to a non-identifier",
+                        l.name.name
+                    ),
+                    "`= bind <bus-binding>`",
+                )?;
                 let xid = ir::TransactorId(
                     prog.transactors
                         .iter()
@@ -3585,14 +3782,33 @@ fn lower_test(
                                 // makes the bind static.
                                 let xdut = &prog.transactors[idx].dut_type;
                                 if *xdut != dut_type {
-                                    return Err(unsupported(
+                                    // The sibling of the multi-handle arm
+                                    // in `transactors.rs`, and it takes the
+                                    // same verdict for the same measured
+                                    // reason: v1 emits `V<xdut>* <field>`
+                                    // while including only the TESTBENCH
+                                    // DUT's Verilated header, so the type is
+                                    // undeclared. Measured on `d1 : Foo`
+                                    // against a `dut : Top` testbench —
+                                    // "'VFoo' does not name a type", plus
+                                    // "'struct Drv' has no member named
+                                    // 'd1'" at the poke site. An enum-typed
+                                    // field is the same failure with a
+                                    // different shape: v1 emits `Color
+                                    // mode;` and never emits a C++ enum at
+                                    // all.
+                                    return Err(not_implemented(
                                         &format!(
                                             "transactor field `{tbn}.{} : {simple}` whose \
                                              `{}` field type `{xdut}` differs from the test \
                                              DUT type `{dut_type}`",
                                             f.name.name, prog.transactors[idx].dut_field
                                         ),
-                                        "",
+                                        "a transactor drives the DUT the test instantiates; \
+                                         v1 emits a `V<Name>*` member for the mismatched \
+                                         type while including only the test DUT's Verilated \
+                                         header, so the emitted C++ does not compile",
+                                        V1Status::EmitsUncompilable,
                                     ));
                                 }
                                 transactor_fields.push((f.name.name.clone(), xid));
@@ -4381,9 +4597,16 @@ fn lower_test(
             }
         })?;
         let xschema = prog.transactor(xid);
-        if xschema.method(&method).is_none() {
+        let Some(target_method) = xschema.method(&method) else {
             return Err(LowerError::Invalid(format!(
                 "`on {xfield}.{method}` hook: transactor `{}` declares no method `{method}`",
+                xschema.name
+            )));
+        };
+        if !target_method.hookable {
+            return Err(LowerError::Invalid(format!(
+                "`on {xfield}.{method}` hook: `{xfield}.{method}` does not name a `hookable` \
+                 method on transactor `{}`",
                 xschema.name
             )));
         }
@@ -4396,10 +4619,8 @@ fn lower_test(
         // method's param names (a test-let sharing a param name resolves to
         // the param, not the promoted cell).
         let mut hook_scope = HashSet::new();
-        if let Some(m) = xschema.method(&method) {
-            for p in &prog.function(m.function).params {
-                hook_scope.insert(p.name.clone());
-            }
+        for p in &prog.function(target_method.function).params {
+            hook_scope.insert(p.name.clone());
         }
         collect_promotable_check_reads(&h.body, &test_let_names, &hook_scope, &mut promoted_lets);
         resolved_hooks.push((xid, method, *side, h));
@@ -4736,6 +4957,7 @@ fn lower_test(
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
         test_scope_lets: test_let_names,
+        regblock_instance_types: regblock_instance_names(regblock_ids, addrmap_decls),
         regblock_bindings: regblock_bindings_map,
         regblock_init_order,
         addrmap_bindings: addrmap_bindings_map,
@@ -4910,15 +5132,41 @@ fn lower_test(
             .expect("tb_periodic_asts is only populated for an impl-bound testbench");
         let mut periodic_services: Vec<ir::TbPeriodicServiceSchema> = Vec::new();
         for h in &tb_periodic_asts {
+            // The FOURTH landing of the non-literal periodic period,
+            // after the three bound-to transactor arms in
+            // `transactors.rs`, and it behaves identically — which is
+            // the point of grouping by what a construct DOES rather
+            // than where it is spelled.
+            //
+            // v1 emits the period expression verbatim into a
+            // `_checkers` closure registered near the top of the run
+            // function, ahead of the impl's own `let`s:
+            //
+            //   * `on per cycles` with `let per = 2` — `(int64_t)(per)`
+            //     at line 161, `int64_t per = 2;` at line 175. Does not
+            //     compile.
+            //   * the same with a file-scope `const per = 7` as well —
+            //     the closure resolves to the `constexpr` at namespace
+            //     scope, so it COMPILES, and the rest of the run body
+            //     sees the `let` that shadows it. Built and run: 2
+            //     firings in 21 cycles where the source asks for a
+            //     period of 2.
+            //
+            // Worst-under-arm, and a silent drop in rate is the worst
+            // of the two, so `SilentlyMisLowers`.
             let period = tb_periodic_literal(&h.event).ok_or_else(|| {
-                unsupported(
+                not_implemented(
                     &format!(
                         "a testbench-scoped `on <N> cycles` handler in `{}` with a \
-                         non-literal period",
+                         non-literal or non-positive period",
                         t.name.name
                     ),
-                    "the TB-IR backend requires a positive integer-literal cycle count \
-                     (e.g. `on 1 cycles`); a field-backed period is not yet lowered",
+                    "`on 0 cycles` makes v1 emit a handler its own `period > 0` guard \
+                     never fires; a period naming one of the impl's own `let` bindings \
+                     either fails to compile or silently picks up a same-named file-scope \
+                     `const` and runs at the wrong rate. A period naming only a file-scope \
+                     `const` does work under v1",
+                    V1Status::SilentlyMisLowers,
                 )
             })?;
             let fid = FunctionId(prog.functions.len() as u32);
@@ -5719,6 +5967,23 @@ pub(crate) struct LowerCtx {
     /// and check are separate IR functions, so v1's shared-capture
     /// scoping is not representable.
     pub test_scope_lets: HashSet<String>,
+    /// Every `regblock` and `addrmap` DECLARATION name in the file.
+    ///
+    /// A `let` whose declared type names one of these is an
+    /// INSTANTIATION and requires `= bind <helper>`; without it there is
+    /// no bus for the registers to reach. v1 states that rule and
+    /// enforces it ("regblock instantiation requires `= bind <helper>`
+    /// (a transactor with write/read methods)"), refusing to emit at
+    /// all. TB-IR used to accept it silently, because a regblock's
+    /// mirror record shares its name and the let landed on the ordinary
+    /// record-local arm — the emitted testbench then served every
+    /// register access from the mirror and issued NO bus traffic, so
+    /// the test passed without ever touching the DUT. See divergence
+    /// 104.
+    ///
+    /// Populated in EVERY context, not just the test one — the hole is
+    /// reachable from a hookable method body and a `tseq` body too.
+    pub regblock_instance_types: HashSet<String>,
     /// Register-block bindings (`let regs : R = bind <helper>`) →
     /// per-binding access context (mirror record, helper field,
     /// registers). Empty for helper/method/synthetic contexts.
@@ -6800,9 +7065,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
             ir::Expr::BitSlice { target, .. } => in_expr(target),
-            ir::Expr::BitSliceDyn { target, hi, lo } => {
-                in_expr(target).or_else(|| in_expr(hi)).or_else(|| in_expr(lo))
-            }
+            ir::Expr::BitSliceDyn { target, hi, lo } => in_expr(target)
+                .or_else(|| in_expr(hi))
+                .or_else(|| in_expr(lo)),
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.

@@ -925,17 +925,22 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                 }
                 _ => false,
             }),
-        Expr::ComponentField { base, field } => component_of_base(cx, base)
-            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
-            .is_some_and(|f| {
-                matches!(
-                    f.kind,
+        Expr::ComponentField { base, field } => {
+            let path: Vec<String> = field.split('.').map(str::to_string).collect();
+            let root = path.first().map(String::as_str).unwrap_or_default();
+            component_of_base(cx, base)
+                .and_then(|c| c.fields.iter().find(|f| f.name == root))
+                .is_some_and(|f| match f.kind {
                     crate::ir::ComponentFieldKind::Scalar {
                         ty: crate::ir::IrType::SInt(_),
                         ..
+                    } => true,
+                    crate::ir::ComponentFieldKind::Record { record } => {
+                        record_path_is_sint(cx, crate::ir::IrType::Record(record), path[1..].iter())
                     }
-                )
-            }),
+                    _ => false,
+                })
+        }
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1050,6 +1055,10 @@ fn component_of_base<'a>(
             c.methods.iter().any(|m| m.function == cx.func.id)
                 || c.on_handlers.iter().any(|h| h.function == cx.func.id)
                 || c.periodic_handlers.iter().any(|h| h.function == cx.func.id)
+                || c.cycle_handlers.iter().any(|h| h.function == cx.func.id)
+                || c.watchdog
+                    .as_ref()
+                    .is_some_and(|w| w.function == cx.func.id)
         }),
         crate::ir::ComponentBase::Local(l) => {
             let crate::ir::IrType::Component(cid) = cx.func.locals.get(l.index())?.ty else {

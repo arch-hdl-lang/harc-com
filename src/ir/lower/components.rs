@@ -70,7 +70,11 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 /// path (its standalone testbench-field placement), and routes to the
 /// composite-component table ONLY when an env must hold it by value — see
 /// the trailing arm's comment.
-pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> bool {
+pub(crate) fn transactor_is_component(
+    t: &TransactorDecl,
+    env_held: bool,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
     let mut has_event = false;
     let mut has_in_event = false;
     let mut has_on_handler = false;
@@ -85,8 +89,14 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
                     if matches!(f.direction, Some(crate::ast::Direction::In)) {
                         has_in_event = true;
                     }
-                } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                    has_module_field = true;
+                } else if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    // Declared records are persistent host-side state, not
+                    // DUT handles. Only an otherwise-unclassified named type
+                    // is evidence that this transactor owns a module field.
+                    if !record_ids.contains_key(simple) {
+                        has_module_field = true;
+                    }
                 }
             }
             ComponentItem::OnHandler(h) if !h.periodic => has_on_handler = true,
@@ -166,7 +176,10 @@ pub(crate) fn transactor_is_component(t: &TransactorDecl, env_held: bool) -> boo
 /// an unbound transactor with an output event surface and no module/DUT
 /// handle. It is stored as a `ComponentSchema`, but its instance mode is
 /// still a source-language transactor property.
-pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
+pub(crate) fn transactor_is_analysis_source(
+    t: &TransactorDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
     if t.bound_to.is_some() {
         return false;
     }
@@ -176,8 +189,11 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
         if let ComponentItem::Field(f) = it {
             if is_event_field(f) {
                 has_event = true;
-            } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                has_named_field = true;
+            } else if let TypeExpr::Named { name, .. } = &f.ty {
+                let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                if !record_ids.contains_key(simple) {
+                    has_named_field = true;
+                }
             }
         }
     }
@@ -186,8 +202,11 @@ pub(crate) fn transactor_is_analysis_source(t: &TransactorDecl) -> bool {
 
 /// Whether an analysis-source transactor has behavior or storage whose
 /// availability depends on the instance mode.
-pub(crate) fn transactor_has_mode_sensitive_analysis_surface(t: &TransactorDecl) -> bool {
-    transactor_is_analysis_source(t)
+pub(crate) fn transactor_has_mode_sensitive_analysis_surface(
+    t: &TransactorDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
+    transactor_is_analysis_source(t, record_ids)
         && t.when_active
             .as_ref()
             .is_some_and(|items| !items.is_empty())
@@ -380,7 +399,13 @@ pub(crate) fn transactor_is_reactive_monitor(t: &TransactorDecl) -> bool {
     !has_in_event && (has_on_handler || has_periodic_handler)
 }
 
-fn is_event_field(f: &ComponentField) -> bool {
+/// An `event<T>` field. `pub(crate)` because the unbound-transactor
+/// item walk splits its directional-field rejection on exactly this
+/// question — v1 models a directional EVENT (a real subscriber vector
+/// plus a fan-out at the emit site) and flattens a directional SCALAR to
+/// an uninitialized `uint64_t` — and asking the routing predicate's own
+/// helper is what keeps the two answers from drifting apart.
+pub(crate) fn is_event_field(f: &ComponentField) -> bool {
     matches!(
         &f.ty,
         TypeExpr::Builtin {
@@ -411,6 +436,7 @@ pub(crate) enum CompSource<'a> {
 /// ids so a `Sub` field / `connect` edge can resolve nested components.
 /// Method `FunctionId`s are assigned from `next_fn` upward; bodies are
 /// lowered in the second pass (`lower_component_bodies`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_component_schema(
     src: &CompSource<'_>,
     ids: &HashMap<String, ComponentId>,
@@ -419,6 +445,12 @@ pub(crate) fn lower_component_schema(
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
     declared_types: &std::collections::HashSet<String>,
+    // `record_ids` restricted to transactions and structs — v1's
+    // `Emitter::is_record_type`. `record_ids` itself also holds every
+    // regblock's mirror record by the time components lower, and the
+    // record-field arm below asks a v1-PARITY question, so it must not
+    // use the contaminated map.
+    declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
         &str,
@@ -592,6 +624,7 @@ pub(crate) fn lower_component_schema(
                         is_transactor,
                         consts,
                         declared_types,
+                        declared_records,
                     )?;
                     if fields.iter().any(|x| x.name == f.name.name) {
                         return Err(LowerError::Invalid(format!(
@@ -816,8 +849,8 @@ pub(crate) fn lower_component_schema(
                 )
             })?;
             cycle_asts.push((h, Some(channel), *activation));
-        } else if is_event_subscription(h, &fields) {
-            let (event, arg_payload) = resolve_on_handler_event(name, h, &fields)?;
+        } else if let Some((event, arg_payload, args)) = event_subscription(h, &fields) {
+            validate_event_handler(name, h, &event, args)?;
             let fid = FunctionId(*next_fn);
             *next_fn += 1;
             on_handlers.push(crate::ir::OnHandlerSchema {
@@ -896,8 +929,8 @@ pub(crate) fn lower_component_schema(
 
     let instance_mode_policy = match src {
         CompSource::Transactor(t)
-            if transactor_is_analysis_source(t)
-                && !transactor_has_mode_sensitive_analysis_surface(t) =>
+            if transactor_is_analysis_source(t, record_ids)
+                && !transactor_has_mode_sensitive_analysis_surface(t, record_ids) =>
         {
             crate::ir::ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
         }
@@ -991,16 +1024,21 @@ pub(crate) fn validate_mode_metadata(components: &[ComponentSchema]) -> Result<(
 /// trigger is a `Call` whose callee is a bare identifier naming a self
 /// `event<...>` field. Everything else (a bare bool predicate, a `Call`
 /// on a non-event name) is a cycle-trigger monitor handler.
-fn is_event_subscription(h: &crate::ast::OnHandler, fields: &[ComponentFieldSchema]) -> bool {
-    let ExprKind::Call { callee, .. } = &*h.event.kind else {
-        return false;
+fn event_subscription<'a>(
+    h: &'a crate::ast::OnHandler,
+    fields: &[ComponentFieldSchema],
+) -> Option<(String, EventPayload, &'a [crate::ast::CallArg])> {
+    let ExprKind::Call { callee, args } = &*h.event.kind else {
+        return None;
     };
     let ExprKind::Ident(id) = &*callee.kind else {
-        return false;
+        return None;
     };
-    fields
-        .iter()
-        .any(|f| f.name == id.name && matches!(f.kind, ComponentFieldKind::Event { .. }))
+    let ComponentFieldKind::Event { payload } = fields.iter().find(|f| f.name == id.name)?.kind
+    else {
+        return None;
+    };
+    Some((id.name.clone(), payload, args.as_slice()))
 }
 
 /// True when `h` is an `on bus.<ch>.handshake(arg)` passive bus-monitor
@@ -1152,15 +1190,49 @@ fn validate_periodic_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<()
     Ok(())
 }
 
-/// Validate an `on <event>(arg) ... end on` handler: it must be a bare
-/// event-subscription (`on in_ev(t)`) to a self `event<scalar>` field,
-/// with no `pre`/`post` hook side, no edge/periodic trigger. Returns the
-/// `(event_field_name, arg_payload)`.
-fn resolve_on_handler_event(
+/// Validate an `on <event>(arg) ... end on` self-event subscription.
+///
+/// This used to also RESOLVE the subscription — re-deriving the three
+/// facts `event_subscription` had already established to route the
+/// handler here, and carrying a rejection arm for each: a non-`Call`
+/// trigger, a dotted callee, a field that is not an `event`, and no such
+/// field. All four were unreachable, as was the `h.periodic` check (a
+/// periodic handler goes into `periodic_asts` at the item split and
+/// never reaches this loop). Replacing each of the five with
+/// `unreachable!()` left the whole suite green, and probing all five
+/// shapes shows them landing on other diagnostics entirely — a dotted
+/// `on tagger.in_ev(t)` on "transactor/method call `.in_ev(...)`", an
+/// `on other(t)` naming a scalar field on "helper call `other(...)`".
+///
+/// So the resolution moved INTO the routing predicate, which now
+/// returns what it found instead of a bool, and only the two checks
+/// that a routed handler can still fail are left:
+///
+/// | trigger | v1 emits | verdict |
+/// |---|---|---|
+/// | `on in_ev(t) pre` | the handler with the hook side dropped, byte-identically | `SilentlyMisLowers` |
+/// | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
+/// | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `SilentlyMisLowers` |
+///
+/// The two arity halves were one arm until they were measured
+/// separately. Zero arguments is the one shape v1 gets right: the
+/// payload is unbound, which is what was written.
+///
+/// The multi-argument half was first labelled `EmitsUncompilable`, on a
+/// body whose `u` had nothing else to resolve to. That is the LESSER of
+/// the two things v1 does here, and an arm's status is the worst one.
+/// Give `u` something to bind to — a component field `u : uint<8>
+/// default 7`, or a file-scope `const u = 9` — and v1 emits
+/// `tagger.seen = tagger.seen + tagger.u;` or `... + u;`, compiles
+/// clean, and runs to a value the source never asked for.
+/// `validate_cycle_handler`, a hundred lines above, is the same
+/// two-shape arm and resolves it the other way round.
+fn validate_event_handler(
     comp: &str,
     h: &crate::ast::OnHandler,
-    fields: &[ComponentFieldSchema],
-) -> Result<(String, EventPayload), LowerError> {
+    event: &str,
+    args: &[crate::ast::CallArg],
+) -> Result<(), LowerError> {
     if h.hook.is_some() {
         // The third member of the hook family, and it probes exactly
         // like the periodic one: v1 emits the subscription handler with
@@ -1178,46 +1250,26 @@ fn resolve_on_handler_event(
             V1Status::SilentlyMisLowers,
         ));
     }
-    if h.periodic {
-        return Err(unsupported(
-            &format!("an `on <N> cycles` periodic handler on `{comp}`"),
-            "periodic/cycle-trigger handlers gate on a later slice",
+    if args.len() > 1 {
+        return Err(not_implemented(
+            &format!(
+                "an `on {event}(...)` handler with {} arguments on `{comp}`",
+                args.len()
+            ),
+            "event handlers take exactly one payload argument; v1 emits the lambda with \
+             only the first parameter and says nothing, so a body naming a later one \
+             either fails to resolve or silently picks up a same-named component field \
+             or file-scope `const`",
+            V1Status::SilentlyMisLowers,
         ));
     }
-    // Event-subscription shape: `on <event>(<arg>)`.
-    let ExprKind::Call { callee, args } = &*h.event.kind else {
+    if args.is_empty() {
         return Err(unsupported(
-            &format!("a cycle-trigger `on <expr>` handler on `{comp}`"),
-            "only `on <event>(arg)` self-subscriptions are lowered",
-        ));
-    };
-    let event = match &*callee.kind {
-        ExprKind::Ident(id) => id.name.clone(),
-        _ => {
-            return Err(unsupported(
-                &format!("a dotted-path `on` handler event on `{comp}`"),
-                "only a bare self-event name is lowered",
-            ));
-        }
-    };
-    if args.len() != 1 {
-        return Err(unsupported(
-            &format!("an `on {event}(...)` handler with {} arguments", args.len()),
-            "event handlers take exactly one payload argument",
+            &format!("an `on {event}()` handler with no payload argument on `{comp}`"),
+            "event handlers bind the payload to exactly one name; v1 synthesizes one",
         ));
     }
-    // The event must name a self `event<...>` field.
-    match fields.iter().find(|f| f.name == event).map(|f| &f.kind) {
-        Some(ComponentFieldKind::Event { payload }) => Ok((event, *payload)),
-        Some(_) => Err(unsupported(
-            &format!("`on {event}` — `{comp}.{event}` is not an `event` field"),
-            "",
-        )),
-        None => Err(unsupported(
-            &format!("`on {event}` — `{comp}` has no field `{event}`"),
-            "",
-        )),
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1234,6 +1286,7 @@ fn lower_field(
     // very different things to the two, and the site had been treating
     // them alike.
     declared_types: &std::collections::HashSet<String>,
+    declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -1348,18 +1401,39 @@ fn lower_field(
                     mode,
                 });
             }
-            // A record type held BY VALUE. The standalone-transactor
-            // path lowers this to `StateFieldKind::Record`, but a
-            // transactor reached through an `env` comes through the
-            // component-field machinery, which has no record kind — so
-            // it must not fall through to the DUT-handle arm below and
-            // report a second DUT handle, which is what it used to do.
-            // v1 emits a plain `Beat cur;` member here and it works.
+            // A record type held by value is persistent host-side state,
+            // not a DUT handle. This is the component-routed counterpart
+            // of `StateFieldKind::Record` on a standalone transactor.
+            //
+            // `declared_records`, not `record_ids`: by the time
+            // components lower, `record_ids` also holds every regblock's
+            // MIRROR record under the regblock's own name, and v1's
+            // `Emitter::is_record_type` is transactions ∪ structs. Using
+            // the contaminated map here would lower a regblock-typed
+            // field to a record member, which v1 emits as `VDmaRegs*`.
+            if declared_records.contains(simple) {
+                let record = record_ids[simple];
+                if f.default.is_some() {
+                    return Err(unsupported(
+                        &format!("a default value on record field `{comp}.{fname}`"),
+                        "record fields use their type-derived default initialization",
+                    ));
+                }
+                return Ok(ComponentFieldKind::Record { record });
+            }
+            // A REGBLOCK-typed field looks like a record to `record_ids`
+            // — its mirror record is in there under the regblock's name
+            // — but not to v1, whose `is_record_type` is transactions ∪
+            // structs. v1 emits `VDmaRegs* r = nullptr;` for it, with
+            // only the test DUT's Verilated header included, so the type
+            // is undeclared and the output does not compile.
             if record_ids.contains_key(simple) {
-                return Err(unsupported(
-                    &format!("a record-typed field `{comp}.{fname}` of type `{simple}`"),
-                    "record state lowers on a standalone `transactor`; through an \
-                     `env` the component-field schema has no record kind yet",
+                return Err(not_implemented(
+                    &format!("a regblock-typed field `{comp}.{fname}` of type `{simple}`"),
+                    "a regblock is instantiated by `let <name> : <Regblock> = bind \
+                     <helper>`, not held as a component field; v1 emits a `V<Name>*` \
+                     member for it and the emitted C++ does not compile",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             // On a transactor, an unknown named type is the module-typed
@@ -1479,7 +1553,7 @@ pub(crate) fn lower_component_bodies(
         // Only EVENT-subscription handlers live in `schema.on_handlers`;
         // periodic (`on N cycles`) handlers are a separate block.
         if let ComponentItem::OnHandler(h) = it {
-            if h.periodic || !is_event_subscription(h, fields) {
+            if h.periodic || event_subscription(h, fields).is_none() {
                 continue;
             }
             let oh = &schema.on_handlers[on_idx];
@@ -1526,7 +1600,7 @@ pub(crate) fn lower_component_bodies(
     let mut cyc_idx = 0usize;
     for it in items.iter().chain(when_active.into_iter().flatten()) {
         if let ComponentItem::OnHandler(h) = it {
-            if h.periodic || is_event_subscription(h, fields) {
+            if h.periodic || event_subscription(h, fields).is_some() {
                 continue;
             }
             let ch = &schema.cycle_handlers[cyc_idx];
@@ -2182,7 +2256,8 @@ where
     let src_comp = &components[src_cid.index()];
     let (src_payload, src_activation) = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { payload }, activation,
+            kind: ComponentFieldKind::Event { payload },
+            activation,
             ..
         }) => (*payload, *activation),
         _ => {
@@ -2201,42 +2276,93 @@ where
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
     let sink_cid = resolve_path(sink_path)?;
     let sink_comp = &components[sink_cid.index()];
+    // The SEMANTIC sink checks below. Measured on an INSTANTIATED env,
+    // which is the only place v1 looks at the edge at all:
+    //
+    //   * not `hookable` — v1 emits `for (auto& _s : sink.plain)`, and
+    //     a `function` method is not a struct member. g++: "'struct
+    //     Sink' has no member named 'plain'".
+    //   * neither a method nor an event field — `for (auto& _s :
+    //     sink.other)` over a `uint64_t`. g++: "there are no arguments
+    //     to 'begin' that depend on a template parameter".
+    //   * wrong parameter count / returns a value — v1 raises its OWN
+    //     error: "connect: hookable sink `sink.two` must take exactly
+    //     one payload argument, got 2" and "connect: hookable sink
+    //     `sink.ret` must return void".
+    //   * payload mismatch — MIXED, and this is the row a first pass
+    //     got wrong. `event_payload_matches_ir_type` compares
+    //     signedness and record identity only, so one arm covers two
+    //     very different shapes:
+    //       - record vs scalar (`event<uint<8>>` into a `Beat` sink) —
+    //         the bridge lambda is generic, but converting it to the
+    //         source's `std::function<void(uint64_t)>` instantiates it,
+    //         so it bites at the wiring line. g++: "no match for call
+    //         to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'".
+    //       - SIGNEDNESS only (`event<uint<8>>` into a `sint<8>` sink)
+    //         — v1 emits `Sink_write_obs(e.sb, _t)` from a
+    //         `void(uint64_t)` channel into an `int64_t` parameter.
+    //         That is an implicit conversion, and it COMPILES AND RUNS
+    //         CORRECTLY: built and run, count=2 sum=8, exactly what the
+    //         program asks for. So v1 implements that program and the
+    //         suggestion is honest for it.
+    //
+    // These are therefore NOT `Invalid`. An earlier pass made them so on
+    // the grounds that an uninstantiated env is "v1 not looking, not v1
+    // running the program" — but v1 emits, compiles and RUNS such a
+    // program to completion, so "a program error under every backend"
+    // is false for every one of these arms, and it was the same
+    // observation the endpoint-shape arms above cite for keeping their
+    // suggestion. One observation cannot reach opposite verdicts in one
+    // function.
+    //
+    // What separates these from the endpoint arms is narrower: an
+    // instantiated malformed PATH can still mean something to v1 (a
+    // single-segment endpoint resolves against the owner's own
+    // hookable), while an instantiated bad SINK never does — except the
+    // signedness row, which is split out below precisely because it
+    // does.
     let (sink, sink_activation) = if let Some(sm) = sink_comp.method(&sink_name) {
         if !sm.hookable {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
-                    "a `connect` sink method `{}.{sink_name}` that is not hookable",
+                    "a `connect` sink method `{}.{sink_name}` that is not `hookable`",
                     sink_path.join(".")
                 ),
-                "analysis sinks must be declared `hookable`",
+                "analysis sinks must be declared `hookable`; v1 emits a fan-out over the \
+                 method name as if it were an event vector, which is not a member of the \
+                 emitted struct at all",
+                V1Status::EmitsUncompilable,
             ));
         }
         if sm.param_names.len() != 1 {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` sink method `{sink_name}` with {} parameters",
                     sm.param_names.len()
                 ),
-                "analysis sinks take exactly one payload parameter",
+                "analysis sinks take exactly one payload parameter; v1 refuses it too, \
+                 with \"must take exactly one payload argument\"",
+                V1Status::Rejects,
             ));
         }
         if sm.has_ret {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` sink method `{}.{sink_name}` that returns a value",
                     sink_path.join(".")
                 ),
-                "analysis sinks must not return a value",
+                "analysis sinks must not return a value; v1 refuses it too, with \"must \
+                 return void\"",
+                V1Status::Rejects,
             ));
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
-                    src_path.join("."),
-                    sink_path.join("."),
-                ),
-                "source and sink payloads must have the same signed scalar shape or record type",
+            return Err(connect_payload_mismatch(
+                &src_path.join("."),
+                &src_event,
+                &sink_path.join("."),
+                &sink_name,
+                both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
         (
@@ -2244,18 +2370,18 @@ where
             sm.activation,
         )
     } else if let Some(ComponentFieldSchema {
-        kind: ComponentFieldKind::Event { payload }, activation,
+        kind: ComponentFieldKind::Event { payload },
+        activation,
         ..
     }) = sink_comp.field(&sink_name)
     {
         if *payload != src_payload {
-            return Err(unsupported(
-                &format!(
-                    "a `connect` payload mismatch from `{}.{src_event}` to `{}.{sink_name}`",
-                    src_path.join("."),
-                    sink_path.join("."),
-                ),
-                "source and sink event payloads must have the same signed scalar shape or record type",
+            return Err(connect_payload_mismatch(
+                &src_path.join("."),
+                &src_event,
+                &sink_path.join("."),
+                &sink_name,
+                both_scalar_payloads(src_payload, *payload),
             ));
         }
         (
@@ -2263,13 +2389,15 @@ where
             *activation,
         )
     } else {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!(
-                "a `connect` sink `{}.{sink_name}` that is neither a sink method nor an \
-                 `event` field",
+                "a `connect` sink `{}.{sink_name}` that is neither a `hookable` sink \
+                 method nor an `event` field",
                 sink_path.join(".")
             ),
-            "",
+            "v1 emits a fan-out over the name as if it were an event vector; on a scalar \
+             field that does not compile",
+            V1Status::EmitsUncompilable,
         ));
     };
 
@@ -2306,6 +2434,112 @@ fn resolve_testbench_path(
     } else {
         resolve_sub_path(&components[cid.index()], components, tail)
     }
+}
+
+/// A `connect` payload mismatch, split on the one distinction that
+/// decides whether v1 runs the program.
+///
+/// `event_payload_matches_ir_type` compares signedness and record
+/// identity, so one check covers two shapes that behave completely
+/// differently under v1:
+///
+///   * both sides SCALAR, differing only in signedness — v1's bridge
+///     lambda is generic, and converting it to the source's
+///     `std::function<void(uint64_t)>` gives an implicit conversion into
+///     the sink's `int64_t` parameter. Built and run: `count=2 sum=8`,
+///     exactly what the program asks for. v1 implements it, so the
+///     suggestion is honest.
+///   * anything else — a RECORD against a scalar in either direction,
+///     two DIFFERENT records, or a component-typed sink parameter
+///     (`method_schema_ir_type` can produce `IrType::Component`). The
+///     same conversion has nothing to convert. g++: "no match for call
+///     to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'". A
+///     first version of this comment named only the record-vs-scalar
+///     row, which is one of three.
+///
+/// `scalars` is the caller's answer to "are both sides scalars?", which
+/// is the exact discriminator rather than a proxy for it.
+fn connect_payload_mismatch(
+    src_path: &str,
+    src_event: &str,
+    sink_path: &str,
+    sink_name: &str,
+    scalars: bool,
+) -> LowerError {
+    let construct = format!(
+        "a `connect` payload mismatch from `{src_path}.{src_event}` to \
+         `{sink_path}.{sink_name}`"
+    );
+    if scalars {
+        unsupported(
+            &construct,
+            "source and sink scalar payloads must agree in signedness; v1 lets the \
+             implicit conversion through and the program runs",
+        )
+    } else {
+        not_implemented(
+            &construct,
+            "the payload shapes cannot be bridged — a record against a scalar, two \
+             different records, or a component-typed parameter; v1 emits the generic \
+             bridge anyway and the emitted C++ does not compile",
+            V1Status::EmitsUncompilable,
+        )
+    }
+}
+
+/// Whether a `connect` source payload and a sink EVENT payload are both
+/// scalars — the discriminator `connect_payload_mismatch` splits on,
+/// for the event-sink branch.
+fn both_scalar_payloads(src: EventPayload, sink: EventPayload) -> bool {
+    matches!(
+        (src, sink),
+        (EventPayload::Scalar { .. }, EventPayload::Scalar { .. })
+    )
+}
+
+/// The same discriminator for the METHOD-sink branch, where the sink
+/// side is a declared parameter type rather than an event payload.
+///
+/// Named for what it answers, not for the branch it is called from: it
+/// is only ever consulted once the payloads are known NOT to match, so
+/// a `true` here means "both scalars, and the mismatch is signedness".
+fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
+    matches!(
+        (payload, ty),
+        (
+            EventPayload::Scalar { .. },
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
+        )
+    )
+}
+
+/// The component predicates v1 and TB-IR both implement without them
+/// being DECLARED methods, so `comp.method(..).is_none()` is true for
+/// them and they reach the "has no method" arms.
+///
+/// `as_component_idle` lowers the first three in expression position and
+/// `quiesced` has its own resolver; a binding position reaches neither,
+/// which is a TB-IR gap rather than a bad program. Keeping this list
+/// beside those two resolvers is the point — if one grows a predicate,
+/// this has to grow with it or a working construct starts being reported
+/// as a program error.
+///
+/// Two callers, and neither of them is `user_override_wins` — an
+/// earlier version of this comment said otherwise, and a maintainer
+/// following it would have added a fifth name here and found it had no
+/// override behaviour. The resolvers match their names inline
+/// (`as_component_idle`'s `"idle" | "idle_in" | "idle_out"`,
+/// `as_component_quiesced`'s `"quiesced"`), so a new predicate has to
+/// be added in BOTH places:
+///
+///   * here, so the "has no method" arms carve it out, and
+///   * in the resolver's own `match`, so it lowers at all.
+///
+/// The callers are `as_component_method_call`'s two error arms (path
+/// form and component-typed-parameter form) and
+/// `as_transactor_method_call`'s.
+pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
+    matches!(name, "idle" | "idle_in" | "idle_out" | "quiesced")
 }
 
 /// Whether a hookable method's declared parameter has the same runtime
@@ -2564,7 +2798,12 @@ fn scalar_default(
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<u64, LowerError> {
     let Some(d) = default else { return Ok(0) };
-    fold_field_default(d, Some(ty), consts, &format!("component field `{comp}.{fname}`"))
+    fold_field_default(
+        d,
+        Some(ty),
+        consts,
+        &format!("component field `{comp}.{fname}`"),
+    )
 }
 
 /// Shared by the component, scoreboard and transactor-state field
@@ -2656,9 +2895,23 @@ impl super::FuncBuilder<'_> {
     /// dotted path rooted at a test-scope component local) or a bare
     /// `publish` self-call inside a method body. Returns
     /// `(base, component, method)` when the receiver resolves to a
-    /// component and `method` is one of its methods; `None` otherwise.
-    /// An error is reserved for a malformed path that clearly INTENDED a
-    /// component (head segment is a component local) but does not resolve.
+    /// component and `method` is one of its methods.
+    ///
+    /// `None` means "not a component-method call" — a callee this
+    /// resolver has no claim on, which the caller passes to the next
+    /// lowering path.
+    ///
+    /// Two different errors come out of it, and they are not the same
+    /// verdict:
+    ///
+    ///   * `Invalid` — a receiver that clearly INTENDED a component
+    ///     (head segment is a component local) naming a method nothing
+    ///     declares. v1 emits `c.nosuch(3)` against a struct with no
+    ///     such member and g++ rejects it, so no backend runs it.
+    ///   * `Unsupported` — a well-formed call to one of the built-in
+    ///     predicates outside expression position. Nothing declares
+    ///     those either, so they reach the same arm, but both backends
+    ///     implement them; see `is_builtin_component_predicate`.
     pub(crate) fn as_component_method_call(
         &self,
         callee: &AstExpr,
@@ -2679,16 +2932,64 @@ impl super::FuncBuilder<'_> {
                     }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
-                    let Some(method_schema) = comp.method(&method) else {
-                        return Err(unsupported(
-                            &format!(
-                                "component `{}` has no method `{method}` (in `{}`)",
-                                comp.name,
-                                path.join(".")
-                            ),
-                            "",
-                        ));
-                    };
+                    if comp.method(&method).is_none() {
+                        // "Not a declared method" is NOT the same set as
+                        // "does not exist", and a first pass made this
+                        // arm `Invalid` on that conflation.
+                        //
+                        // The built-in component predicates — `idle`,
+                        // `idle_in`, `idle_out`, `quiesced` — are not
+                        // declared methods and land here. v1 implements
+                        // all of them (`emit_idle_predicate`,
+                        // `resolve_component_quiesced_predicate`), and
+                        // TB-IR implements them too, one statement
+                        // position over: `assert c.idle(2)` lowers
+                        // through `as_component_idle` and emits, while
+                        // `let q = c.idle(2)` came through here and was
+                        // told its program was invalid. Both backends
+                        // run it; only this seam does not.
+                        //
+                        // So a built-in in a binding position is a real
+                        // TB-IR gap with a working escape hatch, and
+                        // anything else is the program error the first
+                        // pass measured: v1 emits `uint64_t x =
+                        // c.nosuch(3);` against a struct with no such
+                        // member — g++: "'struct Calc' has no member
+                        // named 'nosuch'".
+                        if is_builtin_component_predicate(&method) {
+                            // THREE landings share this arm, not the two
+                            // an earlier version named: `let q =
+                            // c.idle(2)`, `x = c.idle(2)`, and the bare
+                            // statement `c.idle(2)`, which has neither a
+                            // binding nor a local. So the construct
+                            // names the predicate and the detail names
+                            // what IS lowered, rather than describing
+                            // one landing's syntax as if it were all of
+                            // them.
+                            return Err(unsupported(
+                                &format!(
+                                    "the built-in predicate `{}` outside expression position",
+                                    path.join(".")
+                                ),
+                                "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` where \
+                                 their value is USED (`assert c.idle(2)`, `while \
+                                 !c.idle_in(4)`), but not as a `let`/assignment right-hand \
+                                 side or a bare statement; v1 emits it in all of them",
+                            ));
+                        }
+                        return Err(LowerError::Invalid(format!(
+                            "component `{}` has no method `{method}` (in `{}`)",
+                            comp.name,
+                            path.join(".")
+                        )));
+                    }
+                    // main's activation gate, kept for the case the
+                    // block above lets through: a method declared only
+                    // inside `when active` is not callable from an
+                    // always-on position.
+                    let method_schema = comp
+                        .method(&method)
+                        .expect("the arm above returns for every absent method");
                     self.require_component_activation(
                         &path[0],
                         head_cid,
@@ -2728,13 +3029,36 @@ impl super::FuncBuilder<'_> {
                     if let Some(cid) = self.component_of_local(local) {
                         let comp = &self.ctx.components[cid.index()];
                         if comp.method(&method.name).is_none() {
-                            return Err(unsupported(
-                                &format!(
-                                    "component `{}` has no method `{}` (on parameter `{}`)",
-                                    comp.name, method.name, recv.name
-                                ),
-                                "",
-                            ));
+                            // Same condition as the path-shaped sibling
+                            // above, reached through a component-typed
+                            // PARAMETER instead — and reachable: a
+                            // `function observe(a: uint<8>, m: Model)`
+                            // calling `m.nosuch(a)` lands here directly.
+                            // (An earlier note said "not probed, every
+                            // source was claimed by the transactor-method
+                            // arm first"; that arm only fires for
+                            // transactor-typed params.) So this is a
+                            // SECOND landing for a missing method, not
+                            // the single one an earlier entry claimed.
+                            //
+                            // Same built-in carve-out, for the same
+                            // reason.
+                            if is_builtin_component_predicate(&method.name) {
+                                return Err(unsupported(
+                                    &format!(
+                                        "the built-in predicate `{}.{}` on a \
+                                         component-typed parameter",
+                                        recv.name, method.name
+                                    ),
+                                    "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` \
+                                     in expression position but not here; v1 emits it \
+                                     either way",
+                                ));
+                            }
+                            return Err(LowerError::Invalid(format!(
+                                "component `{}` has no method `{}` (on parameter `{}`)",
+                                comp.name, method.name, recv.name
+                            )));
                         }
                         return Ok(Some((
                             ComponentBase::Local(local),
@@ -3050,7 +3374,19 @@ impl super::FuncBuilder<'_> {
         if self.recv_is_scoreboard_sub(head_cid, &tail[..recv_tail_len]) {
             return Ok(false);
         }
-        let cid = self.resolve_component_recv(head_cid, &tail[..recv_tail_len])?;
+        // This is a speculative recognizer, so a non-`Sub` receiver segment
+        // means "not a DUT bind" rather than an error. In particular,
+        // `src.current.value = ...` traverses record state, not a component
+        // receiver; the record-field assignment resolver below must claim it.
+        let mut cid = head_cid;
+        for seg in &tail[..recv_tail_len] {
+            let comp = &self.ctx.components[cid.index()];
+            let Some(ComponentFieldKind::Sub { component, .. }) = comp.field(seg).map(|f| &f.kind)
+            else {
+                return Ok(false);
+            };
+            cid = *component;
+        }
         let comp = &self.ctx.components[cid.index()];
         if !matches!(
             comp.field(field).map(|f| &f.kind),
@@ -3081,10 +3417,118 @@ impl super::FuncBuilder<'_> {
         Ok(true)
     }
 
+    /// Resolve a subfield of a record-valued component field. The IR's
+    /// component member access stores the validated C++ member suffix as
+    /// one string (`current.value`); emission already renders it after the
+    /// resolved component base.
+    fn as_component_record_field(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+        let Some(path) = dotted_path(e) else {
+            return Ok(None);
+        };
+        let path = self.strip_tb_prefix(&path);
+        if path.len() < 2 {
+            return Ok(None);
+        }
+
+        let validate = |record: RecordId, sub: &[String]| -> Result<(), LowerError> {
+            let mut rid = record;
+            for (i, seg) in sub.iter().enumerate() {
+                let schema = &self.ctx.records[rid.index()];
+                let Some(field) = schema.field(seg) else {
+                    return Err(LowerError::Invalid(format!(
+                        "record `{}` has no field `{seg}`",
+                        schema.name
+                    )));
+                };
+                if i + 1 < sub.len() {
+                    match field.ty {
+                        IrType::Record(next) if field.vec_len.is_none() => rid = next,
+                        _ => {
+                            return Err(unsupported(
+                                &format!(
+                                    "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                                    schema.name,
+                                    sub[i + 1]
+                                ),
+                                "only nested struct/transaction fields can be traversed further",
+                            ));
+                        }
+                    }
+                } else if field.vec_len.is_some() {
+                    return Err(unsupported(
+                        &format!("a whole-`Vec` component record field `{}`", path.join(".")),
+                        "indexed component-record `Vec` access is not lowered by TB-IR yet",
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        // Method-body form: `current.value`, where `current` is a field
+        // on the implicit `self` component.
+        if self.lookup(&path[0]).is_none() {
+            if let Some(cid) = self.self_component {
+                let comp = &self.ctx.components[cid.index()];
+                if let Some(schema) = comp.field(&path[0]) {
+                    if let ComponentFieldKind::Record { record } = schema.kind {
+                        self.require_self_activation(schema.activation, "field", &path[0])?;
+                        validate(record, &path[1..])?;
+                        return Ok(Some((ComponentBase::SelfField, path.join("."))));
+                    }
+                }
+            }
+        }
+
+        // Test/nested-component form: `env.source.current.value`. Walk
+        // through zero or more `Sub` fields until the record field is
+        // reached, then validate the remainder against its record schema.
+        let Some((head_cid, mut base, tail, head_mode)) = self.component_path_head(&path) else {
+            return Ok(None);
+        };
+        for recv_len in 0..tail.len() {
+            let Ok(cid) = self.resolve_component_recv(head_cid, &tail[..recv_len]) else {
+                break;
+            };
+            let comp = &self.ctx.components[cid.index()];
+            let Some(schema) = comp.field(&tail[recv_len]) else {
+                continue;
+            };
+            let ComponentFieldKind::Record { record } = schema.kind else {
+                continue;
+            };
+            let sub = &tail[recv_len + 1..];
+            if sub.is_empty() {
+                return Ok(None);
+            }
+            self.require_component_activation(
+                &path[0],
+                head_cid,
+                head_mode,
+                &tail[..recv_len],
+                schema.activation,
+                "field",
+                &tail[recv_len],
+            )?;
+            validate(record, sub)?;
+            base.extend_from_slice(&tail[..recv_len]);
+            return Ok(Some((
+                ComponentBase::Path(base),
+                tail[recv_len..].join("."),
+            )));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn as_component_field_target(
         &self,
         target: &AstExpr,
     ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+        if let Some(record_field) = self.as_component_record_field(target)? {
+            return Ok(Some(record_field));
+        }
         // Self-relative bare field (only inside a method body, and only
         // when the name is NOT a shadowing local).
         if let ExprKind::Ident(id) = &*target.kind {
@@ -3135,6 +3579,12 @@ impl super::FuncBuilder<'_> {
                             base.extend_from_slice(recv_tail);
                             return Ok(Some((ComponentBase::Path(base), field)));
                         }
+                        // A whole sub-component copy is resolved after field
+                        // writes. Decline here so `checker.sb = sb` reaches
+                        // that dedicated, type-checking resolver.
+                        Some(schema) if matches!(schema.kind, ComponentFieldKind::Sub { .. }) => {
+                            return Ok(None);
+                        }
                         _ => {
                             return Err(unsupported(
                                 &format!(
@@ -3151,18 +3601,25 @@ impl super::FuncBuilder<'_> {
         Ok(None)
     }
 
-    /// Resolve a component scalar-field READ as an `Expr::ComponentField`:
-    /// bare `count` (self) or path `env.sb.count`.
+    /// Resolve a component scalar or whole-record field READ as an
+    /// `Expr::ComponentField`: bare `count` / `current` (self), or paths
+    /// `env.sb.count` / `env.source.current`.
     pub(crate) fn as_component_field_read(
         &self,
         e: &AstExpr,
     ) -> Result<Option<IrExpr>, LowerError> {
+        if let Some((base, field)) = self.as_component_record_field(e)? {
+            return Ok(Some(IrExpr::ComponentField { base, field }));
+        }
         if let ExprKind::Ident(id) = &*e.kind {
             if self.lookup(&id.name).is_none() {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(field) = comp.field(&id.name) {
-                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                        if matches!(
+                            field.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some(IrExpr::ComponentField {
                                 base: ComponentBase::SelfField,
@@ -3190,7 +3647,10 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(schema) = comp.field(&field) {
-                        if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) {
+                        if matches!(
+                            schema.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_component_activation(
                                 &path[0],
                                 head_cid,
@@ -3340,18 +3800,14 @@ impl super::FuncBuilder<'_> {
         // path (`sub : Relay active`). The post-walk check below is the
         // honest form of the same question: it asks whether the resolved
         // TARGET requires a mode and lacks one.
-        let resolved = crate::ir::resolve_component_path_mode(
-            &self.ctx.components,
-            head,
-            inherited,
-            segs,
-        )
-        .map_err(|err| match err {
-            crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
-                unsupported(&err.to_string(), "")
-            }
-            _ => LowerError::Invalid(err.to_string()),
-        })?;
+        let resolved =
+            crate::ir::resolve_component_path_mode(&self.ctx.components, head, inherited, segs)
+                .map_err(|err| match err {
+                    crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
+                        unsupported(&err.to_string(), "")
+                    }
+                    _ => LowerError::Invalid(err.to_string()),
+                })?;
         let target = &self.ctx.components[resolved.component.index()];
         if matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
             && target.requires_instance_mode()
@@ -3365,12 +3821,11 @@ impl super::FuncBuilder<'_> {
                 "transactor path `{path}` has no effective active/passive mode"
             )));
         }
-        Ok(matches!(
-            target.kind,
-            crate::ir::ComponentKindTag::Transactor
+        Ok(
+            matches!(target.kind, crate::ir::ComponentKindTag::Transactor)
+                .then_some(resolved.effective_mode)
+                .flatten(),
         )
-        .then_some(resolved.effective_mode)
-        .flatten())
     }
 
     /// The mode context a TEST-SCOPE binding name carries (`env.mon.x`,
@@ -3669,6 +4124,33 @@ impl super::FuncBuilder<'_> {
                         ));
                     }
                 }
+                // The arity check the test-scope `let e : event<T>`
+                // branch below has had all along, missing here and at
+                // the self-relative site. Measured at both, on both
+                // backends: `emit tagger.in_ev(i + 1, 2)` makes TB-IR
+                // emit `_s((i + 1), 2)` against a
+                // `std::function<void(uint64_t)>` — g++: "no match for
+                // call to '(std::function<void(long unsigned int)>)
+                // (int, int)'" — while v1 emits `_s(i + 1)`, silently
+                // dropping the extra payload. Under-supply is
+                // uncompilable under both. So no backend runs the
+                // program as written, and `Invalid` is the verdict the
+                // sibling branch already gives it.
+                //
+                // `Invalid` refuses outright, so the arity rule was
+                // checked against v1 rather than read off the spec.
+                // Both `in_ev : event` (no type argument) and
+                // `in_ev : event<uint<8>, uint<8>>` pass `harc check`,
+                // and v1 emits `std::function<void(uint64_t)>` for
+                // both: one payload slot however the field is spelled.
+                // There is no other arity to be right about.
+                if args.len() != 1 {
+                    return Err(LowerError::Invalid(format!(
+                        "`emit {}` carries {} argument(s); an event payload is exactly one",
+                        path_str(name),
+                        args.len()
+                    )));
+                }
                 let lowered = self.lower_component_call_args(args, None)?;
                 self.push(IrStmt::ComponentEmit {
                     base: ComponentBase::Path(recv),
@@ -3761,6 +4243,14 @@ impl super::FuncBuilder<'_> {
                 ));
             }
         }
+        // Same missing arity check as the path form above; see the
+        // measurement there.
+        if args.len() != 1 {
+            return Err(LowerError::Invalid(format!(
+                "`emit {event}` carries {} argument(s); an event payload is exactly one",
+                args.len()
+            )));
+        }
         let lowered = self.lower_component_call_args(args, None)?;
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
@@ -3770,11 +4260,41 @@ impl super::FuncBuilder<'_> {
         Ok(())
     }
 
+    /// Whether the receiver's own declaration beats the built-in
+    /// predicate of the same name. The built-ins are a DEFAULT, not a
+    /// reserved word: a component that declares `hookable idle(n)`
+    /// means its own method, and v1 has said so since before TB-IR
+    /// existed — both `resolve_component_idle_predicate` and
+    /// `resolve_component_quiesced_predicate` return `None` on a
+    /// declared hookable of the same name — `resolve_component_idle_predicate`
+    /// naming the shipped `buf_mgr_test` fixture as the reason, and
+    /// `resolve_component_quiesced_predicate` doing it through
+    /// `component_has_hookable`.
+    ///
+    /// TB-IR had no such guard, and `as_component_idle` runs BEFORE
+    /// component-method resolution, so the heartbeat won every time.
+    /// Measured on an `agent Calc` with `hookable idle(n) -> uint<32>`
+    /// returning 7, against `assert c.idle(2) == 7`:
+    ///
+    /// * v1 — `if (!(Calc_idle(c, 2) == 7))`: the method runs, the
+    ///   assertion holds.
+    /// * TB-IR, before this guard — `if (!((((cycle_count -
+    ///   c._last_in_cycle) >= 2) && ((cycle_count - c._last_out_cycle)
+    ///   >= 2)) == 7))`: the heartbeat runs, the assertion fails.
+    ///
+    /// Both compile and run, and they disagree — the worst shape a
+    /// divergence takes, and the reason this is a fix rather than a
+    /// classification.
+    fn user_override_wins(&self, cid: ComponentId, method: &str) -> bool {
+        self.ctx.components[cid.index()].method(method).is_some()
+    }
+
     /// Lower `<comp>.idle(N)` / `.idle_in(N)` / `.idle_out(N)` to an
     /// `Expr::ComponentIdle` when the callee resolves to a component
     /// instance path. Returns `None` when the callee is not an idle
     /// predicate on a known component (caller falls through to other
-    /// call-lowering paths).
+    /// call-lowering paths), and — see `user_override_wins` — when the
+    /// receiver's component declares a method of that name itself.
     pub(crate) fn as_component_idle(
         &mut self,
         callee: &AstExpr,
@@ -3802,7 +4322,10 @@ impl super::FuncBuilder<'_> {
         };
         // Walk sub-component segments to confirm the path resolves to a
         // component (the idle stamps live on every component struct).
-        self.resolve_component_recv(head_cid, &path[1..])?;
+        let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        if self.user_override_wins(recv_cid, &name.name) {
+            return Ok(None);
+        }
         if args.len() != 1 {
             return Err(unsupported(
                 &format!("`{}(...)` with {} arguments", name.name, args.len()),
@@ -3870,6 +4393,9 @@ impl super::FuncBuilder<'_> {
         // Resolve the receiver to its component (errors if a mid-path
         // segment is not a sub-component).
         let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        if self.user_override_wins(recv_cid, &name.name) {
+            return Ok(None);
+        }
         if args.len() != 1 {
             return Err(unsupported(
                 &format!("`quiesced(...)` with {} arguments", args.len()),

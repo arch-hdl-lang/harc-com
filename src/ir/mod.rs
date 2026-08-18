@@ -547,6 +547,11 @@ pub struct TransactorMethodSchema {
     pub param_names: Vec<String>,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
+    /// True only when the source declaration used `hookable` rather than
+    /// plain `function`. Both forms share the same method-body IR, but only
+    /// a hookable method may be targeted by `on ... pre/post` handlers or
+    /// hook-triggered covergroups.
+    pub hookable: bool,
     /// True when this method is declared inside the transactor's `when
     /// active` block (as opposed to the always-on body). A method that is
     /// active-only is NOT callable on a `passive` instance — the call site
@@ -1029,10 +1034,20 @@ pub struct ResolvedComponentPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentPathResolutionError {
     MissingComponent(ComponentId),
-    NotSubcomponent { component: String, segment: String },
-    StructuralMode { kind: ComponentKindTag, segment: String },
-    UnresolvedMode { path: String },
-    ForbiddenActiveMode { path: String },
+    NotSubcomponent {
+        component: String,
+        segment: String,
+    },
+    StructuralMode {
+        kind: ComponentKindTag,
+        segment: String,
+    },
+    UnresolvedMode {
+        path: String,
+    },
+    ForbiddenActiveMode {
+        path: String,
+    },
 }
 
 impl std::fmt::Display for ComponentPathResolutionError {
@@ -1043,10 +1058,17 @@ impl std::fmt::Display for ComponentPathResolutionError {
                 write!(f, "`{segment}` is not a sub-component of `{component}`")
             }
             Self::StructuralMode { kind, segment } => {
-                write!(f, "a transactor mode on {} field `{segment}`", kind.keyword())
+                write!(
+                    f,
+                    "a transactor mode on {} field `{segment}`",
+                    kind.keyword()
+                )
             }
             Self::UnresolvedMode { path } => {
-                write!(f, "transactor path `{path}` has no effective active/passive mode")
+                write!(
+                    f,
+                    "transactor path `{path}` has no effective active/passive mode"
+                )
             }
             Self::ForbiddenActiveMode { path } => write!(
                 f,
@@ -1071,11 +1093,12 @@ pub fn resolve_component_path_mode(
         let schema = components
             .get(component.index())
             .ok_or(ComponentPathResolutionError::MissingComponent(component))?;
-        let field = schema.field(segment).ok_or_else(|| {
-            ComponentPathResolutionError::NotSubcomponent {
+        let field =
+            schema
+                .field(segment)
+                .ok_or_else(|| ComponentPathResolutionError::NotSubcomponent {
                 component: schema.name.clone(),
                 segment: segment.clone(),
-            }
         })?;
         let ComponentFieldKind::Sub {
             component: child,
@@ -1176,9 +1199,9 @@ pub fn validate_component_binding_modes(
 
     let mut visited = std::collections::HashSet::new();
     for binding in bindings {
-        let schema = components
-            .get(binding.component.index())
-            .ok_or(ComponentPathResolutionError::MissingComponent(binding.component))?;
+        let schema = components.get(binding.component.index()).ok_or(
+            ComponentPathResolutionError::MissingComponent(binding.component),
+        )?;
         if matches!(
             schema.instance_mode_policy,
             ComponentInstanceModePolicy::AlwaysOnAnalysisMonitor
@@ -1241,6 +1264,9 @@ pub struct ComponentFieldSchema {
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
     Scalar { ty: IrType, default: u64 },
+    /// `current : Sample` — a value-record held as persistent host-side
+    /// component/transactor state.
+    Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is a scalar ≤ 64 bits or a value-record (`elem`
     /// selects the C element type). Manipulated through the component-queue

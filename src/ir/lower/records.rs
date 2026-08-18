@@ -32,6 +32,170 @@ use crate::ast::{
 use crate::ir::{IrType, RecordFieldSchema, RecordId, RecordSchema};
 use std::collections::HashMap;
 
+/// A record field whose leaf type TB-IR does not model. The arm serves
+/// a dozen shapes and they take THREE different verdicts, decided by
+/// what v1 does with the leaf rather than by the type name:
+///
+/// | field type | v1 emits | verdict |
+/// |---|---|---|
+/// | `uint<65>` … `uint<256>` | `_harc_u128` / `harc_rt::HarcWide<n>`, with a matching draw | a real escape hatch |
+/// | `list<uint<8>>`, `list<uint<256>>`, `list<bool>` | `std::vector<T>` + resize + per-element draw | likewise |
+/// | `Vec<uint, 4>`, `Vec<uint<128>, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | likewise |
+/// | `list<Vec<uint<8>, 2>>` | `std::vector<std::array<uint64_t, 2>>` — then `[_i] = 0` | `EmitsUncompilable` |
+/// | `list<Inner>`, `list<string>` | `std::vector<uint64_t>`, and randomize skips the field | `SilentlyMisLowers` |
+/// | `list<queue<uint<8>>>`, `list<int>` | `std::vector<uint64_t>` + `[_i] = 0` | `SilentlyMisLowers` |
+/// | `Vec<queue<uint<8>>, 4>` | `std::array<uint64_t, 4>` — array survives, element does not | `SilentlyMisLowers` |
+/// | `Vec<string, 4>`, `Vec<uint<8>, N>` | `uint64_t` — the whole array collapsed | `SilentlyMisLowers` |
+/// | `queue<uint<8>>` / `string` / `event<T>` / `object` | a bare scalar | `SilentlyMisLowers` |
+///
+/// Every row is decided by the member type `txn_field_c_type` picks and
+/// the draw `emit_field_random` writes, so this asks THOSE —
+/// `cpp_tb::record_leaf_fate` sits next to both and recurses through
+/// the same `list_elem_type` / `fixed_vec_type_args` helpers. Three
+/// versions of this arm got it wrong by restating the rules instead:
+/// one `queue` probe generalised to everything denied `list` its
+/// working hatch; a hand-written type table called a 128-bit field a
+/// flattening and `list<Inner>` a working hatch, both backwards; and
+/// neither noticed that `list<Vec<…>>` makes v1's output stop
+/// compiling.
+/// A scalar leaf whose width slot holds something this compiler cannot
+/// read as a plain decimal — a non-decimal literal (`uint<0x8>`,
+/// `uint<0b1000>`) or a named constant (`uint<W>` against
+/// `const W = 8`).
+///
+/// v1 cannot read it either, but it does not say so — it substitutes a
+/// DIFFERENT fallback in each place that needs the width, so the field
+/// means three things at once. Measured on `uint<0x8>` against `uint<8>`:
+///
+/// | site | `uint<8>` | `uint<0x8>` |
+/// |---|---|---|
+/// | pack | `harc_wide_write_bits(_packed, 0, 8, …)` | `…, 0, 64, …` |
+/// | unpack | `harc_bits(_packed, 7, 0)` | `harc_bits(_packed, 63, 0)` |
+/// | randomize | `harc_rng_uint(harc_rng_next, 8)` | `…, 32)` |
+/// | problem table | `field data u8` | `field data u8` |
+///
+/// `uint<W>` behaves identically — v1 does not fold the constant into
+/// the width either, and packs 64 while drawing 32.
+///
+/// It compiles and runs. That is a silent mis-lowering, so the leaf
+/// must not carry a `--codegen v1` suggestion even though its MEMBER
+/// type (`uint64_t`) is one v1 gets right.
+fn unreadable_width_leaf(ty: &TypeExpr) -> bool {
+    let TypeExpr::Builtin { name, args, .. } = ty else {
+        return false;
+    };
+    if matches!(name, BuiltinTy::Vec) {
+        // The element carries the width, and v1 substitutes the same
+        // fallbacks per element: `Vec<uint<0x8>, 4>` packs four 64-bit
+        // slots where `Vec<uint<8>, 4>` packs four 8-bit ones.
+        return matches!(args.first(), Some(TypeArg::Type(elem)) if unreadable_width_leaf(elem));
+    }
+    // Only a builtin that HAS a width slot. `queue<T>` / `event<T>` /
+    // `list<T>` take a payload in that position, and a RECORD payload
+    // arrives as `TypeArg::Expr(Ident)` — the shape this arm otherwise
+    // reads as an unreadable width. `cpp_tb.rs`'s own comment says so
+    // ("`event<RegOp>` parses as `TypeArg::Expr(Ident)` at the type-arg
+    // layer") and so does `fixed_vec_field`'s NOTE, so the set is
+    // copied from `scalar_leaf_c_type` rather than inferred from the
+    // argument shape.
+    if !matches!(
+        name,
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::Bits
+            | BuiltinTy::Int
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+    ) {
+        return false;
+    }
+    matches!(args.first(), Some(TypeArg::Expr(_))) && declared_scalar_width(args).is_none()
+}
+
+fn non_scalar_record_leaf(
+    kind: &str,
+    owner: &str,
+    fname: &str,
+    ty: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> LowerError {
+    use crate::codegen::cpp_tb::RecordLeafFate;
+    const SUBSET: &str = "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
+                          `Vec<T, N>` arrays of such scalars or of supported \
+                          struct/transaction records, and nested struct/transaction fields \
+                          (whose leaves are themselves supported) are lowered";
+    let what = format!(
+        "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) leaf type `{}`",
+        type_expr_label(ty)
+    );
+    if unreadable_width_leaf(ty) {
+        return not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; a width must be a plain decimal literal — v1 cannot read this \
+                 one either and silently substitutes a different fallback in the pack, \
+                 the unpack and the random draw"
+            ),
+            V1Status::SilentlyMisLowers,
+        );
+    }
+    match crate::codegen::cpp_tb::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
+        RecordLeafFate::Models => unsupported(&what, SUBSET),
+        RecordLeafFate::Flattens => not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; v1 flattens the field to a plain scalar and runs, so it means \
+                 something other than what was written"
+            ),
+            V1Status::SilentlyMisLowers,
+        ),
+        RecordLeafFate::Uncompilable => not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; v1 keeps the container but has no per-element draw for the \
+                 element, so its randomize body assigns `0` to a `std::array` and the \
+                 emitted C++ does not compile"
+            ),
+            V1Status::EmitsUncompilable,
+        ),
+    }
+}
+
+/// A field `default` written as an integer literal this compiler cannot
+/// read — a Verilog-style sized literal, or a value past `u64`. The two
+/// take opposite verdicts, and the line between them is the VALUE, not
+/// the spelling: v1 folds a sized literal through
+/// `cpp_tb::normalized_int_literal` and pastes the result into a member
+/// TB-IR only ever gives 64 bits.
+///
+/// | default | v1 emits | outcome |
+/// |---|---|---|
+/// | `4'd3` | `uint64_t a = 3;` | folds correctly — a real escape hatch |
+/// | `8'hFF` | `uint64_t a = 0xFF;` | likewise |
+/// | `128'hFFFFFFFFFFFFFFFFFFFF` | `(((_harc_u128)0xFFFFULL << 64) \| …)` | `-Woverflow`, truncates to 64 bits |
+/// | `99999999999999999999999` | the literal verbatim | `-Woverflow`, truncates |
+///
+/// So the guard normalizes exactly as v1 does and asks whether the
+/// result fits — splitting on the apostrophe, which is what this did
+/// first, puts the wide-hex row on the wrong side.
+fn record_default_literal(kind: &str, owner: &str, fname: &str, lit: &str) -> LowerError {
+    let what = format!("{kind} field default `{owner}.{fname} default {lit}`");
+    let normalized = crate::codegen::cpp_tb::normalized_int_literal(lit);
+    if super::exprs::parse_int_literal(&normalized).is_some() {
+        return unsupported(
+            &what,
+            "TB-IR does not lower sized literals yet; v1 folds this one to the same value",
+        );
+    }
+    not_implemented(
+        &what,
+        "the value does not fit the 64-bit member either backend gives this field; v1 \
+         folds it in anyway — verbatim for a decimal, as a `_harc_u128` composite for a \
+         wide hex — and g++ truncates it to the low 64 bits with only a warning",
+        V1Status::SilentlyMisLowers,
+    )
+}
+
 pub(crate) fn lower_transaction(
     t: &TransactionDecl,
     enum_names: &std::collections::HashSet<String>,
@@ -89,9 +253,42 @@ pub(crate) fn lower_transaction(
                 keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
-                return Err(unsupported(
+                // This arm has now been measured three times and the
+                // first two both looked at one shape each.
+                //
+                // Round one probed a program with `wait 1 cycle` for a
+                // run body. With no `randomize` there is no solve site
+                // for a guard to appear in, so it concluded v1 drops the
+                // guard — right label, no evidence.
+                //
+                // Round two added `randomize(q)` and found v1 emitting
+                // `if (q.op == 1) { … q.addr = _val_addr; }` — the guard
+                // honoured — and flipped the arm to a real escape hatch.
+                // That is true of the DIRECT shape only.
+                //
+                // Round three is the shape round two's own comment named
+                // and did not run. Put the subtype inside another record
+                // (`transaction Outer { tag : uint<8>; inner : Req }`)
+                // and randomize the OUTER one, and v1 reaches `Req`
+                // through `static void randomize_Req(Req*)`:
+                //
+                //     t->op   = harc_rng_uint(harc_rng_next, 8);
+                //     t->addr = harc_rng_uint(harc_rng_next, 16);
+                //
+                // No guard — `op == 1` appears zero times in the whole
+                // file — and the solver's problem table lists `tag` and
+                // `inner.op` but not `inner.addr`, so the conditional
+                // field is not in the solve at all. It compiles and
+                // runs.
+                //
+                // An arm's status is the worst thing v1 does anywhere
+                // under it, and that is this.
+                return Err(not_implemented(
                     &format!("`when` subtype blocks in transaction `{txn}`"),
-                    "",
+                    "v1 honours the guard when the transaction is randomized directly, but \
+                     reaches a NESTED one through an unconditional `randomize_<T>` that \
+                     drops the guard and leaves the conditional field out of the solve",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -146,15 +343,32 @@ pub(crate) fn lower_struct(
         match item {
             TxnBodyItem::Field(_) => {}
             TxnBodyItem::Keep(_) => {
+                // A real escape hatch. The absence of a randomize
+                // METADATA entry for a struct — which is what the first
+                // pass measured — says nothing about the solver: with
+                // `randomize(r)` in the run body v1 emits
+                // `_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)))`
+                // directly into the generated solver lambda, right
+                // under the field's own width bound.
                 return Err(unsupported(
                     &format!("`keep` constraints in struct `{sname}`"),
-                    "constraint metadata lands with `randomize`",
+                    "only the structural (field) subset of a struct lowers; v1 emits the \
+                     constraint into the solver",
                 ));
             }
             TxnBodyItem::When(_) => {
-                return Err(unsupported(
+                // Measured: v1's `struct Rec` is BYTE-IDENTICAL to the
+                // same struct without the `when` block — the
+                // conditional field is dropped entirely. Reading it
+                // (`r.b`) then fails to compile ("'struct Rec' has no
+                // member named 'b'"), but a program that only declares
+                // it loses a field silently, and that is the worse of
+                // the two.
+                return Err(not_implemented(
                     &format!("`when` subtype blocks in struct `{sname}`"),
-                    "",
+                    "v1 drops the conditional fields from the struct entirely — a program \
+                     that declares one and never reads it loses it with no diagnostic",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -186,6 +400,35 @@ fn lower_record_field(
             "{kind} `{owner}` declares field `{fname}` more than once"
         )));
     }
+    if zero_width_leaf(&f.ty) {
+        // NOT `Invalid`, and the reason is a lesson about the whole
+        // sweep. The first version rested on v1 PANICKING here —
+        // "attempt to subtract with overflow" in `emit_unpack_bits`,
+        // reached from `emit_record_pack_helpers`. That panic is a
+        // DEBUG-BUILD artifact: Rust turns integer overflow checks off
+        // under `--release`, which is how CI builds and how the `harc`
+        // binary ships. In release v1 does not panic at all — it emits
+        // a complete testbench that compiles clean:
+        //
+        //   uint<0>          uint64_t data = 0;
+        //                    harc_wide_write_bits(_packed, 0, 0, value.data)
+        //   Vec<uint<0>, 4>  std::array<uint64_t, 4> data = {};
+        //                    …the same zero-width write, per element
+        //
+        // So the field is a full 64-bit member that carries no packed
+        // bits, silently. `Invalid` claims no backend runs it in any
+        // configuration, and a release-built v1 runs it.
+        return Err(not_implemented(
+            &format!(
+                "{kind} `{owner}` field `{fname}` has a zero-width type; \
+                 a scalar width must be greater than zero"
+            ),
+            "v1 emits a full-width member for it that carries no packed bits — a debug \
+             build panics on the width arithmetic, but a release build, which is how it \
+             ships, compiles and runs",
+            V1Status::SilentlyMisLowers,
+        ));
+    }
     // A nested-record field: the field's type names another transaction or
     // struct. Lower it to `IrType::Record(rid)` with `vec_len = None` — a
     // real C++ struct member (v1 parity), so copy / `==` / pack recurse
@@ -197,9 +440,15 @@ fn lower_record_field(
     // `std::array<Inner, N>` member).
     if let Some(rid) = named_record_id(&f.ty, record_ids) {
         if f.default.is_some() {
-            return Err(unsupported(
+            // v1 emits the initializer straight into the member:
+            // `Inner i = 0;`, which g++ rejects — "could not convert
+            // '0' from 'int' to 'Inner'". Measured with `-std=gnu++20`,
+            // the standard `src/main.rs` builds with.
+            return Err(not_implemented(
                 &format!("a `default` on the nested-record field `{owner}.{fname}`"),
-                "a record-typed field defaults to its own field defaults",
+                "a record-typed field defaults to its own field defaults; v1 emits \
+                 `Inner i = 0;` and g++ rejects the conversion",
+                V1Status::EmitsUncompilable,
             ));
         }
         let mut attr_src = Vec::with_capacity(f.attrs.len());
@@ -227,28 +476,23 @@ fn lower_record_field(
     let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids) {
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
-            let scalar = field_ir_type(&f.ty, enum_names).ok_or_else(|| {
-                unsupported(
-                    &format!(
-                        "{kind} field `{owner}.{fname}` with an unsupported (non-scalar) \
-                         leaf type `{}`",
-                        type_expr_label(&f.ty)
-                    ),
-                    "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
-                     `Vec<T, N>` arrays of such scalars or of supported \
-                     struct/transaction records, and nested struct/transaction \
-                     fields (whose leaves are themselves supported) are lowered",
-                )
-            })?;
+            let scalar = field_ir_type(&f.ty, enum_names)
+                .ok_or_else(|| non_scalar_record_leaf(kind, owner, fname, &f.ty, record_ids))?;
             (scalar, None)
         }
     };
     // A `Vec<T, N>` field has no scalar `default <lit>` form (its zero
     // value is the empty-brace array); reject a literal default on one.
     if vec_len.is_some() && f.default.is_some() {
-        return Err(unsupported(
+        // Same shape as the nested-record default: v1 emits
+        // `std::array<uint64_t, 4> v = 0;` and g++ rejects it —
+        // "could not convert '0' from 'int' to
+        // 'std::array<long unsigned int, 4>'".
+        return Err(not_implemented(
             &format!("a `default` on the `Vec` field `{owner}.{fname}`"),
-            "Vec record fields default to a zero-filled array",
+            "Vec record fields default to a zero-filled array; v1 emits \
+             `std::array<T, N> v = 0;` and g++ rejects the conversion",
+            V1Status::EmitsUncompilable,
         ));
     }
     // Folded through the file's constant table, like the component /
@@ -261,12 +505,8 @@ fn lower_record_field(
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s).ok_or_else(|| {
-                unsupported(
-                    &format!("{kind} field default `{owner}.{fname} default {s}`"),
-                    "not a plain integer literal",
-                )
-            })?,
+            ExprKind::Int(s) => super::exprs::parse_int_literal(s)
+                .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
             ExprKind::Bool(b) => *b as u64,
             _ => super::components::fold_field_default(
                 d,
@@ -363,10 +603,70 @@ fn fixed_vec_field(
     }
 }
 
+/// A zero-width scalar (`uint<0>`) in a field's own type, or under a
+/// `Vec` element. Those are the shapes whose width arithmetic v1 gets
+/// wrong; nothing else here belongs to this arm, and the first version
+/// reached much further:
+///
+/// | field | v1 | |
+/// |---|---|---|
+/// | `uint<0>`, `sint<0>`, `bits<0>` | a full-width member packed at width 0 (a DEBUG build panics in `emit_unpack_bits`; release does not) | `SilentlyMisLowers` |
+/// | `Vec<uint<0>, 4>` | the same, per element | `SilentlyMisLowers` |
+/// | `list<uint<0>>`, `queue<uint<0>>`, `event<uint<0>>` | `std::vector<uint64_t>` / `uint64_t`, and it COMPILES | not this arm's business |
+/// | `uint<0x0>`, `uint<0b0>` | `uint64_t data = 0;`, and it COMPILES | likewise |
+///
+/// The `list`/`queue`/`event` rows were `Invalid` because this recursed
+/// through every `TypeArg::Type`, including a payload argument v1 never
+/// reads a width from. The hex and binary rows were `Invalid` because
+/// this read the width with `parse_int_literal_expr`, which understands
+/// `0x`/`0b`, while v1's `int_width_from_args` and TB-IR's own
+/// `field_ir_type` both do a plain decimal `parse::<u32>()` — so `0x0`
+/// is not a width to either of them and both fall back to 64 bits. The
+/// rule was already written down twice and got reconstructed a third
+/// time; it now reads through `declared_scalar_width`, which IS
+/// `field_ir_type`'s reader.
+///
+/// Only the WIDTH slot counts: `Vec<uint<8>, 0>` is a zero-LENGTH
+/// array, which v1 emits as `std::array<uint64_t, 0>` and g++ accepts.
+fn zero_width_leaf(ty: &TypeExpr) -> bool {
+    match ty {
+        // A named generic list (`list<T>`) carries no width slot, and v1
+        // does not panic on a zero-width payload under one.
+        TypeExpr::Named { .. } => false,
+        TypeExpr::Builtin { name, args, .. } => {
+            if matches!(name, BuiltinTy::Vec) {
+                // `Vec`'s first argument is its element; the second is a
+                // length, not a width.
+                return matches!(args.first(), Some(TypeArg::Type(elem)) if zero_width_leaf(elem));
+            }
+            // A `queue<T>` / `event<T>` payload is not a width slot
+            // either, so only this type's own first argument is read.
+            declared_scalar_width(args) == Some(0)
+        }
+    }
+}
+
+/// The declared bit width in a scalar builtin's type arguments, read the
+/// way BOTH backends read it: a plain decimal integer literal with
+/// underscores stripped. v1's `int_width_from_args` / `type_arg_width`
+/// do exactly this, so `uint<0x0>` has no width to either backend and
+/// falls back to 64 bits rather than being a zero-width type.
+fn declared_scalar_width(args: &[TypeArg]) -> Option<u32> {
+    match args.first() {
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Scalar field-type mapping, mirroring v1's `txn_field_c_type` C-type
 /// choices for the ≤64-bit subset: uint/bits/int → unsigned, sint →
 /// signed, bool/bit → bool. `None` for anything this slice does not
-/// lower (nested records, enums, lists, vecs, >64-bit widths).
+/// lower (nested records, enums, lists, vecs, >64-bit widths), and for
+/// a width this compiler cannot read as a plain decimal — the same
+/// reader `zero_width_leaf` uses, so the two cannot drift.
 fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         // Enum-typed field: v1 lowers it to an `int64_t` struct member
@@ -381,10 +681,7 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
         return None;
     };
     let width = match args.first() {
-        Some(TypeArg::Expr(e)) => match &*e.kind {
-            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
-            _ => return None,
-        },
+        Some(TypeArg::Expr(_)) => Some(declared_scalar_width(args)?),
         Some(_) => return None,
         None => None,
     };

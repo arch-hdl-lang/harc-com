@@ -250,12 +250,22 @@ impl FuncBuilder<'_> {
             } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
                 && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
             {
-                return Err(unsupported(
+                // v1 emits the call against a lambda typed on the
+                // MODULE — `auto touch = [&](VTop* d) -> uint64_t` —
+                // and passes whatever was written: `touch(m)` with `m`
+                // a component gives "no match for call to
+                // `<lambda(VTop*)>` (Model&)". Measured with
+                // `-std=gnu++20`, the standard `src/main.rs` builds
+                // with; the DUT-argument spelling compiles clean, so
+                // the arm is specifically about the other one.
+                return Err(not_implemented(
                     &format!(
                         "helper parameter `{}` of module type with a non-DUT argument",
                         p.name.name
                     ),
-                    "",
+                    "v1 types the emitted lambda on the module and passes the argument \
+                     through, so g++ rejects the call",
+                    V1Status::EmitsUncompilable,
                 ));
             } else {
                 bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
@@ -428,12 +438,19 @@ impl FuncBuilder<'_> {
             } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
                 && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
             {
-                return Err(unsupported(
+                // The testbench-method sibling of the helper arm
+                // above, measured on its own rather than inferred from
+                // it: v1 emits `Tb_peek(_tb, _tb.m)` against
+                // `[&](Tb& self, VTop* d)` and g++ gives "no match for
+                // call to `<lambda(Tb&, VTop*)>` (Tb&, Model&)".
+                return Err(not_implemented(
                     &format!(
                         "testbench method parameter `{}` of module type with a non-DUT argument",
                         p.name.name
                     ),
-                    "",
+                    "v1 types the emitted lambda on the module and passes the argument \
+                     through, so g++ rejects the call",
+                    V1Status::EmitsUncompilable,
                 ));
             } else {
                 bound.push(Bound::Val(self.lower_expr_no_ports(e)?));

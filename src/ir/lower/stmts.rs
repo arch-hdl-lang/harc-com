@@ -55,7 +55,9 @@ fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHand
     };
     if let Some(xid) = b.ctx.transactor_fields.get(field) {
         let x = &b.ctx.transactors[xid.index()];
-        return x.methods.iter().any(|m| m.name == *method);
+        return x.methods
+            .iter()
+            .any(|m| m.name == *method && m.hookable);
     }
     b.ctx
         .component_fields
@@ -301,15 +303,18 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("testbench queue `{field}`"),
+                                args,
+                            )?;
                             let elem = self.tb_queue_elem(&field)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::TbQueuePop { field, dest });
                             return Ok(());
                         }
-                        return Err(not_implemented(
-                            &format!("testbench queue method `{field}.{method}(...)` in statement position"),
-                            "only `push`/`pop`/`size`/`empty` are lowered",
-                            V1Status::EmitsUncompilable,
+                        return Err(queue_method_in_statement_position(
+                            &format!("testbench queue method `{field}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -360,6 +365,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("scoreboard queue `{field}.{queue}`"),
+                                args,
+                            )?;
                             let elem = self.scoreboard_queue_elem(sb, &queue)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::ScoreboardOp {
@@ -370,12 +379,9 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "scoreboard queue method `{field}.{queue}.{method}(...)` in \
-                                      statement position"
-                            ),
-                            "",
+                        return Err(queue_method_in_statement_position(
+                            &format!("scoreboard queue method `{field}.{queue}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -396,17 +402,18 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("component queue `{queue}`"),
+                                args,
+                            )?;
                             let elem = self.component_queue_elem(&base, &queue)?;
                             let dest = self.discard_slot(elem);
                             self.push(Stmt::ComponentQueuePop { base, queue, dest });
                             return Ok(());
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "component queue method `{queue}.{method}(...)` in statement \
-                                 position"
-                            ),
-                            "",
+                        return Err(queue_method_in_statement_position(
+                            &format!("component queue method `{queue}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -431,6 +438,10 @@ impl FuncBuilder<'_> {
                             return Ok(());
                         }
                         if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{field}`"),
+                                args,
+                            )?;
                             let crate::ir::StateFieldKind::Queue { elem } =
                                 self.target_state_fields[&field].clone()
                             else {
@@ -444,13 +455,9 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(not_implemented(
-                            &format!(
-                                "target-state queue method `{field}.{method}(...)` in statement \
-                                 position"
-                            ),
-                            "only `push`/`pop`/`size`/`empty` are lowered",
-                            V1Status::EmitsUncompilable,
+                        return Err(queue_method_in_statement_position(
+                            &format!("target-state queue method `{field}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -479,6 +486,10 @@ impl FuncBuilder<'_> {
                                     return Ok(());
                                 }
                                 if method == "pop" {
+                                    queue_pop_takes_no_arguments(
+                                        &format!("target-state queue `{instance}.{field}`"),
+                                        args,
+                                    )?;
                                     let crate::ir::StateFieldKind::Queue { elem } = kind else {
                                         unreachable!("the enclosing `matches!` gated on Queue");
                                     };
@@ -490,13 +501,12 @@ impl FuncBuilder<'_> {
                                     });
                                     return Ok(());
                                 }
-                                return Err(not_implemented(
+                                return Err(queue_method_in_statement_position(
                                     &format!(
-                                        "target-state queue method `{instance}.{field}.{method}\
-                                         (...)` in statement position"
+                                        "target-state queue method \
+                                         `{instance}.{field}.{method}(...)`"
                                     ),
-                                    "only `push`/`pop`/`size`/`empty` are lowered",
-                                    V1Status::EmitsUncompilable,
+                                    &method,
                                 ));
                             }
                         }
@@ -674,9 +684,10 @@ impl FuncBuilder<'_> {
         // `let v = _tb.pending.pop()` on a testbench-owned queue. This
         // precedes the generic scalar/record let paths so record-element
         // pops retain their record type.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((field, method)) = self.as_tb_queue_call(call) {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("testbench queue `{field}`"), args)?;
                     let elem = self.tb_queue_elem(&field)?;
                     let id = self.declare(&l.name.name);
                     match elem {
@@ -704,9 +715,10 @@ impl FuncBuilder<'_> {
         // which the record-local block below rejects). The popped local's
         // type comes from the queue element (record id from the field, or a
         // scalar width from the optional `let` annotation).
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((base, queue, method)) = self.as_component_queue_call(call)? {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("component queue `{queue}`"), args)?;
                     let elem = self.component_queue_elem(&base, &queue)?;
                     let id = self.declare(&l.name.name);
                     match elem {
@@ -767,9 +779,10 @@ impl FuncBuilder<'_> {
         // component/scoreboard pops above: a record-element pop is a
         // record-typed let WITH an initializer. The popped local's type
         // comes from the queue element.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let Some((field, method)) = self.as_state_queue_call(call) {
                 if method == "pop" {
+                    queue_pop_takes_no_arguments(&format!("target-state queue `{field}`"), args)?;
                     let crate::ir::StateFieldKind::Queue { elem } =
                         self.target_state_fields[&field].clone()
                     else {
@@ -802,11 +815,15 @@ impl FuncBuilder<'_> {
         // `let v = target.pending.pop()` — TEST-SCOPE pop on a bound-to
         // responder queue state field (fully resolved instance). Same
         // ordering rationale as the responder-body state-queue pop above.
-        if let Some(call) = pop_call_callee(&l.value) {
+        if let Some((call, args)) = pop_call_parts(&l.value) {
             if let ExprKind::Field { target, name } = &*call.kind {
                 if name.name == "pop" {
                     if let Some((instance, field, kind)) = self.as_transactor_state_any(target) {
                         if let crate::ir::StateFieldKind::Queue { elem } = kind {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{instance}.{field}`"),
+                                args,
+                            )?;
                             let id = self.declare(&l.name.name);
                             match elem {
                                 crate::ir::QueueElem::Record(rid) => {
@@ -830,6 +847,38 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
+            }
+        }
+        // A `let` whose declared type names a REGBLOCK or ADDRMAP is an
+        // instantiation, and an instantiation without `= bind <helper>`
+        // has no bus for its registers to reach. v1 states that rule and
+        // refuses to emit at all — "regblock instantiation requires
+        // `= bind <helper>` (a transactor with write/read methods)" —
+        // for every spelling: at test scope, inside `run`, with no
+        // initializer, and with a same-typed mirror on the right.
+        //
+        // This ran BEFORE the record arm below because a regblock's
+        // mirror record shares the regblock's name, so without the guard
+        // the let landed on the ordinary record-local path and lowered
+        // clean. The emitted testbench then served every register access
+        // from that mirror and issued NO bus traffic at all: the control
+        // emits `AxilHelper_write(40, 64); v = AxilHelper_read(40);` and
+        // the unbound one emits `v = regs.MM2S_LEN;`. The test passes
+        // without ever touching the DUT.
+        //
+        // A properly bound `let regs : R = bind <helper>` never reaches
+        // here — the test-item walk in `mod.rs` consumes it — and a
+        // `= bind` written in statement position is rejected on its own
+        // before this. Divergence 104.
+        if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
+            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            if self.ctx.regblock_instance_types.contains(simple) {
+                return Err(LowerError::Invalid(format!(
+                    "`let {} : {simple}` instantiates a register block without a bus: a \
+                     regblock/addrmap instantiation requires `= bind <helper>` (a \
+                     transactor with write/read methods)",
+                    l.name.name
+                )));
             }
         }
         // Record-typed local: `let t : TxnType` default-constructs (v1
@@ -860,21 +909,41 @@ impl FuncBuilder<'_> {
                             self.as_component_method_call(callee)?
                         {
                             let comp = &self.ctx.components[component.index()];
+                            // UNREACHABLE by construction, and kept only so the
+                            // condition has one verdict everywhere it is
+                            // written. `as_component_method_call` validates
+                            // the method on EVERY path that returns
+                            // `Ok(Some(..))` — the two that error do so
+                            // themselves, the two that do not are guarded by
+                            // `is_some()` — so by the time a caller holds
+                            // `(base, component, method)` the method exists.
+                            // Confirmed by mutation: neutering this arm
+                            // fails no test, because nothing reaches it.
+                            // The reachable landing is the resolver's own
+                            // arm in `components.rs`, which is where the
+                            // measurement lives.
                             let m = comp.method(&method).ok_or_else(|| {
-                                unsupported(
-                                    &format!("component `{}` has no method `{method}`", comp.name),
-                                    "",
-                                )
+                                LowerError::Invalid(format!(
+                                    "component `{}` has no method `{method}`",
+                                    comp.name
+                                ))
                             })?;
                             if !m.has_ret {
-                                return Err(unsupported(
-                                    &format!(
-                                        "`let {} : {simple} = {}.{method}(...)` — method \
-                                         `{method}` returns no value",
-                                        l.name.name, comp.name
-                                    ),
-                                    "",
-                                ));
+                                // REACHED, contrary to an earlier note
+                                // here. A typed `let` over a SCALAR type
+                                // is claimed by the untyped handler
+                                // below, which is what that note
+                                // generalized from — but this arm is
+                                // guarded on a RECORD type, and
+                                // `let t : TinyTxn = c.noret(3)` lands
+                                // here first try. v1: "conversion from
+                                // 'void' to non-scalar type 'TinyTxn'
+                                // requested".
+                                return Err(LowerError::Invalid(format!(
+                                    "`let {} : {simple} = {}.{method}(...)` — method \
+                                     `{method}` returns no value",
+                                    l.name.name, comp.name
+                                )));
                             }
                             self.check_component_method_result_assignable(
                                 m,
@@ -1062,20 +1131,40 @@ impl FuncBuilder<'_> {
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let Some((base, component, method)) = self.as_component_method_call(callee)? {
                 let comp = &self.ctx.components[component.index()];
+                // UNREACHABLE by construction, and kept only so the
+                // condition has one verdict everywhere it is
+                // written. `as_component_method_call` validates
+                // the method on EVERY path that returns
+                // `Ok(Some(..))` — the two that error do so
+                // themselves, the two that do not are guarded by
+                // `is_some()` — so by the time a caller holds
+                // `(base, component, method)` the method exists.
+                // Confirmed by mutation: neutering this arm
+                // fails no test, because nothing reaches it.
+                // The reachable landing is the resolver's own
+                // arm in `components.rs`, which is where the
+                // measurement lives.
                 let m = comp.method(&method).ok_or_else(|| {
-                    unsupported(
-                        &format!("component `{}` has no method `{method}`", comp.name),
-                        "",
-                    )
+                    LowerError::Invalid(format!(
+                        "component `{}` has no method `{method}`",
+                        comp.name
+                    ))
                 })?;
                 if !m.has_ret {
-                    return Err(unsupported(
-                        &format!(
-                            "`let {} = {}.{method}(...)` — method `{method}` returns no value",
-                            l.name.name, comp.name
-                        ),
-                        "",
-                    ));
+                    // MEASURED and reachable. `let x = c.noret(3)`
+                    // lands here, and v1 emits `auto x = Calc_noret(c,
+                    // 3);` — g++: "deduced type 'void' for 'x' is
+                    // incomplete". (The TYPED form emits `uint64_t x =
+                    // ...` and says "void value not ignored as it ought
+                    // to be"; a first version of this comment paired
+                    // this arm's source with that arm's emission.)
+                    // Taking a value from something that produces none
+                    // is a program error either way, so `Invalid` rather
+                    // than a suggestion. Pinned by mutation.
+                    return Err(LowerError::Invalid(format!(
+                        "`let {} = {}.{method}(...)` — method `{method}` returns no value",
+                        l.name.name, comp.name
+                    )));
                 }
                 if let Some(expected) = declared_scalar_ty.clone() {
                     self.check_component_method_result_assignable(
@@ -1152,9 +1241,9 @@ impl FuncBuilder<'_> {
         // expression, so the local must carry signedness or `d >> 1` /
         // `d / 2` silently go unsigned (#524 adversarial-review finding
         // 6). A declared type still wins via the `.or` chain below.
-        let signed_scalar_ty = self
-            .expr_type(&e)
-            .filter(|t| matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64));
+        let signed_scalar_ty = self.expr_type(&e).filter(|t| {
+            matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64)
+        });
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
@@ -1363,17 +1452,11 @@ impl FuncBuilder<'_> {
         if self.lower_component_dut_bind(target, value)? {
             return Ok(());
         }
-        // Composite-component whole-value copy of a sub-component:
-        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
-        // field is a `Sub` component field; the RHS is a test-scope
-        // component value. Checked before the scalar-field write (whose
-        // resolver would reject the non-scalar `Sub` field).
-        if self.lower_component_sub_assign(target, value)? {
-            return Ok(());
-        }
-        // Composite-component scalar field write — self-relative inside a
-        // method body (`count = ...`) or a dotted path from a test-scope
-        // component local (`env.sb.errors = ...`).
+        // Composite-component scalar/record-leaf field write — self-relative
+        // inside a method body (`count = ...`) or a dotted path from a
+        // test-scope component local (`env.src.current.value = ...`). Record
+        // leaves must be claimed before whole-sub-component assignment:
+        // otherwise that resolver mistakes `current` for a `Sub` receiver.
         if let Some((base, field)) = self.as_component_field_target(target)? {
             let e = self.lower_expr_no_ports(value)?;
             self.push(Stmt::ComponentFieldWrite {
@@ -1381,6 +1464,13 @@ impl FuncBuilder<'_> {
                 field,
                 value: e,
             });
+            return Ok(());
+        }
+        // Composite-component whole-value copy of a sub-component:
+        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
+        // field is a `Sub` component field; the RHS is a test-scope
+        // component value.
+        if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
         // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
@@ -1477,21 +1567,37 @@ impl FuncBuilder<'_> {
                         self.as_component_method_call(callee)?
                     {
                         let comp = &self.ctx.components[component.index()];
+                        // UNREACHABLE by construction, and kept only so the
+                        // condition has one verdict everywhere it is
+                        // written. `as_component_method_call` validates
+                        // the method on EVERY path that returns
+                        // `Ok(Some(..))` — the two that error do so
+                        // themselves, the two that do not are guarded by
+                        // `is_some()` — so by the time a caller holds
+                        // `(base, component, method)` the method exists.
+                        // Confirmed by mutation: neutering this arm
+                        // fails no test, because nothing reaches it.
+                        // The reachable landing is the resolver's own
+                        // arm in `components.rs`, which is where the
+                        // measurement lives.
                         let m = comp.method(&method).ok_or_else(|| {
-                            unsupported(
-                                &format!("component `{}` has no method `{method}`", comp.name),
-                                "",
-                            )
+                            LowerError::Invalid(format!(
+                                "component `{}` has no method `{method}`",
+                                comp.name
+                            ))
                         })?;
                         if !m.has_ret {
-                            return Err(unsupported(
-                                &format!(
-                                    "assignment from `{}.{method}(...)` — method \
-                                     `{method}` returns no value",
-                                    comp.name
-                                ),
-                                "",
-                            ));
+                            // REACHED, contrary to an earlier note here:
+                            // `let x : uint<32> = 0` then
+                            // `x = c.noret(3)` lands on this arm, since
+                            // an assignment is not a `let` and nothing
+                            // claims it first. v1: "void value not
+                            // ignored as it ought to be".
+                            return Err(LowerError::Invalid(format!(
+                                "assignment from `{}.{method}(...)` — method \
+                                 `{method}` returns no value",
+                                comp.name
+                            )));
                         }
                         let expected = self.local_type(local).clone();
                         self.check_component_method_result_assignable(
@@ -1629,7 +1735,8 @@ impl FuncBuilder<'_> {
                             &format!(
                                 "an element write of `Vec` record field `{}` with a \
                                  non-`{}` RHS",
-                                chain.dotted, self.ctx.records[elem_rid.index()].name
+                                chain.dotted,
+                                self.ctx.records[elem_rid.index()].name
                             ),
                             "assign a value of the element's record type, or set the \
                              element's fields individually",
@@ -1757,9 +1864,27 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
-        Err(unsupported(
-            "assignment to a non-port, non-local target",
-            "",
+        // Two measured shapes, and they are not the same failure.
+        //
+        //   * `5 = n` — v1 emits `5 = _tb.n;`. g++: "lvalue required as
+        //     left operand of assignment".
+        //   * a method PARAMETER shadowing the transactor's `dut` field
+        //     (`hookable poke(dut: uint<8>)` with `dut.en = 1` in the
+        //     body) — v1 ignores the shadowing entirely and emits
+        //     `harc_rt::harc_assign(self.dut->en, 1)`, writing to the
+        //     DUT PORT. Built and run: `dut.en=1`, and the parameter
+        //     was never touched. The program says `dut` is a `uint<8>`
+        //     and v1 pokes hardware.
+        //
+        // The second is why this is not `Invalid`: v1 runs that program,
+        // just not the one that was written. Worst-under-arm, and a
+        // silent write to the DUT is the worst thing here.
+        Err(not_implemented(
+            "assignment to a target that is neither a DUT port nor a local",
+            "v1 either emits an assignment to a non-place, which does not compile, or — \
+             when the target NAME is shadowed by a local or parameter — resolves it to \
+             the shadowed DUT handle and writes to the port instead",
+            V1Status::SilentlyMisLowers,
         ))
     }
 
@@ -1771,9 +1896,12 @@ impl FuncBuilder<'_> {
     /// (`<mangled>_en = 0`).
     fn lower_release(&mut self, target: &crate::ast::Expr) -> Result<(), LowerError> {
         let Some(port) = self.as_port_ref(target)? else {
-            return Err(unsupported(
-                "`release` of a non-DUT target",
-                "`release` applies only to a `probe force` signal on the DUT",
+            // MEASURED: v1 refuses this too, with "`release` target must
+            // be `dut.<probe_name>`". Pointing at v1 was a dead end, and
+            // `release` naming something that is not a DUT probe is a
+            // program error under both backends.
+            return Err(LowerError::Invalid(
+                "`release` applies only to a `probe force` signal on the DUT".to_string(),
             ));
         };
         match port.access {
@@ -1862,14 +1990,19 @@ impl FuncBuilder<'_> {
 
     /// Recognize a testbench-owned queue call after impl-form desugaring:
     /// `_tb.pending.push(x)` / `.pop()` / `.size()` / `.empty()`.
-    pub(crate) fn as_tb_queue_call(
-        &self,
-        callee: &crate::ast::Expr,
-    ) -> Option<(String, String)> {
-        let ExprKind::Field { target, name: method } = &*callee.kind else {
+    pub(crate) fn as_tb_queue_call(&self, callee: &crate::ast::Expr) -> Option<(String, String)> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
             return None;
         };
-        let ExprKind::Field { target, name: field } = &*target.kind else {
+        let ExprKind::Field {
+            target,
+            name: field,
+        } = &*target.kind
+        else {
             return None;
         };
         let ExprKind::Ident(root) = &*target.kind else {
@@ -1880,10 +2013,7 @@ impl FuncBuilder<'_> {
             .then(|| (field.name.clone(), method.name.clone()))
     }
 
-    pub(crate) fn tb_queue_elem(
-        &self,
-        field: &str,
-    ) -> Result<crate::ir::QueueElem, LowerError> {
+    pub(crate) fn tb_queue_elem(&self, field: &str) -> Result<crate::ir::QueueElem, LowerError> {
         self.ctx.tb_queue_fields.get(field).cloned().ok_or_else(|| {
             unsupported(
                 &format!("an unknown testbench queue field `{field}`"),
@@ -2595,14 +2725,37 @@ impl FuncBuilder<'_> {
             ));
         };
         let Some(channel) = self.lookup(&id.name) else {
-            return Err(unsupported(
-                &format!(
-                    "an `on {}(...)` subscription in statement position",
-                    id.name
-                ),
-                "only a test-scope `let <e> : event<T>` channel can be subscribed to here; \
-                 a component's `event` field subscribes from the component",
-            ));
+            // `lookup` failing means the name is not a LOCAL here. It
+            // does NOT mean the name is undefined — an earlier version
+            // of this comment said so and was wrong. Measured, all of
+            // these land here: a testbench component field (`s`), a
+            // testbench scalar field (`seen`), the clock (`clk`), the
+            // DUT binding (`dut`), an agent TYPE name (`Src`), and a
+            // component METHOD name (`fire`). Every one is declared
+            // somewhere in the program.
+            //
+            // The verdict survives anyway, and that was measured too:
+            // v1 emits `<name>.push_back(...)` for each and g++ refuses
+            // all six ("'s' was not declared in this scope", "request
+            // for member 'push_back' in 'dut', which is of pointer type
+            // 'VTop*'", and so on). The message says "names no event
+            // channel in scope", which is true of all of them; it is
+            // the reasoning that was over-stated, not the wording.
+            //
+            // MEASURED: v1 emits `nosuch.push_back([&](int64_t v) {...})`
+            // — g++: "'nosuch' was not declared in this scope". A
+            // program error under both backends.
+            //
+            // Its sibling arm above keeps `Unsupported`, and that is
+            // measured too rather than assumed: `on s.obs(v)` for a
+            // component's `event` field makes v1 emit
+            // `_tb.s.obs.push_back(...)` against a real member, and the
+            // program COMPILES AND RUNS — built and run, `seen=3`. Same
+            // statement position, same construct, opposite verdicts.
+            return Err(LowerError::Invalid(format!(
+                "`on {}(...)`: `{}` names no event channel in scope",
+                id.name, id.name
+            )));
         };
         let IrType::Event(payload) = *self.local_type(channel) else {
             return Err(LowerError::Invalid(format!(
@@ -2776,13 +2929,36 @@ impl FuncBuilder<'_> {
         }
 
         let kind = if h.periodic {
+            // `tb_periodic_literal` answers `None` for a NON-POSITIVE
+            // literal as well as a non-literal, so this arm has two
+            // inputs and they do not share a verdict source:
+            //
+            //   * a named period — v1 registers the closure where the
+            //     statement is WRITTEN, after the impl's `let`s, so it
+            //     resolves correctly. Built and run: 10 firings in 21
+            //     cycles at period 2, with a shadowing `const` present.
+            //     That is the escape hatch this arm's suggestion offers,
+            //     and it is real. (Divergence 78 — the same construct
+            //     mis-lowers at four other landings precisely because
+            //     they register ABOVE the `let`s.)
+            //   * `on 0 cycles` — v1 emits the handler and its own
+            //     `period > 0` guard never lets it fire. Built and run:
+            //     0 firings in 21 cycles. The program asked for a
+            //     handler and got a no-op, silently.
+            //
+            // Worst-under-arm, so the arm is `SilentlyMisLowers` even
+            // though the row that motivated its old `Unsupported` is
+            // still a genuine escape hatch. Splitting on
+            // `parse_int_literal_expr(..) == Some(0)` would recover it
+            // and is not done here — the detail names both instead.
             let period = super::tb_periodic_literal(&h.event).ok_or_else(|| {
-                unsupported(
-                    "an `on <N> cycles` handler with a non-literal period",
-                    "the TB-IR backend requires a positive integer-literal cycle count \
-                     (e.g. `on 100 cycles`); a variable period is re-read every cycle \
-                     under v1, which needs host state the registration closure does not \
-                     carry here",
+                not_implemented(
+                    "an `on <N> cycles` handler with a non-literal or non-positive period",
+                    "`on 0 cycles` makes v1 emit a handler its own `period > 0` guard \
+                     never fires, so the registration is a silent no-op; a NAMED period \
+                     does work here, because a statement-position handler is registered \
+                     after the impl's `let` bindings",
+                    V1Status::SilentlyMisLowers,
                 )
             })?;
             CycleHandlerKind::Periodic { period }
@@ -3492,10 +3668,7 @@ impl FuncBuilder<'_> {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
             // context so the impure/tb-method inline emits its statements
             // into the current block ahead of the message.
-            let call = std::mem::replace(
-                e,
-                AstExpr::new(ExprKind::Bool(false), e.span),
-            );
+            let call = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
             let span = call.span;
             let lowered = self.lower_expr(&call)?;
             let ty = self.expr_type(&lowered).unwrap_or(IrType::Unknown);
@@ -3560,7 +3733,10 @@ impl FuncBuilder<'_> {
             // handshake, and binds the response into that local — the same
             // lowering as `let name = bind.method(...)`.
             let lowered = self.try_lower_bus_call(e, super::bus::BusCallDest::Declare(&name))?;
-            debug_assert!(lowered, "bus tlm_method call failed to lower after classification");
+            debug_assert!(
+                lowered,
+                "bus tlm_method call failed to lower after classification"
+            );
         } else {
             // Transactor method call edge with a result destination — the
             // same lowering as `let name = xact.method(...)`.
@@ -3670,12 +3846,32 @@ fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
 
 /// The `callee` of a `let ... = <callee>(...)` initializer when the RHS is
 /// a call (the shape a `.pop()` access takes), or `None`.
-fn pop_call_callee(value: &Option<crate::ast::Expr>) -> Option<&crate::ast::Expr> {
+fn pop_call_parts(value: &Option<crate::ast::Expr>) -> Option<(&crate::ast::Expr, &[CallArg])> {
     let v = value.as_ref()?;
     match &*v.kind {
-        ExprKind::Call { callee, .. } => Some(callee),
+        ExprKind::Call { callee, args } => Some((callee, args.as_slice())),
         _ => None,
     }
+}
+
+/// `pop` removes and returns the front element, so it takes nothing.
+///
+/// Every `pop` branch used to check only the method NAME and drop the
+/// argument list on the floor, which let `q.pop(7, 9)` lower and emit
+/// cleanly while v1 emitted `_tb.pend.pop(7, 9);` — g++: "no matching
+/// function for call to `harc_rt::HarcQueue<long unsigned int>::pop(int,
+/// int)`". Neither backend runs it, so this is `Invalid`, and it is the
+/// mirror of the `push` branches' `[CallArg::Expr(arg)]` pattern, which
+/// has always been exact.
+fn queue_pop_takes_no_arguments(what: &str, args: &[CallArg]) -> Result<(), LowerError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(LowerError::Invalid(format!(
+        "{what}: `pop` takes no arguments (it removes and returns the front element), \
+         but {} were passed",
+        args.len()
+    )))
 }
 
 /// Explicit bit width of a typed scalar `let` annotation
@@ -3754,4 +3950,55 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
 /// hides a severity that the guard would have rejected outright.
 fn is_log_severity(s: &str) -> bool {
     matches!(s, "debug" | "info" | "warn" | "error" | "fatal")
+}
+
+/// A queue method in STATEMENT position that is neither `push` nor
+/// `pop` — both of those are lowered above, so this is what is left.
+///
+/// v1 emits the call against `harc_rt::HarcQueue`, whose whole API is
+/// `push`, `pop`, `size` and `empty`. So the split is exact rather than
+/// a proxy:
+///
+///   * `size` / `empty` — compile. The value is discarded, which makes
+///     the statement a legal no-op, and v1 runs the program. That is a
+///     TB-IR subset gap with a working escape hatch.
+///   * anything else — `clear`, `front`, a typo — g++: "'struct
+///     harc_rt::HarcQueue<long unsigned int>' has no member named
+///     'clear'". No backend runs it.
+///
+/// The emission is verbatim for every name EXCEPT the four width-method
+/// intrinsics: `try_emit_width_method` claims `trunc`/`zext`/`sext`/
+/// `resize` by name before the member-call path, so `sb.q.trunc(2)`
+/// comes out as `((uint64_t)(((uint64_t)(_tb.sb.q) & 0x3ULL)));`, not as
+/// a `.trunc(2)` call. The `Invalid` verdict still holds for those four
+/// — g++ rejects the cast: "invalid cast from type
+/// `harc_rt::HarcQueue<long unsigned int>` to type `uint64_t`" — but it
+/// holds for a different reason, so the runtime header is the
+/// discriminator for every other name and not for these.
+///
+/// Measured at ALL FIVE landings independently rather than four inferred
+/// from one: testbench-owned field, scoreboard queue, component queue,
+/// bare target-state field, and instance-qualified target-state field
+/// each take their own probe. All five behave this way — which is why
+/// they now share this helper instead of three of them carrying a
+/// hand-written `EmitsUncompilable` that measurement contradicts.
+fn queue_method_in_statement_position(what: &str, method: &str) -> LowerError {
+    // `HarcQueue`'s value-returning half. Kept beside the reason it
+    // matters: apart from the four width-method names noted above, v1
+    // emits whatever name is written straight through, so this list is
+    // the runtime's API, and it has to track `runtime/harc_queue_rt.h`
+    // or a working call starts being called a program error. The test
+    // enumerates the header's declared members and compares the whole
+    // set, so growing `HarcQueue` fails here rather than silently.
+    if matches!(method, "size" | "empty") {
+        return unsupported(
+            &format!("{what} in statement position"),
+            "the value is discarded, so v1 emits a legal no-op and runs the program; \
+             TB-IR lowers `size`/`empty` in expression position instead",
+        );
+    }
+    LowerError::Invalid(format!(
+        "{what} in statement position: `HarcQueue` has only `push`, `pop`, `size` and \
+         `empty`"
+    ))
 }

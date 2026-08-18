@@ -61,6 +61,20 @@ fn lower_with_stdlib_bus(
     lower::lower_program(&merged)
 }
 
+/// `merge_for_sim` of one source string plus `stdlib/<Bus>.arch` — the
+/// source-string analogue of `lower_with_stdlib_bus`, for probes built
+/// by editing a bus-using fixture.
+fn merged_with_stdlib_bus(src: &str, bus_file: &str) -> harc::ast::SourceFile {
+    let fix = parse_source(src).expect("source parses");
+    let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("stdlib")
+        .join(bus_file);
+    let bus_src = std::fs::read_to_string(&bus_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
+    let bus = parse_source(&bus_src).expect("stdlib bus parses");
+    merge::merge_for_sim(vec![fix, bus], None).expect("merge")
+}
+
 /// Lower + verify + emit one registry fixture through the tbir backend
 /// with default options (the `--sv` Verilator path the equivalence
 /// harness exercises).
@@ -2142,17 +2156,35 @@ test T
     end run
 end test T
 "#;
+    // v1 emits `for (auto& _s : sink.accept)` over a `function` method,
+    // which is not a struct member — g++: "'struct Sink' has no member
+    // named 'accept'". So v1 is no escape hatch. It is not `Invalid`
+    // either: an env nothing instantiates emits no wiring, and that
+    // program runs fine under v1.
     let err = lower_src(non_hookable).expect_err("must reject non-hookable sink");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("not hookable"), "unexpected diagnostic: {msg}");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("not `hookable`"),
+        "unexpected diagnostic: {msg}"
+    );
 
+    // This second case is a SIGNEDNESS-only mismatch, and v1 RUNS it:
+    // the generic bridge converts `uint64_t` into the sink's `int64_t`
+    // parameter and the program behaves as written (built and run:
+    // count=2 sum=8). So it keeps the suggestion. It sat under
+    // `assert_invalid` for one commit — the counterexample to that
+    // verdict was inside the suite asserting it.
     let mismatched_payload = non_hookable.replace(
         "function accept(v: uint<8>)\n    end accept",
         "hookable accept(v: sint<8>)\n    end accept",
     );
     let err = lower_src(&mismatched_payload).expect_err("must reject incompatible payloads");
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("payload"), "unexpected diagnostic: {msg}");
+    assert!(
+        msg.contains("payload mismatch"),
+        "unexpected diagnostic: {msg}"
+    );
+    cpp_tb::emit(&merged_src(&mismatched_payload)).expect("v1 emits the sign mismatch");
 }
 
 /// An omitted hookable-parameter annotation leaves the front-end type as
@@ -4679,27 +4711,1391 @@ end test MismatchCopyTest
     );
 }
 
-/// `when` subtype blocks stay outside the lowered record shape.
+/// Every non-scalar record leaf, against what v1 emits for it — the
+/// member declaration AND, where it exists, the randomize body.
+///
+/// The arm serves a dozen shapes and they split two ways, so one probe
+/// cannot classify it. Two rounds of this went wrong in opposite
+/// directions: a `queue` probe generalised to the whole arm denied
+/// `list` its working escape hatch, and then a hand-written copy of
+/// v1's type rules called a 128-bit field a flattening (v1 gives it a
+/// correct `_harc_u128`) while calling `list<Inner>` a working hatch
+/// (v1 gives it a `std::vector<uint64_t>` it never randomizes).
+///
+/// So each row carries the exact C++ v1 emits, and the verdict follows
+/// from that rather than from the type name. Both wrong versions redden
+/// here: the table is the measurement.
 #[test]
-fn record_when_subtype_is_unsupported() {
-    let src = r#"
+fn a_non_scalar_record_leaf_is_classified_by_what_v1_emits_for_it() {
+    let field = |ty: &str| {
+        format!(
+            r#"struct Inner
+    x : uint<8>
+end struct Inner
+
+transaction Resp
+    data : {ty}
+end transaction Resp
+
+test T
+    let dut : Top
+    run
+        let r : Resp
+        randomize(r)
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    // v1 gives the leaf a member that means what was written AND a
+    // draw that fills it — a working escape hatch. A scalar row is
+    // width-correct at any width; a container row keeps its shape.
+    for (ty, shape, draw) in [
+        ("uint<65>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("uint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("sint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("bits<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
+        ("uint<200>", "harc_rt::HarcWide<7> data = 0;", "harc_rng_wide<7>"),
+        ("uint<256>", "harc_rt::HarcWide<8> data = 0;", "harc_rng_wide<8>"),
+        ("list<uint<8>>", "std::vector<uint64_t> data", "data[_i] = harc_rt::random::harc_rng_uint"),
+        (
+            "list<uint<256>>",
+            "std::vector<harc_rt::HarcWide<8>> data",
+            "data[_i] = harc_rt::random::harc_rng_wide<8>",
+        ),
+        ("list<bool>", "std::vector<bool> data", "data[_i] = harc_rt::random::harc_rng_range"),
+        (
+            "list<sint<8>>",
+            "std::vector<int64_t> data",
+            "data[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << 7), (1LL << 7) - 1)",
+        ),
+        (
+            "list<sint<64>>",
+            "std::vector<int64_t> data",
+            "data[_i] = harc_rt::random::harc_rng_uint(harc_rng_next, 64)",
+        ),
+        ("Vec<uint, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        // `int` is 32-bit signed in HARC and this backend maps it
+        // through the UNSIGNED width helper, so a `Vec<int, N>` member
+        // is `std::array<uint64_t, N>` — which is also what TB-IR
+        // mirrors. Pinned because the `Int` arm of `scalar_leaf_c_type`
+        // had nothing measuring it.
+        ("Vec<int, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data", "data = {}"),
+        (
+            "Vec<uint<256>, 4>",
+            "std::array<harc_rt::HarcWide<8>, 4> data",
+            "data = {}",
+        ),
+        (
+            "Vec<Vec<uint<8>, 2>, 4>",
+            "std::array<std::array<uint64_t, 2>, 4> data",
+            "data = {}",
+        ),
+    ] {
+        let src = field(ty);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(
+            v1.contains(shape),
+            "`{ty}`: v1 must emit `{shape}` for the suggestion to be honest"
+        );
+        assert!(v1.contains(draw), "`{ty}`: v1 must emit `{draw}`");
+    }
+    // v1 keeps the container but has no per-element draw for it, so the
+    // loop body is `[_i] = 0` into a `std::array` — the emitted C++
+    // does not compile, for any program that declares the record.
+    for ty in ["list<Vec<uint<8>, 2>>", "list<Vec<Vec<uint<8>, 2>, 2>>"] {
+        let src = field(ty);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(
+            v1.contains("std::vector<std::array<") && v1.contains("t->data[_i] = 0;"),
+            "`{ty}`: v1 assigns 0 into an array member: {v1}"
+        );
+    }
+    // v1 flattens it — the field means something else, and the program
+    // still compiles and runs. The `list` rows are the ones a
+    // non-recursive carve-out gets backwards.
+    for (ty, shape) in [
+        ("queue<uint<8>>", "uint64_t data = 0;"),
+        ("string", "int64_t data = 0;"),
+        ("event<uint<8>>", "uint64_t data = 0;"),
+        ("object", "int64_t data = 0;"),
+        ("Vec<string, 4>", "uint64_t data = 0;"),
+        ("Vec<uint<8>, N>", "uint64_t data = 0;"),
+        // The subtle ones: the CONTAINER survives, its element does not.
+        ("Vec<queue<uint<8>>, 4>", "std::array<uint64_t, 4> data"),
+        ("list<Inner>", "std::vector<uint64_t> data"),
+        ("list<string>", "std::vector<uint64_t> data"),
+        ("list<queue<uint<8>>>", "std::vector<uint64_t> data"),
+        ("list<event<uint<8>>>", "std::vector<uint64_t> data"),
+        ("list<Vec<uint<8>, N>>", "std::vector<uint64_t> data"),
+        // `int` is 32-bit signed in HARC and 64-bit unsigned here, and
+        // `emit_field_random`'s list arm has no draw for it either.
+        ("list<int>", "std::vector<uint64_t> data"),
+    ] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        // These flatten; they do NOT have an unreadable width. A
+        // `queue<T>` / `event<T>` payload arrives in the same argument
+        // POSITION a width would, so the two arms are only told apart
+        // by which kind of type argument it is.
+        assert!(
+            msg.contains("flattens the field to a plain scalar") && !msg.contains("plain decimal"),
+            "`{ty}` is the flatten arm, not the unreadable-width one: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(shape), "`{ty}`: v1 flattens it to `{shape}`");
+    }
+    // The flattening `list` rows lose their per-element draw one of two
+    // ways — a skipped field or a bare `0` — and the working ones keep
+    // it. That is the second half of the same rule.
+    for (ty, marker) in [
+        ("list<Inner>", "// data : list (named, not yet supported)"),
+        ("list<string>", "// data : list (named, not yet supported)"),
+        ("list<queue<uint<8>>>", "t->data[_i] = 0;"),
+        ("list<int>", "t->data[_i] = 0;"),
+    ] {
+        let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(marker), "`{ty}`: v1 emits `{marker}`");
+    }
+}
+
+/// A width slot this compiler cannot read as a plain decimal.
+///
+/// It is NOT a zero-width type — `uint<0x0>` does not panic v1 — and it
+/// is NOT an escape hatch either: v1 cannot read the width and says
+/// nothing, substituting a different fallback in every place that needs
+/// one. `uint<0x8>` against `uint<8>` is the whole measurement.
+#[test]
+fn an_unreadable_width_is_a_silent_mis_lowering_not_a_hatch() {
+    let field = |ty: &str| {
+        format!(
+            r#"const W = 8
+
+struct Inner
+    x : uint<8>
+end struct Inner
+
 transaction Req
-    op : uint<2>
-    when op == 1
-        addr : uint<32>
-    end when
+    op : uint<8>
+    data : {ty}
 end transaction Req
+
+test T
+    let dut : Top
+    run
+        let r : Req
+        randomize(r)
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for ty in [
+        "uint<0x0>",
+        "uint<0b0>",
+        "uint<0x8>",
+        "uint<0b1000>",
+        "uint<W>",
+        // v1 substitutes the same fallbacks PER ELEMENT, so a `Vec` of
+        // one is the same silent mis-lowering.
+        "Vec<uint<0x8>, 4>",
+        "Vec<uint<W>, 4>",
+    ] {
+        let src = field(ty);
+        let err = lower_src(&src).unwrap_err();
+        assert!(
+            !matches!(err, lower::LowerError::Invalid(_)),
+            "`{ty}` is not Invalid — v1 does not panic on it: {err:?}"
+        );
+        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    }
+    // The `Vec` rows pack four 64-bit slots where the decimal spelling
+    // packs four 8-bit ones.
+    let vhex = cpp_tb::emit(&merged_src(&field("Vec<uint<0x8>, 4>"))).expect("v1 emits");
+    let vdec = cpp_tb::emit(&merged_src(&field("Vec<uint<8>, 4>"))).expect("v1 emits");
+    assert!(
+        vhex.contains("harc_rt::harc_wide_write_bits(_packed, 0, 64, value.data[0]);")
+            && vdec.contains("harc_rt::harc_wide_write_bits(_packed, 0, 8, value.data[0]);"),
+        "the per-element width is substituted too:\n{vhex}"
+    );
+    for ty in ["uint<0x0>", "uint<0x8>", "uint<W>"] {
+        let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains("uint64_t data = 0;"), "`{ty}`: {v1}");
+    }
+    // A RECORD payload is not a width slot, even though it arrives in
+    // the same argument position as one. This arm must not claim it.
+    for ty in ["queue<Inner>", "event<Inner>"] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            !msg.contains("plain decimal"),
+            "`{ty}` has no width slot — it is the flatten arm: {msg}"
+        );
+    }
+    // The three widths v1 substitutes, none of them the declared 8.
+    let hex = cpp_tb::emit(&merged_src(&field("uint<0x8>"))).expect("v1 emits");
+    for needle in [
+        "harc_rt::harc_wide_write_bits(_packed, 0, 64, value.data);",
+        "value.data = (uint64_t)harc_rt::harc_bits(_packed, 63, 0);",
+        "t->data = harc_rt::random::harc_rng_uint(harc_rng_next, 32);",
+    ] {
+        assert!(hex.contains(needle), "v1 emits `{needle}`: {hex}");
+    }
+    // …against the decimal spelling, which is consistent at 8.
+    let dec = cpp_tb::emit(&merged_src(&field("uint<8>"))).expect("v1 emits");
+    for needle in [
+        "harc_rt::harc_wide_write_bits(_packed, 0, 8, value.data);",
+        "value.data = (uint64_t)harc_rt::harc_bits(_packed, 7, 0);",
+        "t->data = harc_rt::random::harc_rng_uint(harc_rng_next, 8);",
+    ] {
+        assert!(dec.contains(needle), "v1 emits `{needle}`: {dec}");
+    }
+}
+
+/// A zero-width record leaf, and the build profile that decides it.
+///
+/// This arm was `Invalid` on the grounds that v1 PANICS on it —
+/// "attempt to subtract with overflow" in `emit_unpack_bits`. That
+/// panic is a DEBUG-build artifact: Rust turns integer overflow checks
+/// off under `--release`, which is how CI builds and how the `harc`
+/// binary ships. CI caught it; no amount of debug-profile `cargo test`
+/// could have.
+///
+/// In release v1 emits a complete testbench that compiles clean, with
+/// the zero-width field as a full 64-bit member packed at width 0 — it
+/// carries no bits and nothing says so. `Invalid` claims no backend
+/// runs it in ANY configuration, and a release-built v1 runs it.
+///
+/// The assertions hold in BOTH profiles: the verdict is
+/// profile-independent, and the emitted evidence is checked only where
+/// v1 got far enough to produce it.
+#[test]
+fn a_zero_width_record_leaf_is_a_silent_mis_lowering_in_the_shipped_profile() {
+    let field = |ty: &str| {
+        format!(
+            r#"struct Resp
+    data : {ty}
+end struct Resp
+
+test T
+    let dut : Top
+    run
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for (ty, member) in [
+        ("uint<0>", "uint64_t data = 0;"),
+        ("sint<0>", "int64_t data = 0;"),
+        ("bits<0>", "uint64_t data = 0;"),
+        ("Vec<uint<0>, 4>", "std::array<uint64_t, 4> data = {};"),
+    ] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("zero-width"), "`{ty}`: {msg}");
+        // Debug panics on the width arithmetic; release does not. Check
+        // the emission only where there is one — and where there is, it
+        // must be the silent full-width member, not a diagnostic.
+        if let Ok(Ok(v1)) = std::panic::catch_unwind(|| cpp_tb::emit(&merged_src(&field(ty)))) {
+            assert!(v1.contains(member), "`{ty}`: v1 emits `{member}`: {v1}");
+            assert!(
+                v1.contains("harc_wide_write_bits(_packed, 0, 0, value.data"),
+                "`{ty}`: …and packs it at width zero: {v1}"
+            );
+        }
+    }
+    // The length, not the width — `std::array<uint64_t, 0>`, in either
+    // profile.
+    let src = field("Vec<uint<8>, 0>");
+    assert_unsupported(&lower_src(&src).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+    assert!(v1.contains("std::array<uint64_t, 0> data"), "{v1}");
+
+    // A zero-width PAYLOAD under a container is not this rule at all:
+    // v1 never reads a width there and its output compiles. The first
+    // version of the guard recursed through every type argument and
+    // made all three `Invalid`.
+    for (ty, shape) in [
+        ("list<uint<0>>", "std::vector<uint64_t> data"),
+        ("queue<uint<0>>", "uint64_t data = 0;"),
+        ("event<uint<0>>", "uint64_t data = 0;"),
+    ] {
+        let src = field(ty);
+        let err = lower_src(&src).unwrap_err();
+        assert!(
+            !matches!(err, lower::LowerError::Invalid(_)),
+            "`{ty}` is not Invalid: {err:?}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+        assert!(v1.contains(shape), "`{ty}`: v1 emits `{shape}`");
+    }
+}
+
+/// The other `records.rs` arms, each measured on its own.
+///
+/// | construct | v1 | verdict |
+/// |---|---|---|
+/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
+/// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
+/// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
+/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+/// | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits and truncates | `SilentlyMisLowers` |
+///
+/// The literal rows do not split on the apostrophe — the width prefix
+/// is not the value. `4'd3` folds to `3` and `128'hFF…` folds to a
+/// `_harc_u128` composite that the 64-bit member truncates, and an
+/// unsized decimal past `u64` does the same thing with a different
+/// diagnostic. The guard normalizes through `cpp_tb`'s own folder and
+/// asks whether the result fits.
+///
+/// Compiled with `-std=gnu++20`, the standard `src/main.rs` passes.
+#[test]
+fn the_record_field_arms_split_on_measured_v1_behaviour() {
+    let prog = |decls: &str| {
+        format!(
+            "{decls}\ntest T\n    let dut : Top\n    run\n        let r : Rec\n        \
+             randomize(r)\n        log(info, \"x\")\n    end run\nend test T"
+        )
+    };
+
+    // A `keep` on a struct DOES reach the solver — the absence of a
+    // randomize metadata entry, which is what the first pass measured,
+    // says nothing about the generated solver lambda.
+    let keep = prog("struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n");
+    assert_unsupported(&lower_src(&keep).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&keep)).expect("v1 emits");
+    assert!(
+        v1.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
+        "v1 emits the constraint into the solver: {v1}"
+    );
+
+    // Both `default` shapes make v1 emit an initializer g++ rejects.
+    for (decls, needle) in [
+        (
+            "struct Inner\n    x : uint<8>\nend struct Inner\n\nstruct Rec\n    i : Inner default 0\nend struct Rec\n",
+            "Inner i = 0;",
+        ),
+        (
+            "struct Rec\n    v : Vec<uint<8>, 4> default 0\nend struct Rec\n",
+            "std::array<uint64_t, 4> v = 0;",
+        ),
+    ] {
+        let src = prog(decls);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(needle), "v1 emits `{needle}`: {v1}");
+    }
+
+    // A literal whose VALUE fits the 64-bit member folds correctly,
+    // whatever its spelling — a real escape hatch.
+    for (lit, folded) in [
+        ("4'd3", "uint64_t a = 3;"),
+        ("8'hFF", "uint64_t a = 0xFF;"),
+        ("4'b1010", "uint64_t a = 0b1010;"),
+    ] {
+        let src = prog(&format!(
+            "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
+        ));
+        assert_unsupported(&lower_src(&src).unwrap_err());
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+    }
+    // One that does not fit truncates into the member with only a
+    // warning — and a SIZED literal is on this side of the line too,
+    // which is what splitting on the apostrophe got wrong.
+    for (lit, folded) in [
+        (
+            "128'hFFFFFFFFFFFFFFFFFFFF",
+            "uint64_t a = (((_harc_u128)0xFFFFULL << 64) | (_harc_u128)0xFFFFFFFFFFFFFFFFULL);",
+        ),
+        (
+            "0xFFFFFFFFFFFFFFFFF",
+            "uint64_t a = (((_harc_u128)0xFULL << 64) | (_harc_u128)0xFFFFFFFFFFFFFFFFULL);",
+        ),
+        (
+            "99999999999999999999999",
+            "uint64_t a = 99999999999999999999999;",
+        ),
+    ] {
+        let src = prog(&format!(
+            "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
+        ));
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+    }
+}
+
+/// The `scoreboards.rs` arms, measured against v1's emitted struct.
+///
+/// | construct | v1 emits | verdict |
+/// |---|---|---|
+/// | `bound to` on the scoreboard | output BYTE-IDENTICAL to the unbound one | `SilentlyMisLowers` |
+/// | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
+/// | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+/// | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
+/// | `list<uint<8>>` / `uint<128>` field | `std::vector<uint64_t> l;` / `_harc_u128 l;` | a real escape hatch |
+/// | `list<Vec<uint<8>, 2>>` field | `std::vector<std::array<uint64_t, 2>> l;` | likewise — no randomize body to break |
+/// | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
+///
+/// The `bound to` rows are the load-bearing measurement: "v1 emits" is
+/// true for both, and diffing against the unbound control is what shows
+/// the clause left no trace at all.
+#[test]
+fn the_scoreboard_arms_split_on_what_v1_emits() {
+    let prog = |sb: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+end transactor Drv
+
+struct Inner
+    x : uint<8>
+end struct Inner
+
+{sb}
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    let control = prog("scoreboard Sb\n    seen : uint<32> default 0\nend scoreboard Sb");
+    let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits the control");
+    lower_src(&control).expect("the control lowers");
+
+    // Both `bound to` spellings are discarded — byte-identically.
+    for (what, src) in [
+        (
+            "declaration",
+            prog("scoreboard Sb bound to Drv\n    seen : uint<32> default 0\nend scoreboard Sb"),
+        ),
+        (
+            "field",
+            prog("scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb"),
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("`bound to`"), "{what}: {msg}");
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            control_cpp,
+            "{what}: v1's output must be byte-identical to the unbound control — that is \
+             the whole evidence that the clause is discarded"
+        );
+    }
+
+    // A port field keeps its name and loses everything else.
+    let port = prog("scoreboard Sb\n    p : in uint<8>\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&port).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&port))
+            .expect("v1 emits")
+            .contains("uint64_t p;"),
+        "v1 emits an uninitialized scalar with no direction"
+    );
+
+    // A queue default is the one that does not compile.
+    let qd = prog("scoreboard Sb\n    q : queue<uint<32>> default 0\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&qd).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&qd))
+            .expect("v1 emits")
+            .contains("harc_rt::HarcQueue<uint64_t> q = 0;"),
+        "v1 emits an initializer `HarcQueue` has no constructor for"
+    );
+
+    // The field-type arm asks the SAME predicate as the record one
+    // rather than a second copy of it — but maps its third outcome
+    // differently, and that difference is measured, not assumed. A
+    // scoreboard emits no randomize body, so the leaf whose randomize
+    // body is what stops compiling keeps a correct member here.
+    for (ty, shape) in [
+        ("list<uint<8>>", "std::vector<uint64_t> l;"),
+        ("uint<128>", "_harc_u128 l;"),
+        (
+            "list<Vec<uint<8>, 2>>",
+            "std::vector<std::array<uint64_t, 2>> l;",
+        ),
+        // A record-typed field. `txn_field_c_type` alone maps every
+        // named type to `int64_t`, and asking only it called this a
+        // flattening — but the member picker these fields actually go
+        // through adds one layer, and v1 emits the record itself.
+        ("Inner", "Inner l;"),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
+        );
+    }
+    for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {
+        let src = prog(&format!("scoreboard Sb\n    s : {ty}\nend scoreboard Sb"));
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 flattens it to `{shape}`"
+        );
+    }
+}
+
+/// The five `= bind <name>` arms, and the hole between them.
+///
+/// A regblock, an addrmap, an initiator-BFM instance, a bound-to
+/// event-driven transactor and a target-TLM responder all require a
+/// bare identifier on the right of `= bind`, and all five checked for
+/// it with their own copy of the same four-line match — each saying
+/// "re-run with `--codegen v1`". v1 REJECTS a non-identifier RHS itself,
+/// with its own diagnostic, so every one of those suggestions sent the
+/// user to an identical refusal.
+///
+/// The hole is what the five copies were all guarding the wrong side
+/// of: with NO `= bind` at all, `l.bind` is false, none of the five
+/// arms is reached, and a regblock's mirror record shares the
+/// regblock's name — so the `let` landed on the ordinary record-local
+/// path and lowered clean. The emitted testbench then served every
+/// register access from the mirror and issued no bus traffic at all.
+#[test]
+fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
+    let fixture_with = |name: &str, from: &str, to: &str| {
+        let src = fixture(name);
+        assert_eq!(src.matches(from).count(), 1, "`{from}` is unique in {name}");
+        src.replace(from, to)
+    };
+    let lower_bus =
+        |src: &str| lower::lower_program(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+
+    // Every non-identifier spelling, at every one of the five landings.
+    // v1 refuses each with its own message, so none may suggest it.
+    for (name, from, to, construct) in [
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind helper.x",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind 5",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs = bind (helper)",
+            "regblock binding `regs` to a non-identifier helper",
+        ),
+        (
+            "regblock_access_test.harc",
+            "let helper : AxilHelper active = bind axil",
+            "let helper : AxilHelper active = bind axil.aw",
+            "initiator-BFM instance `helper` bound to a non-identifier",
+        ),
+        (
+            "regblock_addrmap_test.harc",
+            "let chip   : Soc = bind helper",
+            "let chip   : Soc = bind helper.x",
+            "addrmap binding `chip` to a non-identifier helper",
+        ),
+        (
+            "axilite_bound_mon_test.harc",
+            "let drv  : AxilXactor active  = bind axil",
+            "let drv  : AxilXactor active  = bind axil.aw",
+            "bound-to event-driven transactor `drv` bound to a non-identifier",
+        ),
+    ] {
+        let src = fixture_with(name, from, to);
+        let msg = assert_not_implemented(&lower_bus(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains(construct), "{msg}");
+        // The evidence: v1 refuses it too, rather than emitting.
+        let err = cpp_tb::emit(&merged_with_stdlib_bus(&src, "BusAxiLite.arch"))
+            .expect_err("v1 refuses a non-identifier bind RHS");
+        assert!(
+            format!("{err}").contains("bind <expr>"),
+            "v1's own refusal names the shape: {err}"
+        );
+    }
+    // The fifth landing lives in a different fixture and bus.
+    let tlm = {
+        let src = fixture("dma_engine_tlm_target_test.harc");
+        src.replace(
+            "let target : DmaMemTarget passive = bind mem",
+            "let target : DmaMemTarget passive = bind mem.x",
+        )
+    };
+    let merged =
+        merge::merge_for_sim(vec![parse_source(&tlm).expect("parses")], None).expect("merge");
+    let msg = assert_not_implemented(
+        &lower::lower_program(&merged).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("target-TLM responder `target`"), "{msg}");
+    assert!(
+        format!("{}", cpp_tb::emit(&merged).expect_err("v1 refuses")).contains("bind <expr>"),
+        "v1 refuses it too"
+    );
+
+    // A regblock-typed SCOREBOARD leaf is not a record leaf, even
+    // though a regblock's mirror record lands in `record_ids`. v1's own
+    // `is_record_type` is transactions ∪ structs, so it flattens this
+    // one to `int64_t l;` — and asking the wrong set turned the arm
+    // into a false escape hatch.
+    let sb_rb = fixture_with(
+        "regblock_access_test.harc",
+        "testbench RegblockAccessTb\n    dut : AxiLiteRegs\nend testbench RegblockAccessTb",
+        "scoreboard Sb\n    l : DmaRegs\nend scoreboard Sb\n\ntestbench RegblockAccessTb\n             dut : AxiLiteRegs\n    sb  : Sb\nend testbench RegblockAccessTb",
+    );
+    assert_not_implemented(
+        &lower_bus(&sb_rb).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        cpp_tb::emit(&merged_with_stdlib_bus(&sb_rb, "BusAxiLite.arch"))
+            .expect("v1 emits")
+            .contains("int64_t l;"),
+        "v1 flattens a regblock-typed scoreboard leaf"
+    );
+
+    // The hole. All three spellings of a regblock-typed `let` with no
+    // `= bind` used to lower clean and drop every bus access — and it
+    // is reachable from a hookable method body and a `tseq` body, not
+    // just from test scope, so every `LowerCtx` carries the type set.
+    for (name, from, to) in [
+        (
+            "regblock_access_test.harc",
+            "let regs   : DmaRegs = bind helper",
+            "let regs   : DmaRegs",
+        ),
+        (
+            "regblock_access_test.harc",
+            "        let v = regs.MM2S_LEN",
+            "        let snap : DmaRegs\n        let v = regs.MM2S_LEN",
+        ),
+        (
+            "regblock_access_test.harc",
+            "        let v = regs.MM2S_LEN",
+            "        let snap : DmaRegs = regs\n        let v = regs.MM2S_LEN",
+        ),
+        (
+            "regblock_addrmap_test.harc",
+            "let chip   : Soc = bind helper",
+            "let chip   : Soc",
+        ),
+        // Inside a hookable METHOD body — a different `LowerCtx`, which
+        // used to carry an empty type set and let the whole thing
+        // through.
+        (
+            "regblock_access_test.harc",
+            "        hookable read(addr: uint<8>) -> uint<32>",
+            "        hookable probe2()\n            let regs4 : DmaRegs\n                         let z = regs4.MM2S_LEN\n        end probe2\n\n        hookable read(addr:              uint<8>) -> uint<32>",
+        ),
+        // …and inside a `tseq` body, which is a third `LowerCtx`. Both
+        // of these lowered AND verified clean before every context
+        // carried the type set, so a status-only assertion on the test
+        // scope pinned nothing about them.
+        (
+            "regblock_access_test.harc",
+            "regblock DmaRegs via AxilHelper width 32",
+            "tseq Str() -> TSeq<uint<8>>\n    let regs5 : DmaRegs\n    yield 1\nend tseq Str\n\nregblock DmaRegs via AxilHelper width 32",
+        ),
+    ] {
+        let src = fixture_with(name, from, to);
+        let err = lower_bus(&src).unwrap_err();
+        let lower::LowerError::Invalid(msg) = &err else {
+            panic!("`{to}` is Invalid, not `{err:?}`");
+        };
+        assert!(msg.contains("without a bus"), "{msg}");
+        // v1 states the same rule, which is where the wording came from.
+        let v1 = cpp_tb::emit(&merged_with_stdlib_bus(&src, "BusAxiLite.arch"))
+            .expect_err("v1 refuses an unbound regblock instantiation");
+        assert!(
+            format!("{v1}").contains("requires `= bind <helper>`"),
+            "v1's own rule: {v1}"
+        );
+    }
+}
+
+/// The unbound-transactor item arms, from BOTH declaration positions.
+///
+/// These were two copies of the same 120-line match — the always-on
+/// walk and the `when active` walk — differing in one expression, so
+/// five of the rejections were the same rejection written twice. Every
+/// one said "re-run with `--codegen v1`"; only one of the six shapes
+/// they cover is something v1 gets right.
+///
+/// | item | v1 emits | verdict |
+/// |---|---|---|
+/// | `req : in event<uint<8>>` | a real subscriber vector plus a fan-out at the emit site | a real escape hatch |
+/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped | `SilentlyMisLowers` |
+/// | `dut : Top default 1` | `VTop* dut = 1;` — "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
+/// | a second module-typed field | `_tb.drv.dut = dut; _tb.drv.other = dut;` — both bound, both driven | a real escape hatch |
+/// | `apply Some.Policy` | nothing at all | `SilentlyMisLowers` |
+///
+/// Every row is asserted in both positions, because that is the
+/// property the merge is for.
+#[test]
+fn the_unbound_transactor_item_arms_agree_across_both_positions() {
+    let drv = |outer: &str, active: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+{outer}
+    when active
+{active}
+        hookable step(n : uint<8>)
+{body}
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.step(1)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let poke = "            dut.en = 1";
+    lower_src(&drv("    dut : Top", "", poke)).expect("the control lowers");
+
+    // Each row, declared OUTSIDE the `when active` block and INSIDE it.
+    // The two spellings must give the identical verdict — that is what
+    // the merged walk buys, and what two copies of it kept losing.
+    let both = |field: &str| {
+        [
+            drv(&format!("    dut : Top\n{field}"), "", poke),
+            drv("    dut : Top", &format!("    {field}"), poke),
+        ]
+    };
+
+    // v1 models a directional EVENT — a real `std::function` fan-out.
+    for src in both("    req : in event<uint<8>>") {
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("directional event field"), "{msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            v1.contains("std::vector<std::function<void(uint64_t)>> req;"),
+            "v1 models the event field: {v1}"
+        );
+    }
+    // The declaration alone is not the claim — an `emit` into it has to
+    // produce a real fan-out, or "v1 models it" is only half measured.
+    let emitting = drv("    dut : Top\n    req : in event<uint<8>>", "", poke).replace(
+        "        drv.step(1)",
+        "        emit drv.req(1)\n        drv.step(1)",
+    );
+    assert_unsupported(&lower_src(&emitting).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&emitting)).expect("v1 emits");
+    assert!(
+        v1.contains("for (auto& _s : _tb.drv.req) _s(1);"),
+        "v1 fans the emit out over the subscriber vector: {v1}"
+    );
+    // …and flattens a directional SCALAR to an uninitialized member.
+    for field in ["    p : in uint<8>", "    p : out uint<8>"] {
+        for src in both(field) {
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::SilentlyMisLowers,
+            );
+            assert!(msg.contains("directional scalar field"), "{msg}");
+            let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+            assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
+        }
+    }
+    // A second DUT handle: v1 emits a `V<Name>*` member for each while
+    // including only the TESTBENCH DUT's Verilated header, and this
+    // function cannot see which module that is — transactors lower
+    // first. So the arm takes the worst of what is under it.
+    for src in both("    other : Top") {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(
+            msg.contains("more than one module-typed field"),
+            "the arm that fires is this one, not a later unrelated              assignment rejection: {msg}"
+        );
+    }
+    let bound_both = format!(
+        r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+    other : Top
+
+    when active
+        hookable step(n : uint<8>)
+            dut.en = 1
+            other.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.dut = dut
+        drv.other = dut
+        drv.step(1)
+        wait 2 cycles
+    end run
+end impl T"#
+    );
+    assert_not_implemented(
+        &lower_src(&bound_both).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&bound_both)).expect("v1 emits");
+    assert!(
+        v1.contains("_tb.drv.dut = dut;") && v1.contains("_tb.drv.other = dut;"),
+        "v1 does bind both handles — that half is real: {v1}"
+    );
+    // …and this is the half that decides the verdict: two handles of a
+    // module that is NOT the testbench's DUT. A split on the
+    // transactor's own handle type calls them equal, and v1 emits
+    // `VFoo*` twice against a `VTop.h`-only include.
+    let two_foo = drv("    d1 : Foo\n    d2 : Foo", "", "            d1.en = 1");
+    assert_not_implemented(
+        &lower_src(&two_foo).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&two_foo)).expect("v1 emits");
+    assert!(
+        v1.contains("VFoo* d1 = nullptr;")
+            && v1.contains("VFoo* d2 = nullptr;")
+            && v1.contains("#include \"VTop.h\"")
+            && !v1.contains("#include \"VFoo.h\""),
+        "v1 emits both members and only the test DUT's header: {v1}"
+    );
+    // …but only for the SAME module type. v1 includes just the one
+    // Verilated header the testbench's DUT needs, so a second named
+    // field of any other type is an undeclared type in the emitted C++.
+    for (field, cty) in [
+        ("    other : AxiLiteRegs", "VAxiLiteRegs* other = nullptr;"),
+        ("    other : Nonesuch", "VNonesuch* other = nullptr;"),
+        ("    mode : Color", "Color mode;"),
+    ] {
+        for src in both(field) {
+            let src = src.replace(
+                "\ntransactor Drv\n",
+                "\nenum Color { Red, Blue }\n\ntransactor Drv\n",
+            );
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::EmitsUncompilable,
+            );
+            assert!(
+                msg.contains("more than one module-typed field"),
+                "`{field}`: {msg}"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+            assert!(v1.contains(cty), "`{field}`: v1 emits `{cty}`: {v1}");
+        }
+    }
+
+    // `apply` leaves no trace whatsoever.
+    for src in both("    apply Some.Policy") {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+    }
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&drv(
+            "    dut : Top\n    apply Some.Policy",
+            "",
+            poke
+        )))
+        .expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&drv("    dut : Top", "", poke))).expect("v1 emits"),
+        "the `apply` item leaves v1's output byte-identical"
+    );
+
+    // The DUT-handle default: `0` is a null pointer constant and
+    // compiles, every other literal does not, so the arm takes the
+    // worse of the two.
+    for lit in ["0", "1", "5"] {
+        for src in both(&format!("    other : Top default {lit}")) {
+            assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::EmitsUncompilable,
+            );
+        }
+    }
+    for (lit, init) in [("0", "VTop* dut = 0;"), ("1", "VTop* dut = 1;")] {
+        let src = drv(&format!("    dut : Top default {lit}"), "", poke);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(init), "`default {lit}` pastes `{init}`: {v1}");
+    }
+}
+
+/// The `on <event>(arg)` subscription arms in `components.rs`.
+///
+/// Six sites; five were provably dead. `event_subscription` — the
+/// predicate that ROUTES a handler here — already establishes that the
+/// trigger is a `Call` on a bare identifier naming an `event` field, and
+/// a periodic handler never reaches the loop at all. The resolver then
+/// re-derived all four facts and carried a rejection arm for each. Every
+/// one of those shapes lands on a different diagnostic entirely, which
+/// is what this test pins: if the routing predicate ever loosens, these
+/// stop matching and the dead arms are dead no longer.
+///
+/// This pins where each lands, NOT that the arm it lands on is itself
+/// correctly classified — those arms are outside this one's scope.
+///
+/// | trigger | where it actually lands |
+/// |---|---|
+/// | `on 3 cycles` | lowers — a periodic handler |
+/// | `on clk` | the unresolved-name arm |
+/// | `on tagger.in_ev(t)` | the transactor/method-call arm |
+/// | `on other(t)` (a scalar field) | the helper-call arm |
+/// | `on nosuch(t)` | the helper-call arm |
+///
+/// The two live arms split on measurement: `on in_ev()` compiles and
+/// runs (v1 synthesizes `_v` for a payload the body cannot name anyway),
+/// while `on in_ev(t, u)` drops the extra parameter without a word.
+#[test]
+fn the_event_subscription_arms_are_two_live_ones_and_five_dead() {
+    let agent = |trigger: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    other : uint<8>  default 0
+
+    on {trigger}
+        {body}
+    end on
+end agent Tagger
+
+test T
+    let dut    : Top
+    let tagger : Tagger
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+        emit tagger.in_ev(1)
+        wait 2 cycles
+        log(info, "seen={{}}", tagger.seen)
+    end run
+end test T"#
+        )
+    };
+
+    // The five shapes the routing predicate excludes. None of them may
+    // reach the subscription arms — each is claimed elsewhere first.
+    lower_src(&agent("3 cycles", "seen = seen + 1")).expect("a periodic handler lowers");
+    for (trigger, elsewhere) in [
+        ("clk", "the unresolved name `clk`"),
+        ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
+        ("other(t)", "helper call `other(...)`"),
+        ("nosuch(t)", "helper call `nosuch(...)`"),
+    ] {
+        let msg = match lower_src(&agent(trigger, "seen = seen + 1")) {
+            Ok(_) => panic!("`on {trigger}` unexpectedly lowered"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(
+            msg.contains(elsewhere),
+            "`on {trigger}` lands on `{elsewhere}`, not a subscription arm: {msg}"
+        );
+    }
+
+    // No payload name: v1 synthesizes one and the handler runs, which
+    // is what was written — the payload is simply unbound.
+    let none = agent("in_ev()", "seen = seen + 1");
+    let msg = assert_unsupported(&lower_src(&none).unwrap_err());
+    assert!(msg.contains("no payload argument"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
+    assert!(
+        v1.contains("tagger.in_ev.push_back([&](uint64_t _v) {"),
+        "v1 synthesizes a payload name: {v1}"
+    );
+
+    // A second payload name: v1 drops it without a word. Naming it in
+    // the body does NOT reliably fail to compile — that was this arm's
+    // first verdict and it is the lesser of the two things v1 does.
+    // Give `u` something else to bind to and v1 compiles and runs to a
+    // value the source never asked for, which is the worse one and so
+    // the arm's label.
+    for body in ["seen = seen + 1", "seen = seen + u"] {
+        let two = agent("in_ev(t, u)", body);
+        assert_not_implemented(
+            &lower_src(&two).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&two)).expect("v1 emits");
+        assert!(
+            v1.contains("tagger.in_ev.push_back([&](uint64_t t) {") && !v1.contains("uint64_t u"),
+            "v1 emits the lambda with only the first parameter: {v1}"
+        );
+    }
+    // The two shapes that make the drop silent rather than loud. Each
+    // resolves `u` to something that is NOT the payload, and the whole
+    // point is that v1 says nothing about it.
+    let shadowed = |extra_decl: &str, extra_field: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+{extra_decl}
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+{extra_field}
+    on in_ev(t, u)
+        seen = seen + u
+    end on
+end agent Tagger
+
+test T
+    let dut    : Top
+    let tagger : Tagger
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+        emit tagger.in_ev(1)
+        wait 2 cycles
+        log(info, "x")
+    end run
+end test T"#
+        )
+    };
+    for (src, resolves_to) in [
+        (
+            shadowed("", "    u     : uint<8>  default 7"),
+            "tagger.seen + tagger.u;",
+        ),
+        (shadowed("\nconst u = 9\n", ""), "tagger.seen + u;"),
+    ] {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            v1.contains(resolves_to),
+            "v1 silently binds `u` to `{resolves_to}`: {v1}"
+        );
+    }
+    // …and the one-argument control really does bind the name, so the
+    // difference above is the dropped parameter and nothing else.
+    let one = agent("in_ev(t)", "seen = seen + t");
+    lower_src(&one).expect("the control lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&one)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&agent("in_ev(t, u)", "seen = seen + t"))).expect("v1 emits"),
+        "the extra parameter leaves no trace in v1's output"
+    );
+}
+
+/// The four `helpers.rs` arms, and two of them were right already —
+/// which is worth a test precisely because it was measured rather than
+/// assumed.
+///
+/// | arm | v1 | verdict |
+/// |---|---|---|
+/// | a DUT/sync-touching helper call in a message | compiles; calls it at the failure site | `Unsupported` |
+/// | a testbench method call in a message | compiles; same | `Unsupported` |
+/// | a helper param of module type, non-DUT arg | `no match for call to <lambda(VTop*)> (Model&)` | `EmitsUncompilable` |
+/// | a testbench method param of module type, non-DUT arg | `no match for call to <lambda(Tb&, VTop*)> (Tb&, Model&)` | `EmitsUncompilable` |
+///
+/// The first two only fire for a CONDITIONALLY-evaluated message — an
+/// assert's `else fail(...)`. An unconditional `log(...)` hoists the
+/// call ahead of the statement and lowers fine, so probing with a
+/// `log` measures nothing at all; the routing gate is `lower_fmt` vs
+/// `lower_fmt_hoisting`, not the arm.
+#[test]
+fn the_helper_arms_split_between_a_real_hatch_and_an_uncompilable_call() {
+    let base = fixture("msg_call_hoist_test.harc");
+    const LOG: &str = "        log(info, \"dbl=${dbl(v)}\")";
+    assert!(base.contains(LOG), "fixture shape changed");
+
+    // Conditionally-evaluated message: v1 evaluates the call at the
+    // failure site, which is exactly the laziness TB-IR cannot inline.
+    for (what, msg, needle) in [
+        (
+            "impure helper",
+            "assert dut.count_out >= 0 else fail(\"cur=${cur_plus(dut, 1)}\")",
+            "cur_plus(dut, 1)",
+        ),
+        (
+            "testbench method",
+            "assert dut.count_out >= 0 else fail(\"dbl=${dbl(v)}\")",
+            "MsgCallHoistTb_dbl(_tb, v)",
+        ),
+    ] {
+        let src = base.replacen(LOG, &format!("        {msg}"), 1);
+        assert_ne!(src, base, "{what}: the message must actually change");
+        let m = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(m.contains("inside a message"), "{what}: {m}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(&format!("sim_log_line(\"FAIL\"")) && v1.contains(needle),
+            "{what}: v1 calls it at the failure site, which is what makes the suggestion honest"
+        );
+    }
+    // A PURE helper in the same position lowers — the arm is about
+    // CFG-inlined calls, not about messages.
+    lower_src(&base.replacen(
+        LOG,
+        "        assert dut.count_out >= 0 else fail(\"inc=${inc(v)}\")",
+        1,
+    ))
+    .expect("a pure helper in a conditional message still lowers");
+
+    // A module-typed parameter given something that is not the DUT:
+    // v1 types the lambda on the module and passes the argument
+    // through, so the call does not compile.
+    let helper = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+end agent Model
+
+function touch(d: Top) -> uint<32>
+    return d.count_out
+end function touch
+
+test T
+    let dut : Top
+    let m : Model
+    clock clk = SysDomain
+    run
+        let s : uint<32> = touch(ARG)
+        wait 1 cycle
+    end run
+end test T"#;
+    lower_src(&helper.replace("ARG", "dut")).expect("the DUT argument lowers");
+    let msg = assert_not_implemented(
+        &lower_src(&helper.replace("ARG", "m")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("helper parameter `d`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&helper.replace("ARG", "m"))).expect("v1 emits");
+    assert!(
+        v1.contains("auto touch = [&](VTop* d)") && v1.contains("touch(m)"),
+        "v1 passes a component to a `VTop*` lambda: {v1}"
+    );
+
+    // The testbench-method sibling, measured on its own.
+    let method = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+end agent Model
+
+testbench Tb
+    dut : Top
+    m   : Model
+    function peek(d: Top) -> uint<32>
+        return d.count_out
+    end peek
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : uint<32> = peek(ARG)
+        wait 1 cycle
+    end run
+end impl T"#;
+    lower_src(&method.replace("ARG", "dut")).expect("the DUT argument lowers");
+    let msg = assert_not_implemented(
+        &lower_src(&method.replace("ARG", "m")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("testbench method parameter `d`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&method.replace("ARG", "m"))).expect("v1 emits");
+    assert!(
+        v1.contains("Tb_peek(_tb, _tb.m)"),
+        "v1 passes the component field through: {v1}"
+    );
+}
+
+/// `when` subtype blocks stay outside the lowered record shape, and
+/// this arm took three rounds of measurement because each of the first
+/// two looked at exactly one shape.
+///
+/// | shape | v1 |
+/// |---|---|
+/// | `randomize(q)` on the transaction itself | emits the guard and gates the conditional field on it |
+/// | the same subtype nested in another record, outer randomized | reaches it through an unconditional `randomize_Req` — no guard anywhere, and the field is not in the solve |
+/// | in a struct | the field is gone from the emitted struct entirely |
+///
+/// The first round measured a program with no `randomize` at all, so
+/// nothing about the guard was observable; the second measured the
+/// direct path and called the arm an escape hatch. The nested path is
+/// the worst of the three and so is the arm's label.
+#[test]
+fn record_when_subtype_splits_by_where_it_is_randomized_from() {
+    let prog = |decl: &str, kind: &str| {
+        format!(
+            r#"{decl}
 
 test WhenTest
     let dut : Top
     run
-        wait 1 cycle
+        let q : {kind}
+        randomize(q)
+        log(info, "x")
     end run
 end test WhenTest
-"#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+"#
+        )
+    };
+    let txn = prog(
+        "transaction Req\n    op : uint<2>\n    when op == 1\n        addr : uint<32>\n    \
+         end when\nend transaction Req",
+        "Req",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&txn).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(msg.contains("`when` subtype"), "names the construct: {msg}");
+    // DIRECTLY randomized, v1 emits the guard and gates the conditional
+    // field on it. This half is why the arm was once called an escape
+    // hatch, and it is real — it is just not the whole arm.
+    let v1 = cpp_tb::emit(&merged_src(&txn)).expect("v1 emits");
+    assert!(
+        v1.contains("if (q.op == 1) {   // active when-subtype field addr"),
+        "v1 emits the subtype guard: {v1}"
+    );
+    assert!(
+        v1.contains("q.addr = _val_addr;"),
+        "…and assigns the conditional field only under it: {v1}"
+    );
+    // Reached through an OUTER record, the same subtype loses the guard
+    // entirely. `randomize_Req` assigns the conditional field
+    // unconditionally and the solver's problem table never mentions it.
+    // That is the worst thing v1 does under this arm, so it is the
+    // arm's label.
+    let nested = prog(
+        "transaction Req\n    op : uint<8>\n    when op == 1\n        addr : uint<16>\n    \
+         end when\nend transaction Req\n\ntransaction Outer\n    tag : uint<8>\n    \
+         inner : Req\nend transaction Outer",
+        "Outer",
+    );
+    assert_not_implemented(
+        &lower_src(&nested).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&nested)).expect("v1 emits");
+    assert!(
+        !v1.contains("op == 1"),
+        "v1 drops the guard on the nested path: {v1}"
+    );
+    assert!(
+        v1.contains("t->addr = harc_rt::random::harc_rng_uint(harc_rng_next, 16);"),
+        "…and draws the conditional field unconditionally: {v1}"
+    );
+    assert!(
+        !v1.contains("inner.addr"),
+        "…and leaves it out of the solve entirely: {v1}"
+    );
+
+    // The struct spelling loses the field, which no `--codegen v1` run
+    // recovers. Diffing against the control is the whole measurement.
+    let st = prog(
+        "struct Rec\n    a : uint<8>\n    when a == 1\n        b : uint<8>\n    end when\n\
+         end struct Rec",
+        "Rec",
+    );
+    let ctl = prog("struct Rec\n    a : uint<8>\nend struct Rec", "Rec");
+    assert_not_implemented(
+        &lower_src(&st).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let with_when = cpp_tb::emit(&merged_src(&st)).expect("v1 emits");
+    let without = cpp_tb::emit(&merged_src(&ctl)).expect("v1 emits the control");
+    let structs = |src: &str| src.split("struct Rec {").nth(1).unwrap_or("")[..80].to_string();
+    assert_eq!(
+        structs(&with_when),
+        structs(&without),
+        "the conditional field is gone from v1's struct"
+    );
 }
 
 /// Record locals cannot live in *pure* helpers (they emit as
@@ -5657,9 +7053,12 @@ test BadWidthDirection
 end test
 "#;
     let err = lower_src(src_wrong_direction).unwrap_err();
+    // v1's sentence verbatim, `≥` and suggestion included — the
+    // covergroup path used to print an ASCII paraphrase while claiming
+    // to quote v1.
     assert!(
         err.to_string()
-            .contains("width must be >= the source width"),
+            .contains("width must be ≥ the source width (otherwise it narrows, wrong direction). Use `.trunc<2>()` to narrow."),
         "{err}"
     );
 }
@@ -7817,8 +9216,14 @@ fn transactor_call_in_message_rejected() {
 /// (its passive surface — persistent state + always-on handlers — is
 /// lowered; #494 P0a/P1b), but calling one of its `when active` methods
 /// on the passive instance is rejected at the call site as `Invalid`
-/// (the method structurally does not exist there). A mode-less field has
-/// nothing to inherit from at testbench scope, so it stays rejected.
+/// (the method structurally does not exist there).
+///
+/// A mode-less field has nothing to inherit from at testbench scope, so
+/// it stays rejected — and as `Invalid`, not with a v1 suggestion.
+/// Measured: v1 refuses it too, with "transactor field `_tb.p : Poker`
+/// has no mode and ...". The comment at the arm has always said the
+/// mode rules "mirror v1"; this one does, so pointing at v1 was never
+/// going to help.
 #[test]
 fn transactor_instance_mode_rules() {
     // `XACTOR_SRC` calls `xt.pulse(...)` / `xt.readv()` — both `when
@@ -7837,8 +9242,15 @@ fn transactor_instance_mode_rules() {
     );
 
     let modeless = XACTOR_SRC.replace("xt  : Xt active", "xt  : Xt");
-    let msg = assert_unsupported(&lower_src(&modeless).unwrap_err());
-    assert!(msg.contains("without an `active`/`passive` mode"), "{msg}");
+    let msg = assert_invalid(&lower_src(&modeless).unwrap_err());
+    assert!(
+        msg.contains("needs an `active`/`passive` mode annotation"),
+        "{msg}"
+    );
+    // The half that makes `Invalid` honest rather than merely tidier.
+    let v1 = cpp_tb::emit(&merged_src(&modeless))
+        .expect_err("v1 refuses a mode-less transactor field too");
+    assert!(format!("{v1}").contains("has no mode"), "{v1}");
 }
 
 /// A `passive` instance whose `when active` methods are never CALLED is
@@ -8963,7 +10375,15 @@ impl EvTest for EvTb
 end impl EvTest
 "#;
     let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
-    assert!(msg.contains("event/directional field `req`"), "{msg}");
+    assert!(msg.contains("directional event field `req`"), "{msg}");
+    // The directional SCALAR spelling is a different verdict — v1
+    // models the event field and flattens the scalar one.
+    let scalar_src = event_src.replace("req : in event<Req>", "req : in uint<8>");
+    let msg = assert_not_implemented(
+        &lower_src(&scalar_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("directional scalar field `req`"), "{msg}");
 
     // A scalar state field now lowers: the transactor carries it on its
     // schema and the testbench records the instance for per-instance
@@ -9085,8 +10505,14 @@ fn lower_coroutine_tags_transactor_bodies() {
 
 /// A method param (or any local) that shadows the DUT field name is
 /// host state — `dut.x` through it must NOT silently lower to a DUT
-/// access (v1 surfaces the shadowing as a C++ compile error; the IR
-/// rejects at lowering).
+/// access.
+///
+/// The parenthetical here used to read "v1 surfaces the shadowing as a
+/// C++ compile error". It does not. v1 ignores the shadowing and emits
+/// `harc_rt::harc_assign(self.dut->en, 1)` — a write to the DUT PORT,
+/// which compiles and runs (built and run: `dut.en=1`, parameter never
+/// touched). That is what moved this arm to `SilentlyMisLowers`, and it
+/// is asserted below rather than described.
 #[test]
 fn local_shadowing_dut_name_does_not_mislower() {
     let src = r#"
@@ -9112,11 +10538,50 @@ impl ShTest for ShTb
     end run
 end impl ShTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(
+        &lower_src(src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(
-        msg.contains("assignment to a non-port, non-local target"),
+        msg.contains("neither a DUT port nor a local"),
         "shadowed name must not resolve to the DUT: {msg}"
+    );
+
+    // The doc above used to say v1 "surfaces the shadowing as a C++
+    // compile error". Measured, it does not: it ignores the shadowing
+    // and writes to the DUT handle. Built and run outside the suite —
+    // `dut.en=1`, with the `uint<8>` parameter never touched.
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the shadowed program");
+    assert!(
+        v1.contains("harc_rt::harc_assign(self.dut->en, 1);"),
+        "v1 resolves the shadowed name to the DUT handle: {v1}"
+    );
+
+    // The other shape under the same arm, which is the uncompilable
+    // one — both are why the arm carries the worse of the two.
+    let non_place = r#"
+testbench NpTb
+    dut : Top
+    n   : uint<32> default 0
+end testbench NpTb
+
+impl NpTest for NpTb
+    run
+        5 = n
+        wait 1 cycle
+    end run
+end impl NpTest
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(non_place).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("neither a DUT port nor a local"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(non_place))
+            .expect("v1 emits")
+            .contains("5 = _tb.n;"),
+        "v1 emits the assignment to a non-place"
     );
 }
 
@@ -11822,10 +13287,16 @@ end impl T"#,
 end test T"#,
     )
     .expect_err("a non-literal period must be rejected");
+    // `SilentlyMisLowers` rather than a v1 suggestion: the arm also
+    // catches `on 0 cycles`, where v1 emits a handler its own
+    // `period > 0` guard never fires. For the NAMED period written
+    // here v1 is a real escape hatch — see
+    // `a_statement_position_periodic_period_resolves_correctly_under_v1`,
+    // which measures both rows.
+    let msg = assert_not_implemented(&period, lower::V1Status::SilentlyMisLowers);
     assert!(
-        assert_unsupported(&period).contains("non-literal period"),
-        "got: {}",
-        assert_unsupported(&period)
+        msg.contains("non-literal or non-positive period"),
+        "got: {msg}"
     );
 }
 
@@ -13507,12 +14978,25 @@ end impl T"#,
 }
 
 /// A queue method that is not `push`/`pop`/`size`/`empty` is not a v1
-/// escape hatch: `HarcQueue` implements exactly those four, so v1 emits
-/// a call to a method the runtime never defines.
+/// escape hatch, and in EXPRESSION position it is not a subset gap
+/// either: `size`/`empty` lower and `pop` has its own arm, so what
+/// reaches the fallback is `push` (which returns void) or a name
+/// `harc_rt::HarcQueue` never declares. v1 emits `uint64_t z =
+/// <recv>.<name>(...);` for all of them and g++ rejects all of them:
+///
+/// | call | g++ |
+/// |---|---|
+/// | `q.push(3)` | "void value not ignored as it ought to be" |
+/// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+///
+/// So they are `Invalid`, which is what separates them from the same
+/// names in STATEMENT position — there the value is discarded, so
+/// `size`/`empty` become a legal no-op v1 runs and they keep the
+/// suggestion.
 #[test]
 fn an_unknown_queue_method_does_not_point_at_v1() {
-    for stmt in ["q.front()", "let v = q.front()"] {
-        let err = lower_src(&format!(
+    let tb = |stmt: &str| {
+        format!(
             r#"testbench Tb
     dut : Top
     q : queue<uint<8>>
@@ -13523,10 +15007,325 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#
-        ))
-        .unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-        assert!(msg.contains("front"), "`{stmt}`: {msg}");
+        )
+    };
+    // Statement position: a program error, and the message names the API.
+    let msg = assert_invalid(&lower_src(&tb("q.front()")).unwrap_err());
+    assert!(
+        msg.contains("in statement position") && msg.contains("has only"),
+        "{msg}"
+    );
+    // Expression position: also a program error, by a different route.
+    let msg = assert_invalid(&lower_src(&tb("let v = q.front()")).unwrap_err());
+    assert!(
+        msg.contains("in expression position") && msg.contains("has only"),
+        "{msg}"
+    );
+    // And v1's own attempt, which is what makes both `Invalid`.
+    for stmt in ["q.front()", "let v = q.front()"] {
+        let v1 = cpp_tb::emit(&merged_src(&tb(stmt)))
+            .unwrap_or_else(|e| panic!("`{stmt}`: v1 emits: {e}"));
+        assert!(
+            v1.contains(".q.front();"),
+            "`{stmt}`: v1 emits the call `HarcQueue` has no member for"
+        );
+    }
+}
+
+/// `pop` removes and returns the front element, so it takes nothing —
+/// and every `pop` branch used to check only the METHOD NAME and drop
+/// the argument list. `q.pop(7, 9)` lowered and emitted cleanly under
+/// TB-IR while v1 emitted `_tb.pend.pop(7, 9);`, which g++ rejects with
+/// "no matching function for call to `harc_rt::HarcQueue<long unsigned
+/// int>::pop(int, int)`". The `push` branches next to them have always
+/// matched `[CallArg::Expr(arg)]` exactly; this is that check's mirror.
+///
+/// NINE guards, not eight, across TEN `pop` landings: the tenth
+/// (`let v = sb.q.pop(7, 9)`) is claimed first by the older
+/// `as_scoreboard_pop` arity check, which says "scoreboard
+/// `sb.q.pop()` takes no arguments" — same verdict, different wording,
+/// and it is why the scoreboard flavour appears below in statement
+/// position only.
+#[test]
+fn a_queue_pop_takes_no_arguments() {
+    let tb = |stmt: &str| {
+        format!(
+            r#"testbench Tb
+    dut : Top
+    q : queue<uint<8>>
+end testbench Tb
+impl T for Tb
+    run
+        q.push(1)
+        {stmt}
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    // Statement position and `let`-RHS position are separate branches.
+    for stmt in ["q.pop(7, 9)", "let v : uint<8> = q.pop(7, 9)"] {
+        let msg = assert_invalid(&lower_src(&tb(stmt)).unwrap_err());
+        assert!(
+            msg.contains("`pop` takes no arguments") && msg.contains("but 2 were passed"),
+            "`{stmt}`: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&tb(stmt)))
+            .unwrap_or_else(|e| panic!("`{stmt}`: v1 emits: {e}"));
+        assert!(
+            v1.contains(".q.pop(7, 9)"),
+            "`{stmt}`: v1 emits the over-applied call: {v1}"
+        );
+    }
+    // The zero-argument form still lowers — the guard must not have
+    // swallowed the ordinary case.
+    lower_src(&tb("q.pop()")).expect("a bare pop still lowers");
+    lower_src(&tb("let v : uint<8> = q.pop()")).expect("a bound pop still lowers");
+
+    // The other queue flavours reach the same guard through their own
+    // branches, so each is checked rather than inferred from the
+    // testbench one.
+    let state = fixture("queue_state_hookable_test.harc");
+    let cases = [
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        model.pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "scoreboard queue",
+            r#"scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    run
+        sb.q.push(3)
+        sb.q.pop(7, 9)
+        wait 1 cycle
+    end run
+end impl QTest"#
+                .to_string(),
+        ),
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        errs.pop(7, 9)
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+    ];
+    for (what, src) in cases {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("`pop` takes no arguments"), "{what}: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".pop(7, 9)"),
+            "{what}: v1 emits the over-applied call"
+        );
+    }
+
+    // …and the `let`-RHS branch of each, which is a SEPARATE guard.
+    // Checking only the testbench flavour in both positions left three
+    // of them unpinned: deleting all three `let`-RHS calls kept the
+    // whole suite green, and `let z : uint<32> = errs.pop(7, 9)` went
+    // back to lowering cleanly against a v1 that emits
+    // `uint64_t z = self.errs.pop(7, 9);`.
+    let bound = [
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            let z : uint<8> = pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        let z : uint<8> = model.pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        let z : uint<32> = errs.pop(7, 9)
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+    ];
+    for (what, src) in bound {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("`pop` takes no arguments"),
+            "{what} (let-RHS): {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".pop(7, 9)"),
+            "{what} (let-RHS): v1 emits the over-applied call"
+        );
+    }
+}
+
+/// `push` in expression position is the other half of that fallback,
+/// and it is a program error for a DIFFERENT reason: `push` is a real
+/// `HarcQueue` member, it just returns void, so v1's `uint64_t z =
+/// _tb.sb.q.push(3);` gets "void value not ignored as it ought to be"
+/// rather than "has no member named". One arm, two mechanisms, two
+/// messages.
+#[test]
+fn a_queue_push_in_expression_position_is_a_program_error() {
+    let src = r#"scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    run
+        sb.q.push(3)
+        let z : uint<32> = sb.q.push(3)
+        wait 1 cycle
+    end run
+end impl QTest"#;
+    let msg = assert_invalid(&lower_src(src).unwrap_err());
+    assert!(
+        msg.contains("`push` returns no value"),
+        "the message must name the mechanism, not the member list: {msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    assert!(
+        v1.contains("z = _tb.sb.q.push(3);"),
+        "v1 binds the void result, which is what does not compile: {v1}"
+    );
+
+    // Four of the five expression landings reach that message. The
+    // TESTBENCH-owned one does not: `lower_tb_queue_query_call` runs
+    // its `!args.is_empty()` arity check BEFORE the method match, so
+    // `pend.push(3)` is refused for its arguments rather than for its
+    // return type. Same `Invalid` verdict, different message — pinned
+    // so the "two mechanisms, two messages" claim is not read as
+    // covering all five.
+    let tb = r#"testbench Tb
+    dut  : Top
+    pend : queue<uint<32>>
+end testbench Tb
+impl T for Tb
+    run
+        pend.push(3)
+        let z : uint<32> = pend.push(3)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(tb).unwrap_err());
+    assert!(
+        msg.contains("takes no arguments"),
+        "the testbench landing is claimed by its arity check first: {msg}"
+    );
+
+    // The other three landings, each reached on its own. Neutralising
+    // the component / bare-target-state / instance-target-state calls
+    // one at a time left the whole suite green — "measured at all five
+    // landings" was true of the probing and false of the regression
+    // tests, which is the same gap the `pop` guards had.
+    let state = fixture("queue_state_hookable_test.harc");
+    let cases = [
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        let z : uint<32> = errs.front()
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            let z : uint<8> = pending.front()",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        let z : uint<8> = model.pending.front()",
+                1,
+            ),
+        ),
+    ];
+    for (what, src) in cases {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("in expression position") && msg.contains("has only"),
+            "{what}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".front();"),
+            "{what}: v1 emits the call `HarcQueue` has no member for"
+        );
     }
 }
 
@@ -14128,11 +15927,26 @@ end impl T"#
     }
 }
 
-/// The sink SIGNATURE checks keep the suggestion too, for the same
-/// reason: v1 raises its own error for a bad arity or a non-void return
-/// only when the owning env is instantiated.
+/// The sink SIGNATURE checks carry `Rejects`, and this test has had
+/// two wrong verdicts written into it.
+///
+/// It first said they "keep the suggestion too, for the same reason" as
+/// the endpoint-shape arms — asserted, never measured, and it only ever
+/// built the INSTANTIATED case. Then it said `Invalid`, which is the
+/// opposite over-correction: an env nothing instantiates emits no
+/// wiring, and THAT program v1 compiles and runs to completion, so "a
+/// program error under every backend" is false.
+///
+/// Measured, both halves. Instantiated, v1 raises its own error:
+/// "connect: hookable sink `sink.two` must take exactly one payload
+/// argument, got 2" and "connect: hookable sink `sink.ret` must return
+/// void" — the env field here is `sink`, and an earlier version of this
+/// doc wrote `sb`. Uninstantiated, v1 runs the
+/// program. Worst-under-arm over those two is `Rejects` — v1 does not
+/// implement the construct, and saying so is honest without claiming
+/// the program is malformed everywhere.
 #[test]
-fn a_bad_connect_sink_signature_keeps_its_v1_suggestion() {
+fn a_bad_connect_sink_signature_is_not_implemented_by_v1_either() {
     let src = |sink: &str, method: &str| {
         format!(
             r#"transactor Src
@@ -14168,21 +15982,56 @@ end impl T"#
         )
     };
 
-    let err = lower_src(&src(
-        "two",
-        "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
-    ))
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("with 2 parameters"), "{msg}");
+    for (sink, method, want) in [
+        (
+            "two",
+            "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
+            "with 2 parameters",
+        ),
+        (
+            "ret",
+            "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
+            "that returns a value",
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src(sink, method)).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{msg}");
 
-    let err = lower_src(&src(
-        "ret",
-        "    hookable ret(v: uint<8>) -> uint<8>\n        return v\n    end ret",
-    ))
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("that returns a value"), "{msg}");
+        // v1 refuses the instantiated form — the row that earns
+        // `Rejects`.
+        let v1 = cpp_tb::emit(&merged_src(&src(sink, method)))
+            .expect_err("v1 refuses an instantiated bad sink signature");
+        // Pin the whole clause, not just the prefix: the arm's detail
+        // quotes v1's wording, and a prefix match would not notice it
+        // drifting.
+        let v1 = format!("{v1}");
+        assert!(
+            v1.contains("connect: hookable sink `sink.")
+                && (v1.contains("must take exactly one payload argument, got 2")
+                    || v1.contains("must return void")),
+            "{v1}"
+        );
+
+        // And the row that rules `Invalid` out: with nothing
+        // instantiating the env, v1 emits no wiring and the program is
+        // fine. TB-IR still refuses it, which is a real strictness gap
+        // — but not a claim that no backend runs it.
+        let uninstantiated = src(sink, method).replacen("    top : E\n", "", 1);
+        assert!(
+            !uninstantiated.contains("top : E"),
+            "the instantiation must actually be gone"
+        );
+        cpp_tb::emit(&merged_src(&uninstantiated))
+            .unwrap_or_else(|e| panic!("v1 runs an uninstantiated bad edge: {e}"));
+        let msg = assert_not_implemented(
+            &lower_src(&uninstantiated).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{msg}");
+    }
 }
 
 /// Record state is legal in BOTH transactor declaration positions —
@@ -14269,15 +16118,12 @@ end impl T"#,
 }
 
 /// A record-typed field on a transactor reached through an `env` comes
-/// through the COMPONENT-field machinery, which has no record kind. It
-/// used to fall through to the DUT-handle arm and report "more than one
-/// DUT handle field (dut, cur)" — a diagnostic that names the wrong
-/// problem entirely. v1 emits a plain member here and it works, so the
-/// `--codegen v1` suggestion is honest; only the wording was wrong.
+/// through the component-field machinery. It is persistent by-value
+/// state, not a second DUT handle, and must remain usable from the
+/// transactor method body.
 #[test]
-fn an_env_held_transactor_record_field_names_the_real_problem() {
-    let err = lower_src(
-        r#"struct Beat
+fn an_env_held_transactor_record_field_lowers() {
+    let src = r#"struct Beat
     tag : uint<8> default 0
 end struct Beat
 
@@ -14304,17 +16150,15 @@ impl T for Tb
     run
         wait 2 cycles
     end run
-end impl T"#,
-    )
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
+end impl T"#;
+    let cpp = emit_cpp_src(src);
     assert!(
-        msg.contains("a record-typed field `Xt.cur` of type `Beat`"),
-        "{msg}"
+        cpp.contains("Beat cur{};"),
+        "record member is emitted:\n{cpp}"
     );
     assert!(
-        !msg.contains("DUT handle"),
-        "the old wording blamed the DUT handle: {msg}"
+        cpp.contains("self.cur.tag = 5;"),
+        "method write keeps the record receiver:\n{cpp}"
     );
 }
 
@@ -14957,6 +16801,770 @@ impl T for Tb
 end impl T
 "#;
 
+/// The four things a coverpoint constant can BE, and the four different
+/// answers v1 gives when it is not a constant.
+///
+/// One helper folded `Vec` lane indices, bit-slice bounds,
+/// `.trunc<N>()`-family widths and `as uint<N>` cast widths, and gave
+/// all four the same refusal — including the same TEXT, so
+/// `.trunc<N>()` was reported as a "non-constant index/slice bound".
+/// Measured per role by mutating `cov_expr_targets_test` and
+/// `packed_vec_lane_test` (fixtures BOTH backends pass) one bound at a
+/// time, and compiling v1's emission against a stub `VTop`:
+///
+/// | role | v1 on an unresolvable name | verdict |
+/// |---|---|---|
+/// | `Vec` lane index | `dut->lane_id_out[EOF]` — compiles, indexes at -1 | `SilentlyMisLowers` |
+/// | bit-slice bound | `harc_bits(v, (uint32_t)(EOF), 0)` — compiles, slices at 4294967295 | `SilentlyMisLowers` |
+/// | width-method width | refuses: "requires a constant integer width" | `Rejects` |
+/// | cast width | `(uint64_t)(...)` — compiles, width ignored entirely | `SilentlyMisLowers` |
+///
+/// `EOF` is the load-bearing input. `N` alone would have said
+/// `EmitsUncompilable` ("'N' was not declared in this scope", measured),
+/// and so would `stderr` ("cast from 'FILE*' to 'uint32_t' loses
+/// precision") — but v1 pastes the HARC identifier into C++ without
+/// looking at it, so a name that also names a macro compiles clean and
+/// samples a bound nobody wrote. The arm's status is the worst thing v1
+/// does anywhere under it.
+#[test]
+fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "cov fixture shape changed");
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert!(lanes.contains(LANE), "lane fixture shape changed");
+    let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
+
+    // The two roles v1 mis-samples: it emits the name verbatim.
+    for (what, src, v1_needle) in [
+        (
+            "bit-slice bound",
+            slice("dut.count_out[EOF:0]"),
+            "(uint32_t)(EOF)",
+        ),
+        (
+            "`Vec` lane index",
+            lane("dut.lane_id_out[EOF]"),
+            "lane_id_out[EOF]",
+        ),
+    ] {
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains(what),
+            "{what}: the role must name itself: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(v1_needle),
+            "{what}: v1 pastes the name into C++: expected `{v1_needle}`"
+        );
+    }
+
+    // The role v1 refuses.
+    let width = slice("dut.count_out[3:0].trunc<N>()");
+    let msg = assert_not_implemented(&lower_src(&width).unwrap_err(), lower::V1Status::Rejects);
+    assert!(msg.contains("width-method width"), "{msg}");
+    let e = cpp_tb::emit(&merged_src(&width)).expect_err("v1 refuses a non-const width");
+    assert!(
+        e.to_string().contains("requires a constant integer width"),
+        "v1's own refusal is what makes this `Rejects`: {e}"
+    );
+
+    // The role v1 never even looks at.
+    let cast = slice("(dut.count_out as uint<N>)");
+    let msg = assert_not_implemented(
+        &lower_src(&cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&cast)).expect("v1 emits");
+    assert!(
+        !v1.contains("(uint32_t)(N)") && !v1.contains("uint<N>"),
+        "v1 drops the width rather than resolving it: {v1}"
+    );
+
+    // Two more shapes, two more verdicts, from the same helper.
+    let runtime = slice("dut.count_out[dut.en:0]");
+    let msg = assert_unsupported(&lower_src(&runtime).unwrap_err());
+    assert!(msg.contains("not a compile-time constant"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&runtime)).expect("v1 emits a dynamic bound");
+    assert!(
+        v1.contains("(uint32_t)(harc_rt::harc_read(dut->en))"),
+        "v1's bound varies per cycle, which is why the suggestion is honest: {v1}"
+    );
+
+    let huge = slice("dut.count_out[99999999999999999999999:0]");
+    let msg = assert_not_implemented(
+        &lower_src(&huge).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("over-wide literal"), "{msg}");
+
+    let sized = slice("dut.count_out[4'd3:0]");
+    let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
+    assert!(msg.contains("sized literal"), "{msg}");
+
+    // NESTED, both kinds. The walk that finds a name or a literal
+    // inside `[K + N:0]` is what makes any of the above work on a
+    // compound bound, and nothing exercised it: stubbing the recursion
+    // out ("visit the top node only") left the whole suite green.
+    let nested = slice("dut.count_out[1 + EOF:0]");
+    let msg = assert_not_implemented(
+        &lower_src(&nested).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`EOF`"),
+        "a buried name must still be found: {msg}"
+    );
+
+    // …and when a bound holds BOTH kinds of unfoldable literal, the
+    // worse verdict has to win regardless of operand order. Returning
+    // the first pre-order hit made `[4'd3 + 999…:0]` promise
+    // `--codegen v1` while `[999… + 4'd3:0]` refused to, for a program
+    // v1 truncates either way.
+    for t in [
+        "dut.count_out[4'd3 + 99999999999999999999999:0]",
+        "dut.count_out[99999999999999999999999 + 4'd3:0]",
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&slice(t)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("over-wide literal"), "`{t}`: {msg}");
+    }
+    // …and the reason that one keeps the suggestion: v1 folds it.
+    let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
+    assert!(
+        v1.contains("(uint32_t)(3)"),
+        "v1 folds `4'd3` to 3, so `--codegen v1` really is a way out: {v1}"
+    );
+}
+
+/// A coverpoint bound is a constant EXPRESSION, not just a literal or a
+/// name. v1 emits `[1 + 2:0]` as `harc_bits(v, (uint32_t)(1 + 2), 0)`,
+/// which means exactly `[3:0]`, so refusing it was a subset gap with
+/// nothing behind it. Folding through `fold_const` — the same evaluator
+/// `const` declarations use — closes it, and the test is equality with
+/// the literal spelling rather than a shape assertion.
+#[test]
+fn a_constant_expression_coverpoint_bound_folds() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice =
+        |prefix: &str, t: &str| format!("{prefix}{}", cov.replacen(CP, &format!("cover {t}\n"), 1));
+    let literal = emit_cpp_src(&cov);
+    for (what, prefix, t) in [
+        ("arithmetic", "", "dut.count_out[1 + 2:0]"),
+        (
+            "a const in an expression",
+            "const K = 1\n\n",
+            "dut.count_out[K + 2:0]",
+        ),
+        ("a shift", "", "dut.count_out[(1 << 2) - 1:0]"),
+        ("a hex literal", "", "dut.count_out[0x3:0]"),
+    ] {
+        assert_eq!(
+            emit_cpp_src(&slice(prefix, t)),
+            literal,
+            "{what} must lower exactly like the literal `[3:0]`"
+        );
+    }
+    // The lane-index role folds through the same helper.
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert_eq!(
+        emit_cpp_src(&lanes.replacen(LANE, "cover dut.lane_id_out[2 - 2]", 1)),
+        emit_cpp_src(&lanes),
+        "a folded lane index must lower exactly like the literal"
+    );
+}
+
+/// The built-in predicates on a TRANSACTOR receiver. v1 resolves them
+/// there as well as on a component — `resolve_component_idle_predicate`
+/// walks `self.transactors` through `synth_component_from_transactor`,
+/// and both backends stamp `_last_in_cycle`/`_last_out_cycle` on
+/// transactor state structs — so a flat `Invalid` was calling twelve
+/// working programs (4 names x assert / bare statement / `let`) errors.
+///
+/// The carve-out that fixed it shipped with no test: `&& false` on it
+/// left the whole suite green.
+#[test]
+fn a_built_in_predicate_on_a_transactor_is_a_gap_not_an_error() {
+    let src = |stmt: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+    when active
+        hookable go()
+            wait 1 cycle
+        end go
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    d   : Drv active
+end testbench Tb
+
+impl TT for Tb
+    clock clk = SysDomain
+    run
+        d.dut = dut
+        {stmt}
+        wait 1 cycle
+    end run
+end impl TT"#
+        )
+    };
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        for stmt in [
+            format!("assert d.{name}(2) else fail(\"o\")"),
+            format!("d.{name}(2)"),
+            format!("let v = d.{name}(2)"),
+        ] {
+            let s = src(&stmt);
+            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains(&format!("`d.{name}` on a transactor")),
+                "`{stmt}`: {msg}"
+            );
+            // The half that makes the suggestion honest: v1 emits the
+            // heartbeat against the transactor's own stamps.
+            let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
+            // `idle_out` reads only the out stamp; the other three read
+            // the in stamp (`idle` and `quiesced` read both).
+            let stamp = if name == "idle_out" {
+                "_tb.d._last_out_cycle"
+            } else {
+                "_tb.d._last_in_cycle"
+            };
+            assert!(
+                v1.contains(stamp),
+                "`{stmt}`: v1 resolves the predicate on the transactor (`{stamp}`)"
+            );
+        }
+    }
+    // …and a name nothing implements is still the program error the
+    // surrounding arm was written for.
+    let s = src("assert d.nosuch(2) else fail(\"o\")");
+    let msg = assert_invalid(&lower_src(&s).unwrap_err());
+    assert!(msg.contains("has no method `nosuch`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&s)).expect("v1 emits it");
+    assert!(
+        v1.contains("_tb.d.nosuch(2)"),
+        "v1 emits a call `Drv` has no member for: {v1}"
+    );
+}
+
+/// Every width-method and cast verdict in the covergroup path, against
+/// what v1 actually does — 224 cells, not the handful of examples that
+/// let four rounds of defects through.
+///
+/// The rule is one-directional and cheap to state: if v1 REFUSES a
+/// program, TB-IR must not answer `Unsupported`, because that renders
+/// "re-run with `--codegen v1`" and v1 is not there. If v1 EMITS one,
+/// TB-IR must not answer `Invalid` or `NotImplemented`, because both
+/// deny an escape hatch that exists.
+///
+/// Checking it by example is what failed repeatedly. Each of these was
+/// found by enumeration and would have been caught here:
+///
+///   * `.resize<4>()` on an 8-bit value — `Invalid`, both backends
+///     compile it (the wrong-direction rule does not apply to `resize`)
+///   * `.zext<2000>()` — `Unsupported`, v1 refuses it at the 1024-bit
+///     language limit
+///   * `(as uint<300>).trunc<200>()` — `NotImplemented`, v1 builds it
+///   * `[200:0].trunc<65>()` — `NotImplemented` blaming a cast that is
+///     not in the program
+///   * `const HI = 100` + `[HI:0].zext<70>()` — `Invalid` where the
+///     literal spelling of the same program is correct, because the
+///     width inference folded and v1's does not
+#[test]
+fn covergroup_width_verdicts_agree_with_v1_across_the_grid() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "fixture shape changed");
+    // Half literal-spelled, half written with a `const` — because the
+    // width INFERENCE differs between the two and a literal-only grid
+    // misses it. Found by mutation on this very test: restoring the
+    // folding inference left an all-literal grid green while
+    // `[HI:0].zext<70>()` went back to `Invalid` on a program v1 runs.
+    const PRELUDE: &str = "const HI = 100\nconst LO = 0\nconst W8 = 8\nconst K128 = 128\n\n";
+    let receivers = [
+        "dut.count_out[3:0]",
+        "dut.count_out[7:0]",
+        "dut.count_out[100:0]",
+        "(dut.count_out as uint<128>)",
+        "(dut.count_out as uint<201>)",
+        "(dut.count_out as uint<300>)",
+        "dut.count_out",
+        "dut.count_out[HI:LO]",
+        "dut.count_out[W8 - 1:0]",
+        "dut.count_out[1 + 2:0]",
+        "(dut.count_out as uint<K128>)",
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    let mut cells = 0usize;
+    for recv in receivers {
+        for method in ["trunc", "zext", "sext", "resize"] {
+            for width in [2u32, 4, 64, 65, 128, 200, 300, 2000] {
+                let target = format!("{recv}.{method}<{width}>()");
+                let src = format!(
+                    "{PRELUDE}{}",
+                    cov.replacen(CP, &format!("cover {target}\n"), 1)
+                );
+                let tb = lower_src(&src);
+                let v1_ok = cpp_tb::emit(&merged_src(&src)).is_ok();
+                cells += 1;
+                let wrong = match (&tb, v1_ok) {
+                    // v1 refuses; TB-IR must not send the user to it.
+                    (Err(lower::LowerError::Unsupported { .. }), false) => {
+                        Some("`Unsupported` but v1 refuses it")
+                    }
+                    // v1 builds it; TB-IR must not deny the hatch.
+                    (Err(lower::LowerError::Invalid(_)), true) => {
+                        Some("`Invalid` but v1 builds it")
+                    }
+                    (Err(lower::LowerError::NotImplemented { .. }), true) => {
+                        Some("`NotImplemented` but v1 builds it")
+                    }
+                    _ => None,
+                };
+                if let Some(why) = wrong {
+                    bad.push(format!("{target}: {why}"));
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 352, "the grid changed shape");
+    assert!(
+        bad.is_empty(),
+        "{} of {cells} cells disagree with v1:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
+/// The width-method DIRECTION rule, above 64 bits and through a nested
+/// receiver — the two places it did not reach, plus the one method it
+/// must not apply to.
+///
+/// The check used to sit below the `>64` refusal, so it was unreachable
+/// for exactly the widths that need it; and `cover_infer_expr_width`
+/// passed `None` for a nested receiver, so `[3:0].trunc<128>()` was
+/// `Invalid` alone and `Unsupported` the moment anything wrapped it.
+/// Neither fix was pinned by anything: reverting either left the whole
+/// suite green.
+///
+/// `resize` is NOT subject to the rule. The spec says so
+/// ("`.resize<N>()` remains direction-agnostic"), v1's own check reads
+/// `"zext" | "sext"`, and TB-IR's general expression lowering excludes
+/// it — three statements of the rule, none of them read before it was
+/// invented, which made `dut.count_out[7:0].resize<4>()` a "program
+/// error" that both backends had been compiling to identical C++.
+#[test]
+fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+
+    // Above 64, where the check could not previously run. v1 refuses
+    // each of these, which is what makes `Invalid` right rather than a
+    // `--codegen v1` suggestion.
+    for t in [
+        "dut.count_out[100:0].zext<70>()",
+        "dut.count_out[100:0].sext<70>()",
+        "(dut.count_out as uint<128>).zext<100>()",
+    ] {
+        let src = slice(t);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("width must be ≥ the source width"),
+            "`{t}`: {msg}"
+        );
+        let e = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses it too");
+        assert!(
+            e.to_string().contains("width must be ≥ the source width"),
+            "`{t}`: v1's sentence is the one TB-IR prints: {e}"
+        );
+    }
+
+    // Through a NESTED width method: the inner program is refused
+    // whether or not something wraps it.
+    let bare = slice("dut.count_out[3:0].trunc<128>()");
+    let wrapped = slice("dut.count_out[3:0].trunc<128>().zext<128>()");
+    let bare_msg = assert_invalid(&lower_src(&bare).unwrap_err());
+    let wrapped_msg = assert_invalid(&lower_src(&wrapped).unwrap_err());
+    assert_eq!(
+        bare_msg, wrapped_msg,
+        "a wrapper must not change the inner program's verdict"
+    );
+
+    // `resize` narrows or widens as it likes, at any width.
+    for t in [
+        "dut.count_out[7:0].resize<4>()",
+        "dut.count_out[7:0].resize<32>()",
+        "dut.count_out[3:0].trunc<2>().resize<1>()",
+    ] {
+        emit_cpp_src(&slice(t));
+        cpp_tb::emit(&merged_src(&slice(t)))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 builds it too: {e}"));
+    }
+
+    // Equal widths: `trunc` is a no-op and refused, the widening pair
+    // is accepted. Both backends agree.
+    let eq_trunc = slice("dut.count_out[7:0].trunc<8>()");
+    assert_invalid(&lower_src(&eq_trunc).unwrap_err());
+    cpp_tb::emit(&merged_src(&eq_trunc)).expect_err("v1 refuses a no-op trunc");
+    emit_cpp_src(&slice("dut.count_out[7:0].zext<8>()"));
+
+    // Wide receivers and wide widths alike keep the suggestion: v1
+    // builds all of them under `-std=gnu++20`, which is what
+    // `src/main.rs` passes to the emitted testbench. An
+    // `EmitsUncompilable` split at 128 used to live here and in
+    // `cover_cast_width`, measured with `-std=c++20`, where
+    // `HarcWide`'s `is_integral_v` gate rejects `__int128`.
+    for t in [
+        "(dut.count_out as uint<300>).trunc<200>()",
+        "dut.count_out[3:0].zext<200>()",
+        "dut.count_out[3:0].sext<200>()",
+        // A slice-derived source width above 128, which the `>128`
+        // machinery reported as a problem with "the receiver's own
+        // cast" when there is no cast at all.
+        "dut.count_out[200:0].trunc<65>()",
+    ] {
+        assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        cpp_tb::emit(&merged_src(&slice(t))).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
+    }
+
+    // The direction check must fire exactly where v1's does, which
+    // means inferring a receiver width only from LITERALS — v1 uses
+    // `eval_const_width` and so does TB-IR's general path. Folding the
+    // bound made these `Invalid` while the identical program compiled
+    // under v1, decided purely by whether the bound had a name.
+    for (pre, t) in [
+        ("const W8 = 8\n\n", "dut.count_out[W8 - 1:0].zext<4>()"),
+        ("", "dut.count_out[1 + 2:0].trunc<4>()"),
+    ] {
+        let src = format!("{pre}{}", slice(t));
+        emit_cpp_src(&src);
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
+    }
+    // A folded bound with a width ABOVE 64 is still refused, but for
+    // the 64-bit model rather than for direction — `Unsupported`, not
+    // the `Invalid` the folding inference used to produce.
+    let folded_wide = format!(
+        "const HI = 100\n\n{}",
+        slice("dut.count_out[HI:0].zext<70>()")
+    );
+    assert_unsupported(&lower_src(&folded_wide).unwrap_err());
+    cpp_tb::emit(&merged_src(&folded_wide)).expect("v1 builds it");
+    // …while the literal spelling of the same program stays `Invalid`
+    // under both backends.
+    assert_invalid(&lower_src(&slice("dut.count_out[100:0].zext<70>()")).unwrap_err());
+}
+
+/// The hook-parameter guard on the four constant ROLES, and the
+/// negative-fold verdict — both added in response to review and
+/// neither pinned by anything, which review round three caught by
+/// deleting each and watching 482 tests stay green. That is the third
+/// time on this branch a guard has shipped unmeasured, in a commit
+/// written to answer a review that said exactly that.
+///
+/// A hook parameter beats a file-scope `const` of the same name. What
+/// v1 does with a per-call bound then depends on the ROLE, and a flat
+/// `Unsupported` for all four was a false escape hatch at two of them:
+///
+/// | coverpoint | v1 | verdict |
+/// |---|---|---|
+/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | `Unsupported` |
+/// | `cmd.ticks.trunc<k>()` | refuses: "requires a constant integer width" | `Rejects` |
+/// | `cmd.ticks.zext<k>()` | same refusal | `Rejects` |
+/// | `(cmd.ticks as uint<k>)` | `(uint64_t)(cmd.ticks)` — width dropped | `SilentlyMisLowers` |
+#[test]
+fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
+    let hooked = fixture("covergroup_hook_param_test.harc")
+        .replacen(
+            "        hookable run_for(cmd: RunCmd)",
+            "        hookable run_for(cmd: RunCmd, k: uint<8>)",
+            1,
+        )
+        .replacen(
+            "covergroup RunCmdCov @(drv.run_for(cmd) post)",
+            "covergroup RunCmdCov @(drv.run_for(cmd, k) post)",
+            1,
+        )
+        .replacen(
+            "            drv.run_for(cmd)",
+            "            drv.run_for(cmd, 3)",
+            1,
+        );
+    assert!(
+        hooked.contains("cmd: RunCmd, k: uint<8>") && hooked.contains("run_for(cmd, 3)"),
+        "the scalar hook parameter must actually be added"
+    );
+    let point = |t: &str| {
+        hooked.replacen(
+            "cp_ticks : cover cmd.ticks",
+            &format!("cp_ticks : cover {t}"),
+            1,
+        )
+    };
+
+    // The role v1 gets right keeps the suggestion…
+    let slice = point("cmd.ticks[k:0]");
+    let msg = assert_unsupported(&lower_src(&slice).unwrap_err());
+    assert!(msg.contains("bit-slice bound `k`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&slice)).expect("v1 emits the per-call bound");
+    assert!(
+        v1.contains("harc_bits(cmd.ticks, (uint32_t)(k)"),
+        "v1 emits the hook ARGUMENT as the bound: {v1}"
+    );
+    // …and it is a real hazard, not a hypothetical: an unrelated const
+    // of the same name must not capture it.
+    let msg = assert_unsupported(&lower_src(&format!("const k = 7\n\n{slice}")).unwrap_err());
+    assert!(
+        msg.contains("is a hook parameter"),
+        "a file-scope `const k` must not fold the bound to [7:0]: {msg}"
+    );
+
+    // The two roles v1 refuses…
+    for t in ["cmd.ticks.trunc<k>()", "cmd.ticks.zext<k>()"] {
+        let src = point(t);
+        let msg = assert_not_implemented(&lower_src(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("width-method width `k`"), "`{t}`: {msg}");
+        let e = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses a non-const width");
+        assert!(
+            e.to_string().contains("requires a constant integer width"),
+            "`{t}`: {e}"
+        );
+    }
+
+    // …and the one it accepts while dropping the width on the floor.
+    let cast = point("(cmd.ticks as uint<k>)");
+    let msg = assert_not_implemented(
+        &lower_src(&cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width `k`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&cast)).expect("v1 emits it, width and all");
+    assert!(
+        !v1.contains("(uint32_t)(k)"),
+        "v1 never resolves a cast width: {v1}"
+    );
+}
+
+/// A NEGATIVE folded bound, which the constant fold made reachable
+/// (`[0 - 1]` was not a constant expression before it) and which a
+/// first version called `Invalid` — twenty lines above a table saying
+/// v1 compiles the equivalent.
+///
+/// `EOF` is `(-1)` on glibc, so `dut.lane_id_out[0 - 1]` and
+/// `dut.lane_id_out[EOF]` are the same C++ after preprocessing. v1
+/// emits both, both compile, both index at -1. One cannot be a program
+/// error while the other is a silent mis-lowering.
+#[test]
+fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
+    let lanes = fixture("packed_vec_lane_test.harc");
+    const LANE: &str = "cover dut.lane_id_out[0]";
+    assert!(lanes.contains(LANE), "fixture shape changed");
+    let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
+
+    let mut v1_forms = Vec::new();
+    for (t, want) in [
+        ("dut.lane_id_out[0 - 1]", "lane_id_out[0 - 1]"),
+        ("dut.lane_id_out[EOF]", "lane_id_out[EOF]"),
+    ] {
+        let src = lane(t);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: {e}"));
+        assert!(v1.contains(want), "`{t}`: v1 emits `{want}`");
+        v1_forms.push(v1);
+    }
+    assert_eq!(
+        v1_forms[0].replace("[0 - 1]", "[EOF]"),
+        v1_forms[1],
+        "the two spellings differ only in the token, which is why they share a verdict"
+    );
+
+    // A negative WIDTH is a different role and takes that role's
+    // verdict, not the lane one.
+    let cov = fixture("cov_expr_targets_test.harc");
+    // …and the VERDICT, not just the message. A first version asserted
+    // only `contains("width-method width -8")`, which survives
+    // replacing the whole arm with the `Invalid` the commit spends four
+    // paragraphs calling wrong.
+    let neg = |t: &str| cov.replacen("cover dut.count_out[3:0]\n", &format!("cover {t}\n"), 1);
+    let msg = assert_not_implemented(
+        &lower_src(&neg("dut.count_out[3:0].sext<0 - 8>()")).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("width-method width -8"), "{msg}");
+
+    // The other two roles take their own verdicts, and neither was
+    // covered at all.
+    let msg = assert_not_implemented(
+        &lower_src(&neg("dut.count_out[0 - 1:0]")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("bit-slice bound -1"), "{msg}");
+
+    let msg = assert_not_implemented(
+        &lower_src(&neg("(dut.count_out as uint<0 - 8>)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width -8"), "{msg}");
+    // v1 drops a cast width rather than resolving it, which is why
+    // that role is `SilentlyMisLowers` and not `Rejects`.
+    let v1 = cpp_tb::emit(&merged_src(&neg("(dut.count_out as uint<0 - 8>)")))
+        .expect("v1 emits it, width and all");
+    assert!(
+        v1.contains("(uint64_t)(harc_rt::harc_read(dut->count_out))"),
+        "v1 emits a plain 64-bit cast: {v1}"
+    );
+}
+
+/// A width above 64 bits is REFUSED, not clamped — and an earlier
+/// version of this test asserted the clamp, on the argument that "a
+/// coverpoint samples 64 bits, so widening past it is the identity".
+///
+/// That holds only when the widened value is sampled DIRECTLY. Slice
+/// it first and v1 keeps a real 128-bit intermediate while a clamped
+/// TB-IR throws the width away and shifts a `uint64_t` past its own
+/// width:
+///
+/// ```text
+/// cover dut.count_out[3:0].sext<128>()[70:65]
+///   v1   : harc_bits(harc_sext_u128(harc_bits(v,3,0), 4, 128), 70, 65)
+///   TB-IR: (((uint64_t)(nibble sign-extended to 64)) >> 65) & 0x3F
+/// ```
+///
+/// At `count_out = 15` those are 63 and 0. Both backends build; g++
+/// warns on the TB-IR side and HARC says nothing at all. The clamp
+/// turned an accurate `--codegen v1` suggestion into a silently wrong
+/// sample, which is the one outcome this sweep exists to prevent.
+///
+/// The refusals split where v1 stops working:
+///
+/// | construct | v1 | verdict |
+/// |---|---|---|
+/// | `.sext<128>()`, `as uint<128>` | `_harc_u128`, compiles | `Unsupported` |
+/// | `as uint<200>` | `HarcWide<7>`, g++ rejects the ctor | `EmitsUncompilable` |
+#[test]
+fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+
+    // The identity claim, falsified: v1's sliced form reads bits the
+    // 64-bit model does not have.
+    let sliced = slice("dut.count_out[3:0].sext<128>()[70:65]");
+    let msg = assert_unsupported(&lower_src(&sliced).unwrap_err());
+    assert!(msg.contains("`.sext<128>()`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&sliced)).expect("v1 emits the 128-bit slice");
+    assert!(
+        v1.contains("harc_sext_u128") && v1.contains("(uint32_t)(70), (uint32_t)(65)"),
+        "v1 slices bits 70:65 of a real 128-bit value: {v1}"
+    );
+
+    // Every widening form refuses, and each names itself.
+    for (t, want) in [
+        ("dut.count_out[3:0].sext<128>()", "`.sext<128>()`"),
+        ("dut.count_out[3:0].zext<128>()", "`.zext<128>()`"),
+        ("dut.count_out[3:0].resize<128>()", "`.resize<128>()`"),
+        ("(dut.count_out as uint<128>)", "cast to 128 bits"),
+        ("(dut.count_out as sint<128>)", "cast to 128 bits"),
+        ("(dut.count_out as uint<65>)", "cast to 65 bits"),
+    ] {
+        let msg = assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains(want), "`{t}`: {msg}");
+        // …and the claim behind the suggestion: v1 builds it.
+        cpp_tb::emit(&merged_src(&slice(t)))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 must emit it for the suggestion to hold: {e}"));
+    }
+
+    // `trunc` is the exception: it NARROWS, so whether v1 accepts it
+    // depends on the source width rather than on 64. On the 4-bit
+    // nibble it is a wrong-direction cast and both backends refuse —
+    // `Invalid`, not a gap, and not the blanket `Rejects` an earlier
+    // version gave every `trunc` above 64 on the strength of this one
+    // input.
+    let t = slice("dut.count_out[3:0].trunc<128>()");
+    let msg = assert_invalid(&lower_src(&t).unwrap_err());
+    assert!(
+        msg.contains("width must be strictly less than the source width"),
+        "{msg}"
+    );
+    let e = cpp_tb::emit(&merged_src(&t)).expect_err("v1 refuses it too");
+    assert!(
+        e.to_string()
+            .contains("width must be strictly less than the source width"),
+        "v1's own rule is what makes it a program error: {e}"
+    );
+
+    // Above 128 v1 keeps working too, so the suggestion stays.
+    //
+    // This asserted `EmitsUncompilable` for four rounds on the strength
+    // of g++ rejecting `HarcWide<7>::HarcWide(__int128 unsigned)`. That
+    // rejection is an artifact of the flag the probe used: `HarcWide`'s
+    // converting constructor is gated on `std::is_integral_v<T>`, which
+    // libstdc++ reports FALSE for `__int128` under `-std=c++20` and
+    // TRUE under `-std=gnu++20` — and `src/main.rs` builds the emitted
+    // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`.
+    // `tests/wide_cast_cpp.rs` already said so in a comment.
+    let wide = slice("(dut.count_out as uint<200>)");
+    let msg = assert_unsupported(&lower_src(&wide).unwrap_err());
+    assert!(msg.contains("cast to 200 bits"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it");
+    assert!(v1.contains("HarcWide<7>"), "{v1}");
+
+    // The language limit is the one width rule that IS a program error,
+    // and this path checked `0` and stopped — so `.zext<2000>()` was
+    // told to re-run under a v1 that refuses it.
+    for t in [
+        "dut.count_out[3:0].zext<2000>()",
+        "dut.count_out[3:0].resize<2000>()",
+    ] {
+        let msg = assert_invalid(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains("1024-bit language limit"), "`{t}`: {msg}");
+        let e = cpp_tb::emit(&merged_src(&slice(t))).expect_err("v1 refuses it too");
+        assert!(e.to_string().contains("1024-bit language limit"), "{e}");
+    }
+
+    // And the width argument must be a plain literal, which the fold
+    // had quietly widened: `.zext<1 + 7>()` lowered while v1 refused it.
+    for t in [
+        "dut.count_out[3:0].zext<1 + 7>()",
+        "dut.count_out[3:0].trunc<1 + 1>()",
+    ] {
+        let msg = assert_invalid(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains("plain integer literal"), "`{t}`: {msg}");
+        cpp_tb::emit(&merged_src(&slice(t))).expect_err("v1 refuses a non-literal width");
+    }
+
+    // Widths AT or below 64 are untouched — the refusal is not a
+    // blanket one.
+    for t in [
+        "dut.count_out[3:0].sext<64>()",
+        "dut.count_out[3:0].zext<8>()",
+        "(dut.count_out as uint<64>)",
+    ] {
+        emit_cpp_src(&slice(t));
+    }
+}
+
 /// A file-scope `const` as a coverpoint slice bound. v1 emits one as
 /// `(uint32_t)(K)` against its own `static constexpr K` — identical
 /// semantics to the literal — while TB-IR refused anything but a plain
@@ -15576,29 +18184,165 @@ fn a_low_precedence_bin_value_is_a_place_v1_is_wrong() {
 }
 
 /// A bare name in a bin spec that is neither a `const`/enum variant nor
-/// a hook param is a typo, and keeps the message that says so. Routing
-/// every non-range member through `lower_bin_bound` would otherwise hand
-/// the user the generic sampler-subset list — less precise, and it
-/// labels a bin as a "point".
+/// a hook param keeps the message that says so — routing it through the
+/// generic sampler-subset list would be less precise and would label a
+/// bin as a "point" — but it does NOT keep the `--codegen v1`
+/// suggestion, which was never true.
+///
+/// v1 emits the name straight into its comparison: `if (((_v == NOPE)))`.
+/// For an undeclared name that is "'NOPE' was not declared in this
+/// scope"; for one that also names a macro it is worse, because
+/// `_v == EOF` COMPILES and yields a bin that can never match, with no
+/// diagnostic from either backend. The arm's status is the worst thing
+/// v1 does under it, so it is `SilentlyMisLowers`.
 #[test]
 fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     emit_cpp_src(&fixture);
 
     let err = lower_src(&fixture.replace("en0 = {0}", "en0 = {NOPE}")).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("bin `en0`"), "a bin is not a point: {msg}");
-    assert!(
-        msg.contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"),
-        "{msg}"
-    );
+    assert!(msg.contains("`NOPE` is not a file-scope const"), "{msg}");
 
-    // The escape hatches the message names all work, so it is accurate.
+    // What v1 does with it, which is what makes the suggestion wrong.
+    for (name, needle) in [("NOPE", "_v == NOPE"), ("EOF", "_v == EOF")] {
+        let v1 = cpp_tb::emit(&merged_src(
+            &fixture.replace("en0 = {0}", &format!("en0 = {{{name}}}")),
+        ))
+        .unwrap_or_else(|e| panic!("{name}: v1 emits: {e}"));
+        assert!(
+            v1.contains(needle),
+            "{name}: v1 pastes the name into the comparison"
+        );
+    }
+
+    // The escape hatches the message names all work, so the rest of it
+    // is accurate.
     lower_src(&format!(
         "const NOPE = 3\n\n{}",
         fixture.replace("en0 = {0}", "en0 = {NOPE}")
     ))
     .expect("a const name folds");
+}
+
+/// An integer literal a bin spec cannot fold splits the same way a
+/// slice bound does (divergence 87), and for the same measured
+/// reasons — but it is a SEPARATE arm, reached before `fold_const` is
+/// ever consulted, so it takes its own probe rather than the other
+/// one's verdict.
+///
+/// | spec | v1 emits | verdict |
+/// |---|---|---|
+/// | `4'd0` | folds to `_v == 0` — correct | `Unsupported`: v1 really is a way out |
+/// | `99999999999999999999999` | verbatim; g++ warns and truncates | `SilentlyMisLowers` |
+#[test]
+fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let spec = |b: &str| fixture.replace("en0 = {0}", &format!("en0 = {{{b}}}"));
+
+    let msg = assert_unsupported(&lower_src(&spec("4'd0")).unwrap_err());
+    assert!(msg.contains("sized literal"), "{msg}");
+    // …and the claim behind that suggestion: v1 folds it to the same
+    // comparison the plain literal produces.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&spec("4'd0"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&spec("0"))).expect("v1 emits"),
+        "v1 folds `4'd0` exactly like `0`, which is what makes `--codegen v1` honest here"
+    );
+
+    let msg = assert_not_implemented(
+        &lower_src(&spec("99999999999999999999999")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("too large for its type"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&spec("99999999999999999999999"))).expect("v1 emits");
+    assert!(
+        v1.contains("_v == 99999999999999999999999"),
+        "v1 pastes the over-wide literal into the comparison: {v1}"
+    );
+
+    // Both landings — a member and a range end — share one
+    // implementation, so both are checked.
+    let range = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [4'd1 .. 7]");
+    assert!(assert_unsupported(&lower_src(&range).unwrap_err()).contains("sized literal"));
+}
+
+/// A bin spec is a constant EXPRESSION, not just a literal or a name.
+/// v1 emits `{1 - 1}` as `if (((_v == 1 - 1)))`, which means `_v == 0`,
+/// so folding it is exact — and it makes the bin a `Const` rather than
+/// a per-sample expression, matching how the literal spells out.
+///
+/// The hook-param precedence survives the fold: a hook parameter beats
+/// a file-scope `const` of the same name, so the fold is skipped when
+/// one appears anywhere in the bound.
+#[test]
+fn a_constant_expression_bin_spec_folds() {
+    let fixture = fixture("cov_runtime_bound_test.harc");
+    let base = emit_cpp_src(&fixture.replace("en0 = {0}", "en0 = {0}"));
+    for (what, prefix, spec) in [
+        ("arithmetic", "", "1 - 1"),
+        ("a const in an expression", "const Z = 1\n\n", "Z - 1"),
+        ("a shift", "", "(1 << 3) - 8"),
+    ] {
+        let src = format!(
+            "{prefix}{}",
+            fixture.replace("en0 = {0}", &format!("en0 = {{{spec}}}"))
+        );
+        assert_eq!(
+            emit_cpp_src(&src),
+            base,
+            "{what} must lower exactly like the literal `{{0}}`"
+        );
+    }
+
+    // Precedence: a hook param of the same name still wins over a
+    // const. The first version of this asserted on `const ticks = 99`
+    // against `covergroup_hook_param_test`, whose hook parameter is
+    // `cmd` — `ticks` is a FIELD of the record it carries and never
+    // appears as a bare identifier in a bound. That assertion passed
+    // for every mutation of the guard, including deleting it: it was
+    // comparing two programs neither of which exercised precedence.
+    //
+    // A real one needs the hook parameter itself in a BIN, which means
+    // giving the hookable a scalar parameter to sample.
+    let hooked = crate::fixture("covergroup_hook_param_test.harc")
+        .replacen(
+            "        hookable run_for(cmd: RunCmd)",
+            "        hookable run_for(cmd: RunCmd, k: uint<8>)",
+            1,
+        )
+        .replacen(
+            "covergroup RunCmdCov @(drv.run_for(cmd) post)",
+            "covergroup RunCmdCov @(drv.run_for(cmd, k) post)",
+            1,
+        )
+        .replacen(
+            "            drv.run_for(cmd)",
+            "            drv.run_for(cmd, 3)",
+            1,
+        );
+    assert!(
+        hooked.contains("cmd: RunCmd, k: uint<8>") && hooked.contains("run_for(cmd, 3)"),
+        "the scalar hook parameter must actually be added"
+    );
+    for (spec, want) in [("k", "_v == k)"), ("k + 0", "_v == (k + 0))")] {
+        let bin = hooked.replacen("one  = {1}", &format!("one  = {{{spec}}}"), 1);
+        assert_ne!(bin, hooked, "`{spec}`: the bin must actually change");
+        let plain = emit_cpp_src(&bin);
+        assert!(
+            plain.contains(want),
+            "`{spec}`: the bin must compare against the hook ARGUMENT (`{want}`)"
+        );
+        // …and an unrelated `const k` must not capture it. This is the
+        // assertion that actually bites: with the guard removed the
+        // bin folds to `_v == 99` and the outputs stop matching.
+        assert_eq!(
+            emit_cpp_src(&format!("const k = 99\n\n{bin}")),
+            plain,
+            "`{spec}`: a file-scope `const k` must not turn the hook parameter into 99"
+        );
+    }
 }
 
 /// A record-typed hook parameter is rejected in a bin the same way it
@@ -15679,11 +18423,13 @@ fn a_rejected_bin_spec_is_reported_as_a_bin() {
         assert!(!msg.contains("point `"), "`{to}`: {msg}");
     }
 
-    // The typo message reaches a range end too.
+    // The typo message reaches a range end too, with the same verdict.
     let err = lower_src(&fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [NOPE .. 7]"))
         .unwrap_err();
-    assert!(assert_unsupported(&err)
-        .contains("`NOPE` is not a file-scope const, enum variant, or hook parameter"));
+    assert!(
+        assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers)
+            .contains("`NOPE` is not a file-scope const")
+    );
 
     // A rejected coverpoint TARGET still says "point", so the relabel is
     // scoped to the bin path rather than renaming the noun everywhere.
@@ -17127,16 +19873,17 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
 }
 
 /// The ninth site, in `scoreboards.rs`, which answers every
-/// `connect`/`on` in a scoreboard body with one `Unsupported`. The
-/// HOOKED half of it is uniform and reclassified: v1 drops the hook,
-/// byte-identically to the same handler without one, at both trigger
-/// shapes.
+/// `connect`/`on` in a scoreboard body with one verdict. The HOOKED
+/// half of it is uniform: v1 drops the hook, byte-identically to the
+/// same handler without one, at both trigger shapes.
 ///
 /// The unhooked half is deliberately left whole. It is mixed, but what
-/// separates its inputs is name resolution in the emitted C++, not
-/// syntax — `on dut.en` compiles and `on w.seen > 0` does not, despite
-/// being a path and an expression respectively. A syntactic split was
-/// written and reverted; see the comment at the site.
+/// separates its inputs is the CONTAINER the scoreboard is instantiated
+/// in — not knowable where a declaration is lowered — and, within one
+/// container, name resolution in the emitted C++ rather than syntax:
+/// `on dut.en` compiles and `on w.seen > 0` does not, despite being a
+/// path and an expression respectively. A syntactic split was written
+/// and reverted; see the comment at the site and the sibling test.
 #[test]
 fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
     let scoreboard = |body: &str| {
@@ -17169,15 +19916,27 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
             "`on {trigger}` must contribute, or the identity below is vacuous"
         );
         // The control itself is still a subset gap, which is what makes
-        // the hook the only thing under test here.
-        assert_unsupported(&lower_src(&ctl).unwrap_err());
+        // the hook the only thing under test here. It carries the
+        // unhooked arm's verdict, measured in the sibling test below.
+        assert_not_implemented(
+            &lower_src(&ctl).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
 
         let hooked = scoreboard(&handler(trigger, " pre"));
         let msg = assert_not_implemented(
             &lower_src(&hooked).unwrap_err(),
             lower::V1Status::SilentlyMisLowers,
         );
-        assert!(msg.contains("on scoreboard `Board`"), "{msg}");
+        // Needle the HOOK, not the shared `on scoreboard \`Board\``
+        // suffix: since the unhooked arm below carries the same status
+        // and the same suffix, matching the suffix would let this test
+        // stay green with the hooked arm deleted — the input would
+        // simply fall through to the unhooked arm.
+        assert!(
+            msg.contains("hook on an `on` handler on scoreboard `Board`"),
+            "{msg}"
+        );
         assert_eq!(
             cpp_tb::emit(&merged_src(&hooked)).expect("v1 emits"),
             v1_ctl,
@@ -17186,19 +19945,36 @@ fn a_hooked_scoreboard_handler_is_dropped_by_v1() {
     }
 }
 
-/// Pins the REVERT. The unhooked `connect`/`on` arm in a scoreboard
-/// body answers one `Unsupported` for its whole input space, and it
-/// must keep doing so until someone classifies it with the scope
-/// analysis it actually needs.
+/// The unhooked `connect`/`on` arm in a scoreboard body answers ONE
+/// verdict for its whole input space, and that verdict is now measured
+/// rather than provisional.
 ///
-/// A syntactic split was written here and undone. The sibling hooked
-/// test's `on w.note` control already fails if it comes back, so this
-/// is not the only guard — it is the one that pins `dut.en`,
-/// `(w.note)`, `w.note cycles` and `w.note phase post_eval`, and that
-/// asserts the two rows the split got BACKWARDS: `on dut.en` is a
+/// A syntactic split was written here and undone. This test pins why:
+/// it asserts the two rows the split got BACKWARDS — `on dut.en` is a
 /// two-segment PATH that v1 compiles, and `on w.seen > 0` is an
 /// EXPRESSION that v1 does not. No predicate over trigger syntax can
 /// separate this arm.
+///
+/// What DOES separate the cases is the CONTAINER, and that is not
+/// knowable here: `lower_scoreboard` lowers a declaration, and the same
+/// scoreboard type can be instantiated as a transactor field or a
+/// testbench field. Measured across both (divergence 70):
+///
+///   * transactor field — v1 emits output byte-identical to the same
+///     program with the wiring DELETED, so it silently drops it;
+///   * testbench field — `connect` emits an uncompilable `.push_back`
+///     on a scalar (`uint64_t`: `cpp_uint_for_width` widens every
+///     scalar ≤ 64 bits, whatever the source declares), while `on`
+///     emits a working checker.
+///
+/// An arm's status is the worst thing v1 does anywhere under it, and a
+/// silent drop is the worst of the three. Hence one
+/// `SilentlyMisLowers`, not one `Unsupported`.
+///
+/// This test covers the TESTBENCH container only — `Board` lands as a
+/// field of `testbench HookTb`. The transactor container, which is
+/// what makes the status `SilentlyMisLowers` at all, is pinned
+/// separately below.
 #[test]
 fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
     let scoreboard = |body: &str| {
@@ -17227,7 +20003,10 @@ fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
         "w.note cycles",
         "w.note phase post_eval",
     ] {
-        let msg = assert_unsupported(&lower_src(&scoreboard(&handler(trigger))).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&scoreboard(&handler(trigger))).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
         assert!(
             msg.contains("event wiring"),
             "`on {trigger}` must still reach the one generic arm: {msg}"
@@ -17251,6 +20030,71 @@ fn an_unhooked_scoreboard_handler_is_one_verdict_for_its_whole_input_space() {
         !expr.contains("_tb.w.seen"),
         "v1 does not qualify it, so there is no `w` in the checker lambda's scope"
     );
+}
+
+/// The TRANSACTOR container — the row that alone justifies
+/// `SilentlyMisLowers`, and the one the two tests above never reach,
+/// because both instantiate `Board` as a field of `testbench HookTb`.
+///
+/// Held instead as a field of `transactor Sender`, v1's output for a
+/// scoreboard carrying `on` wiring, or `connect` wiring, is BYTE-
+/// IDENTICAL to the same program whose scoreboard body is empty. The
+/// wiring contributes nothing: the scoreboard observes no traffic, and
+/// a check that should catch a mismatch passes green.
+///
+/// This is the whole basis for the arm's status, so it is pinned
+/// directly rather than inferred from the testbench rows — and it
+/// covers `connect`, which neither sibling exercises at all even though
+/// the arm's user-facing detail makes a claim about it.
+#[test]
+fn a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1() {
+    let scoreboard = |body: &str| {
+        HOOK_POSITIONS_SRC
+            .replace("HOOK\n", "")
+            .replace("IMPL\n", "")
+            .replace("BODY\n", "")
+            .replace(
+                "end agent Watcher",
+                &format!(
+                    "end agent Watcher\n\nscoreboard Board\n    hits : uint<32> default 0\n\
+                     {body}end scoreboard Board"
+                ),
+            )
+            // The container under test: a TRANSACTOR field, not the
+            // testbench field the sibling tests use.
+            .replace(
+                "transactor Sender\n    dut : Top\n",
+                "transactor Sender\n    dut : Top\n    b   : Board\n",
+            )
+    };
+
+    // Anti-vacuity: the scoreboard is really materialized inside the
+    // transactor, so "identical" below is not two copies of a program
+    // that dropped the whole field.
+    let empty = cpp_tb::emit(&merged_src(&scoreboard(""))).expect("v1 emits");
+    assert!(
+        empty.contains("struct Board {") && empty.contains("    Board b;"),
+        "the transactor must actually hold the scoreboard"
+    );
+
+    for wiring in [
+        "    on hits > 0\n        log(info, \"p\")\n    end on\n",
+        "    connect\n        hits -> ev2\n    end connect\n",
+    ] {
+        let src = scoreboard(wiring);
+        // TB-IR refuses, and says so without offering v1.
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("event wiring"), "{msg}");
+
+        assert_eq!(
+            cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
+            empty,
+            "v1 drops transactor-held wiring: `{wiring}`"
+        );
+    }
 }
 
 /// A period does not change what v1 does with a hooked method path: its
@@ -18960,10 +21804,14 @@ fn a_run_of_discarded_errors_no_longer_hides_a_relation_error() {
 ///
 /// The node budget and depth limit stay as backstops for growth that is
 /// not cyclic — a chain of DISTINCT relations each calling the previous
-/// one twice is finite and exponential. No such case appears below: it
-/// is bottlenecked in `typed_lower`'s own un-budgeted expander long
-/// before v1's backstop is reached, so a test here would be measuring
-/// something else.
+/// one twice is finite and exponential. That case is NOT below, because
+/// it is not v1-specific: `typed_lower` has its own expander over the
+/// same relations, it ran unbudgeted for longer than this guard existed,
+/// and both run on every `harc sim` whatever `--codegen` says. Bounding
+/// one of two expanders bounds nothing. Both limits now live in
+/// `ast.rs` and both expanders charge them; the shape is pinned by
+/// `a_doubling_relation_chain_is_refused_at_the_same_point_by_both_
+/// backends`.
 #[test]
 fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
     let head = "domain D\n  freq_mhz: 100\nend domain D\n\n\
@@ -19657,4 +22505,2214 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         );
         assert!(msg.contains("names no `hookable`"), "{what}: {msg}");
     }
+}
+
+/// The three `on`-handler arms on the two bound-to transactor paths
+/// (`lower_bound_target_transactor`, and the always-on and `when
+/// active` loops of `lower_bound_initiator_transactor`) all said
+/// "event-driven transactors await the event slice".
+///
+/// No program that reaches them contains an event-driven handler. The
+/// gate is `components::transactor_is_component`, which for a bound-to
+/// transactor returns `has_on_handler` — a flag set by NON-periodic
+/// handlers alone. So every event subscriber, `bus.<ch>.handshake`
+/// monitor and cycle-trigger routes to the composite table, and `on <N>
+/// cycles` is the sole shape that falls through to these arms.
+///
+/// This pins both halves: the three positions that DO arrive, and a
+/// non-periodic shape per position that provably does not.
+///
+/// The verdict is `SilentlyMisLowers`, and it took three tries to get
+/// there — `Unsupported` from the old code, then `EmitsUncompilable`
+/// once a period naming a late `let` turned out not to compile, then
+/// this once a file-scope `const` of the same name turned out to make
+/// it compile and run at the wrong rate. Divergence 71 has the six
+/// measured rows. What the test pins is the two that bound the
+/// verdict: the literal period, which works, and the shadowed one,
+/// which sets the status.
+#[test]
+fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
+    let base = fixture("tlm_target_thread_if_test.harc");
+    const THREAD: &str = "    thread bus.read(addr: uint<8>)";
+    assert!(base.contains(THREAD), "fixture shape changed");
+    let hookable = "    hookable ping(v: uint<8>)\n        prep_acc = prep_acc + v\n    end ping\n";
+    let periodic = "    on 5 cycles\n        prep_acc = prep_acc + 1\n    end on\n";
+
+    // The initiator form needs the target thread GONE: a transactor
+    // carrying both is caught by the mixing check ahead of these arms.
+    let no_thread = {
+        let i = base.find(THREAD).expect("thread present");
+        let j = base.find("    end thread").expect("thread ends") + "    end thread\n".len();
+        format!("{}{}", &base[..i], &base[j..])
+    };
+    let initiator = |items: &str| {
+        no_thread.replacen(
+            "    prep_acc : uint<32> default 0\n",
+            &format!("    prep_acc : uint<32> default 0\n\n{hookable}\n{items}"),
+            1,
+        )
+    };
+
+    // The fixture binds the instance `passive`, which is what a
+    // `when active` handler is scoped OUT of. That row needs an
+    // `active` instance for v1's emission to be observable at all.
+    const PASSIVE: &str = "let target : TlmMemTarget passive = bind mem";
+    assert!(base.contains(PASSIVE), "fixture binding changed");
+    let active = |src: String| src.replacen(PASSIVE, &PASSIVE.replace("passive", "active"), 1);
+
+    // Every position that reaches one of the three arms.
+    for (what, src) in [
+        // target-side: no `hookable`, so the thread stays.
+        (
+            "target",
+            base.replacen(THREAD, &format!("{periodic}\n{THREAD}"), 1),
+        ),
+        // initiator-side, always-on items. `active` here too: the
+        // initiator BFM form refuses a `passive` binding outright, so
+        // a passive source never reaches the arm at all.
+        ("initiator items", active(initiator(periodic))),
+        // initiator-side, inside `when active`.
+        (
+            "initiator when active",
+            active(initiator(&format!(
+                "    when active\n{periodic}    end when\n"
+            ))),
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("periodic `on <N> cycles` handlers"),
+            "{what}: {msg}"
+        );
+
+        // The status comes from the period EXPRESSION, not the
+        // handler, so the literal case must still be shown to work —
+        // otherwise it is unearned in the other direction. v1
+        // registers a cycle-stamped closure that fires the body every
+        // N cycles against the instance's state struct.
+        let v1 =
+            cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        assert!(
+            v1.contains("_period = (int64_t)(5);") && v1.contains("prep_acc + 1;"),
+            "{what}: v1 must emit the periodic body"
+        );
+
+        // A period naming an impl-scope `let`. v1 emits it into the
+        // same closure, which is registered BEFORE that `let` exists,
+        // so the emitted C++ does not compile.
+        let named = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
+            "    run\n",
+            "    let limit = 5\n\n    run\n",
+            1,
+        );
+        let v1 = cpp_tb::emit(&merged_src(&named))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the named period: {e}"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let declared = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            declared > used,
+            "{what}: the `let` must be emitted AFTER the use — this is a byte-offset \
+             proxy for 'does not compile', and it is only that: the row below is the \
+             same ordering with a `const` added, and it compiles"
+        );
+
+        // The mirror-image row, and the reason the detail names a
+        // POSITION rather than a category: move the same `let` above
+        // the transactor's own binding and v1 emits it BEFORE the
+        // registration, so the output compiles and the handler runs at
+        // the right rate. `--codegen v1` is a genuine escape hatch for
+        // that program, and a detail claiming "the test's own `let`
+        // bindings" would be lying about it.
+        //
+        // Inserted between the BUS binding and the TRANSACTOR binding,
+        // not above both — the detail names the transactor's binding,
+        // so that is the boundary the row has to straddle. A first
+        // version put the `let` above everything, which demonstrates
+        // something weaker.
+        // Anchored on the transactor binding whatever its mode — two
+        // of the three rows rewrite `passive` to `active`.
+        let binding = src
+            .lines()
+            .find(|l| l.contains("let target : TlmMemTarget") && l.contains("bind mem"))
+            .unwrap_or_else(|| panic!("{what}: the transactor binding must be present"))
+            .to_string();
+        let early = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
+            &binding,
+            &format!("    let limit = 5\n{binding}"),
+            1,
+        );
+        assert!(
+            early.find("let limit").expect("inserted")
+                > early.find("bind dut").expect("the bus binding is above it"),
+            "the `let` must sit BELOW the bus binding, or the row tests the wrong boundary"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&early))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the early `let`: {e}"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let declared = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            declared < used,
+            "{what}: a `let` above the binding must be emitted BEFORE the use"
+        );
+
+        // And the row that SETS the status, which is worse than either
+        // of those: add a file-scope `const` of the same name. Now the
+        // closure resolves — to the `constexpr` at namespace scope —
+        // so v1's output compiles and the handler runs at 7 where the
+        // program says 5. Built and run outside the suite: twice in 21
+        // cycles instead of four.
+        let shadowed = format!("const limit = 7\n\n{named}");
+        let v1 = cpp_tb::emit(&merged_src(&shadowed))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits the shadowed period: {e}"));
+        let konst = v1
+            .find("static constexpr int64_t limit = 7;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the const"));
+        let used = v1
+            .find("_period = (int64_t)(limit);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        let lt = v1
+            .find("int64_t limit = 5;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        assert!(
+            konst < used && used < lt,
+            "{what}: the const must precede the use and the `let` follow it, \
+             or the value the handler picks up is not the wrong one"
+        );
+    }
+
+    // The `when active` rows needed an `active` instance, and this is
+    // why: bound `passive`, v1 SCOPES THE HANDLER OUT — its output is
+    // byte-identical to the same program with the handler deleted.
+    // That is v1 obeying `when active`, not dropping the construct.
+    let when_active = initiator(&format!("    when active\n{periodic}    end when\n"));
+    assert!(
+        when_active.contains(PASSIVE),
+        "the passive binding survives"
+    );
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&when_active)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&initiator(""))).expect("v1 emits"),
+        "v1 scopes a `when active` periodic handler out of a passive instance"
+    );
+
+    // The negative half: a NON-periodic `on` never arrives at any of
+    // the three arms. Each row below is the same source as one of the
+    // positive rows above with only the TRIGGER changed, so what moves
+    // it is the gate and nothing else.
+    let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
+    // `lowers` says which branch the row is expected to take. Without
+    // it a row could silently switch branches — if the target row's
+    // `thread`-through-the-component-path arm were later implemented it
+    // would start lowering, take the `Ok` branch, and quietly stop
+    // asserting anything about where it went.
+    for (what, lowers, src) in [
+        (
+            "target",
+            false,
+            base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
+        ),
+        ("initiator items", true, active(initiator(non_periodic))),
+        (
+            "initiator when active",
+            true,
+            active(initiator(&format!(
+                "    when active\n{non_periodic}    end when\n"
+            ))),
+        ),
+    ] {
+        let got = lower_src(&src);
+        assert_eq!(
+            got.is_ok(),
+            lowers,
+            "{what}: expected lowers={lowers}, got the other branch"
+        );
+        match got {
+            // The two initiator rows go further than "not here": the
+            // composite table LOWERS them, and the trigger lands as a
+            // cycle handler on the component. That is the positive
+            // witness for where they went.
+            Ok(prog) => {
+                let c = prog
+                    .components
+                    .iter()
+                    .find(|c| c.name == "TlmMemTarget")
+                    .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
+                assert!(
+                    !c.cycle_handlers.is_empty(),
+                    "{what}: the composite table must carry the trigger"
+                );
+            }
+            // The target row still has its `thread`, which the
+            // composite path does not lower — but it fails THERE, and
+            // says so.
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("reached through the component path"),
+                    "{what}: a non-periodic `on` must route to the composite table: {msg}"
+                );
+                assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
+            }
+        }
+    }
+}
+
+/// A chain of DISTINCT relations, each calling the previous one twice.
+/// Nothing is cyclic, so neither expander's relation-name stack sees
+/// anything wrong — and the expansion still doubles at every level.
+///
+/// v1's expander was given a node budget in an earlier batch and held.
+/// `constraints::typed_lower`'s was not, and it runs on EVERY `harc
+/// sim` regardless of `--codegen`, so the budget bounded nothing: a
+/// 16-link chain took 7s, an 18-link chain 34s, and a 20-link chain did
+/// not finish. Bounding one of two expanders over the same relations is
+/// not bounding the relation.
+///
+/// Both limits now live in `ast.rs` and both expanders charge them out
+/// of the same constant. The point of sharing it is the row below where
+/// the two backends agree: they refuse the same chain at the same
+/// length, so `Invalid` — "neither backend runs this" — is a measured
+/// claim rather than an assumption about v1.
+///
+/// This test finishing at all is part of the assertion. The 24-link
+/// case did not terminate before the guard existed.
+#[test]
+fn a_doubling_relation_chain_is_refused_at_the_same_point_by_both_backends() {
+    let src = |links: usize| {
+        let mut rels = String::new();
+        for k in 0..links {
+            rels += &format!("relation R{k}(r: Req) = R{}(r) && R{}(r)\n", k + 1, k + 1);
+        }
+        rels += &format!("relation R{links}(r: Req) = r.value > 1000\n");
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n{rels}\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            R0(t)\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+
+    // The guard is a limit, not a ban: a 9-link chain is 512 leaves and
+    // both backends still expand it.
+    let ok = src(9);
+    cpp_tb::emit(&merged_src(&ok)).expect("v1 expands a 9-link chain");
+    lower_src(&ok).expect("TB-IR expands a 9-link chain");
+
+    // One link further, and BOTH refuse — the same boundary, because
+    // the budget is one constant.
+    for links in [10, 16, 24] {
+        let too_big = src(links);
+
+        let v1 = cpp_tb::emit(&merged_src(&too_big)).expect_err("v1 refuses");
+        assert!(
+            format!("{v1}").contains("constraint function call not supported"),
+            "{links} links: {v1}"
+        );
+
+        // `Invalid`, not `Unsupported`: v1 is not a way to run it.
+        let msg = assert_invalid(&lower_src(&too_big).unwrap_err());
+        assert!(
+            msg.contains("exceeds the relation-expansion limit"),
+            "{links} links: {msg}"
+        );
+
+        // The WHOLE message, not a prefix of it. The first version of
+        // this diagnostic reached users with two runs of 22 spaces in
+        // it — a `format!` body whose line continuations had been
+        // flattened — and every assertion above matches text that
+        // lands before the first gap, so none of them could see it.
+        assert!(
+            !msg.contains("  "),
+            "{links} links: the diagnostic must not carry run-on whitespace: {msg:?}"
+        );
+        assert!(
+            msg.ends_with("more than once doubles at every level"),
+            "{links} links: {msg:?}"
+        );
+    }
+
+    // The other shared limit, on the same footing: a chain of SINGLE
+    // calls never doubles, so the budget never fires and the depth
+    // backstop is what answers. It answers at the same link in both
+    // backends — 63 expands, 64 does not — which is the whole point of
+    // the constants being one constant.
+    let linear = |links: usize| {
+        let mut rels = String::new();
+        for k in 0..links {
+            rels += &format!("relation R{k}(r: Req) = R{}(r)\n", k + 1);
+        }
+        rels += &format!("relation R{links}(r: Req) = r.value > 1000\n");
+        format!(
+            "domain D\n  freq_mhz: 100\nend domain D\n\n\
+             transaction Req\n    addr : uint<8>\n    value : uint<32>\n\
+             end transaction Req\n\n{rels}\n\
+             test T\n    let dut : Top\n    let t : Req\n    clock clk = D\n    run\n\
+             \x20       randomize(t) with\n            R0(t)\n        end randomize\n\
+             \x20   end run\nend test T\n"
+        )
+    };
+    let deep = linear(63);
+    cpp_tb::emit(&merged_src(&deep)).expect("v1 expands a 63-link chain");
+    lower_src(&deep).expect("TB-IR expands a 63-link chain");
+
+    let too_deep = linear(64);
+    cpp_tb::emit(&merged_src(&too_deep)).expect_err("v1 refuses a 64-link chain");
+    let msg = assert_invalid(&lower_src(&too_deep).unwrap_err());
+    assert!(
+        msg.contains("exceeds the relation-expansion limit"),
+        "{msg}"
+    );
+}
+
+/// `emit <ev>(...)` has three lowering branches, and only ONE of them
+/// checked that an event payload is exactly one argument: the
+/// test-scope `let e : event<T>` local. The dotted-path form
+/// (`emit tagger.in_ev(v)`) and the self-relative form
+/// (`emit observed(v)` inside a method body) both took whatever they
+/// were given.
+///
+/// Measured on both backends at both sites, which is what makes this
+/// `Invalid` rather than a gap:
+///
+/// | arity | tbir | v1 |
+/// |---|---|---|
+/// | over | `_s(v, 2)` — uncompilable | `_s(v)` — silently drops it |
+/// | under | `_s()` — uncompilable | `_s()` — uncompilable |
+///
+/// g++ on the over-supply form: "no match for call to
+/// '(std::function<void(long unsigned int)>) (int, int)'". So no
+/// backend runs the program as written under any of the four cells,
+/// and the verdict is the one the local-event branch already gave.
+#[test]
+fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
+    for (what, base, call) in [
+        (
+            "dotted path",
+            fixture("agent_on_handler_test.harc"),
+            "emit tagger.in_ev(i + 1)",
+        ),
+        (
+            "self-relative",
+            fixture("analysis_sink_connect_test.harc"),
+            "emit observed(v)",
+        ),
+    ] {
+        assert!(base.contains(call), "{what}: fixture shape changed");
+        // The control lowers, so the refusals below are about arity and
+        // not about the fixture.
+        lower_src(&base).unwrap_or_else(|e| panic!("{what}: control lowers: {e}"));
+
+        let one = call.rfind('(').expect("call has args");
+        for (arity, args) in [("over", "(i + 1, 2)"), ("under", "()")] {
+            let args = if what == "self-relative" && arity == "over" {
+                "(v, 2)"
+            } else {
+                args
+            };
+            let src = base.replacen(call, &format!("{}{args}", &call[..one]), 1);
+            let msg = assert_invalid(&lower_src(&src).unwrap_err());
+            assert!(
+                msg.contains("an event payload is exactly one"),
+                "{what}/{arity}: {msg}"
+            );
+
+            // v1 emits both, which is exactly why TB-IR must not send
+            // anyone there: the over-supply form drops the extra
+            // payload silently and the under-supply form does not
+            // compile.
+            let v1 = cpp_tb::emit(&merged_src(&src))
+                .unwrap_or_else(|e| panic!("{what}/{arity}: v1 emits: {e}"));
+            if arity == "under" {
+                assert!(v1.contains(") _s();"), "{what}: v1 emits a no-arg call");
+            } else {
+                // The POSITIVE fact, not just the absence of the second
+                // payload: v1 emits the one-argument call, so the whole
+                // file is the control's. `!contains(", 2);")` alone
+                // would also pass if v1 dropped the `emit` statement
+                // entirely, or refused — and "silently drops the extra
+                // payload" is the cell the `Invalid` verdict rests on.
+                assert_eq!(
+                    v1,
+                    cpp_tb::emit(&merged_src(&base)).expect("v1 emits the control"),
+                    "{what}: v1's over-supply output must equal the control's"
+                );
+            }
+        }
+    }
+
+    // `Invalid` refuses programs outright, so the way to get this wrong
+    // is a legal spelling whose arity is not one. Two exist and BOTH
+    // pass `harc check`. Neither is an escape hatch: v1 emits a
+    // one-payload channel however the field is written.
+    let agent = fixture("agent_on_handler_test.harc");
+    const FIELD: &str = "in_ev : event<uint<8>>";
+    assert!(agent.contains(FIELD), "fixture shape changed");
+
+    // No type argument at all, emitted and handled with no payload.
+    let bare = agent
+        .replacen(FIELD, "in_ev : event", 1)
+        .replacen("emit tagger.in_ev(i + 1)", "emit tagger.in_ev()", 1)
+        .replacen("on in_ev(t)", "on in_ev()", 1)
+        .replacen("        last = t\n", "", 1);
+    assert_invalid(&lower_src(&bare).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&bare)).expect("v1 emits");
+    assert!(
+        v1.contains("std::vector<std::function<void(uint64_t)>> in_ev;") && v1.contains(") _s();"),
+        "v1 keeps a one-payload channel and calls it with none"
+    );
+
+    // Two type arguments, emitted with two payloads.
+    let two = agent
+        .replacen(FIELD, "in_ev : event<uint<8>, uint<8>>", 1)
+        .replacen("emit tagger.in_ev(i + 1)", "emit tagger.in_ev(i + 1, 2)", 1);
+    assert_invalid(&lower_src(&two).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&two)).expect("v1 emits");
+    assert!(
+        v1.contains("std::vector<std::function<void(uint64_t)>> in_ev;"),
+        "v1 keeps a one-payload channel"
+    );
+    assert!(
+        !v1.contains(", 2);"),
+        "and drops the second payload rather than carrying it"
+    );
+}
+
+/// The remaining `connect` SEMANTIC arms, none of which had a test.
+/// Measured against v1 on an instantiated env — the only place v1 looks
+/// at the edge at all.
+///
+/// | edge | v1 | verdict |
+/// |---|---|---|
+/// | sink is a plain `function` | `for (auto& _s : sink.plain)` — not a struct member | `EmitsUncompilable` |
+/// | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` | `EmitsUncompilable` |
+/// | payload mismatch, RECORD vs scalar | bridge lambda instantiates against the wrong type | `EmitsUncompilable` |
+/// | payload mismatch, SIGNEDNESS only | implicit conversion — compiles and runs correctly | `Unsupported` |
+///
+/// The uncompilable rows are compiler-measured, not read off the text.
+///
+/// The payload rows are one arm covering two shapes, because
+/// `event_payload_matches_ir_type` compares signedness and record
+/// identity only. v1's bridge lambda is GENERIC and looks
+/// type-agnostic; converting it to the source's
+/// `std::function<void(uint64_t)>` instantiates it at the wiring line,
+/// which a record cannot survive and a sign difference passes through
+/// as an ordinary implicit conversion. A first pass measured only the
+/// record shape and called the whole arm `Invalid` — wrong twice over,
+/// since v1 both runs the sign case and runs any of these inside an env
+/// nothing instantiates.
+#[test]
+fn a_connect_sink_that_cannot_receive_the_payload_is_split_by_what_v1_does() {
+    let src = |sink_decl: &str, target: &str, extra: &str| {
+        format!(
+            r#"struct Beat
+    tag : uint<8> default 0
+end struct Beat
+
+transactor Src
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Src
+
+scoreboard Sink
+    seen  : uint<32> default 0
+    other : uint<32> default 0
+{sink_decl}
+end scoreboard Sink
+
+{extra}
+env E
+    src  : Src passive
+    sink : Sink
+{extra_field}
+    connect
+        src.observed -> {target}
+    end connect
+end env E
+
+testbench Tb
+    dut : Top
+    top : E
+end testbench Tb
+impl T for Tb
+    run
+        wait 2 cycles
+    end run
+end impl T"#,
+            extra_field = if extra.is_empty() {
+                ""
+            } else {
+                "    dst  : Dst passive\n"
+            }
+        )
+    };
+    let hookable = "    hookable take(v: uint<8>)\n        seen = seen + 1\n    end take";
+    let dst = |payload: &str| {
+        format!("transactor Dst\n    incoming : event<{payload}>\nend transactor Dst\n")
+    };
+
+    // The control: a well-formed edge of each sink shape lowers.
+    lower_src(&src(hookable, "sink.take", "")).expect("method sink lowers");
+    lower_src(&src(hookable, "dst.incoming", &dst("uint<8>"))).expect("event sink lowers");
+
+    for (what, sink_decl, target, extra, want) in [
+        (
+            "plain function",
+            "    function plain(v: uint<8>)\n        seen = seen + 1\n    end plain",
+            "sink.plain",
+            "".to_string(),
+            "not `hookable`",
+        ),
+        (
+            "scalar field",
+            hookable,
+            "sink.other",
+            "".to_string(),
+            "neither a `hookable` sink method nor an `event` field",
+        ),
+        (
+            "method payload mismatch, record",
+            "    hookable take(v: Beat)\n        seen = seen + 1\n    end take",
+            "sink.take",
+            "".to_string(),
+            "payload mismatch",
+        ),
+        (
+            "event payload mismatch, record",
+            hookable,
+            "dst.incoming",
+            dst("Beat"),
+            "payload mismatch",
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src(sink_decl, target, &extra)).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(msg.contains(want), "{what}: {msg}");
+    }
+
+    // The SIGNEDNESS row, which is the same arm and the opposite
+    // verdict: v1's implicit conversion carries the payload through
+    // intact, so it keeps the suggestion.
+    for (what, sink_decl, target, extra) in [
+        (
+            "method sink",
+            "    hookable take(v: sint<8>)\n        seen = seen + 1\n    end take",
+            "sink.take",
+            "".to_string(),
+        ),
+        ("event sink", hookable, "dst.incoming", dst("sint<8>")),
+    ] {
+        let s = src(sink_decl, target, &extra);
+        let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+        assert!(msg.contains("payload mismatch"), "{what}: {msg}");
+        cpp_tb::emit(&merged_src(&s))
+            .unwrap_or_else(|e| panic!("{what}: v1 emits a sign mismatch: {e}"));
+    }
+}
+
+/// The FOURTH landing of the non-literal periodic period — a
+/// testbench-scoped `on <N> cycles` handler — after the three bound-to
+/// transactor arms. It was `Unsupported` and untested, and it behaves
+/// exactly like the other three, which is the point of grouping by
+/// what a construct DOES rather than where it is spelled.
+///
+/// v1 emits the period expression verbatim into a `_checkers` closure
+/// registered ahead of the impl's own `let`s:
+///
+/// | period | v1 |
+/// |---|---|
+/// | `2` — a literal | fine, and the registered fixture proves it |
+/// | `per`, an impl-scope `let` | used at line 161, declared at 175 — does not compile |
+/// | `per`, with a file-scope `const per = 7` too | resolves to the const: compiles, and runs at 7 |
+///
+/// The last row was built and RUN: 2 firings in 21 cycles where the
+/// source asks for a period of 2. Hence `SilentlyMisLowers`.
+#[test]
+fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
+    let base = fixture("testbench_periodic_period2_test.harc");
+    const LITERAL: &str = "    on 2 cycles";
+    assert!(base.contains(LITERAL), "fixture shape changed");
+
+    // The control: the literal period lowers, so the rows below are
+    // about the EXPRESSION and not about the fixture.
+    lower_src(&base).expect("the literal period lowers");
+
+    let named = base.replacen(LITERAL, "    on per cycles", 1).replacen(
+        "\n    run\n",
+        "\n    let per = 2\n\n    run\n",
+        1,
+    );
+    assert!(named.contains("let per = 2"), "the `let` must be inserted");
+
+    for (what, src) in [
+        ("bare `let`", named.clone()),
+        ("shadowed by a const", format!("const per = 7\n\n{named}")),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("non-literal or non-positive period"),
+            "{what}: {msg}"
+        );
+    }
+
+    // The row that sets the status. v1 emits the const at namespace
+    // scope BEFORE the closure and the `let` after it, so the closure
+    // reads 7 while the run body reads 2 — same name, two values,
+    // decided by emission position.
+    let shadowed = format!("const per = 7\n\n{named}");
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let konst = v1
+        .find("static constexpr int64_t per = 7;")
+        .expect("v1 emits the const at namespace scope");
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    assert!(
+        konst < used && used < lt,
+        "the const must precede the use and the `let` follow it, or the closure \
+         does not pick up the wrong value"
+    );
+
+    // And without the const, the same ordering leaves the name
+    // undeclared at the point of use.
+    let v1 = cpp_tb::emit(&merged_src(&named)).expect("v1 emits");
+    assert!(
+        !v1.contains("constexpr int64_t per"),
+        "no const in this one"
+    );
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    assert!(used < lt, "the `let` is emitted after the use");
+}
+
+/// Two bound-to instance arms each answered BOTH ways of getting the
+/// mode annotation wrong with one `Unsupported`, and v1 answers them
+/// very differently.
+///
+/// | instance | v1 |
+/// |---|---|
+/// | no annotation at all | refuses: "transactor instantiation requires a mode annotation" |
+/// | initiator BFM declared `passive` | emits, byte-identical to the `active` program |
+/// | target responder declared `active` | emits, byte-identical to the `passive` program |
+///
+/// So a missing annotation is a program error under both backends, and
+/// the WRONG annotation is v1 dropping it — the user asks for a passive
+/// instance and gets a driver, or asks for an active responder and gets
+/// a passive one, with nothing said either way.
+///
+/// The anti-vacuity check matters here, because "byte-identical" could
+/// mean v1 has no notion of mode at all: for a transactor that HAS both
+/// halves, flipping the mode changes 67 lines of v1's output. It is
+/// specifically the hookable-only and thread-only shapes whose
+/// annotation v1 drops.
+///
+/// The two cases are told apart by the AST exactly — `mode: None`
+/// versus `mode: Some(wrong)` — so this is a split on the real
+/// distinction rather than a shape heuristic.
+#[test]
+fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
+    // The stdlib-bus fixtures need the bus decl merged in, exactly as
+    // `lower_with_stdlib_bus` does for a fixture NAME — these take a
+    // modified source string instead.
+    let with_bus = |src: &str| {
+        let f = parse_source(src).expect("parses");
+        let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch");
+        let bus_src = std::fs::read_to_string(&bus_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", bus_path.display()));
+        let b = parse_source(&bus_src).expect("stdlib bus parses");
+        merge::merge_for_sim(vec![f, b], None).expect("merge")
+    };
+    let lower_bus = |src: &str| lower::lower_program(&with_bus(src));
+
+    // Initiator BFM: `active` is required.
+    let bfm = fixture("regblock_basic_test.harc");
+    const BFM_LET: &str = "let helper : AxilHelper active = bind axil";
+    assert!(bfm.contains(BFM_LET), "fixture shape changed");
+    lower_bus(&bfm).expect("the `active` control lowers");
+
+    // Target responder: `passive` is required.
+    let tgt = fixture("tlm_target_thread_if_test.harc");
+    const TGT_LET: &str = "let target : TlmMemTarget passive = bind mem";
+    assert!(tgt.contains(TGT_LET), "fixture shape changed");
+    lower_src(&tgt).expect("the `passive` control lowers");
+
+    // No annotation: `Invalid` at both sites, and v1 refuses too.
+    for (what, src, v1_lower) in [
+        (
+            "initiator BFM",
+            bfm.replacen(BFM_LET, "let helper : AxilHelper = bind axil", 1),
+            true,
+        ),
+        (
+            "target responder",
+            tgt.replacen(TGT_LET, "let target : TlmMemTarget = bind mem", 1),
+            false,
+        ),
+    ] {
+        let err = if v1_lower {
+            lower_bus(&src).unwrap_err()
+        } else {
+            lower_src(&src).unwrap_err()
+        };
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("needs an `active`/`passive` mode annotation"),
+            "{what}: {msg}"
+        );
+    }
+
+    // The WRONG annotation: v1 takes it and drops it.
+    let bfm_passive = bfm.replacen(BFM_LET, "let helper : AxilHelper passive = bind axil", 1);
+    let msg = assert_not_implemented(
+        &lower_bus(&bfm_passive).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("initiator-BFM instance") && msg.contains("declared `passive`"),
+        "{msg}"
+    );
+
+    let tgt_active = tgt.replacen(TGT_LET, "let target : TlmMemTarget active = bind mem", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&tgt_active).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("target-TLM responder instance") && msg.contains("declared `active`"),
+        "{msg}"
+    );
+
+    // The measurement the status rests on, at BOTH sites. An earlier
+    // version did only the target, "for the site whose fixture needs no
+    // stdlib bus" — but this same test merges a stdlib bus a few lines
+    // below, so the reason did not hold.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&tgt_active)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&tgt)).expect("v1 emits"),
+        "v1 drops the mode annotation on a target responder"
+    );
+    assert_eq!(
+        cpp_tb::emit(&with_bus(&bfm_passive)).expect("v1 emits"),
+        cpp_tb::emit(&with_bus(&bfm)).expect("v1 emits"),
+        "v1 drops the mode annotation on an initiator BFM"
+    );
+
+    // Anti-vacuity: v1 does honour the mode where it means something.
+    let both_halves = fixture("axilite_bound_mon_test.harc");
+    const MON: &str = "let mon  : AxilXactor passive = bind axil";
+    assert!(both_halves.contains(MON), "fixture shape changed");
+    assert_ne!(
+        cpp_tb::emit(&with_bus(&both_halves)).expect("v1 emits"),
+        cpp_tb::emit(&with_bus(&both_halves.replacen(
+            MON,
+            &MON.replace("passive", "active"),
+            1
+        )))
+        .expect("v1 emits"),
+        "for a transactor with both halves the mode must change v1's output"
+    );
+}
+
+/// The event-driven flavour of the mode-less transactor FIELD, and the
+/// `passive` sibling that does NOT change with it.
+///
+/// | field | v1 |
+/// |---|---|
+/// | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
+/// | `drv : CounterDrv passive`, handler inside `when active` | emits, and correctly OMITS the registration |
+/// | `c : Consumer passive`, handler in the ALWAYS-ON body | emits, and correctly KEEPS it — byte-identical to `active` |
+///
+/// So the two halves of one construct part company: a missing
+/// annotation is a program error under both backends, and a `passive`
+/// one is a legal program v1 runs faithfully and TB-IR does not lower.
+/// The second keeps its suggestion for exactly that reason.
+///
+/// The third row is why the arm's detail no longer claims the handler
+/// "only registers on an `active` instance" — true of the `when
+/// active` shape it was written from, false of the other one under the
+/// same arm.
+///
+/// Only these two arms were measured. The parallel DUT-poking-BFM pair
+/// alongside them needs the transactor held by an `env` to be reached
+/// at all, which no probe here builds, so it is left alone rather than
+/// reclassified by analogy.
+#[test]
+fn a_mode_less_transactor_field_is_a_program_error_but_a_passive_one_is_not() {
+    let base = fixture("event_driven_transactor_test.harc");
+    // The TESTBENCH field, not the env one — an env-held field with no
+    // mode lowers under TB-IR and never reaches this arm.
+    let tb_at = base
+        .find("testbench EventDrivenTransactorTb")
+        .expect("fixture shape changed");
+    let (head, tail) = base.split_at(tb_at);
+    const FIELD: &str = "    drv : CounterDrv active";
+    assert!(tail.contains(FIELD), "fixture shape changed");
+    let with = |repl: &str| format!("{head}{}", tail.replacen(FIELD, repl, 1));
+
+    lower_src(&base).expect("the `active` control lowers");
+
+    // No mode: `Invalid`, and v1 refuses too.
+    let modeless = with("    drv : CounterDrv");
+    let msg = assert_invalid(&lower_src(&modeless).unwrap_err());
+    assert!(
+        msg.contains("needs an `active`/`passive` mode annotation"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&modeless)).expect_err("v1 refuses it too");
+    assert!(format!("{v1}").contains("has no mode"), "{v1}");
+
+    // Passive: still `Unsupported`, because v1 really does run it —
+    // and runs it RIGHT. The `on req` handler lives inside `when
+    // active`, so v1 omitting its registration on a passive instance is
+    // the language's own rule, not a mis-lowering.
+    let passive = with("    drv : CounterDrv passive");
+    let msg = assert_unsupported(&lower_src(&passive).unwrap_err());
+    assert!(
+        msg.contains("passive event-driven transactor field"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&passive)).expect("v1 emits the passive program");
+    assert!(
+        !v1.contains("_tb.drv.req.push_back("),
+        "v1 must omit the `when active` handler registration on a passive instance"
+    );
+    // Anti-vacuity: the active program does register it.
+    assert!(
+        cpp_tb::emit(&merged_src(&base))
+            .expect("v1 emits")
+            .contains("_tb.drv.req.push_back("),
+        "the active control must register the handler, or the check above is empty"
+    );
+
+    // The OTHER shape under the same arm, and the reason its detail no
+    // longer says the handler "only registers on an `active`
+    // instance". Move the `in event` and its handler out of `when
+    // active` and v1's passive output is byte-identical to its active
+    // output: the handler IS registered, and it fires. The verdict is
+    // unaffected — v1 runs both shapes correctly — but one probe was
+    // being described as the whole construct.
+    let always_on = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Consumer
+    req  : in event<uint<8>>
+    seen : uint<32> default 0
+
+    on req(n)
+        seen = seen + n
+    end on
+end transactor Consumer
+
+testbench ConsTb
+    dut : Top
+    c   : Consumer MODE
+end testbench ConsTb
+
+impl ConsTest for ConsTb
+    clock clk = SysDomain
+    run
+        emit c.req(3)
+        wait 1 cycle
+        assert c.seen == 3 else fail("seen=${c.seen}")
+    end run
+end impl ConsTest"#;
+    let mode = |m: &str| always_on.replace("Consumer MODE", &format!("Consumer {m}"));
+    // The measurement this test exists for, and it is unchanged: with
+    // an ALWAYS-ON handler v1 emits byte-identically for both modes and
+    // registers the handler either way. The annotation is inert there.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&mode("passive"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&mode("active"))).expect("v1 emits"),
+        "with an always-on handler v1 treats passive and active identically"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&mode("passive")))
+            .expect("v1 emits")
+            .contains("_tb.c.req.push_back("),
+        "and it does register the handler"
+    );
+    // What TB-IR makes of that has since moved, and in the direction
+    // the measurement points: `passive` — the annotation matching what
+    // v1 actually does — now LOWERS, and `active`, which claims an
+    // ownership v1 does not give it, is a program error. This arm used
+    // to reject `passive` as a gap and accept `active` as the control.
+    lower_src(&mode("passive")).expect("the passive spelling lowers");
+    let lower::LowerError::Invalid(msg) = lower_src(&mode("active")).unwrap_err() else {
+        panic!("`active` on an always-on analysis source is a program error");
+    };
+    assert!(
+        msg.contains("only the passive ownership annotation"),
+        "{msg}"
+    );
+}
+
+/// The FIFTH landing of the non-literal `on <N> cycles` period, and the
+/// one that does NOT move — which is what makes the other four's
+/// verdict mean something.
+///
+/// A statement-position `on <N> cycles` is registered where it is
+/// WRITTEN, inside the run body, after the impl's `let`s have been
+/// emitted. So the period expression resolves to what the source says:
+///
+/// | landing | registration sits | `on per cycles` with `let per = 2` |
+/// |---|---|---|
+/// | three bound-to transactor arms, and the testbench-scoped one | near the top of the run function, before the `let`s | uncompilable, or resolves to a same-named `const` |
+/// | statement position (this one) | at the statement, after the `let`s | resolves to 2 — correct |
+///
+/// Built and run with a file-scope `const per = 7` present as well —
+/// the case that makes the other four `SilentlyMisLowers` — this one
+/// fires 10 times in 21 cycles at period 2, exactly right, because the
+/// `let` shadows the const at the point of use.
+///
+/// So the arm keeps `Unsupported`: v1 implements it. Applying the other
+/// landings' verdict here by analogy would have been wrong, and the
+/// construct is identical — only the emission position differs.
+#[test]
+fn a_statement_position_periodic_period_resolves_correctly_under_v1() {
+    let src = |on: &str, extra: &str| {
+        format!(
+            r#"{extra}domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench SpTb
+    dut : Top
+    n   : uint<32> default 0
+end testbench SpTb
+
+impl SpTest for SpTb
+    clock clk = SysDomain
+    let per = 2
+
+    run
+        on {on} cycles
+            n = n + 1
+        end on
+        wait 8 cycles
+        assert n > 0 else fail("n=${{n}}")
+    end run
+end impl SpTest"#
+        )
+    };
+
+    // The literal control lowers under TB-IR.
+    lower_src(&src("2", "")).expect("the literal period lowers");
+
+    for (what, extra) in [
+        ("bare `let`", ""),
+        ("shadowed by a const", "const per = 7\n\n"),
+    ] {
+        let s = src("per", extra);
+        // TB-IR refuses. The arm carries `SilentlyMisLowers` for the
+        // sake of its OTHER input (`on 0 cycles`, below); for the named
+        // period measured here v1 is a genuine escape hatch, which is
+        // what the rest of this test shows.
+        let msg = assert_not_implemented(
+            &lower_src(&s).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("non-literal or non-positive period"),
+            "{what}: {msg}"
+        );
+
+        // And the reason the suggestion is honest: v1 emits the `let`
+        // BEFORE the registration, so the closure reads the `let` and
+        // not anything else.
+        let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+        let lt = v1
+            .find("int64_t per = 2;")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
+        let used = v1
+            .find("_period = (int64_t)(per);")
+            .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        assert!(
+            lt < used,
+            "{what}: the `let` must precede the use here — that is the whole difference \
+             from the four landings that mis-lower"
+        );
+    }
+
+    // And the contrast made explicit: with the const present, it is
+    // emitted at namespace scope AHEAD of the `let`, and the `let`
+    // still wins because it is nearer. That is the opposite of what
+    // happens when the registration sits above the `let`.
+    let shadowed = src("per", "const per = 7\n\n");
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let konst = v1
+        .find("static constexpr int64_t per = 7;")
+        .expect("v1 emits the const");
+    let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
+    let used = v1
+        .find("_period = (int64_t)(per);")
+        .expect("v1 emits the named period");
+    assert!(konst < lt && lt < used, "const, then `let`, then the use");
+
+    // The arm's OTHER input, and the reason it is not `Unsupported`
+    // despite everything above: `tb_periodic_literal` answers `None` for
+    // a non-positive literal too, so `on 0 cycles` lands here. v1 emits
+    // the handler and its own `period > 0` guard never lets it fire —
+    // built and run, 0 firings in 21 cycles. The program asked for a
+    // handler and got a silent no-op.
+    let zero = src("0", "");
+    let msg = assert_not_implemented(
+        &lower_src(&zero).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("non-positive period"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&zero)).expect("v1 emits the zero-period handler");
+    assert!(
+        v1.contains("_period = (int64_t)(0);"),
+        "v1 emits the zero period verbatim"
+    );
+    assert!(
+        v1.contains("_period > 0 &&"),
+        "and guards it, so the handler never runs"
+    );
+}
+
+/// Naming a component method that does not exist, and using a `void`
+/// method's result as a value. Six arms across two files said
+/// `Unsupported` for these — "re-run with `--codegen v1`" — and v1
+/// emits both, verbatim and uncompilable:
+///
+/// | source | v1 emits | g++ |
+/// |---|---|---|
+/// | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
+/// | `let x : uint<32> = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
+///
+/// Both are type errors: a call to a method that is not there, and a
+/// value taken from something that produces none. No backend runs
+/// either, in any configuration — unlike the `connect` arms, there is
+/// no uninstantiated position for a statement in a run body to hide in.
+/// So `Invalid`, which is what `exprs.rs`'s transactor-shaped sibling
+/// (`transactor \`{}\` has no method \`{}\``) has said all along.
+///
+/// WHAT THIS TEST ACTUALLY REACHES, because six arms is not six
+/// measurements. Mutating each arm in turn and re-running:
+///
+///   * the resolver's path-form arm in `components.rs` — reached, and
+///     the only landing for a missing method. Mutating it fails below.
+///   * the untyped-`let` "returns no value" arm in `stmts.rs` —
+///     reached. Mutating it fails below.
+///   * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
+///     `as_component_method_call` validates the method on every path
+///     that returns `Ok(Some(..))`, so a caller holding a resolved
+///     method always has one. Mutating any of them fails nothing.
+///   * the typed-`let` and assignment "returns no value" arms, and the
+///     parameter-form resolver arm — REACHED, each with a two-line
+///     probe, after an earlier version of this doc recorded all three
+///     as "not probed". They are covered below. The parameter-form arm
+///     in particular means a missing method has TWO landings, not the
+///     one that earlier version claimed.
+///
+/// And the set this arm fires on is "not a DECLARED method", which is
+/// wider than "does not exist": the built-in predicates `idle`,
+/// `idle_in`, `idle_out` and `quiesced` land here too, and BOTH backends
+/// implement those — TB-IR one statement position over. They are carved
+/// out to `Unsupported` and pinned below.
+#[test]
+fn a_missing_or_void_component_method_is_a_program_error() {
+    let src = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Calc
+    acc : uint<32> default 0
+    hookable add(v: uint<8>) -> uint<32>
+        acc = acc + v
+        return acc
+    end add
+    hookable noret(v: uint<8>)
+        acc = acc + v
+    end noret
+end agent Calc
+
+test NmTest
+    let dut : Top
+    let c : Calc
+    clock clk = SysDomain
+    run
+        {call}
+    end run
+end test NmTest"#
+        )
+    };
+
+    // The control: a real method with a real return value lowers.
+    lower_src(&src(
+        "let x : uint<32> = c.add(3)\n        assert x == 3 else fail(\"x\")",
+    ))
+    .expect("the well-formed call lowers");
+
+    for (what, call, want) in [
+        (
+            "typed let, missing method",
+            "let x : uint<32> = c.nosuch(3)",
+            "has no method `nosuch`",
+        ),
+        (
+            "untyped let, missing method",
+            "let x = c.nosuch(3)",
+            "has no method `nosuch`",
+        ),
+        (
+            "typed let, void method",
+            "let x : uint<32> = c.noret(3)",
+            "returns no value",
+        ),
+        (
+            "untyped let, void method",
+            "let x = c.noret(3)",
+            "returns no value",
+        ),
+    ] {
+        let s = src(call);
+        let msg = assert_invalid(&lower_src(&s).unwrap_err());
+        assert!(msg.contains(want), "{what}: {msg}");
+
+        // v1 emits it, which is why the old suggestion was a dead end:
+        // the emitted C++ is what does not compile, one step later.
+        cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+    }
+
+    // The three arms an earlier version of this test recorded as
+    // unreachable-by-probe. Each takes two lines.
+    //
+    // A RECORD-typed `let` is not claimed by the untyped handler — that
+    // arm is guarded on a record type name.
+    let rec = src("let t : TinyTxn = c.noret(3)").replacen(
+        "agent Calc",
+        "struct TinyTxn\n    a : uint<8> default 0\nend struct TinyTxn\n\nagent Calc",
+        1,
+    );
+    let msg = assert_invalid(&lower_src(&rec).unwrap_err());
+    assert!(msg.contains("returns no value"), "record let: {msg}");
+
+    // An ASSIGNMENT is not a `let`, so nothing claims it first.
+    let asg = src("let x : uint<32> = 0\n        x = c.noret(3)");
+    let msg = assert_invalid(&lower_src(&asg).unwrap_err());
+    assert!(msg.contains("returns no value"), "assignment: {msg}");
+
+    // A COMPONENT-typed parameter reaches the parameter-form resolver;
+    // the transactor-method arm that was blamed for claiming it only
+    // fires for transactor-typed params.
+    let param = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Model
+    v : uint<32> default 1
+    hookable get() -> uint<32>
+        return v
+    end get
+end agent Model
+
+scoreboard Obs
+    seen : uint<32> default 0
+    function observe(a: uint<8>, m: Model)
+        seen = seen + a
+    end observe
+end scoreboard Obs
+
+test PTest
+    let dut : Top
+    let m : Model
+    clock clk = SysDomain
+    run
+        wait 1 cycle
+    end run
+end test PTest"#;
+    let param = param.replacen(
+        "        seen = seen + a",
+        "        let r : uint<32> = m.nosuch(a)\n        seen = seen + r",
+        1,
+    );
+    let msg = assert_invalid(&lower_src(&param).unwrap_err());
+    assert!(
+        msg.contains("has no method `nosuch` (on parameter `m`)"),
+        "parameter form: {msg}"
+    );
+
+    // The carve-out through the PARAMETER form, pinned separately from
+    // the path form. Without this the arm is unguarded: turning its
+    // `is_builtin_component_predicate` call into `if false &&` passed
+    // the entire suite, so the one arm the carve-out exists to create
+    // was the one nothing measured.
+    let param_builtin = param.replacen("m.nosuch(a)", "m.idle(a)", 1);
+    let msg = assert_unsupported(&lower_src(&param_builtin).unwrap_err());
+    assert!(
+        msg.contains("on a component-typed parameter"),
+        "parameter-form carve-out: {msg}"
+    );
+    cpp_tb::emit(&merged_src(&param_builtin))
+        .expect("v1 emits the built-in predicate on a parameter");
+
+    // And the carve-out: a BUILT-IN predicate is not a declared method
+    // either, but both backends implement it — TB-IR in expression
+    // position, v1 anywhere. It keeps the suggestion.
+    //
+    // THREE landings reach the path-form arm, not the two an earlier
+    // version of this test checked. A bare statement has no binding and
+    // no local, so a message about "a binding position" described the
+    // wrong one of them.
+    for stmt in ["let q = c.idle(2)", "c.idle(2)", "x = c.idle(2)"] {
+        let builtin = if stmt.starts_with("x =") {
+            src(&format!("let x : uint<32> = 0\n        {stmt}"))
+        } else {
+            src(stmt)
+        };
+        let msg = assert_unsupported(&lower_src(&builtin).unwrap_err());
+        assert!(msg.contains("built-in predicate"), "{stmt}: {msg}");
+        cpp_tb::emit(&merged_src(&builtin))
+            .unwrap_or_else(|e| panic!("{stmt}: v1 emits the built-in predicate: {e}"));
+    }
+    // The same predicate one statement position over lowers under TB-IR,
+    // which is what makes `Invalid` false for it.
+    lower_src(&src("assert c.idle(2) else fail(\"q\")"))
+        .expect("TB-IR lowers the predicate in expression position");
+
+    // A component that DECLARES the name gets its own method, on both
+    // backends — the built-in is a default, not a reserved word. TB-IR
+    // used to reach `as_component_idle` first and emit the heartbeat
+    // against a program whose `idle` returns 7, silently disagreeing
+    // with v1's `Calc_idle(c, 2)`. Now the declaration wins, so the
+    // call is an ordinary component-method call and takes that path's
+    // (pre-existing, name-independent) expression-position gap.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let declared = src(&format!("assert c.{name}(2) == 7 else fail(\"o\")")).replacen(
+            "agent Calc",
+            &format!(
+                "agent Calc\n    hookable {name}(n: uint<8>) -> uint<32>\n        return 7\n    \
+                 end {name}"
+            ),
+            1,
+        );
+        let msg = format!("{}", lower_src(&declared).unwrap_err());
+        assert!(
+            msg.contains(&format!("`.{name}(...)`")),
+            "{name}: the declaration must win, leaving the ordinary method-call gap: {msg}"
+        );
+        // The same refusal an ordinary name gets — the point is that it
+        // is name-independent now.
+        let ordinary = declared.replacen(name, "ordinary", 4);
+        let plain = format!("{}", lower_src(&ordinary).unwrap_err());
+        assert_eq!(
+            msg.replace(name, "ordinary"),
+            plain,
+            "{name}: a declared built-in name must refuse exactly like any other method"
+        );
+        // v1 dispatches to the user's method, which is the behaviour
+        // TB-IR now declines to contradict.
+        let v1 = cpp_tb::emit(&merged_src(&declared)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            v1.contains(&format!("Calc_{name}(c, 2)")),
+            "{name}: v1 calls the declared method"
+        );
+    }
+}
+
+/// Two statement-position `on <event>(...)` subscription arms, side by
+/// side in one function, and they take opposite verdicts.
+///
+/// | subscription | v1 |
+/// |---|---|
+/// | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
+/// | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
+///
+/// The first row was built and RUN, not just emitted: `seen=3`. So v1
+/// implements it and the suggestion is honest — the arm's advice
+/// ("subscribe from the component that owns the `event` field") is
+/// about TB-IR's subset, not about v1 being broken.
+///
+/// The second is an undefined identifier, which is a program error
+/// under both backends. That it IS only that was checked rather than
+/// assumed: a testbench `event` field is claimed by its own arm before
+/// reaching here, and a local that is not an event falls to the
+/// `Invalid` immediately below.
+#[test]
+fn a_statement_position_subscription_splits_on_whether_the_channel_exists() {
+    let src = |on: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Src
+    obs : out event<uint<8>>
+    hookable fire(v: uint<8>)
+        emit obs(v)
+    end fire
+end agent Src
+
+testbench SubTb
+    dut  : Top
+    s    : Src
+    seen : uint<32> default 0
+end testbench SubTb
+
+impl SubTest for SubTb
+    clock clk = SysDomain
+    let ch : event<uint<8>>
+
+    run
+        on {on}(v)
+            seen = seen + v
+        end on
+        emit ch(3)
+        wait 1 cycle
+        assert seen == 3 else fail("seen=${{seen}}")
+    end run
+end impl SubTest"#
+        )
+    };
+
+    // The control: subscribing to the test-scope channel lowers.
+    lower_src(&src("ch")).expect("the in-scope channel lowers");
+
+    // A component's event field by path: TB-IR's subset gap, and v1
+    // really is the way out.
+    //
+    // The stimulus matters, and an earlier version of this test got it
+    // wrong: it subscribed to `s.obs` and then emitted on `ch`, so the
+    // handler could never fire and the "built and run, seen=3" claim
+    // recorded for it was measured on a different program. Firing
+    // `s.fire(3)` — which emits `obs` inside the agent — is what
+    // makes the subscription observable.
+    let path = src("s.obs").replacen("        emit ch(3)", "        s.fire(3)", 1);
+    assert!(
+        path.contains("s.fire(3)"),
+        "the stimulus must actually fire"
+    );
+    let msg = assert_unsupported(&lower_src(&path).unwrap_err());
+    assert!(
+        msg.contains("`on <path>.<event>(arg)` subscription"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&path)).expect("v1 emits the path form");
+    assert!(
+        v1.contains("_tb.s.obs.push_back(") && v1.contains("Src_fire("),
+        "v1 registers against the real member AND emits the stimulus: {v1}"
+    );
+
+    // A name that resolves to nothing: a program error, and v1's
+    // attempt names a symbol that does not exist.
+    let unknown = src("nosuch");
+    let msg = assert_invalid(&lower_src(&unknown).unwrap_err());
+    assert!(msg.contains("names no event channel in scope"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&unknown)).expect("v1 emits");
+    assert!(
+        v1.contains("nosuch.push_back("),
+        "v1 emits the undefined name verbatim: {v1}"
+    );
+
+    // A local that is not an event falls to the `Invalid` just below
+    // the arm under test, not into it.
+    let not_event = src("ch").replacen("    let ch : event<uint<8>>", "    let ch = 5", 1);
+    let msg = assert_invalid(&lower_src(&not_event).unwrap_err());
+    assert!(msg.contains("is not an event channel"), "{msg}");
+
+    // What the arm ACTUALLY catches, which an earlier version of this
+    // test described as "an undefined identifier and nothing else".
+    // Every name below is declared somewhere in the program; none is a
+    // local, so `lookup` misses and they all land here. v1 emits
+    // `<name>.push_back(...)` for each and refuses to compile it, so
+    // the verdict holds — but the set is not what the comment said.
+    for name in ["s", "seen", "clk", "dut", "Src", "fire"] {
+        let s = src(name);
+        let msg = assert_invalid(&lower_src(&s).unwrap_err());
+        assert!(
+            msg.contains("names no event channel in scope"),
+            "{name}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // A NAME, not a substring: every generated testbench contains
+        // `sched.slots.push_back(&_run_slot);`, so `contains("s.push_back(")`
+        // passed for `name = "s"` on any output at all — including one
+        // with the subscription emission deleted. Require the character
+        // before the name to be a non-identifier, non-`.` boundary.
+        let needle = format!("{name}.push_back(");
+        assert!(
+            v1.lines().any(|l| l.match_indices(&needle).any(|(i, _)| {
+                l[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+            })),
+            "{name}: v1 emits the name verbatim"
+        );
+    }
+
+    // A testbench `event` FIELD does not reach this arm — but not for
+    // the reason an earlier version of this test asserted. It dies at
+    // field-declaration lowering, long before the `run` body, so the
+    // old assertion passed for an unrelated reason and would have
+    // passed with the whole subscription arm deleted. Pin the real
+    // cause instead.
+    let tb_field = src("ch")
+        .replacen(
+            "    seen : uint<32> default 0",
+            "    seen : uint<32> default 0\n    tev  : event<uint<8>>",
+            1,
+        )
+        .replacen("on ch(v)", "on tev(v)", 1);
+    let msg = format!("{}", lower_src(&tb_field).unwrap_err());
+    assert!(
+        msg.contains("testbench field `tev`"),
+        "the field declaration is what refuses it: {msg}"
+    );
+}
+
+/// A queue method in STATEMENT position that is neither `push` nor
+/// `pop`. Five arms — testbench-owned field, scoreboard queue,
+/// component queue, bare target-state field, instance-qualified
+/// target-state field — and each splits, because v1 emits the call
+/// against `harc_rt::HarcQueue`, whose whole API is
+/// `push`/`pop`/`size`/`empty`.
+///
+/// | statement | v1 emits | g++ |
+/// |---|---|---|
+/// | `sb.q.size()` | `_tb.sb.q.size();` | compiles — the value is discarded, so it is a legal no-op |
+/// | `sb.q.empty()` | `_tb.sb.q.empty();` | compiles, same |
+/// | `sb.q.clear()` | `_tb.sb.q.clear();` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
+/// | `sb.q.front()` | `_tb.sb.q.front();` | same, no `front` |
+///
+/// So `size`/`empty` keep the suggestion — v1 runs those programs — and
+/// everything else is a program error no backend runs.
+///
+/// All FIVE landings were probed independently rather than four
+/// inferred from one — testbench-owned field, scoreboard queue,
+/// component queue, bare target-state field, instance-qualified
+/// target-state field — and all five behave this way. Three of them
+/// used to carry a hand-written `EmitsUncompilable` instead, which
+/// measurement contradicts: `pend.size()` emits `_tb.pend.size();`,
+/// `pending.size()` emits `self.pending.size();` and
+/// `model.pending.size()` emits `_tb.model.pending.size();`, and g++
+/// compiles all three.
+#[test]
+fn a_queue_method_in_statement_position_splits_on_the_runtime_api() {
+    let sb = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    clock clk = SysDomain
+    run
+        sb.q.push(3)
+        sb.q.{method}()
+        wait 1 cycle
+    end run
+end impl QTest"#
+        )
+    };
+    let comp = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        errs.{method}()
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    clock clk = SysDomain
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+        )
+    };
+
+    let tb_field = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench TbQ
+    dut  : Top
+    pend : queue<uint<32>>
+end testbench TbQ
+
+impl TbQTest for TbQ
+    clock clk = SysDomain
+    run
+        pend.push(3)
+        pend.{method}()
+        wait 1 cycle
+    end run
+end impl TbQTest"#
+        )
+    };
+    let state = fixture("queue_state_hookable_test.harc");
+    let bare_state = |method: &str| {
+        state.replacen(
+            "            pending.push(value)",
+            &format!("            pending.push(value)\n            pending.{method}()"),
+            1,
+        )
+    };
+    let inst_state = |method: &str| {
+        state.replacen(
+            "        model.enqueue(7)",
+            &format!("        model.enqueue(7)\n        model.pending.{method}()"),
+            1,
+        )
+    };
+
+    for (what, src) in [
+        ("scoreboard queue", &sb as &dyn Fn(&str) -> String),
+        ("component queue", &comp),
+        ("testbench queue field", &tb_field),
+        ("bare target-state field", &bare_state),
+        ("instance-qualified target-state field", &inst_state),
+    ] {
+        // `size`/`empty` — v1 emits a legal no-op and runs the program.
+        for method in ["size", "empty"] {
+            let s = src(method);
+            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains("in statement position"),
+                "{what}/{method}: {msg}"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&s))
+                .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
+            assert!(
+                v1.contains(&format!(".{method}();")),
+                "{what}/{method}: v1 emits the discarded call"
+            );
+        }
+
+        // Anything else — v1 emits a call `HarcQueue` does not have.
+        for method in ["clear", "front", "nosuch"] {
+            let s = src(method);
+            let msg = assert_invalid(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains("has only `push`, `pop`, `size` and `empty`"),
+                "{what}/{method}: {msg}"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&s))
+                .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
+            assert!(
+                v1.contains(&format!(".{method}();")),
+                "{what}/{method}: v1 emits the call verbatim, which is what fails to compile"
+            );
+        }
+    }
+
+    // The split tracks the RUNTIME's API, so pin that the two names it
+    // lets through are the two the header actually declares. If
+    // `HarcQueue` grows a method, this fails and the list gets updated
+    // rather than a working call being reported as a program error.
+    let hdr = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_queue_rt.h"),
+    )
+    .expect("runtime header readable");
+    for decl in ["void push(", "T pop(", "bool empty(", "size_t size("] {
+        assert!(hdr.contains(decl), "HarcQueue must still declare `{decl}`");
+    }
+    // Scan for MEMBER DECLARATIONS, not any occurrence: `pop`'s body
+    // calls `_d.front()` on the inner deque, and a `contains("front(")`
+    // matched that and failed for the wrong reason.
+    let declares = |name: &str| {
+        let needle = format!("{name}(");
+        hdr.lines().any(|l| {
+            // A DECLARATION has the name preceded by a return type and
+            // whitespace; a call inside a body has it preceded by `.`,
+            // and `_d.pop_front()` has it preceded by `_`. All three
+            // distinctions are needed — matching the bare substring
+            // `front(` found `pop_front(` and failed for that reason.
+            l.match_indices(&needle).any(|(i, _)| {
+                let before = &l[..i];
+                let boundary = before
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.');
+                boundary && !before.trim().is_empty()
+            })
+        })
+    };
+    for name in ["push", "pop", "empty", "size"] {
+        assert!(declares(name), "HarcQueue must still declare `{name}`");
+    }
+    // …and the set is CLOSED. Spot-checking two absent names made this a
+    // blacklist: adding `T back() const { return _d.back(); }` to the
+    // header left the test green while `errs.back()` kept being reported
+    // as a program error for a statement v1 compiles and runs. Enumerate
+    // what the struct declares and compare the whole set instead.
+    let body = {
+        let start = hdr
+            .find("struct HarcQueue")
+            .expect("struct HarcQueue present");
+        let open = hdr[start..].find('{').expect("struct body opens") + start;
+        let end = hdr[open..].find("\n};").expect("struct body closes") + open;
+        &hdr[open..end]
+    };
+    // Scan the struct body at DEPTH 0 only, over the whole text rather
+    // than line by line: a declaration whose return type sits on its
+    // own line (`std::deque<T>\n    drain() {...}`) is invisible to a
+    // per-line rule, and adding one left this check green while
+    // `pend.drain()` was being called a program error for a statement
+    // v1 compiles. Anything inside a `{...}` body is a call, not a
+    // declaration, so depth is what separates them — not indentation.
+    let mut members: Vec<String> = Vec::new();
+    {
+        let b = body.as_bytes();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'(' if depth == 1 => {
+                    // Walk back over the identifier immediately before
+                    // `(`, then require SOMETHING before it (a return
+                    // type) and that the character before the name is
+                    // not `.` or part of another identifier — which is
+                    // what excludes `_d.front()` and `_d.pop_front()`.
+                    let end = body[..i].trim_end().len();
+                    let start = body[..end]
+                        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    let name = &body[start..end];
+                    let before = body[..start].trim_end();
+                    let sep = body[..start].chars().next_back();
+                    if !name.is_empty()
+                        && !before.is_empty()
+                        && sep.is_some_and(|c| c.is_whitespace())
+                        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        members.push(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    members.sort();
+    members.dedup();
+    assert_eq!(
+        members,
+        vec![
+            "empty".to_string(),
+            "pop".to_string(),
+            "push".to_string(),
+            "size".to_string()
+        ],
+        "`HarcQueue`'s member set changed; `queue_method_in_statement_position` splits on \
+         `size`/`empty` and calls everything else a program error, so that list has to move \
+         with the header"
+    );
+    // What this still does not see, stated rather than implied: an
+    // OVERLOAD leaves the set unchanged, so adding `T pop(size_t n)`
+    // would not fail here even though it would make
+    // `queue_pop_takes_no_arguments` wrong; and a member inherited
+    // from a base class is not in this body at all. Both are outside
+    // what a name-set comparison can answer.
+}
+
+/// The six covergroup hook-trigger shape arms, of which exactly TWO are
+/// reachable — the other four are guarded by the parser, which the
+/// code's own doc comments already said and this test measures.
+///
+/// | trigger | who refuses it |
+/// |---|---|
+/// | `@(drv.step(n) post)` | nobody — the control |
+/// | `@((drv).step(n) post)` | nobody — the paren is unwrapped |
+/// | `@(step(n) post)` | lowering: callee is not a field access (v1: only once instantiated) |
+/// | `@((drv.x + 1).step(n) post)` | lowering: receiver is not a path (v1: only once instantiated) |
+/// | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
+/// | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
+///
+/// Both reachable arms are `Unsupported`, and the first version of
+/// this test said `Invalid` because it measured only the INSTANTIATED
+/// position. v1's matching refusal comes from
+/// `emit_covergroup_hook_sample_registration`, which runs per `cov :
+/// StepCov` field — a covergroup declared and never instantiated never
+/// reaches it, and v1 emits the whole testbench. TB-IR refuses at
+/// DECLARATION, so the two disagree exactly there:
+///
+/// | | `cov : StepCov` present | covergroup uninstantiated |
+/// |---|---|---|
+/// | v1 | refuses: "must resolve to a `hookable`…" | emits, and g++ compiles it |
+/// | TB-IR | refuses | refuses |
+///
+/// "No backend runs it in ANY configuration" is what `Invalid` claims,
+/// and an uninstantiated covergroup is a configuration. Third time
+/// this rule has been broken on this branch, after `connect` and the
+/// built-in predicates.
+///
+/// The four parser-guarded arms stay `Invalid` as invariant guards —
+/// they cannot emit a false `--codegen v1` suggestion from a position
+/// nothing reaches, and if one ever did fire the program would be
+/// malformed.
+#[test]
+fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
+    let fixture = fixture("covergroup_hook_trigger_test.harc");
+    // Anchor on the DECLARATION, not the bare trigger: the same text
+    // appears in a comment eight lines above, and a `replacen(.., 1)`
+    // on the trigger alone edited the comment and left the program
+    // lowering cleanly — the probe measuring the wrong line, in
+    // miniature.
+    const DECL: &str = "covergroup StepCov @(drv.step(n) post)";
+    assert!(fixture.contains(DECL), "fixture shape changed");
+    let with = |t: &str| {
+        let out = fixture.replacen(DECL, &format!("covergroup StepCov @({t} post)"), 1);
+        assert_ne!(out, fixture, "the declaration must actually change");
+        out
+    };
+
+    // Controls: the fixture's own trigger, and the parenthesized
+    // receiver, both lower.
+    lower_src(&fixture).expect("the fixture's trigger lowers");
+    lower_src(&with("(drv).step(n)")).expect("a parenthesized receiver lowers");
+
+    // The two arms lowering actually reaches.
+    for (trigger, want) in [
+        ("step(n)", "`<name>(args)` without a receiver"),
+        ("(drv.x + 1).step(n)", "hook trigger receiver"),
+    ] {
+        let src = with(trigger);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        // Instantiated, v1 refuses it too — which is what the first
+        // version of this test measured, and all it measured.
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses the instantiated form");
+        assert!(
+            format!("{v1}").contains("must resolve to a `hookable`"),
+            "{trigger}: {v1}"
+        );
+
+        // UNINSTANTIATED, v1 emits the whole testbench — so the
+        // suggestion is honest and `Invalid` was not. Dropping the
+        // `cov` field and its readers is the whole difference.
+        let uninst: String = src
+            .lines()
+            .filter(|l| !l.contains("cov ") && !l.contains("cov."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !uninst.contains("cov : StepCov"),
+            "{trigger}: the instantiation must actually be gone"
+        );
+        let out = cpp_tb::emit(&merged_src(&uninst))
+            .unwrap_or_else(|e| panic!("{trigger}: v1 emits the uninstantiated form: {e}"));
+        assert!(
+            out.contains("int main("),
+            "{trigger}: v1 emits a whole testbench, not a stub"
+        );
+        // TB-IR still refuses it, which is the gap this records.
+        assert_unsupported(&lower_src(&uninst).unwrap_err());
+    }
+
+    // The four the PARSER claims first, so lowering never sees them.
+    // Pinned because that is the whole reason those arms are annotated
+    // as invariant guards rather than measured.
+    for (trigger, want) in [
+        ("drv.step", "must be a method call before `pre` or `post`"),
+        ("drv.step(n + 1)", "arguments must be identifiers"),
+    ] {
+        let err = parse_source(&with(trigger)).expect_err("the parser refuses it");
+        let msg = format!("{err:?}");
+        assert!(msg.contains(want), "{trigger}: {msg}");
+    }
+}
+
+/// A transactor `function` is callable but is not a hook target.
+///
+/// The dedicated transactor IR used to discard `HookableMethod::is_hookable`
+/// when it built `TransactorMethodSchema`. That made a plain function declared
+/// in `when active` indistinguishable from a real `hookable`: TB-IR accepted
+/// the pre-hook below and emitted hook fan-out, while v1 correctly rejected it.
+#[test]
+fn a_plain_transactor_function_is_not_a_hook_target() {
+    let src = r#"transactor Drv
+    dut : Top
+    when active
+        function plain(n: uint<8>)
+            log(info, "plain ${n}")
+        end function plain
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    on drv.plain pre
+        log(info, "must not register")
+    end on
+
+    run
+        drv.dut = dut
+        drv.plain(1)
+    end run
+end impl T"#;
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect_err("v1 refuses a hook on `function`");
+    assert!(
+        format!("{v1}").contains("must resolve to a `hookable`"),
+        "v1 establishes the language contract: {v1}"
+    );
+
+    let err = lower_src(src).expect_err("TB-IR must also refuse a hook on `function`");
+    assert!(
+        assert_invalid(&err).contains("does not name a `hookable`"),
+        "the diagnostic must distinguish a plain function from a hookable: {err}"
+    );
+}
+
+/// A value-record field is persistent host-side transactor state, not evidence
+/// that an output-event analysis source owns a DUT handle.  The record must not
+/// divert this source away from composite-component lowering.
+#[test]
+fn analysis_source_with_record_state_lowers_and_emits() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+
+    when active
+        hookable publish(v: uint<8>)
+            current.value = v
+            emit observed(v)
+        end publish
+    end when
+end transactor RecordSource
+
+test RecordSourceTest
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish(7)
+        assert src.current.value == 7 else fail("record state lost")
+    end run
+end test RecordSourceTest
+"#;
+
+    let prog = lower_src(src).expect("record state must preserve analysis-source routing");
+    verify::verify_program(&prog).expect("record-state analysis source verifies");
+    tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("record-state analysis source emits");
+}
+
+/// Record state is a first-class value, not only a collection of independently
+/// addressable leaves. An analysis source can publish its current record on a
+/// record-payload event, as the legacy backend does.
+#[test]
+fn analysis_source_can_emit_whole_record_state() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<Sample>
+    current  : Sample
+    when active
+        hookable publish(v: uint<8>)
+            current.value = v
+            emit observed(current)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish(7)
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// A component-routed transactor's record state remains externally writable,
+/// matching an ordinary unbound transactor record field and the legacy backend.
+#[test]
+fn analysis_source_record_leaf_is_writable_from_test_scope() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+    when active
+        hookable publish()
+            emit observed(current.value)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.current.value = 3
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// The same external write must survive a structural component path; routing
+/// through an env cannot turn the record field into a sub-component receiver.
+#[test]
+fn nested_analysis_source_record_leaf_is_writable_from_test_scope() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+    when active
+        hookable publish()
+            emit observed(current.value)
+        end publish
+    end when
+end transactor RecordSource
+
+env Wrapper
+    src : RecordSource active
+end env Wrapper
+
+test T
+    let dut : Top
+    let env : Wrapper
+    run
+        env.src.current.value = 4
+    end run
+end test T
+"#;
+
+    emit_cpp_src(src);
+}
+
+/// Signedness follows the terminal record leaf through a component field path.
+/// Otherwise `sint<8> >> 1` silently becomes a logical right shift in TBIR C++.
+#[test]
+fn component_record_signed_leaf_uses_arithmetic_right_shift() {
+    let src = r#"
+struct SignedSample
+    bias : sint<8> default 0
+end struct SignedSample
+
+transactor ShiftSource
+    observed : out event<sint<8>>
+    current  : SignedSample
+    shifted  : sint<8> default 0
+    when active
+        on 1 cycles
+            current.bias = -8
+            shifted = current.bias >> 1
+        end on
+    end when
+end transactor ShiftSource
+
+test T
+    let dut : Top
+    let src : ShiftSource active
+    run
+        wait 2 cycles
+        assert src.shifted == -4 else fail("signed shift")
+    end run
+end test T
+"#;
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.current.bias)) >> 1"),
+        "signed record leaf must get an arithmetic shift:\n{cpp}"
+    );
+}
+
+/// Non-periodic cycle-trigger bodies own the same self-relative component
+/// state as methods and periodic handlers. Signedness must therefore resolve
+/// through the cycle-handler function id as well.
+#[test]
+fn component_record_signed_leaf_in_cycle_trigger_uses_arithmetic_right_shift() {
+    let src = r#"
+struct SignedSample
+    bias : sint<8> default -8
+end struct SignedSample
+
+transactor ShiftSource
+    observed : out event<sint<8>>
+    current  : SignedSample
+    shifted  : sint<8> default 0
+    when active
+        on current.bias < 0
+            shifted = current.bias >> 1
+        end on
+    end when
+end transactor ShiftSource
+
+test T
+    let dut : Top
+    let src : ShiftSource active
+    run
+        wait 2 cycles
+        assert src.shifted == -4 else fail("signed shift lost")
+    end run
+end test T
+"#;
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.current.bias)) >> 1"),
+        "signed record leaf must get an arithmetic shift in a cycle handler:\n{cpp}"
+    );
+}
+
+/// A diagnostic must not recommend element-wise `Vec` access while indexed
+/// component-record members are themselves still outside the TBIR subset.
+#[test]
+fn component_record_vec_diagnostic_does_not_promise_an_unsupported_workaround() {
+    let whole = r#"
+struct Inner
+    bytes : Vec<uint<8>, 2>
+end struct Inner
+struct Outer
+    inner : Inner
+end struct Outer
+
+transactor VecSource
+    observed : out event<uint<8>>
+    current  : Outer
+    when active
+        hookable touch()
+            current.inner.bytes = current.inner.bytes
+        end touch
+    end when
+end transactor VecSource
+
+test T
+    let dut : Top
+    let src : VecSource active
+    run
+        src.touch()
+    end run
+end test T
+"#;
+    let indexed = whole.replace(
+        "current.inner.bytes = current.inner.bytes",
+        "current.inner.bytes[0] = 1",
+    );
+
+    let whole_err = lower_src(whole).expect_err("whole Vec state is outside this subset");
+    if let Err(indexed_err) = lower_src(&indexed) {
+        assert!(
+            !whole_err.to_string().contains("element-wise"),
+            "diagnostic recommends indexed access that also fails ({indexed_err}): {whole_err}"
+        );
+    }
+}
+
+/// Hook-triggered covergroups obey the same `hookable` provenance rule as
+/// test-scope pre/post handlers; a plain transactor function must not acquire
+/// an implicit coverage subscription merely because it shares the method IR.
+#[test]
+fn a_plain_transactor_function_is_not_a_covergroup_hook_target() {
+    let src = r#"covergroup C @(drv.plain(n) post)
+    cp : cover dut.count_out
+        bins
+            zero = {0}
+        end bins
+end covergroup C
+
+transactor Drv
+    dut : Top
+    when active
+        function plain(n: uint<8>)
+            log(info, "plain ${n}")
+        end function plain
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+    cov : C
+end testbench Tb
+
+impl T for Tb
+    run
+        drv.dut = dut
+        drv.plain(1)
+    end run
+end impl T"#;
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect_err("v1 refuses a cover hook on `function`");
+    assert!(
+        format!("{v1}").contains("must resolve to a `hookable`"),
+        "v1 establishes the language contract: {v1}"
+    );
+
+    let err = lower_src(src).expect_err("TB-IR must refuse a cover hook on `function`");
+    assert!(
+        assert_invalid(&err).contains("does not name a `hookable`"),
+        "the diagnostic must distinguish a plain function from a hookable: {err}"
+    );
 }
