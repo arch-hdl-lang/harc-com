@@ -158,16 +158,29 @@ pub(crate) fn lower_covergroup(
 /// leading to the method (e.g. `["drv"]` for `drv.send(t)`).
 fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String), LowerError> {
     let ExprKind::Call { callee, .. } = &*call.kind else {
-        return Err(unsupported(
-            &format!("covergroup `{group}` hook trigger must be a method call"),
-            "",
-        ));
+        // PARSER-GUARDED, so unreachable: `validate_cover_hook_trigger`
+        // refuses a non-call trigger first, with "covergroup hook
+        // trigger must be a method call before `pre` or `post`" —
+        // measured with `@(drv.step post)`, which never reaches
+        // lowering. Kept as an invariant guard, and `Invalid` rather
+        // than a v1 suggestion because if it ever did fire the program
+        // would be malformed, not merely outside TB-IR's subset.
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` hook trigger must be a method call"
+        )));
     };
     let ExprKind::Field { target, name } = &*callee.kind else {
-        return Err(unsupported(
-            &format!("covergroup `{group}` hook trigger must be `<obj>.<method>(args)`"),
-            "",
-        ));
+        // REACHABLE — the parser's `validate_cover_hook_trigger` checks
+        // that the trigger is a CALL and that its args are bare
+        // identifiers, but not that the callee is a field access. So a
+        // bare `@(step(n) post)` lands here.
+        //
+        // MEASURED: v1 refuses it too, with "covergroup `StepCov` hook
+        // trigger must resolve to a `hookable` on a known component
+        // type". A program error under both backends.
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` hook trigger must be `<obj>.<method>(args)`"
+        )));
     };
     let method = name.name.clone();
     let mut path: Vec<String> = Vec::new();
@@ -187,12 +200,16 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
                 break;
             }
             _ => {
-                return Err(unsupported(
-                    &format!(
-                        "covergroup `{group}` hook trigger receiver must be a field-access path"
-                    ),
-                    "",
-                ))
+                // REACHABLE, and the second of exactly two arms in this
+                // function that are: `@((drv.x + 1).step(n) post)` has a
+                // callee that IS a field access, so the arm above lets
+                // it through, and a receiver that is not a path.
+                //
+                // MEASURED: v1 refuses it with the same "must resolve to
+                // a `hookable` on a known component type".
+                return Err(LowerError::Invalid(format!(
+                    "covergroup `{group}` hook trigger receiver must be a field-access path"
+                )));
             }
         }
     }
@@ -207,24 +224,27 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
 /// clear unsupported error rather than silently dropped.
 fn hook_call_arg_names(group: &str, call: &AstExpr) -> Result<Vec<String>, LowerError> {
     let ExprKind::Call { args, .. } = &*call.kind else {
-        return Err(unsupported(
-            &format!("covergroup `{group}` hook trigger must be a method call"),
-            "",
-        ));
+        // PARSER-GUARDED, same as the sibling in `lower_hook_call`.
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` hook trigger must be a method call"
+        )));
     };
     let mut names = Vec::with_capacity(args.len());
     for arg in args {
+        // PARSER-GUARDED, both of these: `validate_cover_hook_trigger`
+        // walks the same args and refuses a non-identifier first —
+        // measured with `@(drv.step(n + 1) post)`, which reports the
+        // parser's own "covergroup hook trigger arguments must be
+        // identifiers" and never reaches lowering.
         let crate::ast::CallArg::Expr(e) = arg else {
-            return Err(unsupported(
-                &format!("covergroup `{group}` hook trigger arguments must be identifiers"),
-                "",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{group}` hook trigger arguments must be identifiers"
+            )));
         };
         let ExprKind::Ident(id) = &*e.kind else {
-            return Err(unsupported(
-                &format!("covergroup `{group}` hook trigger arguments must be identifiers"),
-                "",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{group}` hook trigger arguments must be identifiers"
+            )));
         };
         names.push(id.name.clone());
     }

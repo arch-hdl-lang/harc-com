@@ -20657,3 +20657,77 @@ end test CqTest"#
         );
     }
 }
+
+/// The six covergroup hook-trigger shape arms, of which exactly TWO are
+/// reachable — the other four are guarded by the parser, which the
+/// code's own doc comments already said and this test measures.
+///
+/// | trigger | who refuses it |
+/// |---|---|
+/// | `@(drv.step(n) post)` | nobody — the control |
+/// | `@((drv).step(n) post)` | nobody — the paren is unwrapped |
+/// | `@(step(n) post)` | lowering: callee is not a field access |
+/// | `@((drv.x + 1).step(n) post)` | lowering: receiver is not a path |
+/// | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
+/// | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
+///
+/// Both reachable arms are `Invalid`: v1 refuses each with its own
+/// "covergroup `StepCov` hook trigger must resolve to a `hookable` on a
+/// known component type", so no backend runs them. The four
+/// parser-guarded arms carry the same verdict as invariant guards —
+/// they cannot emit a false `--codegen v1` suggestion from a position
+/// nothing reaches, and if one ever did fire the program would be
+/// malformed.
+#[test]
+fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
+    let fixture = fixture("covergroup_hook_trigger_test.harc");
+    // Anchor on the DECLARATION, not the bare trigger: the same text
+    // appears in a comment eight lines above, and a `replacen(.., 1)`
+    // on the trigger alone edited the comment and left the program
+    // lowering cleanly — the probe measuring the wrong line, in
+    // miniature.
+    const DECL: &str = "covergroup StepCov @(drv.step(n) post)";
+    assert!(fixture.contains(DECL), "fixture shape changed");
+    let with = |t: &str| {
+        let out = fixture.replacen(DECL, &format!("covergroup StepCov @({t} post)"), 1);
+        assert_ne!(out, fixture, "the declaration must actually change");
+        out
+    };
+
+    // Controls: the fixture's own trigger, and the parenthesized
+    // receiver, both lower.
+    lower_src(&fixture).expect("the fixture's trigger lowers");
+    lower_src(&with("(drv).step(n)")).expect("a parenthesized receiver lowers");
+
+    // The two arms lowering actually reaches.
+    for (trigger, want) in [
+        ("step(n)", "must be `<obj>.<method>(args)`"),
+        (
+            "(drv.x + 1).step(n)",
+            "receiver must be a field-access path",
+        ),
+    ] {
+        let src = with(trigger);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        // The half that makes `Invalid` honest: v1 refuses it too.
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses it too");
+        assert!(
+            format!("{v1}").contains("must resolve to a `hookable`"),
+            "{trigger}: {v1}"
+        );
+    }
+
+    // The four the PARSER claims first, so lowering never sees them.
+    // Pinned because that is the whole reason those arms are annotated
+    // as invariant guards rather than measured.
+    for (trigger, want) in [
+        ("drv.step", "must be a method call before `pre` or `post`"),
+        ("drv.step(n + 1)", "arguments must be identifiers"),
+    ] {
+        let err = parse_source(&with(trigger)).expect_err("the parser refuses it");
+        let msg = format!("{err:?}");
+        assert!(msg.contains(want), "{trigger}: {msg}");
+    }
+}

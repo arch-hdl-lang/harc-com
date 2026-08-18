@@ -5317,6 +5317,47 @@ case and only locally-determinable `Assign` types are compared).
     `_d.pop_front()` contains `front(`. A substring test is not a name
     test, in the same way a shape test is not a resolution test.
 
+83. **Six covergroup hook-trigger arms, two of them reachable
+    (2026-08-18).**
+
+    `lower_hook_call` and `hook_call_arg_names` between them refuse a
+    malformed `covergroup G @(<trigger> post)` six ways, all
+    `Unsupported`. Probing each shape says which arm actually sees it:
+
+    | trigger | who refuses it |
+    |---|---|
+    | `@(drv.step(n) post)` | nobody — the control |
+    | `@((drv).step(n) post)` | nobody — the paren is unwrapped |
+    | `@(step(n) post)` | LOWERING: the callee is not a field access |
+    | `@((drv.x + 1).step(n) post)` | LOWERING: the receiver is not a path |
+    | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
+    | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
+
+    So `validate_cover_hook_trigger` checks the call shape and the
+    argument shape, and nothing checks the callee form — which is
+    exactly what the two functions' own doc comments already said, and
+    the first time in this sweep that a code comment's reachability
+    claim turned out to be right.
+
+    Both reachable arms are `Invalid`: v1 refuses each with its own
+    "covergroup `StepCov` hook trigger must resolve to a `hookable` on a
+    known component type", so no backend runs them. The four
+    parser-guarded arms take the same verdict as invariant guards —
+    an unreachable arm cannot emit a false `--codegen v1` suggestion,
+    and if one ever did fire the program would be malformed.
+
+    The test pins the parser rows too, since "the parser gets there
+    first" is the entire reason those four are annotated rather than
+    measured.
+
+    One thing the test caught about itself: the trigger text
+    `@(drv.step(n) post)` appears in a COMMENT eight lines above the
+    declaration, so a `replacen(.., 1)` edited the comment and left the
+    program lowering cleanly. The CLI probes had used `sed`, which
+    rewrites both lines, so they were right by accident. Anchoring on
+    the whole declaration fixes it — the probe measuring the wrong line,
+    one more time, in miniature.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
