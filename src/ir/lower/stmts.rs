@@ -2643,14 +2643,26 @@ impl FuncBuilder<'_> {
             ));
         };
         let Some(channel) = self.lookup(&id.name) else {
-            return Err(unsupported(
-                &format!(
-                    "an `on {}(...)` subscription in statement position",
-                    id.name
-                ),
-                "only a test-scope `let <e> : event<T>` channel can be subscribed to here; \
-                 a component's `event` field subscribes from the component",
-            ));
+            // `lookup` failing means the name resolves to NOTHING here,
+            // not that it names the wrong kind of thing: a testbench
+            // `event` field is claimed by its own arm, and a local that
+            // is not an event falls to the `Invalid` just below. So this
+            // is an undefined identifier.
+            //
+            // MEASURED: v1 emits `nosuch.push_back([&](int64_t v) {...})`
+            // — g++: "'nosuch' was not declared in this scope". A
+            // program error under both backends.
+            //
+            // Its sibling arm above keeps `Unsupported`, and that is
+            // measured too rather than assumed: `on s.obs(v)` for a
+            // component's `event` field makes v1 emit
+            // `_tb.s.obs.push_back(...)` against a real member, and the
+            // program COMPILES AND RUNS — built and run, `seen=3`. Same
+            // statement position, same construct, opposite verdicts.
+            return Err(LowerError::Invalid(format!(
+                "`on {}(...)`: `{}` names no event channel in scope",
+                id.name, id.name
+            )));
         };
         let IrType::Event(payload) = *self.local_type(channel) else {
             return Err(LowerError::Invalid(format!(

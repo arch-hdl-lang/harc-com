@@ -5154,6 +5154,35 @@ case and only locally-determinable `Assign` types are compared).
     with two verdicts in one file; the alternative to THAT is claiming
     four measurements that were not made.
 
+80. **Two subscription arms, adjacent, opposite verdicts
+    (2026-08-18).**
+
+    `lower_event_subscription` refuses a statement-position `on
+    <event>(...)` two ways within four lines of each other, and both
+    said `Unsupported`.
+
+    | subscription | v1 |
+    |---|---|
+    | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
+    | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
+
+    The first row was built and RUN, not just emitted: `seen=3`. So v1
+    implements it, the suggestion is honest, and the arm's advice —
+    subscribe from the component that owns the field — is about TB-IR's
+    subset rather than about v1 being unable. It stays.
+
+    The second is an undefined identifier, a program error under both
+    backends → `Invalid`. That it is ONLY that was checked rather than
+    assumed, because the arm's old detail conflated "unknown name" with
+    "known name of the wrong kind": a testbench `event` field is claimed
+    by its own arm before reaching here, and a local that is not an
+    event falls to the `Invalid` immediately below. Both neighbours are
+    pinned in the test so the arm cannot quietly widen.
+
+    Worth noting for its own sake: these two arms are four lines apart,
+    handle the same statement, and needed opposite verdicts. Proximity
+    is not evidence.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

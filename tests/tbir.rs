@@ -20188,3 +20188,104 @@ end test NmTest"#
         cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
     }
 }
+
+/// Two statement-position `on <event>(...)` subscription arms, side by
+/// side in one function, and they take opposite verdicts.
+///
+/// | subscription | v1 |
+/// |---|---|
+/// | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
+/// | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
+///
+/// The first row was built and RUN, not just emitted: `seen=3`. So v1
+/// implements it and the suggestion is honest — the arm's advice
+/// ("subscribe from the component that owns the `event` field") is
+/// about TB-IR's subset, not about v1 being broken.
+///
+/// The second is an undefined identifier, which is a program error
+/// under both backends. That it IS only that was checked rather than
+/// assumed: a testbench `event` field is claimed by its own arm before
+/// reaching here, and a local that is not an event falls to the
+/// `Invalid` immediately below.
+#[test]
+fn a_statement_position_subscription_splits_on_whether_the_channel_exists() {
+    let src = |on: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Src
+    obs : out event<uint<8>>
+    hookable fire(v: uint<8>)
+        emit obs(v)
+    end fire
+end agent Src
+
+testbench SubTb
+    dut  : Top
+    s    : Src
+    seen : uint<32> default 0
+end testbench SubTb
+
+impl SubTest for SubTb
+    clock clk = SysDomain
+    let ch : event<uint<8>>
+
+    run
+        on {on}(v)
+            seen = seen + v
+        end on
+        emit ch(3)
+        wait 1 cycle
+        assert seen == 3 else fail("seen=${{seen}}")
+    end run
+end impl SubTest"#
+        )
+    };
+
+    // The control: subscribing to the test-scope channel lowers.
+    lower_src(&src("ch")).expect("the in-scope channel lowers");
+
+    // A component's event field by path: TB-IR's subset gap, and v1
+    // really is the way out.
+    let path = src("s.obs");
+    let msg = assert_unsupported(&lower_src(&path).unwrap_err());
+    assert!(
+        msg.contains("`on <path>.<event>(arg)` subscription"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&path)).expect("v1 emits the path form");
+    assert!(
+        v1.contains("_tb.s.obs.push_back("),
+        "v1 registers against the real member: {v1}"
+    );
+
+    // A name that resolves to nothing: a program error, and v1's
+    // attempt names a symbol that does not exist.
+    let unknown = src("nosuch");
+    let msg = assert_invalid(&lower_src(&unknown).unwrap_err());
+    assert!(msg.contains("names no event channel in scope"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&unknown)).expect("v1 emits");
+    assert!(
+        v1.contains("nosuch.push_back("),
+        "v1 emits the undefined name verbatim: {v1}"
+    );
+
+    // The two neighbouring shapes that make the arm above an undefined
+    // identifier and nothing else.
+    let tb_field = src("ch").replacen(
+        "    seen : uint<32> default 0",
+        "    seen : uint<32> default 0\n    tev  : event<uint<8>>",
+        1,
+    );
+    let tb_field = tb_field.replacen("on ch(v)", "on tev(v)", 1);
+    assert!(
+        !format!("{}", lower_src(&tb_field).unwrap_err())
+            .contains("names no event channel in scope"),
+        "a testbench `event` field must be claimed by its own arm"
+    );
+    let not_event = src("ch").replacen("    let ch : event<uint<8>>", "    let ch = 5", 1);
+    let msg = assert_invalid(&lower_src(&not_event).unwrap_err());
+    assert!(msg.contains("is not an event channel"), "{msg}");
+}
