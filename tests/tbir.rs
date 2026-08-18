@@ -12871,6 +12871,13 @@ end impl T"#
 /// "no matching function for call to `harc_rt::HarcQueue<long unsigned
 /// int>::pop(int, int)`". The `push` branches next to them have always
 /// matched `[CallArg::Expr(arg)]` exactly; this is that check's mirror.
+///
+/// NINE guards, not eight, across TEN `pop` landings: the tenth
+/// (`let v = sb.q.pop(7, 9)`) is claimed first by the older
+/// `as_scoreboard_pop` arity check, which says "scoreboard
+/// `sb.q.pop()` takes no arguments" — same verdict, different wording,
+/// and it is why the scoreboard flavour appears below in statement
+/// position only.
 #[test]
 fn a_queue_pop_takes_no_arguments() {
     let tb = |stmt: &str| {
@@ -12978,6 +12985,63 @@ end test CqTest"#
             "{what}: v1 emits the over-applied call"
         );
     }
+
+    // …and the `let`-RHS branch of each, which is a SEPARATE guard.
+    // Checking only the testbench flavour in both positions left three
+    // of them unpinned: deleting all three `let`-RHS calls kept the
+    // whole suite green, and `let z : uint<32> = errs.pop(7, 9)` went
+    // back to lowering cleanly against a v1 that emits
+    // `uint64_t z = self.errs.pop(7, 9);`.
+    let bound = [
+        (
+            "bare target-state",
+            state.replacen(
+                "            pending.push(value)",
+                "            pending.push(value)\n            let z : uint<8> = pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "instance-qualified target-state",
+            state.replacen(
+                "        model.enqueue(7)",
+                "        model.enqueue(7)\n        let z : uint<8> = model.pending.pop(7, 9)",
+                1,
+            ),
+        ),
+        (
+            "component queue",
+            r#"agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        let z : uint<32> = errs.pop(7, 9)
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+                .to_string(),
+        ),
+    ];
+    for (what, src) in bound {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("`pop` takes no arguments"),
+            "{what} (let-RHS): {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            v1.contains(".pop(7, 9)"),
+            "{what} (let-RHS): v1 emits the over-applied call"
+        );
+    }
 }
 
 /// `push` in expression position is the other half of that fallback,
@@ -13013,6 +13077,30 @@ end impl QTest"#;
     assert!(
         v1.contains("z = _tb.sb.q.push(3);"),
         "v1 binds the void result, which is what does not compile: {v1}"
+    );
+
+    // Four of the five expression landings reach that message. The
+    // TESTBENCH-owned one does not: `lower_tb_queue_query_call` runs
+    // its `!args.is_empty()` arity check BEFORE the method match, so
+    // `pend.push(3)` is refused for its arguments rather than for its
+    // return type. Same `Invalid` verdict, different message — pinned
+    // so the "two mechanisms, two messages" claim is not read as
+    // covering all five.
+    let tb = r#"testbench Tb
+    dut  : Top
+    pend : queue<uint<32>>
+end testbench Tb
+impl T for Tb
+    run
+        pend.push(3)
+        let z : uint<32> = pend.push(3)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(tb).unwrap_err());
+    assert!(
+        msg.contains("takes no arguments"),
+        "the testbench landing is claimed by its arity check first: {msg}"
     );
 }
 
@@ -21098,9 +21186,11 @@ end impl SubTest"#
 }
 
 /// A queue method in STATEMENT position that is neither `push` nor
-/// `pop`. Two arms — one for a scoreboard queue, one for a component
-/// queue — and each splits, because v1 emits the call verbatim against
-/// `harc_rt::HarcQueue`, whose whole API is `push`/`pop`/`size`/`empty`.
+/// `pop`. Five arms — testbench-owned field, scoreboard queue,
+/// component queue, bare target-state field, instance-qualified
+/// target-state field — and each splits, because v1 emits the call
+/// against `harc_rt::HarcQueue`, whose whole API is
+/// `push`/`pop`/`size`/`empty`.
 ///
 /// | statement | v1 emits | g++ |
 /// |---|---|---|
@@ -21299,25 +21389,49 @@ end impl TbQTest"#
         let end = hdr[open..].find("\n};").expect("struct body closes") + open;
         &hdr[open..end]
     };
-    let mut members: Vec<String> = body
-        .lines()
-        .filter_map(|l| {
-            // `<return type> <name>(` at member indentation. The inner
-            // `_d.push_back(...)` calls sit inside a body and are
-            // preceded by `.`, which the boundary rule below rejects.
-            let paren = l.find('(')?;
-            let head = l[..paren].trim_end();
-            let name = head.rsplit(|c: char| c.is_whitespace()).next()?;
-            let before = head.strip_suffix(name)?;
-            if name.is_empty() || before.trim().is_empty() {
-                return None;
+    // Scan the struct body at DEPTH 0 only, over the whole text rather
+    // than line by line: a declaration whose return type sits on its
+    // own line (`std::deque<T>\n    drain() {...}`) is invisible to a
+    // per-line rule, and adding one left this check green while
+    // `pend.drain()` was being called a program error for a statement
+    // v1 compiles. Anything inside a `{...}` body is a call, not a
+    // declaration, so depth is what separates them — not indentation.
+    let mut members: Vec<String> = Vec::new();
+    {
+        let b = body.as_bytes();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'(' if depth == 1 => {
+                    // Walk back over the identifier immediately before
+                    // `(`, then require SOMETHING before it (a return
+                    // type) and that the character before the name is
+                    // not `.` or part of another identifier — which is
+                    // what excludes `_d.front()` and `_d.pop_front()`.
+                    let end = body[..i].trim_end().len();
+                    let start = body[..end]
+                        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    let name = &body[start..end];
+                    let before = body[..start].trim_end();
+                    let sep = body[..start].chars().next_back();
+                    if !name.is_empty()
+                        && !before.is_empty()
+                        && sep.is_some_and(|c| c.is_whitespace())
+                        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        members.push(name.to_string());
+                    }
+                }
+                _ => {}
             }
-            if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                return None;
-            }
-            Some(name.to_string())
-        })
-        .collect();
+            i += 1;
+        }
+    }
     members.sort();
     members.dedup();
     assert_eq!(
@@ -21332,6 +21446,12 @@ end impl TbQTest"#
          `size`/`empty` and calls everything else a program error, so that list has to move \
          with the header"
     );
+    // What this still does not see, stated rather than implied: an
+    // OVERLOAD leaves the set unchanged, so adding `T pop(size_t n)`
+    // would not fail here even though it would make
+    // `queue_pop_takes_no_arguments` wrong; and a member inherited
+    // from a base class is not in this body at all. Both are outside
+    // what a name-set comparison can answer.
 }
 
 /// The six covergroup hook-trigger shape arms, of which exactly TWO are
@@ -21342,15 +21462,30 @@ end impl TbQTest"#
 /// |---|---|
 /// | `@(drv.step(n) post)` | nobody — the control |
 /// | `@((drv).step(n) post)` | nobody — the paren is unwrapped |
-/// | `@(step(n) post)` | lowering: callee is not a field access |
-/// | `@((drv.x + 1).step(n) post)` | lowering: receiver is not a path |
+/// | `@(step(n) post)` | lowering: callee is not a field access (v1: only once instantiated) |
+/// | `@((drv.x + 1).step(n) post)` | lowering: receiver is not a path (v1: only once instantiated) |
 /// | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
 /// | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
 ///
-/// Both reachable arms are `Invalid`: v1 refuses each with its own
-/// "covergroup `StepCov` hook trigger must resolve to a `hookable` on a
-/// known component type", so no backend runs them. The four
-/// parser-guarded arms carry the same verdict as invariant guards —
+/// Both reachable arms are `Unsupported`, and the first version of
+/// this test said `Invalid` because it measured only the INSTANTIATED
+/// position. v1's matching refusal comes from
+/// `emit_covergroup_hook_sample_registration`, which runs per `cov :
+/// StepCov` field — a covergroup declared and never instantiated never
+/// reaches it, and v1 emits the whole testbench. TB-IR refuses at
+/// DECLARATION, so the two disagree exactly there:
+///
+/// | | `cov : StepCov` present | covergroup uninstantiated |
+/// |---|---|---|
+/// | v1 | refuses: "must resolve to a `hookable`…" | emits, and g++ compiles it |
+/// | TB-IR | refuses | refuses |
+///
+/// "No backend runs it in ANY configuration" is what `Invalid` claims,
+/// and an uninstantiated covergroup is a configuration. Third time
+/// this rule has been broken on this branch, after `connect` and the
+/// built-in predicates.
+///
+/// The four parser-guarded arms stay `Invalid` as invariant guards —
 /// they cannot emit a false `--codegen v1` suggestion from a position
 /// nothing reaches, and if one ever did fire the program would be
 /// malformed.
@@ -21377,22 +21512,41 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
 
     // The two arms lowering actually reaches.
     for (trigger, want) in [
-        ("step(n)", "must be `<obj>.<method>(args)`"),
-        (
-            "(drv.x + 1).step(n)",
-            "receiver must be a field-access path",
-        ),
+        ("step(n)", "`<name>(args)` without a receiver"),
+        ("(drv.x + 1).step(n)", "hook trigger receiver"),
     ] {
         let src = with(trigger);
-        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
         assert!(msg.contains(want), "{trigger}: {msg}");
 
-        // The half that makes `Invalid` honest: v1 refuses it too.
-        let v1 = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses it too");
+        // Instantiated, v1 refuses it too — which is what the first
+        // version of this test measured, and all it measured.
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses the instantiated form");
         assert!(
             format!("{v1}").contains("must resolve to a `hookable`"),
             "{trigger}: {v1}"
         );
+
+        // UNINSTANTIATED, v1 emits the whole testbench — so the
+        // suggestion is honest and `Invalid` was not. Dropping the
+        // `cov` field and its readers is the whole difference.
+        let uninst: String = src
+            .lines()
+            .filter(|l| !l.contains("cov ") && !l.contains("cov."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !uninst.contains("cov : StepCov"),
+            "{trigger}: the instantiation must actually be gone"
+        );
+        let out = cpp_tb::emit(&merged_src(&uninst))
+            .unwrap_or_else(|e| panic!("{trigger}: v1 emits the uninstantiated form: {e}"));
+        assert!(
+            out.contains("int main("),
+            "{trigger}: v1 emits a whole testbench, not a stub"
+        );
+        // TB-IR still refuses it, which is the gap this records.
+        assert_unsupported(&lower_src(&uninst).unwrap_err());
     }
 
     // The four the PARSER claims first, so lowering never sees them.

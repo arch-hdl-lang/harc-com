@@ -178,12 +178,28 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
         // identifiers, but not that the callee is a field access. So a
         // bare `@(step(n) post)` lands here.
         //
-        // MEASURED: v1 refuses it too, with "covergroup `StepCov` hook
-        // trigger must resolve to a `hookable` on a known component
-        // type". A program error under both backends.
-        return Err(LowerError::Invalid(format!(
-            "covergroup `{group}` hook trigger must be `<obj>.<method>(args)`"
-        )));
+        // v1's matching refusal ("must resolve to a `hookable` on a
+        // known component type") comes from
+        // `emit_covergroup_hook_sample_registration`, which runs at the
+        // INSTANTIATION site — per `cov : StepCov` field or `let cov :
+        // G`. A covergroup that is declared and never instantiated
+        // never reaches it, and v1 emits the whole testbench: measured
+        // on `covergroup_hook_trigger_test` with the `cov` field and
+        // its readers removed, 298 lines out and g++ `-fsyntax-only`
+        // clean. TB-IR refuses at DECLARATION, which is why the two
+        // disagree.
+        //
+        // So this is a subset gap with a working escape hatch, not a
+        // program error. The first version measured only the
+        // instantiated position and called it `Invalid` — the same
+        // mistake made on `connect` and on the built-in predicates: an
+        // arm is only `Invalid` if NO backend runs it in ANY reachable
+        // configuration, and "nothing instantiates it" is one.
+        return Err(unsupported(
+            &format!("covergroup `{group}` hook trigger `<name>(args)` without a receiver"),
+            "write `<obj>.<method>(args)`; v1 only checks the trigger where the covergroup \
+             is instantiated, so an uninstantiated one builds under `--codegen v1`",
+        ));
     };
     let method = name.name.clone();
     let mut path: Vec<String> = Vec::new();
@@ -208,11 +224,15 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
                 // callee that IS a field access, so the arm above lets
                 // it through, and a receiver that is not a path.
                 //
-                // MEASURED: v1 refuses it with the same "must resolve to
-                // a `hookable` on a known component type".
-                return Err(LowerError::Invalid(format!(
-                    "covergroup `{group}` hook trigger receiver must be a field-access path"
-                )));
+                // Same instantiation-site split as the arm above, and
+                // measured the same way: v1's refusal only fires where
+                // the covergroup is instantiated.
+                return Err(unsupported(
+                    &format!("covergroup `{group}` hook trigger receiver"),
+                    "the receiver must be a field-access path (`drv` or `env.drv`); v1 only \
+                     checks the trigger where the covergroup is instantiated, so an \
+                     uninstantiated one builds under `--codegen v1`",
+                ));
             }
         }
     }

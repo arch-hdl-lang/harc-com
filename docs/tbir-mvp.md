@@ -2211,7 +2211,7 @@ case and only locally-determinable `Assign` types are compared).
     | indexing a scalar record field, read or write | the subscript verbatim against a `uint64_t` member |
     | `for x in <scalar record field>` | `for (auto& x : rec.v)` over a `uint64_t` |
     | whole-record write with a non-matching RHS | `o.p = q;` between two unrelated structs |
-    | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines — superseded by divergences 82 and 84, which split all ten arms on measurement |
+    | a queue method outside `push`/`pop`/`size`/`empty` (10 sites) | a call to a method `HarcQueue` never defines — superseded by divergences 82 and 84, which split all ten arms on measurement (the row's original count of 9 was one short) |
     | a `default` on a queue field (2 sites) | `HarcQueue<uint64_t> q = 0;` — no such constructor |
 
     **One site, several outcomes.** Three reclassifications were made
@@ -5317,6 +5317,17 @@ case and only locally-determinable `Assign` types are compared).
     `HarcQueue` grows a `back`, the test fails instead of a working
     call being reported as a program error.
 
+    That enumeration took three tries to become what it claimed. The
+    line-oriented version missed a declaration whose return type sits
+    on its own line (`std::deque<T>` / `drain() {...}`): adding one
+    left the test green while `pend.drain()` was being reported as a
+    program error for a statement v1 compiles and runs. It scans the
+    struct body at brace DEPTH 0 now, which is what actually separates
+    a declaration from the `_d.front()` call inside `pop`'s body —
+    indentation never did. An overload and an inherited member are
+    still invisible to a name-set comparison, and the test says so
+    instead of implying otherwise.
+
     A footnote on that scan, because it repeated the sweep's own lesson
     at miniature scale: the first version asked whether the header
     `contains("front(")` and failed, because `pop`'s body calls
@@ -5404,7 +5415,12 @@ case and only locally-determinable `Assign` types are compared).
 
     So all ten are `Invalid`, and the two halves carry different
     messages because they fail for different reasons: `push` names the
-    mechanism (returns no value), everything else names the API.
+    mechanism (returns no value), everything else names the API — at
+    four of the five expression landings. The testbench-owned one runs
+    its `!args.is_empty()` arity check BEFORE the method match, so
+    `let z = pend.push(3)` is refused for its arguments instead. Same
+    verdict, different message, and the test pins that rather than
+    letting the sentence above be read as covering all five.
 
 85. **`pop` ignored its argument list at all eight branches
     (2026-08-18).**
@@ -5416,8 +5432,16 @@ case and only locally-determinable `Assign` types are compared).
     The `push` branches three lines away have always matched
     `[CallArg::Expr(arg)]` exactly, so this was an asymmetry nothing
     had looked at, in the same functions the queue-method split had
-    just been written into. `Invalid`, and pinned at all five queue
-    flavours in both statement and `let`-RHS position.
+    just been written into. `Invalid`.
+
+    NINE guards across TEN landings — the tenth (`let v = sb.q.pop(7,
+    9)`) is claimed first by the older `as_scoreboard_pop` arity check.
+    The first version said "eight" and pinned only the testbench
+    flavour in both positions: deleting the three `let`-RHS guards left
+    the whole suite green, so three of the nine sites were carrying a
+    fix nothing measured. Counting the branches is not the same as
+    reaching them, which is the same lesson as "N arms is not N
+    measurements" one level down.
 
 86. **The built-in component predicates are a DEFAULT, and TB-IR
     treated them as reserved (2026-08-18).**
@@ -5555,6 +5579,79 @@ case and only locally-determinable `Assign` types are compared).
     The `parse_bound` literal arm is a SEPARATE landing, reached before
     `fold_const` is consulted, so it took its own probe rather than the
     other arm's verdict — same split, independently measured.
+
+89. **`Invalid` on an uninstantiated covergroup, which is the third
+    time this rule has been broken (2026-08-18).**
+
+    The two reachable `lower_hook_call` shape arms — a trigger with no
+    receiver (`@(step(n) post)`) and one whose receiver is not a path
+    (`@((drv.x + 1).step(n) post)`) — were `Invalid` on the strength of
+    v1 refusing them with "covergroup `StepCov` hook trigger must
+    resolve to a `hookable` on a known component type".
+
+    That refusal lives in `emit_covergroup_hook_sample_registration`,
+    which runs at the INSTANTIATION site — once per `cov : StepCov`
+    field or `let cov : G`. A covergroup declared and never
+    instantiated never reaches it. TB-IR refuses at DECLARATION.
+    Measured on `covergroup_hook_trigger_test` with the `cov` field and
+    its readers removed:
+
+    | | `cov : StepCov` present | uninstantiated |
+    |---|---|---|
+    | v1 | refuses | emits 298 lines, g++ `-fsyntax-only` clean |
+    | TB-IR | refuses | refuses |
+
+    `Unsupported` now. The rule is unchanged and was simply not applied:
+    `Invalid` means no backend runs it in ANY reachable configuration,
+    and "nothing instantiates it" is a configuration. Same shape as the
+    `connect` sinks and the built-in predicates before it — three
+    times, in three different files, each time because the probe used
+    the fixture as shipped rather than the fixture with the instance
+    taken out.
+
+90. **The built-in predicates on a TRANSACTOR receiver: twelve
+    landings carrying a false `Invalid` (2026-08-18).**
+
+    Divergence 86 fixed the declared-vs-built-in interaction on the
+    component path and restated, in
+    `is_builtin_component_predicate`'s doc, that the list has to track
+    the resolvers "or a working construct starts being reported as a
+    program error". A working construct was being reported as a program
+    error one file over: `as_transactor_method_call` had no carve-out
+    at all.
+
+    v1 resolves the predicates on a transactor receiver too —
+    `resolve_component_idle_predicate` walks `self.transactors` through
+    `synth_component_from_transactor`, and both backends stamp
+    `_last_in_cycle`/`_last_out_cycle` on transactor state structs.
+    Measured on a `transactor Drv` with a `when active` hookable and a
+    testbench field `d : Drv active`, compiling the whole emitted
+    testbench:
+
+    | source | v1 emits | g++ |
+    |---|---|---|
+    | `assert d.idle(2)` | `if (!(((cycle_count - _tb.d._last_in_cycle) >= 2) && …))` | compiles |
+    | `d.idle(2)` | the same expression, discarded | compiles |
+    | `let v = d.idle(2)` | `auto v = …` | compiles |
+    | `d.nosuch(2)` | `_tb.d.nosuch(2)` | "'struct Drv' has no member named 'nosuch'" |
+
+    Four names × three positions = twelve landings, `Unsupported` now;
+    `nosuch` keeps its `Invalid`, which is what the surrounding arm was
+    written for.
+
+    Not closed, only classified honestly: `Expr::ComponentIdle` takes a
+    `ComponentBase`, which names a component instance and has no
+    transactor-field spelling. The runtime state is already there on
+    both sides, so closing it is a matter of giving the predicate a
+    transactor receiver rather than of adding anything to the emitted
+    struct.
+
+    Also corrected in the same doc: the claim that
+    `user_override_wins` consults this list. It does not — it asks
+    `ComponentSchema::method`, and the resolvers match their names
+    inline, so a fifth predicate has to be added in two places, not
+    one. A maintainer following the old sentence would have added a
+    name here and found it had no override behaviour.
 
 ### The probe method
 

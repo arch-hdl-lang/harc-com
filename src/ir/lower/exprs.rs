@@ -1968,6 +1968,46 @@ impl FuncBuilder<'_> {
         };
         let schema = &self.ctx.transactors[xid.index()];
         if schema.method(&method.name).is_none() {
+            // Same carve-out as the component-shaped siblings in
+            // `as_component_method_call`, and it was missing here — so
+            // twelve landings (4 predicate names x assert / bare
+            // statement / `let`) called a working program invalid.
+            //
+            // v1 resolves the built-in predicates on a TRANSACTOR
+            // receiver too: `resolve_component_idle_predicate` walks
+            // `self.transactors` via `synth_component_from_transactor`,
+            // and the heartbeat stamps are emitted on transactor state
+            // structs by both backends. Measured on `transactor Drv`
+            // with a `when active` hookable, testbench field `d : Drv
+            // active`:
+            //
+            //   assert d.idle(2)  -> `if (!(((cycle_count -
+            //                       _tb.d._last_in_cycle) >= 2) && ...)`
+            //   d.idle(2)         -> the same expression, discarded
+            //   let v = d.idle(2) -> `auto v = ...`
+            //
+            // All three compile (whole emitted testbench, g++
+            // `-fsyntax-only`, exit 0), for all four names. `d.nosuch(2)`
+            // does not — "'struct Drv' has no member named 'nosuch'" —
+            // so the surrounding `Invalid` is right for everything else.
+            //
+            // TB-IR cannot lower it yet because `Expr::ComponentIdle`
+            // takes a `ComponentBase`, which names a component instance
+            // and has no transactor-field spelling. The stamps ARE
+            // emitted on TB-IR's transactor state structs
+            // (`emit_state_struct_body`), so closing this is a matter of
+            // giving the predicate a transactor receiver, not of adding
+            // runtime state.
+            if super::components::is_builtin_component_predicate(&method.name) {
+                return Err(unsupported(
+                    &format!(
+                        "the built-in predicate `{}.{}` on a transactor",
+                        field_name, method.name
+                    ),
+                    "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` on a COMPONENT \
+                     receiver; v1 resolves them on a transactor as well",
+                ));
+            }
             return Err(LowerError::Invalid(format!(
                 "transactor `{}` has no method `{}`",
                 schema.name, method.name

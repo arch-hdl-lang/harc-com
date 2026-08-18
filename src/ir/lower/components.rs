@@ -2213,10 +2213,21 @@ fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
 /// this has to grow with it or a working construct starts being reported
 /// as a program error.
 ///
-/// The list is also what [`super::FuncBuilder::user_override_wins`]
-/// consults, so a name only counts as built-in on a component that has
-/// not declared it.
-fn is_builtin_component_predicate(name: &str) -> bool {
+/// Two callers, and neither of them is `user_override_wins` — an
+/// earlier version of this comment said otherwise, and a maintainer
+/// following it would have added a fifth name here and found it had no
+/// override behaviour. The resolvers match their names inline
+/// (`as_component_idle`'s `"idle" | "idle_in" | "idle_out"`,
+/// `as_component_quiesced`'s `"quiesced"`), so a new predicate has to
+/// be added in BOTH places:
+///
+///   * here, so the "has no method" arms carve it out, and
+///   * in the resolver's own `match`, so it lowers at all.
+///
+/// The callers are `as_component_method_call`'s two error arms (path
+/// form and component-typed-parameter form) and
+/// `as_transactor_method_call`'s.
+pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
     matches!(name, "idle" | "idle_in" | "idle_out" | "quiesced")
 }
 
@@ -3556,8 +3567,10 @@ impl super::FuncBuilder<'_> {
     /// means its own method, and v1 has said so since before TB-IR
     /// existed — both `resolve_component_idle_predicate` and
     /// `resolve_component_quiesced_predicate` return `None` on a
-    /// declared hookable of the same name, naming the shipped
-    /// `buf_mgr_test` fixture as the reason.
+    /// declared hookable of the same name — `resolve_component_idle_predicate`
+    /// naming the shipped `buf_mgr_test` fixture as the reason, and
+    /// `resolve_component_quiesced_predicate` doing it through
+    /// `component_has_hookable`.
     ///
     /// TB-IR had no such guard, and `as_component_idle` runs BEFORE
     /// component-method resolution, so the heartbeat won every time.
