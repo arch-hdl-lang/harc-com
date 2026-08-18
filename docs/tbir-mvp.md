@@ -5517,22 +5517,12 @@ case and only locally-determinable `Assign` types are compared).
       declarations already use — closes that with no new arithmetic,
       and the test asserts byte-equality with the literal spelling
       rather than a shape.
-    * **Widths above 64 clamp.** A coverpoint samples 64 bits, so
-      `.sext<128>()`, `.zext<128>()`, `.resize<128>()` and
-      `as uint<128>` are the identity on any source the model holds —
-      which v1's own output confirms: it emits `(uint64_t)(
-      harc_sext_u128(v, 4, 128))` and `(uint64_t)((_harc_u128)(v))`,
-      both equal to the `<64>` form. `as uint<200>` is the case that
-      settles it: v1 emits `(uint64_t)((harc_rt::HarcWide<7>)(v))`,
-      which g++ REJECTS — "no matching function for call to
-      `harc_rt::HarcWide<7>::HarcWide(__int128 unsigned)`". Refusing
-      that with a `--codegen v1` suggestion would have sent users to a
-      backend that cannot build it either.
-
-    `trunc` keeps refusing, and is the one arm here v1 also refuses: it
-    narrows, so a width above the source width is a wrong-direction
-    cast, and every source in a 64-bit sample model is at most 64 bits
-    wide. `Rejects`, in v1's own words.
+    * ~~**Widths above 64 clamp.**~~ **Retracted the same day — see
+      divergence 91.** The clamp was a value divergence, not an
+      identity, and the entry that argued for it is left here because
+      the argument is the instructive part: "a coverpoint samples 64
+      bits, so widening past it is the identity" is true only of a
+      value that is sampled DIRECTLY.
 
     Sized literals stay a plain subset gap — `[4'd3:0]` is folded
     correctly by v1 to `(uint32_t)(3)`, and TB-IR does not lower sized
@@ -5652,6 +5642,103 @@ case and only locally-determinable `Assign` types are compared).
     inline, so a fifth predicate has to be added in two places, not
     one. A maintainer following the old sentence would have added a
     name here and found it had no override behaviour.
+
+91. **The clamp was a value divergence, and the argument for it was
+    an unexamined "identity" (2026-08-18).**
+
+    Divergence 87 clamped a coverpoint width above 64 down to 64,
+    reasoning that the sample is 64 bits wide so widening past it
+    cannot matter. It matters as soon as the widened value is SLICED
+    before it is sampled:
+
+    ```
+    cover dut.count_out[3:0].sext<128>()[70:65]
+    ```
+
+    | | emitted sampler | at `count_out = 15` |
+    |---|---|---|
+    | v1 | `harc_bits(harc_sext_u128(harc_bits(v,3,0), 4, 128), 70, 65)` | 63 |
+    | TB-IR, clamped | `(((uint64_t)(nibble sign-extended to 64)) >> 65) & 0x3F` | 0 |
+
+    Both backends build. g++ warns "right shift count >= width of
+    type" on the TB-IR side; HARC says nothing. With `[100:70]` the
+    numbers are 2147483647 and 0. Before the clamp the program did not
+    lower at all, and `Unsupported` was accurate — v1 compiles it and
+    samples the right value. The clamp turned a correct
+    "re-run with `--codegen v1`" into a silently wrong sample, which is
+    the single outcome this sweep exists to prevent.
+
+    Two more followed from it, both gone with the revert:
+
+    * `.trunc<W>()` with W > 64 was `Rejects`, and
+      `(dut.count_out as uint<128>).trunc<100>()` is something v1
+      compiles and runs — the clamp had made TB-IR believe the source
+      was 64 bits wide while v1 correctly saw 128. The arm now splits
+      on the source width it is actually given: a truncation naming
+      at least as many bits as its source is `Invalid` (v1's own rule,
+      measured on the 4-bit nibble), and anything else keeps the
+      suggestion. Computing the source width BEFORE the width argument
+      is what makes that check trustworthy.
+    * `(dut.count_out as uint<128>).zext<100>()` LOWERED, because the
+      clamped source width was 64 and so the narrowing-`zext`
+      direction check never fired. v1 calls it a program error in
+      plain words. TB-IR was accepting a program the language rejects.
+
+    What the refusals split on now is where v1 stops working: 65..=128
+    is `Unsupported` (v1 carries a `_harc_u128` and keeps the bits),
+    above 128 is `EmitsUncompilable` (v1 reaches for a
+    `harc_rt::HarcWide<N>` it cannot construct).
+
+    The lesson is narrower than "measure v1", which had been done —
+    every direct-sample form really is byte-identical between the two
+    backends, and the test asserted exactly that. What was missing is
+    that an equality proved for one CONTEXT was used to justify a
+    change that alters the value in every other context. A fold is
+    safe when it preserves the value; a clamp discards information,
+    and information nobody is reading yet is still information.
+
+92. **Three smaller holes the same fold opened (2026-08-18).**
+
+    * **Hook-parameter precedence was guarded in bins only.** A hook
+      parameter beats a file-scope `const` of the same name, and
+      `mentions_hook_param` enforced that for bin specs while the four
+      constant ROLES never consulted `hook_params` at all. With
+      `hookable run_for(cmd, k)` and an unrelated `const k = 7`:
+      v1 emits `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — the argument
+      — and TB-IR emitted a fixed `[7:0]`. Both compile, both run,
+      different bits, no diagnostic. The bare-`k` spelling predates the
+      fold; `k + 0` is one the fold newly reached, so the commit
+      widened the hole in the same breath as documenting the guard.
+      `hook_params` is threaded through all five helpers now and a
+      hook-parameter bound refuses, naming the parameter.
+    * **A negative fold became `u64::MAX`.** `[0 - 1]` folded and TB-IR
+      emitted `dut->lane_id_out[18446744073709551615]` with a clean
+      `verify_program`; before the fold it was not a constant
+      expression and the user got an error. `ConstVal::signed` was
+      threaded through and never read — the bit pattern alone cannot
+      tell -1 from `u64::MAX`. Now it is read, and a negative bound is
+      `Invalid` at every role. (An out-of-range POSITIVE lane index is
+      a different matter: `dut.lane_id_out[9]` on a four-lane port
+      emits identically under both backends, so that hole is shared and
+      pre-existing, and the lane count is not available at this layer.)
+    * **The unfoldable-literal verdict flipped on operand order.**
+      Returning the first pre-order hit meant
+      `[4'd3 + 999…:0]` promised `--codegen v1` while
+      `[999… + 4'd3:0]` refused to, for a program v1 truncates either
+      way. The worse of the two kinds wins now, which is the same
+      worst-thing-under-the-arm rule one level down.
+
+    And two claims that were not what they looked like:
+
+    * The precedence test asserted `const ticks = 99` against a
+      fixture whose hook PARAMETER is `cmd` — `ticks` is a field of
+      the record it carries and never appears as a bare identifier in
+      a bound. It passed under every mutation of the guard, including
+      deleting it. It compares a real hook-parameter bin now.
+    * `walk_expr`'s recursion had no coverage at all: stubbing it to
+      "visit the top node only" left 482 tests green, while
+      `[1 + EOF:0]` silently fell through to the wrong arm and
+      `{k + 0}` lost hook-parameter precedence. Both are pinned.
 
 ### The probe method
 

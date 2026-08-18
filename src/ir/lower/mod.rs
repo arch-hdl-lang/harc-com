@@ -220,7 +220,7 @@ impl ConstVal {
     fn as_i64(self) -> i64 {
         self.bits as i64
     }
-    fn is_negative(self) -> bool {
+    pub(crate) fn is_negative(self) -> bool {
         self.signed && (self.bits as i64) < 0
     }
 }

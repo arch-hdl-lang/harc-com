@@ -14687,6 +14687,36 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     let sized = slice("dut.count_out[4'd3:0]");
     let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
     assert!(msg.contains("sized literal"), "{msg}");
+
+    // NESTED, both kinds. The walk that finds a name or a literal
+    // inside `[K + N:0]` is what makes any of the above work on a
+    // compound bound, and nothing exercised it: stubbing the recursion
+    // out ("visit the top node only") left the whole suite green.
+    let nested = slice("dut.count_out[1 + EOF:0]");
+    let msg = assert_not_implemented(
+        &lower_src(&nested).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("`EOF`"),
+        "a buried name must still be found: {msg}"
+    );
+
+    // …and when a bound holds BOTH kinds of unfoldable literal, the
+    // worse verdict has to win regardless of operand order. Returning
+    // the first pre-order hit made `[4'd3 + 999…:0]` promise
+    // `--codegen v1` while `[999… + 4'd3:0]` refused to, for a program
+    // v1 truncates either way.
+    for t in [
+        "dut.count_out[4'd3 + 99999999999999999999999:0]",
+        "dut.count_out[99999999999999999999999 + 4'd3:0]",
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&slice(t)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("over-wide literal"), "`{t}`: {msg}");
+    }
     // …and the reason that one keeps the suggestion: v1 folds it.
     let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
     assert!(
@@ -14734,82 +14764,103 @@ fn a_constant_expression_coverpoint_bound_folds() {
     );
 }
 
-/// Widening past 64 bits inside a coverpoint is the identity, because
-/// the sample IS 64 bits — so TB-IR clamps instead of refusing.
+/// A width above 64 bits is REFUSED, not clamped — and an earlier
+/// version of this test asserted the clamp, on the argument that "a
+/// coverpoint samples 64 bits, so widening past it is the identity".
 ///
-/// v1 agrees for the shapes it can build: `.sext<128>()` comes out as
-/// `(uint64_t)(harc_sext_u128(v, 4, 128))`, `.zext<128>()` and
-/// `.resize<128>()` as `(uint64_t)((_harc_u128)(v))`, `as uint<128>` as
-/// `(uint64_t)((_harc_u128)(v))` — every one equal to the `<64>` form
-/// for any source this model holds.
+/// That holds only when the widened value is sampled DIRECTLY. Slice
+/// it first and v1 keeps a real 128-bit intermediate while a clamped
+/// TB-IR throws the width away and shifts a `uint64_t` past its own
+/// width:
 ///
-/// It does not agree for `as uint<200>`: v1 emits
-/// `(uint64_t)((harc_rt::HarcWide<7>)(v))`, which g++ rejects — "no
-/// matching function for call to `harc_rt::HarcWide<7>::HarcWide(__int128
-/// unsigned)`". Refusing that with a `--codegen v1` suggestion would
-/// have pointed users at a backend that cannot build it either, which
-/// is the second reason to clamp rather than classify.
+/// ```text
+/// cover dut.count_out[3:0].sext<128>()[70:65]
+///   v1   : harc_bits(harc_sext_u128(harc_bits(v,3,0), 4, 128), 70, 65)
+///   TB-IR: (((uint64_t)(nibble sign-extended to 64)) >> 65) & 0x3F
+/// ```
 ///
-/// `trunc` is the exception and keeps refusing: it NARROWS, so a width
-/// above the source width is a wrong-direction cast, and v1 says so in
-/// its own words.
+/// At `count_out = 15` those are 63 and 0. Both backends build; g++
+/// warns on the TB-IR side and HARC says nothing at all. The clamp
+/// turned an accurate `--codegen v1` suggestion into a silently wrong
+/// sample, which is the one outcome this sweep exists to prevent.
+///
+/// The refusals split where v1 stops working:
+///
+/// | construct | v1 | verdict |
+/// |---|---|---|
+/// | `.sext<128>()`, `as uint<128>` | `_harc_u128`, compiles | `Unsupported` |
+/// | `as uint<200>` | `HarcWide<7>`, g++ rejects the ctor | `EmitsUncompilable` |
 #[test]
-fn a_coverpoint_width_above_64_clamps_because_the_sample_is_64_bits() {
+fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
     let cov = fixture("cov_expr_targets_test.harc");
     const CP: &str = "cover dut.count_out[3:0]\n";
     let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
-    for (wide, narrow) in [
-        (
-            "dut.count_out[3:0].sext<128>()",
-            "dut.count_out[3:0].sext<64>()",
-        ),
-        (
-            "dut.count_out[3:0].zext<128>()",
-            "dut.count_out[3:0].zext<64>()",
-        ),
-        (
-            "dut.count_out[3:0].resize<128>()",
-            "dut.count_out[3:0].resize<64>()",
-        ),
-        (
-            "(dut.count_out as uint<128>)",
-            "(dut.count_out as uint<64>)",
-        ),
-        (
-            "(dut.count_out as uint<200>)",
-            "(dut.count_out as uint<64>)",
-        ),
-        (
-            "(dut.count_out as sint<128>)",
-            "(dut.count_out as sint<64>)",
-        ),
+
+    // The identity claim, falsified: v1's sliced form reads bits the
+    // 64-bit model does not have.
+    let sliced = slice("dut.count_out[3:0].sext<128>()[70:65]");
+    let msg = assert_unsupported(&lower_src(&sliced).unwrap_err());
+    assert!(msg.contains("`.sext<128>()`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&sliced)).expect("v1 emits the 128-bit slice");
+    assert!(
+        v1.contains("harc_sext_u128") && v1.contains("(uint32_t)(70), (uint32_t)(65)"),
+        "v1 slices bits 70:65 of a real 128-bit value: {v1}"
+    );
+
+    // Every widening form refuses, and each names itself.
+    for (t, want) in [
+        ("dut.count_out[3:0].sext<128>()", "`.sext<128>()`"),
+        ("dut.count_out[3:0].zext<128>()", "`.zext<128>()`"),
+        ("dut.count_out[3:0].resize<128>()", "`.resize<128>()`"),
+        ("(dut.count_out as uint<128>)", "cast to 128 bits"),
+        ("(dut.count_out as sint<128>)", "cast to 128 bits"),
+        ("(dut.count_out as uint<65>)", "cast to 65 bits"),
     ] {
-        assert_eq!(
-            emit_cpp_src(&slice(wide)),
-            emit_cpp_src(&slice(narrow)),
-            "`{wide}` must lower exactly like `{narrow}` — the sample is 64 bits"
-        );
+        let msg = assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        assert!(msg.contains(want), "`{t}`: {msg}");
+        // …and the claim behind the suggestion: v1 builds it.
+        cpp_tb::emit(&merged_src(&slice(t)))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 must emit it for the suggestion to hold: {e}"));
     }
 
-    // `trunc` is not in that set, and v1 is why.
+    // `trunc` is the exception: it NARROWS, so whether v1 accepts it
+    // depends on the source width rather than on 64. On the 4-bit
+    // nibble it is a wrong-direction cast and both backends refuse —
+    // `Invalid`, not a gap, and not the blanket `Rejects` an earlier
+    // version gave every `trunc` above 64 on the strength of this one
+    // input.
     let t = slice("dut.count_out[3:0].trunc<128>()");
-    let msg = assert_not_implemented(&lower_src(&t).unwrap_err(), lower::V1Status::Rejects);
-    assert!(msg.contains("`.trunc<128>()`"), "{msg}");
-    let e = cpp_tb::emit(&merged_src(&t)).expect_err("v1 refuses a widening trunc");
+    let msg = assert_invalid(&lower_src(&t).unwrap_err());
+    assert!(msg.contains("FEWER bits than its source"), "{msg}");
+    let e = cpp_tb::emit(&merged_src(&t)).expect_err("v1 refuses it too");
     assert!(
         e.to_string()
             .contains("width must be strictly less than the source width"),
-        "v1's own refusal is what makes this `Rejects`: {e}"
+        "v1's own rule is what makes it a program error: {e}"
     );
 
-    // And the one v1 cannot build, which is emitted rather than refused
-    // — so the clamp is a fix, not a workaround for a TB-IR limitation.
-    let wide = cpp_tb::emit(&merged_src(&slice("(dut.count_out as uint<200>)")))
-        .expect("v1 emits the 200-bit cast");
-    assert!(
-        wide.contains("HarcWide<7>"),
-        "v1 reaches for a type it cannot construct here: {wide}"
+    // Above 128 v1 stops working, so the suggestion goes away.
+    let wide = slice("(dut.count_out as uint<200>)");
+    let msg = assert_not_implemented(
+        &lower_src(&wide).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
     );
+    assert!(msg.contains("cast to 200 bits"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it, badly");
+    assert!(
+        v1.contains("HarcWide<7>"),
+        "v1 reaches for a type it cannot construct here: {v1}"
+    );
+
+    // Widths AT or below 64 are untouched — the refusal is not a
+    // blanket one.
+    for t in [
+        "dut.count_out[3:0].sext<64>()",
+        "dut.count_out[3:0].zext<8>()",
+        "(dut.count_out as uint<64>)",
+    ] {
+        emit_cpp_src(&slice(t));
+    }
 }
 
 /// A file-scope `const` as a coverpoint slice bound. v1 emits one as
@@ -15543,14 +15594,53 @@ fn a_constant_expression_bin_spec_folds() {
         );
     }
 
-    // Precedence: a hook param of the same name still wins over a const.
-    let hooked = crate::fixture("covergroup_hook_param_test.harc");
-    let with_const = format!("const ticks = 99\n\n{hooked}");
-    assert_eq!(
-        emit_cpp_src(&with_const),
-        emit_cpp_src(&hooked),
-        "an unrelated `const` must not capture a hook-parameter name"
+    // Precedence: a hook param of the same name still wins over a
+    // const. The first version of this asserted on `const ticks = 99`
+    // against `covergroup_hook_param_test`, whose hook parameter is
+    // `cmd` — `ticks` is a FIELD of the record it carries and never
+    // appears as a bare identifier in a bound. That assertion passed
+    // for every mutation of the guard, including deleting it: it was
+    // comparing two programs neither of which exercised precedence.
+    //
+    // A real one needs the hook parameter itself in a BIN, which means
+    // giving the hookable a scalar parameter to sample.
+    let hooked = crate::fixture("covergroup_hook_param_test.harc")
+        .replacen(
+            "        hookable run_for(cmd: RunCmd)",
+            "        hookable run_for(cmd: RunCmd, k: uint<8>)",
+            1,
+        )
+        .replacen(
+            "covergroup RunCmdCov @(drv.run_for(cmd) post)",
+            "covergroup RunCmdCov @(drv.run_for(cmd, k) post)",
+            1,
+        )
+        .replacen(
+            "            drv.run_for(cmd)",
+            "            drv.run_for(cmd, 3)",
+            1,
+        );
+    assert!(
+        hooked.contains("cmd: RunCmd, k: uint<8>") && hooked.contains("run_for(cmd, 3)"),
+        "the scalar hook parameter must actually be added"
     );
+    for (spec, want) in [("k", "_v == k)"), ("k + 0", "_v == (k + 0))")] {
+        let bin = hooked.replacen("one  = {1}", &format!("one  = {{{spec}}}"), 1);
+        assert_ne!(bin, hooked, "`{spec}`: the bin must actually change");
+        let plain = emit_cpp_src(&bin);
+        assert!(
+            plain.contains(want),
+            "`{spec}`: the bin must compare against the hook ARGUMENT (`{want}`)"
+        );
+        // …and an unrelated `const k` must not capture it. This is the
+        // assertion that actually bites: with the guard removed the
+        // bin folds to `_v == 99` and the outputs stop matching.
+        assert_eq!(
+            emit_cpp_src(&format!("const k = 99\n\n{bin}")),
+            plain,
+            "`{spec}`: a file-scope `const k` must not turn the hook parameter into 99"
+        );
+    }
 }
 
 /// A record-typed hook parameter is rejected in a bin the same way it
