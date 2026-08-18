@@ -2211,7 +2211,7 @@ case and only locally-determinable `Assign` types are compared).
     | indexing a scalar record field, read or write | the subscript verbatim against a `uint64_t` member |
     | `for x in <scalar record field>` | `for (auto& x : rec.v)` over a `uint64_t` |
     | whole-record write with a non-matching RHS | `o.p = q;` between two unrelated structs |
-    | a queue method outside `push`/`pop`/`size`/`empty` (9 sites) | a call to a method `HarcQueue` never defines |
+    | a queue method outside `push`/`pop`/`size`/`empty` (10 sites) | a call to a method `HarcQueue` never defines — superseded by divergences 82 and 84, which split all ten arms on measurement (the row's original count of 9 was one short) |
     | a `default` on a queue field (2 sites) | `HarcQueue<uint64_t> q = 0;` — no such constructor |
 
     **One site, several outcomes.** Three reclassifications were made
@@ -3411,7 +3411,10 @@ case and only locally-determinable `Assign` types are compared).
     rather than by file turns up NINE existing sites across four files —
     three in `components.rs` and six that were invisible from inside it.
     Every one carried at least one wrong verdict, and four were
-    mixed-verdict and had to be split, leaving fifteen arms:
+    mixed-verdict and had to be split. The table below is the current
+    state, not the state at the batch that wrote it: later batches have
+    split rows and re-measured verdicts in place, so the row count no
+    longer matches any one batch's arm count.
 
     | site (→ arms after splitting) | v1 | was | now |
     |---|---|---|---|
@@ -3422,15 +3425,22 @@ case and only locally-determinable `Assign` types are compared).
     | test-scope `phase post_eval` pre-check (`mod.rs`) | rejects | `Unsupported` | `Rejects` |
     | statement position (`stmts.rs`) → `phase post_eval` | rejects | `Unsupported` | `Rejects` |
     | …→ non-path trigger | rejects | `Unsupported` | `Rejects` |
-    | …→ method path | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | …→ method path that RESOLVES to a hookable | **implements it** | `Unsupported` | `Unsupported` (kept) |
+    | …→ method path that does not resolve | rejects | `Unsupported` | `Rejects` (entry 69) |
     | test-scope target resolution (`mod.rs`) → non-path trigger | rejects | `Unsupported` | `Rejects` |
     | …→ nested component path | **implements it** | `Unsupported` | `Unsupported` (kept) |
     | test-scope non-transactor field (`mod.rs`) → hookable found | **implements it** | `Invalid` | `Unsupported` |
     | …→ no hookable | rejects | `Invalid` | `Invalid` (kept) |
     | …→ bare field, no method | rejects | `Invalid` | `Invalid` (message fixed) |
     | scoreboard body (`scoreboards.rs`) → hooked `on` | drops the hook | `Unsupported` | `SilentlyMisLowers` |
-    | …→ unhooked `on` | mixed, not by syntax — see below | `Unsupported` | `Unsupported` (kept) |
-    | …→ `connect` | **unprobed** | `Unsupported` | `Unsupported` (kept) |
+    | …→ unhooked `on` | drops it in a transactor container | `Unsupported` | `SilentlyMisLowers` (entry 70) |
+    | …→ `connect` | drops it in a transactor container | `Unsupported` | `SilentlyMisLowers` (entry 70) |
+
+    The "now" column is kept CURRENT, not frozen at the batch that
+    wrote the table — three rows above carry a later entry number
+    because a later batch re-measured them. A ledger whose only job is
+    to be the one consolidated view is worth less than nothing when it
+    disagrees with the code.
 
     Two of these are worth reading closely.
 
@@ -3966,17 +3976,18 @@ case and only locally-determinable `Assign` types are compared).
     a working fixture. `axi_agent` is rejected by both backends anyway,
     for an unrelated covergroup reason — an earlier draft of this entry
     said "v1 lowers both", which was false and would have counted a
-    rejected fixture as evidence. Three of the four that do surface are program errors under
-    any backend — a relation that does not exist, one called with the
-    wrong arity, and one that expands into itself — so they are `Invalid`
-    and name no escape hatch.
+    rejected fixture as evidence. Four of the five that do surface are
+    program errors under any backend — a relation that does not exist,
+    one called with the wrong arity, one that expands into itself, and
+    (since divergence 72) one whose expansion is finite but past the
+    shared size limit — so they are `Invalid` and name no escape hatch.
 
-    The FOURTH is not. A misplaced argument name is accepted by v1, which
+    The ODD ONE OUT is not. A misplaced argument name is accepted by v1, which
     emits working C++ with the values swapped, so `Invalid`'s "program
     error under every backend" is literally false for it. It carries
     `SilentlyMisLowers` instead — the sweep's ordinary shape, and the
-    verdict that keeps the diagnostic from naming v1 as a way out. Three
-    siblings sharing one code path is not a reason to share one verdict.
+    verdict that keeps the diagnostic from naming v1 as a way out.
+    Siblings sharing one code path is not a reason to share one verdict.
 
     v1's behaviour, measured for each: it rejects the first two
     ("constraint function call not supported in v0 solver path") and on
@@ -4227,6 +4238,16 @@ case and only locally-determinable `Assign` types are compared).
     test would be measuring the other component. That blowup is
     pre-existing — it reproduces on a clean `origin/main` worktree — and
     budgeting that expander is a separate change.
+
+    **Closed in divergence 72.** That separate change was made, and the
+    reasoning above turned out to be the wrong conclusion from a right
+    observation: both expanders run on every `harc sim`, so leaving one
+    unbudgeted left the pair unbudgeted. The limits are shared now and
+    both backstops ARE pinned, at the same boundary in both backends.
+    The "corpus's deepest real nest is 3" line above stands; the
+    "passes at 96 and fails at 88" figure quoted with it does not
+    reproduce — see the constant's own doc in `ast.rs` for the
+    re-measurement.
 
     The regression test steps over the boundary divergence 59 documented:
     it calls `cpp_tb::emit` on five shapes: self-recursive, mutually
@@ -4629,6 +4650,1503 @@ case and only locally-determinable `Assign` types are compared).
     widening the shared helper would change what its other callers
     resolve.
 
+70. **The container, not the syntax, decides what v1 does with a
+    scoreboard's `connect`/`on` (2026-08-17).**
+
+    `lower_scoreboard` answers every `connect` and every unhooked `on`
+    in a data-only scoreboard body with one verdict. That verdict was
+    `Unsupported` — "re-run with `--codegen v1`" — and a previous batch
+    tried to split it syntactically, on `is_v1_method_hook_shape`. The
+    split got its rows backwards and was reverted: `on dut.en` is a
+    two-segment PATH that v1 compiles, and `on w.seen > 0` is an
+    EXPRESSION that v1 does not.
+
+    Re-measured, and the reason no shape predicate can work here is
+    that the discriminator is the CONTAINER the scoreboard is
+    instantiated in, which a declaration-lowering seam cannot see. The
+    same `scoreboard Board` type can be a transactor field or a
+    testbench field:
+
+    | container | input | v1 |
+    |---|---|---|
+    | transactor field | `connect` / `on` | **silently drops the wiring** |
+    | testbench field | `connect` | emits uncompilable C++ |
+    | testbench field | `on w.seen > 0` | emits uncompilable C++ |
+    | testbench field | `on hits > 0` | emits a working checker |
+    | testbench field | `on dut.rst` | emits a working checker |
+
+    The transactor-field row is byte-measured, and on a program built
+    to isolate it — a `Board` held by `transactor Sender` — the output
+    with `on` wiring and with `connect` wiring is byte-identical to the
+    same program whose scoreboard body is empty, with no residue at
+    all. Nothing in the output observes the event. A scoreboard that
+    should catch a mismatch sees no traffic and the test passes green.
+    This is the row the whole status rests on, and it is now pinned by
+    `a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1`,
+    anti-vacuity anchor included.
+
+    The testbench-field `connect` row is compiler-measured: v1 emits
+    `_tb.b.hits.push_back(...)`, and g++ says "request for member
+    'push_back' in '_tb.Tb::b.Board::hits', which is of non-class type
+    **'uint64_t'**".
+
+    That type is worth its own line, because the first version of this
+    entry said `uint32_t` — read off the `hits : uint<32>` in the HARC
+    source rather than off the compiler, in the very paragraph claiming
+    the opposite. `cpp_uint_for_width` widens every scalar ≤ 64 bits to
+    `uint64_t`, so v1 cannot emit `uint32_t` for any scoreboard scalar;
+    `scoreboards.rs`'s own module header says as much. The verdict for
+    the row was unaffected, the evidence for it was fabricated, and
+    "compiler-measured" is exactly the phrase that has to be earned.
+
+    So `--codegen v1` genuinely IS a way to run a testbench-field `on`,
+    and this seam does not offer it. It lowers a declaration and is not
+    given the container — though the caller COULD supply one:
+    `lower_program` already builds `env_held_type_names` and threads it
+    into `transactor_is_component` for the same kind of question. "Does
+    not", then, rather than "cannot".
+
+    An arm's status is the worst thing v1 does anywhere under it, and a
+    silent drop is the worst of the three, so the whole arm is now
+    `SilentlyMisLowers` — strictly better than the old `Unsupported`
+    for the rows where v1 is no escape hatch, worse than necessary for
+    the two where it is (`on hits > 0` and `on dut.rst`, both in a
+    testbench container).
+
+    Splitting on the container alone would not recover that row. A
+    container-split testbench arm still spans `connect` and
+    `on w.seen > 0`, both uncompilable, so worst-under-arm lands it on
+    `EmitsUncompilable` — not `Unsupported`. Getting the suggestion
+    back where it belongs needs the container AND the per-trigger scope
+    analysis this arm has wanted since the reverted syntactic split:
+    both, not either.
+
+71. **Three arms named a construct no program reaching them can
+    contain (2026-08-17).**
+
+    The `on`-handler arms on the two bound-to transactor paths —
+    `lower_bound_target_transactor`, plus the always-on and `when
+    active` loops of `lower_bound_initiator_transactor` — all reported
+    "event-driven transactors await the event slice".
+
+    No program that reaches them is event-driven. The routing gate is
+    `components::transactor_is_component`, which for a `bound to`
+    transactor returns `has_on_handler`, and that flag is set by
+    NON-periodic handlers alone. An event subscriber, a
+    `bus.<ch>.handshake` monitor and a cycle-trigger therefore all go to
+    the composite table; `on <N> cycles` is the only shape that falls
+    through. A user who lands here wrote a periodic handler and was told
+    to wait for a slice that will never cover it.
+
+    The arms are load-bearing, not decorative: stub any one of them to
+    `=> {}` and TB-IR lowers the program with the periodic handler
+    simply absent from the IR. (Two of the three do that outright; the
+    initiator always-on position needs an `active` binding to show it,
+    because the initiator BFM form refuses a `passive` one before the
+    arm is reached. The first version of this entry claimed the plain
+    silent drop at all three and was measured only at two.)
+
+    The VERDICT, though, was wrong — `Unsupported`, kept from the old
+    code and asserted on one probe. `<N>` is any integer expression
+    (spec §7.10), and v1 registers the closure near the top of the run
+    function, so whether its output compiles depends on where the
+    period expression's names are emitted:
+
+    | period | v1 emits | compiles |
+    |---|---|---|
+    | `5`, `2 + 3` | `(int64_t)(5)`, `(int64_t)(2 + 3)` | yes |
+    | `NPER`, a file-scope `const` | `(int64_t)(NPER)`, declared at namespace scope ~80 lines earlier | yes |
+    | `read_count`, a state field | `(int64_t)(target.read_count)`, instance declared 3 lines earlier | yes |
+    | `limit`, a `let` declared AFTER the transactor's binding | `(int64_t)(limit)`, declared **64 lines later** | **no** |
+    | the same `let`, moved between the BUS binding and that one | same, declared before the registration | yes, and correct |
+    | `limit`, with a file-scope `const limit = 7` as well | same, and it RESOLVES — to the const | yes, **and runs at the wrong rate** |
+
+    The fourth row is compiler-measured, not read off the text: g++ on
+    the spliced closure says "'limit' was not declared in this scope".
+    It reaches the arm because the name resolver does not visit a
+    bound-to transactor's `on` trigger at all — `on some_undefined_name
+    cycles` also passes `harc check`.
+
+    The fifth row is that same program with the `let` moved one line
+    up, above the transactor's binding, and it compiles and runs
+    correctly (built and run: 4 firings in 21 cycles at period 5). So
+    `--codegen v1` is a real escape hatch there, and the discriminator
+    is the `let`'s POSITION relative to the binding — not "an
+    impl-scope `let`" as a category, which is what the first version of
+    this entry and the user-facing detail both asserted. An arm whose
+    input space is an expression does not get to be described by the
+    category of one probe.
+
+    The sixth is the one that sets the status, and it was BUILT AND
+    RUN, not just compiled: with `const limit = 7` at file scope and
+    `let limit = 5` in the impl, the closure resolves to the
+    `constexpr` at namespace scope while the rest of the run body sees
+    the `let` that shadows it. The handler fires twice in 21 cycles
+    instead of four. It runs at a rate the program never asks for, and
+    nothing says so.
+
+    That is the same silent const-capture the transactor-parameter arm
+    at the top of the same file already reports, and it means the
+    discriminator is once more name resolution in the emitted C++
+    rather than the shape of the trigger — exactly as on the scoreboard
+    wiring arm, with no predicate over the trigger to split on.
+    Worst-under-arm makes all three `SilentlyMisLowers`. The literal
+    case pays for that by losing a suggestion it would have deserved.
+
+    A first pass at this entry stopped at the fourth row and labelled
+    the arms `EmitsUncompilable`. The sixth row was found by asking the
+    next question rather than the obvious one — not "does it compile?"
+    but "is there a program where it compiles and is still wrong?" —
+    and every arm whose input space is an EXPRESSION has that question
+    waiting in it. The fifth row came from the mirror-image question,
+    "is there a program where the category I just named is fine?", and
+    the answer was yes.
+
+    One row needed care in the other direction. A `when active`
+    periodic handler on a `passive` instance produces v1 output
+    byte-identical to the same program with the handler deleted — which
+    reads like a silent drop and is not: it is v1 obeying `when
+    active`. The first version of the test asserted emission on the
+    fixture's own `passive` binding and failed for exactly that reason.
+    Both halves are pinned now.
+
+    Two general shapes, both of which have bitten this sweep before:
+    the arms in a file do not tell you what reaches the file — only the
+    gate does; and one probe of one shape does not measure an arm whose
+    input space is an expression.
+
+72. **Bounding one of two expanders bounds nothing (2026-08-17).**
+
+    An earlier batch gave v1's relation expander a node budget and a
+    depth backstop, and closed the entry noting that the same shape was
+    "bottlenecked in `typed_lower`'s own un-budgeted expander long
+    before v1's backstop is reached, so a test here would be measuring
+    something else". Both halves of that sentence were true. The
+    conclusion drawn from them was wrong: it treated the second
+    expander as someone else's problem, when it is the same programs
+    running through it on the same command.
+
+    There are TWO expanders that inline `relation` bodies —
+    `codegen::cpp_tb::expand_relation_calls` and
+    `constraints::typed_lower::expand_top_level_relation_call` — and
+    BOTH run on every `harc sim`, whatever `--codegen` says. Measured
+    on a chain of distinct relations each calling the previous one
+    twice (nothing cyclic, so neither name stack fires):
+
+    | links | v1 | tbir |
+    |---|---|---|
+    | 16 | 2.5s | 7.3s |
+    | 18 | 12.1s | 33.5s |
+    | 20 | did not finish in 60s | did not finish in 60s |
+
+    Instrumenting both expanders with call counters settles which one:
+    at 16 links v1's is capped at ~4096 calls by its budget, while
+    `typed_lower`'s runs 2^16 and climbing. The v1 column is slow for
+    the same reason the tbir column is — `typed_lower` is on the path
+    under both.
+
+    That measurement also corrects a reading taken minutes earlier from
+    a modulo-100000 counter, which showed "2 calls" under `--codegen
+    v1` and looked like proof the typed path was tbir-only. A counter
+    that prints every 100000th call cannot distinguish 2 from 65536.
+
+    The fix is one budget, not two: both limits and the node counter
+    that charges them moved to `ast.rs`, the module both expanders
+    already depend on, and `typed_lower` now charges the same constants
+    v1 does. They are a property of how large an expansion the compiler
+    accepts, not of either emitter.
+
+    With that, the boundary is symmetric and measured: a 9-link
+    doubling chain expands in both backends, a 10-link one is refused
+    by both; a 63-link linear chain expands in both, a 64-link one is
+    refused by both. A 24-link chain that never finished now answers in
+    37ms. `typed_lower` gets a `RelationExpansionTooLarge` variant that
+    surfaces as `Invalid` — v1 stops at the same point and its
+    translator then says "constraint function call not supported in v0
+    solver path", so neither backend runs these and naming one as the
+    way out would be false.
+
+    One thing the new arm must not do is what the old code did on the
+    way to its error: return an empty clause list and let the program
+    lower with the constraint silently gone. It records the error, and
+    `is_relation_error` includes it, so the walk stops.
+
+73. **One of three `emit` branches checked the payload arity
+    (2026-08-17).**
+
+    `emit <ev>(...)` lowers through three branches in `components.rs`:
+    the test-scope `let e : event<T>` local, the dotted path
+    (`emit tagger.in_ev(v)`), and the self-relative form
+    (`emit observed(v)` inside a method body). Only the first checked
+    that an event payload is exactly one argument. The other two took
+    whatever they were given, and the asymmetry showed up incidentally
+    while probing something else — the same source shape refused as a
+    local and accepted as a path.
+
+    Measured on both backends at both unchecked sites:
+
+    | arity | tbir | v1 |
+    |---|---|---|
+    | over — `(v, 2)` | `_s(v, 2)` — uncompilable | `_s(v)` — **silently drops the extra payload** |
+    | under — `()` | `_s()` — uncompilable | `_s()` — uncompilable |
+
+    The uncompilable cells are compiler-measured against the emitted
+    channel type: g++ on `_s(v, 2)` against
+    `std::function<void(uint64_t)>` says "no match for call to
+    '(std::function<void(long unsigned int)>) (int, int)'".
+
+    No backend runs any of the four cells as written, so `Invalid` —
+    the same verdict the local-event branch has given all along, now
+    given by all three. The worst cell is v1's silent drop, which is
+    what makes this worth more than a tidier diagnostic: `emit
+    tagger.in_ev(i + 1, 2)` ran green under v1 with the second payload
+    thrown away.
+
+    `Invalid` refuses programs outright, so the obvious way to get this
+    wrong is a legal spelling where the arity is NOT one. Two candidates
+    exist and both pass `harc check`: a bare `in_ev : event` with no
+    type argument, and `in_ev : event<uint<8>, uint<8>>` with two. So
+    the rule was checked against v1 rather than read off the spec's
+    `type event<T>` (§3.4 / §7.3; §17.2 is the PSS flow-object section
+    and defines no emit arity),
+    and it holds for a reason stronger than the spec:
+
+      * bare `event` — v1 emits the channel as
+        `std::vector<std::function<void(uint64_t)>>` anyway and
+        registers `on in_ev()`'s handler as a ONE-parameter lambda,
+        then emits `_s()` at the emit site. g++: "no match for call to
+        '(std::function<void(long unsigned int)>) ()'".
+      * `event<A, B>` — same `void(uint64_t)` channel, and the emit
+        drops the second payload silently.
+
+    v1 has exactly one payload slot however the field is spelled, so
+    there is no arity but one to be right about, and neither
+    alternative spelling is an escape hatch.
+
+74. **Six `connect` arms, and two wrong verdicts before the right ones
+    (2026-08-18).**
+
+    `lower_connect_edge` refuses malformed edges at two quite different
+    points, and an earlier batch gave both the same `Unsupported`.
+
+    The ENDPOINT-SHAPE arms — a non-path endpoint, a one-segment path,
+    an unresolvable segment — are genuinely mixed, and that batch
+    measured why: a malformed PATH can still mean something to v1,
+    because a single-segment endpoint resolves against the owner's own
+    hookable and works. Those keep their suggestion.
+
+    The SEMANTIC arms are different, and getting them right took two
+    passes. Measured on an INSTANTIATED env, which is the only place v1
+    looks at the edge:
+
+    | edge | v1 | verdict |
+    |---|---|---|
+    | sink is a plain `function` | `for (auto& _s : sink.plain)` — g++: "'struct Sink' has no member named 'plain'" | `EmitsUncompilable` |
+    | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` | `EmitsUncompilable` |
+    | sink method takes 2 parameters | "connect: hookable sink `sink.two` must take exactly one payload argument, got 2" | `Rejects` |
+    | sink method returns a value | "connect: hookable sink `sink.ret` must return void" | `Rejects` |
+    | payload mismatch, RECORD vs scalar | g++: "no match for call to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'" | `EmitsUncompilable` |
+    | payload mismatch, SIGNEDNESS only | **compiles and runs correctly** | `Unsupported` |
+
+    The payload rows are one arm covering several shapes, because
+    `event_payload_matches_ir_type` compares signedness and record
+    identity only — width is irrelevant to it. The non-signedness side
+    is not just record-vs-scalar either: two DIFFERENT records, and a
+    component-typed sink parameter (`method_schema_ir_type` can produce
+    `IrType::Component`), land there too, and the arm's detail named
+    only the first until review pointed at the others. v1's bridge lambda is
+    GENERIC (`push_back([&](auto _t) { ... })`) and looks type-agnostic;
+    converting it to the source's `std::function<void(uint64_t)>`
+    instantiates it at the wiring line. A record cannot survive that. A
+    sign difference passes straight through as an ordinary implicit
+    conversion: built and run, an `event<uint<8>>` into a `sint<8>` sink
+    gives `count=2 sum=8`, exactly what the program asks for.
+
+    The first pass called all six `Invalid`, on the argument that an
+    uninstantiated env is "v1 not looking, not v1 running the program".
+    Both halves of that are wrong. v1 emits, compiles and RUNS an
+    uninstantiated malformed env to completion, so "a program error
+    under every backend" is false for all six; and it was the same
+    observation the endpoint-shape arms cite for KEEPING their
+    suggestion, so one observation was reaching opposite verdicts in one
+    function. The narrower true difference is that an instantiated
+    malformed PATH can still mean something to v1, while an instantiated
+    bad SINK never does — except the signedness row, which is why it is
+    split out.
+
+    A test in the suite was the counterexample the whole time: the
+    pre-existing `analysis_connect_rejects_non_hookable_and_payload_
+    mismatched_sinks` builds `hookable accept(v: sint<8>)` against a
+    `uint<8>` source, and the first pass changed it from
+    `assert_unsupported` to `assert_invalid` — moving the one row that
+    disproved the verdict under the verdict.
+
+    Separately, one of the two tests over this family had written its
+    conclusion down without measuring it: its doc said the signature
+    checks "keep the suggestion too, for the same reason", and it only
+    ever built the instantiated case. It builds both now. Four of the
+    six arms had no test at all.
+
+75. **The same period expression, a fourth landing (2026-08-18).**
+
+    Divergence 71 measured the non-literal `on <N> cycles` period at
+    three bound-to transactor arms. Grouping by what a construct DOES
+    rather than where it is spelled turned up a fourth: the
+    testbench-scoped periodic handler in `mod.rs`, still `Unsupported`
+    and untested.
+
+    It behaves identically, because v1 emits it through the same
+    machinery — the period expression verbatim into a `_checkers`
+    closure registered near the top of the run function, ahead of the
+    impl's own `let`s:
+
+    | period | v1 |
+    |---|---|
+    | `2` — a literal | fine, and a registered fixture proves it |
+    | `per`, an impl-scope `let` | used at line 161, declared at 175 — does not compile |
+    | `per`, with a file-scope `const per = 7` too | resolves to the const: compiles, runs at 7 |
+
+    The last row was built and RUN: two firings in 21 cycles where the
+    source asks for a period of 2. Same verdict as the other three,
+    `SilentlyMisLowers`, and it now has the test the arm never had.
+
+    Worth noting what found it. Not a probe of this arm — a survey of
+    `mod.rs`'s remaining sites by CONSTRUCT, in which "a
+    testbench-scoped `on <N> cycles` handler with a non-literal period"
+    read as the same sentence as three arms already measured in another
+    file. The measurement then took one probe rather than a batch.
+
+76. **A missing mode annotation and a wrong one are not the same
+    failure (2026-08-18).**
+
+    Two bound-to instance arms — the initiator BFM, which must be
+    `active`, and the target-TLM responder, which must be `passive` —
+    each answered BOTH ways of getting the annotation wrong with one
+    `Unsupported`. v1 answers them very differently:
+
+    | instance | v1 |
+    |---|---|
+    | no annotation at all | refuses: "let helper: transactor instantiation requires a mode annotation (`AxilHelper active` or `AxilHelper passive`)" |
+    | initiator BFM declared `passive` | emits, byte-identical to the `active` program |
+    | target responder declared `active` | emits, byte-identical to the `passive` program |
+
+    A missing annotation is a program error under both backends, so
+    `Invalid` and no suggestion. The WRONG annotation is v1 dropping it:
+    the user asks for a passive instance and gets one that drives the
+    bus, or asks for an active responder and gets a passive one, with
+    nothing said either way. That is `SilentlyMisLowers`.
+
+    "Byte-identical" needs its anti-vacuity check here, because it could
+    just mean v1 has no notion of mode: for a transactor that HAS both
+    halves — `axilite_bound_mon_test`'s `AxilXactor`, an active driver
+    plus an always-on monitor — flipping the instance's mode changes 67
+    lines of v1's output. It is specifically the hookable-only and
+    thread-only shapes whose annotation v1 drops.
+
+    The split is on `mode: None` versus `mode: Some(wrong)` in the AST,
+    which is the exact distinction rather than a proxy for it. That
+    matters because the sweep has twice tried to split an arm on
+    something that merely correlated with the discriminator, and both
+    times the split was backwards.
+
+77. **The same split at the FIELD position, and the half that does not
+    move (2026-08-18).**
+
+    Divergence 76 split missing-annotation from wrong-annotation at two
+    instance (`let`) arms. The field arms have the same two halves, and
+    already had them as separate arms — both `Unsupported`.
+
+    | field | v1 |
+    |---|---|
+    | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
+    | `p : Poker` — no mode, plain transactor | refuses, same message |
+    | `drv : CounterDrv passive`, handler inside `when active` | emits, and correctly OMITS the registration |
+    | `c : Consumer passive`, handler in the ALWAYS-ON body | emits, and correctly KEEPS it — byte-identical to `active` |
+
+    So the two halves part company. A missing annotation is a program
+    error under both backends → `Invalid`. The `passive` one is a legal
+    program v1 runs FAITHFULLY, in both of its shapes: with the handler
+    inside `when active` v1 omits the registration, which is the
+    language's own rule; with the handler in the ALWAYS-ON body v1 keeps
+    it and the output is byte-identical to the `active` program. It
+    keeps its suggestion for exactly that reason.
+
+    The second shape also corrected the arm's DETAIL, which said the
+    handler "only registers on an `active` instance". That is true of
+    the shape it was written from and false of the other one under the
+    same arm — the verdict survived the second measurement, the
+    explanation did not.
+
+    The mode-less arm's own comment has always said the rules "mirror
+    v1". This one does — which is precisely why pointing at v1 was
+    never going to help.
+
+    Two arms alongside these were initially left alone — the
+    DUT-poking-BFM pair — on the grounds that reaching them needs the
+    transactor held by an `env` (they gate on `dut_poking_bfm_names`,
+    the by-value-in-a-component routing) and no probe here built that.
+    Review built it in ten lines: a `when active` hookable transactor
+    with a `dut` field, held by an `env`, plus a mode-less testbench
+    field of the same type. v1 refuses it with the same "has no mode and
+    no parent specifies one" that made the two siblings `Invalid`, so
+    the mode-less half is now `Invalid` too. "Not probed" is a reason to
+    go and probe, not a reason to leave a false suggestion standing.
+
+    The `passive` half of that pair does stay put, for the reason the
+    rest of this entry gives: variants sharing a code path do not share
+    a verdict.
+
+    One probe went wrong in a way worth recording: the first attempt
+    edited the fixture's FIRST `drv : CounterDrv active`, which is an
+    `env` field, and all three variants lowered. An env-held mode-less
+    field never reaches these arms at all. The arm being measured has to
+    be the arm the probe actually hits.
+
+78. **The fifth landing is the one that does not move (2026-08-18).**
+
+    Four arms now carry `SilentlyMisLowers` for a non-literal
+    `on <N> cycles` period. The fifth — a statement-position `on <N>
+    cycles`, in `stmts.rs` — keeps `Unsupported`, and measuring it is
+    what makes the other four's verdict mean anything.
+
+    | landing | v1 registers the closure | `on per cycles` with `let per = 2` |
+    |---|---|---|
+    | three bound-to transactor arms, plus the testbench-scoped one | near the top of the run function, ahead of the impl's `let`s | uncompilable, or silently resolves to a same-named file-scope `const` |
+    | statement position | at the statement, after the `let`s | resolves to 2 |
+
+    Built and run with `const per = 7` present as well — the exact
+    program that makes the other four mis-lower — this one fires 10
+    times in 21 cycles at period 2. Correct, because the `let` shadows
+    the const at the point of use rather than the other way round.
+
+    So the construct is identical at all five sites and the verdict is
+    not, and what separates them is nothing about the construct: it is
+    where v1 happens to emit the registration. Applying the other
+    landings' verdict here by analogy — which the grouping-by-construct
+    rule might have invited — would have been wrong.
+
+    That is the honest form of the rule. Group by what a construct DOES
+    to find the sites; measure each site anyway.
+
+    **And then measure each INPUT.** This entry originally closed there,
+    leaving the fifth arm on `Unsupported`, and that was one question
+    short again. `tb_periodic_literal` answers `None` for a NON-POSITIVE
+    literal as well as for a non-literal, so `on 0 cycles` lands on the
+    same arm — and there v1 emits the handler and its own `period > 0`
+    guard never lets it fire. Built and run: 0 firings in 21 cycles. The
+    program asked for a handler and got a silent no-op.
+
+    Worst-under-arm makes the fifth arm `SilentlyMisLowers` after all —
+    not because the row this entry measured mis-lowers, but because a
+    row it never looked at does. The named-period row remains a genuine
+    escape hatch and the detail says so; splitting on
+    `parse_int_literal_expr(..) == Some(0)` would recover the suggestion
+    for it and is not done here.
+
+    The same `on 0 cycles` input reaches the testbench-scoped arm
+    (divergence 75), where it only confirms an existing
+    `SilentlyMisLowers`. Both arms' CONSTRUCT text said "with a
+    non-literal period", which is false for `0`; both now say
+    "non-literal or non-positive".
+
+79. **Six arms, two measurements (2026-08-18).**
+
+    Naming a component method that does not exist, and using a `void`
+    method's result as a value. Six arms across `stmts.rs` and
+    `components.rs` said `Unsupported` for these, and v1 emits both,
+    verbatim:
+
+    | source | v1 emits | g++ |
+    |---|---|---|
+    | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
+    | `let x = c.noret(3)` | `auto x = Calc_noret(c, 3);` | "deduced type 'void' for 'x' is incomplete" |
+    | `let x : uint<32> = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
+
+    Both are type errors, and unlike the `connect` arms there is no
+    uninstantiated position for a statement in a run body to hide in.
+
+    **But "has no DECLARED method" is a wider set than "does not
+    exist", and the first pass conflated them.** The built-in component
+    predicates — `idle`, `idle_in`, `idle_out`, `quiesced` — are not
+    declared methods, so they land on the same arm. v1 implements all
+    four, and so does TB-IR, one statement position over:
+    `assert c.idle(2)` lowers and emits, while `let q = c.idle(2)` came
+    through this arm and was told the program was invalid. `Invalid` was
+    false about BOTH backends — the same failure undone for `connect` a
+    few entries earlier, from the same reasoning error. Built-ins in a
+    binding position are carved out to `Unsupported`, which is what they
+    were before and should have stayed.
+
+    The rest of the arm is a genuine program error, and `Invalid` —
+    which is what `exprs.rs`'s transactor-shaped sibling has said all
+    along.
+
+    The scoping was wrong too. Mutating each arm says which is which:
+
+      * the resolver's path-form arm in `components.rs` — reached.
+      * the untyped-`let` "returns no value" arm — reached.
+      * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
+        `as_component_method_call` validates the method on every path
+        that returns `Ok(Some(..))`, so a caller holding a resolved
+        method always has one. Neutering any of them fails nothing.
+        (This claim survived review; the next one did not.)
+      * the typed-`let` and assignment "returns no value" arms, and the
+        parameter-form resolver arm — recorded as NOT PROBED, and all
+        three are reachable with a two-line probe. A typed `let` is
+        claimed by the untyped handler only for SCALAR types, and that
+        arm is guarded on a record: `let t : TinyTxn = c.noret(3)` lands
+        on it first try. An assignment is not a `let`, so nothing claims
+        it. The parameter-form arm fires for a COMPONENT-typed
+        parameter — the transactor-method arm blamed for claiming it
+        only handles transactor-typed ones. All three are pinned now,
+        which also means a missing method has TWO landings, not the one
+        this entry originally claimed.
+
+    "Not probed" turned out to mean "I stopped building probes", and
+    writing it into the code made it read as a measured property of the
+    arm.
+
+80. **Two subscription arms, adjacent, opposite verdicts
+    (2026-08-18).**
+
+    `lower_event_subscription` refuses a statement-position `on
+    <event>(...)` two ways within four lines of each other, and both
+    said `Unsupported`.
+
+    | subscription | v1 |
+    |---|---|
+    | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
+    | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
+
+    The first row is a real escape hatch: v1 compiles AND runs it. That
+    was verified with a firing stimulus (`s.fire(3)`, which emits
+    `obs` inside the agent) — the test originally subscribed to
+    `s.obs` and then emitted on `ch`, a channel nobody subscribed to, so
+    the `seen=3` first recorded here came from a hand-built program and
+    not from the source the test names. Conclusion unchanged, evidence
+    corrected, and the test fires the right stimulus now.
+
+    The second is `Invalid` — but NOT because it is an undefined
+    identifier, which is what this entry first claimed. `lookup` failing
+    means the name is not a LOCAL. Measured, all of these land there and
+    every one is declared somewhere: a testbench component field, a
+    testbench scalar field, the clock, the DUT binding, an agent TYPE
+    name, and a component METHOD name. v1 emits `<name>.push_back(...)`
+    for each and g++ refuses all six, so the verdict holds and the
+    message ("names no event channel in scope") is accurate — the
+    REASONING was wrong, in the sentence that claimed to have checked
+    it. All six are pinned now.
+
+    One neighbour claim was not merely wrong but vacuous: the test
+    asserted that a testbench `event` field "is claimed by its own arm",
+    but that source dies at FIELD-DECLARATION lowering, long before the
+    `run` body — so the assertion passed for an unrelated reason and
+    would have passed with the whole subscription arm deleted. It pins
+    the real cause now.
+
+    Worth noting for its own sake: these two arms are four lines apart,
+    handle the same statement, and needed opposite verdicts. Proximity
+    is not evidence.
+
+81. **A shadowed name makes v1 write to the DUT (2026-08-18).**
+
+    Two arms, probed together because both looked like "the target is
+    not a thing you can assign to".
+
+    `release n`, where `n` is a testbench scalar rather than a DUT probe
+    force: v1 refuses too, with "`release` target must be
+    `dut.<probe_name>`". A program error under both backends →
+    `Invalid`.
+
+    The assignment arm looked the same and is not. It spans:
+
+    | source | v1 |
+    |---|---|
+    | `5 = n` | emits `5 = _tb.n;` — g++: "lvalue required as left operand of assignment" |
+    | `hookable poke(dut: uint<8>)` with `dut.en = 1` in the body | emits `harc_rt::harc_assign(self.dut->en, 1)` — **writes to the DUT port** |
+
+    The second row was built and RUN: `dut.en=1`, and the `uint<8>`
+    parameter was never touched. v1 ignores the shadowing entirely and
+    resolves `dut` to the transactor's own DUT handle. The source says
+    the name is a parameter; the program pokes hardware. That is the
+    worst thing under the arm, so `SilentlyMisLowers` — and it is the
+    reason this arm is not `Invalid` alongside its `release` neighbour,
+    since v1 does run that program, just not the one that was written.
+
+    The existing test over this arm carried the opposite claim in its
+    doc — "v1 surfaces the shadowing as a C++ compile error" — asserted,
+    never measured, and false. It now asserts the emitted line instead
+    of describing it.
+
+    Third time in this sweep that asking "what ELSE is under this arm"
+    changed a verdict rather than confirming one.
+
+82. **A queue method in statement position splits on the runtime's own
+    API (2026-08-18).**
+
+    FIVE arms catch a queue method in statement position that is not
+    `push` or `pop` — testbench-owned field, scoreboard queue,
+    component queue, bare target-state field, instance-qualified
+    target-state field. (The first pass said "two", split those two,
+    and left the other three carrying a hand-written
+    `EmitsUncompilable`; see the correction below.) v1 emits the call
+    against `harc_rt::HarcQueue`, whose entire API is `push`, `pop`,
+    `size` and `empty`:
+
+    | statement | g++ |
+    |---|---|
+    | `sb.q.size()` | compiles — the value is discarded, so it is a legal no-op |
+    | `sb.q.empty()` | compiles, same |
+    | `sb.q.clear()` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
+    | `sb.q.front()` | same, no `front` |
+
+    So `size`/`empty` keep the suggestion — v1 genuinely runs those
+    programs — and everything else is a program error no backend runs.
+    The discriminator is the runtime header for every name except four:
+    `try_emit_width_method` claims `trunc`/`zext`/`sext`/`resize` by
+    name before the member-call path, so `sb.q.trunc(2)` comes out as
+    `((uint64_t)(((uint64_t)(_tb.sb.q) & 0x3ULL)));` and not as a
+    `.trunc(2)` call at all. The `Invalid` verdict survives for those
+    four — g++ rejects the cast — but for a different reason than the
+    one first recorded here, which said v1 "passes whatever name is
+    written straight through". It does, except where it does not.
+
+    All five landings were probed independently rather than four
+    inferred from one, and the test enumerates the member declarations
+    in `runtime/harc_queue_rt.h` and compares the whole set — if
+    `HarcQueue` grows a `back`, the test fails instead of a working
+    call being reported as a program error.
+
+    That enumeration took three tries to become what it claimed. The
+    line-oriented version missed a declaration whose return type sits
+    on its own line (`std::deque<T>` / `drain() {...}`): adding one
+    left the test green while `pend.drain()` was being reported as a
+    program error for a statement v1 compiles and runs. It scans the
+    struct body at brace DEPTH 0 now, which is what actually separates
+    a declaration from the `_d.front()` call inside `pop`'s body —
+    indentation never did. An overload and an inherited member are
+    still invisible to a name-set comparison, and the test says so
+    instead of implying otherwise.
+
+    A footnote on that scan, because it repeated the sweep's own lesson
+    at miniature scale: the first version asked whether the header
+    `contains("front(")` and failed, because `pop`'s body calls
+    `_d.front()` — and the second version failed too, because
+    `_d.pop_front()` contains `front(`. A substring test is not a name
+    test, in the same way a shape test is not a resolution test. The
+    third version fixed the boundary but still only spot-checked two
+    ABSENT names, which is a blacklist wearing an API check's clothes:
+    adding `T back() const` to the header left it green. Enumerating
+    the set is what finally made it the check it claimed to be.
+
+    **Correction, same day.** "Two arms" was wrong twice over. There
+    are five, and the three left untouched kept telling users that
+    `--codegen v1` "accepts it but emits C++ that does not compile" for
+    `pend.size()`, `pending.size()` and `model.pending.size()` — all
+    three of which v1 emits as `_tb.pend.size();`,
+    `self.pending.size();` and `_tb.model.pending.size();`, and g++
+    compiles all three. Grouping by construct found the sites; it did
+    not transfer the verdict, and three of the five were shipped with a
+    verdict nothing had measured. All five share the helper now.
+
+83. **Six covergroup hook-trigger arms, two of them reachable
+    (2026-08-18).**
+
+    `lower_hook_call` and `hook_call_arg_names` between them refuse a
+    malformed `covergroup G @(<trigger> post)` six ways, all
+    `Unsupported`. Probing each shape says which arm actually sees it:
+
+    | trigger | who refuses it |
+    |---|---|
+    | `@(drv.step(n) post)` | nobody — the control |
+    | `@((drv).step(n) post)` | nobody — the paren is unwrapped |
+    | `@(step(n) post)` | LOWERING: the callee is not a field access |
+    | `@((drv.x + 1).step(n) post)` | LOWERING: the receiver is not a path |
+    | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
+    | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
+
+    So `validate_cover_hook_trigger` checks the call shape and the
+    argument shape, and nothing checks the callee form — which is
+    exactly what the two functions' own doc comments already said, and
+    the first time in this sweep that a code comment's reachability
+    claim turned out to be right.
+
+    ~~Both reachable arms are `Invalid`~~ — **retracted, see divergence
+    89.** They are `Unsupported`: v1's refusal only fires where the
+    covergroup is INSTANTIATED, and an uninstantiated one builds. The
+    sentence is left standing with this marker because the reasoning
+    that produced it ("v1 refuses each with its own …") is the
+    instructive part — it was true of the only configuration probed. The four
+    parser-guarded arms take the same verdict as invariant guards —
+    an unreachable arm cannot emit a false `--codegen v1` suggestion,
+    and if one ever did fire the program would be malformed.
+
+    The test pins the parser rows too, since "the parser gets there
+    first" is the entire reason those four are annotated rather than
+    measured.
+
+    One thing the test caught about itself: the trigger text
+    `@(drv.step(n) post)` appears in a COMMENT eight lines above the
+    declaration, so a `replacen(.., 1)` edited the comment and left the
+    program lowering cleanly. The CLI probes had used `sed`, which
+    rewrites both lines, so they were right by accident. Anchoring on
+    the whole declaration fixes it — the probe measuring the wrong line,
+    one more time, in miniature.
+
+84. **A queue method in EXPRESSION position is a program error, by two
+    different mechanisms (2026-08-18).**
+
+    Five more arms, siblings of the statement-position five, sit in the
+    `lower_*_queue_query_call` families. `size` and `empty` lower there
+    and `pop` has its own arm, so what reaches the fallback is either
+    `push` — a real `HarcQueue` member that returns void — or a name
+    the runtime never declares. All five said
+    `NotImplemented { v1: EmitsUncompilable }`, which is the right
+    shape for the wrong reason: "HARC does not implement this yet"
+    describes a gap, and `q.front()` is not a gap, it is a call to
+    something that does not exist.
+
+    Measured at all five landings, v1 emits `uint64_t z =
+    <recv>.<name>(...);` every time, and g++ rejects every one:
+
+    | call | g++ |
+    |---|---|
+    | `q.push(3)` | "void value not ignored as it ought to be" |
+    | `q.push()` | "no matching function for call to `HarcQueue<...>::push()`" |
+    | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+    | `q.size()` | compiles — which is why it never reaches this arm |
+
+    So all ten are `Invalid`, and the two halves carry different
+    messages because they fail for different reasons: `push` names the
+    mechanism (returns no value), everything else names the API — at
+    four of the five expression landings. The testbench-owned one runs
+    its `!args.is_empty()` arity check BEFORE the method match, so
+    `let z = pend.push(3)` is refused for its arguments instead. Same
+    verdict, different message, and the test pins that rather than
+    letting the sentence above be read as covering all five.
+
+85. **`pop` ignored its argument list at all nine branches
+    (2026-08-18).**
+
+    Every `pop` branch checked the method NAME and dropped `args` on the
+    floor, so `q.pop(7, 9)` lowered and emitted cleanly under TB-IR
+    while v1 emitted `_tb.pend.pop(7, 9);` — g++: "no matching function
+    for call to `harc_rt::HarcQueue<long unsigned int>::pop(int, int)`".
+    The `push` branches three lines away have always matched
+    `[CallArg::Expr(arg)]` exactly, so this was an asymmetry nothing
+    had looked at, in the same functions the queue-method split had
+    just been written into. `Invalid`.
+
+    NINE guards across TEN landings — the tenth (`let v = sb.q.pop(7,
+    9)`) is claimed first by the older `as_scoreboard_pop` arity check.
+    The first version said "eight" and pinned only the testbench
+    flavour in both positions: deleting the three `let`-RHS guards left
+    the whole suite green, so three of the nine sites were carrying a
+    fix nothing measured. Counting the branches is not the same as
+    reaching them, which is the same lesson as "N arms is not N
+    measurements" one level down.
+
+86. **The built-in component predicates are a DEFAULT, and TB-IR
+    treated them as reserved (2026-08-18).**
+
+    v1's `resolve_component_idle_predicate` and
+    `resolve_component_quiesced_predicate` both return `None` when the
+    receiver's component declares a `hookable` of that name, deferring
+    to the user's method — its comment names the shipped `buf_mgr_test`
+    fixture (a `hookable idle(n)` that holds bus valids low) as the
+    reason. TB-IR's `as_component_idle` had no such guard, and it runs
+    BEFORE component-method resolution, so the heartbeat won every
+    time.
+
+    Measured on an `agent Calc` declaring `hookable idle(n: uint<8>) ->
+    uint<32>` that returns 7, against `assert c.idle(2) == 7`:
+
+    | backend | emitted | outcome |
+    |---|---|---|
+    | v1 | `if (!(Calc_idle(c, 2) == 7))` | the method runs, assertion holds |
+    | TB-IR (before) | `if (!((((cycle_count - c._last_in_cycle) >= 2) && ((cycle_count - c._last_out_cycle) >= 2)) == 7))` | the heartbeat runs, assertion fails |
+
+    Both compile, both run, and they disagree with no diagnostic — the
+    worst shape a divergence takes, which is why this is a fix and not
+    a classification. All four names behave this way (`idle`,
+    `idle_in`, `idle_out`, `quiesced`).
+
+    With the guard, a declared name is an ordinary component-method
+    call and takes that path's pre-existing gap — value-returning
+    component methods do not lower in expression position for ANY name,
+    which the test pins by asserting the refusal is byte-identical to
+    the one an ordinary method gets. That gap is real and separate;
+    what is fixed here is TB-IR quietly answering a different question.
+
+    Found by review, not by the sweep: the previous commit added a note
+    that `is_builtin_component_predicate` "has to grow when
+    `as_component_idle` grows" and never checked the other direction,
+    which is where the live bug was.
+
+87. **One coverpoint-constant helper, four roles, four different v1
+    behaviours (2026-08-18).**
+
+    `cover_const_u64` folded `Vec` lane indices, bit-slice bounds,
+    `.trunc<N>()`-family widths and `as uint<N>` cast widths, and gave
+    all four the same refusal — including the same TEXT, so
+    `.trunc<N>()` came out as a "non-constant index/slice bound". Five
+    call sites, one message, one verdict, and the verdict was wrong for
+    three of them.
+
+    Measured per role by mutating `cov_expr_targets_test` and
+    `packed_vec_lane_test`, and compiling v1's emission against a stub
+    `VTop`:
+
+    | role | v1 on an unresolvable name | verdict |
+    |---|---|---|
+    | `Vec` lane index | `dut->lane_id_out[EOF]` — compiles, indexes at -1 | `SilentlyMisLowers` |
+    | bit-slice bound | `harc_bits(v, (uint32_t)(EOF), 0)` — compiles, slices at 4294967295 | `SilentlyMisLowers` |
+    | width-method width | refuses: "requires a constant integer width" | `Rejects` |
+    | cast width | `(uint64_t)(...)` — compiles, width ignored entirely | `SilentlyMisLowers` |
+
+    `EOF` is what makes the first two `SilentlyMisLowers` rather than
+    `EmitsUncompilable`. Probing with `N` says "'N' was not declared in
+    this scope" and probing with `stderr` says "cast from `FILE*` to
+    `uint32_t` loses precision" — both compiler errors, both the wrong
+    answer, because v1 pastes the HARC identifier into C++ without
+    looking at it. Enumerate the INPUTS, not the shapes: one input that
+    also names a macro turns the whole arm over.
+
+    Two things were implemented rather than classified:
+
+    * **Constant EXPRESSIONS fold.** `[1 + 2:0]` is emitted by v1 as
+      `harc_bits(v, (uint32_t)(1 + 2), 0)` and means exactly `[3:0]`.
+      Routing the helper through `fold_const` — the evaluator `const`
+      declarations already use — closes that with no new arithmetic,
+      and the test asserts byte-equality with the literal spelling
+      rather than a shape.
+    * ~~**Widths above 64 clamp.**~~ **Retracted the same day — see
+      divergence 91.** The clamp was a value divergence, not an
+      identity, and the entry that argued for it is left here because
+      the argument is the instructive part: "a coverpoint samples 64
+      bits, so widening past it is the identity" is true only of a
+      value that is sampled DIRECTLY.
+
+    Sized literals stay a plain subset gap — `[4'd3:0]` is folded
+    correctly by v1 to `(uint32_t)(3)`, and TB-IR does not lower sized
+    literals anywhere yet, so this is one face of a cross-cutting gap
+    rather than something to special-case here.
+
+88. **A bin spec is the same four roles again, and one of its arms was
+    promising an escape hatch that does not exist (2026-08-18).**
+
+    `lower_bin_bound` folded a bare literal and a bare `const` name and
+    sent everything else to the runtime path, with two hand-written
+    `Unsupported` arms in between. Measured by emitting the whole
+    testbench under v1 and diffing against the literal spelling — which
+    is how the comparison line was found rather than guessed; a filter
+    for "the bin's name" matched the counter DECLARATION (`uint64_t
+    zero = 0;`), identical across every case, and would have said
+    nothing at all:
+
+    | spec | v1 emits | outcome |
+    |---|---|---|
+    | `1 - 1` | `_v == 1 - 1` | correct |
+    | `Z` (a `const`) | folded | correct |
+    | `dut.en` | `_v == harc_rt::harc_read(dut->en)` | correct, per-sample |
+    | `N` (undeclared) | `_v == N` | "'N' was not declared in this scope" |
+    | `EOF` | `_v == EOF` | **compiles**; the bin can never match |
+    | `4'd0` | folded to `_v == 0` | correct |
+    | `99999999999999999999999` | verbatim | compiles with a warning, truncates |
+
+    The unresolvable-name arm said `Unsupported` — "re-run with
+    `--codegen v1`" — and v1 cannot build it. The test defending that
+    arm asserted "the escape hatches the message names all work", which
+    was true of the message's ADVICE and said nothing about the
+    suggestion attached to it. `SilentlyMisLowers` now, `EOF` being the
+    input that sets it, exactly as for a slice bound.
+
+    Constant expressions fold here too, so `{1 - 1}` becomes a `Const`
+    bin rather than a per-sample comparison, matching the literal
+    spelling byte for byte. The hook-parameter precedence survives it:
+    a hook param beats a file-scope `const` of the same name, so the
+    fold is skipped whenever one appears anywhere in the bound, and the
+    ~~test pins that by adding an unrelated `const ticks = 99` to a
+    fixture whose hook parameter is named `ticks`~~ — **wrong, see
+    divergence 92.** That fixture's hook PARAMETER is `cmd`; `ticks` is
+    a field of the record it carries and never appears as a bare
+    identifier in a bound, so the assertion passed under every mutation
+    including deleting the guard. It compares a real hook-parameter bin
+    now.
+
+    The `parse_bound` literal arm is a SEPARATE landing, reached before
+    `fold_const` is consulted, so it took its own probe rather than the
+    other arm's verdict — same split, independently measured.
+
+89. **`Invalid` on an uninstantiated covergroup, which is the third
+    time this rule has been broken (2026-08-18).**
+
+    The two reachable `lower_hook_call` shape arms — a trigger with no
+    receiver (`@(step(n) post)`) and one whose receiver is not a path
+    (`@((drv.x + 1).step(n) post)`) — were `Invalid` on the strength of
+    v1 refusing them with "covergroup `StepCov` hook trigger must
+    resolve to a `hookable` on a known component type".
+
+    That refusal lives in `emit_covergroup_hook_sample_registration`,
+    which runs at the INSTANTIATION site — once per `cov : StepCov`
+    field or `let cov : G`. A covergroup declared and never
+    instantiated never reaches it. TB-IR refuses at DECLARATION.
+    Measured on `covergroup_hook_trigger_test` with the `cov` field and
+    its readers removed:
+
+    | | `cov : StepCov` present | uninstantiated |
+    |---|---|---|
+    | v1 | refuses | emits 298 lines, g++ `-fsyntax-only` clean |
+    | TB-IR | refuses | refuses |
+
+    `Unsupported` now. The rule is unchanged and was simply not applied:
+    `Invalid` means no backend runs it in ANY reachable configuration,
+    and "nothing instantiates it" is a configuration. Same shape as the
+    `connect` sinks and the built-in predicates before it — three
+    times, in three different files, each time because the probe used
+    the fixture as shipped rather than the fixture with the instance
+    taken out.
+
+90. **The built-in predicates on a TRANSACTOR receiver: twelve
+    landings carrying a false `Invalid` (2026-08-18).**
+
+    Divergence 86 fixed the declared-vs-built-in interaction on the
+    component path and restated, in
+    `is_builtin_component_predicate`'s doc, that the list has to track
+    the resolvers "or a working construct starts being reported as a
+    program error". A working construct was being reported as a program
+    error one file over: `as_transactor_method_call` had no carve-out
+    at all.
+
+    v1 resolves the predicates on a transactor receiver too —
+    `resolve_component_idle_predicate` walks `self.transactors` through
+    `synth_component_from_transactor`, and both backends stamp
+    `_last_in_cycle`/`_last_out_cycle` on transactor state structs.
+    Measured on a `transactor Drv` with a `when active` hookable and a
+    testbench field `d : Drv active`, compiling the whole emitted
+    testbench:
+
+    | source | v1 emits | g++ |
+    |---|---|---|
+    | `assert d.idle(2)` | `if (!(((cycle_count - _tb.d._last_in_cycle) >= 2) && …))` | compiles |
+    | `d.idle(2)` | the same expression, discarded | compiles |
+    | `let v = d.idle(2)` | `auto v = …` | compiles |
+    | `d.nosuch(2)` | `_tb.d.nosuch(2)` | "'struct Drv' has no member named 'nosuch'" |
+
+    Four names × three positions = twelve landings, `Unsupported` now;
+    `nosuch` keeps its `Invalid`, which is what the surrounding arm was
+    written for.
+
+    Not closed, only classified honestly: `Expr::ComponentIdle` takes a
+    `ComponentBase`, which names a component instance and has no
+    transactor-field spelling. The runtime state is already there on
+    both sides, so closing it is a matter of giving the predicate a
+    transactor receiver rather than of adding anything to the emitted
+    struct.
+
+    Also corrected in the same doc: the claim that
+    `user_override_wins` consults this list. It does not — it asks
+    `ComponentSchema::method`, and the resolvers match their names
+    inline, so a fifth predicate has to be added in two places, not
+    one. A maintainer following the old sentence would have added a
+    name here and found it had no override behaviour.
+
+91. **The clamp was a value divergence, and the argument for it was
+    an unexamined "identity" (2026-08-18).**
+
+    Divergence 87 clamped a coverpoint width above 64 down to 64,
+    reasoning that the sample is 64 bits wide so widening past it
+    cannot matter. It matters as soon as the widened value is SLICED
+    before it is sampled:
+
+    ```
+    cover dut.count_out[3:0].sext<128>()[70:65]
+    ```
+
+    | | emitted sampler | at `count_out = 15` |
+    |---|---|---|
+    | v1 | `harc_bits(harc_sext_u128(harc_bits(v,3,0), 4, 128), 70, 65)` | 63 |
+    | TB-IR, clamped | `(((uint64_t)(nibble sign-extended to 64)) >> 65) & 0x3F` | 0 |
+
+    Both backends build. g++ warns "right shift count >= width of
+    type" on the TB-IR side; HARC says nothing. With `[100:70]` the
+    numbers are 2147483647 and 0. Before the clamp the program did not
+    lower at all, and `Unsupported` was accurate — v1 compiles it and
+    samples the right value. The clamp turned a correct
+    "re-run with `--codegen v1`" into a silently wrong sample, which is
+    the single outcome this sweep exists to prevent.
+
+    Two more followed from it, both gone with the revert:
+
+    * `.trunc<W>()` with W > 64 was `Rejects`, and
+      `(dut.count_out as uint<128>).trunc<100>()` is something v1
+      compiles and runs — the clamp had made TB-IR believe the source
+      was 64 bits wide while v1 correctly saw 128. The arm now splits
+      on the source width it is actually given: a truncation naming
+      at least as many bits as its source is `Invalid` (v1's own rule,
+      measured on the 4-bit nibble), and anything else keeps the
+      suggestion. Computing the source width BEFORE the width argument
+      is what makes that check trustworthy.
+    * `(dut.count_out as uint<128>).zext<100>()` LOWERED, because the
+      clamped source width was 64 and so the narrowing-`zext`
+      direction check never fired. v1 calls it a program error in
+      plain words. TB-IR was accepting a program the language rejects.
+
+    ~~What the refusals split on now is where v1 stops working:
+    65..=128 is `Unsupported`, above 128 is `EmitsUncompilable`~~ —
+    **the 128 split was measured with the wrong compiler flag and is
+    retracted; see divergence 96.** Every width above 64 is
+    `Unsupported`: v1 builds all of them under the `-std=gnu++20` the
+    product uses.
+
+    The lesson is narrower than "measure v1", which had been done —
+    every direct-sample form really is byte-identical between the two
+    backends, and the test asserted exactly that. What was missing is
+    that an equality proved for one CONTEXT was used to justify a
+    change that alters the value in every other context. A fold is
+    safe when it preserves the value; a clamp discards information,
+    and information nobody is reading yet is still information.
+
+92. **Three smaller holes the same fold opened (2026-08-18).**
+
+    * **Hook-parameter precedence was guarded in bins only.** A hook
+      parameter beats a file-scope `const` of the same name, and
+      `mentions_hook_param` enforced that for bin specs while the four
+      constant ROLES never consulted `hook_params` at all. With
+      `hookable run_for(cmd, k)` and an unrelated `const k = 7`:
+      v1 emits `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — the argument
+      — and TB-IR emitted a fixed `[7:0]`. Both compile, both run,
+      different bits, no diagnostic. The bare-`k` spelling predates the
+      fold; `k + 0` is one the fold newly reached, so the commit
+      widened the hole in the same breath as documenting the guard.
+      `hook_params` is threaded through all five helpers now and a
+      hook-parameter bound refuses, naming the parameter.
+    * **A negative fold became `u64::MAX`.** `[0 - 1]` folded and TB-IR
+      emitted `dut->lane_id_out[18446744073709551615]` with a clean
+      `verify_program`; before the fold it was not a constant
+      expression and the user got an error. `ConstVal::signed` was
+      threaded through and never read — the bit pattern alone cannot
+      tell -1 from `u64::MAX`. Now it is read, and a negative bound is
+      `Invalid` at every role. (An out-of-range POSITIVE lane index is
+      a different matter: `dut.lane_id_out[9]` on a four-lane port
+      emits identically under both backends, so that hole is shared and
+      pre-existing, and the lane count is not available at this layer.)
+    * **The unfoldable-literal verdict flipped on operand order.**
+      Returning the first pre-order hit meant
+      `[4'd3 + 999…:0]` promised `--codegen v1` while
+      `[999… + 4'd3:0]` refused to, for a program v1 truncates either
+      way. The worse of the two kinds wins now, which is the same
+      worst-thing-under-the-arm rule one level down.
+
+    And two claims that were not what they looked like:
+
+    * The precedence test asserted `const ticks = 99` against a
+      fixture whose hook PARAMETER is `cmd` — `ticks` is a field of
+      the record it carries and never appears as a bare identifier in
+      a bound. It passed under every mutation of the guard, including
+      deleting it. It compares a real hook-parameter bin now.
+    * `walk_expr`'s recursion had no coverage at all: stubbing it to
+      "visit the top node only" left 482 tests green, while
+      `[1 + EOF:0]` silently fell through to the wrong arm and
+      `{k + 0}` lost hook-parameter precedence. Both are pinned.
+
+93. **Retracting a bad verdict is not the same as reaching a good one
+    (2026-08-18).**
+
+    Divergence 91 retracted the width clamp. Review round three found
+    that the retraction had converted a silent acceptance into a FALSE
+    ESCAPE HATCH rather than into an honest verdict — the same defect
+    class, one step along.
+
+    `067d632` threaded a source width into `cover_width_arg` and then
+    consulted it only inside `if method == "trunc"`. Everything else
+    fell through to `Unsupported`:
+
+    | coverpoint | TB-IR said | v1 |
+    |---|---|---|
+    | `dut.count_out[100:0].zext<70>()` | re-run with `--codegen v1` | error: "width must be ≥ the source width" |
+    | `dut.count_out[100:0].sext<70>()` | same | same |
+    | `(dut.count_out as uint<128>).zext<100>()` | same | same |
+
+    The third row is the exact input the retraction's own commit
+    message names as the bug it was fixing. The direction check lives
+    in `cover_width_arg` now and runs for every width, phrased in v1's
+    own words so a user who re-runs reads the same sentence twice.
+
+    A second, quieter one: `cover_infer_expr_width` passed `None` for
+    the receiver width of a NESTED width method, with a comment saying
+    the receiver "is not yet known at this call". It is —it is the
+    callee's own target. So `[3:0].trunc<128>()` was `Invalid` alone
+    and `Unsupported` the moment anything wrapped it, for the same
+    inner program v1 refuses either way. A slice or a cast wrapper kept
+    the right answer; only the width-method path lost it. Comments that
+    assert an absence are worth checking: this one was wrong and it was
+    load-bearing.
+
+    Making the cast width available to that check needed a policy
+    split. `cover_cast_width` refuses a `>64` width where the cast is
+    LOWERED, which is right — TB-IR cannot model the value — but the
+    direction check needs the same width as a NUMBER, and refusing
+    there hid the more accurate error behind a less accurate one.
+
+94. **Two guards written to answer a review, neither measured
+    (2026-08-18).**
+
+    Third occurrence on this branch, and this time in the commits
+    written to answer the first two:
+
+    * the hook-parameter guard on the four constant roles — the
+      headline of divergence 92 — survived `.filter(|_| false)` with
+      482 tests green;
+    * the negative-fold rejection survived `&& false` likewise.
+
+    The pattern is stable enough to name: a guard added in response to
+    review gets the care that went into finding it and none of the care
+    that goes into pinning it, because the finding feels like the work.
+    Both are pinned now, along with three expression-position queue
+    landings and the transactor built-in carve-out, all of which
+    "measured at all N landings" covered at the CLI and no test covered
+    at all.
+
+    The negative-fold verdict was also wrong, and wrong in a way the
+    document already contained the answer to. `EOF` is `(-1)` on glibc,
+    so `dut.lane_id_out[0 - 1]` and `dut.lane_id_out[EOF]` are the same
+    C++ after preprocessing; v1 emits both and both index at -1. The
+    role table two entries earlier calls the `EOF` form
+    `SilentlyMisLowers` precisely because v1 compiles it. Calling the
+    arithmetic spelling `Invalid` contradicted that at a distance of
+    twenty lines.
+
+    Same for the hook-parameter guard, which returned a flat
+    `Unsupported` before `role` was consulted, bypassing the four-way
+    split built for exactly this question: `cover cmd.ticks.trunc<k>()`
+    is something v1 refuses outright, and `(cmd.ticks as uint<k>)` is
+    one it accepts while dropping the width. Both now take their role's
+    verdict, from a single `ConstRole::v1_on_unfoldable` the refusal
+    paths share, because keeping them in step by hand did not work.
+
+95. **A rule invented instead of looked up, and a leak reopened one
+    arm over (2026-08-18).**
+
+    Round four, on the commit whose subject was round three. Three
+    blocking findings.
+
+    **`resize` is direction-agnostic, and I made it an error.** The
+    direction check moved into `cover_width_arg` with the arm written
+    as `"zext" | "sext" | "resize" => width < sw`. So
+    `dut.count_out[7:0].resize<4>()` became `Invalid` — "a program
+    error under every backend in every reachable configuration" — for a
+    construct both backends had been compiling to identical C++
+    (`((count_out >> 0) & 0xFF) & 0xF` under TB-IR, the same value
+    under v1, g++ clean).
+
+    Three places already said so, and none was read before the rule was
+    written: the spec ("`.resize<N>()` remains direction-agnostic"),
+    v1's own check (`"zext" | "sext" if width < sw`), and TB-IR's
+    general expression lowering, which excludes it for the same reason.
+    The covergroup path is a THIRD implementation of a rule stated
+    twice already; writing it from intuition rather than copying it is
+    what put a method in the set that does not belong there.
+
+    **The `>128` verdict leaked.** `CastWidthPolicy::Report` was
+    introduced so the direction check could see a wide cast's width
+    without the cast refusing first. It also suppressed the `>128`
+    refusal, and `cover_width_arg` had no split at 128 to carry it —
+    so `(dut.count_out as uint<300>).trunc<200>()` came out
+    `Unsupported` where v1 gives "no matching function for call to
+    `harc_rt::HarcWide<10>::HarcWide(__int128 unsigned)`". Exactly the
+    false escape hatch the policy split's own doc-comment describes,
+    reappearing one arm along.
+
+    Fixing it took a second measurement, because the obvious condition
+    was wrong too: `max(width, src_width) > 128` reports
+    `[3:0].zext<200>()` as uncompilable, and it is not — the
+    `harc_wide_*` helpers take a narrow argument and g++ accepts them.
+    The `HarcWide` constructor failure belongs to the CAST, so the
+    condition is the SOURCE width alone.
+
+    **And none of the three claims was pinned.** 485 tests stayed green
+    under a mutation reverting each: the direction check back below the
+    `>64` refusal, the nested receiver width back to `None`, and
+    `Report` back to `Refuse`. Fourth consecutive round of this
+    finding, on the commit whose subject is that finding — the previous
+    entry named the pattern and then repeated it in the same breath.
+
+    Naming it again is clearly not enough, so: the rule now is that a
+    guard and its mutation test are one edit. Not "add the guard, then
+    add a test" — the mutation is how you find out the guard is
+    load-bearing at all, and running it after the fact is what keeps
+    getting skipped.
+
+    Two smaller ones from the same round. The negative-fold test
+    asserted its MESSAGE and not its verdict, so replacing the arm with
+    the `Invalid` the previous entry spends four paragraphs rejecting
+    left it green; it asserts the verdict now, at all three roles
+    rather than one. And `v1_on_unfoldable`'s doc said `None` meant
+    "`--codegen v1` is a real way out", which is true at the
+    hook-parameter site and false at the negative-fold one — the two
+    callers ask different questions and their answers coincide for
+    unrelated reasons, which the comment now records as measured rather
+    than structural.
+
+96. **Four rounds of machinery on one mis-set compiler flag
+    (2026-08-18).**
+
+    Round five enumerated the width/cast space mechanically — four
+    methods × seven receiver widths × eight widths — instead of by
+    example, and the first thing that fell out was that every
+    `EmitsUncompilable` verdict in this file was measured wrongly.
+
+    `harc_rt::HarcWide<N>`'s converting constructor is gated on
+    `std::is_integral_v<T>`. libstdc++ reports that FALSE for
+    `__int128` under `-std=c++20` and TRUE under `-std=gnu++20`, and
+    `src/main.rs` builds the emitted testbench with
+    `CFG_CXXFLAGS_STD=-std=gnu++20`. Every probe here used
+    `-std=c++20`. So `(dut.count_out as uint<300>).trunc<200>()` — the
+    flagship case for the whole `>128` family — compiles fine under the
+    flags the product uses, and the honest verdict is `Unsupported`,
+    which is what the code said before any of this work.
+
+    `tests/wide_cast_cpp.rs` already carried a comment naming the right
+    standard. Same failure as `resize`: a fact written down in the
+    repo, re-derived wrongly from a local experiment. The probe-method
+    section now states the flag, because nothing else in this document
+    did.
+
+    So the fifth commit is subtractive. Gone: the `>128`
+    `EmitsUncompilable` arms in `cover_width_arg` and
+    `cover_cast_width`, the `src_width > 128` condition, and
+    `CastWidthPolicy` — which existed only to keep that verdict
+    reachable, and whose `Report` mode had in the meantime introduced
+    its own regression (a slice-derived source width above 128 was
+    reported as a problem with "the receiver's own cast" on programs
+    containing no cast).
+
+    Three real holes the enumeration found alongside it:
+
+    * **The 1024-bit language limit was missing.** v1 checks it, TB-IR's
+      general expression path checks it, and the spec states it in the
+      same sentence this file quotes for `resize` — "a positive
+      constant integer literal in `1..=1024`". The covergroup copy
+      checked `0` and stopped, so `.zext<2000>()` was told to re-run
+      under a v1 that refuses it.
+    * **The direction check reached spellings v1's never does.** v1
+      infers a receiver width with `eval_const_width` (literal only), as
+      does TB-IR's general path with `const_eval_width`; the covergroup
+      copy inferred through the folding `cover_const_u32`. So
+      `const HI = 100` + `[HI:0].zext<70>()` was `Invalid` while the
+      identical program compiled and ran under v1 — the verdict decided
+      by whether the bound was written with a name. Inference is
+      literal-only now; the bound itself still folds.
+    * **The width argument accepted non-literals.** `.zext<1 + 7>()`
+      lowered while v1 refused it. The spec says literal.
+
+    The pattern across all three: this file is a THIRD implementation
+    of rules that `cpp_tb.rs` and `exprs.rs` already state, and every
+    place it was written from intuition rather than copied is a place
+    it drifted. That is the argument for the covergroup path consulting
+    the same helpers rather than paraphrasing them, which is the next
+    piece of work here and is deliberately not being done in a fifth
+    consecutive fix commit.
+
+    On whether to revert the line of work: measured against v1 across
+    224 cells, the state before it had 72 wrong verdicts and the state
+    after has none. It converged; the residue was one wrong idea and
+    two missing checks, all localized. Reverting would have traded a
+    small, identified residue for a larger diffuse one.
+
+97. **Seven `records.rs` arms — and the first two passes at them were
+    both wrong, in opposite directions (2026-08-18, corrected
+    2026-08-18).**
+
+    ~~Every one said `Unsupported` and six were false escape hatches.~~
+    Struck: two of those six reclassifications were themselves wrong,
+    and the leaf table below was wrong in both directions at once. The
+    corrected reading:
+
+    | construct | v1 does | verdict |
+    |---|---|---|
+    | `when` subtype in a transaction | emits `if (q.op == 1) { … q.addr = _val_addr; }` — the guard is honoured | a real escape hatch |
+    | `when` subtype in a struct | a struct byte-identical to the same struct without the block — the field is gone | `SilentlyMisLowers` |
+    | `keep` in a struct | `_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)))` — it reaches the solver | a real escape hatch |
+    | `default` on a nested-record field | `Inner i = 0;` — "could not convert '0' from 'int' to 'Inner'" | `EmitsUncompilable` |
+    | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same conversion error | `EmitsUncompilable` |
+    | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+    | `default 128'hFF…`, `0xFF…` | folds to a `_harc_u128` composite the 64-bit member truncates (`-Woverflow`) | `SilentlyMisLowers` |
+    | `default 999…` | pasted verbatim; "integer constant is too large for its type", truncates | `SilentlyMisLowers` |
+
+    **Both wrong verdicts were measured on a program that never
+    randomizes the record.** The `when` probe's run body was `wait 1
+    cycle`, so there was no solve site for a guard to appear in; what it
+    read instead — an unconditional `static void randomize_Req(Req*)` —
+    is only ever called from an OUTER record's randomize. The struct
+    `keep` probe checked for a randomize METADATA entry, which a struct
+    does not get, and concluded the constraint never reaches the solver;
+    the solver lambda emits it directly. `tests/fixtures/axi_agent.harc`
+    is a `when` subtype with `keep`s, and spec §714 / §2787 describe
+    when-subtypes as shipped, both of which would have contradicted the
+    verdict before any probe ran.
+
+    The sized-literal split was right about the outcomes and wrong about
+    the line: it tested `lit.contains('\'')`, but the width prefix is
+    not the value. `4'd3` folds to a correct `3` and
+    `128'hFFFFFFFFFFFFFFFFFFFF` folds to a `_harc_u128` composite the
+    64-bit member truncates. The guard now normalizes through
+    `cpp_tb::normalized_int_literal` — the same rewrite v1 folds with —
+    and asks whether the result fits.
+
+    The non-scalar-leaf arm is the one worth the space. It is a single
+    arm serving a dozen shapes that take THREE verdicts:
+
+    | field type | v1 emits | |
+    |---|---|---|
+    | `uint<65>` … `uint<256>` | `_harc_u128` / `harc_rt::HarcWide<n>`, with a matching pack, unpack and draw | real |
+    | `list<uint<8>>`, `list<sint<8>>`, `list<uint<256>>`, `list<bool>` | `std::vector<T>` + resize + per-element draw | real |
+    | `Vec<uint, 4>`, `Vec<uint<128>, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | real |
+    | `list<Vec<uint<8>, 2>>` | `std::vector<std::array<uint64_t, 2>>` and then `[_i] = 0` | **does not compile** |
+    | `list<Inner>`, `list<string>` | `std::vector<uint64_t>`, and randomize writes `// data : list (named, not yet supported)` | silent |
+    | `list<queue<uint<8>>>`, `list<event<T>>`, `list<int>`, `list<Vec<uint<8>, N>>` | `std::vector<uint64_t>` + `[_i] = 0` | silent |
+    | `Vec<queue<uint<8>>, 4>` | `std::array<uint64_t, 4>` — the array survives, the element does not | silent |
+    | `Vec<string, 4>`, `Vec<uint<8>, N>` | `uint64_t data = 0;` — the whole array collapses | silent |
+    | `queue` / `string` / `event` / `object` | a bare scalar | silent |
+
+    Three versions of this arm got it wrong. A single `queue` probe
+    generalised to everything denied `list` its working hatch and broke
+    `the_escape_hatch_phrases_the_parity_gate_greps_are_stable`, whose
+    fixture is a `list<uint<8>>`. Then a hand-written copy of v1's type
+    rules called a 128-bit field a flattening — v1 gives it a correct
+    `_harc_u128` — while calling `list<Inner>` a working hatch, and it
+    was self-contradictory inside one file: the same `uint<128>` counted
+    as modelling when it was a `Vec` element and as flattening when it
+    was the leaf, thirty lines apart. Neither noticed the third outcome
+    at all.
+
+    So the rules are not restated in the lowering any more.
+    `cpp_tb::record_leaf_fate` sits next to `txn_field_c_type` and
+    `emit_field_random` — the two functions that actually choose the
+    member and the draw — recurses through the same `list_elem_type` /
+    `fixed_vec_type_args` helpers, and returns
+    `Models` / `Flattens` / `Uncompilable`. `emit_field_random`'s
+    per-element draw was extracted into `list_elem_random_expr` so both
+    the emitter and the predicate read one copy of it; v1's output over
+    the whole fixture corpus is byte-identical across that refactor (190 fixtures parse; 160 emit).
+
+    The two consumers map the same fate differently, and that difference
+    is measured too: a scoreboard emits no `randomize_*` body, so the
+    leaf whose randomize body is what stops compiling keeps a correct
+    member there. `list<Vec<uint<8>, 2>>` is `EmitsUncompilable` as a
+    transaction field and a working escape hatch as a scoreboard field.
+
+    ~~A zero-width leaf (`uint<0>`, `Vec<uint<0>, 4>`) is `Invalid`~~ —
+    struck, see divergence 107. The panic it rested on is a debug-build
+    artifact; a release build, which is how `harc` ships, emits and runs
+    the program.
+    `Vec<uint<8>, 0>` is a zero-LENGTH array, a different thing, and
+    stays a suggestion v1 honours (`std::array<uint64_t, 0>`).
+
+    An unresolved type name (`data : Unknown`) stays `SilentlyMisLowers`
+    rather than becoming `Invalid`: v1 emits `int64_t data = 0;` and
+    runs it, and `Invalid` on this branch means no backend runs it in
+    any configuration.
+
+98. **Four `helpers.rs` arms, and the routing gate decided which
+    probe even reached them (2026-08-18).**
+
+    | arm | v1 | verdict |
+    |---|---|---|
+    | a DUT/sync-touching helper call in a message | compiles; calls it AT the failure site | `Unsupported` — correct already |
+    | a testbench method call in a message | compiles; same | `Unsupported` — correct already |
+    | a helper param of module type, non-DUT argument | "no match for call to `<lambda(VTop*)>` (Model&)" | `EmitsUncompilable` |
+    | a testbench method param of module type, non-DUT argument | "no match for call to `<lambda(Tb&, VTop*)>` (Tb&, Model&)" | `EmitsUncompilable` |
+
+    The first two are a negative result, and recording them is the
+    point: two of four arms on this branch turning out to be right is
+    only worth anything if the measurement happened.
+
+    Getting to them took three failed probes. A `log(...)` message
+    HOISTS a CFG-inlined call ahead of the statement and lowers fine
+    (#494 P2d), so probing with a `log` measures nothing — the arms
+    fire only for a CONDITIONALLY-evaluated message, an assert's `else
+    fail(...)`, where hoisting would run the inlined body even when the
+    message never fires. The gate is `lower_fmt` vs
+    `lower_fmt_hoisting`, one call level up, and no amount of reading
+    the arm would have shown that. Adding a `wait` to the helper to
+    make it "sync-touching" was the wrong lever twice before the gate
+    was read.
+
+    The module-param pair is the familiar shape: v1 types the emitted
+    lambda on the MODULE (`[&](VTop* d)`) and passes through whatever
+    was written, so the DUT spelling compiles clean and the component
+    spelling does not. Both measured with `-std=gnu++20`, and the
+    testbench-method sibling probed on its own rather than inferred
+    from the helper — they agree, which is a result, not an assumption.
+
+99. **The width rules now have one statement per backend, which is the
+    minimum (2026-08-18).**
+
+    Round five's root-cause finding, acted on rather than patched
+    around: the covergroup path was a THIRD implementation of rules
+    that `cpp_tb.rs` (v1's) and `exprs.rs` (TB-IR's general path)
+    already stated, and it drifted from both on every one of them —
+    `resize` wrongly in the direction set, the 1024-bit language limit
+    missing entirely, the receiver width inferred through a constant
+    fold where v1 uses literals only. Three separate review findings,
+    one cause.
+
+    `exprs::width_method_violation` is now the single TB-IR statement of
+    zero-width, the language limit, and the direction check (with
+    `resize`'s exemption written once, beside the rule it is exempt
+    from). Both the general path and the covergroup path call it; only
+    the diagnostic PREFIX is per-caller, so the sentences stay
+    identical and there is nothing left to drift.
+
+    Two statements remain — one per backend — and that is irreducible:
+    v1 has its own copy because it is a different compiler. What is
+    gone is the third.
+
+    The check that this is real rather than cosmetic is a mutation on
+    the SHARED function: breaking the `trunc` direction rule now turns
+    five tests red and breaking the 1024-bit limit turns three, across
+    both paths. Before, breaking either in one place left the other
+    silently disagreeing — which is precisely how `resize` shipped as
+    `Invalid` for a construct both backends compile. The 352-cell grid
+    stays at 0 disagreements with v1.
+
+100. **Seven `scoreboards.rs` arms, one of them provably dead
+     (2026-08-18).**
+
+     | construct | v1 emits | verdict |
+     |---|---|---|
+     | `bound to` on the scoreboard | output BYTE-IDENTICAL to the unbound one | `SilentlyMisLowers` |
+     | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
+     | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+     | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
+     | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+     | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
+     | a method on the scoreboard | — | UNREACHABLE |
+
+     The `bound to` rows show why "v1 emits" is never the measurement.
+     It emits for both, and diffing against an unbound control is what
+     shows the clause left no trace whatsoever — the binding silently
+     does not happen.
+
+     The method arm is dead code, and provably: `lower_program` routes
+     a scoreboard to the composite-component table when
+     `components::scoreboard_is_component` holds, and that predicate is
+     `any(ComponentItem::Hookable(_))` — the exact condition of the arm.
+     Replacing its body with `unreachable!()` leaves the whole suite
+     green. Its comment described an intent the routing gate had since
+     made moot, which is a thing to look for: an arm whose justification
+     is written in the past tense of a design that moved.
+
+     The field-type arm asks the same flatten question as the record
+     one and now asks it through the SAME predicate —
+     `cpp_tb::record_leaf_fate` — rather than a second copy. The
+     supported SETS differ (a `queue<T>` is a legal scoreboard field and
+     not a legal record leaf) but the rule about what v1 does with the
+     rest does not, and this file has already paid twice for
+     paraphrasing shared rules.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather
@@ -4639,6 +6157,19 @@ first sweep flagged as gaps, five turned out to be v1 emitting code that
 does not compile or silently means something else. Only the ones where
 v1's output is genuinely usable are worth mirroring; the rest want an
 honest `NotImplemented` diagnostic instead.
+
+**Compile with `-std=gnu++20`, which is what `src/main.rs` passes to
+the emitted testbench (`CFG_CXXFLAGS_STD`).** This is not a detail. An
+`EmitsUncompilable` family spanning two divergence entries and four
+commits rested on g++ rejecting
+`harc_rt::HarcWide<N>::HarcWide(__int128 unsigned)` — a rejection that
+exists only under `-std=c++20`, where libstdc++ reports
+`is_integral_v<__int128>` false. Under the flags the product actually
+uses, v1 compiles every one of those programs, and the verdict should
+have been `Unsupported` throughout. `tests/wide_cast_cpp.rs` already
+carried a comment saying which standard to match; the probe did not
+read it. "It does not compile" is a claim about a specific compiler
+invocation, and the invocation has to be the real one.
 
 ## Negative tests: where rejection actually fires
 
@@ -4668,6 +6199,448 @@ whichever out-of-subset construct lowering hits first, and shifts
 deeper as slices land. The per-fixture residual map for the whole
 former `transaction` group lives in
 [tbir-coverage.md](tbir-coverage.md).
+
+101. **Six `on <event>(arg)` arms in `components.rs`, five of them
+     provably dead (2026-08-18).**
+
+     `event_subscription` is the predicate that ROUTES an `on` handler
+     to the subscription path, and it already establishes three facts:
+     the trigger is a `Call`, its callee is a bare identifier, and that
+     identifier names an `event` field — which is FOUR ways to fail,
+     because the last one splits into "no such field" and "a field of
+     another kind". The resolver it routed into re-derived all of them
+     and carried a rejection arm for each, plus one for `h.periodic` —
+     which the item split at the top of the function has already sent to
+     `periodic_asts`.
+
+     All five are unreachable. Replacing each with `unreachable!()`
+     leaves the whole suite green, and each of the five shapes lands on
+     a different diagnostic entirely:
+
+     | trigger | where it lands |
+     |---|---|
+     | `on 3 cycles` | lowers — a periodic handler |
+     | `on clk` | the unresolved-name arm |
+     | `on tagger.in_ev(t)` | "transactor/method call `.in_ev(...)`" |
+     | `on other(t)` (a scalar field) | "helper call `other(...)`" |
+     | `on nosuch(t)` | "helper call `nosuch(...)`" |
+
+     So the resolution moved into the routing predicate, which now
+     returns what it found rather than a bool. This is the same shape of
+     defect as divergence 97's leaf table and divergence 100's dead
+     scoreboard arm: a fact established in one place, restated in
+     another, and the restatement kept for shapes the first place had
+     already excluded.
+
+     The two arms that survive split on measurement, and they had been
+     one arm:
+
+     | trigger | v1 emits | verdict |
+     |---|---|---|
+     | `on in_ev()` | `[&](uint64_t _v) { … }` — a synthesized name for a payload the body cannot reference anyway | a real escape hatch |
+     | `on in_ev(t, u)` | `[&](uint64_t t) { … }` — the extra parameter is dropped without a word | `SilentlyMisLowers` |
+
+     The multi-argument half was first labelled `EmitsUncompilable`, on
+     a body whose `u` had nothing else to resolve to. That is the LESSER
+     of the two things v1 does here. Give `u` something to bind to and
+     v1 compiles clean and runs to a value the source never asked for:
+
+     | the handler's sibling | v1 emits | result |
+     |---|---|---|
+     | a component field `u : uint<8> default 7` | `tagger.seen = tagger.seen + tagger.u;` | 0 errors, runs |
+     | a file-scope `const u = 9` | `tagger.seen = tagger.seen + u;` | 0 errors, runs |
+
+     A body with nothing named `u` in scope does fail to compile, and a
+     body that never names it is byte-identical to the one-argument
+     form. An arm's status is the WORST of what v1 does under it, so it
+     is `SilentlyMisLowers`; `validate_cycle_handler`, a hundred lines
+     above, is the same two-shape arm and had already resolved it that
+     way. Reconstructing the rule instead of copying the neighbour that
+     states it is the same mistake as divergence 97's leaf table.
+
+
+102. **The unbound-transactor item walk was written twice, and none of
+     its arms had been measured (2026-08-18).**
+
+     `lower_transactor`'s always-on walk and its `when active` walk were
+     two copies of the same 120-line match. They differed in exactly one
+     expression — `methods_ast.push((h, false))` versus `(h, true)` —
+     and in comment text. Five of the ten rejections in them were the
+     same rejection written twice, so a change to one position and not
+     the other would have silently diverged by where the user wrote the
+     item.
+
+     They are now one walk over
+     `t.items.chain(t.when_active.iter().flatten())` carrying the flag,
+     which is also what v1's `synth_component_from_transactor` does with
+     `include_active = true`.
+
+     Two of the arms are dead:
+
+     * every `on` handler — subscription, cycle-trigger, or periodic —
+       routes an unbound transactor to the COMPONENT path
+       (`transactor_is_component` returns true for `has_on_handler ||
+       has_periodic_handler`), so it never reaches this walk;
+     * a lifecycle block is refused by the PARSER inside a transactor
+       ("lifecycle blocks are currently supported only inside
+       `test`/`impl` and `testbench`"), so only the `apply` half of the
+       lifecycle/apply arm is live.
+
+     Both confirmed with `unreachable!()` against the whole suite.
+
+     The four live arms all said "re-run with `--codegen v1`", and one
+     of them was right:
+
+     | item | v1 emits | verdict |
+     |---|---|---|
+     | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;`, and a real fan-out at the emit site: `for (auto& _s : _tb.drv.req) _s(1);` | a real escape hatch |
+     | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
+     | `dut : Top default <lit>` | `VTop* dut = <lit>;` | `EmitsUncompilable` |
+     | a second module-typed field | `_tb.drv.dut = dut; _tb.drv.other = dut;` — both bound, both driven | a real escape hatch (corrected; see below) |
+     | `apply Some.Policy` | nothing; byte-identical output (offsets normalized) | `SilentlyMisLowers` |
+
+     The directional arm covered an event field and a scalar field under
+     one message, and they are opposite verdicts: v1 gives the event a
+     real subscriber vector and the scalar an uninitialized member. The
+     split now asks `components::is_event_field`, the routing
+     predicate's own helper, rather than a second copy of it.
+
+     The `default` row is the "worst thing v1 does anywhere under the
+     arm" rule paying out. `dut : Top default 0` COMPILES — `0` is a
+     null pointer constant, and the test binds the handle anyway, so
+     that one spelling works. `default 1` is "invalid conversion from
+     'int' to 'VTop*'". One working spelling does not make the arm an
+     escape hatch.
+
+     **The second-DUT-handle row was wrong, and review caught it.** I
+     measured a two-handle program against a control that was equally
+     broken. Neither backend auto-binds ANY transactor handle:
+     `VTop* dut = nullptr;` is what the SUPPORTED single-handle shape
+     emits too, and `<inst>.dut = dut` in the run body is the required
+     idiom, which TB-IR accepts. Write both binds and v1 emits
+
+     ```cpp
+     _tb.drv.dut = dut;
+     _tb.drv.other = dut;
+     Drv_step(_tb.drv, 1);
+     ```
+
+     and compiles clean with both handles poked. The null dereference
+     belonged to the missing bind, not to the second field, so the row
+     is `Unsupported`. The assertion that should have caught this
+     checked only the STATUS, and a later unrelated arm carried the same
+     one — it now checks the message too.
+
+     Two smaller corrections from the same review: the directional-scalar
+     detail said "UNINITIALIZED", which `p : in uint<8> default 5` is
+     not (`uint64_t p = 5;`), and the `in event<T>` row was measured on
+     the declaration alone — the emit-site fan-out it claims is now
+     asserted as well. The `in event<T>` claim is measured for scalar
+     payloads; a record payload with an impl-level subscriber hits a
+     separate `on <path>.<event>(arg)` arm whose v1 output does not
+     compile, which is that arm's problem and not this one's.
+
+103. **Four corrections from review, three of them `Invalid` on programs
+     v1 runs (2026-08-18).**
+
+     The branch's own rule — `Invalid` means no backend runs it in ANY
+     configuration — was broken three ways by one guard and one
+     predicate.
+
+     **`zero_width_leaf` recursed through every type argument.** A
+     zero-width scalar under a `list`/`queue`/`event` PAYLOAD is not the
+     shape this arm is about: it emits `std::vector<uint64_t>` /
+     `uint64_t` and compiles clean. Only the type's own width slot and a
+     `Vec` element count. Three constructs went from `Invalid` back to
+     an honest verdict.
+
+     **It read the width with the wrong parser.** It used
+     `parse_int_literal_expr`, which understands `0x`/`0b`; v1's
+     `int_width_from_args` and TB-IR's own `field_ir_type` both do a
+     plain decimal `parse::<u32>()`. So `uint<0x0>` was `Invalid` while
+     v1 compiled it. The width reader is now one function
+     (`declared_scalar_width`) that `field_ir_type` also calls.
+
+     That measurement turned up a real gap the old code had papered
+     over. v1 cannot read a hex width either, and it does not say so —
+     it substitutes a DIFFERENT fallback everywhere it needs one:
+
+     | site | `uint<8>` | `uint<0x8>` |
+     |---|---|---|
+     | pack | `harc_wide_write_bits(_packed, 0, 8, …)` | `…, 0, 64, …` |
+     | unpack | `harc_bits(_packed, 7, 0)` | `harc_bits(_packed, 63, 0)` |
+     | randomize | `harc_rng_uint(harc_rng_next, 8)` | `…, 32)` |
+     | problem table | `field data u8` | `field data u8` |
+
+     It compiles and runs, so an unreadable width is now
+     `SilentlyMisLowers` rather than the escape hatch its member type
+     would suggest.
+
+     **`record_leaf_fate` asked the wrong member-picker.** It consulted
+     the free `txn_field_c_type`, which maps every `TypeExpr::Named` to
+     `int64_t`. The function that actually picks members for scoreboard
+     and record fields is the METHOD `Emitter::record_field_c_type`,
+     which adds one layer: a named type that IS a declared record gets
+     the record's own name. So `scoreboard Sb { l : Inner }` was
+     `SilentlyMisLowers` with the detail "v1 emits an UNINITIALIZED
+     plain scalar", and v1 emits `Inner l;` and compiles. The predicate
+     now takes an `is_record` callback and reproduces that layer.
+
+     Divergence 97's claim that "`txn_field_c_type` is the only caller
+     that picks a member type" was simply false.
+
+     **The `when`-subtype arm needed a third measurement.** Round one
+     probed a program with no `randomize` and concluded the guard was
+     dropped — right label, no evidence. Round two added `randomize(q)`,
+     found `if (q.op == 1) { … }` honoured, and flipped the arm to an
+     escape hatch. Round three is the shape round two's own comment
+     named and did not run: nest the subtype in another record and
+     randomize the OUTER one, and v1 reaches it through
+
+     ```cpp
+     static void randomize_Req(Req* t) {
+         t->op   = harc_rng_uint(harc_rng_next, 8);
+         t->addr = harc_rng_uint(harc_rng_next, 16);   // no guard
+     }
+     ```
+
+     `op == 1` appears zero times in the file and `inner.addr` is absent
+     from the solver's problem table. Worst-thing-anywhere makes the arm
+     `SilentlyMisLowers`.
+
+     Also corrected from the same review: divergence 100 named the
+     shared predicate `records::record_leaf_flattens` (it is
+     `cpp_tb::record_leaf_fate`); divergence 99 claimed six and four
+     tests redden on the shared width mutations (it is five and three);
+     a `scalar_leaf_c_type` doc referenced a function that never
+     existed; inserting `zero_width_leaf` had orphaned `field_ir_type`'s
+     doc comment onto it; and a stale scoreboard comment sat directly
+     above the one that contradicted it.
+
+
+104. **Five copies of one `= bind` check, and a hole between them
+     (2026-08-18).**
+
+     A regblock, an addrmap, an initiator-BFM instance, a bound-to
+     event-driven transactor and a target-TLM responder all require a
+     bare identifier on the right of `= bind`, and each checked for it
+     with its own copy of the same four-line match:
+
+     ```rust
+     let x = match l.value.as_ref().map(|v| &*v.kind) {
+         Some(ExprKind::Ident(id)) => id.name.clone(),
+         _ => return Err(unsupported(…, "only `= bind <…>` is lowered")),
+     };
+     ```
+
+     All five said "re-run with `--codegen v1`". v1 refuses a
+     non-identifier RHS itself, with its own diagnostic — measured on
+     `bind helper.x`, `bind helper()`, `bind (helper)` and `bind 5` at
+     each of the five landings:
+
+     ```
+     let regs : DmaRegs = bind <expr>: regblock binding RHS must be a
+       helper transactor identifier
+     let helper : AxilHelper = bind <expr>: rhs must be a bare
+       bus-binding name in v0
+     ```
+
+     So all five are `NotImplemented { Rejects }`, and they now share one
+     `bind_rhs_ident`.
+
+     **The hole is the side all five copies were guarding the wrong way
+     round.** Each arm is gated on `l.bind`, so a `let` with NO `= bind`
+     reaches none of them — and a regblock's mirror record shares the
+     regblock's name, so `let regs : DmaRegs` landed on the ordinary
+     record-local path and lowered, verified and emitted clean. The
+     difference in the emitted testbench:
+
+     ```cpp
+     // let regs : DmaRegs = bind helper
+     AxilHelper_write(40, 64);
+     v = AxilHelper_read(40);
+     regs.MM2S_LEN = v;
+
+     // let regs : DmaRegs
+     v = regs.MM2S_LEN;
+     ```
+
+     Every register access served from the mirror, no bus traffic at
+     all, and the test passes without ever touching the DUT. v1 refuses
+     the same program outright — "regblock instantiation requires
+     `= bind <helper>` (a transactor with write/read methods)" — for
+     every spelling: at test scope, inside `run`, with no initializer,
+     and with a same-typed mirror on the right. TB-IR states that rule
+     now too, as `Invalid`, in v1's own words. `addrmap` had the same
+     hole reaching a different arm ("uninitialized `let chip` without a
+     scalar type", which named neither the construct nor the fix).
+
+     This is the first defect on this sweep that is not a
+     misclassification: TB-IR was ACCEPTING a program v1 rejects, and
+     tbir is the default backend.
+
+
+105. **Five corrections to the corrections (2026-08-18).**
+
+     Re-review of the four correction commits found one REGRESSION and
+     four arms right only for the shape that prompted them.
+
+     **The regression.** Divergence 103 gave `record_leaf_fate` an
+     `is_record` callback to reproduce `Emitter::record_field_c_type`'s
+     named-record layer, and wired it to `record_ids.contains_key`.
+     `record_ids` is not `is_record_type`: `lower_program` also inserts
+     every REGBLOCK's mirror record into it, and scoreboards lower
+     afterwards. So a `scoreboard Sb { l : DmaRegs }` became a
+     `--codegen v1` suggestion, and v1 flattens it to `int64_t l;`. The
+     callback now takes `declared_record_names`, a snapshot of
+     `record_ids` taken BEFORE the regblock loop — which is exactly
+     transactions ∪ structs.
+
+     **The second-DUT-handle arm** (divergence 102, corrected) is right
+     for a second field of the SAME module type and wrong for anything
+     else. v1 includes only the one Verilated header the testbench's DUT
+     needs:
+
+     | second field | v1 emits | g++ |
+     |---|---|---|
+     | `other : Top` | `VTop* other = nullptr;` + both binds | 0 errors |
+     | `other : AxiLiteRegs` | `VAxiLiteRegs* other = nullptr;` | "'VAxiLiteRegs' does not name a type" |
+     | `other : Nonesuch` | `VNonesuch* other = nullptr;` | "'VNonesuch' does not name a type" |
+     | `mode : Color` (an enum) | `Color mode;` | "'Color' does not name a type" |
+
+     The arm splits on whether the field's type name matches the DUT
+     handle's; the other three are `EmitsUncompilable`.
+
+     **The unreadable-width arm** (divergence 103) did not reach through
+     a `Vec`, though its sibling `zero_width_leaf` does.
+     `Vec<uint<0x8>, 4>` packs four 64-bit slots where
+     `Vec<uint<8>, 4>` packs four 8-bit ones — the same substitution,
+     per element.
+
+     It also claimed a `queue<T>` / `event<T>` / `list<T>` payload
+     "arrives as `TypeArg::Type` and is a different arm's business",
+     which is false for a RECORD payload: `queue<Inner>` arrives as
+     `TypeArg::Expr(Ident)` — the exact shape the arm reads as an
+     unreadable width — and got told "a width must be a plain decimal
+     literal" when there is no width slot at all. `cpp_tb.rs` states
+     this ("`event<RegOp>` parses as `TypeArg::Expr(Ident)` at the
+     type-arg layer") and so does `fixed_vec_field`'s NOTE. The set of
+     width-taking builtins is taken from `scalar_leaf_c_type` now rather
+     than inferred from the argument shape — its integer arms exactly,
+     minus `Bool`/`BoolLower`/`Bit`, which return `"bool"` whatever their
+     arguments say and so have no width slot to mis-read. Same failure
+     mode as divergence 97's leaf table, three commits later.
+
+     **The regblock-without-a-bind hole** (divergence 104) was closed at
+     test scope only. `regblock_instance_types` was populated in
+     `lower_test` and left empty in the helper, tseq, method and three
+     transactor contexts, so `let regs : DmaRegs` inside a `hookable`
+     body still lowered, verified and emitted; the addrmap half in the
+     same position still returned `Unsupported`, the false hatch the
+     divergence says it replaced. Every `LowerCtx` gets the set now,
+     built once by `regblock_instance_names`.
+
+     Smaller: `bind_rhs_ident` rendered an unbalanced backtick at two of
+     its five call sites (a fragment passed into a template that wrapped
+     it); two source comments cited divergence 103 for the hole
+     documented as 104; and `scalar_leaf_c_type`'s doc still claimed
+     `txn_field_c_type` "is the only caller that picks a member type",
+     which divergence 103 had already called false in the same commit.
+
+
+106. **The second-handle arm, third pass — and it cannot see what
+     decides it (2026-08-18).**
+
+     Divergence 105 split the transactor multi-handle arm on
+     `simple != dut_ty`: the second field's type against the
+     transactor's OWN first handle. The thing that decides whether v1's
+     output compiles is a different quantity — v1 includes exactly one
+     Verilated header, the TESTBENCH's DUT type — and
+     `lower_unbound_item` cannot see it. Transactors lower before
+     testbenches, and a transactor with two module fields never reaches
+     the testbench-side check that does know it, because it errors out
+     first.
+
+     ```
+     transactor Drv
+         d1 : Foo
+         d2 : Foo
+         ...
+     testbench Tb
+         dut : Top
+         drv : Drv active
+     ```
+
+     `simple == dut_ty` (`Foo` == `Foo`), so the split said "a real
+     escape hatch". v1 emits `VFoo* d1 = nullptr; VFoo* d2 = nullptr;`
+     and includes only `VTop.h` — `'VFoo' does not name a type`, twice.
+
+     So the whole arm is `EmitsUncompilable`. The `other : Top` row
+     really does compile, but only when the testbench's DUT is also
+     `Top`, and an arm's status is the worst thing under it.
+
+     The same measurement applies to the arm that DOES know the DUT
+     type — `lower_test`'s "field type `X` differs from the test DUT
+     type `Y`" — which was `Unsupported` and is now `EmitsUncompilable`
+     for the same emitted C++.
+
+     **The regblock contamination had one more consumer.**
+     `components.rs`'s record-typed-field arm asked
+     `record_ids.contains_key`, which by then holds every regblock's
+     mirror record, so an `agent Ag { r : DmaRegs }` got a `--codegen
+     v1` suggestion; v1 emits `VDmaRegs* r = nullptr;` and does not
+     compile. The record arm asks `declared_records` now, and a
+     regblock-typed component field gets its own `EmitsUncompilable`
+     arm. Every other `record_ids` consumer was audited: the ones in
+     `records.rs` run before the regblock loop, so they are already
+     exactly transactions ∪ structs.
+
+     Two guards that were correct but unmeasured now have rows: the
+     `tseq` and component-method `LowerCtx`s (emptying either reopened
+     the divergence-104 hole with the suite still green), and
+     `bind_rhs_ident`'s rendered phrase, whose unbalanced backtick no
+     test noticed.
+
+
+107. **A verdict that rested on a debug-only panic, and the CI run that
+     caught it (2026-08-18).**
+
+     The zero-width record leaf was `Invalid` (divergences 103, 105) on
+     the grounds that v1 PANICS on it — "attempt to subtract with
+     overflow" in `emit_unpack_bits`.
+
+     Rust turns integer overflow checks OFF under `--release`. CI builds
+     `cargo build --release --all-targets` and runs `cargo test
+     --release`; the shipped `harc` binary is a release build. So the
+     panic never happens for a user. In release v1 emits a complete
+     testbench that compiles clean:
+
+     | field | v1 emits | packed as |
+     |---|---|---|
+     | `uint<0>` | `uint64_t data = 0;` | `harc_wide_write_bits(_packed, 0, 0, value.data)` |
+     | `Vec<uint<0>, 4>` | `std::array<uint64_t, 4> data = {};` | the same zero-width write, per element |
+
+     A full-width member carrying no packed bits, silently. `Invalid`
+     claims no backend runs it in ANY configuration, and a release-built
+     v1 runs it — so the arm is `SilentlyMisLowers`.
+
+     Two things worth keeping from how this was found:
+
+     * **Every local check on this branch has been a debug build.** The
+       first CI run the branch got in hours failed on this within ninety
+       seconds. Nothing in the local loop — `cargo test`, the mutation
+       harness, five review passes, all debug — could have caught it,
+       because they all observe the panic the release build does not
+       have. The full-suite check now runs `--release` as well.
+     * **A panic is not evidence about v1 without naming the profile.**
+       It was the only verdict on this branch resting on one; the rest
+       rest on emitted text or g++ exit codes, which do not vary this
+       way.
+
+     The test is written to hold in both profiles: the verdict is
+     asserted unconditionally and the emitted member only where v1 got
+     far enough to produce it.
+
 
 ## Next steps
 

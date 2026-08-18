@@ -103,6 +103,10 @@ pub enum LowerError {
     },
     /// Relation expansion is recursive.
     RecursiveRelation { name: String, span: Span },
+    /// Relation expansion is finite but too large. See
+    /// `ast::RELATION_EXPANSION_BUDGET` / `RELATION_EXPANSION_MAX_DEPTH`
+    /// for the two limits and why they are shared with v1's expander.
+    RelationExpansionTooLarge { name: String, span: Span },
     /// Relation call gives an argument a name that does not match the
     /// parameter at that position. `build_relation_subst` zips params
     /// with args POSITIONALLY and drops the name, so
@@ -147,10 +151,17 @@ struct LowerCtx<'a> {
     /// Set by `record_error` when a relation-class error lands. See
     /// `should_stop`.
     saw_relation_error: bool,
+    /// Expression nodes this problem may still produce by relation
+    /// expansion. One budget per `lower_problem` call — one per
+    /// randomize site, plus one per transaction TEMPLATE, since
+    /// `build_typed_solver_problem_table` walks each transaction's
+    /// `keep`s on their own. That matches how v1's expander scopes its
+    /// own: one budget per top-level constraint list.
+    relation_budget: u32,
 }
 
 impl LowerError {
-    /// The four variants `lower_program` acts on.
+    /// The five variants `lower_program` acts on.
     ///
     /// `surface_constraint_lower_error` matches these variants by hand
     /// to word each diagnostic, so the list really is written twice.
@@ -166,6 +177,7 @@ impl LowerError {
             LowerError::UnknownRelation { .. }
                 | LowerError::RelationArityMismatch { .. }
                 | LowerError::RecursiveRelation { .. }
+                | LowerError::RelationExpansionTooLarge { .. }
                 | LowerError::RelationNamedArgMisplaced { .. }
         )
     }
@@ -249,6 +261,7 @@ pub fn lower_problem(
         next_local_id: 0,
         locals: BTreeMap::new(),
         saw_relation_error: false,
+        relation_budget: crate::ast::RELATION_EXPANSION_BUDGET,
     };
 
     // Re-bind `env.enums` after the variant lookup is built — both use
@@ -1929,30 +1942,58 @@ fn expand_top_level_relation_call(
         });
         return Some(Vec::new());
     }
+    // The name stack above refuses everything CYCLIC. These two refuse
+    // what is finite and still unusable: a chain of DISTINCT relations
+    // each calling the previous one twice doubles per level, and a
+    // 20-link chain did not finish at all before this existed (2^20
+    // expansions; 34s at 18 links, 7s at 16). Both limits are shared
+    // with v1's expander — see `ast::RELATION_EXPANSION_BUDGET`.
+    //
+    // Checked BEFORE the substitution that would build the next level,
+    // and charged for what that substitution PRODUCES, because the
+    // growth can be in the argument rather than in the body.
+    if stack.len() as u32 >= crate::ast::RELATION_EXPANSION_MAX_DEPTH {
+        ctx.record_error(LowerError::RelationExpansionTooLarge {
+            name: name.to_string(),
+            span: call.span,
+        });
+        return Some(Vec::new());
+    }
     stack.push(name.to_string());
 
+    let substituted: Vec<(ConstraintOrigin, Expr)> = match &rel.body {
+        RelationBodySchema::Block(clauses) => clauses
+            .iter()
+            .map(|c| {
+                (
+                    c.origin.clone(),
+                    substitute_relation_idents(&c.expr, &subst),
+                )
+            })
+            .collect(),
+        RelationBodySchema::Alias(clause) => vec![(
+            clause.origin.clone(),
+            substitute_relation_idents(&clause.expr, &subst),
+        )],
+    };
+    let produced: u32 = substituted.iter().fold(0u32, |acc, (_, e)| {
+        acc.saturating_add(crate::ast::expr_node_count(e))
+    });
+    match ctx.relation_budget.checked_sub(produced) {
+        Some(left) => ctx.relation_budget = left,
+        None => {
+            stack.pop();
+            ctx.record_error(LowerError::RelationExpansionTooLarge {
+                name: name.to_string(),
+                span: call.span,
+            });
+            return Some(Vec::new());
+        }
+    }
+
     let mut out = Vec::new();
-    match &rel.body {
-        RelationBodySchema::Block(clauses) => {
-            for clause in clauses {
-                let substituted = substitute_relation_idents(&clause.expr, &subst);
-                out.extend(expand_top_level_clause(
-                    ctx,
-                    &substituted,
-                    clause.origin.clone(),
-                    stack,
-                ));
-            }
-        }
-        RelationBodySchema::Alias(clause) => {
-            let substituted = substitute_relation_idents(&clause.expr, &subst);
-            out.extend(expand_top_level_clause(
-                ctx,
-                &substituted,
-                clause.origin.clone(),
-                stack,
-            ));
-        }
+    for (origin, expr) in &substituted {
+        out.extend(expand_top_level_clause(ctx, expr, origin.clone(), stack));
     }
 
     stack.pop();

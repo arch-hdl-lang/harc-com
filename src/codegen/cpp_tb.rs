@@ -52,40 +52,11 @@ pub const TRACE_RT_HEADER: &str = include_str!("../../runtime/harc_trace_rt.h");
 pub const LOG_RT_HEADER: &str = include_str!("../../runtime/harc_log_rt.h");
 pub const Z3_RT_HEADER: &str = include_str!("../../runtime/harc_z3_rt.h");
 
-/// How many expression NODES one top-level constraint list may produce
-/// by expanding relation bodies before the expander gives up and leaves
-/// the call in place.
-///
-/// A BACKSTOP, not the guard. What actually stops a relation expanding
-/// into itself is the relation-name stack in
-/// `try_expand_top_level_call`; this bounds growth that is finite but
-/// exponential — a chain of DISTINCT relations, each calling the
-/// previous one twice.
-///
-/// It counts nodes rather than expansions because a per-expansion
-/// budget cannot see growth in the ARGUMENT: `relation R(r) = R(r + r)`
-/// substitutes the argument into both occurrences of `r`, doubling it
-/// every level, so a handful of expansions build an astronomical tree.
-///
-/// MEASURED, not guessed: the whole fixture corpus passes at 96 and
-/// fails at 88, so 8192 is roughly 90x the deepest real program's need.
-/// The budget is shared across a whole top-level constraint list, so it
-/// scales with program size, not per constraint — which is why the
-/// margin is that wide.
-const RELATION_EXPANSION_BUDGET: u32 = 8_192;
-
-/// How deep relation bodies may nest before the expander gives up.
-///
-/// The other BACKSTOP: the budget bounds total work but not stack, and
-/// the expander recurses once per level. With the name stack in place
-/// nothing cyclic reaches either limit, so this only ever fires on a
-/// finite chain of distinct relations 64 deep — which it refuses, with
-/// v1's generic "constraint function call not supported in v0 solver
-/// path". That is a real tradeoff against a correct program, bought
-/// cheaply: the corpus's deepest real nest is 3, and a 40-deep chain
-/// still emits (there is a control for it in
-/// `v1_no_longer_aborts_on_a_relation_that_expands_forever`).
-const RELATION_EXPANSION_MAX_DEPTH: u32 = 64;
+// The two relation-expansion limits and the node counter that charges
+// them live in `ast.rs`, because the TYPED lowering path has its own
+// expander over the same relations and both run on every `harc sim`.
+// Bounding only this one bounds nothing; see the comment there.
+use crate::ast::{expr_node_count, RELATION_EXPANSION_BUDGET, RELATION_EXPANSION_MAX_DEPTH};
 pub const COSIM_RT_HEADER: &str = include_str!("../../runtime/harc_cosim_rt.h");
 
 const INDENT: &str = "    ";
@@ -12957,56 +12928,10 @@ impl Emitter {
                 f.name.name
             )
             .ok();
-            let elem_ty = list_elem_type(&f.ty);
-            match elem_ty {
-                Some(TypeExpr::Builtin { name, args, .. }) => match name {
-                    BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
-                        let w = type_arg_width(args).unwrap_or(32);
-                        writeln!(
-                            self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = {};",
-                            f.name.name,
-                            emit_random_unsigned_expr(w)
-                        )
-                        .ok();
-                    }
-                    BuiltinTy::SInt | BuiltinTy::SIntCap => {
-                        let w = type_arg_width(args).unwrap_or(32);
-                        if w < 63 {
-                            writeln!(
-                                self.out,
-                                "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1);",
-                                f.name.name,
-                                w.saturating_sub(1),
-                                w.saturating_sub(1)
-                            )
-                            .ok();
-                        } else {
-                            writeln!(
-                                self.out,
-                                "{INDENT}{INDENT}t->{}[_i] = {};",
-                                f.name.name,
-                                emit_random_unsigned_expr(w)
-                            )
-                            .ok();
-                        }
-                    }
-                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                        writeln!(
-                            self.out,
-                            "{INDENT}{INDENT}t->{}[_i] = harc_rt::random::harc_rng_range(harc_rng_next, 0, 1);",
-                            f.name.name
-                        )
-                        .ok();
-                    }
-                    _ => {
-                        writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
-                    }
-                },
-                _ => {
-                    writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = 0;", f.name.name).ok();
-                }
-            }
+            let draw = list_elem_type(&f.ty)
+                .and_then(list_elem_random_expr)
+                .unwrap_or_else(|| "0".to_string());
+            writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = {draw};", f.name.name).ok();
             writeln!(self.out, "{INDENT}}}").ok();
             return;
         }
@@ -19798,17 +19723,159 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
         return format!("std::array<{inner}, {len}>");
     }
     match t {
-        TypeExpr::Builtin { name, args, .. } => match name {
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-                cpp_uint_for_width(int_width_from_args(args))
-            }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)),
-            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => "bool".into(),
-            _ => "uint64_t".into(),
-        },
+        TypeExpr::Builtin { name, args, .. } => {
+            scalar_leaf_c_type(name, args).unwrap_or_else(|| "uint64_t".into())
+        }
         // Enums (and other named user types) lower to int64_t. Real type
         // emission lands when we have a proper type system.
         TypeExpr::Named { .. } => "int64_t".into(),
+    }
+}
+
+/// The builtin leaves this backend gives a real, width-correct C++ value
+/// type. `txn_field_c_type` is the only caller that turns it into a
+/// member, and everything NOT matched there falls through its `_ =>`
+/// arms to a
+/// bare `uint64_t` / `int64_t` — a member that does not mean what was
+/// written. Splitting the decision out is what lets `record_leaf_fate`
+/// ask the question instead of restating it.
+///
+/// NOT the last word on a member type: `Emitter::record_field_c_type`
+/// wraps `txn_field_c_type` with one more layer (a named type that is a
+/// declared record gets the record's own name), and that is the
+/// function scoreboard and record members actually go through.
+fn scalar_leaf_c_type(name: &BuiltinTy, args: &[TypeArg]) -> Option<String> {
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
+            Some(cpp_uint_for_width(int_width_from_args(args)))
+        }
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(cpp_sint_for_width(int_width_from_args(args))),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some("bool".into()),
+        _ => None,
+    }
+}
+
+/// The per-element random draw `emit_field_random` writes inside a
+/// `list<T>` loop, or `None` when this backend has none for `T` and
+/// writes a bare `t->f[_i] = 0;` instead.
+///
+/// A `None` here is not merely a weak draw. The member is
+/// `std::vector<T'>` for whatever `T'` `txn_field_c_type` picked, and
+/// `= 0` only compiles when `T'` is a scalar — for
+/// `list<Vec<uint<8>, 2>>` it is `std::array<uint64_t, 2>` and g++
+/// rejects the assignment, for EVERY program that declares the record.
+/// `record_leaf_fate` asks this rather than restating the arm.
+fn list_elem_random_expr(elem: &TypeExpr) -> Option<String> {
+    let TypeExpr::Builtin { name, args, .. } = elem else {
+        return None;
+    };
+    match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(emit_random_unsigned_expr(
+            type_arg_width(args).unwrap_or(32),
+        )),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => {
+            let w = type_arg_width(args).unwrap_or(32);
+            Some(if w < 63 {
+                format!(
+                    "harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1)",
+                    w.saturating_sub(1),
+                    w.saturating_sub(1)
+                )
+            } else {
+                emit_random_unsigned_expr(w)
+            })
+        }
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
+            Some("harc_rt::random::harc_rng_range(harc_rng_next, 0, 1)".into())
+        }
+        _ => None,
+    }
+}
+
+/// What this backend does with a record-field leaf it is handed.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum RecordLeafFate {
+    /// The member means what was written, at any width.
+    Models,
+    /// The member is a bare scalar — the field silently means something
+    /// else, and the program still compiles and runs.
+    Flattens,
+    /// The member keeps its container shape but the randomize body then
+    /// assigns `0` to it; the emitted C++ does not compile.
+    Uncompilable,
+}
+
+/// What this backend does with a record-field leaf — the whole basis on
+/// which the TB-IR lowering decides whether its rejection may suggest
+/// `--codegen v1`.
+///
+/// TB-IR lowers a narrower record subset than this backend does, so a
+/// rejection for a leaf outside that subset has to say which of three
+/// things is true, and none of them is a property of the type NAME:
+///
+///   * `list<T>` → `std::vector<T'>`, and `emit_field_random` draws the
+///     element only for a scalar `T`. A `T` that models as a CONTAINER
+///     keeps its `std::vector<std::array<…>>` member and then gets
+///     `[_i] = 0`, which does not compile; any other undrawn `T` gets a
+///     `uint64_t` element, which does.
+///   * `Vec<T, N>` → `std::array<T', N>`, but only when
+///     `fixed_vec_type_args` reads it — a non-literal `N` or an element
+///     it cannot type collapses the whole member. There is no
+///     per-element assignment on this path, so it cannot go
+///     uncompilable.
+///   * a scalar → a width-correct type at ANY width, including
+///     `_harc_u128` above 64 bits and `HarcWide<n>` above 128.
+///   * everything else (`queue`, `string`, `event`, `object`, an
+///     unresolved name) → a bare scalar.
+///
+/// `is_record` answers `Emitter::is_record_type` — the extra layer
+/// `record_field_c_type` puts on top of `txn_field_c_type`, and the one
+/// that actually serves scoreboard and record members. Asking only the
+/// free function missed it (divergence 103).
+///
+/// Consulted by the TB-IR lowering (`ir::lower::records` and
+/// `ir::lower::scoreboards`). Writing a second copy of these rules there
+/// is what produced divergence 97's first version, which called a
+/// 128-bit field a flattening and a `list<Inner>` a working escape
+/// hatch — both backwards.
+pub(crate) fn record_leaf_fate(t: &TypeExpr, is_record: &dyn Fn(&str) -> bool) -> RecordLeafFate {
+    if is_list_type(t) {
+        let Some(elem) = list_elem_type(t) else {
+            return RecordLeafFate::Flattens;
+        };
+        if list_elem_random_expr(elem).is_some() {
+            return RecordLeafFate::Models;
+        }
+        // No draw: the loop body is `t->f[_i] = 0;`. Whether that
+        // compiles is decided by the element type this backend picked,
+        // so ask it rather than guess which HARC types are containers.
+        let elem_c = txn_field_c_type(elem);
+        if elem_c.starts_with("std::vector<") || elem_c.starts_with("std::array<") {
+            return RecordLeafFate::Uncompilable;
+        }
+        return RecordLeafFate::Flattens;
+    }
+    if let Some((elem, _)) = fixed_vec_type_args(t) {
+        return match record_leaf_fate(elem, is_record) {
+            RecordLeafFate::Models => RecordLeafFate::Models,
+            _ => RecordLeafFate::Flattens,
+        };
+    }
+    // The layer `record_field_c_type` adds on top of `txn_field_c_type`:
+    // a named type that IS a declared record gets the record's own name
+    // as its member type, not `int64_t`. Asking only `txn_field_c_type`
+    // missed it and called `scoreboard Sb { l : Inner }` a flattening,
+    // when v1 emits `Inner l;` and compiles.
+    if let TypeExpr::Named { name, .. } = t {
+        if name.segments.last().is_some_and(|seg| is_record(&seg.name)) {
+            return RecordLeafFate::Models;
+        }
+    }
+    match t {
+        TypeExpr::Builtin { name, args, .. } if scalar_leaf_c_type(name, args).is_some() => {
+            RecordLeafFate::Models
+        }
+        _ => RecordLeafFate::Flattens,
     }
 }
 
@@ -22057,10 +22124,18 @@ fn c_int_literal_from(k: &ExprKind) -> String {
     }
 }
 
-fn c_int_literal(s: &str) -> String {
-    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`. Then the
-    // unsized-literal post-pass below catches any >64-bit cases.
-    let normalized = if let Some(idx) = s.find('\'') {
+/// An ARCH-style sized literal (`8'hAB`, `4'd3`, `1'b1`) rewritten as
+/// the plain C++ spelling this backend folds it to (`0xAB`, `3`, `0b1`)
+/// — width prefix dropped, base letter turned into a C prefix,
+/// underscores stripped. An unsized literal only loses its underscores.
+///
+/// `pub(crate)` because the width prefix is NOT the value: `4'd3` folds
+/// to a correct `3`, while `128'hFF..FF` folds to a 128-bit composite
+/// that a 64-bit member truncates. The TB-IR lowering classifies a
+/// default it cannot read by asking what this produces and whether the
+/// result fits, rather than by splitting on the apostrophe.
+pub(crate) fn normalized_int_literal(s: &str) -> String {
+    if let Some(idx) = s.find('\'') {
         let (_, tail) = s.split_at(idx + 1);
         let kind = tail.chars().next().unwrap_or('d');
         let digits: String = tail[1..].chars().filter(|c| *c != '_').collect();
@@ -22071,7 +22146,13 @@ fn c_int_literal(s: &str) -> String {
         }
     } else {
         s.replace('_', "")
-    };
+    }
+}
+
+fn c_int_literal(s: &str) -> String {
+    // ARCH-style sized literals (`8'hAB`) → C++ `0xAB`. Then the
+    // unsized-literal post-pass below catches any >64-bit cases.
+    let normalized = normalized_int_literal(s);
 
     // Hex literals wider than 64 bits (>16 hex digits) overflow C++'s
     // unsigned long long. Lower as a composite `_harc_u128` shifted-OR
@@ -22861,57 +22942,6 @@ fn and_join(exprs: &[Expr], span: Span) -> Expr {
 /// case: `R(pkt)` → `pkt`), a field access (`R(env.agent.txn)`), or
 /// a deeper subtree. Field-access names (`Field { name, .. }`) are
 /// attribute references, not bindings, so they're never substituted.
-/// Nodes in `e`, saturating. Used to charge
-/// `RELATION_EXPANSION_BUDGET` for what an expansion actually
-/// PRODUCES.
-///
-/// The arms mirror `expand_relation_subtree`'s: those are exactly the
-/// forms that can carry a substituted argument, so they are exactly the
-/// forms through which a relation body can grow. Anything else counts
-/// as a leaf, which can only undercount forms that cannot grow.
-fn expr_node_count(e: &Expr) -> u32 {
-    fn n(e: &Expr) -> u32 {
-        1u32.saturating_add(match &*e.kind {
-            ExprKind::Field { target, .. } => n(target),
-            ExprKind::Index { target, index } => n(target).saturating_add(n(index)),
-            ExprKind::BitSlice { target, hi, lo } => {
-                n(target).saturating_add(n(hi)).saturating_add(n(lo))
-            }
-            ExprKind::Call { callee, args } => args.iter().fold(n(callee), |a, arg| {
-                a.saturating_add(match arg {
-                    CallArg::Expr(x) => n(x),
-                    CallArg::Named { value, .. } => n(value),
-                })
-            }),
-            ExprKind::ForEachConstraint { iter, body, .. } => {
-                body.iter().fold(n(iter), |a, x| a.saturating_add(n(x)))
-            }
-            ExprKind::SoftConstraint(sc) => {
-                sc.weight.as_ref().map_or(0, n).saturating_add(n(&sc.expr))
-            }
-            ExprKind::Unary { expr, .. } => n(expr),
-            ExprKind::Binary { lhs, rhs, .. } => n(lhs).saturating_add(n(rhs)),
-            ExprKind::Ternary {
-                cond,
-                then_branch,
-                else_branch,
-            } => n(cond)
-                .saturating_add(n(then_branch))
-                .saturating_add(n(else_branch)),
-            ExprKind::Paren(inner) => n(inner),
-            ExprKind::Membership { expr, set } => n(expr).saturating_add(n(set)),
-            ExprKind::Cast { expr, .. } => n(expr),
-            ExprKind::SetLit(items) => items.iter().fold(0, |a, x| a.saturating_add(n(x))),
-            ExprKind::RangeLit { lo, hi } => lo
-                .as_ref()
-                .map_or(0, n)
-                .saturating_add(hi.as_ref().map_or(0, n)),
-            _ => 0,
-        })
-    }
-    n(e)
-}
-
 fn substitute_idents(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
     let span = expr.span;
     let new_kind: ExprKind = match &*expr.kind {
