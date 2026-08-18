@@ -6294,10 +6294,10 @@ former `transaction` group lives in
      | item | v1 emits | verdict |
      |---|---|---|
      | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;`, and a real fan-out at the emit site: `for (auto& _s : _tb.drv.req) _s(1);` | a real escape hatch |
-     | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — uninitialized, direction dropped; a method reading it reads the stack | `SilentlyMisLowers` |
+     | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
      | `dut : Top default <lit>` | `VTop* dut = <lit>;` | `EmitsUncompilable` |
-     | a second module-typed field | `VTop* other = nullptr;`, never bound — and a method poking it emits `self.other->en` | `SilentlyMisLowers` |
-     | `apply Some.Policy` | nothing; byte-identical output | `SilentlyMisLowers` |
+     | a second module-typed field | `_tb.drv.dut = dut; _tb.drv.other = dut;` — both bound, both driven | a real escape hatch (corrected; see below) |
+     | `apply Some.Policy` | nothing; byte-identical output (offsets normalized) | `SilentlyMisLowers` |
 
      The directional arm covered an event field and a scalar field under
      one message, and they are opposite verdicts: v1 gives the event a
@@ -6312,9 +6312,33 @@ former `transaction` group lives in
      'int' to 'VTop*'". One working spelling does not make the arm an
      escape hatch.
 
-     The second-DUT-handle row is the branch's first `SilentlyMisLowers`
-     whose runtime failure is a null dereference rather than a wrong
-     value: v1 compiles the poke against a handle it never binds.
+     **The second-DUT-handle row was wrong, and review caught it.** I
+     measured a two-handle program against a control that was equally
+     broken. Neither backend auto-binds ANY transactor handle:
+     `VTop* dut = nullptr;` is what the SUPPORTED single-handle shape
+     emits too, and `<inst>.dut = dut` in the run body is the required
+     idiom, which TB-IR accepts. Write both binds and v1 emits
+
+     ```cpp
+     _tb.drv.dut = dut;
+     _tb.drv.other = dut;
+     Drv_step(_tb.drv, 1);
+     ```
+
+     and compiles clean with both handles poked. The null dereference
+     belonged to the missing bind, not to the second field, so the row
+     is `Unsupported`. The assertion that should have caught this
+     checked only the STATUS, and a later unrelated arm carried the same
+     one — it now checks the message too.
+
+     Two smaller corrections from the same review: the directional-scalar
+     detail said "UNINITIALIZED", which `p : in uint<8> default 5` is
+     not (`uint64_t p = 5;`), and the `in event<T>` row was measured on
+     the declaration alone — the emit-site fan-out it claims is now
+     asserted as well. The `in event<T>` claim is measured for scalar
+     payloads; a record payload with an impl-level subscriber hits a
+     separate `on <path>.<event>(arg)` arm whose v1 output does not
+     compile, which is that arm's problem and not this one's.
 
 103. **Four corrections from review, three of them `Invalid` on programs
      v1 runs (2026-08-18).**

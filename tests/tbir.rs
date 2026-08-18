@@ -4454,9 +4454,9 @@ end impl T"#
 /// | item | v1 emits | verdict |
 /// |---|---|---|
 /// | `req : in event<uint<8>>` | a real subscriber vector plus a fan-out at the emit site | a real escape hatch |
-/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped | `SilentlyMisLowers` |
 /// | `dut : Top default 1` | `VTop* dut = 1;` — "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
-/// | a second module-typed field | `VTop* other = nullptr;` and `self.other->en` — a null deref at run time | `SilentlyMisLowers` |
+/// | a second module-typed field | `_tb.drv.dut = dut; _tb.drv.other = dut;` — both bound, both driven | a real escape hatch |
 /// | `apply Some.Policy` | nothing at all | `SilentlyMisLowers` |
 ///
 /// Every row is asserted in both positions, because that is the
@@ -4517,6 +4517,18 @@ end impl T"#
             "v1 models the event field: {v1}"
         );
     }
+    // The declaration alone is not the claim — an `emit` into it has to
+    // produce a real fan-out, or "v1 models it" is only half measured.
+    let emitting = drv("    dut : Top\n    req : in event<uint<8>>", "", poke).replace(
+        "        drv.step(1)",
+        "        emit drv.req(1)\n        drv.step(1)",
+    );
+    assert_unsupported(&lower_src(&emitting).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&emitting)).expect("v1 emits");
+    assert!(
+        v1.contains("for (auto& _s : _tb.drv.req) _s(1);"),
+        "v1 fans the emit out over the subscriber vector: {v1}"
+    );
     // …and flattens a directional SCALAR to an uninitialized member.
     for field in ["    p : in uint<8>", "    p : out uint<8>"] {
         for src in both(field) {
@@ -4529,23 +4541,57 @@ end impl T"#
             assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
         }
     }
-    // A second DUT handle is emitted and never bound; poking it emits a
-    // dereference of that null pointer.
+    // A second DUT handle is a real escape hatch: v1 binds and drives
+    // both. The first pass called it a null dereference by comparing
+    // against a control that was equally broken — neither backend
+    // auto-binds ANY handle, so `VTop* dut = nullptr;` is what the
+    // supported single-handle shape emits too, and `<inst>.dut = dut`
+    // is the required idiom in both.
     for src in both("    other : Top") {
-        assert_not_implemented(
-            &lower_src(&src).unwrap_err(),
-            lower::V1Status::SilentlyMisLowers,
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("more than one module-typed field"),
+            "the arm that fires is this one, not a later unrelated              assignment rejection: {msg}"
         );
     }
-    let deref = drv(
-        "    dut : Top\n    other : Top",
-        "",
-        "            dut.en = 1\n            other.en = 1",
+    let bound_both = format!(
+        r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut : Top
+    other : Top
+
+    when active
+        hookable step(n : uint<8>)
+            dut.en = 1
+            other.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.dut = dut
+        drv.other = dut
+        drv.step(1)
+        wait 2 cycles
+    end run
+end impl T"#
     );
-    let v1 = cpp_tb::emit(&merged_src(&deref)).expect("v1 emits");
+    assert_unsupported(&lower_src(&bound_both).unwrap_err());
+    let v1 = cpp_tb::emit(&merged_src(&bound_both)).expect("v1 emits");
     assert!(
-        v1.contains("VTop* other = nullptr;") && v1.contains("self.other->en"),
-        "v1 dereferences the unbound handle: {v1}"
+        v1.contains("_tb.drv.dut = dut;") && v1.contains("_tb.drv.other = dut;"),
+        "v1 binds BOTH handles, which is what makes the suggestion honest: {v1}"
     );
 
     // `apply` leaves no trace whatsoever.

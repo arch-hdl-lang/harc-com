@@ -66,9 +66,9 @@ use std::collections::{HashMap, HashSet};
 /// | item | v1 emits | verdict |
 /// |---|---|---|
 /// | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;` plus a real fan-out at the emit site (`for (auto& _s : _tb.drv.req) _s(1);`) | a real escape hatch |
-/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — UNINITIALIZED, direction dropped; a method reading it reads whatever is on the stack | `SilentlyMisLowers` |
+/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
 /// | `dut : Top default <lit>` | `VTop* dut = <lit>;` — only `0` converts; `default 1` is "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
-/// | a second module-typed field | `VTop* other = nullptr;`, never bound; a method poking it emits `self.other->en` and null-derefs at run time | `SilentlyMisLowers` |
+/// | a second module-typed field | binds and drives both handles | a real escape hatch |
 /// | `apply Some.Policy` | nothing — the output is byte-identical to the same transactor without it | `SilentlyMisLowers` |
 /// | `on <anything>` | — | unreachable |
 ///
@@ -84,6 +84,13 @@ use std::collections::{HashMap, HashSet};
 /// The `default` row is the branch's "worst thing v1 does anywhere under
 /// the arm" rule paying out: `default 0` compiles, because `0` is a null
 /// pointer constant, and every other literal does not.
+///
+/// The second-handle row went the other way, and for the reason the rule
+/// is easiest to misapply: the first measurement compared a two-handle
+/// program against a control that was equally broken. Neither backend
+/// auto-binds ANY transactor handle — `VTop* dut = nullptr;` is what the
+/// supported single-handle shape emits too — so the null dereference
+/// belonged to the missing `<inst>.dut = dut`, not to the second field.
 #[allow(clippy::too_many_arguments)]
 fn lower_unbound_item<'a>(
     ci: &'a ComponentItem,
@@ -122,9 +129,10 @@ fn lower_unbound_item<'a>(
                 }
                 return Err(not_implemented(
                     &format!("transactor `{tname}` directional scalar field `{fname}`"),
-                    "event-driven transactors await the event slice; v1 emits an \
-                     UNINITIALIZED plain scalar and drops the direction, so the field \
-                     reads indeterminate rather than as what was written",
+                    "event-driven transactors await the event slice; v1 emits a plain \
+                     scalar member and DROPS the direction, so the field means something \
+                     other than what was written (and reads indeterminate unless it also \
+                     carries a `default`)",
                     V1Status::SilentlyMisLowers,
                 ));
             }
@@ -149,15 +157,24 @@ fn lower_unbound_item<'a>(
                     ));
                 }
                 if let Some((first, _)) = dut.as_ref() {
-                    return Err(not_implemented(
+                    // A real escape hatch, and the one row on this pass
+                    // measured against a control that was equally
+                    // broken. v1 emits `VTop* other = nullptr;` — but it
+                    // emits `VTop* dut = nullptr;` for the SINGLE handle
+                    // too, and neither backend auto-binds either one:
+                    // `<inst>.dut = dut` in the run body is the required
+                    // idiom, which TB-IR accepts. Write both binds and
+                    // v1 emits `_tb.drv.dut = dut; _tb.drv.other = dut;`
+                    // and compiles clean with both handles poked. The
+                    // null dereference I attributed to the second handle
+                    // was just the absence of any bind at all.
+                    return Err(unsupported(
                         &format!(
                             "transactor `{tname}` with more than one module-typed field \
                              (`{first}`, `{fname}`)"
                         ),
-                        "an unbound transactor drives exactly one DUT instance; v1 emits \
-                         the extra handle as a null pointer and never binds it, so a \
-                         method that pokes it dereferences null at run time",
-                        V1Status::SilentlyMisLowers,
+                        "the TB-IR transactor schema carries exactly one DUT handle; v1 \
+                         binds and drives both",
                     ));
                 }
                 *dut = Some((fname.clone(), simple.to_string()));
