@@ -1,21 +1,21 @@
 name: PR 613 cleanup
 
 on:
-  push:
-    branches:
-      - claude/pr-555-merge-issue-77gfrx
+  pull_request:
+    types: [edited]
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   cleanup:
-    if: github.actor != 'github-actions[bot]'
+    if: github.event.pull_request.number == 613 && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Restore single component module
@@ -109,4 +109,4 @@ pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
           git rm .github/workflows/pr613-cleanup-final.yml
           git add src/ir/lower/components.rs src/ir/lower/components_impl.rs
           git commit -m "fix(tbir): restore single component lowering module"
-          git push origin HEAD:${{ github.ref_name }}
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
