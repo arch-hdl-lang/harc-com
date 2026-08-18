@@ -5281,6 +5281,42 @@ case and only locally-determinable `Assign` types are compared).
     Third time in this sweep that asking "what ELSE is under this arm"
     changed a verdict rather than confirming one.
 
+82. **A queue method in statement position splits on the runtime's own
+    API (2026-08-18).**
+
+    Two arms — one for a scoreboard queue, one for a component queue —
+    catch every queue method in statement position that is not `push`
+    or `pop`, and both said `Unsupported`. v1 emits the call verbatim
+    (`_tb.sb.q.<method>();`, `errs.<method>();`) against
+    `harc_rt::HarcQueue`, whose entire API is `push`, `pop`, `size` and
+    `empty`:
+
+    | statement | g++ |
+    |---|---|
+    | `sb.q.size()` | compiles — the value is discarded, so it is a legal no-op |
+    | `sb.q.empty()` | compiles, same |
+    | `sb.q.clear()` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
+    | `sb.q.front()` | same, no `front` |
+
+    So `size`/`empty` keep the suggestion — v1 genuinely runs those
+    programs — and everything else is a program error no backend runs.
+    The discriminator is not a heuristic: it IS the runtime header, and
+    the helper says so beside the list, because v1 passes whatever name
+    is written straight through to `HarcQueue`.
+
+    Both landings were probed independently rather than one inferred
+    from the other, and the test scans `runtime/harc_queue_rt.h` for the
+    member declarations the split relies on — if `HarcQueue` grows a
+    `clear`, the test fails instead of a working call being reported as
+    a program error.
+
+    A footnote on that scan, because it repeated the sweep's own lesson
+    at miniature scale: the first version asked whether the header
+    `contains("front(")` and failed, because `pop`'s body calls
+    `_d.front()` — and the second version failed too, because
+    `_d.pop_front()` contains `front(`. A substring test is not a name
+    test, in the same way a shape test is not a resolution test.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

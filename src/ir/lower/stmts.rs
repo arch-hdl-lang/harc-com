@@ -370,12 +370,9 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "scoreboard queue method `{field}.{queue}.{method}(...)` in \
-                                      statement position"
-                            ),
-                            "",
+                        return Err(queue_method_in_statement_position(
+                            &format!("scoreboard queue method `{field}.{queue}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -401,12 +398,9 @@ impl FuncBuilder<'_> {
                             self.push(Stmt::ComponentQueuePop { base, queue, dest });
                             return Ok(());
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "component queue method `{queue}.{method}(...)` in statement \
-                                 position"
-                            ),
-                            "",
+                        return Err(queue_method_in_statement_position(
+                            &format!("component queue method `{queue}.{method}(...)`"),
+                            &method,
                         ));
                     }
                 }
@@ -3877,4 +3871,40 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
 /// hides a severity that the guard would have rejected outright.
 fn is_log_severity(s: &str) -> bool {
     matches!(s, "debug" | "info" | "warn" | "error" | "fatal")
+}
+
+/// A queue method in STATEMENT position that is neither `push` nor
+/// `pop` — both of those are lowered above, so this is what is left.
+///
+/// v1 emits the call verbatim (`_tb.sb.q.<method>();`, `errs.<method>();`)
+/// against `harc_rt::HarcQueue`, whose whole API is `push`, `pop`,
+/// `size` and `empty`. So the split is exact rather than a proxy:
+///
+///   * `size` / `empty` — compile. The value is discarded, which makes
+///     the statement a legal no-op, and v1 runs the program. That is a
+///     TB-IR subset gap with a working escape hatch.
+///   * anything else — `clear`, `front`, a typo — g++: "'struct
+///     harc_rt::HarcQueue<long unsigned int>' has no member named
+///     'clear'". No backend runs it.
+///
+/// Measured at BOTH landings independently rather than assumed from
+/// one: the scoreboard-queue arm and the component-queue arm each take
+/// their own probe, and both behave this way.
+fn queue_method_in_statement_position(what: &str, method: &str) -> LowerError {
+    // `HarcQueue`'s value-returning half. Kept beside the reason it
+    // matters: v1 emits whatever name is written straight through, so
+    // this list is the runtime's API, and it has to track
+    // `runtime/harc_queue_rt.h` or a working call starts being called a
+    // program error.
+    if matches!(method, "size" | "empty") {
+        return unsupported(
+            &format!("{what} in statement position"),
+            "the value is discarded, so v1 emits a legal no-op and runs the program; \
+             TB-IR lowers `size`/`empty` in expression position instead",
+        );
+    }
+    LowerError::Invalid(format!(
+        "{what} in statement position: `HarcQueue` has only `push`, `pop`, `size` and \
+         `empty`"
+    ))
 }

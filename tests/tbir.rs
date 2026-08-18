@@ -20507,3 +20507,153 @@ end impl SubTest"#
         "the field declaration is what refuses it: {msg}"
     );
 }
+
+/// A queue method in STATEMENT position that is neither `push` nor
+/// `pop`. Two arms — one for a scoreboard queue, one for a component
+/// queue — and each splits, because v1 emits the call verbatim against
+/// `harc_rt::HarcQueue`, whose whole API is `push`/`pop`/`size`/`empty`.
+///
+/// | statement | v1 emits | g++ |
+/// |---|---|---|
+/// | `sb.q.size()` | `_tb.sb.q.size();` | compiles — the value is discarded, so it is a legal no-op |
+/// | `sb.q.empty()` | `_tb.sb.q.empty();` | compiles, same |
+/// | `sb.q.clear()` | `_tb.sb.q.clear();` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
+/// | `sb.q.front()` | `_tb.sb.q.front();` | same, no `front` |
+///
+/// So `size`/`empty` keep the suggestion — v1 runs those programs — and
+/// everything else is a program error no backend runs.
+///
+/// Both landings were probed independently rather than one inferred
+/// from the other, and both behave this way.
+#[test]
+fn a_queue_method_in_statement_position_splits_on_the_runtime_api() {
+    let sb = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard Sb
+    q : queue<uint<32>>
+end scoreboard Sb
+
+testbench QTb
+    dut : Top
+    sb  : Sb
+end testbench QTb
+
+impl QTest for QTb
+    clock clk = SysDomain
+    run
+        sb.q.push(3)
+        sb.q.{method}()
+        wait 1 cycle
+    end run
+end impl QTest"#
+        )
+    };
+    let comp = |method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Coll
+    errs : queue<uint<32>>
+    hookable note(v: uint<32>)
+        errs.push(v)
+        errs.{method}()
+    end note
+end agent Coll
+
+test CqTest
+    let dut : Top
+    let c : Coll
+    clock clk = SysDomain
+    run
+        c.note(3)
+        wait 1 cycle
+    end run
+end test CqTest"#
+        )
+    };
+
+    for (what, src) in [
+        ("scoreboard queue", &sb as &dyn Fn(&str) -> String),
+        ("component queue", &comp),
+    ] {
+        // `size`/`empty` — v1 emits a legal no-op and runs the program.
+        for method in ["size", "empty"] {
+            let s = src(method);
+            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains("in statement position"),
+                "{what}/{method}: {msg}"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&s))
+                .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
+            assert!(
+                v1.contains(&format!(".{method}();")),
+                "{what}/{method}: v1 emits the discarded call"
+            );
+        }
+
+        // Anything else — v1 emits a call `HarcQueue` does not have.
+        for method in ["clear", "front", "nosuch"] {
+            let s = src(method);
+            let msg = assert_invalid(&lower_src(&s).unwrap_err());
+            assert!(
+                msg.contains("has only `push`, `pop`, `size` and `empty`"),
+                "{what}/{method}: {msg}"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&s))
+                .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
+            assert!(
+                v1.contains(&format!(".{method}();")),
+                "{what}/{method}: v1 emits the call verbatim, which is what fails to compile"
+            );
+        }
+    }
+
+    // The split tracks the RUNTIME's API, so pin that the two names it
+    // lets through are the two the header actually declares. If
+    // `HarcQueue` grows a method, this fails and the list gets updated
+    // rather than a working call being reported as a program error.
+    let hdr = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_queue_rt.h"),
+    )
+    .expect("runtime header readable");
+    for decl in ["void push(", "T pop(", "bool empty(", "size_t size("] {
+        assert!(hdr.contains(decl), "HarcQueue must still declare `{decl}`");
+    }
+    // Scan for MEMBER DECLARATIONS, not any occurrence: `pop`'s body
+    // calls `_d.front()` on the inner deque, and a `contains("front(")`
+    // matched that and failed for the wrong reason.
+    let declares = |name: &str| {
+        let needle = format!("{name}(");
+        hdr.lines().any(|l| {
+            // A DECLARATION has the name preceded by a return type and
+            // whitespace; a call inside a body has it preceded by `.`,
+            // and `_d.pop_front()` has it preceded by `_`. All three
+            // distinctions are needed — matching the bare substring
+            // `front(` found `pop_front(` and failed for that reason.
+            l.match_indices(&needle).any(|(i, _)| {
+                let before = &l[..i];
+                let boundary = before
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.');
+                boundary && !before.trim().is_empty()
+            })
+        })
+    };
+    for name in ["push", "pop", "empty", "size"] {
+        assert!(declares(name), "HarcQueue must still declare `{name}`");
+    }
+    for name in ["clear", "front"] {
+        assert!(
+            !declares(name),
+            "HarcQueue must still lack `{name}`, or the `Invalid` rows above are wrong"
+        );
+    }
+}
