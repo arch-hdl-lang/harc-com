@@ -4337,6 +4337,147 @@ end impl T"#
     }
 }
 
+/// The unbound-transactor item arms, from BOTH declaration positions.
+///
+/// These were two copies of the same 120-line match — the always-on
+/// walk and the `when active` walk — differing in one expression, so
+/// five of the rejections were the same rejection written twice. Every
+/// one said "re-run with `--codegen v1`"; only one of the six shapes
+/// they cover is something v1 gets right.
+///
+/// | item | v1 emits | verdict |
+/// |---|---|---|
+/// | `req : in event<uint<8>>` | a real subscriber vector plus a fan-out at the emit site | a real escape hatch |
+/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
+/// | `dut : Top default 1` | `VTop* dut = 1;` — "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
+/// | a second module-typed field | `VTop* other = nullptr;` and `self.other->en` — a null deref at run time | `SilentlyMisLowers` |
+/// | `apply Some.Policy` | nothing at all | `SilentlyMisLowers` |
+///
+/// Every row is asserted in both positions, because that is the
+/// property the merge is for.
+#[test]
+fn the_unbound_transactor_item_arms_agree_across_both_positions() {
+    let drv = |outer: &str, active: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+{outer}
+    when active
+{active}
+        hookable step(n : uint<8>)
+{body}
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.step(1)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let poke = "            dut.en = 1";
+    lower_src(&drv("    dut : Top", "", poke)).expect("the control lowers");
+
+    // Each row, declared OUTSIDE the `when active` block and INSIDE it.
+    // The two spellings must give the identical verdict — that is what
+    // the merged walk buys, and what two copies of it kept losing.
+    let both = |field: &str| {
+        [
+            drv(&format!("    dut : Top\n{field}"), "", poke),
+            drv("    dut : Top", &format!("    {field}"), poke),
+        ]
+    };
+
+    // v1 models a directional EVENT — a real `std::function` fan-out.
+    for src in both("    req : in event<uint<8>>") {
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("directional event field"), "{msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            v1.contains("std::vector<std::function<void(uint64_t)>> req;"),
+            "v1 models the event field: {v1}"
+        );
+    }
+    // …and flattens a directional SCALAR to an uninitialized member.
+    for field in ["    p : in uint<8>", "    p : out uint<8>"] {
+        for src in both(field) {
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::SilentlyMisLowers,
+            );
+            assert!(msg.contains("directional scalar field"), "{msg}");
+            let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+            assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
+        }
+    }
+    // A second DUT handle is emitted and never bound; poking it emits a
+    // dereference of that null pointer.
+    for src in both("    other : Top") {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+    }
+    let deref = drv(
+        "    dut : Top\n    other : Top",
+        "",
+        "            dut.en = 1\n            other.en = 1",
+    );
+    let v1 = cpp_tb::emit(&merged_src(&deref)).expect("v1 emits");
+    assert!(
+        v1.contains("VTop* other = nullptr;") && v1.contains("self.other->en"),
+        "v1 dereferences the unbound handle: {v1}"
+    );
+
+    // `apply` leaves no trace whatsoever.
+    for src in both("    apply Some.Policy") {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+    }
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&drv(
+            "    dut : Top\n    apply Some.Policy",
+            "",
+            poke
+        )))
+        .expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&drv("    dut : Top", "", poke))).expect("v1 emits"),
+        "the `apply` item leaves v1's output byte-identical"
+    );
+
+    // The DUT-handle default: `0` is a null pointer constant and
+    // compiles, every other literal does not, so the arm takes the
+    // worse of the two.
+    for lit in ["0", "1", "5"] {
+        for src in both(&format!("    other : Top default {lit}")) {
+            assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::EmitsUncompilable,
+            );
+        }
+    }
+    for (lit, init) in [("0", "VTop* dut = 0;"), ("1", "VTop* dut = 1;")] {
+        let src = drv(&format!("    dut : Top default {lit}"), "", poke);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(v1.contains(init), "`default {lit}` pastes `{init}`: {v1}");
+    }
+}
+
 /// The `on <event>(arg)` subscription arms in `components.rs`.
 ///
 /// Six sites; five were provably dead. `event_subscription` — the
@@ -8924,7 +9065,15 @@ impl EvTest for EvTb
 end impl EvTest
 "#;
     let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
-    assert!(msg.contains("event/directional field `req`"), "{msg}");
+    assert!(msg.contains("directional event field `req`"), "{msg}");
+    // The directional SCALAR spelling is a different verdict — v1
+    // models the event field and flattens the scalar one.
+    let scalar_src = event_src.replace("req : in event<Req>", "req : in uint<8>");
+    let msg = assert_not_implemented(
+        &lower_src(&scalar_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("directional scalar field `req`"), "{msg}");
 
     // A scalar state field now lowers: the transactor carries it on its
     // schema and the testbench records the instance for per-instance

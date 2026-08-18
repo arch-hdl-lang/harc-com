@@ -317,7 +317,13 @@ pub(crate) fn transactor_is_reactive_monitor(t: &TransactorDecl) -> bool {
     !has_in_event && (has_on_handler || has_periodic_handler)
 }
 
-fn is_event_field(f: &ComponentField) -> bool {
+/// An `event<T>` field. `pub(crate)` because the unbound-transactor
+/// item walk splits its directional-field rejection on exactly this
+/// question — v1 models a directional EVENT (a real subscriber vector
+/// plus a fan-out at the emit site) and flattens a directional SCALAR to
+/// an uninitialized `uint64_t` — and asking the routing predicate's own
+/// helper is what keeps the two answers from drifting apart.
+pub(crate) fn is_event_field(f: &ComponentField) -> bool {
     matches!(
         &f.ty,
         TypeExpr::Builtin {

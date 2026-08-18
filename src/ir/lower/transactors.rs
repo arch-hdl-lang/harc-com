@@ -55,6 +55,178 @@ use std::collections::{HashMap, HashSet};
 /// `TbFunction` per method. `next_fn` is the id the FIRST method
 /// function will get (the caller pushes the returned functions in
 /// order).
+/// One item of an UNBOUND transactor, from either declaration position.
+///
+/// The two positions used to be two copies of this match, and five of
+/// the rejections were the same rejection written twice. They are also
+/// the arms that had never been measured — every one said "re-run with
+/// `--codegen v1`", and only two of the six shapes they cover are
+/// things v1 actually gets right:
+///
+/// | item | v1 emits | verdict |
+/// |---|---|---|
+/// | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;` plus a real fan-out at the emit site (`for (auto& _s : _tb.drv.req) _s(1);`) | a real escape hatch |
+/// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — UNINITIALIZED, direction dropped; a method reading it reads whatever is on the stack | `SilentlyMisLowers` |
+/// | `dut : Top default <lit>` | `VTop* dut = <lit>;` — only `0` converts; `default 1` is "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
+/// | a second module-typed field | `VTop* other = nullptr;`, never bound; a method poking it emits `self.other->en` and null-derefs at run time | `SilentlyMisLowers` |
+/// | `apply Some.Policy` | nothing — the output is byte-identical to the same transactor without it | `SilentlyMisLowers` |
+/// | `on <anything>` | — | unreachable |
+///
+/// The `on` arm is dead in both positions: `transactor_is_component`
+/// routes an unbound transactor carrying ANY `OnHandler` — subscription,
+/// cycle-trigger, or periodic — to the component path before this
+/// function is called. So is the `Lifecycle` half of the lifecycle/apply
+/// arm, which the PARSER refuses inside a transactor ("lifecycle blocks
+/// are currently supported only inside `test`/`impl` and `testbench`");
+/// only `apply` reaches it. Both were confirmed with `unreachable!()`
+/// against the whole suite.
+///
+/// The `default` row is the branch's "worst thing v1 does anywhere under
+/// the arm" rule paying out: `default 0` compiles, because `0` is a null
+/// pointer constant, and every other literal does not.
+#[allow(clippy::too_many_arguments)]
+fn lower_unbound_item<'a>(
+    ci: &'a ComponentItem,
+    from_when_active: bool,
+    tname: &str,
+    record_ctx: &LowerCtx,
+    dut: &mut Option<(String, String)>,
+    methods_ast: &mut Vec<(&'a HookableMethod, bool)>,
+    state_fields: &mut Vec<StateFieldSchema>,
+    state_names: &mut HashMap<String, StateFieldKind>,
+) -> Result<(), LowerError> {
+    let mut push_state = |f: &crate::ast::ComponentField| -> Result<(), LowerError> {
+        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+        if state_names
+            .insert(sf.name.clone(), sf.kind.clone())
+            .is_some()
+        {
+            return Err(LowerError::Invalid(format!(
+                "transactor `{tname}` declares state field `{}` more than once",
+                sf.name
+            )));
+        }
+        state_fields.push(sf);
+        Ok(())
+    };
+    match ci {
+        ComponentItem::Hookable(h) => methods_ast.push((h, from_when_active)),
+        ComponentItem::Field(f) => {
+            let fname = &f.name.name;
+            if f.direction.is_some() {
+                if super::components::is_event_field(f) {
+                    return Err(unsupported(
+                        &format!("transactor `{tname}` directional event field `{fname}`"),
+                        "event-driven transactors await the event slice",
+                    ));
+                }
+                return Err(not_implemented(
+                    &format!("transactor `{tname}` directional scalar field `{fname}`"),
+                    "event-driven transactors await the event slice; v1 emits an \
+                     UNINITIALIZED plain scalar and drops the direction, so the field \
+                     reads indeterminate rather than as what was written",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            if let TypeExpr::Named { name, .. } = &f.ty {
+                let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                // A whole value-record held as transactor state
+                // (`cur : Beat`), legal in BOTH declaration positions —
+                // v1 compiles one written inside `when active` exactly
+                // as it does one written above. Same schema the bound-to
+                // path produces, and the same duplicate check the scalar
+                // branch makes: without it `cur : uint<32>` plus
+                // `cur : Beat` emitted two `cur` members.
+                if record_ctx.record_ids.contains_key(simple) {
+                    return push_state(f);
+                }
+                if f.default.is_some() {
+                    return Err(not_implemented(
+                        &format!("a default value on the DUT-handle field `{tname}.{fname}`"),
+                        "the DUT handle is bound by the test; v1 pastes the literal into \
+                         `VTop* <f> = <lit>;`, which only compiles when it is `0`",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
+                if let Some((first, _)) = dut.as_ref() {
+                    return Err(not_implemented(
+                        &format!(
+                            "transactor `{tname}` with more than one module-typed field \
+                             (`{first}`, `{fname}`)"
+                        ),
+                        "an unbound transactor drives exactly one DUT instance; v1 emits \
+                         the extra handle as a null pointer and never binds it, so a \
+                         method that pokes it dereferences null at run time",
+                        V1Status::SilentlyMisLowers,
+                    ));
+                }
+                *dut = Some((fname.clone(), simple.to_string()));
+            } else {
+                return push_state(f);
+            }
+        }
+        ComponentItem::OnHandler(_) => unreachable!(
+            "an unbound transactor carrying any `on` handler is routed to the component \
+             path by `transactor_is_component`"
+        ),
+        ComponentItem::TargetTlmThread(_) => {
+            // v1 emits NOTHING for a target thread on an unbound
+            // transactor: its C++ is byte-identical with and without
+            // the `thread` item. The negative anchor is the bound-to
+            // TARGET form, where the same item changes 42 lines — so
+            // v1 implements target threads where it owns them, and
+            // silently drops this one.
+            return Err(not_implemented(
+                &format!("transactor `{tname}` TLM target threads"),
+                "a target thread is served through a `bound to <bus>` transactor; \
+                 on an unbound one v1 discards it silently",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
+        ComponentItem::Watchdog(_) => {
+            // v1 emits a complete `<T>_watchdog` lambda — pre/post
+            // hook vectors, the `max_idle` check against
+            // `_last_in_cycle`/`_last_out_cycle`, the FAIL line, the
+            // error bump — and then never calls it. An AGENT
+            // watchdog gets a periodic `_checkers` closure installed
+            // at its instantiation site (`Producer_watchdog(_tb.prod)`);
+            // a transactor watchdog gets no call site at all, in the
+            // outer, `when active`, and passive landings alike. So
+            // the construct compiles under v1 and the watchdog
+            // silently never fires — the worst outcome available,
+            // and not something to point a user at.
+            return Err(not_implemented(
+                &format!("transactor `{tname}` watchdogs"),
+                "v1 emits the watchdog body but never schedules it, so it never \
+                 fires; declare the watchdog on an `agent` instead",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
+        ComponentItem::Connect(_) => {
+            return Err(not_implemented(
+                &format!("transactor `{tname}` connect blocks"),
+                "v1 parses the block and emits NOTHING for it — the edges are silently \
+                 dropped; wire the endpoints from an `env` `connect` instead",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
+        ComponentItem::Lifecycle(..) => unreachable!(
+            "the parser refuses a lifecycle block inside a transactor: \
+             \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+             `testbench`\""
+        ),
+        ComponentItem::Apply(_) => {
+            return Err(not_implemented(
+                &format!("an `apply` item on transactor `{tname}`"),
+                "v1 emits NOTHING for it — its output is byte-identical to the same \
+                 transactor without the item, so the policy silently does not apply",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn lower_transactor(
     id: TransactorId,
     t: &TransactorDecl,
@@ -146,241 +318,30 @@ pub(crate) fn lower_transactor(
     // `<instance>.<field>`.
     let mut state_fields: Vec<StateFieldSchema> = Vec::new();
     let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
-    for ci in &t.items {
-        match ci {
-            ComponentItem::Hookable(h) => methods_ast.push((h, false)),
-            ComponentItem::Field(f) => {
-                let fname = &f.name.name;
-                if f.direction.is_some() {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` event/directional field `{fname}`"),
-                        "event-driven transactors await the event slice",
-                    ));
-                }
-                if let TypeExpr::Named { name, .. } = &f.ty {
-                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-                    // A whole value-record held as transactor state
-                    // (`cur : Beat`). Same schema the bound-to path
-                    // produces, and the same duplicate check the scalar
-                    // branch below makes — without it `cur : uint<32>`
-                    // plus `cur : Beat` emitted two `cur` members.
-                    if record_ctx.record_ids.contains_key(simple) {
-                        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
-                        if state_names
-                            .insert(sf.name.clone(), sf.kind.clone())
-                            .is_some()
-                        {
-                            return Err(LowerError::Invalid(format!(
-                                "transactor `{tname}` declares state field `{}` more than once",
-                                sf.name
-                            )));
-                        }
-                        state_fields.push(sf);
-                        continue;
-                    }
-                    if f.default.is_some() {
-                        return Err(unsupported(
-                            &format!("transactor `{tname}` field `{fname}` with a default value"),
-                            "",
-                        ));
-                    }
-                    if dut.is_some() {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor `{tname}` with more than one module-typed field \
-                                 (`{}`, `{fname}`)",
-                                dut.as_ref().unwrap().0
-                            ),
-                            "",
-                        ));
-                    }
-                    dut = Some((fname.clone(), simple.to_string()));
-                } else {
-                    let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
-                    if state_names
-                        .insert(sf.name.clone(), sf.kind.clone())
-                        .is_some()
-                    {
-                        return Err(LowerError::Invalid(format!(
-                            "transactor `{tname}` declares state field `{}` more than once",
-                            sf.name
-                        )));
-                    }
-                    state_fields.push(sf);
-                }
-            }
-            ComponentItem::OnHandler(_) => {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` `on` handlers"),
-                    "event-driven transactors await the event slice",
-                ));
-            }
-            ComponentItem::TargetTlmThread(_) => {
-                // v1 emits NOTHING for a target thread on an unbound
-                // transactor: its C++ is byte-identical with and without
-                // the `thread` item. The negative anchor is the bound-to
-                // TARGET form, where the same item changes 42 lines — so
-                // v1 implements target threads where it owns them, and
-                // silently drops this one.
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` TLM target threads"),
-                    "a target thread is served through a `bound to <bus>` transactor; \
-                     on an unbound one v1 discards it silently",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Watchdog(_) => {
-                // v1 emits a complete `<T>_watchdog` lambda — pre/post
-                // hook vectors, the `max_idle` check against
-                // `_last_in_cycle`/`_last_out_cycle`, the FAIL line, the
-                // error bump — and then never calls it. An AGENT
-                // watchdog gets a periodic `_checkers` closure installed
-                // at its instantiation site (`Producer_watchdog(_tb.prod)`);
-                // a transactor watchdog gets no call site at all, in the
-                // outer, `when active`, and passive landings alike. So
-                // the construct compiles under v1 and the watchdog
-                // silently never fires — the worst outcome available,
-                // and not something to point a user at.
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` watchdogs"),
-                    "v1 emits the watchdog body but never schedules it, so it never \
-                     fires; declare the watchdog on an `agent` instead",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Connect(_) => {
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` connect blocks"),
-                    "v1 parses the block and emits NOTHING for it — the edges are silently \
-                     dropped; wire the endpoints from an `env` `connect` instead",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` lifecycle/apply items"),
-                    "",
-                ));
-            }
-        }
-    }
-    for ci in t.when_active.iter().flatten() {
-        match ci {
-            ComponentItem::Field(f) => {
-                let fname = &f.name.name;
-                if f.direction.is_some() {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` event/directional field `{fname}`"),
-                        "event-driven transactors await the event slice",
-                    ));
-                }
-                if let TypeExpr::Named { name, .. } = &f.ty {
-                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-                    // Record state is legal in BOTH declaration
-                    // positions — v1 compiles a `cur : Beat` written
-                    // inside `when active` exactly as it does one
-                    // written above it, so closing only the outer
-                    // position would leave half a feature.
-                    if record_ctx.record_ids.contains_key(simple) {
-                        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
-                        if state_names
-                            .insert(sf.name.clone(), sf.kind.clone())
-                            .is_some()
-                        {
-                            return Err(LowerError::Invalid(format!(
-                                "transactor `{tname}` declares state field `{}` more than once",
-                                sf.name
-                            )));
-                        }
-                        state_fields.push(sf);
-                        continue;
-                    }
-                    if f.default.is_some() {
-                        return Err(unsupported(
-                            &format!("transactor `{tname}` field `{fname}` with a default value"),
-                            "",
-                        ));
-                    }
-                    if dut.is_some() {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor `{tname}` with more than one module-typed field \
-                                 (`{}`, `{fname}`)",
-                                dut.as_ref().unwrap().0
-                            ),
-                            "",
-                        ));
-                    }
-                    dut = Some((fname.clone(), simple.to_string()));
-                } else {
-                    let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
-                    if state_names
-                        .insert(sf.name.clone(), sf.kind.clone())
-                        .is_some()
-                    {
-                        return Err(LowerError::Invalid(format!(
-                            "transactor `{tname}` declares state field `{}` more than once",
-                            sf.name
-                        )));
-                    }
-                    state_fields.push(sf);
-                }
-            }
-            ComponentItem::Hookable(h) => methods_ast.push((h, true)),
-            ComponentItem::OnHandler(_) => {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` `on` handlers"),
-                    "event-driven transactors await the event slice",
-                ));
-            }
-            ComponentItem::TargetTlmThread(_) => {
-                // v1 emits NOTHING for a target thread on an unbound
-                // transactor: its C++ is byte-identical with and without
-                // the `thread` item. The negative anchor is the bound-to
-                // TARGET form, where the same item changes 42 lines — so
-                // v1 implements target threads where it owns them, and
-                // silently drops this one.
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` TLM target threads"),
-                    "a target thread is served through a `bound to <bus>` transactor; \
-                     on an unbound one v1 discards it silently",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Watchdog(_) => {
-                // v1 emits a complete `<T>_watchdog` lambda — pre/post
-                // hook vectors, the `max_idle` check against
-                // `_last_in_cycle`/`_last_out_cycle`, the FAIL line, the
-                // error bump — and then never calls it. An AGENT
-                // watchdog gets a periodic `_checkers` closure installed
-                // at its instantiation site (`Producer_watchdog(_tb.prod)`);
-                // a transactor watchdog gets no call site at all, in the
-                // outer, `when active`, and passive landings alike. So
-                // the construct compiles under v1 and the watchdog
-                // silently never fires — the worst outcome available,
-                // and not something to point a user at.
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` watchdogs"),
-                    "v1 emits the watchdog body but never schedules it, so it never \
-                     fires; declare the watchdog on an `agent` instead",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Connect(_) => {
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` connect blocks"),
-                    "v1 parses the block and emits NOTHING for it — the edges are silently \
-                     dropped; wire the endpoints from an `env` `connect` instead",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
-            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` lifecycle/apply items"),
-                    "",
-                ));
-            }
-        }
+    // ONE walk over both declaration positions. These were two
+    // copies of the same 120-line match, differing in exactly one
+    // expression — `methods_ast.push((h, false))` vs `(h, true)` — and
+    // five of the rejection arms in them were the same rejection
+    // written twice. The flattening itself is v1's
+    // `synth_component_from_transactor` with include_active = true; the
+    // flag is preserved only so an always-on sibling cannot backdoor-
+    // call an active-only method.
+    let items = t
+        .items
+        .iter()
+        .map(|ci| (ci, false))
+        .chain(t.when_active.iter().flatten().map(|ci| (ci, true)));
+    for (ci, from_when_active) in items {
+        lower_unbound_item(
+            ci,
+            from_when_active,
+            tname,
+            record_ctx,
+            &mut dut,
+            &mut methods_ast,
+            &mut state_fields,
+            &mut state_names,
+        )?;
     }
 
     let Some((dut_field, dut_type)) = dut else {

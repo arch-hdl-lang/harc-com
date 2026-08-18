@@ -6243,6 +6243,64 @@ former `transaction` group lives in
      two.
 
 
+102. **The unbound-transactor item walk was written twice, and none of
+     its arms had been measured (2026-08-18).**
+
+     `lower_transactor`'s always-on walk and its `when active` walk were
+     two copies of the same 120-line match. They differed in exactly one
+     expression — `methods_ast.push((h, false))` versus `(h, true)` —
+     and in comment text. Five of the ten rejections in them were the
+     same rejection written twice, so a change to one position and not
+     the other would have silently diverged by where the user wrote the
+     item.
+
+     They are now one walk over
+     `t.items.chain(t.when_active.iter().flatten())` carrying the flag,
+     which is also what v1's `synth_component_from_transactor` does with
+     `include_active = true`.
+
+     Two of the arms are dead:
+
+     * every `on` handler — subscription, cycle-trigger, or periodic —
+       routes an unbound transactor to the COMPONENT path
+       (`transactor_is_component` returns true for `has_on_handler ||
+       has_periodic_handler`), so it never reaches this walk;
+     * a lifecycle block is refused by the PARSER inside a transactor
+       ("lifecycle blocks are currently supported only inside
+       `test`/`impl` and `testbench`"), so only the `apply` half of the
+       lifecycle/apply arm is live.
+
+     Both confirmed with `unreachable!()` against the whole suite.
+
+     The four live arms all said "re-run with `--codegen v1`", and one
+     of them was right:
+
+     | item | v1 emits | verdict |
+     |---|---|---|
+     | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;`, and a real fan-out at the emit site: `for (auto& _s : _tb.drv.req) _s(1);` | a real escape hatch |
+     | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — uninitialized, direction dropped; a method reading it reads the stack | `SilentlyMisLowers` |
+     | `dut : Top default <lit>` | `VTop* dut = <lit>;` | `EmitsUncompilable` |
+     | a second module-typed field | `VTop* other = nullptr;`, never bound — and a method poking it emits `self.other->en` | `SilentlyMisLowers` |
+     | `apply Some.Policy` | nothing; byte-identical output | `SilentlyMisLowers` |
+
+     The directional arm covered an event field and a scalar field under
+     one message, and they are opposite verdicts: v1 gives the event a
+     real subscriber vector and the scalar an uninitialized member. The
+     split now asks `components::is_event_field`, the routing
+     predicate's own helper, rather than a second copy of it.
+
+     The `default` row is the "worst thing v1 does anywhere under the
+     arm" rule paying out. `dut : Top default 0` COMPILES — `0` is a
+     null pointer constant, and the test binds the handle anyway, so
+     that one spelling works. `default 1` is "invalid conversion from
+     'int' to 'VTop*'". One working spelling does not make the arm an
+     escape hatch.
+
+     The second-DUT-handle row is the branch's first `SilentlyMisLowers`
+     whose runtime failure is a null dereference rather than a wrong
+     value: v1 compiles the poke against a handle it never binds.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
