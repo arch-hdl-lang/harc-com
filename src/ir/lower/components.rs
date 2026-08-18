@@ -2558,14 +2558,18 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if comp.method(&method).is_none() {
-                        return Err(unsupported(
-                            &format!(
-                                "component `{}` has no method `{method}` (in `{}`)",
-                                comp.name,
-                                path.join(".")
-                            ),
-                            "",
-                        ));
+                        // MEASURED: v1 emits the call verbatim —
+                        // `uint64_t x = c.nosuch(3);` — against a
+                        // struct with no such member. g++: "'struct
+                        // Calc' has no member named 'nosuch'". Naming a
+                        // method that does not exist is a program
+                        // error, and `exprs.rs`'s transactor-shaped
+                        // sibling has always said so.
+                        return Err(LowerError::Invalid(format!(
+                            "component `{}` has no method `{method}` (in `{}`)",
+                            comp.name,
+                            path.join(".")
+                        )));
                     }
                     return Ok(Some((ComponentBase::Path(recv.to_vec()), cid, method)));
                 }
@@ -2596,13 +2600,18 @@ impl super::FuncBuilder<'_> {
                     if let Some(cid) = self.component_of_local(local) {
                         let comp = &self.ctx.components[cid.index()];
                         if comp.method(&method.name).is_none() {
-                            return Err(unsupported(
-                                &format!(
-                                    "component `{}` has no method `{}` (on parameter `{}`)",
-                                    comp.name, method.name, recv.name
-                                ),
-                                "",
-                            ));
+                            // Same program error as the path-shaped
+                            // sibling above, reached through a
+                            // component-typed local instead. NOT PROBED —
+                            // every source built for it was claimed by the
+                            // transactor-method arm first. It is on the
+                            // measured sibling's verdict because the
+                            // condition is identical, not because a probe
+                            // reached this arm.
+                            return Err(LowerError::Invalid(format!(
+                                "component `{}` has no method `{}` (on parameter `{}`)",
+                                comp.name, method.name, recv.name
+                            )));
                         }
                         return Ok(Some((
                             ComponentBase::Local(local),

@@ -5117,6 +5117,43 @@ case and only locally-determinable `Assign` types are compared).
     That is the honest form of the rule. Group by what a construct DOES
     to find the sites; measure each site anyway.
 
+79. **Six arms, two measurements (2026-08-18).**
+
+    Naming a component method that does not exist, and using a `void`
+    method's result as a value. Six arms across `stmts.rs` and
+    `components.rs` said `Unsupported` for these, and v1 emits both,
+    verbatim:
+
+    | source | v1 emits | g++ |
+    |---|---|---|
+    | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
+    | `let x = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
+
+    Both are type errors, and unlike the `connect` arms there is no
+    uninstantiated position for a statement in a run body to hide in, so
+    no backend runs either in any configuration. `Invalid`, which is
+    what `exprs.rs`'s transactor-shaped sibling has said all along.
+
+    The part worth recording is the scoping. Six arms is not six
+    measurements, and mutating each in turn says which is which:
+
+      * the resolver's path-form arm in `components.rs` — reached, and
+        the ONLY landing a missing method ever gets to.
+      * the untyped-`let` "returns no value" arm — reached.
+      * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
+        `as_component_method_call` validates the method on every path
+        that returns `Ok(Some(..))`, so a caller holding a resolved
+        method always has one. Neutering any of them fails nothing.
+      * the typed-`let` and assignment "returns no value" arms, and the
+        parameter-form resolver arm — NOT PROBED. Every source built for
+        them was claimed by a different arm first.
+
+    All six carry the same verdict, because it is one condition. Only
+    two of them carry a measurement, and each site now says which it is.
+    The alternative — reverting the four — would leave one condition
+    with two verdicts in one file; the alternative to THAT is claiming
+    four measurements that were not made.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

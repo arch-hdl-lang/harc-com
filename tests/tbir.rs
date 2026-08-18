@@ -20087,3 +20087,104 @@ end impl SpTest"#
         .expect("v1 emits the named period");
     assert!(konst < lt && lt < used, "const, then `let`, then the use");
 }
+
+/// Naming a component method that does not exist, and using a `void`
+/// method's result as a value. Six arms across two files said
+/// `Unsupported` for these — "re-run with `--codegen v1`" — and v1
+/// emits both, verbatim and uncompilable:
+///
+/// | source | v1 emits | g++ |
+/// |---|---|---|
+/// | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
+/// | `let x : uint<32> = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
+///
+/// Both are type errors: a call to a method that is not there, and a
+/// value taken from something that produces none. No backend runs
+/// either, in any configuration — unlike the `connect` arms, there is
+/// no uninstantiated position for a statement in a run body to hide in.
+/// So `Invalid`, which is what `exprs.rs`'s transactor-shaped sibling
+/// (`transactor \`{}\` has no method \`{}\``) has said all along.
+///
+/// WHAT THIS TEST ACTUALLY REACHES, because six arms is not six
+/// measurements. Mutating each arm in turn and re-running:
+///
+///   * the resolver's path-form arm in `components.rs` — reached, and
+///     the only landing for a missing method. Mutating it fails below.
+///   * the untyped-`let` "returns no value" arm in `stmts.rs` —
+///     reached. Mutating it fails below.
+///   * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
+///     `as_component_method_call` validates the method on every path
+///     that returns `Ok(Some(..))`, so a caller holding a resolved
+///     method always has one. Mutating any of them fails nothing.
+///   * the typed-`let` and assignment "returns no value" arms, and the
+///     parameter-form resolver arm — NOT PROBED. Every source built for
+///     them was claimed by another arm first. They carry their measured
+///     sibling's verdict because the condition is identical, which is
+///     stated at each site rather than implied.
+#[test]
+fn a_missing_or_void_component_method_is_a_program_error() {
+    let src = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Calc
+    acc : uint<32> default 0
+    hookable add(v: uint<8>) -> uint<32>
+        acc = acc + v
+        return acc
+    end add
+    hookable noret(v: uint<8>)
+        acc = acc + v
+    end noret
+end agent Calc
+
+test NmTest
+    let dut : Top
+    let c : Calc
+    clock clk = SysDomain
+    run
+        {call}
+    end run
+end test NmTest"#
+        )
+    };
+
+    // The control: a real method with a real return value lowers.
+    lower_src(&src(
+        "let x : uint<32> = c.add(3)\n        assert x == 3 else fail(\"x\")",
+    ))
+    .expect("the well-formed call lowers");
+
+    for (what, call, want) in [
+        (
+            "typed let, missing method",
+            "let x : uint<32> = c.nosuch(3)",
+            "has no method `nosuch`",
+        ),
+        (
+            "untyped let, missing method",
+            "let x = c.nosuch(3)",
+            "has no method `nosuch`",
+        ),
+        (
+            "typed let, void method",
+            "let x : uint<32> = c.noret(3)",
+            "returns no value",
+        ),
+        (
+            "untyped let, void method",
+            "let x = c.noret(3)",
+            "returns no value",
+        ),
+    ] {
+        let s = src(call);
+        let msg = assert_invalid(&lower_src(&s).unwrap_err());
+        assert!(msg.contains(want), "{what}: {msg}");
+
+        // v1 emits it, which is why the old suggestion was a dead end:
+        // the emitted C++ is what does not compile, one step later.
+        cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
+    }
+}

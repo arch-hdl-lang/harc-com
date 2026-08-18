@@ -860,21 +860,39 @@ impl FuncBuilder<'_> {
                             self.as_component_method_call(callee)?
                         {
                             let comp = &self.ctx.components[component.index()];
+                            // UNREACHABLE by construction, and kept only so the
+                            // condition has one verdict everywhere it is
+                            // written. `as_component_method_call` validates
+                            // the method on EVERY path that returns
+                            // `Ok(Some(..))` — the two that error do so
+                            // themselves, the two that do not are guarded by
+                            // `is_some()` — so by the time a caller holds
+                            // `(base, component, method)` the method exists.
+                            // Confirmed by mutation: neutering this arm
+                            // fails no test, because nothing reaches it.
+                            // The reachable landing is the resolver's own
+                            // arm in `components.rs`, which is where the
+                            // measurement lives.
                             let m = comp.method(&method).ok_or_else(|| {
-                                unsupported(
-                                    &format!("component `{}` has no method `{method}`", comp.name),
-                                    "",
-                                )
+                                LowerError::Invalid(format!(
+                                    "component `{}` has no method `{method}`",
+                                    comp.name
+                                ))
                             })?;
                             if !m.has_ret {
-                                return Err(unsupported(
-                                    &format!(
-                                        "`let {} : {simple} = {}.{method}(...)` — method \
-                                         `{method}` returns no value",
-                                        l.name.name, comp.name
-                                    ),
-                                    "",
-                                ));
+                                // NOT PROBED. A typed `let` over a
+                                // component method call is claimed by the
+                                // untyped handler below before it reaches
+                                // here — `let x : uint<32> = c.noret(3)`
+                                // reports that arm's wording. Kept on the
+                                // same verdict as its measured sibling
+                                // because it is the same condition, not
+                                // because this landing was measured.
+                                return Err(LowerError::Invalid(format!(
+                                    "`let {} : {simple} = {}.{method}(...)` — method \
+                                     `{method}` returns no value",
+                                    l.name.name, comp.name
+                                )));
                             }
                             self.check_component_method_result_assignable(
                                 m,
@@ -1062,20 +1080,36 @@ impl FuncBuilder<'_> {
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let Some((base, component, method)) = self.as_component_method_call(callee)? {
                 let comp = &self.ctx.components[component.index()];
+                // UNREACHABLE by construction, and kept only so the
+                // condition has one verdict everywhere it is
+                // written. `as_component_method_call` validates
+                // the method on EVERY path that returns
+                // `Ok(Some(..))` — the two that error do so
+                // themselves, the two that do not are guarded by
+                // `is_some()` — so by the time a caller holds
+                // `(base, component, method)` the method exists.
+                // Confirmed by mutation: neutering this arm
+                // fails no test, because nothing reaches it.
+                // The reachable landing is the resolver's own
+                // arm in `components.rs`, which is where the
+                // measurement lives.
                 let m = comp.method(&method).ok_or_else(|| {
-                    unsupported(
-                        &format!("component `{}` has no method `{method}`", comp.name),
-                        "",
-                    )
+                    LowerError::Invalid(format!(
+                        "component `{}` has no method `{method}`",
+                        comp.name
+                    ))
                 })?;
                 if !m.has_ret {
-                    return Err(unsupported(
-                        &format!(
-                            "`let {} = {}.{method}(...)` — method `{method}` returns no value",
-                            l.name.name, comp.name
-                        ),
-                        "",
-                    ));
+                    // MEASURED and reachable: `let x = c.noret(3)` lands
+                    // here, and v1 emits `uint64_t x = Calc_noret(c, 3);`
+                    // — g++: "void value not ignored as it ought to be".
+                    // Taking a value from something that produces none is
+                    // a program error, so `Invalid` rather than a
+                    // suggestion. Pinned by mutation.
+                    return Err(LowerError::Invalid(format!(
+                        "`let {} = {}.{method}(...)` — method `{method}` returns no value",
+                        l.name.name, comp.name
+                    )));
                 }
                 if let Some(expected) = declared_scalar_ty.clone() {
                     self.check_component_method_result_assignable(
@@ -1477,21 +1511,35 @@ impl FuncBuilder<'_> {
                         self.as_component_method_call(callee)?
                     {
                         let comp = &self.ctx.components[component.index()];
+                        // UNREACHABLE by construction, and kept only so the
+                        // condition has one verdict everywhere it is
+                        // written. `as_component_method_call` validates
+                        // the method on EVERY path that returns
+                        // `Ok(Some(..))` — the two that error do so
+                        // themselves, the two that do not are guarded by
+                        // `is_some()` — so by the time a caller holds
+                        // `(base, component, method)` the method exists.
+                        // Confirmed by mutation: neutering this arm
+                        // fails no test, because nothing reaches it.
+                        // The reachable landing is the resolver's own
+                        // arm in `components.rs`, which is where the
+                        // measurement lives.
                         let m = comp.method(&method).ok_or_else(|| {
-                            unsupported(
-                                &format!("component `{}` has no method `{method}`", comp.name),
-                                "",
-                            )
+                            LowerError::Invalid(format!(
+                                "component `{}` has no method `{method}`",
+                                comp.name
+                            ))
                         })?;
                         if !m.has_ret {
-                            return Err(unsupported(
-                                &format!(
-                                    "assignment from `{}.{method}(...)` — method \
-                                     `{method}` returns no value",
-                                    comp.name
-                                ),
-                                "",
-                            ));
+                            // NOT PROBED, same as the typed-`let` landing:
+                            // kept on its measured sibling's verdict
+                            // because the condition is identical, not
+                            // because a probe reached this arm.
+                            return Err(LowerError::Invalid(format!(
+                                "assignment from `{}.{method}(...)` — method \
+                                 `{method}` returns no value",
+                                comp.name
+                            )));
                         }
                         let expected = self.local_type(local).clone();
                         self.check_component_method_result_assignable(
