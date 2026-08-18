@@ -14905,6 +14905,95 @@ end impl TT"#
     );
 }
 
+/// Every width-method and cast verdict in the covergroup path, against
+/// what v1 actually does — 224 cells, not the handful of examples that
+/// let four rounds of defects through.
+///
+/// The rule is one-directional and cheap to state: if v1 REFUSES a
+/// program, TB-IR must not answer `Unsupported`, because that renders
+/// "re-run with `--codegen v1`" and v1 is not there. If v1 EMITS one,
+/// TB-IR must not answer `Invalid` or `NotImplemented`, because both
+/// deny an escape hatch that exists.
+///
+/// Checking it by example is what failed repeatedly. Each of these was
+/// found by enumeration and would have been caught here:
+///
+///   * `.resize<4>()` on an 8-bit value — `Invalid`, both backends
+///     compile it (the wrong-direction rule does not apply to `resize`)
+///   * `.zext<2000>()` — `Unsupported`, v1 refuses it at the 1024-bit
+///     language limit
+///   * `(as uint<300>).trunc<200>()` — `NotImplemented`, v1 builds it
+///   * `[200:0].trunc<65>()` — `NotImplemented` blaming a cast that is
+///     not in the program
+///   * `const HI = 100` + `[HI:0].zext<70>()` — `Invalid` where the
+///     literal spelling of the same program is correct, because the
+///     width inference folded and v1's does not
+#[test]
+fn covergroup_width_verdicts_agree_with_v1_across_the_grid() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "fixture shape changed");
+    // Half literal-spelled, half written with a `const` — because the
+    // width INFERENCE differs between the two and a literal-only grid
+    // misses it. Found by mutation on this very test: restoring the
+    // folding inference left an all-literal grid green while
+    // `[HI:0].zext<70>()` went back to `Invalid` on a program v1 runs.
+    const PRELUDE: &str = "const HI = 100\nconst LO = 0\nconst W8 = 8\nconst K128 = 128\n\n";
+    let receivers = [
+        "dut.count_out[3:0]",
+        "dut.count_out[7:0]",
+        "dut.count_out[100:0]",
+        "(dut.count_out as uint<128>)",
+        "(dut.count_out as uint<201>)",
+        "(dut.count_out as uint<300>)",
+        "dut.count_out",
+        "dut.count_out[HI:LO]",
+        "dut.count_out[W8 - 1:0]",
+        "dut.count_out[1 + 2:0]",
+        "(dut.count_out as uint<K128>)",
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    let mut cells = 0usize;
+    for recv in receivers {
+        for method in ["trunc", "zext", "sext", "resize"] {
+            for width in [2u32, 4, 64, 65, 128, 200, 300, 2000] {
+                let target = format!("{recv}.{method}<{width}>()");
+                let src = format!(
+                    "{PRELUDE}{}",
+                    cov.replacen(CP, &format!("cover {target}\n"), 1)
+                );
+                let tb = lower_src(&src);
+                let v1_ok = cpp_tb::emit(&merged_src(&src)).is_ok();
+                cells += 1;
+                let wrong = match (&tb, v1_ok) {
+                    // v1 refuses; TB-IR must not send the user to it.
+                    (Err(lower::LowerError::Unsupported { .. }), false) => {
+                        Some("`Unsupported` but v1 refuses it")
+                    }
+                    // v1 builds it; TB-IR must not deny the hatch.
+                    (Err(lower::LowerError::Invalid(_)), true) => {
+                        Some("`Invalid` but v1 builds it")
+                    }
+                    (Err(lower::LowerError::NotImplemented { .. }), true) => {
+                        Some("`NotImplemented` but v1 builds it")
+                    }
+                    _ => None,
+                };
+                if let Some(why) = wrong {
+                    bad.push(format!("{target}: {why}"));
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 352, "the grid changed shape");
+    assert!(
+        bad.is_empty(),
+        "{} of {cells} cells disagree with v1:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
 /// The width-method DIRECTION rule, above 64 bits and through a nested
 /// receiver — the two places it did not reach, plus the one method it
 /// must not apply to.
