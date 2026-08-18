@@ -1056,9 +1056,23 @@ impl ConstRole {
         }
     }
 
-    /// What v1 does with a bound at this role that TB-IR cannot fold —
-    /// `None` when v1 handles it correctly and `--codegen v1` is a real
-    /// way out.
+    /// What v1 does with a bound at this role that TB-IR will not use
+    /// — `None` meaning "v1 is not the problem at this role", which the
+    /// two callers turn into different verdicts because they are asking
+    /// different questions:
+    ///
+    ///   * hook parameter — TB-IR cannot FOLD it, and at the lane and
+    ///     slice roles v1 emits the argument correctly, so `None` there
+    ///     really is a working escape hatch (`Unsupported`).
+    ///   * negative fold — TB-IR folded it fine and the VALUE is out of
+    ///     range. v1 emits the negative bound and compiles, so `None`
+    ///     there is `SilentlyMisLowers`, not a way out.
+    ///
+    /// The per-role answers happen to coincide, and for unrelated
+    /// reasons: v1 refuses `.sext<0 - 8>()` because `eval_const_width`
+    /// rejects binary operators, not because the result is negative.
+    /// The alignment is measured, not structural — if a role is added,
+    /// both call sites need their own probe.
     ///
     /// Shared by every refusal path, because they kept drifting: the
     /// unresolved-name path was role-aware from the start, and the
@@ -1387,19 +1401,36 @@ fn cover_width_arg(
     // into a false escape hatch rather than into an honest verdict —
     // the same defect class the retraction was written to remove.
     if let Some(sw) = src_width {
+        // `resize` is NOT in this set. A first version put it here and
+        // made `dut.count_out[7:0].resize<4>()` `Invalid` — a program
+        // both backends previously compiled to identical C++. Three
+        // places already said so and none of them was read: the spec
+        // ("`.resize<N>()` remains direction-agnostic"), v1's own check
+        // (`"zext" | "sext" if width < sw`), and TB-IR's general
+        // expression lowering, which excludes it for the same reason.
+        // The rule was invented rather than looked up.
         let wrong_direction = match method {
             "trunc" => width >= sw,
-            "zext" | "sext" | "resize" => width < sw,
+            "zext" | "sext" => width < sw,
             _ => false,
         };
         if wrong_direction {
-            // Phrased as v1 phrases it, so a user who re-runs under
-            // `--codegen v1` reads the same sentence twice rather than
-            // wondering whether the two backends disagree.
+            // v1's sentence, verbatim — including the `≥` and the
+            // suggestion, which carry the actionable half. Saying
+            // "phrased as v1 phrases it" while printing a paraphrase
+            // left the docs quoting one string and the code printing
+            // another.
             let rule = if method == "trunc" {
-                "width must be strictly less than the source width"
+                format!(
+                    "width must be strictly less than the source width (otherwise it's a \
+                     no-op or wrong-direction). Use `.zext<{width}>()` to widen, or remove \
+                     the cast if you meant a no-op."
+                )
             } else {
-                "width must be >= the source width"
+                format!(
+                    "width must be ≥ the source width (otherwise it narrows, wrong \
+                     direction). Use `.trunc<{width}>()` to narrow."
+                )
             };
             return Err(LowerError::Invalid(format!(
                 "covergroup `{group}` point `{point}` `.{method}<{width}>()` on a \
@@ -1425,9 +1456,37 @@ fn cover_width_arg(
         // every value whose low nibble has bit 3 set. So the honest
         // answer is the one the arm gave before: refuse, and point at
         // the backend that gets it right.
-        // What is left after the direction check is a cast v1 really
-        // does build: `harc_trunc_u128` / `harc_sext_u128` /
-        // `(_harc_u128)`, all of which compile and keep the extra bits.
+        // Split at 128 exactly as `cover_cast_width` does, and for the
+        // same measured reason — which this arm did not do, so a
+        // `>128` CAST underneath a `>64` width method lost the accurate
+        // verdict: `(dut.count_out as uint<300>).trunc<200>()` came out
+        // `Unsupported` while v1 gives "no matching function for call
+        // to `harc_rt::HarcWide<10>::HarcWide(__int128 unsigned)`".
+        //
+        // That is the very leak `CastWidthPolicy` was introduced to
+        // close, reappearing one arm over: `Report` suppresses the
+        // cast's own refusal, so this arm has to carry it.
+        // The `>128` failure belongs to the CAST, not to this method:
+        // measured, `[3:0].zext<200>()` and `[3:0].sext<200>()` emit v1
+        // output that COMPILES (the `harc_wide_*` helpers take a
+        // narrow argument), while `as uint<300>` gives "no matching
+        // function for call to `harc_rt::HarcWide<10>::HarcWide(__int128
+        // unsigned)`" whether or not a width method wraps it. So the
+        // condition is the SOURCE width, not this one — a first version
+        // used `max(width, src_width)` and reported `.zext<200>()` on a
+        // 4-bit slice as uncompilable when it is not.
+        if src_width.is_some_and(|sw| sw > 128) {
+            return Err(not_implemented(
+                &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
+                "the TB-IR covergroup expression model is 64-bit, and the receiver's own \
+                 cast is one v1 cannot build: above 128 bits it reaches for a \
+                 `harc_rt::HarcWide<N>` with no constructor from a 128-bit temporary",
+                V1Status::EmitsUncompilable,
+            ));
+        }
+        // What is left is a cast v1 really does build — `_harc_u128`
+        // and the `harc_*_u128` helpers — which compile and keep the
+        // extra bits.
         return Err(unsupported(
             &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
             "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \

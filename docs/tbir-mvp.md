@@ -5823,6 +5823,70 @@ case and only locally-determinable `Assign` types are compared).
     verdict, from a single `ConstRole::v1_on_unfoldable` the refusal
     paths share, because keeping them in step by hand did not work.
 
+95. **A rule invented instead of looked up, and a leak reopened one
+    arm over (2026-08-18).**
+
+    Round four, on the commit whose subject was round three. Three
+    blocking findings.
+
+    **`resize` is direction-agnostic, and I made it an error.** The
+    direction check moved into `cover_width_arg` with the arm written
+    as `"zext" | "sext" | "resize" => width < sw`. So
+    `dut.count_out[7:0].resize<4>()` became `Invalid` — "a program
+    error under every backend in every reachable configuration" — for a
+    construct both backends had been compiling to identical C++
+    (`((count_out >> 0) & 0xFF) & 0xF` under TB-IR, the same value
+    under v1, g++ clean).
+
+    Three places already said so, and none was read before the rule was
+    written: the spec ("`.resize<N>()` remains direction-agnostic"),
+    v1's own check (`"zext" | "sext" if width < sw`), and TB-IR's
+    general expression lowering, which excludes it for the same reason.
+    The covergroup path is a THIRD implementation of a rule stated
+    twice already; writing it from intuition rather than copying it is
+    what put a method in the set that does not belong there.
+
+    **The `>128` verdict leaked.** `CastWidthPolicy::Report` was
+    introduced so the direction check could see a wide cast's width
+    without the cast refusing first. It also suppressed the `>128`
+    refusal, and `cover_width_arg` had no split at 128 to carry it —
+    so `(dut.count_out as uint<300>).trunc<200>()` came out
+    `Unsupported` where v1 gives "no matching function for call to
+    `harc_rt::HarcWide<10>::HarcWide(__int128 unsigned)`". Exactly the
+    false escape hatch the policy split's own doc-comment describes,
+    reappearing one arm along.
+
+    Fixing it took a second measurement, because the obvious condition
+    was wrong too: `max(width, src_width) > 128` reports
+    `[3:0].zext<200>()` as uncompilable, and it is not — the
+    `harc_wide_*` helpers take a narrow argument and g++ accepts them.
+    The `HarcWide` constructor failure belongs to the CAST, so the
+    condition is the SOURCE width alone.
+
+    **And none of the three claims was pinned.** 485 tests stayed green
+    under a mutation reverting each: the direction check back below the
+    `>64` refusal, the nested receiver width back to `None`, and
+    `Report` back to `Refuse`. Fourth consecutive round of this
+    finding, on the commit whose subject is that finding — the previous
+    entry named the pattern and then repeated it in the same breath.
+
+    Naming it again is clearly not enough, so: the rule now is that a
+    guard and its mutation test are one edit. Not "add the guard, then
+    add a test" — the mutation is how you find out the guard is
+    load-bearing at all, and running it after the fact is what keeps
+    getting skipped.
+
+    Two smaller ones from the same round. The negative-fold test
+    asserted its MESSAGE and not its verdict, so replacing the arm with
+    the `Invalid` the previous entry spends four paragraphs rejecting
+    left it green; it asserts the verdict now, at all three roles
+    rather than one. And `v1_on_unfoldable`'s doc said `None` meant
+    "`--codegen v1` is a real way out", which is true at the
+    hook-parameter site and false at the negative-fold one — the two
+    callers ask different questions and their answers coincide for
+    unrelated reasons, which the comment now records as measured rather
+    than structural.
+
 ### The probe method
 
 Every classification above came from the same mechanical check rather

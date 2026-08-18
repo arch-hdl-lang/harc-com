@@ -4896,9 +4896,12 @@ test BadWidthDirection
 end test
 "#;
     let err = lower_src(src_wrong_direction).unwrap_err();
+    // v1's sentence verbatim, `≥` and suggestion included — the
+    // covergroup path used to print an ASCII paraphrase while claiming
+    // to quote v1.
     assert!(
         err.to_string()
-            .contains("width must be >= the source width"),
+            .contains("width must be ≥ the source width (otherwise it narrows, wrong direction). Use `.trunc<2>()` to narrow."),
         "{err}"
     );
 }
@@ -14902,6 +14905,103 @@ end impl TT"#
     );
 }
 
+/// The width-method DIRECTION rule, above 64 bits and through a nested
+/// receiver — the two places it did not reach, plus the one method it
+/// must not apply to.
+///
+/// The check used to sit below the `>64` refusal, so it was unreachable
+/// for exactly the widths that need it; and `cover_infer_expr_width`
+/// passed `None` for a nested receiver, so `[3:0].trunc<128>()` was
+/// `Invalid` alone and `Unsupported` the moment anything wrapped it.
+/// Neither fix was pinned by anything: reverting either left the whole
+/// suite green.
+///
+/// `resize` is NOT subject to the rule. The spec says so
+/// ("`.resize<N>()` remains direction-agnostic"), v1's own check reads
+/// `"zext" | "sext"`, and TB-IR's general expression lowering excludes
+/// it — three statements of the rule, none of them read before it was
+/// invented, which made `dut.count_out[7:0].resize<4>()` a "program
+/// error" that both backends had been compiling to identical C++.
+#[test]
+fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+
+    // Above 64, where the check could not previously run. v1 refuses
+    // each of these, which is what makes `Invalid` right rather than a
+    // `--codegen v1` suggestion.
+    for t in [
+        "dut.count_out[100:0].zext<70>()",
+        "dut.count_out[100:0].sext<70>()",
+        "(dut.count_out as uint<128>).zext<100>()",
+    ] {
+        let src = slice(t);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("width must be ≥ the source width"),
+            "`{t}`: {msg}"
+        );
+        let e = cpp_tb::emit(&merged_src(&src)).expect_err("v1 refuses it too");
+        assert!(
+            e.to_string().contains("width must be ≥ the source width"),
+            "`{t}`: v1's sentence is the one TB-IR prints: {e}"
+        );
+    }
+
+    // Through a NESTED width method: the inner program is refused
+    // whether or not something wraps it.
+    let bare = slice("dut.count_out[3:0].trunc<128>()");
+    let wrapped = slice("dut.count_out[3:0].trunc<128>().zext<128>()");
+    let bare_msg = assert_invalid(&lower_src(&bare).unwrap_err());
+    let wrapped_msg = assert_invalid(&lower_src(&wrapped).unwrap_err());
+    assert_eq!(
+        bare_msg, wrapped_msg,
+        "a wrapper must not change the inner program's verdict"
+    );
+
+    // `resize` narrows or widens as it likes, at any width.
+    for t in [
+        "dut.count_out[7:0].resize<4>()",
+        "dut.count_out[7:0].resize<32>()",
+        "dut.count_out[3:0].trunc<2>().resize<1>()",
+    ] {
+        emit_cpp_src(&slice(t));
+        cpp_tb::emit(&merged_src(&slice(t)))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 builds it too: {e}"));
+    }
+
+    // Equal widths: `trunc` is a no-op and refused, the widening pair
+    // is accepted. Both backends agree.
+    let eq_trunc = slice("dut.count_out[7:0].trunc<8>()");
+    assert_invalid(&lower_src(&eq_trunc).unwrap_err());
+    cpp_tb::emit(&merged_src(&eq_trunc)).expect_err("v1 refuses a no-op trunc");
+    emit_cpp_src(&slice("dut.count_out[7:0].zext<8>()"));
+
+    // Above 128 the receiver's CAST is what v1 cannot build, and the
+    // width method has to say so — `CastWidthPolicy::Report` suppresses
+    // the cast's own refusal to feed the direction check, so this arm
+    // carries it instead.
+    let wide = slice("(dut.count_out as uint<300>).trunc<200>()");
+    let msg = assert_not_implemented(
+        &lower_src(&wide).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("`.trunc<200>()`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it, badly");
+    assert!(v1.contains("HarcWide<10>"), "{v1}");
+    // …while a wide width method over a NARROW receiver is fine under
+    // v1, so it keeps the suggestion. The condition is the source
+    // width, not this one.
+    for t in [
+        "dut.count_out[3:0].zext<200>()",
+        "dut.count_out[3:0].sext<200>()",
+    ] {
+        assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        cpp_tb::emit(&merged_src(&slice(t))).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
+    }
+}
+
 /// The hook-parameter guard on the four constant ROLES, and the
 /// negative-fold verdict — both added in response to review and
 /// neither pinned by anything, which review round three caught by
@@ -15031,16 +15131,38 @@ fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
     // A negative WIDTH is a different role and takes that role's
     // verdict, not the lane one.
     let cov = fixture("cov_expr_targets_test.harc");
-    let msg = format!(
-        "{}",
-        lower_src(&cov.replacen(
-            "cover dut.count_out[3:0]\n",
-            "cover dut.count_out[3:0].sext<0 - 8>()\n",
-            1
-        ))
-        .unwrap_err()
+    // …and the VERDICT, not just the message. A first version asserted
+    // only `contains("width-method width -8")`, which survives
+    // replacing the whole arm with the `Invalid` the commit spends four
+    // paragraphs calling wrong.
+    let neg = |t: &str| cov.replacen("cover dut.count_out[3:0]\n", &format!("cover {t}\n"), 1);
+    let msg = assert_not_implemented(
+        &lower_src(&neg("dut.count_out[3:0].sext<0 - 8>()")).unwrap_err(),
+        lower::V1Status::Rejects,
     );
     assert!(msg.contains("width-method width -8"), "{msg}");
+
+    // The other two roles take their own verdicts, and neither was
+    // covered at all.
+    let msg = assert_not_implemented(
+        &lower_src(&neg("dut.count_out[0 - 1:0]")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("bit-slice bound -1"), "{msg}");
+
+    let msg = assert_not_implemented(
+        &lower_src(&neg("(dut.count_out as uint<0 - 8>)")).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("cast width -8"), "{msg}");
+    // v1 drops a cast width rather than resolving it, which is why
+    // that role is `SilentlyMisLowers` and not `Rejects`.
+    let v1 = cpp_tb::emit(&merged_src(&neg("(dut.count_out as uint<0 - 8>)")))
+        .expect("v1 emits it, width and all");
+    assert!(
+        v1.contains("(uint64_t)(harc_rt::harc_read(dut->count_out))"),
+        "v1 emits a plain 64-bit cast: {v1}"
+    );
 }
 
 /// A width above 64 bits is REFUSED, not clamped — and an earlier
