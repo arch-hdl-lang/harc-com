@@ -445,6 +445,7 @@ pub(crate) fn lower_transactor(
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         // A method body could host `randomize`, but the constraint-IR
         // problem table only catalogs test/tseq sites — so these stay
         // empty and a method-body `randomize` lowers with no problem-id
@@ -527,6 +528,7 @@ pub(crate) fn lower_transactor(
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             has_ret: f.ret.is_some(),
+            hookable: h.is_hookable,
             active_only,
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),
@@ -803,6 +805,7 @@ fn lower_bound_target_transactor(
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         // Responder bodies are not cataloged in the constraint-IR
         // problem table; a `randomize` here lowers with no problem-id.
         txn_keeps: HashMap::new(),
@@ -1332,6 +1335,7 @@ fn lower_bound_initiator_transactor(
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
@@ -1415,6 +1419,7 @@ fn lower_bound_initiator_transactor(
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             has_ret: f.ret.is_some(),
+            hookable: h.is_hookable,
             active_only,
             pre_hooks: Vec::new(),
             post_hooks: Vec::new(),

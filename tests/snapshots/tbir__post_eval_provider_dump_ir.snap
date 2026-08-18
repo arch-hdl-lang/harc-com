@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 PostEvalProviderTb { dut: PostEvalProvider }
+  testbench tb0 PostEvalProviderTb { dut: PostEvalProvider } component model=c0 active component sb=c1 component responder=c2 active
   test PostEvalProviderTest tb=tb0 run=fn3 check=-
   record r0 ReadResponse
     matched : uint<1>
@@ -25,7 +25,7 @@ tb-ir program
     field pending_data : scalar = 0
     field queued : scalar = 0
     field queued_data : scalar = 0
-    on 1 cycles phase post_eval = fn2
+    on 1 cycles phase post_eval active-only = fn2
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   params:

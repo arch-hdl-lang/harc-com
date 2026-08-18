@@ -963,9 +963,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for it in &file.items {
         match it {
             Item::Const(c) => {
-                let folded = fold_const(&c.value, &const_vals, &c.name.name).and_then(|v| {
-                    check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid)
-                });
+                let folded = fold_const(&c.value, &const_vals, &c.name.name)
+                    .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
                 let v = match folded {
                     Ok(v) => v,
                     Err(ConstFoldErr::Unsupported(detail)) => {
@@ -1117,7 +1116,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
     for it in record_order {
         let schema = match it {
-            Item::Transaction(t) => records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?,
+            Item::Transaction(t) => {
+                records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?
+            }
             Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids, &const_vals)?,
             _ => unreachable!("record_order holds only transactions and structs"),
         };
@@ -1257,7 +1258,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // A pure analysis-source transactor (event port + no DUT
             // field) routes to the composite-component table instead of
             // the DUT-poking `TransactorSchema` (classified below).
-            if components::transactor_is_component(t, env_held(t)) {
+            if components::transactor_is_component(t, env_held(t), &record_ids) {
                 continue;
             }
             if transactor_ids
@@ -1318,7 +1319,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 Some(c.name.name.clone())
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -1328,6 +1331,60 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 Some(c.name.name.clone())
             }
             Item::Sequencer(c) => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Analysis-source transactors deliberately route through the composite
+    // component table, but unlike envs and scoreboards they retain the
+    // transactor mode contract at a direct testbench binding.
+    let mode_sensitive_analysis_source_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t)
+                if components::transactor_has_mode_sensitive_analysis_surface(t, &record_ids) =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Always-on analysis monitors have no active surface to select. Keep the
+    // #538 compatibility policy even when another shape classifier also sees
+    // them (for example, because they have a periodic observation handler):
+    // modeless and `passive` are valid, while `active` is meaningless.
+    let always_on_analysis_source_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t)
+                if components::transactor_is_analysis_source(t, &record_ids)
+                    && !components::transactor_has_mode_sensitive_analysis_surface(
+                        t,
+                        &record_ids,
+                    ) =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Preserve the source declaration kind after shape-based routing into the
+    // component table. This distinguishes always-on transactor monitors (where
+    // `passive` is a compatible ownership annotation) from actual structural
+    // env/agent/scoreboard/sequencer fields, which reject transactor modes.
+    let component_transactor_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
+                Some(t.name.name.clone())
+            }
             _ => None,
         })
         .collect();
@@ -1507,6 +1564,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &transactor_ids,
                         &scoreboard_ids,
                         &component_type_names,
+                        &mode_sensitive_analysis_source_names,
+                        &always_on_analysis_source_names,
+                        &component_transactor_names,
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
                         &dut_poking_bfm_names,
@@ -1674,6 +1734,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         // Pure helpers cannot hold record locals, so `randomize` can
         // never fire in one — these maps stay inert here.
         txn_keeps: HashMap::new(),
@@ -1741,6 +1802,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         target_state: HashMap::new(),
         components: Vec::new(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         txn_keeps: txn_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
@@ -1762,7 +1824,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
-        if components::transactor_is_component(t, env_held(t)) {
+        if components::transactor_is_component(t, env_held(t), &record_ids) {
             continue;
         }
         let id = TransactorId(prog.transactors.len() as u32);
@@ -1799,7 +1861,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 (&c.name.name, components::CompSource::Scoreboard(c))
             }
-            Item::Transactor(t) if components::transactor_is_component(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_component(t, env_held(t), &record_ids) =>
+            {
                 (&t.name.name, components::CompSource::Transactor(t))
             }
             Item::Env(c) if matches!(c.kind, crate::ast::ComponentKind::Env) => {
@@ -1884,6 +1948,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         )?;
         prog.components.push(schema);
     }
+    components::validate_mode_metadata(&prog.components)?;
     // Pass 1b: resolve `connect` edges (env + agent components — both carry
     // a `connect` block wiring their sub-components), now that every
     // component schema (fields + methods) exists. An agent's
@@ -1940,6 +2005,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         target_state: HashMap::new(),
         components: prog.components.clone(),
         component_fields: HashMap::new(),
+        component_modes: HashMap::new(),
         // Component method bodies are not cataloged in the constraint-IR
         // problem table; a `randomize` inside one lowers with no
         // problem-id (v1's nullptr-descriptor fallback).
@@ -2247,6 +2313,9 @@ fn validate_testbench_component(
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
+    mode_sensitive_analysis_source_names: &HashSet<String>,
+    always_on_analysis_source_names: &HashSet<String>,
+    component_transactor_names: &HashSet<String>,
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
     dut_poking_bfm_names: &HashSet<String>,
@@ -2285,6 +2354,32 @@ fn validate_testbench_component(
                 if let TypeExpr::Named { name, mode, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     if covgroup_ids.contains_key(simple) {
+                        continue;
+                    }
+                    if mode_sensitive_analysis_source_names.contains(simple) {
+                        match mode {
+                            Some(TransactorMode::Active) | Some(TransactorMode::Passive) => {
+                                continue;
+                            }
+                            None => {
+                                return Err(LowerError::Invalid(format!(
+                                    "analysis-source transactor field `{}.{} : {simple}` has no \
+                                     effective active/passive mode",
+                                    c.name.name, f.name.name
+                                )));
+                            }
+                        }
+                    }
+                    if always_on_analysis_source_names.contains(simple) {
+                        if matches!(mode, Some(TransactorMode::Active)) {
+                            return Err(LowerError::Invalid(format!(
+                                "an `active` mode on composite-component testbench field \
+                                 `{}.{} : {simple}` is invalid: only the passive ownership \
+                                 annotation is accepted for an always-on analysis-source \
+                                 component field",
+                                c.name.name, f.name.name
+                            )));
+                        }
                         continue;
                     }
                     // A reactive monitor / checker transactor field (`mon :
@@ -2431,31 +2526,35 @@ fn validate_testbench_component(
                         }
                     }
                     // A composite-component type (method-bearing
-                    // scoreboard, analysis-source transactor, env, or
-                    // agent) bound as a testbench field. Accepted by the
-                    // testbench-field-binding slice: the field routes to a
-                    // `ComponentSchema` instance just like a test-scope
-                    // `let env : <Env>` does. A `mode` (active/passive) is
-                    // meaningless on a composite component (that keyword is
-                    // a transactor concept), so reject it rather than
-                    // silently drop it.
+                    // scoreboard, always-on analysis monitor, env, or
+                    // agent) bound as a testbench field. A mode is not a
+                    // property of these structural fields. `passive` stays
+                    // accepted for the legacy analysis-monitor ownership
+                    // annotation; `active` remains a loud rejection. Mode
+                    // inheritance for nested transactors starts at a
+                    // test-scope `let`, not at a reusable testbench field.
                     if component_type_names.contains(simple) {
-                        if matches!(mode, Some(TransactorMode::Active)) {
-                            return Err(unsupported(
-                                &format!(
-                                    "an `active` mode on composite-component \
-                                     testbench field `{}.{} : {simple}`",
-                                    c.name.name, f.name.name
-                                ),
-                                "only the passive ownership annotation is accepted for an \
-                                 analysis-source component field",
-                            ));
+                        if component_transactor_names.contains(simple) {
+                            if matches!(mode, Some(TransactorMode::Active)) {
+                                return Err(unsupported(
+                                    &format!(
+                                        "an `active` mode on composite-component \
+                                         testbench field `{}.{} : {simple}`",
+                                        c.name.name, f.name.name
+                                    ),
+                                    "only the passive ownership annotation is accepted for an \
+                                     analysis-source component field",
+                                ));
+                            }
+                            continue;
                         }
-                        // v1 requires a mode at this declaration site for
-                        // analysis-source transactors even though their
-                        // methods remain callable host-side. `passive` is
-                        // therefore retained as an ownership annotation;
-                        // it does not suppress method or connect emission.
+                        if mode.is_some() {
+                            return Err(LowerError::Invalid(format!(
+                                "a transactor mode on structural component field `{}.{} : \
+                                 {simple}`",
+                                c.name.name, f.name.name
+                            )));
+                        }
                         continue;
                     }
                     if scoreboard_ids.contains_key(simple) {
@@ -2481,7 +2580,9 @@ fn validate_testbench_component(
                         // Multiple passive instances each get their own
                         // per-instance state struct (see `lower_test`).
                         match mode {
-                            Some(TransactorMode::Active) | Some(TransactorMode::Passive) => continue,
+                            Some(TransactorMode::Active) | Some(TransactorMode::Passive) => {
+                                continue
+                            }
                             None => {
                                 // MEASURED, same as the event-driven
                                 // arm above: v1 refuses too, with
@@ -2784,7 +2885,11 @@ fn lower_test(
     // Test-scope composite-component instances (`let env : AnalysisEnv`),
     // collected as (name, component id). Emitted as plain run-scope
     // locals + their `connect` push_backs.
-    let mut test_scope_components: Vec<(String, ir::ComponentId)> = Vec::new();
+    let mut test_scope_components: Vec<(
+        String,
+        ir::ComponentId,
+        Option<ir::ComponentInstanceMode>,
+    )> = Vec::new();
     // Bound-to target-side TLM responder instances (`let target : X
     // passive = bind <busbinding>`), collected as (instance, transactor
     // id, bus-binding field). Validated after the bus bindings are known.
@@ -3318,7 +3423,11 @@ fn lower_test(
                     }
                 }
                 let cid = component_ids[simple];
-                test_scope_components.push((l.name.name.clone(), cid));
+                test_scope_components.push((
+                    l.name.name.clone(),
+                    cid,
+                    component_mode_from_type(l.ty.as_ref()),
+                ));
             }
             // Test-scope unbound-transactor instance: `let h : MemHelper
             // active` (no `= bind`). v1 routes regblock frontdoor calls
@@ -3674,7 +3783,11 @@ fn lower_test(
                             // `prog.transactors`), so it lands here and not
                             // in the data-only routes above.
                             if let Some(cid) = component_ids.get(simple) {
-                                test_scope_components.push((f.name.name.clone(), *cid));
+                                test_scope_components.push((
+                                    f.name.name.clone(),
+                                    *cid,
+                                    component_mode_from_type(Some(&f.ty)),
+                                ));
                                 testbench_component_fields.push((f.name.name.clone(), *cid));
                             }
                         } else if let TypeExpr::Builtin {
@@ -3864,12 +3977,7 @@ fn lower_test(
     // Instance names of `active` bound event-driven transactors — their
     // `on <ev>` driver re-lowers into a queue-fed worker coroutine under
     // `--mt`. Carried onto each `ComponentFieldBinding` below.
-    let mut active_bound_instances: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     for (instance, cid, bus_field, active) in &bound_event_component_binds {
-        if *active {
-            active_bound_instances.insert(instance.clone());
-        }
         // The bound bus binding must be a `let <bus_field> : <Bus> =
         // bind dut` declared in this test, of the component's bound bus.
         let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
@@ -3941,14 +4049,24 @@ fn lower_test(
         // Register as a composite-component instance (same machinery as
         // `let env : AnalysisEnv`): `emit xact.req(t)` fires the handler,
         // `xact.<state>` reads the per-instance state.
-        test_scope_components.push((instance.clone(), *cid));
+        test_scope_components.push((
+            instance.clone(),
+            *cid,
+            Some(if *active {
+                ir::ComponentInstanceMode::Active
+            } else {
+                ir::ComponentInstanceMode::Passive
+            }),
+        ));
     }
     // Composite-component instances → schema bindings (with the env's
     // resolved `connect` edges). A name collision with another binding
     // class would resolve ambiguously, so reject it.
     let mut component_field_map: HashMap<String, ir::ComponentId> = HashMap::new();
+    let mut component_field_modes: HashMap<String, Option<ir::ComponentInstanceMode>> =
+        HashMap::new();
     let mut component_field_bindings: Vec<ir::ComponentFieldBinding> = Vec::new();
-    for (field, cid) in &test_scope_components {
+    for (field, cid, mode) in &test_scope_components {
         if transactor_fields.iter().any(|(f, _)| f == field)
             || bus_binding_decls.contains_key(field)
             || component_field_map.contains_key(field)
@@ -3959,11 +4077,12 @@ fn lower_test(
             )));
         }
         component_field_map.insert(field.clone(), *cid);
+        component_field_modes.insert(field.clone(), *mode);
         component_field_bindings.push(ir::ComponentFieldBinding {
             field: field.clone(),
             component: *cid,
             connects: prog.components[cid.index()].connects.clone(),
-            active: active_bound_instances.contains(field),
+            mode: *mode,
         });
     }
 
@@ -4295,7 +4414,8 @@ fn lower_test(
             let method_fns: Vec<usize> =
                 xschema.methods.iter().map(|m| m.function.index()).collect();
             for fidx in method_fns {
-                if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field) {
+                if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field)
+                {
                     return Err(unsupported(
                         &format!(
                             "bound-to initiator transactor `{xname}` instantiated more than \
@@ -4426,9 +4546,16 @@ fn lower_test(
             }
         })?;
         let xschema = prog.transactor(xid);
-        if xschema.method(&method).is_none() {
+        let Some(target_method) = xschema.method(&method) else {
             return Err(LowerError::Invalid(format!(
                 "`on {xfield}.{method}` hook: transactor `{}` declares no method `{method}`",
+                xschema.name
+            )));
+        };
+        if !target_method.hookable {
+            return Err(LowerError::Invalid(format!(
+                "`on {xfield}.{method}` hook: `{xfield}.{method}` does not name a `hookable` \
+                 method on transactor `{}`",
                 xschema.name
             )));
         }
@@ -4441,10 +4568,8 @@ fn lower_test(
         // method's param names (a test-let sharing a param name resolves to
         // the param, not the promoted cell).
         let mut hook_scope = HashSet::new();
-        if let Some(m) = xschema.method(&method) {
-            for p in &prog.function(m.function).params {
-                hook_scope.insert(p.name.clone());
-            }
+        for p in &prog.function(target_method.function).params {
+            hook_scope.insert(p.name.clone());
         }
         collect_promotable_check_reads(&h.body, &test_let_names, &hook_scope, &mut promoted_lets);
         resolved_hooks.push((xid, method, *side, h));
@@ -4581,6 +4706,14 @@ fn lower_test(
     }
 
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
+    ir::validate_component_binding_modes(&prog.components, &component_field_bindings).map_err(
+        |err| {
+            LowerError::Invalid(format!(
+                "test `{}` has invalid component instance modes: {err}",
+                t.name.name
+            ))
+        },
+    )?;
     prog.testbenches.push(TestbenchSchema {
         name: tb_schema_name,
         dut_field: "dut".to_string(),
@@ -4782,6 +4915,7 @@ fn lower_test(
         target_state,
         components: prog.components.clone(),
         component_fields: component_field_map,
+        component_modes: component_field_modes,
         txn_keeps: txn_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
@@ -5566,6 +5700,20 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     }
 }
 
+fn component_mode_from_type(t: Option<&TypeExpr>) -> Option<ir::ComponentInstanceMode> {
+    match t? {
+        TypeExpr::Named {
+            mode: Some(TransactorMode::Active),
+            ..
+        } => Some(ir::ComponentInstanceMode::Active),
+        TypeExpr::Named {
+            mode: Some(TransactorMode::Passive),
+            ..
+        } => Some(ir::ComponentInstanceMode::Passive),
+        _ => None,
+    }
+}
+
 fn is_tb_dut_wire(s: &AstStmt) -> bool {
     let StmtKind::Assign { target, value } = &s.kind else {
         return false;
@@ -5828,6 +5976,9 @@ pub(crate) struct LowerCtx {
     /// resolves through the component path machinery (`env.source.publish`,
     /// `env.sb.count`). Empty in helper/method/transactor contexts.
     pub component_fields: HashMap<String, ir::ComponentId>,
+    /// Declared root mode for a component instance. Structural roots use this
+    /// only as inherited context for nested transactor fields.
+    pub component_modes: HashMap<String, Option<ir::ComponentInstanceMode>>,
     /// Per-transaction `keep` constraint clauses as AST expressions, by
     /// transaction name. Merged ahead of a `randomize(t)` call-site
     /// `with {...}` body (v1's spec-§4 merge) when building the
@@ -6141,6 +6292,10 @@ pub(crate) struct FuncBuilder<'a> {
     /// relatively (`Expr::ComponentField { base: SelfField }`), and
     /// `emit <ev>(...)` resolves against the body's `out event` fields.
     pub(crate) self_component: Option<ir::ComponentId>,
+    /// Whether the currently lowered component body itself came from
+    /// `when active`; prevents an always-on body from backdoor-accessing an
+    /// active-only sibling member.
+    pub(crate) self_component_active_only: bool,
     /// Program-wide side tables, shared across every function lowered
     /// for one program so the handles minted from them are globally
     /// unique. A `randomize` site appends a `ConstraintSite` and the
@@ -6492,6 +6647,7 @@ impl<'a> FuncBuilder<'a> {
             in_test_body: false,
             let_widths: HashMap::new(),
             self_component: None,
+            self_component_active_only: false,
             side_tables,
             recv_payloads: HashMap::new(),
             temporal_slots: HashMap::new(),
@@ -6858,9 +7014,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
             ir::Expr::BitSlice { target, .. } => in_expr(target),
-            ir::Expr::BitSliceDyn { target, hi, lo } => {
-                in_expr(target).or_else(|| in_expr(hi)).or_else(|| in_expr(lo))
-            }
+            ir::Expr::BitSliceDyn { target, hi, lo } => in_expr(target)
+                .or_else(|| in_expr(hi))
+                .or_else(|| in_expr(lo)),
             ir::Expr::Ternary(c, t, f) => in_expr(c).or_else(|| in_expr(t)).or_else(|| in_expr(f)),
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.

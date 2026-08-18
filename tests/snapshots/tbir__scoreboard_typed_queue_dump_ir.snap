@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 Tb { dut: ScoreboardTypedQueue }
+  testbench tb0 Tb { dut: ScoreboardTypedQueue } component sb=c0 component checker=c1 active
   test ScoreboardTypedQueueTest tb=tb0 run=fn2 check=-
   record r0 CheckerError
     checker_id : uint<8>
@@ -16,7 +16,7 @@ tb-ir program
   component c1 Checker (transactor)
     field dut : dut ScoreboardTypedQueue
     field sb : sub c0
-    on 1 cycles phase post_eval = fn1
+    on 1 cycles phase post_eval active-only = fn1
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   params:

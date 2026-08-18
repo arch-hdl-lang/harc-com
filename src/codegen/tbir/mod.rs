@@ -842,9 +842,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         ComponentQueuePop { .. }
         | ComponentSubAssign { .. }
         | TransactorStateQueuePop { .. }
-        | TbQueuePop { .. } => {
-            false
-        }
+        | TbQueuePop { .. } => false,
         TlmFork(desc) => desc.args.iter().any(expr_has_probe),
         TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
         // The check BODY is a program-level schema, not a statement
@@ -1631,7 +1629,7 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
         }
         visited[i] = true;
         for f in &prog.components[i].fields {
-            if let ir::ComponentFieldKind::Sub { component } = &f.kind {
+            if let ir::ComponentFieldKind::Sub { component, .. } = &f.kind {
                 visit(component.index(), prog, visited, order);
             }
         }
@@ -1641,6 +1639,32 @@ fn component_emit_order(prog: &TbProgram) -> Vec<usize> {
         visit(i, prog, &mut visited, &mut order);
     }
     order
+}
+
+fn edge_is_enabled(
+    prog: &TbProgram,
+    owner: ir::ComponentId,
+    inherited: Option<ir::ComponentInstanceMode>,
+    edge: &ir::ConnectEdgeSchema,
+) -> bool {
+    let source_mode = ir::resolve_component_path_mode(
+        &prog.components,
+        owner,
+        inherited,
+        &edge.src_path,
+    )
+    .expect("verified component connect source path")
+    .effective_mode;
+    let sink_mode = ir::resolve_component_path_mode(
+        &prog.components,
+        owner,
+        inherited,
+        &edge.sink_path,
+    )
+    .expect("verified component connect sink path")
+    .effective_mode;
+    ir::component_mode_includes_activation(source_mode, edge.src_activation)
+        && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
 }
 
 /// Register every `on <ev>(arg)` handler on `component` (and nested
@@ -1660,10 +1684,14 @@ fn emit_on_handler_regs(
     // sub-components are still registered normally. Always `false` on the
     // cooperative-default path, so default output is unchanged.
     skip_top_on_handlers: bool,
+    mode: Option<ir::ComponentInstanceMode>,
 ) {
     let comp = &prog.components[component.index()];
     if !skip_top_on_handlers {
         for oh in &comp.on_handlers {
+            if !ir::component_mode_includes_activation(mode, oh.activation) {
+                continue;
+            }
             let lambda = func::on_handler_lambda_name(comp, oh);
             writeln!(
                 out,
@@ -1675,9 +1703,23 @@ fn emit_on_handler_regs(
     }
     // Recurse into by-value sub-components (an env holding an agent).
     for f in &comp.fields {
-        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+        if let ir::ComponentFieldKind::Sub { component: sub, .. } = &f.kind {
             let sub_path = format!("{inst_path}.{}", f.name);
-            emit_on_handler_regs(out, prog, *sub, &sub_path, false);
+            emit_on_handler_regs(
+                out,
+                prog,
+                *sub,
+                &sub_path,
+                false,
+                ir::resolve_component_path_mode(
+                    &prog.components,
+                    component,
+                    mode,
+                    std::slice::from_ref(&f.name),
+                )
+                .expect("verified nested component path")
+                .effective_mode,
+            );
         }
     }
 }
@@ -1740,16 +1782,27 @@ fn emit_nested_connects(
     prog: &TbProgram,
     component: ir::ComponentId,
     inst_path: &str,
+    mode: Option<ir::ComponentInstanceMode>,
 ) {
     let comp = &prog.components[component.index()];
     for f in &comp.fields {
-        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+        if let ir::ComponentFieldKind::Sub { component: sub, .. } = &f.kind {
             let sub_path = format!("{inst_path}.{}", f.name);
             let sub_comp = &prog.components[sub.index()];
+            let sub_mode = ir::resolve_component_path_mode(
+                &prog.components,
+                component,
+                mode,
+                std::slice::from_ref(&f.name),
+            )
+            .expect("verified nested component path")
+            .effective_mode;
             for edge in &sub_comp.connects {
-                emit_one_connect(out, prog, &sub_path, edge);
+                if edge_is_enabled(prog, *sub, sub_mode, edge) {
+                    emit_one_connect(out, prog, &sub_path, edge);
+                }
             }
-            emit_nested_connects(out, prog, *sub, &sub_path);
+            emit_nested_connects(out, prog, *sub, &sub_path, sub_mode);
         }
     }
 }
@@ -1772,12 +1825,16 @@ fn emit_lifecycle_checkers(
     prog: &TbProgram,
     component: ir::ComponentId,
     inst_path: &str,
+    mode: Option<ir::ComponentInstanceMode>,
 ) -> Result<(), EmitError> {
     let comp = &prog.components[component.index()];
     // A valid C++ identifier for the static tag (`env.agent` → `env_agent`).
     let inst_tag = inst_path.replace('.', "_");
 
     for ph in &comp.periodic_handlers {
+        if !ir::component_mode_includes_activation(mode, ph.activation) {
+            continue;
+        }
         let lambda = func::periodic_handler_lambda_name(comp, ph);
         let period = func::clause_expr_cpp(prog, ph.function, inst_path, &ph.period)?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
@@ -1809,6 +1866,9 @@ fn emit_lifecycle_checkers(
     // primary-clock cycle and fires the body when the predicate satisfies
     // the requested edge mode. Mirrors v1's `emit_cycle_trigger`.
     for ch in &comp.cycle_handlers {
+        if !ir::component_mode_includes_activation(mode, ch.activation) {
+            continue;
+        }
         let lambda = func::cycle_handler_lambda_name(comp, ch);
         let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
@@ -1880,68 +1940,85 @@ fn emit_lifecycle_checkers(
     }
 
     if let Some(w) = &comp.watchdog {
-        let lambda = func::watchdog_lambda_name(comp, w);
-        let period = match &w.period {
-            Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
-            None => WATCHDOG_DEFAULT_PERIOD.to_string(),
-        };
-        let max_idle = match &w.max_idle {
-            Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
-            None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
-        };
-        let tag = format!("_wdog_{inst_tag}_{}", w.function.0);
-        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
-        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
-        writeln!(
-            out,
-            "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
-        )
-        .ok();
-        writeln!(
+        if !ir::component_mode_includes_activation(mode, w.activation) {
+            // A passive instance has no active-only watchdog registration.
+        } else {
+            let lambda = func::watchdog_lambda_name(comp, w);
+            let period = match &w.period {
+                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                None => WATCHDOG_DEFAULT_PERIOD.to_string(),
+            };
+            let max_idle = match &w.max_idle {
+                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
+            };
+            let tag = format!("_wdog_{inst_tag}_{}", w.function.0);
+            writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+            writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+            writeln!(
+                out,
+                "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
+            )
+            .ok();
+            writeln!(
             out,
             "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
         )
         .ok();
-        writeln!(
-            out,
-            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
-        )
-        .ok();
-        // 1. User body (typically a heartbeat log).
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
-        // 2. Idle check — trips FAIL when BOTH activity stamps are
-        //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
-        //    block (framework error-counter bump on trip).
-        writeln!(
-            out,
-            "{INDENT}{INDENT}{INDENT}int64_t {tag}_max_idle = (int64_t)({max_idle});"
-        )
-        .ok();
-        writeln!(
+            writeln!(
+                out,
+                "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+            )
+            .ok();
+            // 1. User body (typically a heartbeat log).
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+            // 2. Idle check — trips FAIL when BOTH activity stamps are
+            //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
+            //    block (framework error-counter bump on trip).
+            writeln!(
+                out,
+                "{INDENT}{INDENT}{INDENT}int64_t {tag}_max_idle = (int64_t)({max_idle});"
+            )
+            .ok();
+            writeln!(
             out,
             "{INDENT}{INDENT}{INDENT}if ({tag}_max_idle > 0 \
              && (int64_t)((uint64_t)cycle_count - {inst_path}._last_in_cycle) >= {tag}_max_idle \
              && (int64_t)((uint64_t)cycle_count - {inst_path}._last_out_cycle) >= {tag}_max_idle) {{"
         )
         .ok();
-        writeln!(
+            writeln!(
             out,
             "{INDENT}{INDENT}{INDENT}{INDENT}sim_log_line(\"FAIL\", \"watchdog: {} has been idle for >= %lld cycles\", (long long){tag}_max_idle);",
             comp.name
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}ctx.errors++;").ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
-        writeln!(out, "{INDENT}{INDENT}}}").ok();
-        writeln!(out, "{INDENT}}});").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}ctx.errors++;").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
+            writeln!(out, "{INDENT}{INDENT}}}").ok();
+            writeln!(out, "{INDENT}}});").ok();
+        }
     }
 
     // Recurse into by-value sub-components (an env holding an agent that
     // carries a watchdog / periodic handler).
     for f in &comp.fields {
-        if let ir::ComponentFieldKind::Sub { component: sub } = &f.kind {
+        if let ir::ComponentFieldKind::Sub { component: sub, .. } = &f.kind {
             let sub_path = format!("{inst_path}.{}", f.name);
-            emit_lifecycle_checkers(out, prog, *sub, &sub_path)?;
+            emit_lifecycle_checkers(
+                out,
+                prog,
+                *sub,
+                &sub_path,
+                ir::resolve_component_path_mode(
+                    &prog.components,
+                    component,
+                    mode,
+                    std::slice::from_ref(&f.name),
+                )
+                .expect("verified nested component path")
+                .effective_mode,
+            )?;
         }
     }
     Ok(())
@@ -2177,6 +2254,23 @@ fn emit_test(
                         receiver_path.join(".")
                     )));
                 };
+                if let Some(binding) = tb.component_fields.iter().find(|binding| {
+                    binding.field == *receiver
+                }) {
+                    let component = &prog.components[binding.component.index()];
+                    if let Some(target_method) = component.method(method) {
+                        if !ir::component_mode_includes_activation(
+                            binding.mode,
+                            target_method.activation,
+                        ) {
+                            return Err(EmitError(format!(
+                                "tbir: hook-triggered covergroup `{}` targets active-only \
+                                 method `{receiver}.{method}` through passive component binding",
+                                schema.name
+                            )));
+                        }
+                    }
+                }
                 let target = tb
                     .transactor_fields
                     .iter()
@@ -2375,9 +2469,11 @@ fn emit_test(
         // sub-component's connects (an env holding an agent whose own
         // `sequencer.dispatched -> drv.req` bridge must be installed).
         for edge in &cf.connects {
-            emit_one_connect(out, prog, &cf.field, edge);
+            if edge_is_enabled(prog, cf.component, cf.mode, edge) {
+                emit_one_connect(out, prog, &cf.field, edge);
+            }
         }
-        emit_nested_connects(out, prog, cf.component, &cf.field);
+        emit_nested_connects(out, prog, cf.component, &cf.field, cf.mode);
         // An `active` bound event-driven transactor (`let drv : X active =
         // bind axil`) re-lowers its `on <ev>` driver into a queue-fed
         // worker-coroutine actor on its own `ThreadScheduler` under `--mt`,
@@ -2403,8 +2499,10 @@ fn emit_test(
         // queue nor worker and keeps the synchronous subscriber —
         // byte-identical output.
         let bound_drv = &prog.components[cf.component.index()];
-        let relower_driver =
-            mt && cf.active && bound_drv.bound_bus.is_some() && !bound_drv.on_handlers.is_empty();
+        let relower_driver = mt
+            && matches!(cf.mode, Some(ir::ComponentInstanceMode::Active))
+            && bound_drv.bound_bus.is_some()
+            && !bound_drv.on_handlers.is_empty();
         if relower_driver {
             func::emit_active_bound_driver_actor(
                 out,
@@ -2423,13 +2521,13 @@ fn emit_test(
         // mirroring v1's `on`-subscriber registration. Suppressed for the
         // top component when its driver was re-lowered into a worker actor
         // above (the worker replaces the synchronous driver under `--mt`).
-        emit_on_handler_regs(out, prog, cf.component, &cf.field, relower_driver);
+        emit_on_handler_regs(out, prog, cf.component, &cf.field, relower_driver, cf.mode);
         // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
         // closures, for this component and any nested sub-components.
         // Bound-bus handshake monitors stay cooperative `_checkers`
         // latches even under `--mt` (see the NOTE in
         // `emit_lifecycle_checkers`), so no actor registration is needed.
-        emit_lifecycle_checkers(out, prog, cf.component, &cf.field)?;
+        emit_lifecycle_checkers(out, prog, cf.component, &cf.field, cf.mode)?;
     }
 
     // Testbench-scoped `on <N> cycles [phase post_eval]` periodic services

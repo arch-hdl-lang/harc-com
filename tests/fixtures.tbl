@@ -21,6 +21,8 @@ testbench_owned_state_connect_test | Top  | top_counter.sv         | | | OwnedSt
 testbench_owned_state_connect_test | Top  | top_counter.sv         | | | OwnedStateConnectFreshTest
 passive_analysis_monitor_test | Top    | top_counter.sv         | | | PassiveAnalysisMonitorTest
 passive_analysis_monitor_test | Top    | top_counter.sv         | | | PassiveAnalysisMonitorFreshTest
+analysis_source_mode_test     | Top    | top_counter.sv         | | | AnalysisSourceModeTest
+analysis_source_mode_test     | Top    | top_counter.sv         | | | AnalysisSourceModeFreshTest
 wait_until_quiesce_test | Top            | top_counter.sv         |
 wait_until_counter_test | Top            | top_counter.sv         |
 after_cycles_test       | Top            | top_counter.sv         |

@@ -431,6 +431,93 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
     }
+    // Component-mode metadata is consumed directly by lowering and codegen:
+    // preserve the invariant that only transactors have an active surface,
+    // and that a nested mode override names a transactor child.
+    for (ci, component) in prog.components.iter().enumerate() {
+        let mut component_functions = std::collections::HashSet::new();
+        let mut check_component_function = |what: &str, function: FunctionId| {
+            if !component_functions.insert(function) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` uses fn{} for more than one {what}",
+                        component.name, function.0
+                    ),
+                });
+            }
+            match prog.functions.get(function.index()) {
+                Some(f)
+                    if f.kind
+                        == (FunctionKind::ComponentMethod {
+                            component: ComponentId(ci as u32),
+                        }) => {}
+                Some(f) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` {what} points at fn{} with kind {:?}",
+                        component.name, function.0, f.kind
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` {what} references missing fn{}",
+                        component.name, function.0
+                    ),
+                }),
+            }
+        };
+        for method in &component.methods {
+            check_component_function("method", method.function);
+        }
+        for handler in &component.on_handlers {
+            check_component_function("on handler", handler.function);
+        }
+        for handler in &component.periodic_handlers {
+            check_component_function("periodic handler", handler.function);
+        }
+        for handler in &component.cycle_handlers {
+            check_component_function("cycle handler", handler.function);
+        }
+        if let Some(handler) = &component.watchdog {
+            check_component_function("watchdog", handler.function);
+        }
+        if component.has_active_surface()
+            && !matches!(component.kind, ComponentKindTag::Transactor)
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "component c{ci} `{}` is not a transactor but has active-only members",
+                    component.name
+                ),
+            });
+        }
+        for field in &component.fields {
+            let ComponentFieldKind::Sub {
+                component: child,
+                mode: Some(_),
+            } = &field.kind
+            else {
+                continue;
+            };
+            match prog.components.get(child.index()) {
+                Some(child_schema) if matches!(child_schema.kind, ComponentKindTag::Transactor) => {
+                }
+                Some(child_schema) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} field `{}` declares a transactor mode on {} `{}`",
+                        field.name,
+                        child_schema.kind.keyword(),
+                        child_schema.name
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} field `{}` references missing child c{}",
+                        field.name, child.0
+                    ),
+                }),
+            }
+        }
+    }
     // Concurrent-check schemas: every `Expr::TemporalSlot` in a check
     // body must name a slot the check declares, and a latch's own
     // operand must not itself be a slot reading (no `past(past(x))` —
@@ -524,6 +611,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         }
     }
     for (ti, tb) in prog.testbenches.iter().enumerate() {
+        let mut component_binding_names = std::collections::HashSet::new();
         let state_scalars: Vec<_> = tb
             .state_fields
             .iter()
@@ -569,6 +657,31 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        for binding in &tb.component_fields {
+            if !component_binding_names.insert(&binding.field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares component field `{}` more than once",
+                        binding.field
+                    ),
+                });
+            }
+            match prog.components.get(binding.component.index()) {
+                Some(_) => {}
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} component field `{}` references missing c{}",
+                        binding.field, binding.component.0
+                    ),
+                }),
+            }
+        }
+        if let Err(detail) = validate_component_binding_modes(&prog.components, &tb.component_fields)
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!("tb{ti} has invalid component instance modes: {detail}"),
+            });
+        }
         for edge in &tb.connects {
             if let Err(detail) = verify_testbench_connect(prog, tb, edge) {
                 errs.push(VerifyError::BadProgramRef {
@@ -606,9 +719,9 @@ fn verify_testbench_connect(
         .ok_or_else(|| format!("source component c{} does not resolve", src_id.0))?;
     let payload = match src.field(&edge.src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { payload },
+            kind: ComponentFieldKind::Event { payload }, activation,
             ..
-        }) => *payload,
+        }) if *activation == edge.src_activation => *payload,
         _ => {
             return Err(format!(
                 "source `{}.{}` is not an event field",
@@ -636,19 +749,34 @@ fn verify_testbench_connect(
             let Some(m) = sink.method(method) else {
                 return Err(format!("sink method `{method}` does not resolve"));
             };
+            if m.activation != edge.sink_activation {
+                return Err(format!("sink method `{method}` has mismatched activation metadata"));
+            }
             if !m.hookable || m.param_names.len() != 1 || m.has_ret || m.param_tys.len() != 1 {
-                return Err(format!("sink method `{method}` is not a one-argument void hookable"));
+                return Err(format!(
+                    "sink method `{method}` is not a one-argument void hookable"
+                ));
             }
             if !event_payload_matches_type(payload, &m.param_tys[0]) {
-                return Err(format!("sink method `{method}` has an incompatible payload type"));
+                return Err(format!(
+                    "sink method `{method}` has an incompatible payload type"
+                ));
             }
         }
         ConnectSink::Event { event } => match sink.field(event) {
             Some(ComponentFieldSchema {
-                kind: ComponentFieldKind::Event { payload: sink_payload },
+                kind:
+                    ComponentFieldKind::Event {
+                        payload: sink_payload,
+                    },
+                activation,
                 ..
-            }) if *sink_payload == payload => {}
-            _ => return Err(format!("sink event `{event}` does not resolve or has a mismatched payload")),
+            }) if *sink_payload == payload && *activation == edge.sink_activation => {}
+            _ => {
+                return Err(format!(
+                    "sink event `{event}` does not resolve or has a mismatched payload"
+                ))
+            }
         },
     }
     Ok(())
@@ -675,7 +803,7 @@ fn resolve_testbench_component_path(
             .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
         cid = match component.field(segment) {
             Some(ComponentFieldSchema {
-                kind: ComponentFieldKind::Sub { component },
+                kind: ComponentFieldKind::Sub { component, .. },
                 ..
             }) => *component,
             _ => return Err(format!("path segment `{segment}` is not a sub-component")),
@@ -851,8 +979,7 @@ impl Checker<'_> {
                     value,
                 } => {
                     self.check_local(*local);
-                    let mid_positions: Vec<usize> =
-                        mid_indices.iter().map(|(p, _)| *p).collect();
+                    let mid_positions: Vec<usize> = mid_indices.iter().map(|(p, _)| *p).collect();
                     self.check_record_field(*local, field, path, &mid_positions);
                     for (_, idx) in mid_indices {
                         self.check_expr(idx, false, "RecordFieldWrite mid index");
@@ -895,9 +1022,10 @@ impl Checker<'_> {
                 Stmt::TbQueuePop { field, dest } => {
                     self.check_tb_queue(field);
                     self.check_local(*dest);
-                    if let (Some(elem), Some(local)) =
-                        (self.tb_queue_elem(field), self.func.locals.get(dest.index()))
-                    {
+                    if let (Some(elem), Some(local)) = (
+                        self.tb_queue_elem(field),
+                        self.func.locals.get(dest.index()),
+                    ) {
                         if !queue_elem_matches_type(elem, &local.ty) {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
@@ -1850,8 +1978,7 @@ fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
     // compatibility it is the same wildcard `Unknown` was before the
     // substitution carried signedness: assignable into (and from) any
     // scalar local, exactly the pre-#525 accepted set.
-    let widthless =
-        |t: &IrType| matches!(t, IrType::UInt(None) | IrType::SInt(None));
+    let widthless = |t: &IrType| matches!(t, IrType::UInt(None) | IrType::SInt(None));
     if widthless(expected) || widthless(actual) {
         return true;
     }

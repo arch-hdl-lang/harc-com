@@ -3,7 +3,7 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 TbReactive { dut: ScoreboardTypedQueue } periodic every 1 cyc phase post_eval fn3
+  testbench tb0 TbReactive { dut: ScoreboardTypedQueue } component collector=c0 component auditor=c1 periodic every 1 cyc phase post_eval fn3
   test TbReactivePostEval tb=tb0 run=fn2 check=-
   record r0 Sample
     got : uint<64>

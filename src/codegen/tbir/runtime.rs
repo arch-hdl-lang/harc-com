@@ -188,12 +188,7 @@ fn cosim_dut_shim(out: &mut String, dut_type: &str, co: &crate::codegen::cpp_tb:
             .ok();
             continue;
         }
-        writeln!(
-            out,
-            "{INDENT}harc_rt::cosim::SigProxy<{id}> {};",
-            p.name
-        )
-        .ok();
+        writeln!(out, "{INDENT}harc_rt::cosim::SigProxy<{id}> {};", p.name).ok();
     }
     // Probe accessors: the emission reads probes as
     // `dut->rootp-><Verilator-mangled name>` (and writes the `_drv` /
@@ -230,7 +225,11 @@ fn cosim_dut_shim(out: &mut String, dut_type: &str, co: &crate::codegen::cpp_tb:
     // after mid-cycle drives (post-eval services, blocking-call loops)
     // to re-settle combinational logic — under co-sim the simulator
     // needs a real time step to do the same.
-    writeln!(out, "{INDENT}void eval() {{ harc_rt::cosim::bridge().settle(); }}").ok();
+    writeln!(
+        out,
+        "{INDENT}void eval() {{ harc_rt::cosim::bridge().settle(); }}"
+    )
+    .ok();
     writeln!(out, "{INDENT}void final() {{}}").ok();
     writeln!(out, "}};").ok();
     writeln!(out).ok();
@@ -291,7 +290,11 @@ pub(super) fn unbound_state_struct_decl(
 /// Emit one instance variable of the shared per-TYPE state struct
 /// (`_<Type>_state <instance>;`). Multiple instances of one type each get
 /// their own variable with independent default-initialized state.
-pub(super) fn unbound_state_var(out: &mut String, schema: &crate::ir::TransactorSchema, instance: &str) {
+pub(super) fn unbound_state_var(
+    out: &mut String,
+    schema: &crate::ir::TransactorSchema,
+    instance: &str,
+) {
     let ty = unbound_state_struct_ty(schema);
     writeln!(out, "{INDENT}{ty} {instance};").ok();
 }
@@ -429,6 +432,10 @@ pub(super) fn component_struct(
                 };
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
+            ComponentFieldKind::Record { record } => {
+                let rname = &records[record.index()].name;
+                writeln!(out, "{INDENT}{rname} {}{{}};", f.name).ok();
+            }
             ComponentFieldKind::Queue { elem } => {
                 let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();
@@ -442,7 +449,7 @@ pub(super) fn component_struct(
                 )
                 .ok();
             }
-            ComponentFieldKind::Sub { component } => {
+            ComponentFieldKind::Sub { component, .. } => {
                 let cname = &components[component.index()].name;
                 writeln!(out, "{INDENT}{cname} {};", f.name).ok();
             }

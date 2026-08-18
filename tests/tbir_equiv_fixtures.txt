@@ -162,6 +162,8 @@ testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | O
 testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectFreshTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorFreshTest
+analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - | - | AnalysisSourceModeTest
+analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - | - | AnalysisSourceModeFreshTest
 keep_constraints_test | Top | top_counter.sv | top_counter.arch | pass
 wrapping_keep_constraint_test | Top | top_counter.sv | - | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest

@@ -3,8 +3,8 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 LargeTb { dut: Top } connect lifecycle.seen->sink.accept
-  testbench tb1 LargeTb { dut: Top } connect lifecycle.seen->sink.accept
+  testbench tb0 LargeTb { dut: Top } connect lifecycle.seen->sink.accept component lifecycle=c0 passive component sink=c1
+  testbench tb1 LargeTb { dut: Top } connect lifecycle.seen->sink.accept component lifecycle=c0 passive component sink=c1
   test PassiveAnalysisMonitorFreshTest tb=tb0 run=fn3 check=-
   test PassiveAnalysisMonitorTest tb=tb1 run=fn4 check=fn5
   record r0 LifeRec
