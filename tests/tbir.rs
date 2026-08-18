@@ -19876,12 +19876,18 @@ fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
 /// | field | v1 |
 /// |---|---|
 /// | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
-/// | `drv : CounterDrv passive` | emits, and correctly drops the `when active` handler registration |
+/// | `drv : CounterDrv passive`, handler inside `when active` | emits, and correctly OMITS the registration |
+/// | `c : Consumer passive`, handler in the ALWAYS-ON body | emits, and correctly KEEPS it — byte-identical to `active` |
 ///
 /// So the two halves of one construct part company: a missing
 /// annotation is a program error under both backends, and a `passive`
 /// one is a legal program v1 runs faithfully and TB-IR does not lower.
 /// The second keeps its suggestion for exactly that reason.
+///
+/// The third row is why the arm's detail no longer claims the handler
+/// "only registers on an `active` instance" — true of the `when
+/// active` shape it was written from, false of the other one under the
+/// same arm.
 ///
 /// Only these two arms were measured. The parallel DUT-poking-BFM pair
 /// alongside them needs the transactor held by an `env` to be reached
@@ -19933,5 +19939,57 @@ fn a_mode_less_transactor_field_is_a_program_error_but_a_passive_one_is_not() {
             .expect("v1 emits")
             .contains("_tb.drv.req.push_back("),
         "the active control must register the handler, or the check above is empty"
+    );
+
+    // The OTHER shape under the same arm, and the reason its detail no
+    // longer says the handler "only registers on an `active`
+    // instance". Move the `in event` and its handler out of `when
+    // active` and v1's passive output is byte-identical to its active
+    // output: the handler IS registered, and it fires. The verdict is
+    // unaffected — v1 runs both shapes correctly — but one probe was
+    // being described as the whole construct.
+    let always_on = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Consumer
+    req  : in event<uint<8>>
+    seen : uint<32> default 0
+
+    on req(n)
+        seen = seen + n
+    end on
+end transactor Consumer
+
+testbench ConsTb
+    dut : Top
+    c   : Consumer MODE
+end testbench ConsTb
+
+impl ConsTest for ConsTb
+    clock clk = SysDomain
+    run
+        emit c.req(3)
+        wait 1 cycle
+        assert c.seen == 3 else fail("seen=${c.seen}")
+    end run
+end impl ConsTest"#;
+    let mode = |m: &str| always_on.replace("Consumer MODE", &format!("Consumer {m}"));
+    lower_src(&mode("active")).expect("the always-on active control lowers");
+    let msg = assert_unsupported(&lower_src(&mode("passive")).unwrap_err());
+    assert!(
+        msg.contains("passive event-driven transactor field"),
+        "{msg}"
+    );
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&mode("passive"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&mode("active"))).expect("v1 emits"),
+        "with an always-on handler v1 treats passive and active identically"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&mode("passive")))
+            .expect("v1 emits")
+            .contains("_tb.c.req.push_back("),
+        "and it does register the handler"
     );
 }

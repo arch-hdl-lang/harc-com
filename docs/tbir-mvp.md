@@ -5056,16 +5056,22 @@ case and only locally-determinable `Assign` types are compared).
     |---|---|
     | `drv : CounterDrv` — no mode | refuses: "transactor field `_tb.drv : CounterDrv` has no mode and ..." |
     | `p : Poker` — no mode, plain transactor | refuses, same message |
-    | `drv : CounterDrv passive` | emits, and correctly drops the `when active` handler registration |
+    | `drv : CounterDrv passive`, handler inside `when active` | emits, and correctly OMITS the registration |
+    | `c : Consumer passive`, handler in the ALWAYS-ON body | emits, and correctly KEEPS it — byte-identical to `active` |
 
     So the two halves part company. A missing annotation is a program
     error under both backends → `Invalid`. The `passive` one is a legal
-    program v1 runs FAITHFULLY: the `on req` handler lives inside `when
-    active`, so v1 omitting its registration on a passive instance is
-    the language's own rule and not a mis-lowering. It keeps its
-    suggestion for exactly that reason, and the test asserts the
-    omission plus an anti-vacuity check that the active program does
-    register it.
+    program v1 runs FAITHFULLY, in both of its shapes: with the handler
+    inside `when active` v1 omits the registration, which is the
+    language's own rule; with the handler in the ALWAYS-ON body v1 keeps
+    it and the output is byte-identical to the `active` program. It
+    keeps its suggestion for exactly that reason.
+
+    The second shape also corrected the arm's DETAIL, which said the
+    handler "only registers on an `active` instance". That is true of
+    the shape it was written from and false of the other one under the
+    same arm — the verdict survived the second measurement, the
+    explanation did not.
 
     The mode-less arm's own comment has always said the rules "mirror
     v1". This one does — which is precisely why pointing at v1 was

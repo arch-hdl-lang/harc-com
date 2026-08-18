@@ -2241,14 +2241,37 @@ fn validate_testbench_component(
                         match mode {
                             Some(TransactorMode::Active) => continue,
                             Some(TransactorMode::Passive) => {
+                                // `Unsupported` is right — v1 runs both
+                                // shapes of this and runs them
+                                // correctly — but the detail took one
+                                // of them for the whole construct.
+                                //
+                                //   * handler inside `when active` —
+                                //     v1 omits the registration on a
+                                //     passive instance, which is the
+                                //     language's own rule.
+                                //   * handler in the ALWAYS-ON body —
+                                //     v1 registers it, and its output
+                                //     is byte-identical to the `active`
+                                //     program. The handler fires.
+                                //
+                                // So "only registers on an `active`
+                                // instance" was false for the second,
+                                // and it is the sentence the reader
+                                // acts on. What is actually true of
+                                // both is narrower: TB-IR does not
+                                // lower a passive instance of this
+                                // shape at all.
                                 return Err(unsupported(
                                     &format!(
                                         "a passive event-driven transactor field `{}.{} : \
                                          {simple} passive`",
                                         c.name.name, f.name.name
                                     ),
-                                    "the consumer's `on` handler only registers on an \
-                                     `active` instance",
+                                    "TB-IR lowers the consumer only as an `active` \
+                                     instance; v1 runs a passive one, registering an \
+                                     always-on `on` handler and omitting a `when \
+                                     active`-scoped one",
                                 ));
                             }
                             None => {
