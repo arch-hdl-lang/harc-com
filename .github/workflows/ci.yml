@@ -1,118 +1,458 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
-permissions:
-  contents: write
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  cleanup-pr-613:
-    if: github.event.pull_request.number == 613
+  build-and-test:
+    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install Z3 (needed by harc's Z3 bindings at link time)
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v6
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Restore single component lowering module
-        shell: bash
+      - name: cargo build
+        run: cargo build --release --all-targets
+
+      - name: cargo test
+        run: cargo test --release
+
+  parse-fixtures:
+    # Every fixture must round-trip parse + check cleanly. This catches
+    # AST/parser regressions that the snapshot suite alone won't.
+    name: harc check fixtures
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: fixture registration
+        # A fixture with a DUT that no runner references never executes, and
+        # the omission is invisible — CI stays green. See #514.
+        run: ./tests/check_fixture_registration.sh
+
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      - name: harc check every fixture
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
+          fail=0
+          for f in tests/fixtures/*.harc; do
+            if ! ./target/release/harc check "$f"; then
+              echo "::error file=$f::harc check failed"
+              fail=1
+            fi
+          done
+          exit $fail
 
-          src = Path('src/ir/lower/components_impl.rs')
-          text = src.read_text()
-          start_marker = "/// True when a consumer's subscribing `on <ev>` handler lives ONLY under"
-          end_marker = "/// True when a composite-component transactor is a *reactive monitor /"
-          start = text.index(start_marker)
-          end = text.index(end_marker, start)
-          replacement = r'''/// True when at least one always-visible `in event` has subscribers only under
-/// `when active`.
-///
-/// This must be decided per event, not per transactor. An always-on
-/// `on req1(v)` does not make `req2` safe on a passive instance if the only
-/// `on req2(v)` lives under `when active`: `emit t.req2(...)` would otherwise
-/// iterate an empty subscriber vector and silently drop the transaction.
-///
-/// Inputs declared themselves under `when active` are excluded: they are not
-/// part of a passive instance's visible surface, and ordinary activation checks
-/// reject attempts to emit through them.
-pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
-    if !transactor_is_event_driven(t) {
-        return false;
-    }
+      - name: v1 vs TB-IR emitted parity
+        # Acceptance + solver-constraint-text parity between the two
+        # emitters, across the whole fixture corpus. Complements
+        # run_tbir_equiv.sh, which trace-diffs: that needs Verilator, needs
+        # both backends to build AND run, and is therefore blind to a
+        # one-sided rejection — the shape harc#559 shipped with every job
+        # green. This one only needs --emit-only, so it lives in the fast
+        # job and does not need a fixture to be runnable to compare it.
+        # Scope is the shared table (tests/fixtures.tbl). See harc#551.
+        run: ./tests/run_emit_parity.sh
+        env:
+          HARC: ./target/release/harc
 
-    fn subscription_event(h: &crate::ast::OnHandler) -> Option<&str> {
-        if h.periodic {
-            return None;
-        }
-        let ExprKind::Call { callee, .. } = &*h.event.kind else {
-            return None;
-        };
-        let ExprKind::Ident(id) = &*callee.kind else {
-            return None;
-        };
-        Some(id.name.as_str())
-    }
-
-    let is_always_input = |event: &str| {
-        t.items.iter().any(|item| {
-            matches!(
-                item,
-                ComponentItem::Field(field)
-                    if is_event_field(field)
-                        && matches!(field.direction, Some(Direction::In))
-                        && field.name.name == event
-            )
-        })
-    };
-
-    let has_always_subscriber = |event: &str| {
-        t.items.iter().any(|item| {
-            matches!(
-                item,
-                ComponentItem::OnHandler(handler)
-                    if subscription_event(handler) == Some(event)
-            )
-        })
-    };
-
-    t.when_active
-        .iter()
-        .flatten()
-        .filter_map(|item| match item {
-            ComponentItem::OnHandler(handler) => subscription_event(handler),
-            _ => None,
-        })
-        .any(|event| is_always_input(event) && !has_always_subscriber(event))
-}
-
-'''
-          Path('src/ir/lower/components.rs').write_text(text[:start] + replacement + text[end:])
-          src.unlink()
-          PY
-
-          # Restore the repository's real CI workflow and remove the temporary
-          # cleanup workflow before committing the source cleanup.
-          git checkout origin/main -- .github/workflows/ci.yml
-          rm -f .github/workflows/pr613-cleanup-final.yml
-
-      - name: Format and validate cleanup
-        run: |
-          cargo fmt --all
-          cargo test --release --test tbir_active_only_consumer_multi_event
-          cargo test --release
-
-      - name: Commit cleaned branch
-        shell: bash
+      - name: harc fmt round-trip
+        # Pretty-print → reparse → pretty-print again must be a fixed point.
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "fix(tbir): restore single component lowering module"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          fail=0
+          for f in tests/fixtures/*.harc; do
+            tmp1=$(mktemp)
+            tmp2=$(mktemp)
+            ./target/release/harc fmt "$f" > "$tmp1"
+            if ! ./target/release/harc check "$tmp1"; then
+              echo "::error file=$f::pretty-printed output failed harc check"
+              fail=1
+              continue
+            fi
+            ./target/release/harc fmt "$tmp1" > "$tmp2"
+            if ! diff -q "$tmp1" "$tmp2" > /dev/null; then
+              echo "::error file=$f::harc fmt is not idempotent"
+              diff "$tmp1" "$tmp2" | head -40
+              fail=1
+            fi
+          done
+          exit $fail
+
+  run-fixtures:
+    # End-to-end: build harc + Verilator-compile each vendored DUT +
+    # run the matching .harc fixture, asserting "ALL TESTS PASSED".
+    # This is what catches codegen regressions that parse-only CI misses.
+    name: harc sim fixtures
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Z3 + clang
+        # clang is needed because the emitted test `.cpp` uses
+        # `#pragma clang optimize off` to work around a C++20
+        # lambda-coroutine miscompile at `-Os` (verilator default)
+        # that affects both clang and GCC. GCC's equivalent pragma
+        # doesn't propagate through coroutine codegen, so we use
+        # clang on both platforms. See `run_verilator` in
+        # src/main.rs and the prelude in src/codegen/cpp_tb.rs
+        # for the full rationale.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      # Verilator: install from source. Ubuntu's apt package is
+      # 5.020 which rejects `<=` array assignment inside `for`
+      # loops (BLKLOOPINIT) — used in several arch-com DUTs we
+      # vendor (e.g. buf_mgr's reset for-loops over head/tail/count
+      # arrays, which legitimately need non-blocking assignment per
+      # always_ff convention). Verilator 5.034 fixes this; we pin
+      # to the v5.034 tag for reproducibility. Cached across runs
+      # so this only pays the build cost on cache miss.
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
+      # ccache: the fixture jobs do ~370 verilator+clang compiles, and
+      # most share object code — the verilated runtime is identical across
+      # every fixture, shared DUTs (e.g. top_counter.sv drives ~20
+      # fixtures) recompile identically, and the equivalence harness
+      # compiles each DUT twice (once per codegen). ccache turns those
+      # into cache hits within a run and across runs.
+      #
+      # HARC_CXX=clang++ is forwarded into the verilator makefile as a
+      # bare `CXX=clang++` (a multi-word `ccache clang++` would break
+      # make's command-line var parse — `clang++` would be read as a
+      # goal). So instead of wrapping the compiler in the var, we
+      # masquerade: a PATH dir whose `clang++` is a symlink to ccache,
+      # placed ahead of the real clang++. `make` resolves `clang++` to
+      # the symlink, ccache identifies the real compiler one hop further
+      # down PATH and caches it.
+      - name: Set up ccache (masquerade clang++)
+        run: |
+          mkdir -p "$HOME/.ccache-bin"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang++"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang"
+          echo "$HOME/.ccache-bin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=1G" >> "$GITHUB_ENV"
+          # Normalize the per-fixture absolute build paths (all under the
+          # workspace) so the shared verilated runtime and same-DUT object
+          # files hit across fixtures, not just on identical re-runs.
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-sim-${{ github.run_id }}
+          restore-keys: ccache-sim-
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      - name: ccache zero stats
+        run: ccache -z
+
+      - name: Run all fixtures end-to-end
+        env:
+          # Force the verilator build to use clang++ — see comment
+          # on `CXX=` in src/main.rs's run_verilator(). HARC_CXX
+          # propagates via -MAKEFLAGS into the verilator makefile.
+          HARC_CXX: clang++
+        run: ./tests/run_fixtures.sh
+
+      - name: Run negative-fixture runner (expects FATAL / abort)
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_negative_fixtures.sh
+
+      - name: VCD dup-dump smoke test (issue #477)
+        # A clocked TB with an active `phase post_eval` service, run under
+        # VCD tracing, must not emit Verilator `previous dump at t=`
+        # warnings (duplicate same-timestamp dump). Reuses the Verilator
+        # install/cache and harc build above.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_vcd_dump_smoke.sh
+
+      - name: v1-vs-tbir codegen equivalence harness
+        # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
+        # produce identical semantic traces under both C++ emitters
+        # (`--codegen v1` and `--codegen tbir`). Lives in this job to
+        # reuse the Verilator install/cache and harc build above.
+        # ARCH_BIN is intentionally NOT set here (no arch checkout in
+        # this job), so the optional --dut sweep self-skips.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_tbir_equiv.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+  run-cosim-fixtures:
+    # Same fixture table as run-fixtures, through the `--cosim dpi`
+    # backend (spec §10 simulator-owned-time DPI-C co-sim): generated
+    # HarcCosimTop.sv harness owns the clock, the TB runs as a passive
+    # DPI-C runtime on the thread bridge, and DUT access crosses the
+    # boundary through generated typed accessors. Full parity with the
+    # direct backend (130/130) is the standing invariant — this job is
+    # the gate that keeps the co-sim contract from rotting. Mirrors
+    # run-fixtures' setup and reuses its Verilator/ccache/cargo caches.
+    name: harc sim fixtures (cosim dpi)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Z3 + clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
+      - name: Set up ccache (masquerade clang++)
+        # Same masquerade as run-fixtures (see the rationale there).
+        # Co-sim builds share less object code with the direct builds
+        # (`--binary --timing` vs `--cc --no-timing`) but the verilated
+        # runtime and per-DUT model objects still hit across fixtures.
+        run: |
+          mkdir -p "$HOME/.ccache-bin"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang++"
+          ln -sf "$(command -v ccache)" "$HOME/.ccache-bin/clang"
+          echo "$HOME/.ccache-bin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=1G" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-cosim-${{ github.run_id }}
+          restore-keys: |
+            ccache-cosim-
+            ccache-sim-
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      - name: ccache zero stats
+        run: ccache -z
+
+      - name: Run all fixtures through --cosim dpi
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_cosim_fixtures.sh
+
+      - name: Run negative fixtures through --cosim dpi (expects $fatal path)
+        # Exercises the failure half of the co-sim protocol —
+        # RC_DONE_FAIL -> $fatal -> nonzero exit — which the all-green
+        # parity sweep never touches.
+        env:
+          HARC_CXX: clang++
+        run: ./tests/run_cosim_negative_fixtures.sh
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+  check-backends:
+    # sim<->SV equivalence net: run representative arch-com designs under
+    # BOTH backends (ARCH native sim via --dut, Verilator via --sv) with
+    # `harc sim --check-backends` and assert the per-cycle traces match.
+    # This is the standing invariant that catches the silent-divergence
+    # class (e.g. a mutex policy or Vec<Bus> lowering that one backend
+    # disagrees with the other). Needs BOTH compilers, so it checks out
+    # and builds arch-com alongside harc.
+    name: harc sim<->SV parity
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pin the ARCH compiler to a released version. The prebuilt binary is
+      # installed below via cargo-dist (no slow source build); this sparse,
+      # shallow checkout only fetches the example .arch/.harc design files
+      # the parity net runs, at the SAME tag so designs match the binary.
+      # Bump ARCH_VERSION (here + the installer step) to test against a newer
+      # released arch.
+      - name: Check out arch-com example designs (pinned, sparse)
+        uses: actions/checkout@v6
+        with:
+          repository: arch-hdl-lang/arch-com
+          ref: v0.70.4
+          path: arch-com
+          fetch-depth: 1
+          sparse-checkout: examples/nic400
+          sparse-checkout-cone-mode: true
+
+      - name: Install Z3 + clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build harc
+        run: cargo build --release --bin harc
+
+      # Install the prebuilt ARCH compiler via cargo-dist — a few-second
+      # binary download instead of a ~1-2 min source build. Pinned to the
+      # same tag as the design checkout above.
+      - name: Install arch v0.70.4 (cargo-dist prebuilt)
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.4/arch-installer.sh | sh
+          "$HOME/.cargo/bin/arch" --version
+
+      - name: Run sim<->SV parity net
+        env:
+          HARC_CXX: clang++
+          # arch sim's TB compile defaults to g++, which on Linux is real GCC
+          # and miscompiles the C++20 coroutine testbench scheduler. v0.70.4+
+          # honors ARCH_CXX (mirrors HARC_CXX) — select clang++. (Replaced the
+          # earlier g++ -> clang++ PATH shim once arch-com#538 shipped.)
+          ARCH_CXX: clang++
+          ARCH_COM: arch-com
+        run: |
+          # Absolute path avoids coreutils `arch` (prints machine arch) shadowing.
+          export ARCH="$HOME/.cargo/bin/arch"
+          ./tests/run_check_backends.sh
