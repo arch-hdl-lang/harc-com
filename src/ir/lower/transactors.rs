@@ -68,7 +68,8 @@ use std::collections::{HashMap, HashSet};
 /// | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;` plus a real fan-out at the emit site (`for (auto& _s : _tb.drv.req) _s(1);`) | a real escape hatch |
 /// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
 /// | `dut : Top default <lit>` | `VTop* dut = <lit>;` — only `0` converts; `default 1` is "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
-/// | a second module-typed field | binds and drives both handles | a real escape hatch |
+/// | a second field of the SAME module type | binds and drives both handles | a real escape hatch |
+/// | a second named field of any OTHER type | `V<Name>* other = nullptr;` with no matching header — "'VAxiLiteRegs' does not name a type" | `EmitsUncompilable` |
 /// | `apply Some.Policy` | nothing — the output is byte-identical to the same transactor without it | `SilentlyMisLowers` |
 /// | `on <anything>` | — | unreachable |
 ///
@@ -156,18 +157,41 @@ fn lower_unbound_item<'a>(
                         V1Status::EmitsUncompilable,
                     ));
                 }
-                if let Some((first, _)) = dut.as_ref() {
-                    // A real escape hatch, and the one row on this pass
-                    // measured against a control that was equally
-                    // broken. v1 emits `VTop* other = nullptr;` — but it
-                    // emits `VTop* dut = nullptr;` for the SINGLE handle
-                    // too, and neither backend auto-binds either one:
-                    // `<inst>.dut = dut` in the run body is the required
-                    // idiom, which TB-IR accepts. Write both binds and
-                    // v1 emits `_tb.drv.dut = dut; _tb.drv.other = dut;`
-                    // and compiles clean with both handles poked. The
-                    // null dereference I attributed to the second handle
-                    // was just the absence of any bind at all.
+                if let Some((first, dut_ty)) = dut.as_ref() {
+                    // v1 emits `V<Name>* <field> = nullptr;` for the
+                    // extra field and includes only the ONE header the
+                    // testbench's DUT type needs, so whether its output
+                    // compiles turns on whether the second field names
+                    // that same module:
+                    //
+                    //   other : Top            VTop* other = nullptr;    0 errors
+                    //   other : AxiLiteRegs    'VAxiLiteRegs' does not name a type
+                    //   other : Nonesuch       'VNonesuch' does not name a type
+                    //   mode  : Color (enum)   'Color' does not name a type
+                    //
+                    // The same-module row is a real escape hatch — and
+                    // it is the row that corrected an earlier verdict,
+                    // because the null pointer is what the SUPPORTED
+                    // single-handle shape emits too (neither backend
+                    // auto-binds any handle; `<inst>.dut = dut` is the
+                    // idiom). Write both binds and v1 emits
+                    // `_tb.drv.dut = dut; _tb.drv.other = dut;` and
+                    // compiles.
+                    //
+                    // The other three do not compile, and an arm's
+                    // status is the worst thing under it.
+                    if simple != dut_ty {
+                        return Err(not_implemented(
+                            &format!(
+                                "transactor `{tname}` with a second named field `{fname}` of \
+                                 a different type from its DUT handle `{first}`"
+                            ),
+                            "v1 emits `V<Name>* <field> = nullptr;` for it while including \
+                             only the DUT's own Verilated header, so the type is undeclared \
+                             and the emitted C++ does not compile",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
                     return Err(unsupported(
                         &format!(
                             "transactor `{tname}` with more than one module-typed field \
@@ -413,7 +437,7 @@ pub(crate) fn lower_transactor(
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -771,7 +795,7 @@ fn lower_bound_target_transactor(
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1300,7 +1324,7 @@ fn lower_bound_initiator_transactor(
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),

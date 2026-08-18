@@ -6480,6 +6480,72 @@ former `transaction` group lives in
      tbir is the default backend.
 
 
+105. **Five corrections to the corrections (2026-08-18).**
+
+     Re-review of the four correction commits found one REGRESSION and
+     four arms right only for the shape that prompted them.
+
+     **The regression.** Divergence 103 gave `record_leaf_fate` an
+     `is_record` callback to reproduce `Emitter::record_field_c_type`'s
+     named-record layer, and wired it to `record_ids.contains_key`.
+     `record_ids` is not `is_record_type`: `lower_program` also inserts
+     every REGBLOCK's mirror record into it, and scoreboards lower
+     afterwards. So a `scoreboard Sb { l : DmaRegs }` became a
+     `--codegen v1` suggestion, and v1 flattens it to `int64_t l;`. The
+     callback now takes `declared_record_names`, a snapshot of
+     `record_ids` taken BEFORE the regblock loop — which is exactly
+     transactions ∪ structs.
+
+     **The second-DUT-handle arm** (divergence 102, corrected) is right
+     for a second field of the SAME module type and wrong for anything
+     else. v1 includes only the one Verilated header the testbench's DUT
+     needs:
+
+     | second field | v1 emits | g++ |
+     |---|---|---|
+     | `other : Top` | `VTop* other = nullptr;` + both binds | 0 errors |
+     | `other : AxiLiteRegs` | `VAxiLiteRegs* other = nullptr;` | "'VAxiLiteRegs' does not name a type" |
+     | `other : Nonesuch` | `VNonesuch* other = nullptr;` | "'VNonesuch' does not name a type" |
+     | `mode : Color` (an enum) | `Color mode;` | "'Color' does not name a type" |
+
+     The arm splits on whether the field's type name matches the DUT
+     handle's; the other three are `EmitsUncompilable`.
+
+     **The unreadable-width arm** (divergence 103) did not reach through
+     a `Vec`, though its sibling `zero_width_leaf` does.
+     `Vec<uint<0x8>, 4>` packs four 64-bit slots where
+     `Vec<uint<8>, 4>` packs four 8-bit ones — the same substitution,
+     per element.
+
+     It also claimed a `queue<T>` / `event<T>` / `list<T>` payload
+     "arrives as `TypeArg::Type` and is a different arm's business",
+     which is false for a RECORD payload: `queue<Inner>` arrives as
+     `TypeArg::Expr(Ident)` — the exact shape the arm reads as an
+     unreadable width — and got told "a width must be a plain decimal
+     literal" when there is no width slot at all. `cpp_tb.rs` states
+     this ("`event<RegOp>` parses as `TypeArg::Expr(Ident)` at the
+     type-arg layer") and so does `fixed_vec_field`'s NOTE. The set of
+     width-taking builtins is copied from `scalar_leaf_c_type` now
+     rather than inferred from the argument shape. Same failure mode as
+     divergence 97's leaf table, three commits later.
+
+     **The regblock-without-a-bind hole** (divergence 104) was closed at
+     test scope only. `regblock_instance_types` was populated in
+     `lower_test` and left empty in the helper, tseq, method and three
+     transactor contexts, so `let regs : DmaRegs` inside a `hookable`
+     body still lowered, verified and emitted; the addrmap half in the
+     same position still returned `Unsupported`, the false hatch the
+     divergence says it replaced. Every `LowerCtx` gets the set now,
+     built once by `regblock_instance_names`.
+
+     Smaller: `bind_rhs_ident` rendered an unbalanced backtick at two of
+     its five call sites (a fragment passed into a template that wrapped
+     it); two source comments cited divergence 103 for the hole
+     documented as 104; and `scalar_leaf_c_type`'s doc still claimed
+     `txn_field_c_type` "is the only caller that picks a member type",
+     which divergence 103 had already called false in the same commit.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

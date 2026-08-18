@@ -4103,6 +4103,10 @@ fn an_unreadable_width_is_a_silent_mis_lowering_not_a_hatch() {
         format!(
             r#"const W = 8
 
+struct Inner
+    x : uint<8>
+end struct Inner
+
 transaction Req
     op : uint<8>
     data : {ty}
@@ -4124,6 +4128,10 @@ end test T"#
         "uint<0x8>",
         "uint<0b1000>",
         "uint<W>",
+        // v1 substitutes the same fallbacks PER ELEMENT, so a `Vec` of
+        // one is the same silent mis-lowering.
+        "Vec<uint<0x8>, 4>",
+        "Vec<uint<W>, 4>",
     ] {
         let src = field(ty);
         let err = lower_src(&src).unwrap_err();
@@ -4132,8 +4140,32 @@ end test T"#
             "`{ty}` is not Invalid — v1 does not panic on it: {err:?}"
         );
         assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
+    }
+    // The `Vec` rows pack four 64-bit slots where the decimal spelling
+    // packs four 8-bit ones.
+    let vhex = cpp_tb::emit(&merged_src(&field("Vec<uint<0x8>, 4>"))).expect("v1 emits");
+    let vdec = cpp_tb::emit(&merged_src(&field("Vec<uint<8>, 4>"))).expect("v1 emits");
+    assert!(
+        vhex.contains("harc_rt::harc_wide_write_bits(_packed, 0, 64, value.data[0]);")
+            && vdec.contains("harc_rt::harc_wide_write_bits(_packed, 0, 8, value.data[0]);"),
+        "the per-element width is substituted too:\n{vhex}"
+    );
+    for ty in ["uint<0x0>", "uint<0x8>", "uint<W>"] {
+        let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains("uint64_t data = 0;"), "`{ty}`: {v1}");
+    }
+    // A RECORD payload is not a width slot, even though it arrives in
+    // the same argument position as one. This arm must not claim it.
+    for ty in ["queue<Inner>", "event<Inner>"] {
+        let src = field(ty);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            !msg.contains("plain decimal"),
+            "`{ty}` has no width slot — it is the flatten arm: {msg}"
+        );
     }
     // The three widths v1 substitutes, none of them the declared 8.
     let hex = cpp_tb::emit(&merged_src(&field("uint<0x8>"))).expect("v1 emits");
@@ -4554,8 +4586,31 @@ fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
         "v1 refuses it too"
     );
 
+    // A regblock-typed SCOREBOARD leaf is not a record leaf, even
+    // though a regblock's mirror record lands in `record_ids`. v1's own
+    // `is_record_type` is transactions ∪ structs, so it flattens this
+    // one to `int64_t l;` — and asking the wrong set turned the arm
+    // into a false escape hatch.
+    let sb_rb = fixture_with(
+        "regblock_access_test.harc",
+        "testbench RegblockAccessTb\n    dut : AxiLiteRegs\nend testbench RegblockAccessTb",
+        "scoreboard Sb\n    l : DmaRegs\nend scoreboard Sb\n\ntestbench RegblockAccessTb\n             dut : AxiLiteRegs\n    sb  : Sb\nend testbench RegblockAccessTb",
+    );
+    assert_not_implemented(
+        &lower_bus(&sb_rb).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        cpp_tb::emit(&merged_with_stdlib_bus(&sb_rb, "BusAxiLite.arch"))
+            .expect("v1 emits")
+            .contains("int64_t l;"),
+        "v1 flattens a regblock-typed scoreboard leaf"
+    );
+
     // The hole. All three spellings of a regblock-typed `let` with no
-    // `= bind` used to lower clean and drop every bus access.
+    // `= bind` used to lower clean and drop every bus access — and it
+    // is reachable from a hookable method body and a `tseq` body, not
+    // just from test scope, so every `LowerCtx` carries the type set.
     for (name, from, to) in [
         (
             "regblock_access_test.harc",
@@ -4576,6 +4631,14 @@ fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
             "regblock_addrmap_test.harc",
             "let chip   : Soc = bind helper",
             "let chip   : Soc",
+        ),
+        // Inside a hookable METHOD body — a different `LowerCtx`, which
+        // used to carry an empty type set and let the whole thing
+        // through.
+        (
+            "regblock_access_test.harc",
+            "        hookable read(addr: uint<8>) -> uint<32>",
+            "        hookable probe2()\n            let regs4 : DmaRegs\n                         let z = regs4.MM2S_LEN\n        end probe2\n\n        hookable read(addr:              uint<8>) -> uint<32>",
         ),
     ] {
         let src = fixture_with(name, from, to);
@@ -4744,6 +4807,28 @@ end impl T"#
         v1.contains("_tb.drv.dut = dut;") && v1.contains("_tb.drv.other = dut;"),
         "v1 binds BOTH handles, which is what makes the suggestion honest: {v1}"
     );
+    // …but only for the SAME module type. v1 includes just the one
+    // Verilated header the testbench's DUT needs, so a second named
+    // field of any other type is an undeclared type in the emitted C++.
+    for (field, cty) in [
+        ("    other : AxiLiteRegs", "VAxiLiteRegs* other = nullptr;"),
+        ("    other : Nonesuch", "VNonesuch* other = nullptr;"),
+        ("    mode : Color", "Color mode;"),
+    ] {
+        for src in both(field) {
+            let src = src.replace(
+                "\ntransactor Drv\n",
+                "\nenum Color { Red, Blue }\n\ntransactor Drv\n",
+            );
+            let msg = assert_not_implemented(
+                &lower_src(&src).unwrap_err(),
+                lower::V1Status::EmitsUncompilable,
+            );
+            assert!(msg.contains("second named field"), "`{field}`: {msg}");
+            let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+            assert!(v1.contains(cty), "`{field}`: v1 emits `{cty}`: {v1}");
+        }
+    }
 
     // `apply` leaves no trace whatsoever.
     for src in both("    apply Some.Policy") {

@@ -19733,11 +19733,16 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
 }
 
 /// The builtin leaves this backend gives a real, width-correct C++ value
-/// type. `txn_field_c_type` is the only caller that picks a member type,
-/// and everything NOT matched here falls through its `_ =>` arms to a
+/// type. `txn_field_c_type` is the only caller that reads it, and
+/// everything NOT matched here falls through its `_ =>` arms to a
 /// bare `uint64_t` / `int64_t` — a member that does not mean what was
 /// written. Splitting the decision out is what lets `record_leaf_fate`
 /// ask the question instead of restating it.
+///
+/// NOT the last word on a member type: `Emitter::record_field_c_type`
+/// wraps `txn_field_c_type` with one more layer (a named type that is a
+/// declared record gets the record's own name), and that is the
+/// function scoreboard and record members actually go through.
 fn scalar_leaf_c_type(name: &BuiltinTy, args: &[TypeArg]) -> Option<String> {
     match name {
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {

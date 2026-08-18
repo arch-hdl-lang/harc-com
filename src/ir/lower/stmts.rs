@@ -867,7 +867,7 @@ impl FuncBuilder<'_> {
         // A properly bound `let regs : R = bind <helper>` never reaches
         // here — the test-item walk in `mod.rs` consumes it — and a
         // `= bind` written in statement position is rejected on its own
-        // before this. Divergence 103.
+        // before this. Divergence 104.
         if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
             if self.ctx.regblock_instance_types.contains(simple) {

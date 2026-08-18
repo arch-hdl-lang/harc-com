@@ -791,16 +791,38 @@ fn surface_constraint_lower_error(
 ///
 /// So none of them is an escape hatch; the suggestion sent the user to
 /// an identical refusal.
+/// Every `regblock` and `addrmap` DECLARATION name in the file. A `let`
+/// whose declared type names one of these is an INSTANTIATION and
+/// requires `= bind <helper>` — see the guard in `stmts::lower_let`.
+///
+/// Every `LowerCtx` gets this, not just the test one: the hole it closes
+/// is reachable from a hookable method body and a `tseq` body too, and
+/// leaving those contexts with an empty set is what left it half open.
+fn regblock_instance_names(
+    regblock_ids: &HashMap<String, RegblockId>,
+    addrmap_decls: &HashMap<String, &AddrmapDecl>,
+) -> HashSet<String> {
+    regblock_ids
+        .keys()
+        .chain(addrmap_decls.keys())
+        .cloned()
+        .collect()
+}
+
 fn bind_rhs_ident(
     value: Option<&crate::ast::Expr>,
     what: &str,
+    // The COMPLETE phrase, backticks included — "`= bind <helper>` (a
+    // transactor instance)". Passing a fragment to be wrapped by the
+    // template is how the first version rendered an unbalanced
+    // backtick at two of the five call sites.
     expected: &str,
 ) -> Result<String, LowerError> {
     match value.map(|v| &*v.kind) {
         Some(ExprKind::Ident(id)) => Ok(id.name.clone()),
         _ => Err(not_implemented(
             what,
-            format!("only `= bind {expected}` is lowered, and v1 rejects the rest too"),
+            format!("only {expected} is lowered, and v1 rejects the rest too"),
             V1Status::Rejects,
         )),
     }
@@ -1112,6 +1134,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // The regblock name doubles as the mirror record's name, so a
     // `let regs : R` resolves `R` to the synthetic record via
     // `record_ids` exactly like a transaction local.
+    // `record_ids` restricted to transactions and structs — exactly
+    // `Emitter::is_record_type`. Taken before the regblock loop below
+    // adds every regblock's mirror record to `record_ids`.
+    let declared_record_names: std::collections::HashSet<String> =
+        record_ids.keys().cloned().collect();
     let mut regblock_ids: HashMap<String, RegblockId> = HashMap::new();
     let mut regblock_schemas: Vec<ir::RegblockSchema> = Vec::new();
     for it in &file.items {
@@ -1124,6 +1151,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
             let rec_id = RecordId(record_schemas.len() as u32);
             let (rec, schema) = regblock::lower_regblock(r, rec_id, &const_vals)?;
+            // A regblock's MIRROR record joins `record_ids` here, which
+            // makes that map a superset of `Emitter::is_record_type`
+            // (transactions ∪ structs) from this point on. Anything
+            // asking "is this a declared record?" the way v1 asks it —
+            // `record_leaf_fate`'s `is_record` — must use
+            // `declared_record_names`, captured above, or it answers yes
+            // for a regblock and calls a flattened `int64_t l;` a
+            // faithful member.
             record_ids.insert(name.clone(), rec_id);
             record_schemas.push(rec);
             regblock_ids.insert(name.clone(), RegblockId(regblock_schemas.len() as u32));
@@ -1155,6 +1190,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             }
         }
     }
+
+    // Every `regblock` and `addrmap` DECLARATION name. A `let` whose
+    // declared type names one of these is an INSTANTIATION and requires
+    // `= bind <helper>`; see the guard in `stmts::lower_let`. Built once
+    // and handed to EVERY `LowerCtx`, because the hole it closes is
+    // reachable from a hookable method and a `tseq` body, not just from
+    // test scope.
+    let regblock_instance_names = regblock_instance_names(&regblock_ids, &addrmap_decls);
 
     // `tseq` (transaction-sequence) declarations: name → element record
     // type. Validated up front (the element type must be a declared
@@ -1244,7 +1287,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema = scoreboards::lower_scoreboard(c, &record_ids, &const_vals)?;
+            let schema =
+                scoreboards::lower_scoreboard(c, &record_ids, &declared_record_names, &const_vals)?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1621,7 +1665,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1688,7 +1732,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -1886,7 +1930,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
         test_scope_lets: HashSet::new(),
-        regblock_instance_types: HashSet::new(),
+        regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
         regblock_init_order: Vec::new(),
         addrmap_bindings: HashMap::new(),
@@ -2882,7 +2926,7 @@ fn lower_test(
                         "regblock binding `{}` to a non-identifier helper",
                         l.name.name
                     ),
-                    "<helper>` (a transactor instance)",
+                    "`= bind <helper>` (a transactor instance)",
                 )?;
                 regblock_binds.push((l.name.name.clone(), rbid, helper_field));
             }
@@ -2915,7 +2959,7 @@ fn lower_test(
                         "addrmap binding `{}` to a non-identifier helper",
                         l.name.name
                     ),
-                    "<helper>` (a transactor instance)",
+                    "`= bind <helper>` (a transactor instance)",
                 )?;
                 addrmap_binds.push((l.name.name.clone(), amap_name, helper_field));
             }
@@ -3012,7 +3056,7 @@ fn lower_test(
                         "initiator-BFM instance `{}` bound to a non-identifier",
                         l.name.name
                     ),
-                    "<bus-binding>",
+                    "`= bind <bus-binding>`",
                 )?;
                 let xid = ir::TransactorId(
                     prog.transactors
@@ -3112,7 +3156,7 @@ fn lower_test(
                         "bound-to event-driven transactor `{}` bound to a non-identifier",
                         l.name.name
                     ),
-                    "<bus-binding>",
+                    "`= bind <bus-binding>`",
                 )?;
                 let cid = component_ids[simple];
                 bound_event_component_binds.push((
@@ -3195,7 +3239,7 @@ fn lower_test(
                         "target-TLM responder `{}` bound to a non-identifier",
                         l.name.name
                     ),
-                    "<bus-binding>",
+                    "`= bind <bus-binding>`",
                 )?;
                 let xid = ir::TransactorId(
                     prog.transactors
@@ -4709,11 +4753,7 @@ fn lower_test(
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
         test_scope_lets: test_let_names,
-        regblock_instance_types: regblock_ids
-            .keys()
-            .chain(addrmap_decls.keys())
-            .cloned()
-            .collect(),
+        regblock_instance_types: regblock_instance_names(regblock_ids, addrmap_decls),
         regblock_bindings: regblock_bindings_map,
         regblock_init_order,
         addrmap_bindings: addrmap_bindings_map,
@@ -5720,7 +5760,10 @@ pub(crate) struct LowerCtx {
     /// record-local arm — the emitted testbench then served every
     /// register access from the mirror and issued NO bus traffic, so
     /// the test passed without ever touching the DUT. See divergence
-    /// 103.
+    /// 104.
+    ///
+    /// Populated in EVERY context, not just the test one — the hole is
+    /// reachable from a hookable method body and a `tseq` body too.
     pub regblock_instance_types: HashSet<String>,
     /// Register-block bindings (`let regs : R = bind <helper>`) →
     /// per-binding access context (mirror record, helper field,

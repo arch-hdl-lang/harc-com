@@ -33,6 +33,11 @@ use std::collections::HashMap;
 pub(crate) fn lower_scoreboard(
     c: &ComponentDecl,
     record_ids: &HashMap<String, RecordId>,
+    // `record_ids` restricted to transactions and structs. By the time
+    // scoreboards lower, `record_ids` also holds every regblock's mirror
+    // record, and v1's `Emitter::is_record_type` does not — see the
+    // capture site in `lower_program`.
+    declared_records: &std::collections::HashSet<String>,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
@@ -111,7 +116,7 @@ pub(crate) fn lower_scoreboard(
                         "scoreboard `{sb}` declares field `{fname}` more than once"
                     )));
                 }
-                let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids)?;
+                let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids, declared_records)?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
                         let default = scalar_default(&f.default, sb, fname, &f.ty, consts)?;
@@ -283,6 +288,7 @@ fn scoreboard_field_kind(
     fname: &str,
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
+    declared_records: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Queue,
@@ -321,7 +327,7 @@ fn scoreboard_field_kind(
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
-        let fate = crate::codegen::cpp_tb::record_leaf_fate(t, &|n| record_ids.contains_key(n));
+        let fate = crate::codegen::cpp_tb::record_leaf_fate(t, &|n| declared_records.contains(n));
         if fate == RecordLeafFate::Flattens {
             return not_implemented(
                 &what,

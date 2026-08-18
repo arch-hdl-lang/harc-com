@@ -85,12 +85,30 @@ fn unreadable_width_leaf(ty: &TypeExpr) -> bool {
         return false;
     };
     if matches!(name, BuiltinTy::Vec) {
+        // The element carries the width, and v1 substitutes the same
+        // fallbacks per element: `Vec<uint<0x8>, 4>` packs four 64-bit
+        // slots where `Vec<uint<8>, 4>` packs four 8-bit ones.
+        return matches!(args.first(), Some(TypeArg::Type(elem)) if unreadable_width_leaf(elem));
+    }
+    // Only a builtin that HAS a width slot. `queue<T>` / `event<T>` /
+    // `list<T>` take a payload in that position, and a RECORD payload
+    // arrives as `TypeArg::Expr(Ident)` — the shape this arm otherwise
+    // reads as an unreadable width. `cpp_tb.rs`'s own comment says so
+    // ("`event<RegOp>` parses as `TypeArg::Expr(Ident)` at the type-arg
+    // layer") and so does `fixed_vec_field`'s NOTE, so the set is
+    // copied from `scalar_leaf_c_type` rather than inferred from the
+    // argument shape.
+    if !matches!(
+        name,
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::Bits
+            | BuiltinTy::Int
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+    ) {
         return false;
     }
-    // A width SLOT that is present and unreadable. `Some(TypeArg::Expr)`
-    // is what makes it a width slot at all: a `queue<T>` / `event<T>` /
-    // `list<T>` payload arrives as `TypeArg::Type` and is a different
-    // arm's business.
     matches!(args.first(), Some(TypeArg::Expr(_))) && declared_scalar_width(args).is_none()
 }
 
