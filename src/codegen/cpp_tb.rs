@@ -19733,8 +19733,9 @@ fn txn_field_c_type(t: &TypeExpr) -> String {
 }
 
 /// The builtin leaves this backend gives a real, width-correct C++ value
-/// type. `txn_field_c_type` is the only caller that reads it, and
-/// everything NOT matched here falls through its `_ =>` arms to a
+/// type. `txn_field_c_type` is the only caller that turns it into a
+/// member, and everything NOT matched there falls through its `_ =>`
+/// arms to a
 /// bare `uint64_t` / `int64_t` — a member that does not mean what was
 /// written. Splitting the decision out is what lets `record_leaf_fate`
 /// ask the question instead of restating it.

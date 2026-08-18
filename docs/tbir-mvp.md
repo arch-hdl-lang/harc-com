@@ -6525,9 +6525,11 @@ former `transaction` group lives in
      literal" when there is no width slot at all. `cpp_tb.rs` states
      this ("`event<RegOp>` parses as `TypeArg::Expr(Ident)` at the
      type-arg layer") and so does `fixed_vec_field`'s NOTE. The set of
-     width-taking builtins is copied from `scalar_leaf_c_type` now
-     rather than inferred from the argument shape. Same failure mode as
-     divergence 97's leaf table, three commits later.
+     width-taking builtins is taken from `scalar_leaf_c_type` now rather
+     than inferred from the argument shape — its integer arms exactly,
+     minus `Bool`/`BoolLower`/`Bit`, which return `"bool"` whatever their
+     arguments say and so have no width slot to mis-read. Same failure
+     mode as divergence 97's leaf table, three commits later.
 
      **The regblock-without-a-bind hole** (divergence 104) was closed at
      test scope only. `regblock_instance_types` was populated in
@@ -6544,6 +6546,60 @@ former `transaction` group lives in
      documented as 104; and `scalar_leaf_c_type`'s doc still claimed
      `txn_field_c_type` "is the only caller that picks a member type",
      which divergence 103 had already called false in the same commit.
+
+
+106. **The second-handle arm, third pass — and it cannot see what
+     decides it (2026-08-18).**
+
+     Divergence 105 split the transactor multi-handle arm on
+     `simple != dut_ty`: the second field's type against the
+     transactor's OWN first handle. The thing that decides whether v1's
+     output compiles is a different quantity — v1 includes exactly one
+     Verilated header, the TESTBENCH's DUT type — and
+     `lower_unbound_item` cannot see it. Transactors lower before
+     testbenches, and a transactor with two module fields never reaches
+     the testbench-side check that does know it, because it errors out
+     first.
+
+     ```
+     transactor Drv
+         d1 : Foo
+         d2 : Foo
+         ...
+     testbench Tb
+         dut : Top
+         drv : Drv active
+     ```
+
+     `simple == dut_ty` (`Foo` == `Foo`), so the split said "a real
+     escape hatch". v1 emits `VFoo* d1 = nullptr; VFoo* d2 = nullptr;`
+     and includes only `VTop.h` — `'VFoo' does not name a type`, twice.
+
+     So the whole arm is `EmitsUncompilable`. The `other : Top` row
+     really does compile, but only when the testbench's DUT is also
+     `Top`, and an arm's status is the worst thing under it.
+
+     The same measurement applies to the arm that DOES know the DUT
+     type — `lower_test`'s "field type `X` differs from the test DUT
+     type `Y`" — which was `Unsupported` and is now `EmitsUncompilable`
+     for the same emitted C++.
+
+     **The regblock contamination had one more consumer.**
+     `components.rs`'s record-typed-field arm asked
+     `record_ids.contains_key`, which by then holds every regblock's
+     mirror record, so an `agent Ag { r : DmaRegs }` got a `--codegen
+     v1` suggestion; v1 emits `VDmaRegs* r = nullptr;` and does not
+     compile. The record arm asks `declared_records` now, and a
+     regblock-typed component field gets its own `EmitsUncompilable`
+     arm. Every other `record_ids` consumer was audited: the ones in
+     `records.rs` run before the regblock loop, so they are already
+     exactly transactions ∪ structs.
+
+     Two guards that were correct but unmeasured now have rows: the
+     `tseq` and component-method `LowerCtx`s (emptying either reopened
+     the divergence-104 hole with the suite still green), and
+     `bind_rhs_ident`'s rendered phrase, whose unbalanced backtick no
+     test noticed.
 
 
 ## Next steps

@@ -354,6 +354,7 @@ pub(crate) enum CompSource<'a> {
 /// ids so a `Sub` field / `connect` edge can resolve nested components.
 /// Method `FunctionId`s are assigned from `next_fn` upward; bodies are
 /// lowered in the second pass (`lower_component_bodies`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_component_schema(
     src: &CompSource<'_>,
     ids: &HashMap<String, ComponentId>,
@@ -362,6 +363,12 @@ pub(crate) fn lower_component_schema(
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
     declared_types: &std::collections::HashSet<String>,
+    // `record_ids` restricted to transactions and structs — v1's
+    // `Emitter::is_record_type`. `record_ids` itself also holds every
+    // regblock's mirror record by the time components lower, and the
+    // record-field arm below asks a v1-PARITY question, so it must not
+    // use the contaminated map.
+    declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentSchema, LowerError> {
     let (name, kind, items, when_active): (
         &str,
@@ -530,6 +537,7 @@ pub(crate) fn lower_component_schema(
                     is_transactor,
                     consts,
                     declared_types,
+                    declared_records,
                 )?;
                 if fields.iter().any(|x| x.name == f.name.name) {
                     return Err(LowerError::Invalid(format!(
@@ -1083,6 +1091,7 @@ fn lower_field(
     // very different things to the two, and the site had been treating
     // them alike.
     declared_types: &std::collections::HashSet<String>,
+    declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
@@ -1191,11 +1200,26 @@ fn lower_field(
             // it must not fall through to the DUT-handle arm below and
             // report a second DUT handle, which is what it used to do.
             // v1 emits a plain `Beat cur;` member here and it works.
-            if record_ids.contains_key(simple) {
+            if declared_records.contains(simple) {
                 return Err(unsupported(
                     &format!("a record-typed field `{comp}.{fname}` of type `{simple}`"),
                     "record state lowers on a standalone `transactor`; through an \
                      `env` the component-field schema has no record kind yet",
+                ));
+            }
+            // A REGBLOCK-typed field looks like a record to `record_ids`
+            // — its mirror record is in there under the regblock's name
+            // — but not to v1, whose `is_record_type` is transactions ∪
+            // structs. v1 emits `VDmaRegs* r = nullptr;` for it, with
+            // only the test DUT's Verilated header included, so the type
+            // is undeclared and the output does not compile.
+            if record_ids.contains_key(simple) {
+                return Err(not_implemented(
+                    &format!("a regblock-typed field `{comp}.{fname}` of type `{simple}`"),
+                    "a regblock is instantiated by `let <name> : <Regblock> = bind \
+                     <helper>`, not held as a component field; v1 emits a `V<Name>*` \
+                     member for it and the emitted C++ does not compile",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             // On a transactor, an unknown named type is the module-typed

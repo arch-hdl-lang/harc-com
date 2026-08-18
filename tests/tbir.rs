@@ -4640,6 +4640,15 @@ fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
             "        hookable read(addr: uint<8>) -> uint<32>",
             "        hookable probe2()\n            let regs4 : DmaRegs\n                         let z = regs4.MM2S_LEN\n        end probe2\n\n        hookable read(addr:              uint<8>) -> uint<32>",
         ),
+        // …and inside a `tseq` body, which is a third `LowerCtx`. Both
+        // of these lowered AND verified clean before every context
+        // carried the type set, so a status-only assertion on the test
+        // scope pinned nothing about them.
+        (
+            "regblock_access_test.harc",
+            "regblock DmaRegs via AxilHelper width 32",
+            "tseq Str() -> TSeq<uint<8>>\n    let regs5 : DmaRegs\n    yield 1\nend tseq Str\n\nregblock DmaRegs via AxilHelper width 32",
+        ),
     ] {
         let src = fixture_with(name, from, to);
         let err = lower_bus(&src).unwrap_err();
@@ -4755,14 +4764,15 @@ end impl T"#
             assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
         }
     }
-    // A second DUT handle is a real escape hatch: v1 binds and drives
-    // both. The first pass called it a null dereference by comparing
-    // against a control that was equally broken — neither backend
-    // auto-binds ANY handle, so `VTop* dut = nullptr;` is what the
-    // supported single-handle shape emits too, and `<inst>.dut = dut`
-    // is the required idiom in both.
+    // A second DUT handle: v1 emits a `V<Name>*` member for each while
+    // including only the TESTBENCH DUT's Verilated header, and this
+    // function cannot see which module that is — transactors lower
+    // first. So the arm takes the worst of what is under it.
     for src in both("    other : Top") {
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
         assert!(
             msg.contains("more than one module-typed field"),
             "the arm that fires is this one, not a later unrelated              assignment rejection: {msg}"
@@ -4801,11 +4811,31 @@ impl T for Tb
     end run
 end impl T"#
     );
-    assert_unsupported(&lower_src(&bound_both).unwrap_err());
+    assert_not_implemented(
+        &lower_src(&bound_both).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
     let v1 = cpp_tb::emit(&merged_src(&bound_both)).expect("v1 emits");
     assert!(
         v1.contains("_tb.drv.dut = dut;") && v1.contains("_tb.drv.other = dut;"),
-        "v1 binds BOTH handles, which is what makes the suggestion honest: {v1}"
+        "v1 does bind both handles — that half is real: {v1}"
+    );
+    // …and this is the half that decides the verdict: two handles of a
+    // module that is NOT the testbench's DUT. A split on the
+    // transactor's own handle type calls them equal, and v1 emits
+    // `VFoo*` twice against a `VTop.h`-only include.
+    let two_foo = drv("    d1 : Foo\n    d2 : Foo", "", "            d1.en = 1");
+    assert_not_implemented(
+        &lower_src(&two_foo).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let v1 = cpp_tb::emit(&merged_src(&two_foo)).expect("v1 emits");
+    assert!(
+        v1.contains("VFoo* d1 = nullptr;")
+            && v1.contains("VFoo* d2 = nullptr;")
+            && v1.contains("#include \"VTop.h\"")
+            && !v1.contains("#include \"VFoo.h\""),
+        "v1 emits both members and only the test DUT's header: {v1}"
     );
     // …but only for the SAME module type. v1 includes just the one
     // Verilated header the testbench's DUT needs, so a second named
@@ -4824,7 +4854,10 @@ end impl T"#
                 &lower_src(&src).unwrap_err(),
                 lower::V1Status::EmitsUncompilable,
             );
-            assert!(msg.contains("second named field"), "`{field}`: {msg}");
+            assert!(
+                msg.contains("more than one module-typed field"),
+                "`{field}`: {msg}"
+            );
             let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
             assert!(v1.contains(cty), "`{field}`: v1 emits `{cty}`: {v1}");
         }

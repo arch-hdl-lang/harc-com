@@ -68,8 +68,7 @@ use std::collections::{HashMap, HashSet};
 /// | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;` plus a real fan-out at the emit site (`for (auto& _s : _tb.drv.req) _s(1);`) | a real escape hatch |
 /// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
 /// | `dut : Top default <lit>` | `VTop* dut = <lit>;` — only `0` converts; `default 1` is "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
-/// | a second field of the SAME module type | binds and drives both handles | a real escape hatch |
-/// | a second named field of any OTHER type | `V<Name>* other = nullptr;` with no matching header — "'VAxiLiteRegs' does not name a type" | `EmitsUncompilable` |
+/// | a second module-typed field | a `V<Name>*` member each, but only the testbench DUT's header — and this function cannot see which module that is | `EmitsUncompilable` |
 /// | `apply Some.Policy` | nothing — the output is byte-identical to the same transactor without it | `SilentlyMisLowers` |
 /// | `on <anything>` | — | unreachable |
 ///
@@ -86,12 +85,14 @@ use std::collections::{HashMap, HashSet};
 /// the arm" rule paying out: `default 0` compiles, because `0` is a null
 /// pointer constant, and every other literal does not.
 ///
-/// The second-handle row went the other way, and for the reason the rule
-/// is easiest to misapply: the first measurement compared a two-handle
-/// program against a control that was equally broken. Neither backend
-/// auto-binds ANY transactor handle — `VTop* dut = nullptr;` is what the
-/// supported single-handle shape emits too — so the null dereference
-/// belonged to the missing `<inst>.dut = dut`, not to the second field.
+/// The second-handle row took three passes. The first called it a null
+/// dereference by comparing against a control that was equally broken —
+/// neither backend auto-binds ANY handle, so `VTop* dut = nullptr;` is
+/// what the supported single-handle shape emits too, and
+/// `<inst>.dut = dut` is the idiom in both. The second called it a real
+/// escape hatch on the strength of the one row that compiles. The third
+/// is above: the row that compiles does so only when the field names
+/// the TESTBENCH's DUT module, which this function cannot see.
 #[allow(clippy::too_many_arguments)]
 fn lower_unbound_item<'a>(
     ci: &'a ComponentItem,
@@ -157,48 +158,46 @@ fn lower_unbound_item<'a>(
                         V1Status::EmitsUncompilable,
                     ));
                 }
-                if let Some((first, dut_ty)) = dut.as_ref() {
-                    // v1 emits `V<Name>* <field> = nullptr;` for the
-                    // extra field and includes only the ONE header the
-                    // testbench's DUT type needs, so whether its output
-                    // compiles turns on whether the second field names
-                    // that same module:
+                if let Some((first, _)) = dut.as_ref() {
+                    // v1 emits `V<Name>* <field> = nullptr;` for every
+                    // module-typed field and includes exactly ONE
+                    // Verilated header — the TESTBENCH's DUT type. So
+                    // whether its output compiles turns on whether each
+                    // field names that module, which this function
+                    // cannot see: transactors lower before testbenches,
+                    // and a transactor with two module fields never
+                    // reaches the testbench-side check that does know it
+                    // (`lower_test`'s DUT-type comparison), because it
+                    // errors out here first.
                     //
-                    //   other : Top            VTop* other = nullptr;    0 errors
-                    //   other : AxiLiteRegs    'VAxiLiteRegs' does not name a type
-                    //   other : Nonesuch       'VNonesuch' does not name a type
-                    //   mode  : Color (enum)   'Color' does not name a type
+                    //   dut : Top, other : Top   both bound, 0 errors
+                    //     — when the testbench DUT is also `Top`
+                    //   d1 : Foo, d2 : Foo       'VFoo' does not name a
+                    //     type, twice — and this arm cannot tell the two
+                    //     apart
+                    //   other : AxiLiteRegs      'VAxiLiteRegs' likewise
+                    //   mode  : Color (an enum)  `Color mode;` — no `V`
+                    //     prefix and no pointer; v1 never emits a C++
+                    //     enum at all, so the name is simply undeclared
                     //
-                    // The same-module row is a real escape hatch — and
-                    // it is the row that corrected an earlier verdict,
-                    // because the null pointer is what the SUPPORTED
-                    // single-handle shape emits too (neither backend
-                    // auto-binds any handle; `<inst>.dut = dut` is the
-                    // idiom). Write both binds and v1 emits
-                    // `_tb.drv.dut = dut; _tb.drv.other = dut;` and
-                    // compiles.
-                    //
-                    // The other three do not compile, and an arm's
-                    // status is the worst thing under it.
-                    if simple != dut_ty {
-                        return Err(not_implemented(
-                            &format!(
-                                "transactor `{tname}` with a second named field `{fname}` of \
-                                 a different type from its DUT handle `{first}`"
-                            ),
-                            "v1 emits `V<Name>* <field> = nullptr;` for it while including \
-                             only the DUT's own Verilated header, so the type is undeclared \
-                             and the emitted C++ does not compile",
-                            V1Status::EmitsUncompilable,
-                        ));
-                    }
-                    return Err(unsupported(
+                    // An arm's status is the worst thing v1 does
+                    // anywhere under it. A first pass called this a real
+                    // escape hatch on the `other : Top` row alone; a
+                    // second tried to split on `simple != dut_ty`, which
+                    // compares the second field against the FIRST
+                    // HANDLE rather than against the testbench's DUT —
+                    // right answer for `other : AxiLiteRegs`, wrong one
+                    // for `d1 : Foo, d2 : Foo`.
+                    return Err(not_implemented(
                         &format!(
                             "transactor `{tname}` with more than one module-typed field \
                              (`{first}`, `{fname}`)"
                         ),
                         "the TB-IR transactor schema carries exactly one DUT handle; v1 \
-                         binds and drives both",
+                         emits a `V<Name>*` member for each while including only the \
+                         testbench DUT's Verilated header, so unless every one of them \
+                         names that same module the emitted C++ does not compile",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 *dut = Some((fname.clone(), simple.to_string()));

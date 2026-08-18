@@ -1880,6 +1880,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &mut next_fn,
             &const_vals,
             &declared_types,
+            &declared_record_names,
         )?;
         prog.components.push(schema);
     }
@@ -3621,14 +3622,33 @@ fn lower_test(
                                 // makes the bind static.
                                 let xdut = &prog.transactors[idx].dut_type;
                                 if *xdut != dut_type {
-                                    return Err(unsupported(
+                                    // The sibling of the multi-handle arm
+                                    // in `transactors.rs`, and it takes the
+                                    // same verdict for the same measured
+                                    // reason: v1 emits `V<xdut>* <field>`
+                                    // while including only the TESTBENCH
+                                    // DUT's Verilated header, so the type is
+                                    // undeclared. Measured on `d1 : Foo`
+                                    // against a `dut : Top` testbench —
+                                    // "'VFoo' does not name a type", plus
+                                    // "'struct Drv' has no member named
+                                    // 'd1'" at the poke site. An enum-typed
+                                    // field is the same failure with a
+                                    // different shape: v1 emits `Color
+                                    // mode;` and never emits a C++ enum at
+                                    // all.
+                                    return Err(not_implemented(
                                         &format!(
                                             "transactor field `{tbn}.{} : {simple}` whose \
                                              `{}` field type `{xdut}` differs from the test \
                                              DUT type `{dut_type}`",
                                             f.name.name, prog.transactors[idx].dut_field
                                         ),
-                                        "",
+                                        "a transactor drives the DUT the test instantiates; \
+                                         v1 emits a `V<Name>*` member for the mismatched \
+                                         type while including only the test DUT's Verilated \
+                                         header, so the emitted C++ does not compile",
+                                        V1Status::EmitsUncompilable,
                                     ));
                                 }
                                 transactor_fields.push((f.name.name.clone(), xid));
