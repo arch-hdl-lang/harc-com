@@ -1157,7 +1157,7 @@ impl FuncBuilder<'_> {
         // name and a transactor field are disjoint namespaces).
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some((elem, _)) = self.ctx.tseqs.get(&name.name) {
+                if let Some((elem, _, _)) = self.ctx.tseqs.get(&name.name) {
                     let seq_ty = elem.seq_type();
                     let call = self.lower_tseq_call(&name.name, args)?;
                     let id = self.declare(&l.name.name);
@@ -1270,8 +1270,17 @@ impl FuncBuilder<'_> {
                 // `(None, Some(_))` is uninhabited. (An earlier comment
                 // credited the guard above for this; that was the wrong
                 // reason for a right conclusion.)
+                // `RecordSeq`/`Seq` alongside `Record`: a `-> TSeq<T>`
+                // method result is as much a typed value as a record
+                // one, and dropping it left `let ys = k.gen(xs)`
+                // untyped — so the next slot the local entered read it
+                // as having no known shape. `method_schema_ir_type`
+                // resolves the sequence into `ret_ty`; this arm just has
+                // to stop discarding it.
                 let inferred = declared_scalar_ty.clone().or_else(|| match &m.ret_ty {
-                    Some(ty @ IrType::Record(_)) => Some(ty.clone()),
+                    Some(ty @ (IrType::Record(_) | IrType::RecordSeq(_) | IrType::Seq(_))) => {
+                        Some(ty.clone())
+                    }
                     _ => None,
                 });
                 if let Some(ty) = inferred {
@@ -1698,7 +1707,7 @@ impl FuncBuilder<'_> {
         what: &str,
     ) -> Result<(), LowerError> {
         let got = self.slot_shape_of(value);
-        if got == want {
+        if got == want || !want.known() || !got.known() {
             return Ok(());
         }
         Err(LowerError::Invalid(format!(
@@ -1708,17 +1717,30 @@ impl FuncBuilder<'_> {
         )))
     }
 
-    /// The slot shape a lowered value presents. A sequence is read off
-    /// the value's `IrType` (only a tseq call result and a local bound
-    /// from one carry `RecordSeq`/`Seq`), so nothing else changes shape.
+    /// The slot shape a lowered value presents. `record_id_of_expr`
+    /// answers the record question on its own terms; everything else is
+    /// read off the value's `IrType`, and a type this compiler could not
+    /// infer stays `Unknown` rather than being called a scalar. An
+    /// untyped local is the single most common way a correct program
+    /// reached the old `Scalar` fallback and got rejected for it.
     fn slot_shape_of(&self, value: &crate::ir::Expr) -> Slot {
         if let Some(rid) = self.record_id_of_expr(value) {
             return Slot::Record(rid);
         }
+        // A literal is a scalar whatever its `ty` says. Bare integer
+        // literals carry `ty: Unknown` (the width is inferred at the
+        // use site), so reading their shape off `expr_type` alone would
+        // make `q.push(1)` into a `queue<Beat>` unknown — and that cell
+        // is the one this whole family started from.
+        if matches!(
+            value,
+            crate::ir::Expr::Literal { .. } | crate::ir::Expr::WideLiteral(_)
+        ) {
+            return Slot::Scalar;
+        }
         match self.expr_type(value) {
-            Some(IrType::RecordSeq(rid)) => Slot::Seq(Some(rid)),
-            Some(IrType::Seq(_)) => Slot::Seq(None),
-            _ => Slot::Scalar,
+            Some(ty) => Slot::of_ir(&ty),
+            None => Slot::Unknown,
         }
     }
 
@@ -1730,6 +1752,9 @@ impl FuncBuilder<'_> {
             }
             Slot::Seq(None) => "a scalar `TSeq`".to_string(),
             Slot::Scalar => "a non-record value".to_string(),
+            // Unreachable: `check_slot_shape` returns `Ok` before
+            // building a message when either side is `Unknown`.
+            Slot::Unknown => "a value of unknown type".to_string(),
         }
     }
 
@@ -2917,18 +2942,14 @@ impl FuncBuilder<'_> {
         // `param_tys` for this — it carried only names, so there was
         // nothing here to type-check against.
         for (i, (a, ty)) in lowered.iter().zip(m.param_tys.iter()).enumerate() {
-            let want = match ty {
-                IrType::Record(r) => Some(*r),
-                _ => None,
-            };
             let pname = m
                 .param_names
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", i + 1));
-            self.check_slot_type(
+            self.check_slot_ir(
                 a,
-                want,
+                ty,
                 &format!("parameter `{pname}` of `{}.{method}`", schema.name),
             )?;
         }
@@ -3189,31 +3210,40 @@ impl FuncBuilder<'_> {
         // measured, `RandomTxns(n = 5)` emits `RandomTxns(5)` against
         // `auto RandomTxns = [&](uint64_t n)` — byte-identical to the
         // positional call. The names ride in `ctx.tseqs` for this.
-        if let Some((_, declared)) = self.ctx.tseqs.get(name) {
-            let declared = declared.clone();
-            super::reject_misplaced_named_args(
-                args,
-                &declared,
-                &format!("tseq call `{name}(...)`"),
-            )?;
-        }
+        let param_tys = match self.ctx.tseqs.get(name) {
+            Some((_, declared, tys)) => {
+                let (declared, tys) = (declared.clone(), tys.clone());
+                super::reject_misplaced_named_args(
+                    args,
+                    &declared,
+                    &format!("tseq call `{name}(...)`"),
+                )?;
+                tys
+            }
+            None => Vec::new(),
+        };
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
             let v = self.lower_expr_no_ports(e)?;
-            // Every REACHABLE tseq parameter is a scalar, so the slot
-            // rule here needs no type table — `ctx.tseqs` carries names
-            // and the element type, and that is enough.
+            // A note here once claimed every REACHABLE tseq parameter is
+            // a scalar, so the slot needed no type table and could be
+            // hard-coded to "not a record". `TSeq<T>` disproves it:
+            // `tseq Wrap(xs: TSeq<Beat>)` is compiled by v1 as
+            // `[&](const std::vector<Beat>& xs) -> std::vector<Beat>`,
+            // and the hard-coded slot rejected `Wrap(xs)` — which works
+            // — while passing `Wrap(7)`, which v1 refuses with "no known
+            // conversion from 'int' to 'const std::vector<Beat>&'".
             //
-            // Measured, a record-typed tseq parameter has no working
-            // member at all: yielding it is refused upstream (`yield
-            // <param>` is not a record local), reading `<param>.<field>`
-            // is refused, and even leaving it UNUSED breaks both
-            // backends — tbir emits `[&](uint64_t seed)` and v1
-            // `[&](VBeat* seed)`, treating the record as a Verilated
-            // module pointer, and neither compiles. So a record
-            // argument here is wrong however the callee is written.
-            self.check_slot_type(&v, None, &format!("parameter of tseq `{name}`"))?;
+            // The RECORD half of that note survives and is still why a
+            // record argument is wrong however the callee is written:
+            // `yield <param>` is refused upstream, `<param>.<field>` is
+            // refused, and leaving it UNUSED breaks both backends — tbir
+            // emits `[&](uint64_t seed)` and v1 `[&](VBeat* seed)`,
+            // reading the record as a Verilated module pointer.
+            if let Some(ty) = param_tys.get(i) {
+                self.check_slot_ir(&v, ty, &format!("parameter of tseq `{name}`"))?;
+            }
             lowered.push(v);
         }
         Ok(Expr::Call(
@@ -4233,6 +4263,23 @@ impl FuncBuilder<'_> {
         // the program `Invalid` — while v1 emits
         // `auto r = Tb_make_result(_tb, 7);` and compiles.
         let ret_record = self.record_id_of_expr(&v);
+        // NO sequence arm here, deliberately, and the first attempt at
+        // this batch wrote one that could never fire. A testbench
+        // method's return temp is typed by `ir_type_of_with_records`,
+        // which answers `Unknown` for `TSeq<T>` — so there is no
+        // sequence type to carry, and code reading `expr_type` for one
+        // is dead.
+        //
+        // That is a real gap, and it is OLDER than the slot rule: the
+        // whole inlined chain is untyped, parameter included, so tbir
+        // emits `uint64_t s = 0; uint64_t ys = 0;` and then `s = xs;`,
+        // which g++ refuses ("cannot convert `std::vector<Beat>` to
+        // `uint64_t`") while v1 compiles
+        // `[&](Tb& self, const std::vector<Beat>& s)`. Reproducible on
+        // the merge base, so it is not this rule's to fix — typing that
+        // chain changes the emitted C++ and wants its own measurement.
+        // Recorded in divergence 114; the `Unknown` rule keeps the slot
+        // check from adding a false rejection on top of it meanwhile.
         // No "…unless the annotation names that same record" escape,
         // because by construction the annotation here never can. A `let`
         // whose declared type names a record is claimed a thousand lines
@@ -4547,26 +4594,41 @@ fn pop_call_parts(value: &Option<crate::ast::Expr>) -> Option<(&crate::ast::Expr
     }
 }
 
-/// What a typed slot accepts, to the precision lowering can decide.
+/// What a typed slot accepts, or what a value presents, to the precision
+/// lowering can actually decide.
 ///
-/// `Scalar` is also where every type this compiler cannot name lands —
-/// an enum parameter, an unresolved path. That is deliberate and it is
-/// the pre-existing behaviour: an enum lowers to an `int64_t` member
-/// (`field_ir_type`), so calling it non-record is true for the case that
-/// actually reaches here. A `TSeq<T>` is NOT such a case — it lowers to
-/// a `std::vector`, and describing it as a non-record value was simply
-/// wrong — so it gets its own variant rather than falling in.
+/// `Unknown` is the load-bearing variant, and the first version of this
+/// enum did not have it: everything lowering could not name fell into
+/// `Scalar`, which turns an ABSENCE of information into the positive
+/// claim "this is not a record". Three well-typed programs were called
+/// `Invalid` on the strength of that claim — a `-> TSeq<T>` method
+/// result, a `TSeq<T>` transactor parameter, a `TSeq<T>` tseq parameter
+/// — each one compiled by v1 and each one rejected by the DEFAULT
+/// backend. `component_base_id` already states the rule this broke:
+/// callers must treat "cannot tell" as cannot tell, never as "not a
+/// record".
+///
+/// So the guard is conservative by construction — it rejects only when
+/// it can name BOTH sides. A slot whose declared type this compiler
+/// cannot resolve (an enum, an unresolved path) is unchecked rather
+/// than assumed scalar; the program is no worse off than before any of
+/// this existed, and a wrong verdict is worse than no verdict.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     /// A declared record — `t: Beat`, `queue<Beat>`, `event<Beat>`.
     Record(crate::ir::RecordId),
     /// A `TSeq<T>`; `Some(rid)` when the element is a declared record.
     Seq(Option<crate::ir::RecordId>),
-    /// A scalar, or a type named by no table (see above).
+    /// Known to be a scalar — `uint<N>`, `sint<N>`, `bit`, `bool`.
     Scalar,
+    /// Not nameable here. Never compared, never reported.
+    Unknown,
 }
 
 impl Slot {
+    /// For the many slots that genuinely are record-or-scalar — a queue
+    /// element, an event payload — where `None` means the slot was
+    /// declared scalar rather than "could not be read".
     fn of_record(want: Option<crate::ir::RecordId>) -> Self {
         match want {
             Some(rid) => Slot::Record(rid),
@@ -4579,8 +4641,13 @@ impl Slot {
             IrType::Record(rid) => Slot::Record(*rid),
             IrType::RecordSeq(rid) => Slot::Seq(Some(*rid)),
             IrType::Seq(_) => Slot::Seq(None),
-            _ => Slot::Scalar,
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => Slot::Scalar,
+            _ => Slot::Unknown,
         }
+    }
+
+    fn known(self) -> bool {
+        !matches!(self, Slot::Unknown)
     }
 }
 

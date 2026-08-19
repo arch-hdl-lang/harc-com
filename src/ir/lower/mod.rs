@@ -36,7 +36,7 @@ use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
     CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
     RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, Terminator, TestSchema,
-    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TseqElem, TypedLocal, TypedParam,
+    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -2929,7 +2929,7 @@ fn lower_test(
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
-    tseq_records: &HashMap<String, (TseqElem, Vec<String>)>,
+    tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
@@ -6161,14 +6161,15 @@ pub(crate) struct LowerCtx {
     /// `CallTarget::Tseq` whose result types the local as the element's
     /// `RecordSeq`/`Seq` (`TseqElem::seq_type`), and a `for t in txns` over
     /// such a local lowers to a counted loop over `txns`.
-    /// tseq name -> (element type, declared parameter NAMES).
+    /// tseq name -> (element type, declared parameter NAMES, declared
+    /// parameter TYPES).
     ///
     /// The names ride along for the same reason
     /// `TransactorMethodSchema::param_names` carries them: the call site
     /// lowers from this map alone, and without the names it could only
     /// refuse every named argument — including the in-order form v1
     /// emits byte-identically.
-    pub tseqs: HashMap<String, (TseqElem, Vec<String>)>,
+    pub tseqs: tseqs::TseqTable,
     /// DUT-internal `probe` declarations on `let dut` (probe name →
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with

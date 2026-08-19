@@ -341,8 +341,7 @@ impl FuncBuilder<'_> {
         p: &crate::ast::Param,
         owner: &str,
     ) -> Result<(), LowerError> {
-        let want = tseq_ir_type(p.ty.as_ref(), &self.ctx.record_ids)
-            .unwrap_or_else(|| ir_type_of_param(p.ty.as_ref(), self.ctx));
+        let want = slot_ir_type(p.ty.as_ref(), &self.ctx.record_ids);
         self.check_slot_ir(v, &want, &format!("parameter `{}` of {owner}", p.name.name))
     }
 
@@ -667,6 +666,37 @@ pub(crate) fn tseq_ir_type(
         }
     }
     Some(IrType::Unknown)
+}
+
+/// The declared type of a SLOT, for the argument checks — as opposed to
+/// `ir_type_of_with_records`, which also types the parameter's local and
+/// therefore the emitted C++.
+///
+/// The two differ on exactly one thing: `int` (and `time`) are scalars
+/// that `ir_type_of` deliberately leaves `Unknown`, because they carry
+/// no width and local typing wants that absence preserved. A slot check
+/// does not care about width — it only asks record / sequence / scalar —
+/// so it can answer where local typing must not.
+///
+/// Use this wherever the declared `TypeExpr` is in hand. Where only a
+/// schema's `param_tys` is available the check reads that instead, and
+/// an `int` parameter there stays unchecked: those tables exist to type
+/// locals, and widening them would change what the backend emits.
+pub(crate) fn slot_ir_type(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> IrType {
+    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+        return seq;
+    }
+    if let Some(TypeExpr::Builtin { name, .. }) = ty {
+        match name {
+            BuiltinTy::Int => return IrType::SInt(None),
+            BuiltinTy::Time => return IrType::UInt(None),
+            _ => {}
+        }
+    }
+    ir_type_of_with_records(ty, record_ids)
 }
 
 pub(crate) fn ir_type_of_with_records(

@@ -7168,11 +7168,16 @@ former `transaction` group lives in
      available at both construction sites. Same three mismatched cells,
      same verdicts, both controls compiling.
 
-     **`tseq` call arguments** turned out not to need one either, for a
-     different reason: every REACHABLE tseq parameter is a scalar, so
+     **`tseq` call arguments** looked like they needed nothing either:
+     every reachable tseq parameter is a scalar, the reasoning went, so
      the slot is always `None` and `ctx.tseqs` needs nothing added.
-     That is measured, not assumed — a record-typed tseq parameter has
-     no working member however the callee is written:
+     That was wrong, and divergence 114 has the correction — a
+     `TSeq<T>` tseq parameter is reachable and v1 compiles it, so the
+     hard-coded `None` rejected a working call while passing a broken
+     one. What the measurement below DOES establish is the narrower
+     claim about RECORD parameters, which still holds: a record-typed
+     tseq parameter has no working member however the callee is
+     written:
 
      | shape | outcome |
      |---|---|
@@ -7219,15 +7224,15 @@ former `transaction` group lives in
      user wrote; the third is the hole that wording was hiding, since an
      `int` is not a record either.
 
-     Nothing new was needed to fix it. `IrType` already had `RecordSeq`
-     and `Seq`, and `method_schema_ir_type` already resolved `TSeq<T>`
-     into them for the component-method schema — `param_tys` was
-     carrying the right type all along and the slot check was throwing
-     it away. The fix names the three shapes the check can actually
-     decide (record, sequence, everything else) and routes the parameter
-     positions through the declared `IrType` instead of a boolean. The
-     `TSeq` resolver moved to `helpers::tseq_ir_type` so the schema side
-     and the check side cannot disagree about what `TSeq<Beat>` means.
+     `IrType` already had `RecordSeq` and `Seq`, and
+     `method_schema_ir_type` already resolved `TSeq<T>` into them for the
+     component-method schema — `param_tys` was carrying the right type
+     all along and the slot check was throwing it away. The fix names
+     the shapes the check can actually decide and routes the
+     COMPONENT-METHOD and TESTBENCH-METHOD parameter positions through
+     the declared `IrType` instead of a boolean. The `TSeq` resolver
+     moved to `helpers::tseq_ir_type` so the schema side and the check
+     side cannot disagree about what `TSeq<Beat>` means.
 
      Enumerated mechanically rather than sampled — 3 value shapes (a
      scalar, a `Beat`, a `TSeq<Beat>`) into 8 slots (scalar, record and
@@ -7237,11 +7242,12 @@ former `transaction` group lives in
      under v1 and lower under tbir, all 16 mismatches get a g++ error
      from v1. `Invalid` throughout, as everywhere else in this family.
 
-     "Everything else" — an enum parameter, an unresolved path — still
-     reports as a non-record value. That is deliberate rather than
-     overlooked: an enum lowers to an `int64_t` member (`field_ir_type`),
-     so the wording is true for the case that reaches it. A `TSeq` was
-     the case where it was not.
+     The grid covers the two spellings it names and no others. Reading
+     it as a statement about "the parameter positions" was the mistake
+     divergence 114 had to undo: the transactor-method, `tseq` and bus
+     `tlm_method` positions were NOT routed through `IrType`, and two of
+     them went on to reject working programs. A grid is evidence about
+     its own cells.
 
      Three further mutants from the same round, each a real gap:
 
@@ -7257,6 +7263,99 @@ former `transaction` group lives in
        first and returns on every path. The check was a condition with
        one reachable verdict dressed as two, and is now written as one.
 
+
+114. **"Cannot tell" is not "is not a record" (2026-08-19).**
+
+     Divergences 111-113 built a slot check that answers with a small
+     enum, and every type it could not name fell into `Scalar`. That
+     turns an ABSENCE of information into a positive claim, and three
+     well-typed programs were called `Invalid` on the strength of it —
+     each one compiled by v1, each one refused by the DEFAULT backend:
+
+     | program | v1 | before 113 | after 113 |
+     |---|---|---|---|
+     | `let ys = k.gen(xs)` on `-> TSeq<Beat>`, then `k.fseq(ys)` | compiles | lowered, emitted `uint64_t ys = 0` | **`Invalid`** |
+     | `drv.dispatch(xs)` on `dispatch(txns: TSeq<Beat>)` | compiles | lowered, emitted `std::function<void(long unsigned int)>` | **`Invalid`** |
+     | `Wrap(xs)` on `tseq Wrap(xs: TSeq<Beat>)` | compiles | lowered, emitted `[&](uint64_t xs)` | **`Invalid`** |
+
+     The middle column is the point. Before 113 each of these was an
+     `EmitsUncompilable` gap — bad, but the honest verdict for it is
+     `Unsupported`/`NotImplemented`. Turning it into `Invalid` did not
+     tighten anything; it took a program v1 builds and had the default
+     backend refuse it outright. The repo already stated the rule this
+     broke, in `component_base_id`'s own doc: callers "must treat that
+     as 'cannot tell', never as 'not a record'."
+
+     So the enum grows an `Unknown` and the guard rejects only when it
+     can name BOTH sides. That is the whole safety property, and it is
+     what makes the check safe to extend: a slot the compiler cannot
+     resolve is now unchecked rather than assumed scalar.
+
+     `Unknown` alone would have been a retreat, because the hole runs
+     the other way too — a scalar into a `TSeq` slot is exactly as wrong
+     and v1 refuses it. So the four positions that were guessing got
+     their types instead:
+
+     - the transactor method schema learned `TSeq` (`method_param_ir_type`);
+     - `ctx.tseqs` carries declared parameter TYPES, not just names;
+     - a `-> TSeq<T>` method result now types its `let` at the
+       component-method spelling (the testbench-method one cannot yet —
+       see below);
+     - the bus `tlm_method` request path gained a check at all — it had
+       the declared type in hand as a WIDTH hint and never asked whether
+       the argument belonged in the slot. `mem.read(b)` with a record
+       argument lowered, verified, and emitted
+       `harc_rt::harc_assign(dut->mem_read_addr, b);` from BOTH backends,
+       both failing g++ with "invalid `static_cast` from type `Beat`".
+       Guarded at the blocking and `fork` spellings together.
+
+     Two shapes deliberately stay unchecked, and it is worth being
+     explicit about which:
+
+     - An `int`- or `time`-typed parameter reached through a SCHEMA's
+       `param_tys`. Those tables also type the parameter's local and
+       therefore the emitted C++, so widening them to call `int` a
+       scalar would change what the backend emits — out of scope for a
+       slot check. Where the declared `TypeExpr` is in hand,
+       `helpers::slot_ir_type` answers precisely; where only the schema
+       is, the slot is unchecked. A missed rejection, never a false one.
+     - A literal is read as a scalar directly rather than through its
+       `IrType`, because a bare integer literal carries `ty: Unknown`
+       (the width is inferred at the use site). Without that,
+       `q.push(1)` into a `queue<Beat>` — the cell this whole family
+       started from — would have become unknown and stopped being
+       rejected.
+
+     One thing this did NOT fix, and the first attempt claimed it had.
+     A testbench method's return temp resolves through
+     `ir_type_of_with_records`, which answers `Unknown` for `TSeq<T>`,
+     so the whole inlined chain is untyped — parameter included:
+
+     ```
+     v1    auto Tb_passthru = [&](Tb& self, const std::vector<Beat>& s)
+                                  -> const std::vector<Beat>& { ... };
+           auto ys = Tb_passthru(_tb, xs);          // compiles
+     tbir  uint64_t s = 0;  uint64_t ys = 0;
+           s = xs;                                  // g++: cannot convert
+                                                    // `std::vector<Beat>`
+                                                    // to `uint64_t`
+     ```
+
+     Reproducible on the merge base, so it is an older
+     `EmitsUncompilable` gap and not this rule's to close — typing that
+     chain changes the emitted C++ and deserves its own measurement. The
+     code written for it here read `expr_type` for a sequence that is
+     never there, i.e. it was dead the moment it was written, and has
+     been removed rather than left looking like a fix. The `Unknown`
+     rule is what keeps the slot check from adding a false rejection on
+     top of the gap meanwhile.
+
+     Found by review, not by the mutation round: 21 mutants over the 113
+     change surface were all caught, and every one of these defects
+     survived that, because a mutant can only ask whether the code does
+     what its tests say. None of the three false `Invalid`s had a test,
+     since the grid that "proved" the change covered two spellings and
+     the defects were in the other three.
 
 ## Next steps
 

@@ -1668,6 +1668,14 @@ fn method_param_ir_type(
             return Ok(IrType::Record(rid));
         }
     }
+    // A `TSeq<T>` parameter, through the resolver the component-method
+    // schema uses. Without it the type came back `Unknown` and the slot
+    // check described a `TSeq<Beat>` parameter as taking a non-record
+    // value — then rejected `drv.dispatch(xs)`, which v1 compiles
+    // (`[&](Drv& self, const std::vector<Beat>& txns)`).
+    if let Some(seq) = helpers::tseq_ir_type(p.ty.as_ref(), record_ids) {
+        return Ok(seq);
+    }
     check_method_param_ty(
         tname,
         mname,

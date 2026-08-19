@@ -6651,11 +6651,34 @@ end impl T"#
     // `uint64_t b; b = Src_mk(...)` — which does not compile — and then
     // made every slot guard above call five well-typed programs
     // `Invalid`, because the local read as a scalar.
-    let inferred = call_prog("        let r = s.mk(1)\n        s.robs(r)");
-    lower_src(&inferred).expect("an untyped record-returning `let` lowers");
+    let inferred = call_prog("        let got = s.mk(1)\n        s.robs(got)");
+    let lowered = lower_src(&inferred).expect("an untyped record-returning `let` lowers");
+    // Asserted on the LOCAL's type, and named `got` rather than `r`, for
+    // two reasons this test learned the hard way. The emitted-substring
+    // form matched `Beat r{}` from inside `Src_mk`'s own body — the
+    // callee declares a local named `r` too — so it passed with the
+    // inference deleted. And once a slot whose shape cannot be read is
+    // waved through rather than assumed scalar, "the program is still
+    // rejected" stopped distinguishing a typed local from an untyped
+    // one at all. The type is the thing the inference exists to set, so
+    // it is the thing to check.
+    let got = lowered
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .expect("run fn")
+        .locals
+        .iter()
+        .find(|l| l.name == "got")
+        .expect("no `got` local");
     assert!(
-        emit_cpp_src(&inferred).contains("Beat r{}"),
-        "the local declares as the method's return record"
+        matches!(got.ty, ir::IrType::Record(_)),
+        "the local types as the method's return record, got {:?}",
+        got.ty
+    );
+    assert!(
+        emit_cpp_src(&inferred).contains("Beat got{}"),
+        "…and declares as it (untyped emitted `uint64_t got = 0;`)"
     );
 
     // A TESTBENCH-METHOD `let` takes the method's return record too —
@@ -7601,6 +7624,255 @@ end impl T"#
         assert!(
             cpp_tb::emit(&merged_src(&src)).is_ok(),
             "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// The slot check's own failure mode: it answered with a small enum, and
+/// every type it could not name fell into "not a record". That turns an
+/// absence of information into a claim, and three programs v1 COMPILES
+/// were rejected outright by the default backend for it.
+///
+/// Each cell below was measured on both backends. The `_ok` ones compile
+/// under v1 and must lower; the `_bad` ones get a g++ error from v1 and
+/// must be `Invalid`. Before this fix the two columns were swapped at
+/// every one of these spellings — the working call rejected, the broken
+/// one waved through.
+#[test]
+fn a_slot_the_compiler_cannot_name_is_not_a_scalar() {
+    // A `-> TSeq<T>` method result types its `let`, so the next slot the
+    // local enters sees a sequence rather than an untyped value.
+    let seq_ret = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+agent Sink
+    n : uint<32> default 0
+    function gen(s: TSeq<Beat>) -> TSeq<Beat>
+        return s
+    end function
+    function fseq(s: TSeq<Beat>)
+        n = n + 1
+    end function
+end agent Sink
+
+testbench Tb
+    dut : Top
+    k   : Sink
+
+    function passthru(s: TSeq<Beat>) -> TSeq<Beat>
+        return s
+    end passthru
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+{call}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // The testbench-method spelling lowers too, but its local does NOT
+    // type as a sequence, and that is a gap OLDER than this rule rather
+    // than one it left behind: a testbench method's return temp resolves
+    // through `ir_type_of_with_records`, which answers `Unknown` for
+    // `TSeq<T>`. The whole inlined chain is untyped, so tbir emits
+    // `uint64_t ys = 0;` and `s = xs;` and g++ refuses it, while v1
+    // compiles `[&](Tb& self, const std::vector<Beat>& s)`. Reproducible
+    // on the merge base. What matters here is that the slot check does
+    // not pile a false rejection on top of it.
+    lower_src(&seq_ret(
+        "        let ys = passthru(xs)\n        k.fseq(ys)",
+    ))
+    .expect("the untyped testbench-method chain still lowers, rather than being rejected");
+
+    for ok in [
+        // v1: `auto ys = Sink_gen(_tb.k, xs); Sink_fseq(_tb.k, ys);`
+        "        let ys = k.gen(xs)\n        k.fseq(ys)",
+    ] {
+        let prog = lower_src(&seq_ret(ok))
+            .unwrap_or_else(|e| panic!("`{ok}` lowers (v1 compiles it): {e:?}"));
+        // Not just "is accepted" — the local must carry the SEQUENCE
+        // type. Accepting it is only half the fix and the weaker half:
+        // an untyped local is waved through by the `Unknown` rule
+        // whether or not the result type was carried, so a test that
+        // checks lowering alone passes with the inference deleted. What
+        // the inference actually buys is the declaration, and getting it
+        // wrong is silent — v1 emits `std::vector<Beat>` while an
+        // untyped tbir local emitted `uint64_t ys = 0`.
+        let ys = prog
+            .functions
+            .iter()
+            .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+            .expect("run fn")
+            .locals
+            .iter()
+            .find(|l| l.name == "ys")
+            .unwrap_or_else(|| panic!("`{ok}`: no `ys` local"));
+        assert!(
+            matches!(ys.ty, ir::IrType::RecordSeq(_)),
+            "`{ok}`: `ys` must type as the method's sequence result, got {:?}",
+            ys.ty
+        );
+    }
+
+    // A `TSeq<T>` parameter on a TRANSACTOR method. The schema resolved
+    // it to `Unknown`, so the slot claimed to be non-record and the
+    // working call was refused while the broken one passed.
+    let xactor = |arg: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+transactor Drv
+    dut : Top
+    when active
+        hookable dispatch(txns: TSeq<Beat>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+        drv.dispatch({arg})
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // v1: `[&](Drv& self, const std::vector<Beat>& txns)`, called with `xs`.
+    lower_src(&xactor("xs")).expect("a matching sequence argument lowers");
+    let msg = assert_invalid(&lower_src(&xactor("1")).unwrap_err());
+    assert!(
+        msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
+        "and the scalar is refused, naming the sequence: {msg}"
+    );
+
+    // The same pair at the `tseq` spelling, whose slot was hard-coded to
+    // "not a record" on the belief that every reachable tseq parameter
+    // is a scalar.
+    let tseq_param = |arg: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+tseq Wrap(xs: TSeq<Beat>) -> TSeq<Beat>
+    let b : Beat
+    b.v = 9
+    yield b
+end tseq Wrap
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+        let ys = Wrap({arg})
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // v1: `[&](const std::vector<Beat>& xs) -> std::vector<Beat>`.
+    lower_src(&tseq_param("xs")).expect("a matching sequence argument lowers");
+    let msg = assert_invalid(&lower_src(&tseq_param("7")).unwrap_err());
+    assert!(
+        msg.contains("parameter of tseq `Wrap`")
+            && msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
+        "{msg}"
+    );
+
+    // The bus `tlm_method` request path had the declared type in hand as
+    // a WIDTH hint and never asked whether the argument belonged in the
+    // slot at all. Both backends emitted
+    // `harc_rt::harc_assign(dut->mem_read_addr, b);` and both fail g++
+    // with "invalid `static_cast` from type `Beat`".
+    let bus = |call: &str| {
+        fixture("tlm_method_blocking_fork_bus_test.harc")
+            .replacen(
+                "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+                "transaction Beat\n    v : uint<8>\nend transaction Beat\n\n\
+                 testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+                1,
+            )
+            .replacen(
+                "        let forked = fork mem.read(5)\n        join_all\n",
+                &format!("        let b : Beat\n{call}\n"),
+                1,
+            )
+            .replacen(
+                "        assert forked == 261\n            else fail(\"forked blocking read got \
+                 0x${forked:08x}, expected 0x00000105\")\n",
+                "",
+                1,
+            )
+    };
+    for ok in [
+        "        let r = mem.read(5)",
+        "        let f = fork mem.read(5)\n        join_all",
+    ] {
+        lower_src(&bus(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (call, what) in [
+        ("        let r = mem.read(b)", "of bus method `read`"),
+        (
+            "        let f = fork mem.read(b)\n        join_all",
+            "of forked bus method `read`",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&bus(call)).unwrap_err());
+        assert!(
+            msg.contains(what) && msg.contains("was given a `Beat`"),
+            "`{call}`: {msg}"
         );
     }
 }
