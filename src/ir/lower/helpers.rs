@@ -365,14 +365,20 @@ impl FuncBuilder<'_> {
         // Same measurement as the helper arm above:
         // `ref_add(b = 222, a = 111)` emits `ref_add(222, 111)` under
         // v1, and the in-order form emits the positional one unchanged.
-        if let Some((declared, _)) = self.ctx.extern_fns.get(name) {
-            super::reject_misplaced_named_args(
-                args,
-                declared,
-                &format!("extern fn call `{name}(...)`"),
-            )?;
-        }
-        let (pnames, ptys) = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
+        // One lookup, not two, and no `None` path on either: the sole
+        // caller (`exprs.rs`) dispatches here only when the name is in
+        // `extern_fns`. The previous shape had three separate
+        // expressions of that impossible `None` — an `if let` that
+        // silently skipped the named-argument check, an
+        // `unwrap_or_default`, and a `contains_key` guard — and the
+        // commit that removed two of them said in its own message that
+        // the lookup always hits.
+        let (pnames, ptys) = self.ctx.extern_fns[name].clone();
+        super::reject_misplaced_named_args(
+            args,
+            &pnames,
+            &format!("extern fn call `{name}(...)`"),
+        )?;
         // Arity, before the slot loop — the same order
         // `check_component_call_args` uses, and for the reason its doc
         // records: without it the `zip`/`get` silently stops at the
@@ -386,10 +392,6 @@ impl FuncBuilder<'_> {
         // "an argument of extern fn `f` takes a non-record value",
         // describing parameter #2 of a one-parameter function. A slot
         // that does not exist has no type to disagree with.
-        // No `contains_key` guard: the sole caller (`exprs.rs`)
-        // dispatches here only when the name IS in `extern_fns`, so the
-        // lookup above always hits and `pnames`/`ptys` are the callee's
-        // own, never the default.
         if args.len() != pnames.len() {
             return Err(LowerError::Invalid(format!(
                 "extern fn `{name}` takes {} argument(s), call passes {}",

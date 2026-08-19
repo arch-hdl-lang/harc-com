@@ -1242,10 +1242,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // declaration alone is what breaks. `emit_extern_fn_decls` is shared
     // (tbir calls straight into v1's) and runs every parameter AND the
     // return type through `c_type_for`, whose `Named` fall-through is
-    // `V{last}*`. Exactly one `V<name>.h` is ever included — the DUT
-    // module's — so any other name is undeclared and BOTH backends fail
-    // to compile the translation unit, called or not. Hence `Invalid`,
-    // and hence the declaration rather than the call site.
+    // `V{last}*`. The only `V<name>.h` headers ever included are the DUT
+    // module's own (plus its `___024root` when the test declares
+    // probes), so any other name is undeclared and BOTH backends fail to
+    // compile the translation unit, called or not. Hence `Invalid`, and
+    // hence the declaration rather than the call site.
     //
     // The question is asked THROUGH the emitter
     // (`cpp_tb::verilated_handle_name`) rather than restated here, and
@@ -1279,8 +1280,29 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
     let bad_handle = |t: Option<&TypeExpr>| -> Option<String> {
-        let n = crate::codegen::cpp_tb::verilated_handle_name(t?)?;
-        (!dut_types.contains(n)).then(|| n.to_string())
+        let t = t?;
+        // The `Named` fall-through: `V<name>*`, satisfiable only for the
+        // DUT's own type.
+        if let Some(n) = crate::codegen::cpp_tb::verilated_handle_name(t) {
+            if !dut_types.contains(n) {
+                return Some(n.to_string());
+            }
+        }
+        // …and the ELEMENT of a `TSeq<T>` / `queue<T>`, which is pasted
+        // verbatim into `std::vector<T>` / `HarcQueue<T>`. Satisfiable
+        // for a record (emitted as a C++ struct of that name) and
+        // nothing else — NOT even the DUT: `TSeq<Top>` pastes `Top`,
+        // while the struct that exists is `VTop`. Measured against the
+        // compiling control `TSeq<Beat>`; `TSeq<Nope>`, `TSeq<Top>`,
+        // `TSeq<Color>` and `queue<Nope>` all fail g++ from both
+        // backends.
+        //
+        // This arm is why the previous version's claim to cover
+        // "every parameter AND the return type through `c_type_for`"
+        // was not true of the CHECK: `c_type_for` has three arms that
+        // paste a HARC name, and the rule modelled one.
+        let n = crate::codegen::cpp_tb::element_type_name(t)?;
+        (!record_ids.contains_key(n)).then(|| n.to_string())
     };
     // File order, not `extern_fn_decls` order: that is a `HashMap`, so
     // iterating it named a different offender run to run on the same
@@ -1298,10 +1320,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             });
         if let Some((where_, ty)) = bad {
             return Err(LowerError::Invalid(format!(
-                "`extern function {}` names `{ty}` in its {where_}; both backends emit \
-                 that as `V{ty}*`, a Verilated module handle, and only the DUT's own \
-                 `V<Type>.h` is included — so the generated C++ does not compile. Pass \
-                 scalars (or a `list`/`Vec` of them) across the extern boundary instead",
+                "`extern function {}` names `{ty}` in its {where_}; both backends paste \
+                 that name into the generated C++ with no declaration behind it, so the \
+                 translation unit does not compile. Across the extern boundary pass \
+                 scalars, a `list`/`Vec` of them, or a sequence of a declared \
+                 `transaction`/`struct`",
                 decl.name.name
             )));
         }
@@ -5584,16 +5607,32 @@ pub(crate) fn reject_misplaced_named_args(
         // pre-existing arity gap — the exact failure mode this guard was
         // rewritten to stop producing.
         //
-        // An earlier version of this comment claimed call sites check
-        // arity first so the branch is unreachable. That was false, and
-        // it named two callers: `lower_extern_fn_call` and the
-        // component-method path. The extern one has since GAINED an
-        // arity check (`ref_add(b = 2, a = 1, 3)` is now
-        // "extern fn `ref_add` takes 2 argument(s), call passes 3", not
-        // a silent lowering), so of the two only the component-method
-        // path still arrives here mis-counted — `axil_write(t.value)`
-        // lowers. The branch is still reachable; the worked example that
-        // used to demonstrate it is not.
+        // The branch IS reachable, and two earlier attempts to say why
+        // both got it wrong. The first claimed call sites check arity
+        // first, so it is dead. The second claimed the extern path had
+        // since been fixed and only the component path still arrives
+        // mis-counted, witnessed by `axil_write(t.value)`.
+        //
+        // The reachability argument is about ORDER, not about which
+        // callers check arity at all. Every caller that checks arity
+        // does so AFTER calling this: `lower_extern_fn_call` rejects
+        // misplaced names at helpers.rs and counts arguments a couple
+        // of dozen lines later; the component path calls
+        // `lower_component_call_args` before `check_component_call_args`.
+        // So a mis-counted call reaches here from both, and
+        // `ref_add(b = 2, a = 1, 3)` is the witness — it takes the
+        // `continue` above, then gets "extern fn `ref_add` takes 2
+        // argument(s), call passes 3" from the later check.
+        //
+        // `axil_write(t.value)` is not a witness for anything here: it
+        // is POSITIONAL, so the loop's `let CallArg::Named { .. } = a
+        // else { continue }` skips it before any count is compared. It
+        // also no longer lowers — the component-method arity check
+        // added earlier in this same sweep rejects it — which made the
+        // second attempt false on the day it was written.
+        //
+        // ("two callers" was inherited from the claim being corrected
+        // and is also wrong: this function has fourteen call sites.)
         //
         // Measured before accepting that: the two backends emit the same
         // arguments in the same order for those calls

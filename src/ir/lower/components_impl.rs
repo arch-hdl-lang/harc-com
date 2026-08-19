@@ -4043,11 +4043,15 @@ impl super::FuncBuilder<'_> {
                 // Deliberately NOT a claim about the callee's parameter
                 // count, which this seam does not know. A one-argument
                 // call to a two-parameter method emits an uncompilable
-                // call under v1 — but so does the positional
+                // call under v1, and naming the argument is not what
+                // caused that — so the wording below describes the name
+                // without pretending the call is well-formed.
+                //
+                // This used to add "…but so does the positional
                 // `axil_write(t.value)`, which tbir lowers and verifies
-                // clean. That arity gap is real and pre-existing; it is
-                // not something naming the argument caused, and the
-                // wording below does not pretend the call is well-formed.
+                // clean". It no longer does: the component-method arity
+                // check added later in the same sweep rejects it. The
+                // point the sentence was making does not depend on it.
                 //
                 // Reached ONLY when the caller had no parameter list to
                 // pass — the `emit <ev>(...)` payload callers. An event

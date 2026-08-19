@@ -7618,6 +7618,69 @@ former `transaction` group lives in
      line short. "Read the emitter" is not a technique — reading the
      whole function is.
 
+119. **Three arms paste a name; the rule modelled one (2026-08-19).**
+
+     Divergence 118 said the rule "asks the emitter instead of restating
+     it". It did not: `verilated_handle_name` was written NEXT to
+     `c_type_for` with the guard and the segment extraction duplicated,
+     which is the same restatement one file over — and the two had
+     already drifted (`c_type_for` used `unwrap_or("")` on an empty
+     path, the new function returned `None`; unreachable through the
+     parser, but a real difference between two functions asserted to be
+     one). `c_type_for` now calls it, so the claim is true by
+     construction rather than by intention.
+
+     And "every parameter AND the return type through `c_type_for`" was
+     true of the EMITTER and false of the CHECK. `c_type_for` pastes a
+     HARC name in three places: the `Named` fall-through (`V{name}*`),
+     the `TSeq<T>` element (`const std::vector<T>&`) and the `queue<T>`
+     element (`HarcQueue<T>&`). The rule covered the first. Measured
+     against the compiling controls `TSeq<Beat>` / `queue<Beat>`:
+
+     | extern parameter | both backends emit | g++ | verdict before |
+     |---|---|---|---|
+     | `TSeq<Nope>` | `const std::vector<Nope>&` | not declared | lowered |
+     | `TSeq<Color>` (enum) | `const std::vector<Color>&` | not declared | lowered |
+     | `TSeq<Top>` (the DUT) | `const std::vector<Top>&` | not declared | lowered |
+     | `queue<Nope>` | `harc_rt::HarcQueue<Nope>&` | not declared | lowered |
+
+     The element position takes a DECLARED RECORD and nothing else —
+     transactions and structs are emitted as C++ structs of the same
+     name. Not even the DUT: `TSeq<Top>` pastes `Top`, while the struct
+     that exists is `VTop`. The DUT exception belongs to the handle
+     position only, and assuming it extended inward would have been the
+     next variant of this same mistake.
+
+     **The comment corrected in 118 was wrong again, and worse.** It
+     said the extern path had "since GAINED an arity check" so only the
+     component path still arrives mis-counted, witnessed by
+     `axil_write(t.value)`. Every part of that fails:
+
+     - `axil_write(t.value)` does not lower — the component-method arity
+       check added five commits EARLIER in this same sweep rejects it,
+       so the sentence was false the day it was written;
+     - it is positional, so it can never reach the branch in question,
+       which `continue`s on anything that is not a named argument;
+     - the reachability argument is about ORDER, not about which callers
+       check arity: every caller that checks does so AFTER calling this,
+       so mis-counted calls arrive from both paths. The real witness is
+       `ref_add(b = 2, a = 1, 3)`;
+     - "two callers" was inherited from the claim being corrected. There
+       are fourteen.
+
+     Two further copies of the same dead claim were sitting in
+     `components_impl.rs` and in `tests/tbir.rs` — the latter
+     contradicting its own assertions eight lines below it. A grep for
+     the worked example would have found all three; correcting one and
+     not searching for the others is how a false sentence survives being
+     noticed.
+
+     Sixth variant, and the honest summary of the series: every one of
+     these was a claim that was true when written and never re-run. The
+     defect is not carelessness about the facts, it is treating a
+     comment as a record of a conclusion rather than of a measurement
+     that has an expiry date.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

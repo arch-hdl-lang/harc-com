@@ -8065,6 +8065,55 @@ impl T for Tb
 end impl T"#;
     lower_src(listy).expect("a `List`-spelled parameter lowers (v1 emits std::vector and builds)");
 
+    // `c_type_for` pastes a HARC name in THREE places, and the rule
+    // modelled one. The element of a `TSeq<T>`/`queue<T>` goes into
+    // `std::vector<T>` / `HarcQueue<T>` verbatim, so it must name a
+    // declared record — a C++ struct of that name is emitted for one.
+    // Not even the DUT works there: `TSeq<Top>` pastes `Top`, while the
+    // struct that exists is `VTop`. All measured against the compiling
+    // controls `TSeq<Beat>` / `queue<Beat>`.
+    let elem = |ty: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+enum Color {{ RED, GREEN }}
+
+extern function fx(x: {ty}) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["TSeq<Beat>", "queue<Beat>"] {
+        lower_src(&elem(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers (v1 builds it): {e:?}"));
+    }
+    for (ty, named) in [
+        ("TSeq<Nope>", "Nope"),
+        ("TSeq<Color>", "Color"),
+        ("TSeq<Top>", "Top"),
+        ("queue<Nope>", "Nope"),
+    ] {
+        let msg = assert_invalid(&lower_src(&elem(ty)).unwrap_err());
+        assert!(
+            msg.contains(&format!("names `{named}`")),
+            "`{ty}` names the pasted element: {msg}"
+        );
+    }
+
     // Extern-fn ARITY, which had no check at all. Without it the slot
     // loop's `get(i)` silently stopped at the shorter side, and a
     // surplus argument was checked against a fabricated scalar slot —
@@ -23985,9 +24034,11 @@ fn named_arguments_are_bound_by_position_by_v1() {
     // count, and the message must not be read as a claim about the
     // latter. A single named argument to the TWO-parameter method emits
     // exactly what the equivalent positional call emits — both are
-    // under-supplied and neither compiles, but that is a pre-existing
-    // arity gap (tbir lowers `axil_write(t.value)` too) rather than
-    // something naming the argument caused.
+    // under-supplied and neither compiles, but that is an arity
+    // problem rather than something naming the argument caused. (This
+    // comment used to add "tbir lowers `axil_write(t.value)` too",
+    // which the component-method arity check below has since made
+    // false — and which contradicted the assertions eight lines down.)
     // A single named argument to the TWO-parameter method is
     // UNDER-SUPPLIED. `data` names a real parameter, but with one
     // argument supplied the positions do not correspond, so there is no
