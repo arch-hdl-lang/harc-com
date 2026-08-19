@@ -1217,8 +1217,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    // Name -> declared parameter names and TYPES. The names are carried
-    // (not just membership) so `lower_extern_fn_call` can check a named
+    // Name -> declared parameter names, parameter types, and return type.
+    // The names are carried (not just membership) so `lower_extern_fn_call` can check a named
     // argument against the DECLARATION rather than against an invented
     // list; the types so the call site can check each argument against
     // the slot it is entering.
@@ -1233,6 +1233,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         .iter()
                         .map(|p| helpers::slot_ir_type(p.ty.as_ref(), &record_ids))
                         .collect(),
+                    helpers::slot_ir_type(d.return_ty.as_ref(), &record_ids),
                 ),
             )
         })
@@ -6078,9 +6079,9 @@ fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
 
 /// Per-test lowering context shared by all of the test's functions.
 /// extern-fn name -> (declared parameter NAMES, declared parameter
-/// TYPES). Named so the pair can be threaded without tripping clippy's
-/// complex-type lint.
-pub(crate) type ExternFnTable = HashMap<String, (Vec<String>, Vec<IrType>)>;
+/// TYPES, and declared return TYPE. Named so the tuple can be threaded
+/// without tripping clippy's complex-type lint.
+pub(crate) type ExternFnTable = HashMap<String, (Vec<String>, Vec<IrType>, IrType)>;
 
 #[derive(Clone)]
 pub(crate) struct LowerCtx {

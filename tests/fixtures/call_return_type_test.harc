@@ -1,0 +1,59 @@
+// Regression coverage for TB-IR call-result typing. Both extern and pure
+// helper calls must preserve their declared return type when an untyped let
+// receives the result. Pure-helper parameters and returns must also retain
+// scalar widths above 64 bits at the emitted C++ ABI.
+
+extern function ref_neg() -> sint<8>
+extern function ref_wide() -> bits<128>
+
+function helper_neg() -> sint<8>
+    return 0 - 8
+end function helper_neg
+
+function id128(x: bits<128>) -> bits<128>
+    return x
+end function id128
+
+function id256(x: bits<256>) -> bits<256>
+    return x
+end function id256
+
+test CallReturnTypeTest
+    let dut : Top
+
+    run
+        let extern_signed = ref_neg()
+        assert extern_signed < 0
+            else fail("extern signed return lost: value=${extern_signed}")
+
+        let extern_wide = ref_wide()
+        assert extern_wide == 0x123456789abcdef0_0fedcba987654321
+            else fail("extern 128-bit return lost")
+
+        let helper_signed = helper_neg()
+        assert helper_signed < 0
+            else fail("helper signed return lost: value=${helper_signed}")
+        assert (helper_signed / 2) == 0 - 4
+            else fail("helper signed division used unsigned result")
+        assert (helper_signed >> 1) == 0 - 4
+            else fail("helper signed shift used unsigned result")
+        assert (helper_neg() >> 1) == 0 - 4
+            else fail("direct helper call shift used unsigned result")
+        assert (ref_neg() >> 1) == 0 - 4
+            else fail("direct extern call shift used unsigned result")
+
+        let helper_input : bits<128> = 0x123456789abcdef0_0fedcba987654321
+        let helper_output : bits<128> = id128(helper_input)
+        assert helper_output == helper_input
+            else fail("pure helper 128-bit ABI truncated the value")
+        assert (id128(helper_input) >> 64) == 0x123456789abcdef0
+            else fail("direct helper call lost 128-bit width")
+        assert (ref_wide() >> 64) == 0x123456789abcdef0
+            else fail("direct extern call lost 128-bit width")
+
+        let helper_input_256 : bits<256> = 0x89abcdef01234567_76543210fedcba98_1122334455667788_aabbccddeeff0011
+        let helper_output_256 : bits<256> = id256(helper_input_256)
+        assert helper_output_256 == helper_input_256
+            else fail("pure helper 256-bit ABI truncated the value")
+    end run
+end test CallReturnTypeTest

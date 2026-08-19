@@ -11,6 +11,7 @@ backend_parity_test     | Top            | top_counter.sv         |
 const_expr_init_test    | Top            | top_counter.sv         |
 signed_use_site_test    | Top            | top_counter.sv         |
 signed_helper_param_test | Top           | top_counter.sv         |
+call_return_type_test  | Top            | top_counter.sv         | | call_return_type_ref.cpp |
 signed_component_method_param_test | Top | top_counter.sv         |
 signed_host_state_test  | Top            | top_counter.sv         |
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |

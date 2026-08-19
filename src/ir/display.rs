@@ -1225,9 +1225,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::Call(target, args) => {
             let t = match target {
-                CallTarget::Helper(n) => n.clone(),
+                CallTarget::Helper { name, .. } => name.clone(),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
-                CallTarget::ExternFn(n) => format!("extern:{n}"),
+                CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
                 }
@@ -1298,8 +1298,8 @@ fn cover_expr_str(e: &Expr) -> String {
         },
         Expr::Call(target, args) => {
             let t = match target {
-                CallTarget::Helper(n) => n.clone(),
-                CallTarget::ExternFn(n) => format!("extern:{n}"),
+                CallTarget::Helper { name, .. } => name.clone(),
+                CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")

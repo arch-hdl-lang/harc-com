@@ -10091,11 +10091,49 @@ fn helper_categorization_pure_vs_impure() {
     assert_eq!(waits, 2, "one inlined wait per read_addr call:\n{run}");
     let calls_double_it = run.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| {
-            matches!(s, ir::Stmt::Assign(_, e)
-                if format!("{:?}", e).contains("Helper(\"double_it\")"))
+            matches!(s, ir::Stmt::Assign(
+                _,
+                ir::Expr::Call(ir::CallTarget::Helper { name, .. }, _)
+            ) if name == "double_it")
         })
     });
     assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
+}
+
+/// Declared call-result metadata participates in invariant 15 just like
+/// literals and locals, so a pass cannot silently route an unsigned helper
+/// result into a signed destination of the same width.
+#[test]
+fn verifier_rejects_call_result_type_mismatch() {
+    let mut prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    let run_idx = prog.tests[0].run.index();
+    let call_dest = prog.functions[run_idx]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Helper { name, .. }, _))
+                if name == "double_it" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("run calls the pure helper");
+    prog.functions[run_idx].locals[call_dest.index()].ty = ir::IrType::SInt(Some(8));
+
+    let errs = verify::verify_program(&prog).expect_err("call result mismatch is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::TypeMismatch {
+                expected: ir::IrType::SInt(Some(8)),
+                actual: ir::IrType::UInt(Some(8)),
+                ..
+            }
+        )),
+        "{errs:?}"
+    );
 }
 
 /// Param remapping: each inline site gets fresh locals for the helper's
@@ -11218,6 +11256,57 @@ end impl HookHelperCovTest
     assert!(
         sb_decl < hook_registration,
         "component instance must be declared before hook sampler registration: {cpp}"
+    );
+}
+
+#[test]
+fn covergroup_hook_helper_int_and_time_returns_use_helper_local_types() {
+    let src = r#"
+function as_int(x: uint<8>) -> int
+    return x
+end function as_int
+
+function as_time(x: uint<8>) -> time
+    return x
+end function as_time
+
+scoreboard SampleSb
+    hookable observe(v: uint<8>)
+    end observe
+end scoreboard SampleSb
+
+covergroup IntTimeHookCov @(sb.observe(v) post)
+    cp_int : cover as_int(v)
+        bins
+            one = {1}
+        end bins
+    cp_time : cover as_time(v)
+        bins
+            one = {1}
+        end bins
+end covergroup IntTimeHookCov
+
+testbench CoverIntTimeHookTb
+    dut : Top
+    sb  : SampleSb
+    cov : IntTimeHookCov
+end testbench CoverIntTimeHookTb
+
+impl CoverIntTimeHook for CoverIntTimeHookTb
+    run
+        sb.observe(1)
+        wait 1 cycle
+    end run
+end impl CoverIntTimeHook
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("int/time helper coverpoints lower");
+    verify::verify_program(&prog).expect("int/time helper coverpoints verify");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("int/time helper coverpoints emit");
+    assert!(
+        cpp.contains("harc_helper_as_int(v)") && cpp.contains("harc_helper_as_time(v)"),
+        "both helper calls survive in the hook sampler: {cpp}"
     );
 }
 
@@ -16483,6 +16572,54 @@ end test T"#,
             msg.contains("narrows") && msg.contains(want),
             "expected a narrowing diagnostic containing `{want}`, got: {msg}"
         );
+    }
+}
+
+/// Helper and extern call targets carry their exact declared result type,
+/// so incompatible explicit destinations get the source-level assignment
+/// diagnostic while ordinary same-signed widening remains valid.
+#[test]
+fn call_result_assignment_checks_signedness_and_narrowing() {
+    lower_src(
+        r#"extern function ext_u8() -> uint<8>
+
+test T
+    let dut : Top
+    run
+        let widened : uint<16> = ext_u8()
+    end run
+end test T"#,
+    )
+    .expect("same-signed call result widening lowers");
+
+    for (src, want) in [
+        (
+            r#"function helper_u8() -> uint<8>
+    return 1
+end function helper_u8
+
+test T
+    let dut : Top
+    run
+        let signed : sint<8> = helper_u8()
+    end run
+end test T"#,
+            "Signedness must match",
+        ),
+        (
+            r#"extern function ext_u16() -> uint<16>
+
+test T
+    let dut : Top
+    run
+        let narrow : uint<8> = ext_u16()
+    end run
+end test T"#,
+            "narrows",
+        ),
+    ] {
+        let err = lower_src(src).expect_err("incompatible call result is rejected");
+        assert!(err.to_string().contains(want), "{err}");
     }
 }
 

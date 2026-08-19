@@ -2774,14 +2774,16 @@ pub enum ScoreboardQuery {
 
 #[derive(Debug, Clone)]
 pub enum CallTarget {
-    Helper(String),
+    /// Pure helper call plus the declared return type used by caller-side
+    /// local inference and signed/width-sensitive expression emission.
+    Helper { name: String, ret: IrType },
     Builtin(String),
     /// Call to a `extern function name(...) -> ret` (spec §9) — a C
     /// reference model linked in via `--ref-src`. Emitted with the RAW
     /// symbol name (no `harc_helper_` mangling) so it resolves against
     /// the user-provided `extern "C"` definition; the forward
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
-    ExternFn(String),
+    ExternFn { name: String, ret: IrType },
     TransactorMethod {
         bus_field: String,
         method: String,

@@ -69,6 +69,7 @@ top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass
+call_return_type_test | Top | top_counter.sv | - | pass | - | call_return_type_ref.cpp
 signed_host_state_test | Top | top_counter.sv | top_counter.arch | pass
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 msg_call_hoist_test | Top | top_counter.sv | top_counter.arch | pass

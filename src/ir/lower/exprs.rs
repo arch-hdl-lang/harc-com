@@ -1551,6 +1551,11 @@ impl FuncBuilder<'_> {
                 WidthCastKind::Sext => IrType::SInt(Some(*width)),
                 _ => IrType::UInt(Some(*width)),
             }),
+            Expr::Call(
+                crate::ir::CallTarget::Helper { ret, .. }
+                | crate::ir::CallTarget::ExternFn { ret, .. },
+                _,
+            ) => Some(ret.clone()),
             // A record-field chain types as its leaf: the leaf field's own
             // scalar/record type, or the element type when the leaf `Vec`
             // is indexed. A whole (unindexed) `Vec` leaf is an array — it

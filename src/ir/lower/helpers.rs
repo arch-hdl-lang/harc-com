@@ -213,7 +213,14 @@ impl FuncBuilder<'_> {
                 self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
                 lowered.push(v);
             }
-            return Ok(Expr::Call(CallTarget::Helper(name.to_string()), lowered));
+            let ret = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            return Ok(Expr::Call(
+                CallTarget::Helper {
+                    name: name.to_string(),
+                    ret,
+                },
+                lowered,
+            ));
         }
 
         // ── CFG inline ──────────────────────────────────────────────
@@ -373,7 +380,7 @@ impl FuncBuilder<'_> {
         // `unwrap_or_default`, and a `contains_key` guard — and the
         // commit that removed two of them said in its own message that
         // the lookup always hits.
-        let (pnames, ptys) = self.ctx.extern_fns[name].clone();
+        let (pnames, ptys, ret) = self.ctx.extern_fns[name].clone();
         super::reject_misplaced_named_args(
             args,
             &pnames,
@@ -431,7 +438,13 @@ impl FuncBuilder<'_> {
                 }
             }
         }
-        Ok(Expr::Call(CallTarget::ExternFn(name.to_string()), lowered))
+        Ok(Expr::Call(
+            CallTarget::ExternFn {
+                name: name.to_string(),
+                ret,
+            },
+            lowered,
+        ))
     }
 
     /// `Some(method)` when `callee` is a call target of the form

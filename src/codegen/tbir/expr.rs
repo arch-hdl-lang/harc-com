@@ -541,12 +541,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         }
         Expr::Call(target, args) => {
             let name = match target {
-                CallTarget::Helper(n) => helper_cpp_name(n),
+                CallTarget::Helper { name, .. } => helper_cpp_name(name),
                 // Extern reference functions emit with the RAW symbol
                 // name (no `harc_helper_` mangling) so the call binds to
                 // the user's `extern "C"` definition supplied via
                 // `--ref-src`; the forward decl is emitted file-scope.
-                CallTarget::ExternFn(n) => n.clone(),
+                CallTarget::ExternFn { name, .. } => name.clone(),
                 CallTarget::Builtin(_) => {
                     return Err(EmitError(
                         "tbir: builtin calls are not emitted yet (lowering should \
@@ -902,6 +902,9 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::Ternary(_, t, f) => expr_static_width(cx, t).or_else(|| expr_static_width(cx, f)),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
         Expr::WidthCast { width, .. } => Some(*width),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            ir_type_width(ret)
+        }
         Expr::CycleCount => Some(64),
         _ => None,
     }
@@ -956,6 +959,9 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             .locals
             .get(id.0 as usize)
             .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            matches!(ret, crate::ir::IrType::SInt(_))
+        }
         // Host-state member reads are real C++ struct members whose C
         // type already carries the declared signedness (`int64_t` for a
         // `sint` field — every host-state struct emission maps SInt so).
