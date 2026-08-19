@@ -7963,7 +7963,7 @@ impl T for Tb
 end impl T"#;
     let msg = assert_invalid(&lower_src(ext).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_add` names the HARC type `Beat` in its parameter `b`"),
+        msg.contains("`extern function ref_add` names `Beat` in its parameter `b`"),
         "{msg}"
     );
     // …and the UNCALLED declaration is refused too, which is the cell
@@ -7973,7 +7973,7 @@ end impl T"#;
         .replace("        let z = ref_add(1, s)\n", "");
     let msg = assert_invalid(&lower_src(&uncalled).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_add` names the HARC type `Beat`"),
+        msg.contains("`extern function ref_add` names `Beat`"),
         "an uncalled record-parameter extern fn is refused too: {msg}"
     );
     // The RETURN type goes through the same `c_type_for` two lines down
@@ -7986,7 +7986,7 @@ end impl T"#;
     );
     let msg = assert_invalid(&lower_src(&ret).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_mk` names the HARC type `Beat` in its return type"),
+        msg.contains("`extern function ref_mk` names `Beat` in its return type"),
         "{msg}"
     );
     // …and an ENUM parameter, which the record question could not see
@@ -8002,7 +8002,7 @@ end impl T"#;
         );
     let msg = assert_invalid(&lower_src(&en).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_en` names the HARC type `Color`"),
+        msg.contains("`extern function ref_en` names `Color`"),
         "{msg}"
     );
     // A DUT-MODULE-typed parameter is NOT this defect and must keep
@@ -8027,6 +8027,43 @@ impl T for Tb
 end impl T"#;
     lower_src(dut_param)
         .expect("a DUT-module-typed extern parameter lowers (both backends build it)");
+    // …and this cell only means something next to its negatives. An
+    // earlier version asserted the DUT exception with a fixture whose
+    // type name was simply absent from a whitelist, so it exercised the
+    // same path as a name the whitelist had FORGOTTEN and would have
+    // passed under any implementation that forgot one. These two say
+    // what `Top` is being excepted FROM.
+    let unknown = dut_param.replace("ref_peek(d: Top)", "ref_peek(d: Nope)");
+    let msg = assert_invalid(&lower_src(&unknown).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_peek` names `Nope`"),
+        "a name that is not the DUT's is refused: {msg}"
+    );
+    // A `list`/`Vec` spelling is NOT a module handle: `c_type_for`
+    // intercepts it on its first line, before the `V{name}*` arm, and
+    // renders `std::vector<uint64_t>` — which compiles. Keying the rule
+    // on "HARC declares this name" rejected exactly this.
+    let listy = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct List
+    v : uint<8>
+end struct List
+
+extern function fx(x: List) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(listy).expect("a `List`-spelled parameter lowers (v1 emits std::vector and builds)");
 
     // Extern-fn ARITY, which had no check at all. Without it the slot
     // loop's `get(i)` silently stopped at the shorter side, and a

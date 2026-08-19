@@ -7498,15 +7498,19 @@ former `transaction` group lives in
      of that were narrower than the mechanism they were built on.
 
      `emit_extern_fn_decls` runs every type in the signature through the
-     free `c_type_for`, whose `Named` arm has no conditions at all:
+     free `c_type_for`, whose `Named` arm is
 
      ```rust
      TypeExpr::Named { name, .. } => format!("V{last}*")
      ```
 
-     So it is not about records. Two shapes it could not see, each
-     lowering clean at HEAD and each emitting C++ that neither backend
-     compiles:
+     So it is not about records. Two shapes the record question could
+     not see, each lowering clean at the time and each emitting C++ that
+     neither backend compiles:
+
+     (This entry described that arm as having "no conditions at all".
+     It has one, three lines above it, and divergence 118 is what that
+     cost.)
 
      | declaration | both backends emit | g++ |
      |---|---|---|
@@ -7556,6 +7560,63 @@ former `transaction` group lives in
      Parameters rather than "signature". Scalar rather than "pure".
      Reading the emitter is what separates them, and it is cheaper than
      four review rounds.
+
+118. **"Reading the emitter" — while quoting the wrong line of it
+     (2026-08-19).**
+
+     Divergence 117 closed with "Reading the emitter is what separates
+     them", and rested the rule on a claim about `c_type_for`: that its
+     `Named` arm is *unconditional*. It is not. The function opens with
+     a guard, three lines above the match:
+
+     ```rust
+     fn c_type_for(t: &TypeExpr) -> String {
+         if is_list_type(t) || fixed_vec_type_args(t).is_some() {
+             return txn_field_c_type(t);
+         }
+     ```
+
+     and `is_list_type` is defined ON `TypeExpr::Named` — it matches any
+     named type whose last segment is `list` or `List`. So a `Named`
+     type can and does bypass the `V{last}*` arm.
+
+     The rule keyed on "does HARC declare this name", which was wrong in
+     BOTH directions at once:
+
+     | signature | both backends emit | verdict before |
+     |---|---|---|
+     | `struct List` parameter | `std::vector<uint64_t>` — **compiles** | **`Invalid`** |
+     | bare undeclared `Nope` | `VNope*` — undeclared | lowered |
+     | a `domain` name | `VSysDomain*` — undeclared | lowered |
+     | `string` (parses as `Named`) | `Vstring*` — undeclared | lowered |
+
+     A false `Invalid` on a program v1 builds, and three live holes, from
+     one whitelist. And the message asserted `V{ty}*` for the `List`
+     case, where no such handle is emitted at all.
+
+     The rule now asks the emitter instead of restating it:
+     `cpp_tb::verilated_handle_name` sits next to `c_type_for`, applies
+     the same guard, and answers "does this render as `V<name>*`". A
+     name is refused unless it is the DUT's own type — measured, and now
+     pinned by a negative: `ref_peek(d: Top)` lowers while
+     `ref_peek(d: Nope)` does not, which is what makes the DUT cell mean
+     anything. The previous version of that test used a fixture whose
+     type name was merely absent from the whitelist, so it would have
+     passed under any implementation that forgot an item kind.
+
+     Two smaller ones from the same round, both in code this sweep
+     wrote: the comment recording that `lower_extern_fn_call` "has no
+     arity check anywhere in the pipeline" survived the commit that
+     added one, worked example and all; and the arity check left behind
+     the dead `None` arms it made unreachable — including the one
+     producing "an argument of extern fn `f`", the exact diagnostic that
+     commit was written to retire.
+
+     Fifth variant of one shape, and the sharpest: the previous four
+     were rules built from an example's incidental features. This one
+     was a rule built from a *quotation* of the emitter that stopped one
+     line short. "Read the emitter" is not a technique — reading the
+     whole function is.
 
 ## Next steps
 

@@ -386,7 +386,11 @@ impl FuncBuilder<'_> {
         // "an argument of extern fn `f` takes a non-record value",
         // describing parameter #2 of a one-parameter function. A slot
         // that does not exist has no type to disagree with.
-        if self.ctx.extern_fns.contains_key(name) && args.len() != pnames.len() {
+        // No `contains_key` guard: the sole caller (`exprs.rs`)
+        // dispatches here only when the name IS in `extern_fns`, so the
+        // lookup above always hits and `pnames`/`ptys` are the callee's
+        // own, never the default.
+        if args.len() != pnames.len() {
             return Err(LowerError::Invalid(format!(
                 "extern fn `{name}` takes {} argument(s), call passes {}",
                 pnames.len(),
@@ -398,10 +402,12 @@ impl FuncBuilder<'_> {
             match a {
                 CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
                     let v = self.lower_expr_no_ports(e)?;
-                    let slot = match pnames.get(i) {
-                        Some(pn) => format!("parameter `{pn}` of extern fn `{name}`"),
-                        None => format!("an argument of extern fn `{name}`"),
-                    };
+                    // Arity is checked above and `pnames`/`ptys` come
+                    // from the same `d.params`, so both indexes are
+                    // total. The `None` labels these used to carry
+                    // described a parameter that does not exist — the
+                    // very diagnostic the arity check exists to replace.
+                    let slot = format!("parameter `{}` of extern fn `{name}`", pnames[i]);
                     // Against the DECLARED type, not against "scalar".
                     // A comment here twice asserted that every extern-fn
                     // parameter is a scalar — citing this module's own
@@ -418,11 +424,7 @@ impl FuncBuilder<'_> {
                     // The record case never reaches here: it is refused
                     // at the declaration, where both backends already
                     // break.
-                    // Arity is checked above, so the index is total
-                    // whenever the callee is known at all.
-                    if let Some(want) = ptys.get(i) {
-                        self.check_slot_ir(&v, want, &slot)?;
-                    }
+                    self.check_slot_ir(&v, &ptys[i], &slot)?;
                     lowered.push(v)
                 }
             }

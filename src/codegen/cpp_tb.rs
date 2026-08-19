@@ -20197,6 +20197,28 @@ pub(crate) fn emit_extern_fn_decls(out: &mut String, file: &SourceFile) {
     writeln!(out, "").ok();
 }
 
+/// `Some(name)` when `t` renders as a Verilated module handle
+/// (`V<name>*`) rather than a real C++ type — the `Named` fall-through
+/// of `c_type_for` below, AFTER its `list`/`Vec` guard.
+///
+/// Exposed because TB-IR lowering has to refuse an `extern function`
+/// whose signature names such a type: only `V<dut_type>.h` is ever
+/// included, so any other `V<name>` is undeclared and the generated C++
+/// does not compile. Lowering asking this function, rather than
+/// restating the rule, is deliberate — the first version restated it as
+/// "the `Named` arm is unconditional" and missed the guard on the line
+/// above, which turned a `struct List` parameter (rendered
+/// `std::vector<uint64_t>`, and compiling) into a rejection.
+pub(crate) fn verilated_handle_name(t: &TypeExpr) -> Option<&str> {
+    if is_list_type(t) || fixed_vec_type_args(t).is_some() {
+        return None;
+    }
+    match t {
+        TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
+        _ => None,
+    }
+}
+
 fn c_type_for(t: &TypeExpr) -> String {
     if is_list_type(t) || fixed_vec_type_args(t).is_some() {
         return txn_field_c_type(t);
