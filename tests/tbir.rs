@@ -6468,6 +6468,1819 @@ end impl T"#
     }
 }
 
+/// The assignment rule at the other half of the surface: a value
+/// entering a TYPED SLOT — a queue element, a method parameter, an
+/// event payload — must match that slot's type.
+///
+/// Both directions were open, at every slot family. Only the matching
+/// combination compiles; every other one is refused by BOTH backends,
+/// so all of them are `Invalid`. The testbench queue was the sharpest
+/// case: two of its four cells reached the verifier's `BadProgramRef`,
+/// which renders as "internal error: TB-IR failed verification after
+/// lowering" — a PROGRAM error answered through the compiler-bug
+/// channel.
+#[test]
+fn a_value_entering_a_typed_slot_must_match_that_slot() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    sq : queue<uint<8>>
+    rq : queue<Beat>
+end scoreboard Sb
+
+agent Src
+    cq   : queue<uint<8>>
+    crq  : queue<Beat>
+    obs  : out event<uint<8>>
+    robs : out event<Beat>
+    seen : uint<32> default 0
+
+    function takes(x: uint<8>)
+        seen = seen + x
+    end function
+
+    function takesr(t: Beat)
+        seen = seen + t.v
+    end function
+end agent Src
+
+transactor Drv
+    dut : Top
+
+    when active
+        hookable step(n: uint<8>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+    s   : Src
+    drv : Drv active
+    tq  : queue<uint<8>>
+    trq : queue<Beat>
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The controls: a matching value at every family.
+    for body in [
+        "        sb.rq.push(b)",
+        "        s.crq.push(b)",
+        "        trq.push(b)",
+        "        sb.sq.push(1)",
+        "        s.takesr(b)",
+        "        s.takes(1)",
+        "        emit s.robs(b)",
+        "        emit s.obs(1)",
+        "        drv.step(1)",
+    ] {
+        lower_src(&prog(body)).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+    }
+
+    // Each component-call SITE separately: the statement position, the
+    // record-annotated `let`, the untyped/scalar `let`, and assignment
+    // into an existing local. Only the first was covered, so removing
+    // the guard at any of the other three left the suite green.
+    let call_prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    seen : uint<32> default 0
+
+    function takes(x: uint<8>) -> uint<8>
+        seen = seen + x
+        return x
+    end function
+
+    function mk(x: uint<8>) -> Beat
+        let r : Beat
+        r.v = x
+        return r
+    end function
+
+    function robs(t: Beat)
+        seen = seen + t.v
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (body, site) in [
+        ("        s.takes(b)", "statement position"),
+        ("        let r : Beat = s.mk(b)", "record-annotated `let`"),
+        ("        let n = s.takes(b)", "untyped `let`"),
+        (
+            "        let n : uint<8> = s.takes(b)",
+            "scalar-annotated `let`",
+        ),
+        (
+            "        let n : uint<8> = 0\n        n = s.takes(b)",
+            "assignment into an existing local",
+        ),
+    ] {
+        let src = call_prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("parameter `x` of `Src.takes`")
+                || msg.contains("parameter `x` of `Src.mk`"),
+            "{site}: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "{site}: v1 emits it (and g++ refuses)"
+        );
+    }
+    // An untyped `let` bound from a RECORD-returning method takes the
+    // method's own return type. Leaving it untyped made tbir emit
+    // `uint64_t b; b = Src_mk(...)` — which does not compile — and then
+    // made every slot guard above call five well-typed programs
+    // `Invalid`, because the local read as a scalar.
+    let inferred = call_prog("        let got = s.mk(1)\n        s.robs(got)");
+    let lowered = lower_src(&inferred).expect("an untyped record-returning `let` lowers");
+    // Asserted on the LOCAL's type, and named `got` rather than `r`, for
+    // two reasons this test learned the hard way. The emitted-substring
+    // form matched `Beat r{}` from inside `Src_mk`'s own body — the
+    // callee declares a local named `r` too — so it passed with the
+    // inference deleted. And once a slot whose shape cannot be read is
+    // waved through rather than assumed scalar, "the program is still
+    // rejected" stopped distinguishing a typed local from an untyped
+    // one at all. The type is the thing the inference exists to set, so
+    // it is the thing to check.
+    let got = lowered
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .expect("run fn")
+        .locals
+        .iter()
+        .find(|l| l.name == "got")
+        .expect("no `got` local");
+    assert!(
+        matches!(got.ty, ir::IrType::Record(_)),
+        "the local types as the method's return record, got {:?}",
+        got.ty
+    );
+    assert!(
+        emit_cpp_src(&inferred).contains("Beat got{}"),
+        "…and declares as it (untyped emitted `uint64_t got = 0;`)"
+    );
+
+    // A TESTBENCH-METHOD `let` takes the method's return record too —
+    // the same rule as the component-method one, at the spelling one
+    // screen over in the source. Leaving it untyped made every slot
+    // guard read the local as a scalar and reject a program v1
+    // compiles (`auto r = Tb_make_result(_tb, 7);`).
+    let tb_method = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    rq : queue<Beat>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+
+    function make_result(value: uint<8>) -> Beat
+        let result : Beat
+        result.v = value
+        return result
+    end make_result
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in [
+        "        let r = make_result(7)\n        sb.rq.push(r)",
+        "        let r : Beat = make_result(7)\n        sb.rq.push(r)",
+        // A QUALIFIED annotation names the same record as the bare one.
+        // Every record-typed position in lowering resolves a `Named`
+        // path by its last segment, so a `let` annotation that read the
+        // FIRST segment instead would reject this while the field,
+        // parameter and `tlm_method` return positions kept accepting it.
+        "        let r : Pkg.Beat = make_result(7)\n        sb.rq.push(r)",
+        "        sb.rq.push(make_result(7))",
+    ] {
+        lower_src(&tb_method(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    let msg =
+        assert_invalid(&lower_src(&tb_method("        let r : int = make_result(7)")).unwrap_err());
+    assert!(
+        msg.contains("declared with a non-record type") && msg.contains("`Beat`"),
+        "{msg}"
+    );
+    // …and a record annotation that names the WRONG record never gets
+    // this far: `lower_let`'s record-typed-local branch claims every
+    // record-naming annotation and reports the copy rule instead. That
+    // is what makes the guard above unconditional rather than an
+    // "unless the names match" test.
+    let msg = assert_invalid(
+        &lower_src(&tb_method("        let r : Other = make_result(7)")).unwrap_err(),
+    );
+    assert!(
+        msg.contains("transaction local `r`") && msg.contains("it is a `Other`"),
+        "{msg}"
+    );
+
+    // …and the component-method `let` must NOT retype past its own
+    // annotation. `typed_let_ir_type` answers `None` for `int` and
+    // `bit`, so keying the inference on it silently discarded the
+    // annotation and the DEFAULT backend ran a program v1 refuses to
+    // build — the very defect the untyped-`let` guard keys on `l.ty` to
+    // prevent.
+    for ann in ["int", "bit"] {
+        let src = call_prog(&format!("        let n : {ann} = s.mk(1)"));
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("declared with a non-record type") && msg.contains("`Beat`"),
+            "`let n : {ann} = s.mk(1)`: {msg}"
+        );
+    }
+
+    // `tseq` arguments — the last slot family, and the only one whose
+    // record direction has no reachable member at all. Measured: a
+    // record-typed tseq PARAMETER breaks both backends however the
+    // callee is written — `yield <param>` is refused upstream,
+    // `<param>.<field>` is refused, and leaving it unused still emits
+    // `[&](uint64_t seed)` under tbir and `[&](VBeat* seed)` under v1
+    // (a record read as a Verilated module pointer), neither of which
+    // compiles. So the slot is always scalar, and no type table was
+    // needed.
+    let tseq_prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+tseq GenSc(n: int) -> TSeq<Beat>
+    for _ in 1 .. n
+        let t : Beat
+        yield t
+    end for
+end tseq GenSc
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&tseq_prog("        let xs = GenSc(3)")).expect("a scalar tseq argument lowers");
+    for (body, got) in [
+        ("        let xs = GenSc(b)", "a `Beat`"),
+        ("        let xs = GenSc(o)", "a `Other`"),
+    ] {
+        let src = tseq_prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("parameter of tseq `GenSc`") && msg.contains(&format!("was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // The FORK spelling of a record-returning call. `try_lower_tlm_fork`
+    // declared its destination without typing it, where the non-fork
+    // path one screen up computes `tlm_ret_record_id(m.ret)` — so this
+    // is the third instance of the same defect, and the worst: with no
+    // slot involved the two backends BOTH compiled and silently
+    // computed different values, tbir reading a raw `uint64_t` where v1
+    // unpacks the struct.
+    let forked = fixture("tlm_method_blocking_fork_bus_test.harc")
+        .replacen(
+            "bus TlmMemBlockingForkBus\n    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+            "struct Resp\n    data : uint<32>\n    flag : uint<8>\nend struct Resp\n\n\
+             scoreboard Sb\n    rq : queue<Resp>\nend scoreboard Sb\n\n\
+             bus TlmMemBlockingForkBus\n    tlm_method read(addr: uint<8>) -> Resp: blocking;",
+            1,
+        )
+        .replacen(
+            "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+            "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory\n    sb  : Sb",
+            1,
+        )
+        .replacen(
+            "        assert forked == 261\n            else fail(\"forked blocking read got \
+             0x${forked:08x}, expected 0x00000105\")",
+            "        sb.rq.push(forked)",
+            1,
+        );
+    lower_src(&forked)
+        .unwrap_or_else(|e| panic!("a record-returning fork result keeps its record type: {e:?}"));
+    assert!(
+        emit_cpp_src(&forked).contains("Resp forked"),
+        "and the fork destination declares as the record, not a `uint64_t`"
+    );
+
+    // The SCALAR half of that same typing. A record return is only one
+    // of the two things the non-fork path carries onto the dest; the
+    // other is the declared WIDTH. Dropping just the `else` branch keeps
+    // the record cell above green while a `-> uint<128>` fork silently
+    // declares `uint64_t` and truncates the top 64 bits — the same class
+    // of silent divergence, one step quieter.
+    let wide = fixture("tlm_method_blocking_fork_bus_test.harc")
+        .replacen("-> uint<32>: blocking;", "-> uint<128>: blocking;", 1)
+        .replacen(
+            "        assert forked == 261\n            else fail(\"forked blocking read got \
+             0x${forked:08x}, expected 0x00000105\")\n",
+            "",
+            1,
+        );
+    assert!(
+        emit_cpp_src(&wide).contains("_harc_u128 forked"),
+        "a wide fork destination declares at its declared width, not `uint64_t`"
+    );
+
+    // Parameter index > 0. Every mismatch cell above sits at
+    // parameter #1, so truncating BOTH parameter loops to `.take(1)`
+    // left the whole suite green — and the `i`/`param_names.get(i)`
+    // indexing was exercised only at zero.
+    let two_param = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    seen : uint<32> default 0
+    function two(a: uint<8>, b: uint<8>)
+        seen = seen + a + b
+    end function
+    function tworec(a: uint<8>, t: Beat)
+        seen = seen + a + t.v
+    end function
+end agent Src
+
+transactor Drv
+    dut : Top
+    when active
+        hookable step2(m: uint<8>, n: uint<8>)
+            dut.en = m
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    s   : Src
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (body, pname) in [
+        ("        s.two(1, b)", "`b` of `Src.two`"),
+        ("        s.tworec(1, 1)", "`t` of `Src.tworec`"),
+        ("        drv.step2(1, b)", "`n` of `Drv.step2`"),
+    ] {
+        let msg = assert_invalid(&lower_src(&two_param(body)).unwrap_err());
+        assert!(
+            msg.contains(pname),
+            "the SECOND parameter is checked, and named: {msg}"
+        );
+    }
+    lower_src(&two_param("        s.tworec(1, b)")).expect("the matching two-arg call lowers");
+
+    // The SIBLING-transactor spelling of the same loop — `step2(1, b)`
+    // from another method of `Drv`, where the cell above is the
+    // BOUND-INSTANCE spelling `drv.step2(1, b)`. The two run different
+    // loops over different tables (`param_tys` here, the component
+    // schema there), and only this one was still unpinned past index 0.
+    let sib2 = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transactor Drv
+    dut : Top
+    when active
+        hookable step2(m: uint<8>, n: uint<8>)
+            dut.en = m + n
+            wait 1 cycle
+        end hookable
+
+        hookable step2r(m: uint<8>, t: Beat)
+            dut.en = m + t.v
+            wait 1 cycle
+        end hookable
+
+        hookable outer(k: uint<8>)
+            let b : Beat
+{body}
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.outer(1)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&sib2("            step2r(1, b)")).expect("the matching sibling call lowers");
+    for (body, pname) in [
+        ("            step2(1, b)", "`n` of `Drv.step2`"),
+        ("            step2r(1, 1)", "`t` of `Drv.step2r`"),
+    ] {
+        let msg = assert_invalid(&lower_src(&sib2(body)).unwrap_err());
+        assert!(
+            msg.contains(pname),
+            "`{body}`: the SECOND parameter is checked, and named: {msg}"
+        );
+    }
+
+    // A record-payload local event — the OTHER arm of the test-scope
+    // `emit` shape check. Replacing it with `true` left the suite
+    // green, because the case below only exercised the scalar arm.
+    let rec_event = |line: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+        let e : event<Beat>
+        on e(t)
+            log(info, "v=${{t.v}}")
+        end on
+{line}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&rec_event("        emit e(b)")).expect("a matching record payload lowers");
+    for line in ["        emit e(o)", "        emit e(1)"] {
+        let msg = assert_invalid(&lower_src(&rec_event(line)).unwrap_err());
+        assert!(
+            msg.contains("the channel carries `event<Beat>`"),
+            "`{line}`: {msg}"
+        );
+    }
+
+    // The TEST-SCOPE `let e : event<T>` emit lane. Its check already
+    // existed but was keyed on `expr_type`, whose `Unknown` arm waved
+    // through exactly the record-carrying shapes divergence 108 taught
+    // the compiler to type — so reverting it to `expr_type` left the
+    // suite green. A record-valued COMPONENT FIELD is the payload that
+    // separates the two.
+    let local_event = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    cur : Beat
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let e : event<uint<8>>
+        on e(x)
+            log(info, "x=${x}")
+        end on
+        emit e(s.cur)
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(local_event).unwrap_err());
+    assert!(
+        msg.contains("does not match that shape"),
+        "a record component field into a scalar-payload local event: {msg}"
+    );
+
+    // The SELF-RELATIVE `emit` spelling, inside a component method body
+    // — a different lane from the dotted one, and unpinned until now.
+    let self_emit = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    obs  : out event<uint<8>>
+    seen : uint<32> default 0
+
+    function fire()
+        let b : Beat
+        emit obs(b)
+        seen = seen + 1
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        s.fire()
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(self_emit).unwrap_err());
+    assert!(
+        msg.contains("event `obs` takes a non-record value and was given a `Beat`"),
+        "{msg}"
+    );
+
+    // The BOUND-INITIATOR transactor is a second `param_tys`
+    // construction site. Emptying only that one leaves the other's
+    // tests green.
+    let helper = fixture("regblock_fields_test.harc").replacen(
+        "impl RegblockFieldsTest for RegblockFieldsTb",
+        "transaction Beat\n    v : uint<8>\nend transaction Beat\n\n\
+         impl RegblockFieldsTest for RegblockFieldsTb",
+        1,
+    );
+    let bad = helper.replacen(
+        "    run\n",
+        "    run\n        let bt : Beat\n        helper.write(bt, 1)\n",
+        1,
+    );
+    let msg = assert_invalid(&lower_with_stdlib_bus_src(&bad).unwrap_err());
+    assert!(
+        msg.contains("parameter `addr` of `AxilHelper.write`"),
+        "the bound-initiator schema carries its parameter types too: {msg}"
+    );
+
+    // The target-state queue is a FIFTH and SIXTH lane, on a bound-to
+    // TLM responder. Its element lives in `target_state_fields`, not a
+    // queue table, so it took its own wiring — and the controls needed
+    // their own DUT stub before they proved anything: the first run
+    // showed all four cells failing to compile, which was a missing
+    // `VTlmReadInitiator.h`, not the push.
+    let responder = |line: &str| {
+        fixture("target_record_state_test.harc")
+            .replacen(
+                "    last : Beat\n",
+                "    last : Beat\n    sq   : queue<uint<8>>\n    rq   : queue<Beat>\n",
+                1,
+            )
+            .replacen(
+                "        wait 1 cycle\n",
+                &format!("        wait 1 cycle\n{line}\n"),
+                1,
+            )
+    };
+    for ok in ["        sq.push(3)", "        rq.push(last)"] {
+        lower_src(&responder(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (line, want, got) in [
+        ("        sq.push(last)", "a non-record value", "a `Beat`"),
+        ("        rq.push(1)", "a `Beat`", "a non-record value"),
+    ] {
+        let msg = assert_invalid(&lower_src(&responder(line)).unwrap_err());
+        assert!(
+            msg.contains("target-state queue")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{line}`: {msg}"
+        );
+    }
+    // …and the TEST-SCOPE spelling of the same push
+    // (`responder.sq.push(x)`), which is a separate lane. Covering only
+    // the bare-name one left this one's guard unpinned — a mutation
+    // that removed it kept the suite green.
+    let at_test_scope = |line: &str| {
+        responder("").replacen(
+            "        dut.rst = 1\n",
+            &format!("        dut.rst = 1\n{line}\n"),
+            1,
+        )
+    };
+    lower_src(&at_test_scope("        responder.sq.push(3)"))
+        .expect("a matching test-scope push lowers");
+    for (line, want, got) in [
+        (
+            "        let t : Beat\n        responder.sq.push(t)",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        responder.rq.push(1)",
+            "a `Beat`",
+            "a non-record value",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&at_test_scope(line)).unwrap_err());
+        assert!(
+            msg.contains("target-state queue `responder.")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{line}`: {msg}"
+        );
+    }
+
+    // Every mismatch, both directions, at every family. Each row names
+    // the slot and both types, and v1 emits it for g++ to refuse.
+    for (body, slot, want, got) in [
+        // queue element scalar <- record
+        (
+            "        sb.sq.push(b)",
+            "scoreboard queue `sq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        s.cq.push(b)",
+            "component queue `cq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        tq.push(b)",
+            "testbench queue `tq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        // queue element record <- a DIFFERENT record
+        (
+            "        sb.rq.push(o)",
+            "scoreboard queue `rq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        (
+            "        s.crq.push(o)",
+            "component queue `crq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        (
+            "        trq.push(o)",
+            "testbench queue `trq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        // queue element record <- scalar. Not one the verifier caught
+        // even where it caught the other two, so it emitted freely.
+        (
+            "        sb.rq.push(1)",
+            "scoreboard queue `rq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        s.crq.push(1)",
+            "component queue `crq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        trq.push(1)",
+            "testbench queue `trq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        // component method parameter
+        (
+            "        s.takes(b)",
+            "parameter `x` of `Src.takes`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        s.takesr(1)",
+            "parameter `t` of `Src.takesr`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        s.takesr(o)",
+            "parameter `t` of `Src.takesr`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        // transactor/hookable parameter — the schema had to learn
+        // `param_tys` for this one; it carried only names.
+        (
+            "        drv.step(b)",
+            "parameter `n` of `Drv.step`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        // event payload
+        (
+            "        emit s.obs(b)",
+            "event `obs`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        emit s.robs(1)",
+            "event `robs`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        emit s.robs(o)",
+            "event `robs`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+    ] {
+        let src = prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains(slot) && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}` names the slot and both types: {msg}"
+        );
+        // v1 emits it, and g++ refuses — so there is nowhere to send
+        // the user, which is what makes this `Invalid` and not a gap.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// Two slot families divergence 111 deferred, on the belief that each
+/// needed a parameter-type table that did not exist. Both were wrong:
+/// the testbench-method call already had `ir_type_of_param` in hand,
+/// and the sibling-transactor table only needed a fourth tuple element.
+///
+/// One of the testbench-method cells was the worse kind of gap — a
+/// mismatched RECORD reached the verifier's `TypeMismatch`, which
+/// renders as "internal error: TB-IR failed verification after
+/// lowering". A program error answered through the compiler-bug
+/// channel, exactly the pathology divergence 111 fixed for the
+/// testbench queue.
+#[test]
+fn a_method_parameter_slot_is_checked_at_both_remaining_spellings() {
+    let tb = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+testbench Tb
+    dut : Top
+    n   : uint<32> default 0
+
+    function tf(t: Beat) -> uint<8>
+        n = n + 1
+        return t.v
+    end tf
+
+    function ts(x: uint<8>) -> uint<8>
+        n = n + x
+        return x
+    end ts
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["        let z = tf(b)", "        let z = ts(1)"] {
+        lower_src(&tb(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want, got) in [
+        ("        let z = tf(1)", "a `Beat`", "a non-record value"),
+        // This one reached the verifier before, not the user.
+        ("        let z = tf(o)", "a `Beat`", "a `Other`"),
+        ("        let z = ts(b)", "a non-record value", "a `Beat`"),
+    ] {
+        let src = tb(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("of testbench method")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // The SIBLING spelling — `inner(x)` from another method of the same
+    // transactor, where the bound-instance spelling is `drv.inner(x)`.
+    let sib = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+transactor Drv
+    dut : Top
+
+    when active
+        hookable inner(t: Beat)
+            dut.en = t.v
+            wait 1 cycle
+        end hookable
+
+        hookable innersc(k: uint<8>)
+            dut.en = k
+            wait 1 cycle
+        end hookable
+
+        hookable outer(n: uint<8>)
+            let b : Beat
+            let o : Other
+{body}
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.outer(1)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["            inner(b)", "            innersc(1)"] {
+        lower_src(&sib(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want, got) in [
+        ("            inner(1)", "a `Beat`", "a non-record value"),
+        ("            inner(o)", "a `Beat`", "a `Other`"),
+        ("            innersc(b)", "a non-record value", "a `Beat`"),
+    ] {
+        let src = sib(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("of `Drv.") && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// The slot rule had a third value shape it could not name. A slot check
+/// that only asks "record or not" describes a `TSeq<Beat>` parameter as
+/// taking "a non-record value" — false, it takes a `std::vector<Beat>` —
+/// and, worse, lets `k.fseq(1)` through, because an `int` is also not a
+/// record. `RecordSeq`/`Seq` were already in `IrType` and the component
+/// schema already resolved `TSeq<T>` into them; the slot check was the
+/// one place that flattened them away.
+///
+/// Enumerated mechanically over the whole grid — 3 value shapes (a
+/// scalar, a `Beat`, a `TSeq<Beat>`) into 8 slots (a scalar, record and
+/// sequence parameter at the component and testbench-method spellings,
+/// plus a scalar and a record scoreboard queue), on BOTH backends. The
+/// verdict is a clean diagonal: the 8 matching cells compile under v1
+/// and lower under tbir, and all 16 mismatches get a g++ error from v1
+/// ("no match for call to `<lambda(Sink&, const std::vector<Beat>&)>`"
+/// for the sequence ones). So `Invalid` throughout, as everywhere else
+/// in this family.
+#[test]
+fn a_sequence_slot_is_named_as_a_sequence_in_both_directions() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB() -> TSeq<Beat>
+    let b : Beat
+    b.v = 1
+    yield b
+end tseq GenB
+
+tseq GenS() -> TSeq<uint<8>>
+    yield 3
+end tseq GenS
+
+scoreboard Sb
+    qr : queue<Beat>
+end scoreboard Sb
+
+agent Sink
+    n : uint<32> default 0
+    function fsc(x: uint<8>)
+        n = n + 1
+    end function
+    function fseq(s: TSeq<Beat>)
+        n = n + 1
+    end function
+    function fseqs(s: TSeq<uint<8>>)
+        n = n + 1
+    end function
+    function fseqw(s: TSeq<uint<32>>)
+        n = n + 1
+    end function
+end agent Sink
+
+testbench Tb
+    dut : Top
+    k   : Sink
+    sb  : Sb
+
+    function tseqf(s: TSeq<Beat>) -> uint<8>
+        return 1
+    end tseqf
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let xs = GenB()
+        let ys = GenS()
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in [
+        "        k.fsc(1)",
+        "        k.fseq(xs)",
+        "        k.fseqs(ys)",
+        "        let z = tseqf(xs)",
+        "        sb.qr.push(b)",
+        // A scalar sequence carries no width in the slot shape, and
+        // should not: v1 emits `std::vector<uint64_t>` for every scalar
+        // `TSeq` element, so `TSeq<uint<8>>` into a `TSeq<uint<32>>`
+        // parameter compiles there. Measured, not assumed.
+        "        k.fseqw(ys)",
+    ] {
+        lower_src(&prog(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want, got) in [
+        // Into a sequence slot — the direction that lowered clean before,
+        // because "not a record" was the only thing the check could say.
+        ("        k.fseq(1)", "a `TSeq<Beat>`", "a non-record value"),
+        ("        k.fseq(b)", "a `TSeq<Beat>`", "a `Beat`"),
+        (
+            "        let z = tseqf(1)",
+            "a `TSeq<Beat>`",
+            "a non-record value",
+        ),
+        ("        let z = tseqf(b)", "a `TSeq<Beat>`", "a `Beat`"),
+        // …and out of one, where the sequence is the value.
+        ("        k.fsc(xs)", "a non-record value", "a `TSeq<Beat>`"),
+        ("        sb.qr.push(xs)", "a `Beat`", "a `TSeq<Beat>`"),
+        // The record and scalar ELEMENT kinds are two shapes, not one:
+        // collapsing them keeps every cell above green while
+        // `k.fseqs(xs)` — a `std::vector<Beat>` into a
+        // `std::vector<uint64_t>` — sails through.
+        ("        k.fseqs(xs)", "a scalar `TSeq`", "a `TSeq<Beat>`"),
+        ("        k.fseq(ys)", "a `TSeq<Beat>`", "a scalar `TSeq`"),
+        (
+            "        k.fseqs(1)",
+            "a scalar `TSeq`",
+            "a non-record value",
+        ),
+        ("        k.fseqs(b)", "a scalar `TSeq`", "a `Beat`"),
+        ("        k.fsc(ys)", "a non-record value", "a scalar `TSeq`"),
+    ] {
+        let src = prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// The slot check's own failure mode: it answered with a small enum, and
+/// every type it could not name fell into "not a record". That turns an
+/// absence of information into a claim, and three programs v1 COMPILES
+/// were rejected outright by the default backend for it.
+///
+/// Each cell below was measured on both backends. The `_ok` ones compile
+/// under v1 and must lower; the `_bad` ones get a g++ error from v1 and
+/// must be `Invalid`. Before this fix the two columns were swapped at
+/// every one of these spellings — the working call rejected, the broken
+/// one waved through.
+#[test]
+fn a_slot_the_compiler_cannot_name_is_not_a_scalar() {
+    // A `-> TSeq<T>` method result types its `let`, so the next slot the
+    // local enters sees a sequence rather than an untyped value.
+    let seq_ret = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+agent Sink
+    n : uint<32> default 0
+    function gen(s: TSeq<Beat>) -> TSeq<Beat>
+        return s
+    end function
+    function fseq(s: TSeq<Beat>)
+        n = n + 1
+    end function
+end agent Sink
+
+testbench Tb
+    dut : Top
+    k   : Sink
+
+    function passthru(s: TSeq<Beat>) -> TSeq<Beat>
+        return s
+    end passthru
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+{call}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // The testbench-method spelling lowers too, but its local does NOT
+    // type as a sequence, and that is a gap OLDER than this rule rather
+    // than one it left behind: a testbench method's return temp resolves
+    // through `ir_type_of_with_records`, which answers `Unknown` for
+    // `TSeq<T>`. The whole inlined chain is untyped, so tbir emits
+    // `uint64_t ys = 0;` and `s = xs;` and g++ refuses it, while v1
+    // compiles `[&](Tb& self, const std::vector<Beat>& s)`. Reproducible
+    // on the merge base. What matters here is that the slot check does
+    // not pile a false rejection on top of it.
+    lower_src(&seq_ret(
+        "        let ys = passthru(xs)\n        k.fseq(ys)",
+    ))
+    .expect("the untyped testbench-method chain still lowers, rather than being rejected");
+
+    for ok in [
+        // v1: `auto ys = Sink_gen(_tb.k, xs); Sink_fseq(_tb.k, ys);`
+        "        let ys = k.gen(xs)\n        k.fseq(ys)",
+    ] {
+        let prog = lower_src(&seq_ret(ok))
+            .unwrap_or_else(|e| panic!("`{ok}` lowers (v1 compiles it): {e:?}"));
+        // Not just "is accepted" — the local must carry the SEQUENCE
+        // type. Accepting it is only half the fix and the weaker half:
+        // an untyped local is waved through by the `Unknown` rule
+        // whether or not the result type was carried, so a test that
+        // checks lowering alone passes with the inference deleted. What
+        // the inference actually buys is the declaration, and getting it
+        // wrong is silent — v1 emits `std::vector<Beat>` while an
+        // untyped tbir local emitted `uint64_t ys = 0`.
+        let ys = prog
+            .functions
+            .iter()
+            .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+            .expect("run fn")
+            .locals
+            .iter()
+            .find(|l| l.name == "ys")
+            .unwrap_or_else(|| panic!("`{ok}`: no `ys` local"));
+        assert!(
+            matches!(ys.ty, ir::IrType::RecordSeq(_)),
+            "`{ok}`: `ys` must type as the method's sequence result, got {:?}",
+            ys.ty
+        );
+    }
+
+    // A `TSeq<T>` parameter on a TRANSACTOR method. The schema resolved
+    // it to `Unknown`, so the slot claimed to be non-record and the
+    // working call was refused while the broken one passed.
+    let xactor = |arg: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+transactor Drv
+    dut : Top
+    when active
+        hookable dispatch(txns: TSeq<Beat>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+        drv.dispatch({arg})
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // v1: `[&](Drv& self, const std::vector<Beat>& txns)`, called with `xs`.
+    lower_src(&xactor("xs")).expect("a matching sequence argument lowers");
+    let msg = assert_invalid(&lower_src(&xactor("1")).unwrap_err());
+    assert!(
+        msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
+        "and the scalar is refused, naming the sequence: {msg}"
+    );
+
+    // The same pair at the `tseq` spelling, whose slot was hard-coded to
+    // "not a record" on the belief that every reachable tseq parameter
+    // is a scalar.
+    let tseq_param = |arg: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenB(n: uint<8>) -> TSeq<Beat>
+    let b : Beat
+    b.v = n
+    yield b
+end tseq GenB
+
+tseq Wrap(xs: TSeq<Beat>) -> TSeq<Beat>
+    let b : Beat
+    b.v = 9
+    yield b
+end tseq Wrap
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let xs = GenB(2)
+        let ys = Wrap({arg})
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // v1: `[&](const std::vector<Beat>& xs) -> std::vector<Beat>`.
+    lower_src(&tseq_param("xs")).expect("a matching sequence argument lowers");
+    let msg = assert_invalid(&lower_src(&tseq_param("7")).unwrap_err());
+    assert!(
+        msg.contains("parameter of tseq `Wrap`")
+            && msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
+        "{msg}"
+    );
+
+    // The bus `tlm_method` request path had the declared type in hand as
+    // a WIDTH hint and never asked whether the argument belonged in the
+    // slot at all. Both backends emitted
+    // `harc_rt::harc_assign(dut->mem_read_addr, b);` and both fail g++
+    // with "invalid `static_cast` from type `Beat`".
+    let bus = |call: &str| {
+        fixture("tlm_method_blocking_fork_bus_test.harc")
+            .replacen(
+                "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+                "transaction Beat\n    v : uint<8>\nend transaction Beat\n\n\
+                 testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+                1,
+            )
+            .replacen(
+                "        let forked = fork mem.read(5)\n        join_all\n",
+                &format!("        let b : Beat\n{call}\n"),
+                1,
+            )
+            .replacen(
+                "        assert forked == 261\n            else fail(\"forked blocking read got \
+                 0x${forked:08x}, expected 0x00000105\")\n",
+                "",
+                1,
+            )
+    };
+    for ok in [
+        "        let r = mem.read(5)",
+        "        let f = fork mem.read(5)\n        join_all",
+    ] {
+        lower_src(&bus(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (call, what) in [
+        ("        let r = mem.read(b)", "of bus method `read`"),
+        (
+            "        let f = fork mem.read(b)\n        join_all",
+            "of forked bus method `read`",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&bus(call)).unwrap_err());
+        assert!(
+            msg.contains(what) && msg.contains("was given a `Beat`"),
+            "`{call}`: {msg}"
+        );
+    }
+}
+
+/// Two spellings of one unbuildable program must not get two different
+/// verdicts. When the `tseq` slot learned its declared types, a record
+/// parameter started resolving to `Record(Beat)` — so `Wrap(s)` MATCHED
+/// and lowered, while `Wrap(7)` was still refused for being the wrong
+/// shape. Neither compiles anywhere: v1 renders a record `tseq`
+/// parameter as `[&](VBeat* seed)` ("`VBeat` has not been declared") and
+/// tbir as `[&](uint64_t seed)`. The defect is the PARAMETER, so that is
+/// where it is named — once, for every call.
+///
+/// `NotImplemented` rather than `Invalid`, because the declaration alone
+/// is fine under tbir: an uncalled one compiles there.
+#[test]
+fn a_record_typed_parameter_is_refused_on_the_parameter_not_the_argument() {
+    let tseq_decl = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq Wrap(seed: Beat) -> TSeq<Beat>
+    let b : Beat
+    b.v = 9
+    yield b
+end tseq Wrap
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : Beat
+{call}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // Uncalled: tbir compiles it, so there is nothing to refuse.
+    lower_src(&tseq_decl("")).expect("an uncalled record-parameter tseq lowers");
+    for call in ["        let ys = Wrap(s)", "        let ys = Wrap(7)"] {
+        let err = lower_src(&tseq_decl(call)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains("record-typed parameter `seed` on `tseq Wrap`"),
+            "`{call}` names the parameter, not the argument: {msg}"
+        );
+    }
+
+    // The extern-fn spelling is NOT the same rule, and calling it the
+    // same was the mistake. `emit_extern_fn_decls` is shared — tbir
+    // calls straight into v1's — so BOTH backends emit
+    // `uint64_t ref_add(uint64_t a, VBeat* b);` and neither compiles the
+    // translation unit. That makes it `Invalid` rather than a per-call
+    // `NotImplemented`, and puts the verdict at the DECLARATION: the
+    // call-site version left a declared-but-uncalled one lowering clean
+    // while the default backend emitted C++ that does not build.
+    let ext = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+extern function ref_add(a: uint<8>, b: Beat) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : Beat
+        let z = ref_add(1, s)
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(ext).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_add` names `Beat` in its parameter `b`"),
+        "{msg}"
+    );
+    // …and the UNCALLED declaration is refused too, which is the cell
+    // the call-site version missed.
+    let uncalled = ext
+        .replace("        let s : Beat\n", "")
+        .replace("        let z = ref_add(1, s)\n", "");
+    let msg = assert_invalid(&lower_src(&uncalled).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_add` names `Beat`"),
+        "an uncalled record-parameter extern fn is refused too: {msg}"
+    );
+    // The RETURN type goes through the same `c_type_for` two lines down
+    // in `emit_extern_fn_decls`, so it is the same defect. Asking the
+    // record question about parameters only missed it: `-> Beat` emits
+    // `VBeat* ref_mk(uint64_t a);` from both backends.
+    let ret = uncalled.replace(
+        "extern function ref_add(a: uint<8>, b: Beat) -> uint<8>",
+        "extern function ref_mk(a: uint<8>) -> Beat",
+    );
+    let msg = assert_invalid(&lower_src(&ret).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_mk` names `Beat` in its return type"),
+        "{msg}"
+    );
+    // …and an ENUM parameter, which the record question could not see
+    // by construction, though `c_type_for` renders it `VColor*` alike.
+    let en = uncalled
+        .replace(
+            "transaction Beat\n    v : uint<8>\nend transaction Beat",
+            "enum Color { RED, GREEN }",
+        )
+        .replace(
+            "extern function ref_add(a: uint<8>, b: Beat) -> uint<8>",
+            "extern function ref_en(c: Color) -> uint<8>",
+        );
+    let msg = assert_invalid(&lower_src(&en).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_en` names `Color`"),
+        "{msg}"
+    );
+    // A DUT-MODULE-typed parameter is NOT this defect and must keep
+    // lowering: `VTop*` is the one `V<name>` that IS in scope, and both
+    // backends compile `uint64_t ref_peek(VTop* d);`. This is why the
+    // rule asks what HARC declares rather than what looks like a module.
+    let dut_param = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+extern function ref_peek(d: Top) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(dut_param)
+        .expect("a DUT-module-typed extern parameter lowers (both backends build it)");
+    // …and this cell only means something next to its negatives. An
+    // earlier version asserted the DUT exception with a fixture whose
+    // type name was simply absent from a whitelist, so it exercised the
+    // same path as a name the whitelist had FORGOTTEN and would have
+    // passed under any implementation that forgot one. These two say
+    // what `Top` is being excepted FROM.
+    let unknown = dut_param.replace("ref_peek(d: Top)", "ref_peek(d: Nope)");
+    let msg = assert_invalid(&lower_src(&unknown).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_peek` names `Nope`"),
+        "a name that is not the DUT's is refused: {msg}"
+    );
+    // A `list`/`Vec` spelling is NOT a module handle: `c_type_for`
+    // intercepts it on its first line, before the `V{name}*` arm, and
+    // renders `std::vector<uint64_t>` — which compiles. Keying the rule
+    // on "HARC declares this name" rejected exactly this.
+    let listy = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct List
+    v : uint<8>
+end struct List
+
+extern function fx(x: List) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(listy).expect("a `List`-spelled parameter lowers (v1 emits std::vector and builds)");
+
+    // `c_type_for` pastes a HARC name in THREE places, and the rule
+    // modelled one. The element of a `TSeq<T>`/`queue<T>` goes into
+    // `std::vector<T>` / `HarcQueue<T>` verbatim, so it must name a
+    // declared record — a C++ struct of that name is emitted for one.
+    // Not even the DUT works there: `TSeq<Top>` pastes `Top`, while the
+    // struct that exists is `VTop`. All measured against the compiling
+    // controls `TSeq<Beat>` / `queue<Beat>`.
+    let elem = |ty: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+enum Color {{ RED, GREEN }}
+
+extern function fx(x: {ty}) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["TSeq<Beat>", "queue<Beat>"] {
+        lower_src(&elem(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers (v1 builds it): {e:?}"));
+    }
+    for (ty, named) in [
+        ("TSeq<Nope>", "Nope"),
+        ("TSeq<Color>", "Color"),
+        ("TSeq<Top>", "Top"),
+        ("queue<Nope>", "Nope"),
+    ] {
+        let msg = assert_invalid(&lower_src(&elem(ty)).unwrap_err());
+        assert!(
+            msg.contains(&format!("names `{named}`")),
+            "`{ty}` names the pasted element: {msg}"
+        );
+    }
+
+    // Extern-fn ARITY, which had no check at all. Without it the slot
+    // loop's `get(i)` silently stopped at the shorter side, and a
+    // surplus argument was checked against a fabricated scalar slot —
+    // `f(1, b)` reported "an argument of extern fn `f` takes a
+    // non-record value", describing parameter #2 of a one-parameter
+    // function. Measured with a compiling control (`f(1)`): both
+    // backends give "too many arguments to function
+    // `uint64_t f(uint64_t)`" and "too few arguments" respectively.
+    let arity = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+extern function f(x: uint<8>) -> uint<8>
+extern function g(y: uint<8>, z: uint<8>) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["        let a = f(1)", "        let a = g(1, 2)"] {
+        lower_src(&arity(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want) in [
+        (
+            "        let a = f(1, 2)",
+            "`f` takes 1 argument(s), call passes 2",
+        ),
+        (
+            "        let a = g(1)",
+            "`g` takes 2 argument(s), call passes 1",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&arity(body)).unwrap_err());
+        assert!(msg.contains(want), "`{body}`: {msg}");
+    }
+
+    // A `TSeq<T>` extern parameter, by contrast, is a slot that WORKS:
+    // `c_type_for` renders it `const std::vector<Beat>&` and v1 compiles
+    // the call. Hard-coding the extern slot to "scalar" rejected this —
+    // a false `Invalid` introduced by the check meant to prevent them.
+    let seq_ext = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenR() -> TSeq<Beat>
+    let b : Beat
+    b.v = 1
+    yield b
+end tseq GenR
+
+extern function ref_sum(xs: TSeq<Beat>) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let ys = GenR()
+        let z = ref_sum(ys)
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(seq_ext).expect("a sequence into a `TSeq<T>` extern parameter lowers");
+    // …and the mismatch at that same slot is still caught.
+    let bad = seq_ext.replace("ref_sum(ys)", "ref_sum(1)");
+    let msg = assert_invalid(&lower_src(&bad).unwrap_err());
+    assert!(
+        msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
+        "{msg}"
+    );
+}
+
+/// A record-valued operand under an operator that does not PRODUCE a
+/// record. `expr_type` propagates its operand's type through `Binary`,
+/// `Unary` and `Ternary` without asking whether the operator preserves
+/// record-ness; `record_id_of_expr` does ask. Reading the value's shape
+/// off `expr_type` alone made the guard assert that `b + 1` IS a `Beat`
+/// — the same absence-dressed-as-a-claim this family exists to remove,
+/// mirrored onto the value side — and let `s.obs(b + 1)` lower.
+///
+/// The two sources disagreeing is the signature of a malformed record
+/// expression, and it is now the rejection. Measured on both backends
+/// with a compiling control: v1 and tbir alike give "no match for
+/// `operator+` (operand types are `Beat` and `int`)" and "operands to
+/// `?:` have different types `Beat` and `Other`".
+#[test]
+fn a_record_under_an_operator_that_does_not_produce_one_is_rejected() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    q : queue<Beat>
+end scoreboard Sb
+
+agent Src
+    n : uint<32> default 0
+    function obs(t: Beat)
+        n = n + 1
+    end function
+    function obo(t: Other)
+        n = n + 1
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // The control: a plain record value still enters a record slot.
+    lower_src(&prog("        s.obs(b)")).expect("a well-formed record argument lowers");
+    for body in [
+        "        s.obs(b + 1)",
+        // …including when the mis-typing pointed at a DIFFERENT record,
+        // which is where the false claim was visible in the message.
+        "        s.obo(b + 1)",
+        "        sb.q.push(b + 1)",
+        "        s.obs(dut.en == 1 ? b : o)",
+    ] {
+        let src = prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("record-valued operand in a position that does not produce a record"),
+            "`{body}` names the shape of the mistake rather than claiming a type: {msg}"
+        );
+        // …and never asserts what the expression's type IS.
+        assert!(
+            !msg.contains("was given a `Beat`") && !msg.contains("was given a `Other`"),
+            "`{body}` must not claim a record type for a non-record expression: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
@@ -22309,17 +24122,27 @@ fn named_arguments_are_bound_by_position_by_v1() {
     // count, and the message must not be read as a claim about the
     // latter. A single named argument to the TWO-parameter method emits
     // exactly what the equivalent positional call emits — both are
-    // under-supplied and neither compiles, but that is a pre-existing
-    // arity gap (tbir lowers `axil_write(t.value)` too) rather than
-    // something naming the argument caused.
+    // under-supplied and neither compiles, but that is an arity
+    // problem rather than something naming the argument caused. (This
+    // comment used to add "tbir lowers `axil_write(t.value)` too",
+    // which the component-method arity check below has since made
+    // false — and which contradicted the assertions eight lines down.)
     // A single named argument to the TWO-parameter method is
     // UNDER-SUPPLIED. `data` names a real parameter, but with one
     // argument supplied the positions do not correspond, so there is no
-    // swap to describe — claiming one would be a false explanation of a
-    // pre-existing arity gap. It lowers, exactly as the positional
-    // under-supply does.
-    lower_src(&call("data = t.value")).expect("a named under-supply lowers");
-    lower_src(&call("t.value")).expect("the positional under-supply also lowers today");
+    // swap to describe — claiming one would be a false explanation of
+    // an arity gap. Both spellings are refused identically, and for the
+    // arity, not the name: neither backend compiles an under-supplied
+    // call. (This gap used to let both spellings lower; closing it also
+    // stopped `zip` from silently skipping the type check on every
+    // parameter past the last supplied one.)
+    for spelling in ["data = t.value", "t.value"] {
+        let msg = assert_invalid(&lower_src(&call(spelling)).unwrap_err());
+        assert!(
+            msg.contains("takes 2 argument(s), call passes 1"),
+            "`{spelling}` is refused for its arity: {msg}"
+        );
+    }
     let v1_named_short = cpp_tb::emit(&merged_src(&call("data = t.value"))).expect("v1 emits");
     // Anchor first: the under-supplied call really is in v1's output,
     // so the identity below is not two absences matching.

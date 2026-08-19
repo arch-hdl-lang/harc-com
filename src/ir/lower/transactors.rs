@@ -470,6 +470,15 @@ pub(crate) fn lower_transactor(
                         .iter()
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
+                    h.params
+                        .iter()
+                        .map(|p| {
+                            super::helpers::ir_type_of_with_records(
+                                p.ty.as_ref(),
+                                &method_ctx.record_ids,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     h.return_ty.is_some(),
                     *active_only,
                 ),
@@ -527,6 +536,7 @@ pub(crate) fn lower_transactor(
             name: mname.clone(),
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+            param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
@@ -1352,6 +1362,15 @@ fn lower_bound_initiator_transactor(
                         .iter()
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
+                    h.params
+                        .iter()
+                        .map(|p| {
+                            super::helpers::ir_type_of_with_records(
+                                p.ty.as_ref(),
+                                &method_ctx.record_ids,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     h.return_ty.is_some(),
                     *active_only,
                 ),
@@ -1414,6 +1433,7 @@ fn lower_bound_initiator_transactor(
             name: mname.clone(),
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+            param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
@@ -1647,6 +1667,14 @@ fn method_param_ir_type(
         if let Some(&rid) = record_ids.get(simple) {
             return Ok(IrType::Record(rid));
         }
+    }
+    // A `TSeq<T>` parameter, through the resolver the component-method
+    // schema uses. Without it the type came back `Unknown` and the slot
+    // check described a `TSeq<Beat>` parameter as taking a non-record
+    // value — then rejected `drv.dispatch(xs)`, which v1 compiles
+    // (`[&](Drv& self, const std::vector<Beat>& txns)`).
+    if let Some(seq) = helpers::tseq_ir_type(p.ty.as_ref(), record_ids) {
+        return Ok(seq);
     }
     check_method_param_ty(
         tname,

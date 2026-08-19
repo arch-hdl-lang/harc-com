@@ -36,7 +36,7 @@ use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
     CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
     RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, Terminator, TestSchema,
-    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TseqElem, TypedLocal, TypedParam,
+    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1083,26 +1083,15 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // `extern function name(...) -> ret` (spec §9) names — calls to
     // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
-    // across every lowering context (an extern fn is a pure scalar C
-    // call, callable wherever a pure helper is).
+    // across every lowering context (an extern fn is a PURE call,
+    // callable wherever a pure helper is — its parameters are not
+    // restricted to scalars; see `lower_extern_fn_call`).
     let extern_fn_decls: HashMap<String, &crate::ast::ExternFnDecl> = file
         .items
         .iter()
         .filter_map(|it| match it {
             Item::ExternFn(f) => Some((f.name.name.clone(), f)),
             _ => None,
-        })
-        .collect();
-    // Name -> declared parameter names. The names are carried (not just
-    // membership) so `lower_extern_fn_call` can check a named argument
-    // against the DECLARATION rather than against an invented list.
-    let extern_fns: HashMap<String, Vec<String>> = extern_fn_decls
-        .iter()
-        .map(|(k, d)| {
-            (
-                k.clone(),
-                d.params.iter().map(|p| p.name.name.clone()).collect(),
-            )
         })
         .collect();
 
@@ -1225,6 +1214,119 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             record_schemas.push(rec);
             regblock_ids.insert(name.clone(), RegblockId(regblock_schemas.len() as u32));
             regblock_schemas.push(schema);
+        }
+    }
+
+    // Name -> declared parameter names and TYPES. The names are carried
+    // (not just membership) so `lower_extern_fn_call` can check a named
+    // argument against the DECLARATION rather than against an invented
+    // list; the types so the call site can check each argument against
+    // the slot it is entering.
+    let extern_fns: ExternFnTable = extern_fn_decls
+        .iter()
+        .map(|(k, d)| {
+            (
+                k.clone(),
+                (
+                    d.params.iter().map(|p| p.name.name.clone()).collect(),
+                    d.params
+                        .iter()
+                        .map(|p| helpers::slot_ir_type(p.ty.as_ref(), &record_ids))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    // An extern-fn signature type that the emitter renders as a
+    // VERILATED MODULE HANDLE is refused at the DECLARATION, because the
+    // declaration alone is what breaks. `emit_extern_fn_decls` is shared
+    // (tbir calls straight into v1's) and runs every parameter AND the
+    // return type through `c_type_for`, whose `Named` fall-through is
+    // `V{last}*`. The only `V<name>.h` headers ever included are the DUT
+    // module's own (plus its `___024root` when the test declares
+    // probes), so any other name is undeclared and BOTH backends fail to
+    // compile the translation unit, called or not. Hence `Invalid`, and
+    // hence the declaration rather than the call site.
+    //
+    // The question is asked THROUGH the emitter
+    // (`cpp_tb::verilated_handle_name`) rather than restated here, and
+    // that is the whole point. Restating it cost two rounds: first as
+    // "is it a record", which cannot see an enum or a return type, then
+    // as "does HARC declare the name", which was wrong in both
+    // directions at once — it rejected a `struct List` parameter (the
+    // `list`/`Vec` guard on `c_type_for`'s FIRST line renders that
+    // `std::vector<uint64_t>`, and it compiles) while still passing a
+    // bare undeclared `Nope`, a `domain` name and a `bus` name, each of
+    // which emits an undeclared `V*` from both backends.
+    //
+    // The DUT's own type is the one exception, and it is measured:
+    // `extern function ref_peek(d: Top)` emits
+    // `uint64_t ref_peek(VTop* d);` and compiles under both backends,
+    // because `VTop` is precisely the handle that IS in scope.
+    let dut_types: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Test(t) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.items.iter())
+        .filter_map(|ti| match ti {
+            TestItem::Let(l) if l.name.name == "dut" => match l.ty.as_ref() {
+                Some(TypeExpr::Named { name, .. }) => name.segments.last().map(|s| s.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let bad_handle = |t: Option<&TypeExpr>| -> Option<String> {
+        let t = t?;
+        // The `Named` fall-through: `V<name>*`, satisfiable only for the
+        // DUT's own type.
+        if let Some(n) = crate::codegen::cpp_tb::verilated_handle_name(t) {
+            if !dut_types.contains(n) {
+                return Some(n.to_string());
+            }
+        }
+        // …and the ELEMENT of a `TSeq<T>` / `queue<T>`, which is pasted
+        // verbatim into `std::vector<T>` / `HarcQueue<T>`. Satisfiable
+        // for a record (emitted as a C++ struct of that name) and
+        // nothing else — NOT even the DUT: `TSeq<Top>` pastes `Top`,
+        // while the struct that exists is `VTop`. Measured against the
+        // compiling control `TSeq<Beat>`; `TSeq<Nope>`, `TSeq<Top>`,
+        // `TSeq<Color>` and `queue<Nope>` all fail g++ from both
+        // backends.
+        //
+        // This arm is why the previous version's claim to cover
+        // "every parameter AND the return type through `c_type_for`"
+        // was not true of the CHECK: `c_type_for` has three arms that
+        // paste a HARC name, and the rule modelled one.
+        let n = crate::codegen::cpp_tb::element_type_name(t)?;
+        (!record_ids.contains_key(n)).then(|| n.to_string())
+    };
+    // File order, not `extern_fn_decls` order: that is a `HashMap`, so
+    // iterating it named a different offender run to run on the same
+    // input. `emit_extern_fn_decls` walks `file.items`; so does this.
+    for it in &file.items {
+        let Item::ExternFn(decl) = it else { continue };
+        let bad = decl
+            .params
+            .iter()
+            .find_map(|p| {
+                bad_handle(p.ty.as_ref()).map(|ty| (format!("parameter `{}`", p.name.name), ty))
+            })
+            .or_else(|| {
+                bad_handle(decl.return_ty.as_ref()).map(|ty| ("return type".to_string(), ty))
+            });
+        if let Some((where_, ty)) = bad {
+            return Err(LowerError::Invalid(format!(
+                "`extern function {}` names `{ty}` in its {where_}; both backends paste \
+                 that name into the generated C++ with no declaration behind it, so the \
+                 translation unit does not compile. Across the extern boundary pass \
+                 scalars, a `list`/`Vec` of them, or a sequence of a declared \
+                 `transaction`/`struct`",
+                decl.name.name
+            )));
         }
     }
 
@@ -1821,8 +1923,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
         probes: HashMap::new(),
-        // Extern fns are pure scalar C calls — callable from a pure
-        // helper body.
+        // Extern fns are PURE calls — callable from a pure helper body.
         extern_fns: extern_fns.clone(),
     };
     for it in &file.items {
@@ -2925,11 +3026,11 @@ fn lower_test(
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
-    extern_fns: &HashMap<String, Vec<String>>,
+    extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
-    tseq_records: &HashMap<String, (TseqElem, Vec<String>)>,
+    tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     prog: &mut TbProgram,
@@ -5507,14 +5608,32 @@ pub(crate) fn reject_misplaced_named_args(
         // pre-existing arity gap — the exact failure mode this guard was
         // rewritten to stop producing.
         //
-        // An earlier version of this comment claimed call sites check
-        // arity first so the branch is unreachable. That is false at
-        // exactly two of them: `lower_extern_fn_call` has no arity check
-        // anywhere in the pipeline, and TB-IR never checks
-        // component-method arity (`axil_write(t.value)` lowers). Both
-        // reach here, and both LOSE a diagnostic they used to give:
-        // `ref_add(b = 2, a = 1, 3)` reported a swap before and lowers
-        // now.
+        // The branch IS reachable, and two earlier attempts to say why
+        // both got it wrong. The first claimed call sites check arity
+        // first, so it is dead. The second claimed the extern path had
+        // since been fixed and only the component path still arrives
+        // mis-counted, witnessed by `axil_write(t.value)`.
+        //
+        // The reachability argument is about ORDER, not about which
+        // callers check arity at all. Every caller that checks arity
+        // does so AFTER calling this: `lower_extern_fn_call` rejects
+        // misplaced names at helpers.rs and counts arguments a couple
+        // of dozen lines later; the component path calls
+        // `lower_component_call_args` before `check_component_call_args`.
+        // So a mis-counted call reaches here from both, and
+        // `ref_add(b = 2, a = 1, 3)` is the witness — it takes the
+        // `continue` above, then gets "extern fn `ref_add` takes 2
+        // argument(s), call passes 3" from the later check.
+        //
+        // `axil_write(t.value)` is not a witness for anything here: it
+        // is POSITIONAL, so the loop's `let CallArg::Named { .. } = a
+        // else { continue }` skips it before any count is compared. It
+        // also no longer lowers — the component-method arity check
+        // added earlier in this same sweep rejects it — which made the
+        // second attempt false on the day it was written.
+        //
+        // ("two callers" was inherited from the claim being corrected
+        // and is also wrong: this function has fourteen call sites.)
         //
         // Measured before accepting that: the two backends emit the same
         // arguments in the same order for those calls
@@ -5958,6 +6077,11 @@ fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
 // ── Function builder ─────────────────────────────────────────────────
 
 /// Per-test lowering context shared by all of the test's functions.
+/// extern-fn name -> (declared parameter NAMES, declared parameter
+/// TYPES). Named so the pair can be threaded without tripping clippy's
+/// complex-type lint.
+pub(crate) type ExternFnTable = HashMap<String, (Vec<String>, Vec<IrType>)>;
+
 #[derive(Clone)]
 pub(crate) struct LowerCtx {
     /// Test-scope DUT field name (`"dut"`).
@@ -6162,14 +6286,15 @@ pub(crate) struct LowerCtx {
     /// `CallTarget::Tseq` whose result types the local as the element's
     /// `RecordSeq`/`Seq` (`TseqElem::seq_type`), and a `for t in txns` over
     /// such a local lowers to a counted loop over `txns`.
-    /// tseq name -> (element type, declared parameter NAMES).
+    /// tseq name -> (element type, declared parameter NAMES, declared
+    /// parameter TYPES).
     ///
     /// The names ride along for the same reason
     /// `TransactorMethodSchema::param_names` carries them: the call site
     /// lowers from this map alone, and without the names it could only
     /// refuse every named argument — including the in-order form v1
     /// emits byte-identically.
-    pub tseqs: HashMap<String, (TseqElem, Vec<String>)>,
+    pub tseqs: tseqs::TseqTable,
     /// DUT-internal `probe` declarations on `let dut` (probe name →
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with
@@ -6182,10 +6307,9 @@ pub(crate) struct LowerCtx {
     /// with the RAW symbol name (resolved at link via `--ref-src`); the
     /// forward declaration is emitted file-scope by
     /// `emit_extern_fn_decls`. Visible in EVERY context (test bodies,
-    /// helpers, methods) — an extern fn is a pure scalar C function, so
-    /// it is callable wherever a pure helper is. Empty when the program
-    /// declares no extern fns.
-    pub extern_fns: HashMap<String, Vec<String>>,
+    /// helpers, methods) — an extern fn is callable wherever a pure
+    /// helper is. Empty when the program declares no extern fns.
+    pub extern_fns: ExternFnTable,
 }
 
 impl LowerCtx {
@@ -6414,7 +6538,14 @@ pub(crate) struct FuncBuilder<'a> {
     /// same information `TransactorMethodSchema::param_names` carries
     /// for the bound-instance path, and it was dropped in both places
     /// for the same reason.
-    pub(crate) self_transactor_methods: HashMap<String, (Vec<String>, bool, bool)>,
+    /// Sibling methods callable by bare name inside a transactor body:
+    /// `(param_names, param_tys, has_ret, active_only)`. The types are
+    /// carried for the same reason `TransactorMethodSchema::param_tys`
+    /// is — a call site lowers under a snapshot, with no functions
+    /// table, so without them it had nothing to type-check an argument
+    /// against.
+    pub(crate) self_transactor_methods:
+        HashMap<String, (Vec<String>, Vec<crate::ir::IrType>, bool, bool)>,
     /// True while lowering a transactor method declared under
     /// `when active`. Used to reject an always-on method that would
     /// backdoor-call an active-only sibling.

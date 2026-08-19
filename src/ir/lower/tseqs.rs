@@ -101,6 +101,11 @@ fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
     }
 }
 
+/// tseq name -> (element type, declared parameter NAMES, declared
+/// parameter TYPES). Named because the triple is threaded through
+/// `LowerCtx` and three lowering entry points.
+pub(crate) type TseqTable = HashMap<String, (TseqElem, Vec<String>, Vec<IrType>)>;
+
 /// Build the `tseq name → element type` map, validating each declaration
 /// up front. A `tseq`'s element is either a declared record (`TSeq<Record>`,
 /// → `TseqElem::Record`) or a primitive scalar (`TSeq<uint<N>>`, →
@@ -114,7 +119,7 @@ fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
-) -> Result<HashMap<String, (TseqElem, Vec<String>)>, LowerError> {
+) -> Result<TseqTable, LowerError> {
     let mut out = HashMap::new();
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
@@ -180,8 +185,20 @@ pub(crate) fn collect_tseq_records(
             ));
         };
         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();
+        // Declared parameter TYPES, for the call-site slot check. A note
+        // here once claimed every reachable tseq parameter is a scalar,
+        // so the slot was hard-coded to "not a record". That was false
+        // for `TSeq<T>`: `tseq Wrap(xs: TSeq<Beat>)` is compiled by v1
+        // (`[&](const std::vector<Beat>& xs) -> std::vector<Beat>`) and
+        // the hard-coded slot rejected the correct call while letting
+        // `Wrap(7)` — which v1 refuses — straight through.
+        let param_tys: Vec<IrType> = decl
+            .params
+            .iter()
+            .map(|p| super::helpers::slot_ir_type(p.ty.as_ref(), record_ids))
+            .collect();
         if out
-            .insert(decl.name.name.clone(), (elem, param_names))
+            .insert(decl.name.name.clone(), (elem, param_names, param_tys))
             .is_some()
         {
             return Err(LowerError::Invalid(format!(

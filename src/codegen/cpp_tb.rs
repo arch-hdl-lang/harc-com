@@ -20580,6 +20580,55 @@ pub(crate) fn emit_extern_fn_decls(out: &mut String, file: &SourceFile) {
     writeln!(out, "").ok();
 }
 
+/// `Some(name)` when `t` renders as a Verilated module handle
+/// (`V<name>*`) rather than a real C++ type — the `Named` fall-through
+/// of `c_type_for` below, AFTER its `list`/`Vec` guard.
+///
+/// Exposed because TB-IR lowering has to refuse an `extern function`
+/// whose signature names such a type: only `V<dut_type>.h` is ever
+/// included, so any other `V<name>` is undeclared and the generated C++
+/// does not compile. Lowering asking this function, rather than
+/// restating the rule, is deliberate — the first version restated it as
+/// "the `Named` arm is unconditional" and missed the guard on the line
+/// above, which turned a `struct List` parameter (rendered
+/// `std::vector<uint64_t>`, and compiling) into a rejection.
+pub(crate) fn verilated_handle_name(t: &TypeExpr) -> Option<&str> {
+    if is_list_type(t) || fixed_vec_type_args(t).is_some() {
+        return None;
+    }
+    match t {
+        TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
+        _ => None,
+    }
+}
+
+/// The HARC name that `c_type_for` pastes as the ELEMENT of a
+/// `TSeq<T>` / `queue<T>` — `const std::vector<T>&`,
+/// `harc_rt::HarcQueue<T>&`. `None` when the element renders as a real
+/// C++ type (a scalar) or the type is neither.
+///
+/// A record element is fine: transactions and structs are emitted as C++
+/// structs of the same name, so `TSeq<Beat>` compiles. Anything else —
+/// an enum, a module, an undeclared name — is pasted verbatim with no
+/// declaration behind it, which is the same failure the `Named`
+/// fall-through has, one level in.
+pub(crate) fn element_type_name(t: &TypeExpr) -> Option<&str> {
+    let TypeExpr::Builtin { name, args, .. } = t else {
+        return None;
+    };
+    if !matches!(name, BuiltinTy::TSeq | BuiltinTy::Queue) {
+        return None;
+    }
+    match args.first()? {
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Ident(id) => Some(id.name.as_str()),
+            _ => None,
+        },
+        TypeArg::Type(inner) => verilated_handle_name(inner),
+        _ => None,
+    }
+}
+
 fn c_type_for(t: &TypeExpr) -> String {
     if is_list_type(t) || fixed_vec_type_args(t).is_some() {
         return txn_field_c_type(t);
@@ -20624,11 +20673,25 @@ fn c_type_for(t: &TypeExpr) -> String {
             // — caller will get a compile error pointing at the gap.
             _ => format!("/* TODO: type {:?} */ uint64_t", name),
         },
-        TypeExpr::Named { name, .. } => {
+        TypeExpr::Named { .. } => {
             // User-defined module types lower to Verilator pointers (`VFoo*`).
             // Matches the `let dut : AxiLiteRegs` → `VAxiLiteRegs* dut` rule
             // already used for the test-level DUT decl.
-            let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            //
+            // Routed THROUGH `verilated_handle_name` rather than repeating
+            // its body: TB-IR lowering refuses an `extern function` whose
+            // signature renders this way, and a second copy of the rule is
+            // exactly how the `list`/`Vec` guard above came to be missed
+            // once already. One of these two callers being wrong is now
+            // impossible rather than merely unlikely.
+            //
+            // Inlining the callee here is an EQUIVALENT mutant — same
+            // behaviour, so no test can see it — and that is the point.
+            // What this line buys is not a behaviour but the absence of
+            // a place for the two to disagree later; a mutation score
+            // cannot measure that, and citing one here would be citing
+            // the wrong evidence.
+            let last = verilated_handle_name(t).unwrap_or("");
             format!("V{last}*")
         }
     }

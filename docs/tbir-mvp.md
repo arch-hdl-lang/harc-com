@@ -7027,6 +7027,659 @@ former `transaction` group lives in
      different method name or a one-level target, and nothing tested
      the arm that was deliberately left alone.
 
+111. **The assignment rule at the other half of the surface: a typed
+     SLOT (2026-08-19).**
+
+     Divergences 104 and 108 swept assignment destinations. The mirror
+     of that rule — a value entering a queue element, a method
+     parameter or an event payload — was open at every family, in BOTH
+     directions. Measured across four slot families × the combinations
+     each admits, on both backends:
+
+     | slot | value | v1 / tbir C++ |
+     |---|---|---|
+     | `queue<uint<8>>` | a record | "cannot convert 'Beat' to 'long unsigned int'" |
+     | `queue<Beat>` | the same record | **compiles** |
+     | `queue<Beat>` | a different record | "cannot convert 'Other' to 'Beat'" |
+     | `queue<Beat>` | a scalar | "cannot convert 'long unsigned int' to 'Beat'" |
+     | scalar parameter | a record | "no match for call to ..." |
+     | record parameter | a scalar / other record | "no match for call to ..." |
+     | `event<uint<8>>` payload | a record | "no match for call to ..." |
+     | `event<Beat>` payload | a scalar / other record | "no match for call to ..." |
+
+     Sixteen mismatched cells; five matching ones compile. Every
+     mismatch is refused by BOTH backends, so all sixteen are `Invalid`
+     — a type error with nothing to implement.
+
+     Three things this turned up that a single probe would have missed:
+
+       * **The testbench queue answered a PROGRAM error through the
+         COMPILER-BUG channel.** Two of its four cells reached the
+         verifier's `BadProgramRef` — "internal error: TB-IR failed
+         verification after lowering" — for a program the user wrote
+         wrong. The other two lowered and emitted freely, so the
+         verifier check was not merely misplaced, it was asymmetric.
+       * **The `emit` shape check that existed was keyed on
+         `expr_type`,** whose `(_, IrType::Unknown) => true` arm waved
+         through exactly the record-carrying shapes divergence 108 had
+         just taught the compiler to type. It reads `record_id_of_expr`
+         now. The other two `emit` lanes (`ComponentEmit`, both the
+         dotted and self-relative spellings) checked arity and never
+         the payload type at all.
+       * **`TransactorMethodSchema` carried `param_names` but not
+         `param_tys`,** so the transactor call site had nothing to
+         type-check against — the same gap its own doc comment records
+         for names ("this was `n_params` and the names were dropped on
+         the floor at construction"). Extended the same way.
+
+     The queue family has SIX lanes, not three. Beyond the scoreboard,
+     component and testbench pushes, a bound-to TLM responder's
+     target-state queue takes a push in two spellings — bare
+     (`pending.push(x)`, inside the responder body) and test-scope
+     (`responder.pending.push(x)`) — and both were open. Its element
+     lives in `target_state_fields` rather than a queue table, which is
+     why it reads differently at each site.
+
+     A note on how that one was measured, because the first attempt
+     proved nothing: all four target-state cells failed to compile,
+     which looked like confirmation until the error turned out to be a
+     missing `VTlmReadInitiator.h` — the CONTROLS were failing too. With
+     a stub written from the `dut->` references in the generated file,
+     the two matching cells compile and the two mismatched ones fail in
+     both backends, which is the actual evidence.
+
+     **The guards found a pre-existing bug by breaking on it.** An
+     untyped `let` bound from a RECORD-returning component method
+     (`let b = s.mk(1)`) never applied the method's `ret_ty`, so the
+     local carried no record type: tbir emitted `uint64_t b; b =
+     Src_mk(...)` — which does not compile — while v1's
+     `auto b = Src_mk(_tb.s, 1);` does. Silent, and invisible until the
+     slot guards started reading that local's type, saw "a scalar", and
+     called five well-typed programs `Invalid`. `lower_let` applies
+     `m.ret_ty` now, which fixes the false rejections and the silent
+     mis-emission together.
+
+     A second review round found the same shape twice more. The
+     TESTBENCH-METHOD spelling of that `let` was untyped for the same
+     reason and broke the same way. And the `ret_ty` inference itself
+     regressed: gated on `declared_scalar_ty`, which
+     `typed_let_ir_type` answers `None` for on `int` and `bit`, it
+     typed `let n : int = s.mk(1)` as the method's RECORD — the default
+     backend emitted `Beat n{}` and RAN while v1 refused to build it.
+     That is the defect the untyped-`let` guard one screen up keys on
+     `l.ty` to prevent; the same mistake was made in code written next
+     to the fix for it. Both now key on `l.ty`.
+
+     A third round found the defect a THIRD time, at the `fork`
+     spelling: `try_lower_tlm_fork` declared its destination without
+     typing it, where the non-fork path one screen up computes
+     `tlm_ret_record_id(m.ret)`. That one is the worst of the three,
+     because with no slot involved nothing fails — tbir emitted
+     `uint64_t r = 0; r = harc_read(...)` and v1
+     `Resp r = {}; r = harc_unpack_Resp(...)`, and BOTH compile, so for
+     a multi-field struct the two backends silently computed different
+     values.
+
+     One `check_slot_type(value, want, what)` behind all of it, with a
+     `check_queue_push` adapter for `QueueElem`. Twenty-six mutations,
+     all caught — but only after review found FOUR of the eight advertised
+     call sites unpinned: the test exercised statement-position calls
+     and the dotted `emit` spelling only, so removing the guard at the
+     record-annotated `let`, the untyped `let`, the assignment site, the
+     self-relative `emit`, or the bound-initiator `param_tys` left the
+     suite green. Each spelling needed its own case.
+
+     **Deferred, measured:** three slot families, on the belief that
+     each needed a parameter-type table that did not exist. None of the
+     three did — see divergence 112.
+
+112. **None of the three deferred slot families needed a new table
+     (2026-08-19).**
+
+     Divergence 111 deferred the transactor SIBLING-method call,
+     testbench-method parameters, and `tseq` arguments together, on the
+     stated ground that each needs a parameter-type table that does not
+     exist. That was wrong about all three.
+
+     **Testbench-method parameters** already had the types in hand:
+     `lower_tb_method_call` calls `ir_type_of_param(p.ty, ctx)` two
+     lines above the argument loop, to decide the module-typed-parameter
+     arm. The check is three lines. Measured, both backends refuse every
+     mismatch and accept both matching cells:
+
+     | call | v1 / tbir |
+     |---|---|
+     | `tf(b)` into `t: Beat`, `ts(1)` into `x: uint<8>` | compile |
+     | `tf(1)` | "no match for call to" |
+     | `tf(o)` on a different record | **reached the VERIFIER** |
+     | `ts(b)` | "no match for call to" |
+
+     The third row is why this one was worth doing first: a mismatched
+     record reached `verify_program`'s `TypeMismatch`, which `main.rs`
+     renders as "internal error: TB-IR failed verification after
+     lowering". A program error answered through the compiler-bug
+     channel — the same pathology divergence 111 fixed for the testbench
+     queue, still live one spelling over.
+
+     **The sibling-transactor call** needed a fourth element on an
+     existing tuple, not a new table: `self_transactor_methods` is built
+     from `h.params` right after `method_ctx`, so
+     `ir_type_of_with_records(p.ty, &method_ctx.record_ids)` was
+     available at both construction sites. Same three mismatched cells,
+     same verdicts, both controls compiling.
+
+     **`tseq` call arguments** looked like they needed nothing either:
+     every reachable tseq parameter is a scalar, the reasoning went, so
+     the slot is always `None` and `ctx.tseqs` needs nothing added.
+     That was wrong, and divergence 114 has the correction — a
+     `TSeq<T>` tseq parameter is reachable and v1 compiles it, so the
+     hard-coded `None` rejected a working call while passing a broken
+     one. What the measurement below DOES establish is the narrower
+     claim about RECORD parameters, which still holds: a record-typed
+     tseq parameter has no working member however the callee is
+     written:
+
+     | shape | outcome |
+     |---|---|
+     | `yield <param>` | refused upstream — not a record local |
+     | `<param>.<field>` | refused — "field access on a non-DUT value" |
+     | declared, UNUSED | tbir `[&](uint64_t seed)`, v1 `[&](VBeat* seed)` — v1 does not compile; tbir DOES (see divergence 115) |
+
+     That last row is a separate, pre-existing defect at the tseq
+     DECLARATION site: both backends silently mis-type a record
+     parameter, v1 reading it as a Verilated module pointer. Left for
+     its own batch — the call-site guard here is right regardless,
+     since a record argument is wrong under every spelling of the
+     callee.
+
+     Five mutations, all caught, including one that empties the sibling
+     `param_tys` at both construction sites (emptying only one is caught
+     by the other's test) and one that maps a record parameter to a
+     scalar slot.
+
+     That "all caught" was measured over five mutants and stated as if
+     it covered the change. It did not: a later round truncating each
+     parameter loop to `.take(1)` found the sibling spelling had no
+     mismatched cell past parameter #1, so the whole loop index was
+     tested only at zero. The five mutants were the ones this entry
+     thought to write, which is not the same as the ones the code
+     admits. See divergence 113.
+
+113. **A slot rule with a third value shape it could not name
+     (2026-08-19).**
+
+     Divergences 111 and 112 built the slot check around one question —
+     "is this a record, and if so which?" — because the two shapes they
+     had measured were a record and a scalar. A `TSeq<T>` parameter is
+     neither, and flattening it into "not a record" was wrong in both
+     directions at once:
+
+     | call, on `function fseq(s: TSeq<Beat>)` | before | v1 |
+     |---|---|---|
+     | `k.fseq(xs)` | lowers | compiles |
+     | `k.fseq(b)` | rejected: "takes a non-record value" — **false** | "no match for call to `<lambda(Sink&, const std::vector<Beat>&)>`" |
+     | `k.fseq(1)` | **lowered clean** | same "no match for call to" |
+
+     The second row states something untrue about the declaration the
+     user wrote; the third is the hole that wording was hiding, since an
+     `int` is not a record either.
+
+     `IrType` already had `RecordSeq` and `Seq`, and
+     `method_schema_ir_type` already resolved `TSeq<T>` into them for the
+     component-method schema — `param_tys` was carrying the right type
+     all along and the slot check was throwing it away. The fix names
+     the shapes the check can actually decide and routes the
+     COMPONENT-METHOD and TESTBENCH-METHOD parameter positions through
+     the declared `IrType` instead of a boolean. The `TSeq` resolver
+     moved to `helpers::tseq_ir_type` so the schema side and the check
+     side cannot disagree about what `TSeq<Beat>` means.
+
+     Enumerated mechanically rather than sampled — 3 value shapes (a
+     scalar, a `Beat`, a `TSeq<Beat>`) into 8 slots (scalar, record and
+     sequence parameters at the component and testbench-method
+     spellings, plus a scalar and a record scoreboard queue), on both
+     backends. 24 cells, a clean diagonal: the 8 matching cells compile
+     under v1 and lower under tbir, all 16 mismatches get a g++ error
+     from v1. `Invalid` throughout, as everywhere else in this family.
+
+     The grid covers the two spellings it names and no others. Reading
+     it as a statement about "the parameter positions" was the mistake
+     divergence 114 had to undo: the transactor-method, `tseq` and bus
+     `tlm_method` positions were NOT routed through `IrType`, and two of
+     them went on to reject working programs. A grid is evidence about
+     its own cells.
+
+     Three further mutants from the same round, each a real gap:
+
+     - the sibling-transactor parameter loop truncated to `.take(1)` —
+       every mismatched cell in the suite sat at parameter #1;
+     - the scalar half of divergence 111's `fork` destination typing
+       deleted — the record cell kept it green while a
+       `-> uint<128>` fork silently declared `uint64_t` and truncated;
+     - `.last()` → `.first()` on a `let` annotation's type path, which
+       chased down a better answer than a test: the guard it sat in can
+       never see a record-naming annotation at all, because
+       `lower_let`'s record-typed-local branch claims every one of them
+       first and returns on every path. The check was a condition with
+       one reachable verdict dressed as two, and is now written as one.
+
+
+114. **"Cannot tell" is not "is not a record" (2026-08-19).**
+
+     Divergences 111-113 built a slot check that answers with a small
+     enum, and every type it could not name fell into `Scalar`. That
+     turns an ABSENCE of information into a positive claim, and three
+     well-typed programs were called `Invalid` on the strength of it —
+     each one compiled by v1, each one refused by the DEFAULT backend:
+
+     | program | v1 | before 113 | after 113 |
+     |---|---|---|---|
+     | `let ys = k.gen(xs)` on `-> TSeq<Beat>`, then `k.fseq(ys)` | compiles | lowered, emitted `uint64_t ys = 0` | **`Invalid`** |
+     | `drv.dispatch(xs)` on `dispatch(txns: TSeq<Beat>)` | compiles | lowered, emitted `std::function<void(long unsigned int)>` | **`Invalid`** |
+     | `Wrap(xs)` on `tseq Wrap(xs: TSeq<Beat>)` | compiles | lowered, emitted `[&](uint64_t xs)` | **`Invalid`** |
+
+     The middle column is the point. Before 113 each of these was an
+     `EmitsUncompilable` gap — bad, but the honest verdict for it is
+     `Unsupported`/`NotImplemented`. Turning it into `Invalid` did not
+     tighten anything; it took a program v1 builds and had the default
+     backend refuse it outright. The repo already stated the rule this
+     broke, in `component_base_id`'s own doc: callers "must treat that
+     as 'cannot tell', never as 'not a record'."
+
+     So the enum grows an `Unknown` and the guard rejects only when it
+     can name BOTH sides. That is the whole safety property, and it is
+     what makes the check safe to extend: a slot the compiler cannot
+     resolve is now unchecked rather than assumed scalar.
+
+     `Unknown` alone would have been a retreat, because the hole runs
+     the other way too — a scalar into a `TSeq` slot is exactly as wrong
+     and v1 refuses it. So the four positions that were guessing got
+     their types instead:
+
+     - the transactor method schema learned `TSeq` (`method_param_ir_type`);
+     - `ctx.tseqs` carries declared parameter TYPES, not just names;
+     - a `-> TSeq<T>` method result now types its `let` at the
+       component-method spelling (the testbench-method one cannot yet —
+       see below). Typing the `let` is all this does: the METHOD's own
+       return slot is still emitted `uint64_t __ret`, so tbir gets
+       `std::vector<Beat> ys{}` and then `__ret = s;` — "cannot convert
+       `std::vector<Beat>` to `uint64_t`" — while v1 compiles. That
+       half reproduces on the merge base too, so the row below is about
+       the REJECTION going away, not about the program building;
+     - the bus `tlm_method` request path gained a check at all — it had
+       the declared type in hand as a WIDTH hint and never asked whether
+       the argument belonged in the slot. `mem.read(b)` with a record
+       argument lowered, verified, and emitted
+       `harc_rt::harc_assign(dut->mem_read_addr, b);` from BOTH backends,
+       both failing g++ with "invalid `static_cast` from type `Beat`".
+       Guarded at the blocking and `fork` spellings together.
+
+     Two shapes deliberately stay unchecked, and it is worth being
+     explicit about which:
+
+     - An `int`- or `time`-typed parameter reached through a SCHEMA's
+       `param_tys`. Those tables also type the parameter's local and
+       therefore the emitted C++, so widening them to call `int` a
+       scalar would change what the backend emits — out of scope for a
+       slot check. Where the declared `TypeExpr` is in hand,
+       `helpers::slot_ir_type` answers precisely; where only the schema
+       is, the slot is unchecked. A missed rejection, never a false one.
+     - A literal is read as a scalar directly rather than through its
+       `IrType`, because a bare integer literal carries `ty: Unknown`
+       (the width is inferred at the use site). Without that,
+       `q.push(1)` into a `queue<Beat>` — the cell this whole family
+       started from — would have become unknown and stopped being
+       rejected.
+
+     One thing this did NOT fix, and the first attempt claimed it had.
+     A testbench method's return temp resolves through
+     `ir_type_of_with_records`, which answers `Unknown` for `TSeq<T>`,
+     so the whole inlined chain is untyped — parameter included:
+
+     ```
+     v1    auto Tb_passthru = [&](Tb& self, const std::vector<Beat>& s)
+                                  -> const std::vector<Beat>& { ... };
+           auto ys = Tb_passthru(_tb, xs);          // compiles
+     tbir  uint64_t s = 0;  uint64_t ys = 0;
+           s = xs;                                  // g++: cannot convert
+                                                    // `std::vector<Beat>`
+                                                    // to `uint64_t`
+     ```
+
+     Reproducible on the merge base, so it is an older
+     `EmitsUncompilable` gap and not this rule's to close — typing that
+     chain changes the emitted C++ and deserves its own measurement. The
+     code written for it here read `expr_type` for a sequence that is
+     never there, i.e. it was dead the moment it was written, and has
+     been removed rather than left looking like a fix. The `Unknown`
+     rule is what keeps the slot check from adding a false rejection on
+     top of the gap meanwhile.
+
+     Found by review, not by the mutation round: 21 mutants over the 113
+     change surface were all caught, and every one of these defects
+     survived that, because a mutant can only ask whether the code does
+     what its tests say. None of the three false `Invalid`s had a test,
+     since the grid that "proved" the change covered two spellings and
+     the defects were in the other three.
+
+115. **The fix that dropped the rejection it was quoting (2026-08-19).**
+
+     Divergence 114 gave the `tseq` call site a real parameter table so
+     it would stop hard-coding the slot to "not a record". Resolving
+     that table through `slot_ir_type` turned a `tseq Wrap(seed: Beat)`
+     parameter into `IrType::Record(Beat)` — so a `Beat` argument now
+     MATCHED, and the call lowered. The comment sitting on that exact
+     line still said a record argument is refused, and listed the
+     evidence for it. The evidence was still true; the code had stopped
+     acting on it.
+
+     | call | HEAD before this fix | v1 | tbir |
+     |---|---|---|---|
+     | `Wrap(s)` on `seed: Beat` | **lowered** | `[&](VBeat* seed)` — "`VBeat` has not been declared" | `[&](uint64_t seed)` — no match for call |
+     | `Wrap(7)` on `seed: Beat` | `Invalid`, wrong shape | same | rejected |
+
+     Two spellings of one unbuildable program getting two different
+     verdicts is the tell: the defect is the PARAMETER, not the
+     argument. Neither emitter honours a record there — v1 renders it as
+     a Verilated module handle, tbir as a scalar — so no call to such a
+     `tseq` compiles under v1. It is now named on the parameter, once,
+     and classified `NotImplemented { EmitsUncompilable }` rather than
+     `Invalid`, because the DECLARATION alone is fine under tbir: an
+     uncalled `tseq Wrap(seed: Beat)` compiles there (`uint64_t seed` is
+     a valid lambda parameter, merely wrong). Divergence 112's table
+     said "neither compiles" for that row; that was measured on the
+     CALLED form and stated of the unused one.
+
+     `extern function ref_add(a: uint<8>, b: Beat)` is a NEIGHBOURING
+     defect, and the comment there was worse — it asserted that every
+     extern-fn parameter is a scalar (citing this module's own header)
+     and quoted a diagnostic to match: "both backends emit
+     `ref_add(1, <Beat>)`: cannot convert `Beat` to `uint64_t`". The
+     declaration parses, and both backends emit
+
+     ```
+     uint64_t ref_add(uint64_t a, VBeat* b);
+     ```
+
+     — g++: "`VBeat` has not been declared". Right verdict, invented
+     reason.
+
+     It is NOT the same rule as the `tseq` one, and the first fix said
+     it was ("for the same reason … and measured the same way"). See
+     divergence 116: `emit_extern_fn_decls` is shared — tbir calls
+     straight into v1's — so unlike the `tseq` lambda there is no
+     backend that compiles it, which makes it `Invalid` and puts the
+     verdict at the DECLARATION rather than at each call.
+
+     **And the same "absence dressed as a claim" on the value side.**
+     `expr_type` propagates its operand's type through `Binary`,
+     `Unary` and `Ternary` without asking whether the operator PRODUCES
+     that type, while `record_id_of_expr` does ask (its ternary arm
+     requires both arms to name the same record). Reading the value's
+     shape off `expr_type` alone therefore made the guard state:
+
+         parameter `t` of `Src.obo` takes a `Other` and was given a `Beat`
+
+     about `s.obo(b + 1)` — asserting that `b + 1` IS a `Beat`. It is
+     not; it is a type error, and `s.obs(b + 1)` lowered clean because
+     the assertion happened to point the right way there.
+
+     The two type sources disagreeing is not noise — it is the signature
+     of a malformed record expression, and it is now the rejection
+     itself. Measured on both backends with a compiling control
+     (`s.obs(b)`): `s.obs(b + 1)` gives "no match for `operator+`
+     (operand types are `Beat` and `int`)" and a mismatched-arm ternary
+     "operands to `?:` have different types `Beat` and `Other`", from v1
+     and tbir alike. `Invalid`, and the message names the shape of the
+     mistake rather than claiming a type for the expression.
+
+     Three review rounds in a row have now found that a verdict was
+     resting on a sentence nobody re-measured after the code moved. The
+     pattern is specific enough to name: when a check changes what it
+     consults, the comment justifying it is evidence about the OLD
+     consultation, and it has to be re-run, not re-read.
+
+116. **The check meant to stop false `Invalid`s introduced one
+     (2026-08-19).**
+
+     Divergence 113 gave the extern-fn call a slot check and hard-coded
+     the slot to scalar, on the ground that "every extern-fn parameter
+     is a scalar — this module's own header says so". Divergence 115
+     rewrote that function, put the declared parameter TYPES in scope
+     two statements above, used them for the record case, and left the
+     loop reading `None` — re-asserting the same comment on the way
+     past.
+
+     `TSeq<T>` is the counterexample. `cpp_tb::c_type_for` renders it
+     `const std::vector<T>&`:
+
+     | | verdict |
+     |---|---|
+     | `extern function ref_sum(xs: TSeq<Beat>)`, called with a sequence | **`Invalid`** at HEAD |
+     | v1 | `uint64_t ref_sum(const std::vector<Beat>& xs);` — compiles |
+     | tbir at the merge base | same line — compiles |
+
+     A false `Invalid` on a program BOTH backends build, introduced by
+     the family whose entire purpose is removing them, in the commit
+     written to remove the previous three. The slot now reads the
+     declared type like every other parameter position.
+
+     **And the record case was classified off the wrong measurement.**
+     Divergence 115 argued `NotImplemented` rather than `Invalid`
+     because an uncalled declaration compiles — true for `tseq`, where
+     tbir emits its own `[&](uint64_t seed)` lambda, and asserted of
+     extern fns without re-measuring. `emit_extern_fn_decls` is shared:
+     `src/codegen/tbir/mod.rs` calls straight into v1's, so both
+     backends emit the byte-identical `VBeat*` forward declaration and
+     NEITHER compiles — called or not:
+
+     ```
+     v1    uint64_t ref_add(uint64_t a, VBeat* b);   // 'VBeat' has not been declared
+     tbir  uint64_t ref_add(uint64_t a, VBeat* b);   // identical
+     ```
+
+     So it is `Invalid`, and the call site was the wrong place to put
+     it: a declared-but-uncalled record-parameter extern fn lowered
+     clean while the default backend emitted C++ that does not build.
+     Moved to the declaration, where the breakage actually is.
+
+     That is the same "measured on one form, stated of the other" error
+     divergence 115 was written to correct, committed one commit later
+     inside the correction. The two spellings look alike and are not:
+     `tseq` emits a lambda per backend, `extern function` emits one
+     shared declaration. Sharing a code path is what decides whether a
+     backend can differ, and it has to be read, not assumed from the
+     surface similarity of two constructs.
+
+117. **One mechanism, asked about one type (2026-08-19).**
+
+     Divergence 116 moved the extern-fn record check to the declaration,
+     keyed on `IrType::Record`, looking only at parameters. Both halves
+     of that were narrower than the mechanism they were built on.
+
+     `emit_extern_fn_decls` runs every type in the signature through the
+     free `c_type_for`, whose `Named` arm is
+
+     ```rust
+     TypeExpr::Named { name, .. } => format!("V{last}*")
+     ```
+
+     So it is not about records. Two shapes the record question could
+     not see, each lowering clean at the time and each emitting C++ that
+     neither backend compiles:
+
+     (This entry described that arm as having "no conditions at all".
+     It has one, three lines above it, and divergence 118 is what that
+     cost.)
+
+     | declaration | both backends emit | g++ |
+     |---|---|---|
+     | `extern function ref_mk(a: uint<8>) -> Beat` | `VBeat* ref_mk(uint64_t a);` | "`VBeat` does not name a type" |
+     | `extern function ref_en(c: Color) -> uint<8>` | `uint64_t ref_en(VColor* c);` | "`VColor` was not declared" |
+
+     The return type goes through the same call two lines down from the
+     parameters, and an enum is rendered `V*` exactly like a record —
+     `IrType::Record` just cannot represent one. The check now asks
+     whether HARC DECLARES the name (transaction, struct, enum, agent,
+     env, scoreboard, sequencer, covergroup, transactor, regblock), and
+     covers the return type alongside the parameters.
+
+     The exception is measured, not assumed: a DUT-module-typed
+     parameter still lowers, because `VTop*` is the one `V<name>` that
+     IS in scope — `extern function ref_peek(d: Top)` emits
+     `uint64_t ref_peek(VTop* d);` and compiles under both backends.
+     That is precisely why the rule asks what HARC declares rather than
+     what looks like a module handle.
+
+     Three smaller things from the same round, all in code this sweep
+     wrote:
+
+     - **No arity check on extern calls at all.** The slot loop's
+       `get(i)` stopped at the shorter side, so `f(1, 2)` on a
+       one-parameter fn lowered — both backends: "too many arguments to
+       function `uint64_t f(uint64_t)`". Worse, a surplus RECORD
+       argument was checked against a fabricated scalar slot and
+       reported that "an argument of extern fn `f` takes a non-record
+       value", describing a parameter that does not exist. A slot that
+       is not there has no type to disagree with.
+     - **A nondeterministic diagnostic.** The declaration loop iterated
+       `extern_fn_decls`, a `HashMap`, so with two offending extern fns
+       the compiler named a different one run to run on identical input.
+       Every other declaration walk in `lower_program` iterates
+       `file.items`; so does this one now.
+     - **"Extern fns are pure scalar C functions"** survived in three
+       comments after divergence 116 removed the two that quoted it.
+       `TSeq<T>` disproves the "scalar"; PURITY is the property the
+       lowering actually depends on, and the two had been travelling
+       together as one claim.
+
+     The recurring shape across rounds 5-8 is worth stating once more,
+     because this is its fourth variant: a rule gets built from one
+     measured example, and the example's incidental features get baked
+     in alongside its essential one. Record rather than "named type".
+     Parameters rather than "signature". Scalar rather than "pure".
+     Reading the emitter is what separates them, and it is cheaper than
+     four review rounds.
+
+118. **"Reading the emitter" — while quoting the wrong line of it
+     (2026-08-19).**
+
+     Divergence 117 closed with "Reading the emitter is what separates
+     them", and rested the rule on a claim about `c_type_for`: that its
+     `Named` arm is *unconditional*. It is not. The function opens with
+     a guard, three lines above the match:
+
+     ```rust
+     fn c_type_for(t: &TypeExpr) -> String {
+         if is_list_type(t) || fixed_vec_type_args(t).is_some() {
+             return txn_field_c_type(t);
+         }
+     ```
+
+     and `is_list_type` is defined ON `TypeExpr::Named` — it matches any
+     named type whose last segment is `list` or `List`. So a `Named`
+     type can and does bypass the `V{last}*` arm.
+
+     The rule keyed on "does HARC declare this name", which was wrong in
+     BOTH directions at once:
+
+     | signature | both backends emit | verdict before |
+     |---|---|---|
+     | `struct List` parameter | `std::vector<uint64_t>` — **compiles** | **`Invalid`** |
+     | bare undeclared `Nope` | `VNope*` — undeclared | lowered |
+     | a `domain` name | `VSysDomain*` — undeclared | lowered |
+     | `string` (parses as `Named`) | `Vstring*` — undeclared | lowered |
+
+     A false `Invalid` on a program v1 builds, and three live holes, from
+     one whitelist. And the message asserted `V{ty}*` for the `List`
+     case, where no such handle is emitted at all.
+
+     The rule now asks the emitter instead of restating it:
+     `cpp_tb::verilated_handle_name` sits next to `c_type_for`, applies
+     the same guard, and answers "does this render as `V<name>*`". A
+     name is refused unless it is the DUT's own type — measured, and now
+     pinned by a negative: `ref_peek(d: Top)` lowers while
+     `ref_peek(d: Nope)` does not, which is what makes the DUT cell mean
+     anything. The previous version of that test used a fixture whose
+     type name was merely absent from the whitelist, so it would have
+     passed under any implementation that forgot an item kind.
+
+     Two smaller ones from the same round, both in code this sweep
+     wrote: the comment recording that `lower_extern_fn_call` "has no
+     arity check anywhere in the pipeline" survived the commit that
+     added one, worked example and all; and the arity check left behind
+     the dead `None` arms it made unreachable — including the one
+     producing "an argument of extern fn `f`", the exact diagnostic that
+     commit was written to retire.
+
+     Fifth variant of one shape, and the sharpest: the previous four
+     were rules built from an example's incidental features. This one
+     was a rule built from a *quotation* of the emitter that stopped one
+     line short. "Read the emitter" is not a technique — reading the
+     whole function is.
+
+119. **Three arms paste a name; the rule modelled one (2026-08-19).**
+
+     Divergence 118 said the rule "asks the emitter instead of restating
+     it". It did not: `verilated_handle_name` was written NEXT to
+     `c_type_for` with the guard and the segment extraction duplicated,
+     which is the same restatement one file over — and the two had
+     already drifted (`c_type_for` used `unwrap_or("")` on an empty
+     path, the new function returned `None`; unreachable through the
+     parser, but a real difference between two functions asserted to be
+     one). `c_type_for` now calls it, so the claim is true by
+     construction rather than by intention.
+
+     And "every parameter AND the return type through `c_type_for`" was
+     true of the EMITTER and false of the CHECK. `c_type_for` pastes a
+     HARC name in three places: the `Named` fall-through (`V{name}*`),
+     the `TSeq<T>` element (`const std::vector<T>&`) and the `queue<T>`
+     element (`HarcQueue<T>&`). The rule covered the first. Measured
+     against the compiling controls `TSeq<Beat>` / `queue<Beat>`:
+
+     | extern parameter | both backends emit | g++ | verdict before |
+     |---|---|---|---|
+     | `TSeq<Nope>` | `const std::vector<Nope>&` | not declared | lowered |
+     | `TSeq<Color>` (enum) | `const std::vector<Color>&` | not declared | lowered |
+     | `TSeq<Top>` (the DUT) | `const std::vector<Top>&` | not declared | lowered |
+     | `queue<Nope>` | `harc_rt::HarcQueue<Nope>&` | not declared | lowered |
+
+     The element position takes a DECLARED RECORD and nothing else —
+     transactions and structs are emitted as C++ structs of the same
+     name. Not even the DUT: `TSeq<Top>` pastes `Top`, while the struct
+     that exists is `VTop`. The DUT exception belongs to the handle
+     position only, and assuming it extended inward would have been the
+     next variant of this same mistake.
+
+     **The comment corrected in 118 was wrong again, and worse.** It
+     said the extern path had "since GAINED an arity check" so only the
+     component path still arrives mis-counted, witnessed by
+     `axil_write(t.value)`. Every part of that fails:
+
+     - `axil_write(t.value)` does not lower — the component-method arity
+       check added five commits EARLIER in this same sweep rejects it,
+       so the sentence was false the day it was written;
+     - it is positional, so it can never reach the branch in question,
+       which `continue`s on anything that is not a named argument;
+     - the reachability argument is about ORDER, not about which callers
+       check arity: every caller that checks does so AFTER calling this,
+       so mis-counted calls arrive from both paths. The real witness is
+       `ref_add(b = 2, a = 1, 3)`;
+     - "two callers" was inherited from the claim being corrected. There
+       are fourteen.
+
+     Two further copies of the same dead claim were sitting in
+     `components_impl.rs` and in `tests/tbir.rs` — the latter
+     contradicting its own assertions eight lines below it. A grep for
+     the worked example would have found all three; correcting one and
+     not searching for the others is how a false sentence survives being
+     noticed.
+
+     Sixth variant, and the honest summary of the series: every one of
+     these was a claim that was true when written and never re-run. The
+     defect is not carelessness about the facts, it is treating a
+     comment as a record of a conclusion rather than of a measurement
+     that has an expiry date.
 
 ## Next steps
 

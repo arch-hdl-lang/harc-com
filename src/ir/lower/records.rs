@@ -702,6 +702,11 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
 /// `Some(rid)` when `t` is a bare `Named` type whose simple name is a known
 /// transaction or struct (a nested-record field type). Enum names live in a
 /// disjoint namespace, so a match here is unambiguously a record.
+///
+/// Resolution is by LAST segment, so a qualified spelling (`Pkg.Beat`)
+/// names the same record as the bare one — the rule `tlm_ret_record_id`
+/// and `field_ir_type` already use, and the reason this is shared rather
+/// than restated at each caller.
 fn named_record_id(t: &TypeExpr, record_ids: &HashMap<String, RecordId>) -> Option<RecordId> {
     let TypeExpr::Named { name, .. } = t else {
         return None;

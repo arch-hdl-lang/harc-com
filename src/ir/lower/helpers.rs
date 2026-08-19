@@ -208,8 +208,10 @@ impl FuncBuilder<'_> {
 
         if entry.pure {
             let mut lowered = Vec::with_capacity(arg_exprs.len());
-            for e in arg_exprs {
-                lowered.push(self.lower_expr(e)?);
+            for (p, e) in decl.params.iter().zip(arg_exprs) {
+                let v = self.lower_expr(e)?;
+                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                lowered.push(v);
             }
             return Ok(Expr::Call(CallTarget::Helper(name.to_string()), lowered));
         }
@@ -268,7 +270,16 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
+                let v = self.lower_expr_no_ports(e)?;
+                // The INLINED spelling is the one that mattered most:
+                // without this, `poke(b)` on a `x: uint<8>` parameter
+                // reached `verify_program`'s `TypeMismatch` and
+                // surfaced as "internal error: TB-IR failed
+                // verification after lowering" — a program error
+                // answered through the compiler-bug channel, the third
+                // place in this sweep that has happened.
+                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                bound.push(Bound::Val(v));
             }
         }
 
@@ -318,13 +329,34 @@ impl FuncBuilder<'_> {
         Ok(Expr::Local(dest))
     }
 
+    /// One declared parameter's slot check, shared by the helper and
+    /// testbench-method arms. Resolves through `slot_ir_type`, which
+    /// answers for the two shapes a schema's `param_tys` cannot: a
+    /// `TSeq<T>` (described as the sequence it is, rather than as "a
+    /// non-record value") and an `int`/`time` scalar.
+    pub(crate) fn check_param_slot(
+        &self,
+        v: &Expr,
+        p: &crate::ast::Param,
+        owner: &str,
+    ) -> Result<(), LowerError> {
+        let want = slot_ir_type(p.ty.as_ref(), &self.ctx.record_ids);
+        self.check_slot_ir(v, &want, &format!("parameter `{}` of {owner}", p.name.name))
+    }
+
     /// Lower a call to an `extern function name(...) -> ret` (spec §9).
     /// Mirrors v1: arguments lower as plain scalar values and the call
     /// stays an `Expr::Call(CallTarget::ExternFn, ...)`, emitted with the
     /// RAW symbol name so it binds to the user's `extern "C"` definition
-    /// linked via `--ref-src`. Extern fns are pure scalar C functions, so
-    /// (unlike impure helpers) the call never CFG-inlines and never takes
-    /// a DUT handle — arguments are lowered without port access.
+    /// linked via `--ref-src`. An extern fn is PURE — it never
+    /// CFG-inlines and (unlike an impure helper) never takes a DUT
+    /// handle, so arguments lower without port access.
+    ///
+    /// Not "scalar", which this comment used to say and which the loop
+    /// below used to enforce: `c_type_for` renders `TSeq<T>` as
+    /// `const std::vector<T>&`, and a sequence argument compiles under
+    /// both backends. Purity is the property the lowering depends on;
+    /// scalar-ness was an assumption sitting next to it.
     pub(crate) fn lower_extern_fn_call(
         &mut self,
         name: &str,
@@ -333,18 +365,69 @@ impl FuncBuilder<'_> {
         // Same measurement as the helper arm above:
         // `ref_add(b = 222, a = 111)` emits `ref_add(222, 111)` under
         // v1, and the in-order form emits the positional one unchanged.
-        if let Some(declared) = self.ctx.extern_fns.get(name) {
-            super::reject_misplaced_named_args(
-                args,
-                declared,
-                &format!("extern fn call `{name}(...)`"),
-            )?;
+        // One lookup, not two, and no `None` path on either: the sole
+        // caller (`exprs.rs`) dispatches here only when the name is in
+        // `extern_fns`. The previous shape had three separate
+        // expressions of that impossible `None` — an `if let` that
+        // silently skipped the named-argument check, an
+        // `unwrap_or_default`, and a `contains_key` guard — and the
+        // commit that removed two of them said in its own message that
+        // the lookup always hits.
+        let (pnames, ptys) = self.ctx.extern_fns[name].clone();
+        super::reject_misplaced_named_args(
+            args,
+            &pnames,
+            &format!("extern fn call `{name}(...)`"),
+        )?;
+        // Arity, before the slot loop — the same order
+        // `check_component_call_args` uses, and for the reason its doc
+        // records: without it the `zip`/`get` silently stops at the
+        // shorter side. Measured with a compiling control (`f(1)` on a
+        // one-parameter fn): `f(1, 2)` gives "too many arguments to
+        // function `uint64_t f(uint64_t)`" and `g(1)` on a two-parameter
+        // fn "too few arguments", from both backends.
+        //
+        // This also retires a `None` arm that checked a surplus argument
+        // against a fabricated scalar slot — `f(1, b)` reported that
+        // "an argument of extern fn `f` takes a non-record value",
+        // describing parameter #2 of a one-parameter function. A slot
+        // that does not exist has no type to disagree with.
+        if args.len() != pnames.len() {
+            return Err(LowerError::Invalid(format!(
+                "extern fn `{name}` takes {} argument(s), call passes {}",
+                pnames.len(),
+                args.len()
+            )));
         }
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             match a {
                 CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
-                    lowered.push(self.lower_expr_no_ports(e)?)
+                    let v = self.lower_expr_no_ports(e)?;
+                    // Arity is checked above and `pnames`/`ptys` come
+                    // from the same `d.params`, so both indexes are
+                    // total. The `None` labels these used to carry
+                    // described a parameter that does not exist — the
+                    // very diagnostic the arity check exists to replace.
+                    let slot = format!("parameter `{}` of extern fn `{name}`", pnames[i]);
+                    // Against the DECLARED type, not against "scalar".
+                    // A comment here twice asserted that every extern-fn
+                    // parameter is a scalar — citing this module's own
+                    // header — and the loop hard-coded the slot to match.
+                    // `TSeq<T>` is the counterexample: `cpp_tb`'s
+                    // `c_type_for` renders it `const std::vector<T>&`,
+                    // and `extern function ref_sum(xs: TSeq<Beat>)`
+                    // called with a sequence compiles under v1 and under
+                    // tbir at the merge base. Hard-coding the slot made
+                    // the DEFAULT backend reject it — the exact class of
+                    // false `Invalid` this family exists to remove,
+                    // reintroduced by the check meant to prevent it.
+                    //
+                    // The record case never reaches here: it is refused
+                    // at the declaration, where both backends already
+                    // break.
+                    self.check_slot_ir(&v, &ptys[i], &slot)?;
+                    lowered.push(v)
                 }
             }
         }
@@ -453,7 +536,19 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
+                let v = self.lower_expr_no_ports(e)?;
+                // The testbench-method spelling of the slot rule.
+                // `ir_type_of_param` is already in hand two lines up, so
+                // this needed no new type table — the note that deferred
+                // it said otherwise and was wrong. Measured: `tf(1)`
+                // into a `t: Beat` parameter lowered and emitted, and
+                // both backends answer "no match for call to"; `tf(o)`
+                // on a DIFFERENT record reached the VERIFIER's
+                // `TypeMismatch` and surfaced as "internal error: TB-IR
+                // failed verification after lowering" — a program error
+                // answered through the compiler-bug channel.
+                self.check_param_slot(&v, p, &format!("testbench method `{name}`"))?;
+                bound.push(Bound::Val(v));
             }
         }
 
@@ -572,6 +667,81 @@ pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
         _ => IrType::Unknown,
     }
+}
+
+/// `TSeq<T>` as an `IrType` — `RecordSeq(r)` for a declared record
+/// element, `Seq(scalar)` for a scalar one, `Unknown` for an element
+/// this compiler cannot name. `None` when `ty` is not a `TSeq` at all.
+///
+/// Shared by the component-method schema (which types the sequence a
+/// `hookable`/`function` parameter or return declares) and by the slot
+/// check that decides whether an argument may enter such a parameter,
+/// so the two cannot disagree about what `TSeq<Beat>` means.
+pub(crate) fn tseq_ir_type(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
+    let Some(TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    }) = ty
+    else {
+        return None;
+    };
+    let elem_name: Option<&str> = match args.first() {
+        Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
+            name.segments.last().map(|s| s.name.as_str())
+        }
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Ident(id) => Some(id.name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(rid) = elem_name.and_then(|s| record_ids.get(s)) {
+        return Some(IrType::RecordSeq(*rid));
+    }
+    if let Some(TypeArg::Type(inner)) = args.first() {
+        if let ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) = ir_type_of(Some(inner)) {
+            return Some(IrType::Seq(Box::new(ty)));
+        }
+    }
+    Some(IrType::Unknown)
+}
+
+/// The declared type of a SLOT, for the argument checks — as opposed to
+/// `ir_type_of_with_records`, which also types the parameter's local and
+/// therefore the emitted C++.
+///
+/// They differ on two things. `TSeq<T>` resolves here to
+/// `RecordSeq`/`Seq` (the short-circuit on the first line) where
+/// `ir_type_of_with_records` falls through to `Unknown`. And `int` (and
+/// `time`) are scalars that `ir_type_of` deliberately leaves `Unknown`,
+/// because they carry no width and local typing wants that absence
+/// preserved — a slot check does not care about width, it only asks
+/// record / sequence / scalar, so it can answer where local typing must
+/// not.
+///
+/// Use this wherever the declared `TypeExpr` is in hand. Where only a
+/// schema's `param_tys` is available the check reads that instead, and
+/// an `int` parameter there stays unchecked: those tables exist to type
+/// locals, and widening them would change what the backend emits.
+pub(crate) fn slot_ir_type(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> IrType {
+    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+        return seq;
+    }
+    if let Some(TypeExpr::Builtin { name, .. }) = ty {
+        match name {
+            BuiltinTy::Int => return IrType::SInt(None),
+            BuiltinTy::Time => return IrType::UInt(None),
+            _ => {}
+        }
+    }
+    ir_type_of_with_records(ty, record_ids)
 }
 
 pub(crate) fn ir_type_of_with_records(

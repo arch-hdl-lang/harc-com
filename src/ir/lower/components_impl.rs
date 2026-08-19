@@ -2015,45 +2015,12 @@ fn on_handler_arg_name(h: &crate::ast::OnHandler) -> String {
 /// (same typing a `let txns = SomeTseq(...)` local would get). A
 /// `TSeq<scalar>` or unresolved element falls back to `Unknown`.
 fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
-    if let Some(TypeExpr::Builtin {
-        name: BuiltinTy::TSeq,
-        args,
-        ..
-    }) = ty
-    {
-        // The element type-arg of `TSeq<RegOp>`. A bare `RegOp` identifier
-        // parses as `TypeArg::Expr(Ident)` (the parser only treats builtin
-        // keywords as `TypeArg::Type`); a `TypeArg::Type(Named)` also
-        // occurs via the fragment parser. Resolve both shapes.
-        let elem_name: Option<&str> = match args.first() {
-            Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
-                name.segments.last().map(|s| s.name.as_str())
-            }
-            Some(TypeArg::Expr(e)) => match &*e.kind {
-                ExprKind::Ident(id) => Some(id.name.as_str()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(simple) = elem_name {
-            if let Some(rid) = ctx.record_ids.get(simple) {
-                return IrType::RecordSeq(*rid);
-            }
-        }
-        // A scalar element (`TSeq<uint<N>>`/`<sint<N>>`/`<bool>`) parses as
-        // `TypeArg::Type(Builtin)` — not a record name — so type the param as
-        // `Seq(scalar)`, mirroring how `collect_tseq_records` types a
-        // scalar-element tseq result (#453). v1 renders both `RecordSeq` and
-        // `Seq` as `std::vector<T>`; only the element C++ type differs.
-        if let Some(TypeArg::Type(inner)) = args.first() {
-            match helpers::ir_type_of(Some(inner)) {
-                ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
-                    return IrType::Seq(Box::new(ty));
-                }
-                _ => {}
-            }
-        }
-        return IrType::Unknown;
+    // A `TSeq<T>` parameter. `RecordSeq` for a record element and
+    // `Seq(scalar)` for a scalar one, mirroring how `collect_tseq_records`
+    // types a scalar-element tseq result (#453). v1 renders both as
+    // `std::vector<T>`; only the element C++ type differs.
+    if let Some(seq) = helpers::tseq_ir_type(ty, &ctx.record_ids) {
+        return seq;
     }
     // A record-typed component/scoreboard method parameter
     // (`observe(cmd: Cmd)`) is a by-value transaction/struct, not a
@@ -2090,36 +2057,8 @@ fn method_schema_ir_type(
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,
 ) -> IrType {
-    if let Some(TypeExpr::Builtin {
-        name: BuiltinTy::TSeq,
-        args,
-        ..
-    }) = ty
-    {
-        let elem_name: Option<&str> = match args.first() {
-            Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
-                name.segments.last().map(|s| s.name.as_str())
-            }
-            Some(TypeArg::Expr(e)) => match &*e.kind {
-                ExprKind::Ident(id) => Some(id.name.as_str()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(simple) = elem_name {
-            if let Some(rid) = record_ids.get(simple) {
-                return IrType::RecordSeq(*rid);
-            }
-        }
-        if let Some(TypeArg::Type(inner)) = args.first() {
-            match helpers::ir_type_of(Some(inner)) {
-                ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
-                    return IrType::Seq(Box::new(ty));
-                }
-                _ => {}
-            }
-        }
-        return IrType::Unknown;
+    if let Some(seq) = helpers::tseq_ir_type(ty, record_ids) {
+        return seq;
     }
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -4105,11 +4044,15 @@ impl super::FuncBuilder<'_> {
                 // Deliberately NOT a claim about the callee's parameter
                 // count, which this seam does not know. A one-argument
                 // call to a two-parameter method emits an uncompilable
-                // call under v1 — but so does the positional
+                // call under v1, and naming the argument is not what
+                // caused that — so the wording below describes the name
+                // without pretending the call is well-formed.
+                //
+                // This used to add "…but so does the positional
                 // `axil_write(t.value)`, which tbir lowers and verifies
-                // clean. That arity gap is real and pre-existing; it is
-                // not something naming the argument caused, and the
-                // wording below does not pretend the call is well-formed.
+                // clean". It no longer does: the component-method arity
+                // check added later in the same sweep rejects it. The
+                // point the sentence was making does not depend on it.
                 //
                 // Reached ONLY when the caller had no parameter list to
                 // pass — the `emit <ev>(...)` payload callers. An event
@@ -4230,6 +4173,21 @@ impl super::FuncBuilder<'_> {
                     )));
                 }
                 let lowered = self.lower_component_call_args(args, None)?;
+                // The payload TYPE, not just the arity. The channel
+                // renders as `std::function<void(uint64_t)>` or
+                // `std::function<void(<Record>)>`, and passing one where
+                // the other is expected is a hard C++ error in both
+                // backends — measured on all four combinations.
+                if let Some(payload) = self.component_event_payload(cid, &event) {
+                    self.check_slot_type(
+                        &lowered[0],
+                        match payload {
+                            EventPayload::Record(r) => Some(r),
+                            EventPayload::Scalar { .. } => None,
+                        },
+                        &format!("event `{event}`"),
+                    )?;
+                }
                 self.push(IrStmt::ComponentEmit {
                     base: ComponentBase::Path(recv),
                     event,
@@ -4260,13 +4218,16 @@ impl super::FuncBuilder<'_> {
                     // scalar payload to a 64-bit slot, so `sint` into an
                     // `event<uint<8>>` is the same benign conversion v1
                     // performs.
-                    let arg_ty = self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown);
-                    let shape_ok = match (payload, &arg_ty) {
-                        (_, IrType::Unknown) => true,
-                        (EventPayload::Record(want), IrType::Record(got)) => want == *got,
-                        (EventPayload::Record(_), _) => false,
-                        (EventPayload::Scalar { .. }, IrType::Record(_)) => false,
-                        (EventPayload::Scalar { .. }, _) => true,
+                    // `record_id_of_expr`, not `expr_type`: the latter
+                    // has no arm for a record-valued component field,
+                    // transactor-state field or ternary, and this match
+                    // waved `Unknown` straight through — so exactly the
+                    // shapes divergence 108 taught the compiler to type
+                    // were the ones this check could not see.
+                    let got = self.record_id_of_expr(&lowered[0]);
+                    let shape_ok = match payload {
+                        EventPayload::Record(want) => got == Some(want),
+                        EventPayload::Scalar { .. } => got.is_none(),
                     };
                     if !shape_ok {
                         let want = match payload {
@@ -4330,12 +4291,45 @@ impl super::FuncBuilder<'_> {
             )));
         }
         let lowered = self.lower_component_call_args(args, None)?;
+        if let Some(payload) = self.component_event_payload(cid, &event) {
+            self.check_slot_type(
+                &lowered[0],
+                match payload {
+                    EventPayload::Record(r) => Some(r),
+                    EventPayload::Scalar { .. } => None,
+                },
+                &format!("event `{event}`"),
+            )?;
+        }
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
             event,
             args: lowered,
         });
         Ok(())
+    }
+
+    /// The payload an `event` field of `cid` carries — `Record` or
+    /// `Scalar`.
+    ///
+    /// The `None` results are UNREACHABLE from both callers, and kept
+    /// only so the condition has one verdict everywhere it is written
+    /// (the same reason the record-typed `let` arm above keeps its
+    /// no-such-method check). Each caller has already matched the field
+    /// against `ComponentFieldKind::Event` and returned `Err` otherwise
+    /// — the path form a few lines up, and the self-relative form
+    /// through its `match comp.field(&event)` — so by the time this runs
+    /// the field exists and is an event. Confirmed by mutation: making
+    /// the non-event arm `panic!` fails no test.
+    ///
+    /// An earlier version of this comment said `Err`, and the version
+    /// after that explained what `None` means for the caller as though
+    /// it were a live branch. Neither described the code.
+    fn component_event_payload(&self, cid: ComponentId, event: &str) -> Option<EventPayload> {
+        match self.ctx.components.get(cid.index())?.field(event)?.kind {
+            ComponentFieldKind::Event { payload, .. } => Some(payload),
+            _ => None,
+        }
     }
 
     /// Whether the receiver's own declaration beats the built-in

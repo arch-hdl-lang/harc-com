@@ -570,9 +570,25 @@ impl FuncBuilder<'_> {
             &format!("a `bus.{}(...)` call", m.name.name),
         )?;
         let mut lowered = Vec::with_capacity(args.len());
-        for (a, (_, decl_ty)) in args.iter().zip(m.args.iter()) {
+        for (a, (aname, decl_ty)) in args.iter().zip(m.args.iter()) {
             let hint = super::helpers::ir_type_of(Some(decl_ty));
-            lowered.push(self.lower_expr_no_ports_hinted(call_arg_expr(a), Some(hint))?);
+            let v = self.lower_expr_no_ports_hinted(call_arg_expr(a), Some(hint))?;
+            // The bus spelling of the parameter slot rule. This path had
+            // the declared type in hand already — as a WIDTH hint one
+            // line up — and never asked whether the argument belonged in
+            // the slot at all. Measured: `mem.read(b)` on
+            // `read(addr: uint<8>)` lowered, verified and EMITTED
+            // `harc_rt::harc_assign(dut->mem_read_addr, b);` from both
+            // backends, and both fail g++ identically ("invalid
+            // 'static_cast' from type 'Beat'"). No backend runs it, so
+            // it is `Invalid` like the rest of the family.
+            let want = super::helpers::slot_ir_type(Some(decl_ty), &self.ctx.record_ids);
+            self.check_slot_ir(
+                &v,
+                &want,
+                &format!("parameter `{}` of bus method `{}`", aname.name, m.name.name),
+            )?;
+            lowered.push(v);
         }
         let call = Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
@@ -731,14 +747,47 @@ impl FuncBuilder<'_> {
             &format!("a `fork bus.{}(...)` call", m.name.name),
         )?;
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
-            lowered.push(self.lower_expr_no_ports(call_arg_expr(a))?);
+        for (a, (aname, decl_ty)) in args.iter().zip(m.args.iter()) {
+            let v = self.lower_expr_no_ports(call_arg_expr(a))?;
+            // The FORK spelling of the parameter check one screen up.
+            // Same declared types, same rule; the blocking and fork
+            // request sides emit the same `harc_assign` into the same
+            // request port, so a slot that is wrong in one is wrong in
+            // the other.
+            let want = super::helpers::slot_ir_type(Some(decl_ty), &self.ctx.record_ids);
+            self.check_slot_ir(
+                &v,
+                &want,
+                &format!(
+                    "parameter `{}` of forked bus method `{}`",
+                    aname.name, m.name.name
+                ),
+            )?;
+            lowered.push(v);
         }
         // The response destination is declared + zero-init at the fork
         // site (v1 emits `T x = {};`), so reads between fork and join_all
         // see a defined-but-zero local. `Discard` carries no dest.
         let dest_local = match dest {
-            BusCallDest::Declare(name) => Some(self.declare(name)),
+            BusCallDest::Declare(name) => {
+                let id = self.declare(name);
+                // The same typing the NON-fork path one screen up does.
+                // Dropping it left a `let r = fork mem.read(5)` on a
+                // record-returning `tlm_method` untyped, and that is not
+                // merely a missing annotation: tbir emitted
+                // `uint64_t r = 0; r = harc_read(dut->mem_read_rsp_data);`
+                // where v1 emits `Resp r = {}; r = harc_unpack_Resp(...)`.
+                // BOTH compile, so for a multi-field struct the two
+                // backends silently computed DIFFERENT values — worse
+                // than the uncompilable emissions elsewhere in this
+                // family, because nothing fails.
+                if let Some(rid) = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t)) {
+                    self.set_local_type(id, crate::ir::IrType::Record(rid));
+                } else if let Some(ret) = m.ret.as_ref() {
+                    self.set_local_type(id, super::helpers::ir_type_of(Some(ret)));
+                }
+                Some(id)
+            }
             BusCallDest::Discard => None,
         };
         let desc = crate::ir::TlmForkDesc {
