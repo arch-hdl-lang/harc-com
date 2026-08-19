@@ -28603,3 +28603,152 @@ end impl T"#;
         "the diagnostic must distinguish a plain function from a hookable: {err}"
     );
 }
+
+#[test]
+fn component_fixed_vec_elements_lower_emit_and_remain_per_instance() {
+    let src = r#"scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable store(index: uint<32>, value: uint<64>)
+        words[index] = value
+        flags[index] = true
+    end store
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        a.store(2, 0x1234)
+        b.store(2, 0x5678)
+        assert a.flags[2] else fail("a flag")
+        assert a.words[2] == 0x1234 else fail("a value")
+        assert b.words[2] == 0x5678 else fail("b value")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("direct component Vec lowers");
+    let table = prog.components.iter().find(|c| c.name == "Table").unwrap();
+    assert!(matches!(
+        &table.field("words").unwrap().kind,
+        ir::ComponentFieldKind::FixedVec(v)
+            if v.elem == ir::IrType::UInt(Some(64)) && v.len == 4
+    ));
+    verify::verify_program(&prog).expect("component Vec IR verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("std::array<uint64_t, 4> words{};"), "{cpp}");
+    assert!(cpp.contains("std::array<bool, 4> flags{};"), "{cpp}");
+    assert!(cpp.contains("self.words[index] = value;"), "{cpp}");
+    assert!(cpp.contains("a.words[2]"), "{cpp}");
+    assert!(cpp.contains("b.words[2]"), "{cpp}");
+}
+
+#[test]
+fn component_fixed_vec_literal_bounds_and_defaults_are_precise() {
+    let base = r#"scoreboard Table
+    words : Vec<uint<8>, 2>
+end scoreboard Table
+testbench Tb
+    dut : Top
+    table : Table
+end testbench Tb
+impl T for Tb
+    run
+        table.words[2] = 1
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(base).expect_err("literal index equal to length is rejected");
+    assert!(
+        err.to_string().contains(
+            "element index 2 is out of range for component `Vec` field `table.words` of length 2"
+        ),
+        "{err}"
+    );
+
+    let defaulted = base.replace(
+        "words : Vec<uint<8>, 2>",
+        "words : Vec<uint<8>, 2> default 0",
+    );
+    let err = lower_src(&defaulted).expect_err("aggregate default is rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("default value on fixed-vector field `Table.words`"), "{msg}");
+}
+
+#[test]
+fn nested_self_component_vec_preserves_element_width_and_signedness() {
+    let src = r#"scoreboard Leaf
+    bytes : Vec<uint<8>, 2>
+    signed_values : Vec<sint<8>, 2>
+    hookable seed()
+        bytes[0] = bytes[0]
+    end seed
+end scoreboard Leaf
+
+scoreboard Parent
+    child : Leaf
+    inverted : uint<8> default 0
+    shifted : sint<8> default 0
+    hookable update()
+        inverted = ~child.bytes[0]
+        shifted = child.signed_values[0] >> 1
+    end update
+end scoreboard Parent
+
+testbench Tb
+    dut : Top
+    parent : Parent
+end testbench Tb
+
+impl T for Tb
+    run
+        parent.child.bytes[0] = 0
+        parent.child.signed_values[0] = -8
+        parent.update()
+        assert parent.inverted == 255 else fail("narrow bit-not")
+        assert parent.shifted == -4 else fail("signed shift")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("~(self.child.bytes[0]) & 0xFFULL"),
+        "nested vector width must drive bit-not masking:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(self.child.signed_values[0])) >> 1"),
+        "nested signed vector element must use arithmetic shift:\n{cpp}"
+    );
+}
+
+#[test]
+fn test_scope_component_named_self_keeps_vector_element_metadata() {
+    let src = r#"scoreboard Values
+    signed_values : Vec<sint<8>, 1>
+    hookable seed()
+        signed_values[0] = signed_values[0]
+    end seed
+end scoreboard Values
+testbench Tb
+    dut : Top
+    self : Values
+end testbench Tb
+impl T for Tb
+    run
+        self.signed_values[0] = -8
+        assert (self.signed_values[0] >> 1) == -4 else fail("signed shift")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.signed_values[0])) >> 1"),
+        "a real test-scope `self` binding must win over the component sentinel:\n{cpp}"
+    );
+}

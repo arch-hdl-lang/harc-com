@@ -491,6 +491,21 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for field in &component.fields {
+            if let ComponentFieldKind::FixedVec(vec) = &field.kind {
+                let valid_elem = matches!(
+                    &vec.elem,
+                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w))
+                        if *w > 0 && *w <= 64
+                ) || matches!(&vec.elem, crate::ir::IrType::Bool);
+                if vec.len == 0 || !valid_elem {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} field `{}` has invalid fixed-vector schema {:?}",
+                            field.name, vec
+                        ),
+                    });
+                }
+            }
             let ComponentFieldKind::Sub {
                 component: child,
                 mode: Some(_),
@@ -1244,6 +1259,10 @@ impl Checker<'_> {
                     // no-inline-port rule like any Assign value.
                     self.check_expr(value, false, "ComponentFieldWrite value");
                 }
+                Stmt::ComponentVecElementWrite { index, value, .. } => {
+                    self.check_expr(index, false, "ComponentVecElementWrite index");
+                    self.check_expr(value, false, "ComponentVecElementWrite value");
+                }
                 Stmt::ComponentEmit { args, .. } => {
                     for a in args {
                         self.check_expr(a, false, "ComponentEmit arg");
@@ -1738,6 +1757,9 @@ impl Checker<'_> {
             // Component host state — resolved at lowering against the
             // component schema; no local/port dependency to verify here.
             Expr::ComponentField { .. } => {}
+            Expr::ComponentVecElement { index, .. } => {
+                self.check_expr(index, ports_ok, context);
+            }
             // A by-value component passed as a method arg. A `Local` base
             // is a method-param local (verify it is defined); a
             // `SelfField`/`Path` base is resolved at lowering.
@@ -2282,6 +2304,10 @@ fn check_def_before_use(
                     }
                 },
                 Stmt::ComponentFieldWrite { value, .. } => check_e(value, &defined, errs),
+                Stmt::ComponentVecElementWrite { index, value, .. } => {
+                    check_e(index, &defined, errs);
+                    check_e(value, &defined, errs);
+                }
                 Stmt::ComponentEmit { args, .. } => {
                     for a in args {
                         check_e(a, &defined, errs);
@@ -2385,6 +2411,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::CovHookArg { .. } => {}
+        Expr::ComponentVecElement { index, .. } => for_each_local(index, f),
         Expr::ComponentValue { base } => {
             if let crate::ir::ComponentBase::Local(l) = base {
                 f(*l);

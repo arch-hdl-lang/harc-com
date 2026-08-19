@@ -432,6 +432,14 @@ pub(super) fn component_struct(
                 };
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
+            ComponentFieldKind::FixedVec(vec) => {
+                let cty = match vec.elem {
+                    crate::ir::IrType::Bool => "bool",
+                    crate::ir::IrType::SInt(_) => "int64_t",
+                    _ => "uint64_t",
+                };
+                writeln!(out, "{INDENT}std::array<{cty}, {}> {}{{}};", vec.len, f.name).ok();
+            }
             ComponentFieldKind::Record { record } => {
                 let rname = &records[record.index()].name;
                 writeln!(out, "{INDENT}{rname} {}{{}};", f.name).ok();

@@ -7332,6 +7332,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.
             ir::Expr::ComponentField { .. } => None,
+            ir::Expr::ComponentVecElement { index, .. } => in_expr(index),
             _ => None,
         }
     }
@@ -7385,6 +7386,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // state filler (they are not bound-to target responders);
                 // any expr they carry holds no transactor-state node.
                 ir::Stmt::ComponentFieldWrite { value, .. } => in_expr(value),
+                ir::Stmt::ComponentVecElementWrite { index, value, .. } => {
+                    in_expr(index).or_else(|| in_expr(value))
+                }
                 ir::Stmt::ComponentEmit { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ComponentCall { args, .. } => args.iter().find_map(in_expr),
                 // tseq bodies never appear in a bound-to responder body
@@ -7468,6 +7472,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::CovHookParam {
                 index: Some(idx), ..
             } => fill_expr(idx, instance),
+            ir::Expr::ComponentVecElement { index, .. } => fill_expr(index, instance),
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -7575,6 +7580,10 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     ir::ScoreboardOp::QueuePop { .. } => {}
                 },
                 ir::Stmt::ComponentFieldWrite { value, .. } => fill_expr(value, instance),
+                ir::Stmt::ComponentVecElementWrite { index, value, .. } => {
+                    fill_expr(index, instance);
+                    fill_expr(value, instance);
+                }
                 ir::Stmt::ComponentEmit { args, .. } => {
                     for a in args {
                         fill_expr(a, instance);
@@ -7730,6 +7739,9 @@ fn fill_visit_expr(
         Expr::CovHookParam {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
+        Expr::ComponentVecElement { index, .. } => {
+            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
+        }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
         | Expr::Local(_)
@@ -7817,6 +7829,10 @@ fn fill_initiator_bus_prefix(
                     | Stmt::TransactorStateRecordFieldWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
+                    }
+                    Stmt::ComponentVecElementWrite { index, value, .. } => {
+                        visit_expr(index, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::AssertCheck { cond, on_fail }
                     | Stmt::AssumeCheck { cond, on_fail } => {

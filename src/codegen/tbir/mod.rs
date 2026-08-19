@@ -800,6 +800,7 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
         ComponentIdle { n, .. } => expr_has_probe(n),
+        ComponentVecElement { index, .. } => expr_has_probe(index),
         _ => false,
     }
 }
@@ -823,6 +824,9 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
+        ComponentVecElementWrite { index, value, .. } => {
+            expr_has_probe(index) || expr_has_probe(value)
+        }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             expr_has_probe(cond) || fmt_has_probe(on_fail)
         }
@@ -1082,6 +1086,10 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        ComponentVecElementWrite { index, value, .. } => {
+            for_each_port_in_expr(index, f);
+            for_each_port_in_expr(value, f);
+        }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             for_each_port_in_expr(cond, f);
             for_each_port_in_fmt(on_fail, f);
@@ -1180,6 +1188,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
+        ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
         _ => {}
     }
 }

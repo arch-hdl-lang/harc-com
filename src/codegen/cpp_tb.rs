@@ -12060,6 +12060,11 @@ impl Emitter {
                     // Pointer fields default to nullptr — caller assigns
                     // via `drv.dut = dut` after construction.
                     " = nullptr".into()
+                } else if matches!(
+                    &f.ty,
+                    TypeExpr::Builtin { name: BuiltinTy::Vec, .. }
+                ) {
+                    "{}".into()
                 } else {
                     "".into()
                 };
@@ -12187,6 +12192,11 @@ impl Emitter {
                 let cty = self.scoreboard_field_c_type(&f.ty);
                 let init = if let Some(d) = &f.default {
                     format!(" = {}", format_simple_expr(d))
+                } else if matches!(
+                    &f.ty,
+                    TypeExpr::Builtin { name: BuiltinTy::Vec, .. }
+                ) {
+                    "{}".into()
                 } else {
                     "".into()
                 };

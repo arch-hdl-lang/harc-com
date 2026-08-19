@@ -478,6 +478,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
         }
+        Expr::ComponentVecElement { base, field, index } => {
+            let index = expr_cpp(cx, index)?;
+            format!("{}.{field}[{index}]", comp_base_cpp_subst_cx(cx, base))
+        }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
         // receiver — a plain C++ struct value, copied at the call.
@@ -875,6 +879,12 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                     _ => None,
                 })
         }
+        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
+            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
+            .and_then(|f| match &f.kind {
+                crate::ir::ComponentFieldKind::FixedVec(vec) => ir_type_width(&vec.elem),
+                _ => None,
+            }),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1017,6 +1027,14 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     _ => false,
                 })
         }
+        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
+            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| matches!(
+                &f.kind,
+                crate::ir::ComponentFieldKind::FixedVec(crate::ir::FixedVecSchema {
+                    elem: crate::ir::IrType::SInt(_), ..
+                })
+            )),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1151,10 +1169,26 @@ fn component_of_base<'a>(
             prog.components.get(cid.index())
         }
         crate::ir::ComponentBase::Path(path) => {
-            let tb = owner_tb(cx)?;
             let (first, rest) = path.split_first()?;
-            let root = tb.component_fields.iter().find(|b| b.field == *first)?;
-            let mut c = prog.components.get(root.component.index())?;
+            let test_root = owner_tb(cx).and_then(|tb| {
+                tb.component_fields
+                    .iter()
+                    .find(|b| b.field == *first)
+                    .and_then(|root| prog.components.get(root.component.index()))
+            });
+            let mut c = if let Some(root) = test_root {
+                root
+            } else if first == "self" {
+                prog.components.iter().find(|c| {
+                    c.methods.iter().any(|m| m.function == cx.func.id)
+                        || c.on_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.periodic_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.cycle_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.watchdog.as_ref().is_some_and(|w| w.function == cx.func.id)
+                })?
+            } else {
+                return None;
+            };
             for seg in rest {
                 let f = c.fields.iter().find(|f| f.name == *seg)?;
                 let crate::ir::ComponentFieldKind::Sub { component, .. } = f.kind else {

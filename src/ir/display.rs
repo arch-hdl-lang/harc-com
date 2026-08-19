@@ -262,6 +262,9 @@ impl Display for TbProgram {
                     ComponentFieldKind::Scalar { default, .. } => {
                         format!("scalar = {default}")
                     }
+                    ComponentFieldKind::FixedVec(vec) => {
+                        format!("fixed-vec<{:?}, {}>", vec.elem, vec.len)
+                    }
                     ComponentFieldKind::Record { record } => {
                         format!("record {}", self.records[record.index()].name)
                     }
@@ -765,6 +768,10 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             comp_base_str(base),
             expr_str(func, value)
         ),
+        Stmt::ComponentVecElementWrite { base, field, index, value } => format!(
+            "ComponentVecElementWrite({}.{field}[{}], {})",
+            comp_base_str(base), expr_str(func, index), expr_str(func, value)
+        ),
         Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
             format!(
@@ -1144,6 +1151,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
+        }
+        Expr::ComponentVecElement { base, field, index } => {
+            format!("{}.{field}[{}]", comp_base_str(base), expr_str(func, index))
         }
         Expr::ComponentValue { base } => {
             format!("ComponentValue({})", comp_base_str(base))
