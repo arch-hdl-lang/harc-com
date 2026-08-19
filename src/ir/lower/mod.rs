@@ -1093,18 +1093,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
-    // Name -> declared parameter names. The names are carried (not just
-    // membership) so `lower_extern_fn_call` can check a named argument
-    // against the DECLARATION rather than against an invented list.
-    let extern_fns: HashMap<String, Vec<String>> = extern_fn_decls
-        .iter()
-        .map(|(k, d)| {
-            (
-                k.clone(),
-                d.params.iter().map(|p| p.name.name.clone()).collect(),
-            )
-        })
-        .collect();
 
     // Enum names, so transaction fields of enum type lower as scalars
     // (v1 flattens them to `int64_t` members with index values).
@@ -1227,6 +1215,27 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             regblock_schemas.push(schema);
         }
     }
+
+    // Name -> declared parameter names and TYPES. The names are carried
+    // (not just membership) so `lower_extern_fn_call` can check a named
+    // argument against the DECLARATION rather than against an invented
+    // list; the types so it can spot a record-typed parameter, which v1
+    // renders as a Verilated module handle that does not compile.
+    let extern_fns: ExternFnTable = extern_fn_decls
+        .iter()
+        .map(|(k, d)| {
+            (
+                k.clone(),
+                (
+                    d.params.iter().map(|p| p.name.name.clone()).collect(),
+                    d.params
+                        .iter()
+                        .map(|p| helpers::slot_ir_type(p.ty.as_ref(), &record_ids))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
 
     // Addrmap declarations (`addrmap A via H { instance ... }`), in file
     // order. Resolved per-binding at the `let chip : A = bind helper`
@@ -2925,7 +2934,7 @@ fn lower_test(
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
-    extern_fns: &HashMap<String, Vec<String>>,
+    extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
     txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
@@ -5957,6 +5966,11 @@ fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
 // ── Function builder ─────────────────────────────────────────────────
 
 /// Per-test lowering context shared by all of the test's functions.
+/// extern-fn name -> (declared parameter NAMES, declared parameter
+/// TYPES). Named so the pair can be threaded without tripping clippy's
+/// complex-type lint.
+pub(crate) type ExternFnTable = HashMap<String, (Vec<String>, Vec<IrType>)>;
+
 #[derive(Clone)]
 pub(crate) struct LowerCtx {
     /// Test-scope DUT field name (`"dut"`).
@@ -6182,10 +6196,9 @@ pub(crate) struct LowerCtx {
     /// with the RAW symbol name (resolved at link via `--ref-src`); the
     /// forward declaration is emitted file-scope by
     /// `emit_extern_fn_decls`. Visible in EVERY context (test bodies,
-    /// helpers, methods) — an extern fn is a pure scalar C function, so
-    /// it is callable wherever a pure helper is. Empty when the program
-    /// declares no extern fns.
-    pub extern_fns: HashMap<String, Vec<String>>,
+    /// helpers, methods) — an extern fn is callable wherever a pure
+    /// helper is. Empty when the program declares no extern fns.
+    pub extern_fns: ExternFnTable,
 }
 
 impl LowerCtx {

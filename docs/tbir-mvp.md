@@ -7183,7 +7183,7 @@ former `transaction` group lives in
      |---|---|
      | `yield <param>` | refused upstream — not a record local |
      | `<param>.<field>` | refused — "field access on a non-DUT value" |
-     | declared, UNUSED | tbir `[&](uint64_t seed)`, v1 `[&](VBeat* seed)` — neither compiles |
+     | declared, UNUSED | tbir `[&](uint64_t seed)`, v1 `[&](VBeat* seed)` — v1 does not compile; tbir DOES (see divergence 115) |
 
      That last row is a separate, pre-existing defect at the tseq
      DECLARATION site: both backends silently mis-type a record
@@ -7300,7 +7300,12 @@ former `transaction` group lives in
      - `ctx.tseqs` carries declared parameter TYPES, not just names;
      - a `-> TSeq<T>` method result now types its `let` at the
        component-method spelling (the testbench-method one cannot yet —
-       see below);
+       see below). Typing the `let` is all this does: the METHOD's own
+       return slot is still emitted `uint64_t __ret`, so tbir gets
+       `std::vector<Beat> ys{}` and then `__ret = s;` — "cannot convert
+       `std::vector<Beat>` to `uint64_t`" — while v1 compiles. That
+       half reproduces on the merge base too, so the row below is about
+       the REJECTION going away, not about the program building;
      - the bus `tlm_method` request path gained a check at all — it had
        the declared type in hand as a WIDTH hint and never asked whether
        the argument belonged in the slot. `mem.read(b)` with a record
@@ -7356,6 +7361,77 @@ former `transaction` group lives in
      what its tests say. None of the three false `Invalid`s had a test,
      since the grid that "proved" the change covered two spellings and
      the defects were in the other three.
+
+115. **The fix that dropped the rejection it was quoting (2026-08-19).**
+
+     Divergence 114 gave the `tseq` call site a real parameter table so
+     it would stop hard-coding the slot to "not a record". Resolving
+     that table through `slot_ir_type` turned a `tseq Wrap(seed: Beat)`
+     parameter into `IrType::Record(Beat)` — so a `Beat` argument now
+     MATCHED, and the call lowered. The comment sitting on that exact
+     line still said a record argument is refused, and listed the
+     evidence for it. The evidence was still true; the code had stopped
+     acting on it.
+
+     | call | HEAD before this fix | v1 | tbir |
+     |---|---|---|---|
+     | `Wrap(s)` on `seed: Beat` | **lowered** | `[&](VBeat* seed)` — "`VBeat` has not been declared" | `[&](uint64_t seed)` — no match for call |
+     | `Wrap(7)` on `seed: Beat` | `Invalid`, wrong shape | same | rejected |
+
+     Two spellings of one unbuildable program getting two different
+     verdicts is the tell: the defect is the PARAMETER, not the
+     argument. Neither emitter honours a record there — v1 renders it as
+     a Verilated module handle, tbir as a scalar — so no call to such a
+     `tseq` compiles under v1. It is now named on the parameter, once,
+     and classified `NotImplemented { EmitsUncompilable }` rather than
+     `Invalid`, because the DECLARATION alone is fine under tbir: an
+     uncalled `tseq Wrap(seed: Beat)` compiles there (`uint64_t seed` is
+     a valid lambda parameter, merely wrong). Divergence 112's table
+     said "neither compiles" for that row; that was measured on the
+     CALLED form and stated of the unused one.
+
+     `extern function ref_add(a: uint<8>, b: Beat)` is the same defect
+     at another spelling, and the comment there was worse — it asserted
+     that every extern-fn parameter is a scalar (citing this module's
+     own header) and quoted a diagnostic to match: "both backends emit
+     `ref_add(1, <Beat>)`: cannot convert `Beat` to `uint64_t`". The
+     declaration parses, and v1 emits
+
+     ```
+     uint64_t ref_add(uint64_t a, VBeat* b);
+     ```
+
+     — g++: "`VBeat` has not been declared". Right verdict, invented
+     reason. Now named on the parameter like the `tseq` one, off a table
+     that carries declared TYPES instead of only names.
+
+     **And the same "absence dressed as a claim" on the value side.**
+     `expr_type` propagates its operand's type through `Binary`,
+     `Unary` and `Ternary` without asking whether the operator PRODUCES
+     that type, while `record_id_of_expr` does ask (its ternary arm
+     requires both arms to name the same record). Reading the value's
+     shape off `expr_type` alone therefore made the guard state:
+
+         parameter `t` of `Src.obo` takes a `Other` and was given a `Beat`
+
+     about `s.obo(b + 1)` — asserting that `b + 1` IS a `Beat`. It is
+     not; it is a type error, and `s.obs(b + 1)` lowered clean because
+     the assertion happened to point the right way there.
+
+     The two type sources disagreeing is not noise — it is the signature
+     of a malformed record expression, and it is now the rejection
+     itself. Measured on both backends with a compiling control
+     (`s.obs(b)`): `s.obs(b + 1)` gives "no match for `operator+`
+     (operand types are `Beat` and `int`)" and a mismatched-arm ternary
+     "operands to `?:` have different types `Beat` and `Other`", from v1
+     and tbir alike. `Invalid`, and the message names the shape of the
+     mistake rather than claiming a type for the expression.
+
+     Three review rounds in a row have now found that a verdict was
+     resting on a sentence nobody re-measured after the code moved. The
+     pattern is specific enough to name: when a check changes what it
+     consults, the comment justifying it is evidence about the OLD
+     consultation, and it has to be re-run, not re-read.
 
 ## Next steps
 

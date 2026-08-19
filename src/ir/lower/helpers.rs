@@ -329,12 +329,11 @@ impl FuncBuilder<'_> {
         Ok(Expr::Local(dest))
     }
 
-    /// One declared parameter's slot check, shared by the helper,
-    /// extern-fn and testbench-method arms. `ir_type_of_param` is the
-    /// same resolver those arms already use to spot a module-typed
-    /// parameter; `tseq_ir_type` in front of it is what the schema-side
-    /// resolver does too, so a `TSeq<T>` parameter is described here as
-    /// the sequence it is rather than as "a non-record value".
+    /// One declared parameter's slot check, shared by the helper and
+    /// testbench-method arms. Resolves through `slot_ir_type`, which
+    /// answers for the two shapes a schema's `param_tys` cannot: a
+    /// `TSeq<T>` (described as the sequence it is, rather than as "a
+    /// non-record value") and an `int`/`time` scalar.
     pub(crate) fn check_param_slot(
         &self,
         v: &Expr,
@@ -360,26 +359,56 @@ impl FuncBuilder<'_> {
         // Same measurement as the helper arm above:
         // `ref_add(b = 222, a = 111)` emits `ref_add(222, 111)` under
         // v1, and the in-order form emits the positional one unchanged.
-        if let Some(declared) = self.ctx.extern_fns.get(name) {
+        if let Some((declared, _)) = self.ctx.extern_fns.get(name) {
             super::reject_misplaced_named_args(
                 args,
                 declared,
                 &format!("extern fn call `{name}(...)`"),
             )?;
         }
-        let pnames = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
+        let (pnames, ptys) = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
+        // A RECORD-typed extern parameter, named on the parameter rather
+        // than on the argument — for the same reason as the `tseq` one,
+        // and measured the same way. An earlier comment here asserted
+        // that every extern-fn parameter IS a scalar (citing this
+        // module's own header) and that both backends emit
+        // `ref_add(1, <Beat>)` with "cannot convert 'Beat' to
+        // 'uint64_t'". Neither half was true: `extern function
+        // ref_add(a: uint<8>, b: Beat)` parses, and v1 emits the
+        // forward declaration
+        //
+        //     uint64_t ref_add(uint64_t a, VBeat* b);
+        //
+        // reading the record as a Verilated module handle — g++:
+        // "'VBeat' has not been declared". The verdict was right and the
+        // reason quoted for it was invented.
+        if let Some((i, _)) = ptys
+            .iter()
+            .enumerate()
+            .find(|(_, t)| matches!(t, IrType::Record(_)))
+        {
+            let pname = pnames
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", i + 1));
+            return Err(not_implemented(
+                &format!("a record-typed parameter `{pname}` on `extern function {name}`"),
+                "v1 emits the parameter as a Verilated module handle \
+                 (`uint64_t ref_add(uint64_t a, VBeat* b);`), which does not compile; \
+                 pass the record's fields as scalars instead"
+                    .to_string(),
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             match a {
                 CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
                     let v = self.lower_expr_no_ports(e)?;
-                    // Every extern-fn parameter is a scalar — this
-                    // module's own header says so ("Extern fns are pure
-                    // scalar C functions"), and `ctx.extern_fns`
-                    // consequently carries names only. So the slot is
-                    // always `None`, and both backends emit
-                    // `ref_add(1, <Beat>)` for a record argument:
-                    // "cannot convert 'Beat' to 'uint64_t'".
+                    // Every REMAINING extern-fn parameter is a scalar:
+                    // the record case is refused above, and an extern fn
+                    // is otherwise a pure scalar C function (this
+                    // module's header).
                     let slot = match pnames.get(i) {
                         Some(pn) => format!("parameter `{pn}` of extern fn `{name}`"),
                         None => format!("an argument of extern fn `{name}`"),
@@ -672,11 +701,14 @@ pub(crate) fn tseq_ir_type(
 /// `ir_type_of_with_records`, which also types the parameter's local and
 /// therefore the emitted C++.
 ///
-/// The two differ on exactly one thing: `int` (and `time`) are scalars
-/// that `ir_type_of` deliberately leaves `Unknown`, because they carry
-/// no width and local typing wants that absence preserved. A slot check
-/// does not care about width — it only asks record / sequence / scalar —
-/// so it can answer where local typing must not.
+/// They differ on two things. `TSeq<T>` resolves here to
+/// `RecordSeq`/`Seq` (the short-circuit on the first line) where
+/// `ir_type_of_with_records` falls through to `Unknown`. And `int` (and
+/// `time`) are scalars that `ir_type_of` deliberately leaves `Unknown`,
+/// because they carry no width and local typing wants that absence
+/// preserved — a slot check does not care about width, it only asks
+/// record / sequence / scalar, so it can answer where local typing must
+/// not.
 ///
 /// Use this wherever the declared `TypeExpr` is in hand. Where only a
 /// schema's `param_tys` is available the check reads that instead, and

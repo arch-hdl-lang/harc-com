@@ -1706,6 +1706,33 @@ impl FuncBuilder<'_> {
         want: Slot,
         what: &str,
     ) -> Result<(), LowerError> {
+        // A record-valued operand under an operator that does not
+        // PRODUCE a record — `s.obs(b + 1)`, or a ternary whose arms name
+        // different records. `expr_type` propagates its operand's type
+        // through `Binary`/`Unary`/`Ternary` without asking whether the
+        // operator preserves record-ness, while `record_id_of_expr` does
+        // ask (its ternary arm requires both arms to name the SAME
+        // record). So the two disagreeing is not noise — it is exactly
+        // the signature of a malformed record expression, and reading
+        // the value's shape off `expr_type` alone made the diagnostic
+        // assert that `b + 1` IS a `Beat`. That is the same absence
+        // dressed as a claim this rule exists to stop, mirrored onto the
+        // value side.
+        //
+        // Measured on both backends with a compiling control
+        // (`s.obs(b)`): `s.obs(b + 1)` gives "no match for `operator+`
+        // (operand types are `Beat` and `int`)" and the mismatched
+        // ternary "operands to `?:` have different types `Beat` and
+        // `Other`", from v1 and tbir alike. No backend runs it.
+        if self.record_id_of_expr(value).is_none()
+            && matches!(self.expr_type(value), Some(IrType::Record(_)))
+        {
+            return Err(LowerError::Invalid(format!(
+                "{what} was given a record-valued operand in a position that does not \
+                 produce a record (an arithmetic or bitwise operator, or a `?:` whose \
+                 arms name different records)"
+            )));
+        }
         let got = self.slot_shape_of(value);
         if got == want || !want.known() || !got.known() {
             return Ok(());
@@ -1739,6 +1766,17 @@ impl FuncBuilder<'_> {
             return Slot::Scalar;
         }
         match self.expr_type(value) {
+            // UNREACHABLE from the one caller, and kept so the
+            // condition has one verdict everywhere it is written.
+            // `record_id_of_expr` is the authority on records and has
+            // already said no by the time this runs, so a `Record` here
+            // is the two sources disagreeing — and `check_slot_shape`
+            // turns that disagreement into a rejection before it calls
+            // this. Confirmed by mutation: deleting this arm fails no
+            // test. It stays because the alternative is a line that
+            // silently re-asserts the record-ness the caller just
+            // refused, if the order of those two ever changes.
+            Some(IrType::Record(_)) => Slot::Unknown,
             Some(ty) => Slot::of_ir(&ty),
             None => Slot::Unknown,
         }
@@ -3222,6 +3260,47 @@ impl FuncBuilder<'_> {
             }
             None => Vec::new(),
         };
+        // A RECORD-typed tseq parameter is not a slot any argument can
+        // enter, so the verdict belongs to the parameter rather than to
+        // what is passed. Neither emitter honours the declared type:
+        // v1 renders it as a Verilated module handle
+        // (`[&](VBeat* seed)`) and tbir as a scalar
+        // (`[&](uint64_t seed)`). v1's spelling does not compile under
+        // ANY call — `'VBeat' has not been declared` — so every call to
+        // such a tseq is uncompilable there.
+        //
+        // Naming it here rather than at the argument is what the first
+        // version of this got wrong: routing the slot through
+        // `slot_ir_type` resolved the parameter to `Record(Beat)`, so a
+        // `Beat` argument MATCHED and the call lowered, while a scalar
+        // one was rejected for being the wrong shape. Both spellings are
+        // equally unbuildable, and the comment left behind still claimed
+        // the record one was refused.
+        //
+        // Not `Invalid`: the DECLARATION alone is fine under tbir — an
+        // uncalled `tseq Wrap(seed: Beat)` compiles there (`uint64_t
+        // seed` is a valid lambda parameter, it is only wrong) — so the
+        // program is out of subset rather than meaningless, and the
+        // verdict is what v1 does with it.
+        if let Some((i, _)) = param_tys
+            .iter()
+            .enumerate()
+            .find(|(_, t)| matches!(t, IrType::Record(_)))
+        {
+            let pname = match self.ctx.tseqs.get(name) {
+                Some((_, names, _)) => names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", i + 1)),
+                None => format!("#{}", i + 1),
+            };
+            return Err(not_implemented(
+                &format!("a record-typed parameter `{pname}` on `tseq {name}`"),
+                "v1 emits the parameter as a Verilated module handle (`[&](VBeat* seed)`),                  which does not compile; pass the record's fields as scalars instead"
+                    .to_string(),
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
@@ -3235,12 +3314,8 @@ impl FuncBuilder<'_> {
             // — while passing `Wrap(7)`, which v1 refuses with "no known
             // conversion from 'int' to 'const std::vector<Beat>&'".
             //
-            // The RECORD half of that note survives and is still why a
-            // record argument is wrong however the callee is written:
-            // `yield <param>` is refused upstream, `<param>.<field>` is
-            // refused, and leaving it UNUSED breaks both backends — tbir
-            // emits `[&](uint64_t seed)` and v1 `[&](VBeat* seed)`,
-            // reading the record as a Verilated module pointer.
+            // A record-typed parameter never reaches this loop — it is
+            // refused above, on the parameter rather than the argument.
             if let Some(ty) = param_tys.get(i) {
                 self.check_slot_ir(&v, ty, &format!("parameter of tseq `{name}`"))?;
             }

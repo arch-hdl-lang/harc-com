@@ -7877,6 +7877,182 @@ end impl T"#
     }
 }
 
+/// Two spellings of one unbuildable program must not get two different
+/// verdicts. When the `tseq` slot learned its declared types, a record
+/// parameter started resolving to `Record(Beat)` — so `Wrap(s)` MATCHED
+/// and lowered, while `Wrap(7)` was still refused for being the wrong
+/// shape. Neither compiles anywhere: v1 renders a record `tseq`
+/// parameter as `[&](VBeat* seed)` ("`VBeat` has not been declared") and
+/// tbir as `[&](uint64_t seed)`. The defect is the PARAMETER, so that is
+/// where it is named — once, for every call.
+///
+/// `NotImplemented` rather than `Invalid`, because the declaration alone
+/// is fine under tbir: an uncalled one compiles there.
+#[test]
+fn a_record_typed_parameter_is_refused_on_the_parameter_not_the_argument() {
+    let tseq_decl = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq Wrap(seed: Beat) -> TSeq<Beat>
+    let b : Beat
+    b.v = 9
+    yield b
+end tseq Wrap
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : Beat
+{call}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // Uncalled: tbir compiles it, so there is nothing to refuse.
+    lower_src(&tseq_decl("")).expect("an uncalled record-parameter tseq lowers");
+    for call in ["        let ys = Wrap(s)", "        let ys = Wrap(7)"] {
+        let err = lower_src(&tseq_decl(call)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains("record-typed parameter `seed` on `tseq Wrap`"),
+            "`{call}` names the parameter, not the argument: {msg}"
+        );
+    }
+
+    // The extern-fn spelling of the same defect. The comment here used
+    // to claim every extern parameter is a scalar and quote "cannot
+    // convert `Beat` to `uint64_t`"; v1 actually emits
+    // `uint64_t ref_add(uint64_t a, VBeat* b);`.
+    let ext = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+extern function ref_add(a: uint<8>, b: Beat) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let s : Beat
+        let z = ref_add(1, s)
+        wait 2 cycles
+    end run
+end impl T"#;
+    let err = lower_src(ext).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("record-typed parameter `b` on `extern function ref_add`"),
+        "{msg}"
+    );
+}
+
+/// A record-valued operand under an operator that does not PRODUCE a
+/// record. `expr_type` propagates its operand's type through `Binary`,
+/// `Unary` and `Ternary` without asking whether the operator preserves
+/// record-ness; `record_id_of_expr` does ask. Reading the value's shape
+/// off `expr_type` alone made the guard assert that `b + 1` IS a `Beat`
+/// — the same absence-dressed-as-a-claim this family exists to remove,
+/// mirrored onto the value side — and let `s.obs(b + 1)` lower.
+///
+/// The two sources disagreeing is the signature of a malformed record
+/// expression, and it is now the rejection. Measured on both backends
+/// with a compiling control: v1 and tbir alike give "no match for
+/// `operator+` (operand types are `Beat` and `int`)" and "operands to
+/// `?:` have different types `Beat` and `Other`".
+#[test]
+fn a_record_under_an_operator_that_does_not_produce_one_is_rejected() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    q : queue<Beat>
+end scoreboard Sb
+
+agent Src
+    n : uint<32> default 0
+    function obs(t: Beat)
+        n = n + 1
+    end function
+    function obo(t: Other)
+        n = n + 1
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    // The control: a plain record value still enters a record slot.
+    lower_src(&prog("        s.obs(b)")).expect("a well-formed record argument lowers");
+    for body in [
+        "        s.obs(b + 1)",
+        // …including when the mis-typing pointed at a DIFFERENT record,
+        // which is where the false claim was visible in the message.
+        "        s.obo(b + 1)",
+        "        sb.q.push(b + 1)",
+        "        s.obs(dut.en == 1 ? b : o)",
+    ] {
+        let src = prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("record-valued operand in a position that does not produce a record"),
+            "`{body}` names the shape of the mistake rather than claiming a type: {msg}"
+        );
+        // …and never asserts what the expression's type IS.
+        assert!(
+            !msg.contains("was given a `Beat`") && !msg.contains("was given a `Other`"),
+            "`{body}` must not claim a record type for a non-record expression: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
