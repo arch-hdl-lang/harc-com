@@ -1,0 +1,31 @@
+scoreboard FixedTable
+    words  : Vec<uint<64>, 4>
+    valids : Vec<uint<1>, 4>
+
+    hookable store(index: uint<32>, value: uint<64>)
+        words[index] = value
+        valids[index] = 1
+    end store
+end scoreboard FixedTable
+
+testbench ComponentVecTb
+    dut : Top
+    left : FixedTable
+    right : FixedTable
+end testbench ComponentVecTb
+
+impl ComponentVecTest for ComponentVecTb
+    run
+        assert left.valids[2] == 0 else fail("left did not start zeroed")
+        assert right.valids[2] == 0 else fail("right did not start zeroed")
+        left.store(2, 0x1234)
+        assert left.valids[2] == 1 else fail("left was not marked valid")
+        assert left.words[2] == 0x1234 else fail("left value changed")
+        assert right.valids[2] == 0 else fail("left write aliased right validity")
+        assert right.words[2] == 0 else fail("left write aliased right value")
+        right.store(2, 0x5678)
+        assert left.words[2] == 0x1234 else fail("right write aliased left value")
+        assert right.words[2] == 0x5678 else fail("right value changed")
+        wait 1 cycle
+    end run
+end impl ComponentVecTest

@@ -1268,10 +1268,18 @@ pub struct ComponentFieldSchema {
     pub activation: Activation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedVecSchema {
+    pub elem: IrType,
+    pub len: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
     Scalar { ty: IrType, default: u64 },
+    /// `words : Vec<uint<64>, 4>` — fixed, by-value component state.
+    FixedVec(FixedVecSchema),
     /// `current : Sample` — a value-record held as persistent host-side
     /// component/transactor state.
     Record { record: RecordId },
@@ -2184,6 +2192,12 @@ pub enum Stmt {
         field: String,
         value: Expr,
     },
+    ComponentVecElementWrite {
+        base: ComponentBase,
+        field: String,
+        index: Expr,
+        value: Expr,
+    },
     /// `emit observed(v)` — fan the args out to every callback registered
     /// on the named `out event<T>` field of the component named by `base`.
     /// `base = SelfField` for a self-relative `emit observed(v)` inside a
@@ -2582,6 +2596,11 @@ pub enum Expr {
     ComponentField {
         base: ComponentBase,
         field: String,
+    },
+    ComponentVecElement {
+        base: ComponentBase,
+        field: String,
+        index: Box<Expr>,
     },
     /// A whole composite-component value, passed by value as a method
     /// argument: `sb.observe(addr, model)` reads `model` here, where the

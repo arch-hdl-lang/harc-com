@@ -1472,6 +1472,11 @@ fn emit_stmt(
             )
             .ok();
         }
+        Stmt::ComponentVecElementWrite { base, field, index, value } => {
+            let index = expr_cpp(cx, index)?;
+            let value = expr_cpp(cx, value)?;
+            writeln!(out, "{pad}{}.{field}[{index}] = {value};", comp_base_cpp_subst_cx(cx, base)).ok();
+        }
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
         // component's `_last_out_cycle` heartbeat (v1's emit lowering).

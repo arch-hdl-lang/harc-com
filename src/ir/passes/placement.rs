@@ -376,6 +376,11 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
+            Stmt::ComponentVecElementWrite { index, value, .. } => {
+                host_service_only = false;
+                visit_expr(index, &mut accesses, &mut transactor);
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
             Stmt::ComponentEmit { args, .. } => {
                 // Analysis-port fan-out — host-side callback dispatch.
                 host_service_only = false;
@@ -560,6 +565,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::CovBin { .. }
         | Expr::CovHookParam { .. }
         | Expr::CovHookArg { .. } => {}
+        Expr::ComponentVecElement { index, .. } => visit_expr(index, accesses, transactor),
     }
 }
 

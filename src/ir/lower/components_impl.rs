@@ -28,7 +28,8 @@ use crate::ast::{
 use crate::ir::{
     Activation, ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentInstanceMode,
     ComponentKindTag, ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload,
-    FunctionId, FunctionKind, IrType, RecordId, ScoreboardId, TbFunction, Terminator, TypedParam,
+    FixedVecSchema, FunctionId, FunctionKind, IrType, RecordId, ScoreboardId, TbFunction,
+    Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -1401,6 +1402,48 @@ fn lower_field(
             // unknown named type) is rejected precisely.
             let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
             Ok(ComponentFieldKind::Queue { elem })
+        }
+        TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } => {
+            if f.direction.is_some() {
+                return Err(unsupported(
+                    &format!("a directional fixed-vector field `{comp}.{fname}`"),
+                    "fixed component state is non-directional",
+                ));
+            }
+            if f.default.is_some() {
+                return Err(unsupported(
+                    &format!("a default value on fixed-vector field `{comp}.{fname}`"),
+                    "fixed vectors are value-initialized; aggregate defaults are not lowered",
+                ));
+            }
+            let elem = match args.first() {
+                Some(TypeArg::Type(ty)) => scalar_ir_type(ty),
+                _ => None,
+            }
+            .filter(|ty| matches!(ty,
+                IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
+            ) || matches!(ty, IrType::Bool))
+            .ok_or_else(|| unsupported(
+                &format!("fixed-vector field `{comp}.{fname}` with an unsupported element type"),
+                "only nonzero-width uint/sint/bits/bool/bit elements up to 64 bits are lowered; nested vectors and record elements are not yet supported",
+            ))?;
+            let len = match args.get(1) {
+                Some(TypeArg::Expr(e)) => match &*e.kind {
+                    ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .filter(|n| *n != 0)
+            .ok_or_else(|| unsupported(
+                &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
+                "the length must be a nonzero decimal compile-time literal",
+            ))?;
+            Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
         }
         // Scalar counter, or a nested sub-component (`source :
         // AnalysisSource passive` / `sb : AnalysisSb`).
@@ -3683,6 +3726,55 @@ impl super::FuncBuilder<'_> {
                                 base: ComponentBase::Path(base),
                                 field,
                             }));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve the unindexed field portion of a direct component `Vec` access.
+    pub(crate) fn as_component_vec_field(
+        &self,
+        e: &AstExpr,
+    ) -> Result<Option<(ComponentBase, String, FixedVecSchema)>, LowerError> {
+        if let ExprKind::Ident(id) = &*e.kind {
+            if self.lookup(&id.name).is_none() {
+                if let Some(cid) = self.self_component {
+                    if let Some(schema) = self.ctx.components[cid.index()].field(&id.name) {
+                        if let ComponentFieldKind::FixedVec(vec) = &schema.kind {
+                            self.require_self_activation(schema.activation, "field", &id.name)?;
+                            return Ok(Some((
+                                ComponentBase::SelfField,
+                                id.name.clone(),
+                                vec.clone(),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(path) = dotted_path(e) {
+            let path = self.strip_tb_prefix(&path);
+            if path.len() >= 2 {
+                if let Some((head_cid, mut base, tail, head_mode)) =
+                    self.component_path_head(&path)
+                {
+                    let (recv_tail, last) = tail.split_at(tail.len() - 1);
+                    if !self.recv_is_scoreboard_sub(head_cid, recv_tail) {
+                        let Ok(cid) = self.resolve_component_recv(head_cid, recv_tail) else {
+                            return Ok(None);
+                        };
+                        if let Some(schema) = self.ctx.components[cid.index()].field(&last[0]) {
+                            if let ComponentFieldKind::FixedVec(vec) = &schema.kind {
+                                self.require_component_activation(
+                                    &path[0], head_cid, head_mode, recv_tail,
+                                    schema.activation, "field", &last[0],
+                                )?;
+                                base.extend_from_slice(recv_tail);
+                                return Ok(Some((ComponentBase::Path(base), last[0].clone(), vec.clone())));
+                            }
                         }
                     }
                 }
