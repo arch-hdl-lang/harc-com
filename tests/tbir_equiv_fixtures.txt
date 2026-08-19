@@ -250,4 +250,4 @@ passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
 soft_constraint_randomize_test | Top | top_counter.sv | - | pass
 target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
-uint64_unique_randomize_test | Top | top_counter.sv | - | pass
+uint64_unique_randomize_test | Top | top_counter.sv | - | pass | - | uint64_unique_randomize_ref.cpp
