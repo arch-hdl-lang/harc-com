@@ -297,6 +297,26 @@ inline void harc_wide_write_bits(HarcWide<N>& dst, unsigned lo, unsigned width, 
     }
 }
 
+// Extract an arbitrary bit range into a width-sized wide carrier. Unlike
+// `harc_bits`, this never truncates the result to 64 bits. Bits outside the
+// requested range and storage padding in the final word are always zero.
+template<std::size_t OutWords, std::size_t InWords>
+inline HarcWide<OutWords> harc_wide_extract_bits(
+    const HarcWide<InWords>& value, unsigned lo, unsigned width) {
+    HarcWide<OutWords> out;
+    const unsigned capped = width < OutWords * 32 ? width : OutWords * 32;
+    for (unsigned b = 0; b < capped; ++b) {
+        if (harc_wide_get_bit(value, lo + b)) harc_wide_set_bit(out, b);
+    }
+    return harc_wide_mask_bits(out, capped);
+}
+
+template<std::size_t OutWords>
+inline HarcWide<OutWords> harc_wide_extract_bits(
+    _harc_u128 value, unsigned lo, unsigned width) {
+    return harc_wide_extract_bits<OutWords>(harc_wide_zext<4>(value), lo, width);
+}
+
 template<std::size_t N>
 inline HarcWide<N> operator+(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     HarcWide<N> out;
@@ -372,8 +392,8 @@ inline HarcWide<N> operator<<(const HarcWide<N>& value, S shift_raw) {
     if constexpr (std::is_signed_v<S>) {
         if (shift_raw < 0) return out;
     }
+    if (static_cast<_harc_u128>(shift_raw) >= N * 32) return out;
     const unsigned shift = static_cast<unsigned>(shift_raw);
-    if (shift >= N * 32) return out;
     const unsigned word_shift = shift / 32;
     const unsigned bit_shift = shift % 32;
     for (std::size_t i = word_shift; i < N; ++i) {
@@ -390,8 +410,8 @@ inline HarcWide<N> operator>>(const HarcWide<N>& value, S shift_raw) {
     if constexpr (std::is_signed_v<S>) {
         if (shift_raw < 0) return out;
     }
+    if (static_cast<_harc_u128>(shift_raw) >= N * 32) return out;
     const unsigned shift = static_cast<unsigned>(shift_raw);
-    if (shift >= N * 32) return out;
     const unsigned word_shift = shift / 32;
     const unsigned bit_shift = shift % 32;
     for (std::size_t i = 0; i + word_shift < N; ++i) {
@@ -516,6 +536,49 @@ inline _harc_u128 harc_mask_u128(unsigned width) {
 
 inline _harc_u128 harc_trunc_u128(_harc_u128 value, unsigned width) {
     return value & harc_mask_u128(width);
+}
+
+inline _harc_u128 harc_shl_u128(_harc_u128 value, uint64_t shift, unsigned width) {
+    if (shift >= 128) return 0;
+    return harc_trunc_u128(value << shift, width);
+}
+
+inline _harc_u128 harc_shr_u128(_harc_u128 value, uint64_t shift, unsigned width) {
+    if (shift >= width || shift >= 128) return 0;
+    return harc_trunc_u128(value, width) >> shift;
+}
+
+inline _harc_u128 harc_ashr_u128(_harc_u128 value, uint64_t shift, unsigned width) {
+    value = harc_trunc_u128(value, width);
+    if (width == 0) return 0;
+    const bool negative = ((value >> (width - 1)) & 1u) != 0;
+    if (shift >= width) return negative ? harc_mask_u128(width) : 0;
+    _harc_u128 out = value >> shift;
+    if (negative && shift != 0) {
+        out |= harc_mask_u128(width) & ~harc_mask_u128(width - shift);
+    }
+    return harc_trunc_u128(out, width);
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_ashr(HarcWide<N> value, uint64_t shift, unsigned width) {
+    value = harc_wide_mask_bits(value, width);
+    if (width == 0) return HarcWide<N>();
+    const bool negative = harc_wide_get_bit(value, width - 1);
+    if (shift >= width) {
+        HarcWide<N> out;
+        if (negative) {
+            for (unsigned bit = 0; bit < width; ++bit) harc_wide_set_bit(out, bit);
+        }
+        return out;
+    }
+    HarcWide<N> out = value >> shift;
+    if (negative) {
+        for (unsigned bit = width - static_cast<unsigned>(shift); bit < width; ++bit) {
+            harc_wide_set_bit(out, bit);
+        }
+    }
+    return harc_wide_mask_bits(out, width);
 }
 
 inline _harc_u128 harc_sext_u128(_harc_u128 value, unsigned source_width, unsigned dest_width) {

@@ -100,13 +100,6 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
-fn emit_cpp_src_result(src: &str) -> Result<String, String> {
-    let merged = merged_src(src);
-    let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
-    verify::verify_program(&prog).map_err(|e| format!("{e:?}"))?;
-    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).map_err(|e| e.to_string())
-}
-
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -418,8 +411,8 @@ end test T"#,
 /// shift operand's width, so `(wide & 0xFF) >> 4` is a 64-bit-safe shift
 /// even when `wide` is `uint<128>` — the guard must not reject it (it
 /// did, by taking the max over `&` operands). The unmasked wide operand
-/// must still reject, in BOTH directions — `<<` previously had no guard
-/// and silently emitted a wrong 64-bit shift.
+/// must use width-aware helpers in BOTH directions — `<<` previously had
+/// no guard and silently emitted a wrong 64-bit shift.
 #[test]
 fn wide_shift_guard_is_mask_aware_and_symmetric() {
     let masked = r#"const M : uint<8> = 0xF0
@@ -438,7 +431,10 @@ end test T"#;
         "masked wide operand must emit a plain 64-bit shift; got:\n{cpp}"
     );
 
-    for (expr, dir) in [("wide >> 1", "right"), ("wide << 1", "left")] {
+    for (expr, helper) in [
+        ("wide >> 1", "harc_rt::harc_shr_u128"),
+        ("wide << 1", "harc_rt::harc_shl_u128"),
+    ] {
         let src = format!(
             r#"test T
     let dut : Top
@@ -449,15 +445,10 @@ end test T"#;
     end run
 end test T"#
         );
-        let merged = merged_src(&src);
-        let prog = lower::lower_program(&merged).expect("lowers");
-        verify::verify_program(&prog).expect("verifies");
-        let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
-            .expect_err("unmasked wide shift must fail emission");
-        let msg = format!("{err:?}");
+        let cpp = emit_cpp_src(&src);
         assert!(
-            msg.contains(&format!("{dir} shift above 64 bits")),
-            "wide `{expr}` must reject with a {dir}-shift emit error; got: {msg}"
+            cpp.contains(helper),
+            "wide `{expr}` must use `{helper}`; got:\n{cpp}"
         );
     }
 }
@@ -939,8 +930,8 @@ end test T"#,
 }
 
 #[test]
-fn signed_wide_right_shift_is_rejected_in_tbir() {
-    let err = emit_cpp_src_result(
+fn signed_wide_right_shift_uses_declared_width_arithmetic_helper() {
+    let cpp = emit_cpp_src(
         r#"test T
         let dut : Top
     run
@@ -950,11 +941,10 @@ fn signed_wide_right_shift_is_rejected_in_tbir() {
         assert ((1 + wide) >> 1) == 0 else fail("wide-rhs-shr")
     end run
 end test T"#,
-    )
-    .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
+    );
     assert!(
-        err.contains("right shift above 64 bits"),
-        "wide signed shift must have a targeted diagnostic; got: {err}"
+        cpp.matches("harc_rt::harc_ashr_u128").count() >= 3,
+        "wide signed shifts must use the arithmetic helper: {cpp}"
     );
 }
 
@@ -6703,12 +6693,6 @@ end test T"#
     // draw that fills it — a working escape hatch. A scalar row is
     // width-correct at any width; a container row keeps its shape.
     for (ty, shape, draw) in [
-        ("uint<65>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("uint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("sint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("bits<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("uint<200>", "harc_rt::HarcWide<7> data = 0;", "harc_rng_wide<7>"),
-        ("uint<256>", "harc_rt::HarcWide<8> data = 0;", "harc_rng_wide<8>"),
         ("list<uint<8>>", "std::vector<uint64_t> data", "data[_i] = harc_rt::random::harc_rng_uint"),
         (
             "list<uint<256>>",
@@ -6733,12 +6717,6 @@ end test T"#
         // mirrors. Pinned because the `Int` arm of `scalar_leaf_c_type`
         // had nothing measuring it.
         ("Vec<int, 4>", "std::array<uint64_t, 4> data", "data = {}"),
-        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data", "data = {}"),
-        (
-            "Vec<uint<256>, 4>",
-            "std::array<harc_rt::HarcWide<8>, 4> data",
-            "data = {}",
-        ),
         (
             "Vec<Vec<uint<8>, 2>, 4>",
             "std::array<std::array<uint64_t, 2>, 4> data",
@@ -6820,6 +6798,116 @@ end test T"#
         let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains(marker), "`{ty}`: v1 emits `{marker}`");
     }
+}
+
+#[test]
+fn wide_scalar_record_leaves_reuse_the_standalone_storage_and_unpack_model() {
+    let src = r#"
+struct WideState
+    value : uint<256>
+    mid   : uint<128>
+    odd   : uint<65>
+    tag   : uint<3>
+    lanes : Vec<uint<130>, 2>
+end struct WideState
+
+test WideRecordTest
+    let dut : Top
+    run
+        let src : uint<256> = 1
+        let a : WideState
+        a.value = src << 200
+        a.tag = 5
+        let b : WideState = a
+        assert b == a else fail("record copy changed the value")
+        assert b.value[207:193] == 128 else fail("high slice changed")
+    end run
+end test WideRecordTest
+"#;
+    let prog = lower_src(src).expect("wide record lowers");
+    let record = prog.records.iter().find(|r| r.name == "WideState").unwrap();
+    assert!(matches!(record.field("value").unwrap().ty, ir::IrType::UInt(Some(256))));
+    assert!(matches!(record.field("mid").unwrap().ty, ir::IrType::UInt(Some(128))));
+    assert!(matches!(record.field("odd").unwrap().ty, ir::IrType::UInt(Some(65))));
+    assert_eq!(record.field("lanes").unwrap().vec_len, Some(2));
+
+    let cpp = emit_cpp_src(src);
+    for want in [
+        "harc_rt::HarcWide<8> value = 0;",
+        "_harc_u128 mid = 0;",
+        "_harc_u128 odd = 0;",
+        "std::array<harc_rt::HarcWide<5>, 2> lanes = {};",
+        "harc_wide_extract_bits<8>(_packed, 456, 256)",
+        "harc_wide_extract_bits<5>(_packed, 0, 130)",
+        "harc_wide_mask_bits(((src) << (200)), 256)",
+        "harc_bits((b.value), 207, 193)",
+    ] {
+        assert!(cpp.contains(want), "expected `{want}` in:\n{cpp}");
+    }
+
+}
+
+#[test]
+fn wide_record_fields_in_transactor_and_component_state_keep_their_declared_width() {
+    let src = r#"
+struct WideState
+    odd  : uint<130>
+    sign : sint<65>
+end struct WideState
+
+transactor WideTransactor
+    cur : WideState
+
+    hookable verify()
+        assert (cur.odd << 1) == 0 else fail("transactor unsigned shift")
+        assert (cur.sign >> 64) == 0 - 1 else fail("transactor signed shift")
+    end verify
+end transactor WideTransactor
+
+agent WideAgent
+    cur : WideState
+end agent WideAgent
+
+testbench WideStateTb
+    dut : Top
+    tx  : WideTransactor active
+    ag  : WideAgent
+end testbench WideStateTb
+
+impl WideStateTest for WideStateTb
+    run
+        let one : uint<130> = 1
+        tx.cur.odd = one << 129
+        tx.cur.sign = (one.trunc<65>() << 64) as sint<65>
+        tx.verify()
+
+        ag.cur.odd = one << 129
+        ag.cur.sign = (one.trunc<65>() << 64) as sint<65>
+        assert (ag.cur.odd << 1) == 0 else fail("component unsigned shift")
+        assert (ag.cur.sign >> 64) == 0 - 1 else fail("component signed shift")
+    end run
+end impl WideStateTest
+"#;
+
+    let cpp = emit_cpp_src(src);
+    for want in [
+        "harc_rt::harc_wide_mask_bits(((self.cur.odd) << (1)), 130)",
+        "harc_rt::harc_ashr_u128((_harc_u128)(self.cur.sign), (uint64_t)(64), 65)",
+        "harc_rt::harc_wide_mask_bits(((ag.cur.odd) << (1)), 130)",
+        "harc_rt::harc_ashr_u128((_harc_u128)(ag.cur.sign), (uint64_t)(64), 65)",
+    ] {
+        assert!(cpp.contains(want), "expected `{want}` in:\n{cpp}");
+    }
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits persistent wide record shifts");
+    assert!(
+        v1.matches("harc_rt::harc_wide_mask_bits").count() >= 2,
+        "v1 must mask both declared-width record left shifts:\n{v1}"
+    );
+    assert!(
+        v1.matches("harc_rt::harc_ashr_u128").count() >= 2,
+        "v1 must arithmetic-shift both signed record fields:\n{v1}"
+    );
 }
 
 /// A width slot this compiler cannot read as a plain decimal.
@@ -16250,8 +16338,8 @@ end impl T"#
         );
     }
 
-    // Literal bounds keep folding into the shift-and-mask form — the
-    // helper is the fallback for unknown widths, not a replacement.
+    // Literal bounds use the same width-aware helper so high and
+    // cross-word slices never cast their source down to uint64_t.
     let cpp = emit_cpp_src(
         r#"testbench Tb
     dut : Top
@@ -16264,8 +16352,8 @@ impl T for Tb
 end impl T"#,
     );
     assert!(
-        !cpp.contains("harc_rt::harc_bits("),
-        "a constant slice must still fold to a shift and mask:\n{cpp}"
+        cpp.contains("harc_rt::harc_bits("),
+        "a constant slice must use the width-aware helper:\n{cpp}"
     );
 }
 

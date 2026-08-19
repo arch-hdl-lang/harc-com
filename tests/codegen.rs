@@ -7186,6 +7186,36 @@ fn harcwide_shift_compare_div_mod_runtime() {
 }
 
 #[test]
+fn harcwide_extract_and_declared_width_shift_runtime() {
+    compile_and_run_runtime_cpp(
+        "extract_shift",
+        r#"
+        harc_rt::HarcWide<12> packed;
+        harc_rt::HarcWide<8> field;
+        field.words[0] = 0x89abcdefu;
+        field.words[3] = 0x76543210u;
+        field.words[7] = 0x80000000u;
+        harc_rt::harc_wide_write_bits(packed, 37, 256, field);
+        auto extracted = harc_rt::harc_wide_extract_bits<8>(packed, 37, 256);
+        assert(extracted == field);
+
+        harc_rt::HarcWide<5> dirty;
+        for (auto& word : dirty.words) word = 0xffffffffu;
+        harc_rt::harc_wide_write_bits(packed, 3, 130, dirty);
+        auto odd = harc_rt::harc_wide_extract_bits<5>(packed, 3, 130);
+        assert(odd.words[4] == 3u);
+
+        auto signed65 = harc_rt::harc_wide_sext<3>(1u, 1, 65);
+        auto shifted = harc_rt::harc_wide_ashr(signed65, 64, 65);
+        assert(shifted.words[0] == 0xffffffffu);
+        assert(shifted.words[1] == 0xffffffffu);
+        assert(shifted.words[2] == 1u);
+        assert(harc_rt::harc_ashr_u128((_harc_u128{1} << 64), 64, 65) == harc_rt::harc_mask_u128(65));
+        "#,
+    );
+}
+
+#[test]
 fn uint256_arithmetic_expression_uses_harcwide_operators() {
     let parsed = parse_source(
         r#"testbench Tb
@@ -8911,12 +8941,8 @@ end test EscapeHatch"#;
     );
 }
 
-/// The SECOND phrase the gate greps, which lives in the TB-IR *emitter*
-/// rather than in `LowerError` — and which nothing pinned until now, so
-/// rewording it would have left `cargo test` green while silently
-/// reclassifying a genuine escape hatch as a divergence.
 #[test]
-fn the_wide_shift_escape_hatch_phrase_is_stable() {
+fn wide_shifts_emit_in_both_backends() {
     let src = r#"test WideShiftHatch
     let dut : Top
     run
@@ -8927,35 +8953,18 @@ fn the_wide_shift_escape_hatch_phrase_is_stable() {
 end test WideShiftHatch"#;
     let parsed = parse_source(src).expect("parses");
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
-    // v1 implements wide shifts, so v1 really is the escape hatch here.
+    // Both backends now route the operation through their wide-value model.
+    let v1 = cpp_tb::emit(&merged).expect("v1 implements wide shifts");
     assert!(
-        cpp_tb::emit(&merged).is_ok(),
-        "v1 must still implement wide shifts, or this is not an escape hatch"
+        v1.contains("harc_rt::harc_shl_u128"),
+        "v1 must emit the declared-width shift helper: {v1}"
     );
-    // TB-IR refuses, and the refusal must carry the phrase the gate greps.
-    let err = match harc::ir::lower::lower_program(&merged) {
-        Err(e) => e.to_string(),
-        Ok(prog) => {
-            let opts = harc::codegen::cpp_tb::EmitOpts::default();
-            cpp_tb::emit_randomize_snippets(&merged, &opts, &prog.constraint_sites, 5)
-                .err()
-                .map(|e| e.0)
-                .unwrap_or_else(|| {
-                    harc::codegen::tbir::emit(&prog, &merged, &opts)
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_default()
-                })
-        }
-    };
+    let prog = harc::ir::lower::lower_program(&merged).expect("TB-IR lowers");
+    let opts = harc::codegen::cpp_tb::EmitOpts::default();
+    let cpp = harc::codegen::tbir::emit(&prog, &merged, &opts).expect("TB-IR emits");
     assert!(
-        // Including `for`: run_emit_parity.sh's needle is
-        // `use--codegenv1for`, so asserting the shorter prefix leaves a
-        // reword like "use --codegen v1 instead: ..." green here while
-        // the gate reclassifies the escape hatch as a divergence.
-        err.contains("use --codegen v1 for"),
-        "run_emit_parity.sh greps this exact phrase to classify the wide-shift \
-         gap as an escape hatch; got: {err}"
+        cpp.contains("harc_rt::harc_shl_u128"),
+        "TB-IR must emit the declared-width shift helper: {cpp}"
     );
 }
 
