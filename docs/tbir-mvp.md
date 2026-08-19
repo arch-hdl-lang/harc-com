@@ -7390,20 +7390,26 @@ former `transaction` group lives in
      said "neither compiles" for that row; that was measured on the
      CALLED form and stated of the unused one.
 
-     `extern function ref_add(a: uint<8>, b: Beat)` is the same defect
-     at another spelling, and the comment there was worse — it asserted
-     that every extern-fn parameter is a scalar (citing this module's
-     own header) and quoted a diagnostic to match: "both backends emit
+     `extern function ref_add(a: uint<8>, b: Beat)` is a NEIGHBOURING
+     defect, and the comment there was worse — it asserted that every
+     extern-fn parameter is a scalar (citing this module's own header)
+     and quoted a diagnostic to match: "both backends emit
      `ref_add(1, <Beat>)`: cannot convert `Beat` to `uint64_t`". The
-     declaration parses, and v1 emits
+     declaration parses, and both backends emit
 
      ```
      uint64_t ref_add(uint64_t a, VBeat* b);
      ```
 
      — g++: "`VBeat` has not been declared". Right verdict, invented
-     reason. Now named on the parameter like the `tseq` one, off a table
-     that carries declared TYPES instead of only names.
+     reason.
+
+     It is NOT the same rule as the `tseq` one, and the first fix said
+     it was ("for the same reason … and measured the same way"). See
+     divergence 116: `emit_extern_fn_decls` is shared — tbir calls
+     straight into v1's — so unlike the `tseq` lambda there is no
+     backend that compiles it, which makes it `Invalid` and puts the
+     verdict at the DECLARATION rather than at each call.
 
      **And the same "absence dressed as a claim" on the value side.**
      `expr_type` propagates its operand's type through `Binary`,
@@ -7432,6 +7438,58 @@ former `transaction` group lives in
      pattern is specific enough to name: when a check changes what it
      consults, the comment justifying it is evidence about the OLD
      consultation, and it has to be re-run, not re-read.
+
+116. **The check meant to stop false `Invalid`s introduced one
+     (2026-08-19).**
+
+     Divergence 113 gave the extern-fn call a slot check and hard-coded
+     the slot to scalar, on the ground that "every extern-fn parameter
+     is a scalar — this module's own header says so". Divergence 115
+     rewrote that function, put the declared parameter TYPES in scope
+     two statements above, used them for the record case, and left the
+     loop reading `None` — re-asserting the same comment on the way
+     past.
+
+     `TSeq<T>` is the counterexample. `cpp_tb::c_type_for` renders it
+     `const std::vector<T>&`:
+
+     | | verdict |
+     |---|---|
+     | `extern function ref_sum(xs: TSeq<Beat>)`, called with a sequence | **`Invalid`** at HEAD |
+     | v1 | `uint64_t ref_sum(const std::vector<Beat>& xs);` — compiles |
+     | tbir at the merge base | same line — compiles |
+
+     A false `Invalid` on a program BOTH backends build, introduced by
+     the family whose entire purpose is removing them, in the commit
+     written to remove the previous three. The slot now reads the
+     declared type like every other parameter position.
+
+     **And the record case was classified off the wrong measurement.**
+     Divergence 115 argued `NotImplemented` rather than `Invalid`
+     because an uncalled declaration compiles — true for `tseq`, where
+     tbir emits its own `[&](uint64_t seed)` lambda, and asserted of
+     extern fns without re-measuring. `emit_extern_fn_decls` is shared:
+     `src/codegen/tbir/mod.rs` calls straight into v1's, so both
+     backends emit the byte-identical `VBeat*` forward declaration and
+     NEITHER compiles — called or not:
+
+     ```
+     v1    uint64_t ref_add(uint64_t a, VBeat* b);   // 'VBeat' has not been declared
+     tbir  uint64_t ref_add(uint64_t a, VBeat* b);   // identical
+     ```
+
+     So it is `Invalid`, and the call site was the wrong place to put
+     it: a declared-but-uncalled record-parameter extern fn lowered
+     clean while the default backend emitted C++ that does not build.
+     Moved to the declaration, where the breakage actually is.
+
+     That is the same "measured on one form, stated of the other" error
+     divergence 115 was written to correct, committed one commit later
+     inside the correction. The two spellings look alike and are not:
+     `tseq` emits a lambda per backend, `extern function` emits one
+     shared declaration. Sharing a code path is what decides whether a
+     backend can differ, and it has to be read, not assumed from the
+     surface similarity of two constructs.
 
 ## Next steps
 

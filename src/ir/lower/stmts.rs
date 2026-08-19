@@ -3248,7 +3248,7 @@ impl FuncBuilder<'_> {
         // measured, `RandomTxns(n = 5)` emits `RandomTxns(5)` against
         // `auto RandomTxns = [&](uint64_t n)` — byte-identical to the
         // positional call. The names ride in `ctx.tseqs` for this.
-        let param_tys = match self.ctx.tseqs.get(name) {
+        let (param_names, param_tys) = match self.ctx.tseqs.get(name) {
             Some((_, declared, tys)) => {
                 let (declared, tys) = (declared.clone(), tys.clone());
                 super::reject_misplaced_named_args(
@@ -3256,9 +3256,9 @@ impl FuncBuilder<'_> {
                     &declared,
                     &format!("tseq call `{name}(...)`"),
                 )?;
-                tys
+                (declared, tys)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         // A RECORD-typed tseq parameter is not a slot any argument can
         // enter, so the verdict belongs to the parameter rather than to
@@ -3287,17 +3287,16 @@ impl FuncBuilder<'_> {
             .enumerate()
             .find(|(_, t)| matches!(t, IrType::Record(_)))
         {
-            let pname = match self.ctx.tseqs.get(name) {
-                Some((_, names, _)) => names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{}", i + 1)),
-                None => format!("#{}", i + 1),
-            };
+            let pname = param_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", i + 1));
             return Err(not_implemented(
                 &format!("a record-typed parameter `{pname}` on `tseq {name}`"),
-                "v1 emits the parameter as a Verilated module handle (`[&](VBeat* seed)`),                  which does not compile; pass the record's fields as scalars instead"
-                    .to_string(),
+                format!(
+                    "v1 emits `{pname}` as a Verilated module handle (`V<Record>*`), which \
+                     does not compile; pass the record's fields as scalars instead"
+                ),
                 V1Status::EmitsUncompilable,
             ));
         }

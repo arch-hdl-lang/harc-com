@@ -1219,8 +1219,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Name -> declared parameter names and TYPES. The names are carried
     // (not just membership) so `lower_extern_fn_call` can check a named
     // argument against the DECLARATION rather than against an invented
-    // list; the types so it can spot a record-typed parameter, which v1
-    // renders as a Verilated module handle that does not compile.
+    // list; the types so the call site can check each argument against
+    // the slot it is entering.
     let extern_fns: ExternFnTable = extern_fn_decls
         .iter()
         .map(|(k, d)| {
@@ -1236,6 +1236,36 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             )
         })
         .collect();
+    // A RECORD-typed extern parameter is refused at the DECLARATION, not
+    // at the call, because the declaration alone is what breaks: both
+    // backends emit the same forward declaration —
+    // `emit_extern_fn_decls` is shared, tbir calls straight into v1's —
+    // and both render the record as a Verilated module handle:
+    //
+    //     uint64_t ref_add(uint64_t a, VBeat* b);   // g++: 'VBeat' has
+    //                                               // not been declared
+    //
+    // so an extern fn that is merely DECLARED already breaks the
+    // translation unit under both. That is what makes it `Invalid` and
+    // makes the call site the wrong place: checking there left a
+    // declared-but-uncalled one lowering clean while the default backend
+    // emitted C++ that does not compile.
+    //
+    // The `tseq` spelling of this rule is NOT the same and must not be
+    // merged with it: there tbir emits its own lambda
+    // (`[&](uint64_t seed)`), which compiles while unused, so that one
+    // is a per-call `NotImplemented`. An earlier version of this check
+    // claimed the two were "measured the same way"; they were not.
+    for (name, decl) in &extern_fn_decls {
+        for p in &decl.params {
+            if let IrType::Record(_) = helpers::slot_ir_type(p.ty.as_ref(), &record_ids) {
+                return Err(LowerError::Invalid(format!(
+                    "`extern function {name}` declares parameter `{}` with a record type;                      both backends emit it as a Verilated module handle                      (`V<Record>*`), which does not compile — pass the record's fields                      as scalars instead",
+                    p.name.name
+                )));
+            }
+        }
+    }
 
     // Addrmap declarations (`addrmap A via H { instance ... }`), in file
     // order. Resolved per-binding at the `let chip : A = bind helper`

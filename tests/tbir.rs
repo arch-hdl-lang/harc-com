@@ -7931,10 +7931,14 @@ end impl T"#
         );
     }
 
-    // The extern-fn spelling of the same defect. The comment here used
-    // to claim every extern parameter is a scalar and quote "cannot
-    // convert `Beat` to `uint64_t`"; v1 actually emits
-    // `uint64_t ref_add(uint64_t a, VBeat* b);`.
+    // The extern-fn spelling is NOT the same rule, and calling it the
+    // same was the mistake. `emit_extern_fn_decls` is shared — tbir
+    // calls straight into v1's — so BOTH backends emit
+    // `uint64_t ref_add(uint64_t a, VBeat* b);` and neither compiles the
+    // translation unit. That makes it `Invalid` rather than a per-call
+    // `NotImplemented`, and puts the verdict at the DECLARATION: the
+    // call-site version left a declared-but-uncalled one lowering clean
+    // while the default backend emitted C++ that does not build.
     let ext = r#"domain SysDomain
   freq_mhz: 100
 end domain SysDomain
@@ -7957,10 +7961,60 @@ impl T for Tb
         wait 2 cycles
     end run
 end impl T"#;
-    let err = lower_src(ext).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    let msg = assert_invalid(&lower_src(ext).unwrap_err());
     assert!(
-        msg.contains("record-typed parameter `b` on `extern function ref_add`"),
+        msg.contains("`extern function ref_add` declares parameter `b` with a record type"),
+        "{msg}"
+    );
+    // …and the UNCALLED declaration is refused too, which is the cell
+    // the call-site version missed.
+    let uncalled = ext
+        .replace("        let s : Beat\n", "")
+        .replace("        let z = ref_add(1, s)\n", "");
+    let msg = assert_invalid(&lower_src(&uncalled).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_add` declares parameter `b`"),
+        "an uncalled record-parameter extern fn is refused too: {msg}"
+    );
+
+    // A `TSeq<T>` extern parameter, by contrast, is a slot that WORKS:
+    // `c_type_for` renders it `const std::vector<Beat>&` and v1 compiles
+    // the call. Hard-coding the extern slot to "scalar" rejected this —
+    // a false `Invalid` introduced by the check meant to prevent them.
+    let seq_ext = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+tseq GenR() -> TSeq<Beat>
+    let b : Beat
+    b.v = 1
+    yield b
+end tseq GenR
+
+extern function ref_sum(xs: TSeq<Beat>) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let ys = GenR()
+        let z = ref_sum(ys)
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(seq_ext).expect("a sequence into a `TSeq<T>` extern parameter lowers");
+    // …and the mismatch at that same slot is still caught.
+    let bad = seq_ext.replace("ref_sum(ys)", "ref_sum(1)");
+    let msg = assert_invalid(&lower_src(&bad).unwrap_err());
+    assert!(
+        msg.contains("takes a `TSeq<Beat>` and was given a non-record value"),
         "{msg}"
     );
 }

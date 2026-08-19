@@ -367,53 +367,35 @@ impl FuncBuilder<'_> {
             )?;
         }
         let (pnames, ptys) = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
-        // A RECORD-typed extern parameter, named on the parameter rather
-        // than on the argument — for the same reason as the `tseq` one,
-        // and measured the same way. An earlier comment here asserted
-        // that every extern-fn parameter IS a scalar (citing this
-        // module's own header) and that both backends emit
-        // `ref_add(1, <Beat>)` with "cannot convert 'Beat' to
-        // 'uint64_t'". Neither half was true: `extern function
-        // ref_add(a: uint<8>, b: Beat)` parses, and v1 emits the
-        // forward declaration
-        //
-        //     uint64_t ref_add(uint64_t a, VBeat* b);
-        //
-        // reading the record as a Verilated module handle — g++:
-        // "'VBeat' has not been declared". The verdict was right and the
-        // reason quoted for it was invented.
-        if let Some((i, _)) = ptys
-            .iter()
-            .enumerate()
-            .find(|(_, t)| matches!(t, IrType::Record(_)))
-        {
-            let pname = pnames
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", i + 1));
-            return Err(not_implemented(
-                &format!("a record-typed parameter `{pname}` on `extern function {name}`"),
-                "v1 emits the parameter as a Verilated module handle \
-                 (`uint64_t ref_add(uint64_t a, VBeat* b);`), which does not compile; \
-                 pass the record's fields as scalars instead"
-                    .to_string(),
-                V1Status::EmitsUncompilable,
-            ));
-        }
         let mut lowered = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             match a {
                 CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
                     let v = self.lower_expr_no_ports(e)?;
-                    // Every REMAINING extern-fn parameter is a scalar:
-                    // the record case is refused above, and an extern fn
-                    // is otherwise a pure scalar C function (this
-                    // module's header).
                     let slot = match pnames.get(i) {
                         Some(pn) => format!("parameter `{pn}` of extern fn `{name}`"),
                         None => format!("an argument of extern fn `{name}`"),
                     };
-                    self.check_slot_type(&v, None, &slot)?;
+                    // Against the DECLARED type, not against "scalar".
+                    // A comment here twice asserted that every extern-fn
+                    // parameter is a scalar — citing this module's own
+                    // header — and the loop hard-coded the slot to match.
+                    // `TSeq<T>` is the counterexample: `cpp_tb`'s
+                    // `c_type_for` renders it `const std::vector<T>&`,
+                    // and `extern function ref_sum(xs: TSeq<Beat>)`
+                    // called with a sequence compiles under v1 and under
+                    // tbir at the merge base. Hard-coding the slot made
+                    // the DEFAULT backend reject it — the exact class of
+                    // false `Invalid` this family exists to remove,
+                    // reintroduced by the check meant to prevent it.
+                    //
+                    // The record case never reaches here: it is refused
+                    // at the declaration, where both backends already
+                    // break.
+                    match ptys.get(i) {
+                        Some(want) => self.check_slot_ir(&v, want, &slot)?,
+                        None => self.check_slot_type(&v, None, &slot)?,
+                    }
                     lowered.push(v)
                 }
             }
