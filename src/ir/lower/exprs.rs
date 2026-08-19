@@ -1100,34 +1100,39 @@ impl FuncBuilder<'_> {
                     ));
                 }
                 _ if indexed => {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "field access `.{}` on an element of `{dotted}`, \
                              whose elements are scalars",
                             fields[i + 1]
                         ),
                         "only `Vec` fields with struct/transaction elements can be \
-                         traversed further",
+                         traversed further"
+                            .to_string(),
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 IrType::Record(_) if fld.vec_len.is_some() => {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "traversing the `Vec` record field `{dotted}` without an \
                              element index; cannot access `.{}`",
                             fields[i + 1]
                         ),
                         format!("select one element first (`{seg}[i].{}`)", fields[i + 1]),
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 _ => {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
-                            "field `{}.{seg}` is not a nested record; cannot access `.{}`",
-                            schema.name,
-                            fields[i + 1]
+                            "field access `.{}` on `{}.{seg}`, which is not a nested record",
+                            fields[i + 1],
+                            schema.name
                         ),
-                        "only nested struct/transaction fields can be traversed further",
+                        "only nested struct/transaction fields can be traversed further"
+                            .to_string(),
+                        V1Status::EmitsUncompilable,
                     ));
                 }
             }

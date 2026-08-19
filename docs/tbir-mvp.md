@@ -7886,6 +7886,43 @@ former `transaction` group lives in
      obvious "fix" fails a test that explains itself rather than
      silently changing what a program means.
 
+123. **Three misdirections in the record-traversal loop (2026-08-19).**
+
+     Three arms of the record field-chain walk told the user to re-run
+     with `--codegen v1`, and v1 emits code g++ refuses. Measured, each
+     against controls that compile under BOTH backends
+     (`r.kids[1].p`, `r.inner.p`, `r.data[2]`, `s.kids = r.kids`):
+
+     | source | v1 |
+     |---|---|
+     | `r.data[0].p` — field on a scalar element | emits, g++ refuses |
+     | `r.kids.p` — traverse a `Vec` with no index | emits, g++ refuses |
+     | `r.n.p` — field on a scalar | emits, g++ refuses |
+
+     `NotImplemented { EmitsUncompilable }` now, matching `r.n[0]` — the
+     same family, one site over, which already carried that verdict.
+     Following the in-file precedent rather than inventing one.
+
+     One message also stopped being a sentence: "field `Rec.n` is not a
+     nested record; cannot access `.p`" reads as nonsense once spliced
+     into "HARC does not implement … yet", so it is a noun phrase now.
+
+     **The mutation round is the part worth recording.** The first three
+     mutants all reported CAUGHT, and all three were vacuous: deleting a
+     `V1Status` argument from `not_implemented` leaves a two-argument
+     call to a three-argument function, so the mutant fails to COMPILE,
+     and a harness that scores "tests not green" counts that as caught.
+     Rewritten to flip `EmitsUncompilable` → `Rejects` — which compiles
+     — two of the three survived. Only the `Vec`-traversal arm had a
+     test; the other two sites had none, and the vacuous run would have
+     shipped that.
+
+     A mutant that does not compile tests the type checker, not the
+     suite. The harness cannot tell the difference, so the check has to
+     be that the mutation is a legal program — which is the same
+     discipline as running a compiling control beside every failing
+     cell, applied to the tool instead of the fixture.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

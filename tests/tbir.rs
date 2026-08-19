@@ -3995,6 +3995,13 @@ end test VecOfBadRecordTest
 /// Traversing a `Vec<Record, N>` field WITHOUT an element index
 /// (`tbl.entries.tag`) is rejected with a message that points at
 /// element selection, not silently mis-lowered.
+///
+/// `NotImplemented { EmitsUncompilable }`, not `Unsupported`: this used
+/// to promise a `--codegen v1` escape hatch, and v1 emits the traversal
+/// and g++ refuses it. Measured against three controls that DO compile
+/// under both backends — `tbl.entries[1].tag`, a plain nested-record
+/// field, and a scalar `Vec` element read — so the rejection is about
+/// the missing index and not about `Vec` fields generally.
 #[test]
 fn vec_of_record_traversal_without_index_is_rejected() {
     let src = r#"
@@ -4015,11 +4022,77 @@ test VecOfStructNoIndexTest
 end test VecOfStructNoIndexTest
 "#;
     let err = lower_src(src).expect_err("un-indexed Vec traversal must be rejected");
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("without an element index"),
         "names the missing index: {msg}"
     );
+    assert!(
+        cpp_tb::emit(&merged_src(src)).is_ok(),
+        "v1 emits it (and g++ refuses)"
+    );
+
+    // Its two siblings in the same traversal loop, which had no cell of
+    // their own — the first mutation round over this change "caught"
+    // them only because deleting a `V1Status` argument fails to compile,
+    // which proves nothing about what is pinned.
+    let sib = |decl: &str, body: &str| {
+        format!(
+            r#"
+struct Entry
+    tag : uint<8>
+end struct Entry
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+    data    : Vec<uint<8>, 4>
+    n       : uint<8>
+{decl}
+end struct EntryTable
+
+test VecOfStructNoIndexTest
+    let dut : Top
+    run
+        let tbl : EntryTable
+        {body}
+    end run
+end test VecOfStructNoIndexTest
+"#
+        )
+    };
+    for (body, names) in [
+        // A field access on an element whose elements are SCALARS.
+        ("let z = tbl.data[0].tag", "on an element of"),
+        // …and on a plain scalar field.
+        ("let z = tbl.n.tag", "which is not a nested record"),
+    ] {
+        let src = sib("", body);
+        let err = lower_src(&src).expect_err("rejected");
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains(names), "`{body}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // The controls. Each of these compiles under both backends, so the
+    // verdict above is about the missing index rather than about `Vec`
+    // record fields as such.
+    for ok in ["tbl.entries[1].tag = 1", "tbl.n = 1"] {
+        let good = src
+            .replacen(
+                "struct EntryTable
+    entries : Vec<Entry, 4>",
+                "struct EntryTable
+    n : uint<8>
+    entries : Vec<Entry, 4>",
+                1,
+            )
+            .replacen("        tbl.entries.tag = 1", &format!("        {ok}"), 1);
+        lower_src(&good).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+        cpp_tb::emit(&merged_src(&good)).expect("v1 emits the control");
+    }
 }
 
 /// An element store with a non-matching RHS (`tbl.entries[i] = 5`) is
