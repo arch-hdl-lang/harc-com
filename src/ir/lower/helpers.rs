@@ -453,7 +453,27 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
+                let v = self.lower_expr_no_ports(e)?;
+                // The testbench-method spelling of the slot rule.
+                // `ir_type_of_param` is already in hand two lines up, so
+                // this needed no new type table — the note that deferred
+                // it said otherwise and was wrong. Measured: `tf(1)`
+                // into a `t: Beat` parameter lowered and emitted, and
+                // both backends answer "no match for call to"; `tf(o)`
+                // on a DIFFERENT record reached the VERIFIER's
+                // `TypeMismatch` and surfaced as "internal error: TB-IR
+                // failed verification after lowering" — a program error
+                // answered through the compiler-bug channel.
+                let want = match ir_type_of_param(p.ty.as_ref(), self.ctx) {
+                    IrType::Record(r) => Some(r),
+                    _ => None,
+                };
+                self.check_slot_type(
+                    &v,
+                    want,
+                    &format!("parameter `{}` of testbench method `{name}`", p.name.name),
+                )?;
+                bound.push(Bound::Val(v));
             }
         }
 

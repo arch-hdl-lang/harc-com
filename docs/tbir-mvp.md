@@ -7129,15 +7129,68 @@ former `transaction` group lives in
      self-relative `emit`, or the bound-initiator `param_tys` left the
      suite green. Each spelling needed its own case.
 
-     **Deferred, measured:** three slot families whose type table does
-     not exist yet — the transactor SIBLING-method call
-     (`self_transactor_methods` carries names, not types), testbench-
-     method parameters, and `tseq` call arguments. All lower and emit
-     today; both backends refuse every mismatch. One testbench-method
-     cell reaches the verifier's `TypeMismatch`, so it answers a program
-     error through the compiler-bug channel — the same pathology this
-     divergence fixed for the testbench queue, still live one spelling
-     over.
+     **Deferred, measured:** three slot families, on the belief that
+     each needed a parameter-type table that did not exist. None of the
+     three did — see divergence 112.
+
+112. **None of the three deferred slot families needed a new table
+     (2026-08-19).**
+
+     Divergence 111 deferred the transactor SIBLING-method call,
+     testbench-method parameters, and `tseq` arguments together, on the
+     stated ground that each needs a parameter-type table that does not
+     exist. That was wrong about all three.
+
+     **Testbench-method parameters** already had the types in hand:
+     `lower_tb_method_call` calls `ir_type_of_param(p.ty, ctx)` two
+     lines above the argument loop, to decide the module-typed-parameter
+     arm. The check is three lines. Measured, both backends refuse every
+     mismatch and accept both matching cells:
+
+     | call | v1 / tbir |
+     |---|---|
+     | `tf(b)` into `t: Beat`, `ts(1)` into `x: uint<8>` | compile |
+     | `tf(1)` | "no match for call to" |
+     | `tf(o)` on a different record | **reached the VERIFIER** |
+     | `ts(b)` | "no match for call to" |
+
+     The third row is why this one was worth doing first: a mismatched
+     record reached `verify_program`'s `TypeMismatch`, which `main.rs`
+     renders as "internal error: TB-IR failed verification after
+     lowering". A program error answered through the compiler-bug
+     channel — the same pathology divergence 111 fixed for the testbench
+     queue, still live one spelling over.
+
+     **The sibling-transactor call** needed a fourth element on an
+     existing tuple, not a new table: `self_transactor_methods` is built
+     from `h.params` right after `method_ctx`, so
+     `ir_type_of_with_records(p.ty, &method_ctx.record_ids)` was
+     available at both construction sites. Same three mismatched cells,
+     same verdicts, both controls compiling.
+
+     **`tseq` call arguments** turned out not to need one either, for a
+     different reason: every REACHABLE tseq parameter is a scalar, so
+     the slot is always `None` and `ctx.tseqs` needs nothing added.
+     That is measured, not assumed — a record-typed tseq parameter has
+     no working member however the callee is written:
+
+     | shape | outcome |
+     |---|---|
+     | `yield <param>` | refused upstream — not a record local |
+     | `<param>.<field>` | refused — "field access on a non-DUT value" |
+     | declared, UNUSED | tbir `[&](uint64_t seed)`, v1 `[&](VBeat* seed)` — neither compiles |
+
+     That last row is a separate, pre-existing defect at the tseq
+     DECLARATION site: both backends silently mis-type a record
+     parameter, v1 reading it as a Verilated module pointer. Left for
+     its own batch — the call-site guard here is right regardless,
+     since a record argument is wrong under every spelling of the
+     callee.
+
+     Five mutations, all caught, including one that empties the sibling
+     `param_tys` at both construction sites (emptying only one is caught
+     by the other's test) and one that maps a record parameter to a
+     scalar slot.
 
 
 ## Next steps

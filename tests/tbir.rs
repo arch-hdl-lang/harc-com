@@ -6726,6 +6726,68 @@ end impl T"#
         );
     }
 
+    // `tseq` arguments — the last slot family, and the only one whose
+    // record direction has no reachable member at all. Measured: a
+    // record-typed tseq PARAMETER breaks both backends however the
+    // callee is written — `yield <param>` is refused upstream,
+    // `<param>.<field>` is refused, and leaving it unused still emits
+    // `[&](uint64_t seed)` under tbir and `[&](VBeat* seed)` under v1
+    // (a record read as a Verilated module pointer), neither of which
+    // compiles. So the slot is always scalar, and no type table was
+    // needed.
+    let tseq_prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+tseq GenSc(n: int) -> TSeq<Beat>
+    for _ in 1 .. n
+        let t : Beat
+        yield t
+    end for
+end tseq GenSc
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&tseq_prog("        let xs = GenSc(3)")).expect("a scalar tseq argument lowers");
+    for (body, got) in [
+        ("        let xs = GenSc(b)", "a `Beat`"),
+        ("        let xs = GenSc(o)", "a `Other`"),
+    ] {
+        let src = tseq_prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("parameter of tseq `GenSc`") && msg.contains(&format!("was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
     // The FORK spelling of a record-returning call. `try_lower_tlm_fork`
     // declared its destination without typing it, where the non-fork
     // path one screen up computes `tlm_ret_record_id(m.ret)` — so this
@@ -7148,6 +7210,155 @@ end impl T"#;
         );
         // v1 emits it, and g++ refuses — so there is nowhere to send
         // the user, which is what makes this `Invalid` and not a gap.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// Two slot families divergence 111 deferred, on the belief that each
+/// needed a parameter-type table that did not exist. Both were wrong:
+/// the testbench-method call already had `ir_type_of_param` in hand,
+/// and the sibling-transactor table only needed a fourth tuple element.
+///
+/// One of the testbench-method cells was the worse kind of gap — a
+/// mismatched RECORD reached the verifier's `TypeMismatch`, which
+/// renders as "internal error: TB-IR failed verification after
+/// lowering". A program error answered through the compiler-bug
+/// channel, exactly the pathology divergence 111 fixed for the
+/// testbench queue.
+#[test]
+fn a_method_parameter_slot_is_checked_at_both_remaining_spellings() {
+    let tb = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+testbench Tb
+    dut : Top
+    n   : uint<32> default 0
+
+    function tf(t: Beat) -> uint<8>
+        n = n + 1
+        return t.v
+    end tf
+
+    function ts(x: uint<8>) -> uint<8>
+        n = n + x
+        return x
+    end ts
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["        let z = tf(b)", "        let z = ts(1)"] {
+        lower_src(&tb(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want, got) in [
+        ("        let z = tf(1)", "a `Beat`", "a non-record value"),
+        // This one reached the verifier before, not the user.
+        ("        let z = tf(o)", "a `Beat`", "a `Other`"),
+        ("        let z = ts(b)", "a non-record value", "a `Beat`"),
+    ] {
+        let src = tb(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("of testbench method")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // The SIBLING spelling — `inner(x)` from another method of the same
+    // transactor, where the bound-instance spelling is `drv.inner(x)`.
+    let sib = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+transactor Drv
+    dut : Top
+
+    when active
+        hookable inner(t: Beat)
+            dut.en = t.v
+            wait 1 cycle
+        end hookable
+
+        hookable innersc(k: uint<8>)
+            dut.en = k
+            wait 1 cycle
+        end hookable
+
+        hookable outer(n: uint<8>)
+            let b : Beat
+            let o : Other
+{body}
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.outer(1)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["            inner(b)", "            innersc(1)"] {
+        lower_src(&sib(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want, got) in [
+        ("            inner(1)", "a `Beat`", "a non-record value"),
+        ("            inner(o)", "a `Beat`", "a `Other`"),
+        ("            innersc(b)", "a non-record value", "a `Beat`"),
+    ] {
+        let src = sib(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("of `Drv.") && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}`: {msg}"
+        );
         assert!(
             cpp_tb::emit(&merged_src(&src)).is_ok(),
             "`{body}`: v1 emits it (and g++ refuses)"

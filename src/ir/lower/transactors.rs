@@ -470,6 +470,15 @@ pub(crate) fn lower_transactor(
                         .iter()
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
+                    h.params
+                        .iter()
+                        .map(|p| {
+                            super::helpers::ir_type_of_with_records(
+                                p.ty.as_ref(),
+                                &method_ctx.record_ids,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     h.return_ty.is_some(),
                     *active_only,
                 ),
@@ -1352,6 +1361,15 @@ fn lower_bound_initiator_transactor(
                     h.params
                         .iter()
                         .map(|p| p.name.name.clone())
+                        .collect::<Vec<_>>(),
+                    h.params
+                        .iter()
+                        .map(|p| {
+                            super::helpers::ir_type_of_with_records(
+                                p.ty.as_ref(),
+                                &method_ctx.record_ids,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                     h.return_ty.is_some(),
                     *active_only,

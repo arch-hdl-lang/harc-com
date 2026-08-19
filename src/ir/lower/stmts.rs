@@ -2898,7 +2898,7 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some((param_names, has_ret, callee_active_only)) =
+        let Some((param_names, param_tys, has_ret, callee_active_only)) =
             self.self_transactor_methods.get(name).cloned()
         else {
             return Ok(None);
@@ -2947,6 +2947,25 @@ impl FuncBuilder<'_> {
         for a in args {
             let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
+        }
+        // The SIBLING spelling of the parameter rule — `inner(1)` from
+        // another method of the same transactor, where the bound-
+        // instance spelling is `drv.inner(1)`. Arity is checked above,
+        // so the zip is total.
+        for (i, (a, ty)) in lowered.iter().zip(param_tys.iter()).enumerate() {
+            let want = match ty {
+                IrType::Record(r) => Some(*r),
+                _ => None,
+            };
+            let pname = param_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", i + 1));
+            self.check_slot_type(
+                a,
+                want,
+                &format!("parameter `{pname}` of `{transactor}.{name}`"),
+            )?;
         }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorSelfMethod {
@@ -3126,7 +3145,21 @@ impl FuncBuilder<'_> {
         let mut lowered = Vec::with_capacity(args.len());
         for a in args {
             let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
-            lowered.push(self.lower_expr_no_ports(e)?);
+            let v = self.lower_expr_no_ports(e)?;
+            // Every REACHABLE tseq parameter is a scalar, so the slot
+            // rule here needs no type table — `ctx.tseqs` carries names
+            // and the element type, and that is enough.
+            //
+            // Measured, a record-typed tseq parameter has no working
+            // member at all: yielding it is refused upstream (`yield
+            // <param>` is not a record local), reading `<param>.<field>`
+            // is refused, and even leaving it UNUSED breaks both
+            // backends — tbir emits `[&](uint64_t seed)` and v1
+            // `[&](VBeat* seed)`, treating the record as a Verilated
+            // module pointer, and neither compiles. So a record
+            // argument here is wrong however the callee is written.
+            self.check_slot_type(&v, None, &format!("parameter of tseq `{name}`"))?;
+            lowered.push(v);
         }
         Ok(Expr::Call(
             crate::ir::CallTarget::Tseq(name.to_string()),

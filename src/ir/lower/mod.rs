@@ -6413,7 +6413,14 @@ pub(crate) struct FuncBuilder<'a> {
     /// same information `TransactorMethodSchema::param_names` carries
     /// for the bound-instance path, and it was dropped in both places
     /// for the same reason.
-    pub(crate) self_transactor_methods: HashMap<String, (Vec<String>, bool, bool)>,
+    /// Sibling methods callable by bare name inside a transactor body:
+    /// `(param_names, param_tys, has_ret, active_only)`. The types are
+    /// carried for the same reason `TransactorMethodSchema::param_tys`
+    /// is — a call site lowers under a snapshot, with no functions
+    /// table, so without them it had nothing to type-check an argument
+    /// against.
+    pub(crate) self_transactor_methods:
+        HashMap<String, (Vec<String>, Vec<crate::ir::IrType>, bool, bool)>,
     /// True while lowering a transactor method declared under
     /// `when active`. Used to reject an always-on method that would
     /// backdoor-call an active-only sibling.
