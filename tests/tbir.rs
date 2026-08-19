@@ -8291,6 +8291,90 @@ end impl T"#
     }
 }
 
+/// A `connect` endpoint may name the OWNER's own port, not just a
+/// sub-component's — `own_ev -> sb.write_obs` on an env that declares
+/// `own_ev : out event<uint<8>>`, and `source.observed -> own_sink` on
+/// one that declares the hookable. v1 implements both and genuinely
+/// WIRES them:
+///
+///     env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });
+///     env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });
+///
+/// TB-IR refused both, under the arm that catches malformed edges — a
+/// feature and a set of mistakes sharing one verdict, which is what made
+/// the note there say "one site, three outcomes".
+///
+/// Nothing downstream needed changing to support it. `src_path` and
+/// `sink_path` are relative to the owning scope, so the EMPTY path
+/// already means the owner: `resolve_component_path_mode` returns the
+/// owner untouched for it, and the emitter chains it onto the instance
+/// prefix. tbir's wiring lines come out byte-identical to v1's.
+#[test]
+fn a_connect_endpoint_may_name_the_owners_own_port() {
+    let base = fixture("analysis_sink_connect_test.harc");
+
+    // SOURCE direction: the env's own `out event` feeds a sub-component.
+    let own_src = base
+        .replacen(
+            "env AnalysisEnv\n    source : AnalysisSource passive",
+            "env AnalysisEnv\n    own_ev : out event<uint<8>>\n    source : AnalysisSource passive",
+            1,
+        )
+        .replacen(
+            "        source.observed -> sb.write_obs\n",
+            "        own_ev -> sb.write_obs\n",
+            1,
+        );
+    let cpp = emit_cpp_src(&own_src);
+    assert!(
+        cpp.contains("env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });"),
+        "the owner's own event is wired, and exactly as v1 wires it:\n{cpp}"
+    );
+
+    // SINK direction: a sub-component's event feeds the env's own hookable.
+    let own_sink = base
+        .replacen(
+            "env AnalysisEnv\n    source : AnalysisSource passive",
+            "env AnalysisEnv\n    seen : uint<32> default 0\n    source : AnalysisSource passive",
+            1,
+        )
+        .replacen(
+            "    connect",
+            "    hookable own_sink(v: uint<8>)\n        seen = seen + 1\n    end hookable\n\n    connect",
+            1,
+        )
+        .replacen(
+            "        source.observed -> sb.write_obs\n",
+            "        source.observed -> own_sink\n",
+            1,
+        );
+    let cpp = emit_cpp_src(&own_sink);
+    assert!(
+        cpp.contains(
+            "env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });"
+        ),
+        "the owner's own hookable is wired, and exactly as v1 wires it:\n{cpp}"
+    );
+
+    // …and a single segment that names NEITHER — a sub-component field,
+    // say — is still the malformed edge it always was. Measured on
+    // `src.observed -> sink`: instantiated, g++ refuses; UNINSTANTIATED,
+    // v1 compiles. So it keeps `connect`'s standing placement verdict
+    // rather than borrowing the sub-component arm's `EmitsUncompilable`,
+    // which would be false half the time.
+    let not_a_port = base.replacen(
+        "        source.observed -> sb.write_obs\n",
+        "        source.observed -> source\n",
+        1,
+    );
+    let err = lower_src(&not_a_port).unwrap_err();
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("sink `source` without a method"),
+        "names the endpoint the user wrote: {msg}"
+    );
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
@@ -19682,7 +19766,15 @@ end impl T"#
 
     for (edge, want) in [
         ("src.observed -> sink", "sink `sink` without a method"),
-        ("src -> sink.take", "source `src` without an event field"),
+        // Reported against the OWNER now: a single-segment source is a
+        // real spelling (see the owner-relative test below), so `src`
+        // gets checked as one and fails on being a sub-component field
+        // rather than an event port. Same `Unsupported`, same placement
+        // reason, a name closer to what the user wrote.
+        (
+            "src -> sink.take",
+            "source `src` that is not an `out event` port",
+        ),
         (
             "src.n -> sink.take",
             "source `src.n` that is not an `out event` port",

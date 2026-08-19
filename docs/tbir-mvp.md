@@ -7681,6 +7681,62 @@ former `transaction` group lives in
      comment as a record of a conclusion rather than of a measurement
      that has an expiry date.
 
+120. **A feature and a set of mistakes sharing one verdict (2026-08-19).**
+
+     The `connect` endpoint arm refused every edge whose source or sink
+     was a single segment, and its note said why in a sentence that also
+     named the exception: *"a single-segment endpoint resolves against
+     the owner's own hookable / `out event` and works"*. That was
+     recorded as a reason the verdict had to stay vague — "one site,
+     three outcomes" — rather than as a feature to implement.
+
+     It is a feature, in both directions, and v1 genuinely WIRES it:
+
+     ```
+     own_ev -> sb.write_obs
+       → env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });
+
+     source.observed -> own_sink
+       → env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });
+     ```
+
+     Both compile. tbir now lowers both, and its wiring lines are
+     byte-identical to v1's — verified by diffing the emitted
+     `push_back` sets, not by reading them.
+
+     Nothing downstream needed changing, which is the part worth
+     recording: `src_path`/`sink_path` are documented as relative to the
+     owning scope, so the EMPTY path already meant "the owner".
+     `resolve_component_path_mode` returns the start component untouched
+     for an empty path, and the emitter chains it onto the instance
+     prefix. The gap was one `len() < 2` guard rejecting a shape three
+     other layers already handled.
+
+     **Two things this did NOT license.** Splitting a feature out of a
+     mixed arm routes new shapes into the neighbouring arms, and those
+     were measured on different inputs:
+
+     - A single segment naming something that is neither a hookable nor
+       an event — a sub-component field, say — started reaching the
+       sub-component arm and inheriting its
+       `NotImplemented { EmitsUncompilable }`. Measured on
+       `src.observed -> sink`: instantiated, g++ refuses; UNINSTANTIATED,
+       v1 compiles. `EmitsUncompilable` would be false half the time, so
+       it keeps `connect`'s standing placement verdict instead.
+     - The testbench-owned `connect` resolver gets `None` for the owner
+       id, because a testbench is not itself a component in the table.
+       Its own-relative form is UNMEASURED, and the comment says so
+       rather than implying it is impossible.
+
+     The placement rule the old note recorded still governs everything
+     else, and this round re-measured it across six malformations × two
+     placements × both backends: instantiated, v1 emits the path
+     verbatim and g++ refuses; uninstantiated, v1 emits no wiring and
+     succeeds. Uniform. That is why the `--codegen v1` suggestion stays
+     on the genuinely malformed edges — it is true somewhere — and it is
+     the same evidence, now separated from the feature it was tangled
+     with.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

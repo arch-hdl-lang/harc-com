@@ -2136,7 +2136,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let comp_snapshot = prog.components.clone();
     for (i, src) in comp_sources.iter().enumerate() {
         if let components::CompSource::Env(decl) | components::CompSource::Agent(decl) = src {
-            let connects = components::resolve_connects(decl, &comp_snapshot[i], &comp_snapshot)?;
+            let connects = components::resolve_connects(
+                decl,
+                ir::ComponentId(i as u32),
+                &comp_snapshot[i],
+                &comp_snapshot,
+            )?;
             prog.components[i].connects = connects;
         }
     }

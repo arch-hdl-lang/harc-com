@@ -2137,6 +2137,7 @@ fn lower_method_body(
 /// from the env down, e.g. `["source"]`).
 pub(crate) fn resolve_connects(
     env: &ComponentDecl,
+    env_id: ComponentId,
     env_schema: &ComponentSchema,
     components: &[ComponentSchema],
 ) -> Result<Vec<ConnectEdgeSchema>, LowerError> {
@@ -2146,9 +2147,13 @@ pub(crate) fn resolve_connects(
             continue;
         };
         for e in &block.edges {
-            edges.push(resolve_one_connect(env, components, e, |path| {
-                resolve_sub_path(env_schema, components, path)
-            })?);
+            edges.push(resolve_one_connect(
+                env,
+                Some(env_id),
+                components,
+                e,
+                |path| resolve_sub_path(env_schema, components, path),
+            )?);
         }
     }
     Ok(edges)
@@ -2167,7 +2172,11 @@ pub(crate) fn resolve_testbench_connects(
             continue;
         };
         for e in &block.edges {
-            edges.push(resolve_one_connect(tb, components, e, |path| {
+            // `None`: a testbench is not itself a component in the
+            // table, so it has no id for a single-segment endpoint to
+            // resolve against. Its own-relative form is UNMEASURED, not
+            // known-impossible — the env one below is what was probed.
+            edges.push(resolve_one_connect(tb, None, components, e, |path| {
                 resolve_testbench_path(roots, components, path)
             })?);
         }
@@ -2175,8 +2184,21 @@ pub(crate) fn resolve_testbench_connects(
     Ok(edges)
 }
 
+/// How an endpoint reads back to the user. The path is relative to the
+/// owning scope, so an EMPTY one is the owner's own port — `own_ev`, not
+/// `.own_ev`, which is what naive `join(".")` produces once single-segment
+/// endpoints are allowed to reach these messages.
+fn endpoint_label(path: &[String], leaf: &str) -> String {
+    if path.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{}.{leaf}", path.join("."))
+    }
+}
+
 fn resolve_one_connect<F>(
     owner: &ComponentDecl,
+    owner_id: Option<ComponentId>,
     components: &[ComponentSchema],
     edge: &ConnectEdge,
     resolve_path: F,
@@ -2209,19 +2231,46 @@ where
     })?;
     // The source path is `<subcomp>.<event>` (final segment is the event
     // port on the source sub-component).
-    if from.len() < 2 {
-        // NOT reclassified, and the reason is worth keeping: what v1
-        // does with a malformed `connect` edge depends on where the edge
-        // SITS, not on how it is malformed. In an INSTANTIATED env v1
-        // emits the path verbatim and the result usually does not
-        // compile — but a single-segment endpoint resolves against the
-        // owner's own hookable / `out event` and works
-        // (`E_take(_tb.top, _t)`), and an UNINSTANTIATED env emits no
-        // wiring at all, so every malformed edge in one is invisible and
-        // v1 simply succeeds. tbir resolves `connect` for every env in
-        // the merged file, so it sees edges v1 never reaches. One site,
-        // three outcomes — the `--codegen v1` suggestion stays, because
-        // it is true somewhere.
+    // A SINGLE-segment endpoint names the owner's own port rather than a
+    // sub-component's, and that is a v1 feature this arm used to refuse
+    // along with the malformed edges. The note that lived here said as
+    // much in passing — "a single-segment endpoint resolves against the
+    // owner's own hookable / `out event` and works" — and it is exact:
+    // v1 emits, for `own_ev -> sb.write_obs` on an env declaring
+    // `own_ev : out event<uint<8>>`,
+    //
+    //     env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });
+    //
+    // and for the sink direction `source.observed -> own_sink`,
+    //
+    //     env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });
+    //
+    // Both compile and both are genuinely WIRED, not dropped. So this is
+    // an implementable gap, not a malformation, and lumping the two
+    // under one verdict is what made "one site, three outcomes" true.
+    //
+    // Nothing downstream needed changing: `src_path`/`sink_path` are
+    // relative to the owning scope, so the EMPTY path already means "the
+    // owner", `resolve_component_path_mode` returns the owner untouched
+    // for it, and the emitter chains it onto the instance prefix to
+    // produce exactly v1's line.
+    //
+    // What stays rejected is an endpoint with no segments at all, which
+    // names nothing in any scope. The placement rule the old note
+    // records still governs THAT case and the other malformed shapes:
+    // in an instantiated env v1 emits the path verbatim and g++ refuses;
+    // in an uninstantiated one v1 emits no wiring and succeeds, so the
+    // same edge is invisible there. Measured across six malformations ×
+    // both placements — uniform, and the reason the `--codegen v1`
+    // suggestion stays: it is true somewhere.
+    // `from.is_empty()` is UNREACHABLE — `dotted_path` returns `Some`
+    // only with at least one segment — and is kept because the split
+    // below computes `from.len() - 1`, which underflows on an empty
+    // slice. It guards an arithmetic edge, not a user-facing case, which
+    // is why no test pins it (confirmed by mutation: deleting it fails
+    // nothing) and why deleting it would be trading a diagnostic for a
+    // panic.
+    if from.is_empty() || (from.len() < 2 && owner_id.is_none()) {
         return Err(unsupported(
             &format!(
                 "a `connect` source `{}` without an event field",
@@ -2234,7 +2283,10 @@ where
     let src_event = src_event[0].clone();
     // The sink path is `<subcomp>.<method>` (final segment is the
     // hookable method on the sink sub-component).
-    if to.len() < 2 {
+    // Same rule at the sink: `-> own_sink` names the owner's own
+    // hookable, which v1 wires (see the source note above).
+    // Same underflow guard as the source side above.
+    if to.is_empty() || (to.len() < 2 && owner_id.is_none()) {
         return Err(unsupported(
             &format!("a `connect` sink `{}` without a method", to.join(".")),
             "",
@@ -2244,7 +2296,10 @@ where
     let sink_name = sink_name[0].clone();
 
     // Resolve the source sub-component and verify it exposes `src_event`.
-    let src_cid = resolve_path(src_path)?;
+    let src_cid = match (src_path.is_empty(), owner_id) {
+        (true, Some(id)) => id,
+        _ => resolve_path(src_path)?,
+    };
     let src_comp = &components[src_cid.index()];
     let (src_payload, src_activation) = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
@@ -2255,8 +2310,8 @@ where
         _ => {
             return Err(unsupported(
                 &format!(
-                    "a `connect` source `{}.{src_event}` that is not an `out event` port",
-                    src_path.join(".")
+                    "a `connect` source `{}` that is not an `out event` port",
+                    endpoint_label(src_path, &src_event)
                 ),
                 "",
             ));
@@ -2266,7 +2321,10 @@ where
     // Resolve the sink sub-component. The final segment is either a
     // hookable sink method (`sb.write_obs`) or an `in event<T>` field on
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
-    let sink_cid = resolve_path(sink_path)?;
+    let sink_cid = match (sink_path.is_empty(), owner_id) {
+        (true, Some(id)) => id,
+        _ => resolve_path(sink_path)?,
+    };
     let sink_comp = &components[sink_cid.index()];
     // The SEMANTIC sink checks below. Measured on an INSTANTIATED env,
     // which is the only place v1 looks at the edge at all:
@@ -2317,8 +2375,8 @@ where
         if !sm.hookable {
             return Err(not_implemented(
                 &format!(
-                    "a `connect` sink method `{}.{sink_name}` that is not `hookable`",
-                    sink_path.join(".")
+                    "a `connect` sink method `{}` that is not `hookable`",
+                    endpoint_label(sink_path, &sink_name)
                 ),
                 "analysis sinks must be declared `hookable`; v1 emits a fan-out over the \
                  method name as if it were an event vector, which is not a member of the \
@@ -2340,8 +2398,8 @@ where
         if sm.has_ret {
             return Err(not_implemented(
                 &format!(
-                    "a `connect` sink method `{}.{sink_name}` that returns a value",
-                    sink_path.join(".")
+                    "a `connect` sink method `{}` that returns a value",
+                    endpoint_label(sink_path, &sink_name)
                 ),
                 "analysis sinks must not return a value; v1 refuses it too, with \"must \
                  return void\"",
@@ -2350,10 +2408,8 @@ where
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
             return Err(connect_payload_mismatch(
-                &src_path.join("."),
-                &src_event,
-                &sink_path.join("."),
-                &sink_name,
+                &endpoint_label(src_path, &src_event),
+                &endpoint_label(sink_path, &sink_name),
                 both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
@@ -2369,10 +2425,8 @@ where
     {
         if *payload != src_payload {
             return Err(connect_payload_mismatch(
-                &src_path.join("."),
-                &src_event,
-                &sink_path.join("."),
-                &sink_name,
+                &endpoint_label(src_path, &src_event),
+                &endpoint_label(sink_path, &sink_name),
                 both_scalar_payloads(src_payload, *payload),
             ));
         }
@@ -2381,11 +2435,26 @@ where
             *activation,
         )
     } else {
+        // An OWNER-relative name that resolves to neither is a malformed
+        // single-segment endpoint, not the sub-component shape this arm
+        // was measured on, and it does not share its v1 profile.
+        // Measured on `src.observed -> sink`, where `sink` names a
+        // sub-component FIELD of the owner: instantiated, g++ refuses;
+        // UNINSTANTIATED, v1 compiles. So `EmitsUncompilable` would be
+        // false half the time, and this falls under `connect`'s standing
+        // placement rule instead — the same verdict the other malformed
+        // endpoints get, for the same measured reason.
+        if sink_path.is_empty() {
+            return Err(unsupported(
+                &format!("a `connect` sink `{sink_name}` without a method"),
+                "",
+            ));
+        }
         return Err(not_implemented(
             &format!(
-                "a `connect` sink `{}.{sink_name}` that is neither a `hookable` sink \
+                "a `connect` sink `{}` that is neither a `hookable` sink \
                  method nor an `event` field",
-                sink_path.join(".")
+                endpoint_label(sink_path, &sink_name)
             ),
             "v1 emits a fan-out over the name as if it were an event vector; on a scalar \
              field that does not compile",
@@ -2451,17 +2520,11 @@ fn resolve_testbench_path(
 ///
 /// `scalars` is the caller's answer to "are both sides scalars?", which
 /// is the exact discriminator rather than a proxy for it.
-fn connect_payload_mismatch(
-    src_path: &str,
-    src_event: &str,
-    sink_path: &str,
-    sink_name: &str,
-    scalars: bool,
-) -> LowerError {
-    let construct = format!(
-        "a `connect` payload mismatch from `{src_path}.{src_event}` to \
-         `{sink_path}.{sink_name}`"
-    );
+fn connect_payload_mismatch(src: &str, sink: &str, scalars: bool) -> LowerError {
+    // Both arguments are already full endpoint labels (`endpoint_label`),
+    // not path-plus-leaf: an owner-relative endpoint has an EMPTY path,
+    // and re-appending the leaf here would render it `.own_ev`.
+    let construct = format!("a `connect` payload mismatch from `{src}` to `{sink}`");
     if scalars {
         unsupported(
             &construct,
