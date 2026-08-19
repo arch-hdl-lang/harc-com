@@ -10487,7 +10487,154 @@ impl Emitter {
                 v.map(|v| if v == 0 { 1 } else { 64 - v.leading_zeros() })
             }
             ExprKind::Ident(id) => self.let_widths.get(&id.name).map(|lw| lw.bits),
+            ExprKind::Field { .. } | ExprKind::Index { .. } => self
+                .resolve_value_field_type(e)
+                .and_then(|ty| declared_type_bit_width(&ty)),
             _ => None,
+        }
+    }
+
+    /// Conservative width propagation specifically for shift receivers.
+    /// A wide value nested in arithmetic/ternary syntax must not fall back
+    /// to C++'s 64-bit shift path. A literal `&` mask is the one narrowing
+    /// operation: it bounds the result to the smaller known width.
+    fn infer_shift_width_best_effort(&self, e: &Expr) -> Option<u32> {
+        match &*e.kind {
+            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
+                self.infer_shift_width_best_effort(inner)
+            }
+            ExprKind::Binary {
+                op: BinaryOp::BitAnd,
+                lhs,
+                rhs,
+            } => {
+                let bound = |operand: &Expr| match &*operand.kind {
+                    ExprKind::Int(text) => literal_operand_bit_width(text),
+                    _ => self.infer_shift_width_best_effort(operand),
+                };
+                match (bound(lhs), bound(rhs)) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (width, None) | (None, width) => width,
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => self
+                .infer_shift_width_best_effort(lhs)
+                .max(self.infer_shift_width_best_effort(rhs)),
+            ExprKind::Ternary {
+                then_branch,
+                else_branch,
+                ..
+            } => self
+                .infer_shift_width_best_effort(then_branch)
+                .max(self.infer_shift_width_best_effort(else_branch)),
+            ExprKind::Int(text) => literal_operand_bit_width(text),
+            _ => self.infer_expr_width_best_effort(e),
+        }
+    }
+
+    /// Resolve a value-producing field chain to its declared source type.
+    /// The root is a let/testbench/component binding from `let_types`; each
+    /// following segment may walk a record, component, or transactor field.
+    /// This is the v1 counterpart of TB-IR's schema-based record path lookup.
+    fn resolve_value_field_type(&self, e: &Expr) -> Option<TypeExpr> {
+        match &*e.kind {
+            ExprKind::Ident(id) => {
+                let ty_name = self.let_types.get(&id.name)?.clone();
+                Some(TypeExpr::Named {
+                    name: Path {
+                        segments: vec![Ident {
+                            name: ty_name,
+                            span: id.span,
+                        }],
+                        span: id.span,
+                    },
+                    generics: Vec::new(),
+                    mode: None,
+                    span: id.span,
+                })
+            }
+            ExprKind::Index { target, .. } => {
+                let container = self.resolve_value_field_type(target)?;
+                fixed_vec_type_args(&container).map(|(elem, _)| elem.clone())
+            }
+            ExprKind::Field { target, name } => {
+                let owner = self.resolve_value_field_type(target)?;
+                let owner_name = type_simple_name(Some(&owner))?;
+                if let Some(fields) = self.record_fields.get(owner_name) {
+                fields
+                    .iter()
+                        .find(|f| f.name.name == name.name)
+                    .map(|f| f.ty.clone())
+                } else if let Some(comp) = self.components.get(owner_name) {
+                    component_field_type(&comp.items, &name.name)
+                } else if let Some(transactor) = self.transactors.get(owner_name) {
+                    component_field_type(
+                        &synth_component_from_transactor(
+                            transactor,
+                            /*include_active*/ true,
+                        )
+                        .items,
+                        &name.name,
+                    )
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Best-effort signedness for ordinary expression emission. This mirrors
+    /// the TB-IR shift rule closely enough that a wide signed record field and
+    /// simple expressions derived from it select arithmetic right shift.
+    fn infer_expr_signed_best_effort(&self, e: &Expr) -> bool {
+        match &*e.kind {
+            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
+                self.infer_expr_signed_best_effort(inner)
+            }
+            ExprKind::Cast { ty, .. } => matches!(
+                ty,
+                TypeExpr::Builtin {
+                    name: BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Int,
+                    ..
+                }
+            ),
+            ExprKind::Ident(id) => self
+                .let_widths
+                .get(&id.name)
+                .is_some_and(|lw| lw.signed),
+            ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                self.resolve_value_field_type(e).is_some_and(|ty| {
+                matches!(
+                    ty,
+                    TypeExpr::Builtin {
+                        name: BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Int,
+                        ..
+                    }
+                )
+                })
+            }
+            ExprKind::Int(_) => true,
+            ExprKind::Ternary {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.infer_expr_signed_best_effort(then_branch)
+                    && self.infer_expr_signed_best_effort(else_branch)
+            }
+            ExprKind::Binary { op, lhs, rhs } => match op {
+                BinaryOp::Shl | BinaryOp::Shr => self.infer_expr_signed_best_effort(lhs),
+                _ => {
+                    self.infer_expr_signed_best_effort(lhs)
+                        && self.infer_expr_signed_best_effort(rhs)
+                }
+            },
+            ExprKind::Call { callee, .. } => matches!(
+                &*callee.kind,
+                ExprKind::Field { name, .. } if name.name == "sext"
+            ),
+            _ => false,
         }
     }
 
@@ -12184,17 +12331,139 @@ impl Emitter {
             }
             return;
         }
+        if let Some(name) = self.packed_record_name(ty) {
+            let Some(width) = self.packed_width(ty) else {
+                return;
+            };
+            let words = width.div_ceil(32).max(1);
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "{target_expr} = harc_unpack_{name}(harc_rt::harc_wide_extract_bits<{words}>(_packed, {offset}, {width}));"
+            )
+            .ok();
+            return;
+        }
         let Some(width) = self.packed_width(ty) else {
             return;
         };
         let cty = self.record_field_c_type(ty);
+        let rhs = if width <= 64 {
+            format!(
+                "({cty})harc_rt::harc_bits(_packed, {}, {offset})",
+                offset + width - 1
+            )
+        } else if width <= 128 {
+            format!(
+                "static_cast<_harc_u128>(harc_rt::harc_wide_extract_bits<4>(_packed, {offset}, {width}))"
+            )
+        } else {
+            let words = width.div_ceil(32);
+            format!("harc_rt::harc_wide_extract_bits<{words}>(_packed, {offset}, {width})")
+        };
         self.pad(depth);
-        writeln!(
-            self.out,
-            "{target_expr} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
-            hi = offset + width - 1
-        )
-        .ok();
+        writeln!(self.out, "{target_expr} = {rhs};").ok();
+    }
+
+    fn emit_structured_unpack_field(
+        &mut self,
+        ty: &TypeExpr,
+        target_expr: &str,
+        raw_expr: &str,
+        depth: usize,
+    ) {
+        if let Some((elem, len)) = fixed_vec_type_args(ty) {
+            for i in 0..len {
+                self.emit_structured_unpack_field(
+                    elem,
+                    &format!("{target_expr}[{i}]"),
+                    &format!("{raw_expr}[{i}]"),
+                    depth,
+                );
+            }
+            return;
+        }
+        if let Some(name) = self.packed_record_name(ty) {
+            self.pad(depth);
+            writeln!(self.out, "{target_expr} = harc_unpack_{name}({raw_expr});").ok();
+            return;
+        }
+        let width = self.packed_width(ty).unwrap_or(64);
+        let signed = matches!(
+            ty,
+            TypeExpr::Builtin {
+                name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                ..
+            }
+        );
+        let numeric = matches!(
+            ty,
+            TypeExpr::Builtin {
+                name: BuiltinTy::UInt
+                    | BuiltinTy::UIntCap
+                    | BuiltinTy::Bits
+                    | BuiltinTy::Int
+                    | BuiltinTy::SInt
+                    | BuiltinTy::SIntCap,
+                ..
+            }
+        );
+        let rhs = if width > 128 {
+            let words = width.div_ceil(32);
+            format!(
+                "harc_rt::harc_wide_trunc<{words}>(harc_rt::harc_read({raw_expr}), {width})"
+            )
+        } else if signed && width <= 64 {
+            format!(
+                "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({raw_expr})), {width}, 64))"
+            )
+        } else if numeric {
+            let cty = self.record_field_c_type(ty);
+            format!(
+                "static_cast<{cty}>(harc_rt::harc_trunc_u128(static_cast<_harc_u128>(harc_rt::harc_read({raw_expr})), {width}))"
+            )
+        } else {
+            let cty = self.record_field_c_type(ty);
+            format!("static_cast<{cty}>(harc_rt::harc_read({raw_expr}))")
+        };
+        self.pad(depth);
+        writeln!(self.out, "{target_expr} = {rhs};").ok();
+    }
+
+    fn emit_structured_drive_field(
+        &mut self,
+        ty: &TypeExpr,
+        sig_expr: &str,
+        value_expr: &str,
+        depth: usize,
+    ) {
+        if let Some((elem, len)) = fixed_vec_type_args(ty) {
+            for i in 0..len {
+                self.emit_structured_drive_field(
+                    elem,
+                    &format!("{sig_expr}[{i}]"),
+                    &format!("{value_expr}[{i}]"),
+                    depth,
+                );
+            }
+            return;
+        }
+        self.pad(depth);
+        if let Some(name) = self.packed_record_name(ty) {
+            writeln!(self.out, "harc_drive_{name}({sig_expr}, {value_expr});").ok();
+        } else {
+            let width = self.packed_width(ty);
+            let normalized = match width {
+                Some(w) if w > 128 => {
+                    format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
+                }
+                Some(w) => format!(
+                    "harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})"
+                ),
+                None => value_expr.to_string(),
+            };
+            writeln!(self.out, "harc_rt::harc_assign({sig_expr}, {normalized});").ok();
+        }
     }
 
     fn emit_record_pack_helpers(&mut self, name: &str, fields: &[Field]) {
@@ -12240,15 +12509,12 @@ impl Emitter {
             self.pad(2);
             writeln!(self.out, "{name} value{{}};").ok();
             for f in fields {
-                if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
-                    for i in 0..len {
-                        self.pad(2);
-                        writeln!(self.out, "value.{0}[{i}] = raw.{0}[{i}];", f.name.name).ok();
-                    }
-                } else {
-                    self.pad(2);
-                    writeln!(self.out, "value.{0} = raw.{0};", f.name.name).ok();
-                }
+                self.emit_structured_unpack_field(
+                    &f.ty,
+                    &format!("value.{}", f.name.name),
+                    &format!("raw.{}", f.name.name),
+                    2,
+                );
             }
             self.pad(2);
             writeln!(self.out, "return value;").ok();
@@ -12293,15 +12559,12 @@ impl Emitter {
             )
             .ok();
             for f in fields {
-                if let Some((_, len)) = fixed_vec_type_args(&f.ty) {
-                    for i in 0..len {
-                        self.pad(2);
-                        writeln!(self.out, "sig.{0}[{i}] = value.{0}[{i}];", f.name.name).ok();
-                    }
-                } else {
-                    self.pad(2);
-                    writeln!(self.out, "sig.{0} = value.{0};", f.name.name).ok();
-                }
+                self.emit_structured_drive_field(
+                    &f.ty,
+                    &format!("sig.{}", f.name.name),
+                    &format!("value.{}", f.name.name),
+                    2,
+                );
             }
             self.pad(1);
             writeln!(self.out, "}} else {{").ok();
@@ -19482,6 +19745,65 @@ impl Emitter {
                         return;
                     }
                 }
+                // Shifts on wide scalar values operate at the HARC type's
+                // declared width, not at the padded C++ carrier width. Use
+                // the same runtime helpers as TB-IR so non-word-aligned
+                // UInt values cannot retain padding bits and SInt right
+                // shifts sign-fill from their declared sign bit.
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    if let Some(width) = self
+                        .infer_shift_width_best_effort(lhs)
+                        .filter(|w| *w > 64)
+                    {
+                        let signed = self.infer_expr_signed_best_effort(lhs);
+                        match (*op, width, signed) {
+                            (BinaryOp::Shl, 129.., _) => {
+                                write!(self.out, "harc_rt::harc_wide_mask_bits(((").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, ") << (").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, ")), {width})").ok();
+                            }
+                            (BinaryOp::Shl, _, _) => {
+                                write!(self.out, "harc_rt::harc_shl_u128((_harc_u128)(").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, "), (uint64_t)(").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, "), {width})").ok();
+                            }
+                            (BinaryOp::Shr, 129.., true) => {
+                                write!(self.out, "harc_rt::harc_wide_ashr((").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, "), (uint64_t)(").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, "), {width})").ok();
+                            }
+                            (BinaryOp::Shr, 129.., false) => {
+                                write!(self.out, "harc_rt::harc_wide_mask_bits(((").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, ") >> (").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, ")), {width})").ok();
+                            }
+                            (BinaryOp::Shr, _, true) => {
+                                write!(self.out, "harc_rt::harc_ashr_u128((_harc_u128)(").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, "), (uint64_t)(").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, "), {width})").ok();
+                            }
+                            (BinaryOp::Shr, _, false) => {
+                                write!(self.out, "harc_rt::harc_shr_u128((_harc_u128)(").ok();
+                                self.emit_expr(lhs);
+                                write!(self.out, "), (uint64_t)(").ok();
+                                self.emit_expr(rhs);
+                                write!(self.out, "), {width})").ok();
+                            }
+                            _ => unreachable!(),
+                        }
+                        return;
+                    }
+                }
                 self.emit_expr(lhs);
                 let s = c_binary_op(*op);
                 write!(self.out, " {s} ").ok();
@@ -20441,6 +20763,13 @@ fn wide_literal_bit_width(s: &str) -> Option<u32> {
 struct LetWidth {
     bits: u32,
     signed: bool,
+}
+
+fn component_field_type(items: &[ComponentItem], name: &str) -> Option<TypeExpr> {
+    items.iter().find_map(|item| match item {
+        ComponentItem::Field(field) if field.name.name == name => Some(field.ty.clone()),
+        _ => None,
+    })
 }
 
 /// A one-bit UNSIGNED scalar field, the only field shape that reads as a

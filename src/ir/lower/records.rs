@@ -38,9 +38,8 @@ use std::collections::HashMap;
 ///
 /// | field type | v1 emits | verdict |
 /// |---|---|---|
-/// | `uint<65>` … `uint<256>` | `_harc_u128` / `harc_rt::HarcWide<n>`, with a matching draw | a real escape hatch |
 /// | `list<uint<8>>`, `list<uint<256>>`, `list<bool>` | `std::vector<T>` + resize + per-element draw | likewise |
-/// | `Vec<uint, 4>`, `Vec<uint<128>, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | likewise |
+/// | `Vec<uint, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | likewise |
 /// | `list<Vec<uint<8>, 2>>` | `std::vector<std::array<uint64_t, 2>>` — then `[_i] = 0` | `EmitsUncompilable` |
 /// | `list<Inner>`, `list<string>` | `std::vector<uint64_t>`, and randomize skips the field | `SilentlyMisLowers` |
 /// | `list<queue<uint<8>>>`, `list<int>` | `std::vector<uint64_t>` + `[_i] = 0` | `SilentlyMisLowers` |
@@ -120,7 +119,7 @@ fn non_scalar_record_leaf(
     record_ids: &HashMap<String, RecordId>,
 ) -> LowerError {
     use crate::codegen::cpp_tb::RecordLeafFate;
-    const SUBSET: &str = "only uint/sint/bits/bool/bit scalar fields up to 64 bits, fixed \
+    const SUBSET: &str = "only nonzero-width uint/sint/bits/bool/bit scalar fields, fixed \
                           `Vec<T, N>` arrays of such scalars or of supported \
                           struct/transaction records, and nested struct/transaction fields \
                           (whose leaves are themselves supported) are lowered";
@@ -662,9 +661,9 @@ fn declared_scalar_width(args: &[TypeArg]) -> Option<u32> {
 }
 
 /// Scalar field-type mapping, mirroring v1's `txn_field_c_type` C-type
-/// choices for the ≤64-bit subset: uint/bits/int → unsigned, sint →
-/// signed, bool/bit → bool. `None` for anything this slice does not
-/// lower (nested records, enums, lists, vecs, >64-bit widths), and for
+/// choices: uint/bits/int → unsigned, sint → signed, bool/bit →
+/// bool. `None` for anything this slice does not lower (nested records,
+/// enums, lists, vecs), and for
 /// a width this compiler cannot read as a plain decimal — the same
 /// reader `zero_width_leaf` uses, so the two cannot drift.
 fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -> Option<IrType> {
@@ -685,7 +684,7 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
         Some(_) => return None,
         None => None,
     };
-    if width.is_some_and(|w| w == 0 || w > 64) {
+    if width == Some(0) {
         return None;
     }
     match name {

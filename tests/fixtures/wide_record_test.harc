@@ -1,0 +1,58 @@
+struct WideLeaf
+    value : uint<256>
+    odd   : uint<130>
+    sign  : sint<65>
+    long_sign : sint<130>
+    tag   : uint<3>
+end struct WideLeaf
+
+struct WideEnvelope
+    head  : uint<8>
+    inner : WideLeaf
+    lanes : Vec<uint<129>, 2>
+end struct WideEnvelope
+
+struct WideTable
+    entries : Vec<WideLeaf, 2>
+end struct WideTable
+
+test WideRecordTest
+    let dut : Top
+
+    run
+        let one : uint<256> = 1
+        let neg9 : sint<9> = 0 - 1
+        let a : WideLeaf
+        a.value = one << 200
+        a.odd = one.trunc<130>() << 129
+        a.sign = (one.trunc<65>() << 64) as sint<65>
+        a.long_sign = neg9.sext<130>()
+        a.tag = 5
+
+        let b : WideLeaf = a
+        assert b == a else fail("wide record copy changed the value")
+        assert b.value == a.value else fail("wide field changed")
+        assert b.value[207:193] == 128 else fail("high slice changed")
+        assert (b.odd >> 129) == 1 else fail("wide right shift changed")
+        assert (b.odd << 1) == 0 else fail("wide left shift leaked into carrier padding")
+        assert (b.sign >> 1)[64:64] == 1 else fail("signed wide right shift lost sign fill")
+        assert ((b.sign + 0) >> 1)[64:64] == 1 else fail("nested signed wide shift lost width")
+        assert (b.long_sign >> 1)[129:129] == 1 else fail("HarcWide signed shift lost sign fill")
+
+        let e : WideEnvelope
+        e.head = 0xA5
+        e.inner = b
+        e.lanes[0] = one.trunc<129>() << 128
+        e.lanes[1] = 7
+        let f : WideEnvelope = e
+        assert f == e else fail("nested/vector wide record copy changed")
+        assert (f.lanes[0] << 1) == 0 else fail("vec element shift leaked into carrier padding")
+        let huge_shift : uint<64> = 4294967296
+        assert (f.lanes[0] >> huge_shift) == 0 else fail("wide shift amount narrowed to 32 bits")
+        assert (b.sign >> huge_shift)[0:0] == 1 else fail("u128 shift amount narrowed to 32 bits")
+
+        let table : WideTable
+        table.entries[0] = b
+        assert (table.entries[0].odd << 1) == 0 else fail("Vec<Record> field lost declared width")
+    end run
+end test WideRecordTest
