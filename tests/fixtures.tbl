@@ -11,6 +11,7 @@ backend_parity_test     | Top            | top_counter.sv         |
 const_expr_init_test    | Top            | top_counter.sv         |
 signed_use_site_test    | Top            | top_counter.sv         |
 signed_helper_param_test | Top           | top_counter.sv         |
+signed_component_method_param_test | Top | top_counter.sv         |
 signed_host_state_test  | Top            | top_counter.sv         |
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 msg_call_hoist_test     | Top            | top_counter.sv         |
@@ -34,6 +35,7 @@ check_phase_shadow_let_test | Top        | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
 component_method_randomize_test | Top     | top_counter.sv         |
+component_early_return_post_cover_test | Top | top_counter.sv      |
 env_quiesced_phase_test | Top            | top_counter.sv         |
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchSmoke
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchEnableToggle

@@ -509,6 +509,7 @@ static EMPTY_CHECK_SCOPE: std::sync::LazyLock<TbFunction> =
         blocks: Vec::new(),
         entry: crate::ir::BlockId(0),
         ret: None,
+        implicit_returns: Vec::new(),
     });
 
 impl Display for TbFunction {
