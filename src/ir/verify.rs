@@ -712,6 +712,27 @@ fn verify_testbench_connect(
     tb: &TestbenchSchema,
     edge: &ConnectEdgeSchema,
 ) -> Result<(), String> {
+    let endpoint_mode = |path: &[String]| -> Result<_, String> {
+        let (root, tail) = path
+            .split_first()
+            .ok_or_else(|| "empty component path".to_string())?;
+        let binding = tb
+            .component_fields
+            .iter()
+            .find(|field| field.field == *root)
+            .ok_or_else(|| format!("root `{root}` is not a testbench component field"))?;
+        resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
+            .map(|resolved| resolved.effective_mode)
+            .map_err(|err| err.to_string())
+    };
+    let source_mode = endpoint_mode(&edge.src_path)?;
+    let sink_mode = endpoint_mode(&edge.sink_path)?;
+    if !component_mode_includes_activation(source_mode, edge.src_activation)
+        || !component_mode_includes_activation(sink_mode, edge.sink_activation)
+    {
+        return Err("connect edge uses a mode-disabled endpoint".to_string());
+    }
+
     let src_id = resolve_testbench_component_path(prog, tb, &edge.src_path)?;
     let src = prog
         .components
