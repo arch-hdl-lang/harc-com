@@ -1083,8 +1083,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // `extern function name(...) -> ret` (spec §9) names — calls to
     // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
-    // across every lowering context (an extern fn is a pure scalar C
-    // call, callable wherever a pure helper is).
+    // across every lowering context (an extern fn is a PURE call,
+    // callable wherever a pure helper is — its parameters are not
+    // restricted to scalars; see `lower_extern_fn_call`).
     let extern_fn_decls: HashMap<String, &crate::ast::ExternFnDecl> = file
         .items
         .iter()
@@ -1236,34 +1237,78 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             )
         })
         .collect();
-    // A RECORD-typed extern parameter is refused at the DECLARATION, not
-    // at the call, because the declaration alone is what breaks: both
-    // backends emit the same forward declaration —
-    // `emit_extern_fn_decls` is shared, tbir calls straight into v1's —
-    // and both render the record as a Verilated module handle:
+    // A HARC-DECLARED type anywhere in an extern-fn signature — any
+    // parameter, or the return — is refused at the DECLARATION, because
+    // the declaration alone is what breaks. `emit_extern_fn_decls` is
+    // shared (tbir calls straight into v1's) and runs every type through
+    // the free `c_type_for`, whose `Named` arm is unconditional:
     //
-    //     uint64_t ref_add(uint64_t a, VBeat* b);   // g++: 'VBeat' has
-    //                                               // not been declared
+    //     TypeExpr::Named { .. } => format!("V{last}*")
     //
-    // so an extern fn that is merely DECLARED already breaks the
-    // translation unit under both. That is what makes it `Invalid` and
-    // makes the call site the wrong place: checking there left a
-    // declared-but-uncalled one lowering clean while the default backend
-    // emitted C++ that does not compile.
+    // so `b: Beat` becomes `VBeat*`, `-> Beat` becomes `VBeat*`, and
+    // `c: Color` becomes `VColor*`. Exactly one `V<name>` is ever in
+    // scope — the DUT module's, via its generated header — so every
+    // other name is undeclared and BOTH backends fail to compile the
+    // translation unit, called or not. Hence `Invalid`, and hence the
+    // declaration rather than the call site.
     //
-    // The `tseq` spelling of this rule is NOT the same and must not be
-    // merged with it: there tbir emits its own lambda
-    // (`[&](uint64_t seed)`), which compiles while unused, so that one
-    // is a per-call `NotImplemented`. An earlier version of this check
-    // claimed the two were "measured the same way"; they were not.
-    for (name, decl) in &extern_fn_decls {
-        for p in &decl.params {
-            if let IrType::Record(_) = helpers::slot_ir_type(p.ty.as_ref(), &record_ids) {
-                return Err(LowerError::Invalid(format!(
-                    "`extern function {name}` declares parameter `{}` with a record type;                      both backends emit it as a Verilated module handle                      (`V<Record>*`), which does not compile — pass the record's fields                      as scalars instead",
-                    p.name.name
-                )));
+    // Keyed on "HARC declares this name", not on `IrType::Record`. The
+    // first version of this check asked the record question, which by
+    // construction cannot see an enum, a component, a transactor or a
+    // covergroup — all of which `c_type_for` renders `V*` just the same
+    // — and looked only at parameters while `emit_extern_fn_decls` runs
+    // the RETURN type through the same function two lines down. One
+    // mechanism, one rule.
+    //
+    // A DUT-module-typed parameter is deliberately NOT caught: `VTop*`
+    // IS in scope, and `extern function ref_peek(d: Top)` compiles under
+    // both backends (measured). That is why this asks what HARC
+    // declares rather than what looks like a module.
+    let harc_declared: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Struct(d) => Some(d.name.name.as_str()),
+            Item::Enum(d) => Some(d.name.name.as_str()),
+            Item::Transaction(d) => Some(d.name.name.as_str()),
+            Item::Agent(d) | Item::Env(d) | Item::Scoreboard(d) | Item::Sequencer(d) => {
+                Some(d.name.name.as_str())
             }
+            Item::Covergroup(d) => Some(d.name.name.as_str()),
+            Item::Transactor(d) => Some(d.name.name.as_str()),
+            Item::Regblock(d) => Some(d.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let declared_name = |t: Option<&TypeExpr>| -> Option<String> {
+        let TypeExpr::Named { name, .. } = t? else {
+            return None;
+        };
+        let last = name.segments.last()?.name.as_str();
+        harc_declared.contains(last).then(|| last.to_string())
+    };
+    // File order, not `extern_fn_decls` order: that is a `HashMap`, so
+    // iterating it reported a different offender run to run on the same
+    // input. `emit_extern_fn_decls` walks `file.items`; so does this.
+    for it in &file.items {
+        let Item::ExternFn(decl) = it else { continue };
+        let bad = decl
+            .params
+            .iter()
+            .find_map(|p| {
+                declared_name(p.ty.as_ref()).map(|ty| (format!("parameter `{}`", p.name.name), ty))
+            })
+            .or_else(|| {
+                declared_name(decl.return_ty.as_ref()).map(|ty| ("return type".to_string(), ty))
+            });
+        if let Some((where_, ty)) = bad {
+            return Err(LowerError::Invalid(format!(
+                "`extern function {}` names the HARC type `{ty}` in its {where_}; both \
+                 backends emit that as `V{ty}*`, a Verilated module handle with no \
+                 declaration, so the generated C++ does not compile — pass the \
+                 record's fields as scalars instead",
+                decl.name.name
+            )));
         }
     }
 
@@ -1860,8 +1905,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
         probes: HashMap::new(),
-        // Extern fns are pure scalar C calls — callable from a pure
-        // helper body.
+        // Extern fns are PURE calls — callable from a pure helper body.
         extern_fns: extern_fns.clone(),
     };
     for it in &file.items {

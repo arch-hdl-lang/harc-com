@@ -7963,7 +7963,7 @@ impl T for Tb
 end impl T"#;
     let msg = assert_invalid(&lower_src(ext).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_add` declares parameter `b` with a record type"),
+        msg.contains("`extern function ref_add` names the HARC type `Beat` in its parameter `b`"),
         "{msg}"
     );
     // …and the UNCALLED declaration is refused too, which is the cell
@@ -7973,9 +7973,107 @@ end impl T"#;
         .replace("        let z = ref_add(1, s)\n", "");
     let msg = assert_invalid(&lower_src(&uncalled).unwrap_err());
     assert!(
-        msg.contains("`extern function ref_add` declares parameter `b`"),
+        msg.contains("`extern function ref_add` names the HARC type `Beat`"),
         "an uncalled record-parameter extern fn is refused too: {msg}"
     );
+    // The RETURN type goes through the same `c_type_for` two lines down
+    // in `emit_extern_fn_decls`, so it is the same defect. Asking the
+    // record question about parameters only missed it: `-> Beat` emits
+    // `VBeat* ref_mk(uint64_t a);` from both backends.
+    let ret = uncalled.replace(
+        "extern function ref_add(a: uint<8>, b: Beat) -> uint<8>",
+        "extern function ref_mk(a: uint<8>) -> Beat",
+    );
+    let msg = assert_invalid(&lower_src(&ret).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_mk` names the HARC type `Beat` in its return type"),
+        "{msg}"
+    );
+    // …and an ENUM parameter, which the record question could not see
+    // by construction, though `c_type_for` renders it `VColor*` alike.
+    let en = uncalled
+        .replace(
+            "transaction Beat\n    v : uint<8>\nend transaction Beat",
+            "enum Color { RED, GREEN }",
+        )
+        .replace(
+            "extern function ref_add(a: uint<8>, b: Beat) -> uint<8>",
+            "extern function ref_en(c: Color) -> uint<8>",
+        );
+    let msg = assert_invalid(&lower_src(&en).unwrap_err());
+    assert!(
+        msg.contains("`extern function ref_en` names the HARC type `Color`"),
+        "{msg}"
+    );
+    // A DUT-MODULE-typed parameter is NOT this defect and must keep
+    // lowering: `VTop*` is the one `V<name>` that IS in scope, and both
+    // backends compile `uint64_t ref_peek(VTop* d);`. This is why the
+    // rule asks what HARC declares rather than what looks like a module.
+    let dut_param = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+extern function ref_peek(d: Top) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(dut_param)
+        .expect("a DUT-module-typed extern parameter lowers (both backends build it)");
+
+    // Extern-fn ARITY, which had no check at all. Without it the slot
+    // loop's `get(i)` silently stopped at the shorter side, and a
+    // surplus argument was checked against a fabricated scalar slot —
+    // `f(1, b)` reported "an argument of extern fn `f` takes a
+    // non-record value", describing parameter #2 of a one-parameter
+    // function. Measured with a compiling control (`f(1)`): both
+    // backends give "too many arguments to function
+    // `uint64_t f(uint64_t)`" and "too few arguments" respectively.
+    let arity = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+extern function f(x: uint<8>) -> uint<8>
+extern function g(y: uint<8>, z: uint<8>) -> uint<8>
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in ["        let a = f(1)", "        let a = g(1, 2)"] {
+        lower_src(&arity(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (body, want) in [
+        (
+            "        let a = f(1, 2)",
+            "`f` takes 1 argument(s), call passes 2",
+        ),
+        (
+            "        let a = g(1)",
+            "`g` takes 2 argument(s), call passes 1",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&arity(body)).unwrap_err());
+        assert!(msg.contains(want), "`{body}`: {msg}");
+    }
 
     // A `TSeq<T>` extern parameter, by contrast, is a slot that WORKS:
     // `c_type_for` renders it `const std::vector<Beat>&` and v1 compiles

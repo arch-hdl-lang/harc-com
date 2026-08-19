@@ -348,9 +348,15 @@ impl FuncBuilder<'_> {
     /// Mirrors v1: arguments lower as plain scalar values and the call
     /// stays an `Expr::Call(CallTarget::ExternFn, ...)`, emitted with the
     /// RAW symbol name so it binds to the user's `extern "C"` definition
-    /// linked via `--ref-src`. Extern fns are pure scalar C functions, so
-    /// (unlike impure helpers) the call never CFG-inlines and never takes
-    /// a DUT handle — arguments are lowered without port access.
+    /// linked via `--ref-src`. An extern fn is PURE — it never
+    /// CFG-inlines and (unlike an impure helper) never takes a DUT
+    /// handle, so arguments lower without port access.
+    ///
+    /// Not "scalar", which this comment used to say and which the loop
+    /// below used to enforce: `c_type_for` renders `TSeq<T>` as
+    /// `const std::vector<T>&`, and a sequence argument compiles under
+    /// both backends. Purity is the property the lowering depends on;
+    /// scalar-ness was an assumption sitting next to it.
     pub(crate) fn lower_extern_fn_call(
         &mut self,
         name: &str,
@@ -367,6 +373,26 @@ impl FuncBuilder<'_> {
             )?;
         }
         let (pnames, ptys) = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
+        // Arity, before the slot loop — the same order
+        // `check_component_call_args` uses, and for the reason its doc
+        // records: without it the `zip`/`get` silently stops at the
+        // shorter side. Measured with a compiling control (`f(1)` on a
+        // one-parameter fn): `f(1, 2)` gives "too many arguments to
+        // function `uint64_t f(uint64_t)`" and `g(1)` on a two-parameter
+        // fn "too few arguments", from both backends.
+        //
+        // This also retires a `None` arm that checked a surplus argument
+        // against a fabricated scalar slot — `f(1, b)` reported that
+        // "an argument of extern fn `f` takes a non-record value",
+        // describing parameter #2 of a one-parameter function. A slot
+        // that does not exist has no type to disagree with.
+        if self.ctx.extern_fns.contains_key(name) && args.len() != pnames.len() {
+            return Err(LowerError::Invalid(format!(
+                "extern fn `{name}` takes {} argument(s), call passes {}",
+                pnames.len(),
+                args.len()
+            )));
+        }
         let mut lowered = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             match a {
@@ -392,9 +418,10 @@ impl FuncBuilder<'_> {
                     // The record case never reaches here: it is refused
                     // at the declaration, where both backends already
                     // break.
-                    match ptys.get(i) {
-                        Some(want) => self.check_slot_ir(&v, want, &slot)?,
-                        None => self.check_slot_type(&v, None, &slot)?,
+                    // Arity is checked above, so the index is total
+                    // whenever the callee is known at all.
+                    if let Some(want) = ptys.get(i) {
+                        self.check_slot_ir(&v, want, &slot)?;
                     }
                     lowered.push(v)
                 }

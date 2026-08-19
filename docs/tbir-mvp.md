@@ -7491,6 +7491,72 @@ former `transaction` group lives in
      backend can differ, and it has to be read, not assumed from the
      surface similarity of two constructs.
 
+117. **One mechanism, asked about one type (2026-08-19).**
+
+     Divergence 116 moved the extern-fn record check to the declaration,
+     keyed on `IrType::Record`, looking only at parameters. Both halves
+     of that were narrower than the mechanism they were built on.
+
+     `emit_extern_fn_decls` runs every type in the signature through the
+     free `c_type_for`, whose `Named` arm has no conditions at all:
+
+     ```rust
+     TypeExpr::Named { name, .. } => format!("V{last}*")
+     ```
+
+     So it is not about records. Two shapes it could not see, each
+     lowering clean at HEAD and each emitting C++ that neither backend
+     compiles:
+
+     | declaration | both backends emit | g++ |
+     |---|---|---|
+     | `extern function ref_mk(a: uint<8>) -> Beat` | `VBeat* ref_mk(uint64_t a);` | "`VBeat` does not name a type" |
+     | `extern function ref_en(c: Color) -> uint<8>` | `uint64_t ref_en(VColor* c);` | "`VColor` was not declared" |
+
+     The return type goes through the same call two lines down from the
+     parameters, and an enum is rendered `V*` exactly like a record —
+     `IrType::Record` just cannot represent one. The check now asks
+     whether HARC DECLARES the name (transaction, struct, enum, agent,
+     env, scoreboard, sequencer, covergroup, transactor, regblock), and
+     covers the return type alongside the parameters.
+
+     The exception is measured, not assumed: a DUT-module-typed
+     parameter still lowers, because `VTop*` is the one `V<name>` that
+     IS in scope — `extern function ref_peek(d: Top)` emits
+     `uint64_t ref_peek(VTop* d);` and compiles under both backends.
+     That is precisely why the rule asks what HARC declares rather than
+     what looks like a module handle.
+
+     Three smaller things from the same round, all in code this sweep
+     wrote:
+
+     - **No arity check on extern calls at all.** The slot loop's
+       `get(i)` stopped at the shorter side, so `f(1, 2)` on a
+       one-parameter fn lowered — both backends: "too many arguments to
+       function `uint64_t f(uint64_t)`". Worse, a surplus RECORD
+       argument was checked against a fabricated scalar slot and
+       reported that "an argument of extern fn `f` takes a non-record
+       value", describing a parameter that does not exist. A slot that
+       is not there has no type to disagree with.
+     - **A nondeterministic diagnostic.** The declaration loop iterated
+       `extern_fn_decls`, a `HashMap`, so with two offending extern fns
+       the compiler named a different one run to run on identical input.
+       Every other declaration walk in `lower_program` iterates
+       `file.items`; so does this one now.
+     - **"Extern fns are pure scalar C functions"** survived in three
+       comments after divergence 116 removed the two that quoted it.
+       `TSeq<T>` disproves the "scalar"; PURITY is the property the
+       lowering actually depends on, and the two had been travelling
+       together as one claim.
+
+     The recurring shape across rounds 5-8 is worth stating once more,
+     because this is its fourth variant: a rule gets built from one
+     measured example, and the example's incidental features get baked
+     in alongside its essential one. Record rather than "named type".
+     Parameters rather than "signature". Scalar rather than "pure".
+     Reading the emitter is what separates them, and it is cheaper than
+     four review rounds.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
