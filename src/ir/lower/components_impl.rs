@@ -525,33 +525,10 @@ pub(crate) fn lower_component_schema(
             ));
         }
         if let Some(bt) = t.bound_to.as_ref() {
-            match bt {
-                TypeExpr::Named {
-                    name: bn, generics, ..
-                } => {
-                    if !generics.is_empty() {
-                        return Err(unsupported(
-                            &format!(
-                                "event-driven transactor `{name}` bound to a generic-applied \
-                                 bus type"
-                            ),
-                            "",
-                        ));
-                    }
-                    bound_bus = Some(
-                        bn.segments
-                            .last()
-                            .map(|s| s.name.clone())
-                            .unwrap_or_default(),
-                    );
-                }
-                _ => {
-                    return Err(unsupported(
-                        &format!("event-driven transactor `{name}` bound to a non-named bus type"),
-                        "",
-                    ));
-                }
-            }
+            bound_bus = Some(super::bound_bus_name(
+                bt,
+                &format!("event-driven transactor `{name}`"),
+            )?);
         }
     }
     if let CompSource::Env(c)
@@ -572,7 +549,72 @@ pub(crate) fn lower_component_schema(
             ));
         }
         if c.bound_to.is_some() {
-            return Err(unsupported(&format!("a `bound to` clause on `{name}`"), ""));
+            // ONE label, after three wrong verdicts. v1 does three
+            // different things here, and the arm carries the worst.
+            //
+            // Measured, `agent Watcher bound to BusAxiLite` in eight
+            // cells — four handler shapes across the two instantiation
+            // positions, counting bare `bus` identifiers outside
+            // comments in v1's output:
+            //
+            //                                = bind    tb field
+            //   on <ev> driver                  0          4
+            //   on <bool-expr> cycle trigger    1          1
+            //   on N cycles + a bus write       1          1
+            //   on bus.<ch>.handshake(...)      1          1
+            //
+            // A `hookable` body behaves exactly like the `on <ev>`
+            // driver — 0 bare `bus` at a bind, 4 as a field — so the
+            // working column has two entries, not one. (v1 REFUSES the
+            // transactor spelling of that same program, "drives a DUT
+            // signal from the always-on body … spec §8.1"; the
+            // env/agent spelling bypasses that check.)
+            //
+            // `bus` is declared nowhere in the non-working cells, so
+            // g++ answers "'bus' was not declared in this scope".
+            //
+            // And a NINTH cell is worse than either: a
+            // `thread bus.<method>(...)` responder. v1 COMPILES that
+            // one — zero bare `bus` references — because it drops the
+            // responder coroutine entirely. Against
+            // `tlm_target_thread_if_test`, changing only the keyword
+            // `transactor` to `agent` deletes the whole
+            // `_target_read_target_slot` block (300 emitted lines to
+            // 242); the DUT's blocking read is then never answered and
+            // the test's own assertions fail at run time. All four
+            // declaration kinds emit byte-identically. That is
+            // `SilentlyMisLowers`, and it outranks the seven
+            // uncompilable cells.
+            //
+            // Two earlier versions tried to name the working cell with
+            // a predicate here. The first keyed on "is there a
+            // non-periodic `on bus.<ch>.handshake` handler", which
+            // misses a cycle trigger that reads the bus, a periodic
+            // handler that writes it, and — because `parse_on_handler`
+            // reads the trigger before the `cycles` decoration —
+            // `on bus.w.handshake(d) cycles`, the canonical broken
+            // shape wearing one extra word. The instantiation position
+            // IS knowable here (`lower_program` pre-scans every
+            // `TestItem::Let { bind: true }` before components lower,
+            // and already threads five whole-file pre-scans into this
+            // function), so an earlier note claiming otherwise was
+            // wrong — but a position split does not help either, since
+            // the `thread` cell is silent in BOTH columns.
+            //
+            // So: one label, the worst one, and a detail that names
+            // both the working cell and the silent one.
+            return Err(not_implemented(
+                &format!("a `bound to` clause on {} `{name}`", kind.keyword()),
+                "v1 does three different things with this clause. A \
+                 `thread bus.<method>(...)` responder COMPILES and is silently dropped — \
+                 the target never answers. An `on <ev>` handler body OR a `hookable` \
+                 body, on an instance bound at a `let x : C = bind <bus>` site, emits a \
+                 working driver. A cycle trigger, a periodic handler, an \
+                 `on bus.<ch>.handshake(...)` monitor, or either working shape \
+                 instantiated as a plain testbench field, emit `bus` verbatim into a \
+                 scope that declares no such name",
+                V1Status::SilentlyMisLowers,
+            ));
         }
     }
 
@@ -800,20 +842,36 @@ pub(crate) fn lower_component_schema(
         ));
     }
     if dut_fields.len() > 1 {
-        return Err(unsupported(
+        // v1's poke lowering hardwires the name `dut` and resolves it
+        // to the TEST's DUT pointer, so the transactor's own module
+        // field is an inert `VTop* dut = nullptr;` member. A SECOND
+        // handle is inert too while unread — but a poke through it
+        // emits `_tb.drv.dut2.en`, a `.` on a `VTop*`: "request for
+        // member 'en' ... which is of pointer type".
+        return Err(not_implemented(
             &format!(
                 "an event-driven transactor `{name}` with more than one DUT handle field \
                  ({})",
                 dut_fields.join(", ")
             ),
-            "the consumer BFM drives exactly one DUT instance",
+            "the consumer BFM drives exactly one DUT instance; v1 emits the extra handle \
+             as an unbound `VTop* <name> = nullptr;` member and a poke through it as \
+             `_tb.<inst>.<name>.<sig>` — a `.` on a pointer, which g++ refuses",
+            V1Status::EmitsUncompilable,
         ));
     }
     if let Some(&df) = dut_fields.first() {
         if df != "dut" {
-            return Err(unsupported(
+            // Same mechanism, one handle: v1 only rewrites a poke into
+            // `dut->...` when the field is literally named `dut`.
+            // Under any other name it emits `_tb.<inst>.<name>.<sig>`
+            // against a `VTop*`.
+            return Err(not_implemented(
                 &format!("an event-driven transactor DUT handle field named `{df}`"),
-                "name the DUT handle `dut` (the handler body resolves DUT pokes through it)",
+                "name the DUT handle `dut` (the handler body resolves DUT pokes through \
+                 it); v1 rewrites a poke to the test DUT only for that name, and emits \
+                 `_tb.<inst>.<name>.<sig>` on a `VTop*` for any other",
+                V1Status::EmitsUncompilable,
             ));
         }
     }
@@ -828,26 +886,27 @@ pub(crate) fn lower_component_schema(
     // theirs AFTER the periodic block (kept contiguous for pass 2).
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
     for (h, activation) in &on_asts {
-        if is_bus_handshake_monitor(h) {
+        if let Some(channel) = bus_handshake_monitor_channel(h) {
             // `on bus.<ch>.handshake(arg)` — desugars to a cycle-trigger
             // handler (valid && ready, rising edge) observing the bound
             // bus channel. Only valid on a `bound to <Bus>` transactor.
             if bound_bus.is_none() {
-                return Err(unsupported(
+                // v1 emits the handler anyway, against a `bus` that
+                // does not exist in the emitted scope: "'bus' was not
+                // declared in this scope", and the same for the
+                // payload argument. Nothing to re-run with.
+                return Err(not_implemented(
                     &format!(
                         "an `on bus.<ch>.handshake(...)` handshake-monitor handler on \
                          non-bound component `{name}`"
                     ),
                     "handshake-monitor handlers observe a `bound to <Bus>` transactor's \
-                     channels; an unbound component has no bus to observe",
+                     channels; an unbound component has no bus to observe, and v1 emits \
+                     the handler regardless — g++ answers \"'bus' was not declared in \
+                     this scope\"",
+                    V1Status::EmitsUncompilable,
                 ));
             }
-            let channel = bus_handshake_monitor_channel(h).ok_or_else(|| {
-                unsupported(
-                    &format!("a malformed `on bus.<ch>.handshake(...)` handler on `{name}`"),
-                    "the trigger must be `bus.<channel>.handshake(<arg>)`",
-                )
-            })?;
             cycle_asts.push((h, Some(channel), *activation));
         } else if let Some((event, arg_payload, args)) = event_subscription(h, &fields) {
             validate_event_handler(name, h, &event, args)?;
@@ -1041,32 +1100,17 @@ fn event_subscription<'a>(
     Some((id.name.clone(), payload, args.as_slice()))
 }
 
-/// True when `h` is an `on bus.<ch>.handshake(arg)` passive bus-monitor
-/// handler: its trigger is a `Call` whose callee is a `<bus>.<ch>.handshake`
-/// field-path. (The `bus` head is the bound-bus placeholder keyword inside
-/// a bound transactor; any dotted `.handshake(...)` call is the monitor
-/// shape — distinct from a bare-ident event subscription.)
-fn is_bus_handshake_monitor(h: &crate::ast::OnHandler) -> bool {
-    let ExprKind::Call { callee, .. } = &*h.event.kind else {
-        return false;
-    };
-    let ExprKind::Field {
-        target,
-        name: method,
-    } = &*callee.kind
-    else {
-        return false;
-    };
-    if method.name != "handshake" {
-        return false;
-    }
-    // `<x>.<ch>.handshake` — the target must itself be a `<x>.<ch>` field.
-    matches!(&*target.kind, ExprKind::Field { .. })
-}
-
 /// The channel name of an `on bus.<ch>.handshake(arg)` monitor handler
 /// (`<ch>` from the `<bus>.<ch>.handshake` callee), or `None` if `h` is
-/// not a well-formed handshake-monitor.
+/// not a handshake-monitor at all.
+///
+/// This is also the PREDICATE. A separate `is_bus_handshake_monitor`
+/// used to test the same three conditions — a `Call`, a callee
+/// `Field { name: "handshake" }`, and a `Field` target — and the caller
+/// ran the predicate first, then this function, then reported "a
+/// malformed `on bus.<ch>.handshake(...)` handler" if they disagreed.
+/// They cannot: whenever the predicate passed, this returned `Some`.
+/// One rule stated twice, and the second copy guarded nothing.
 fn bus_handshake_monitor_channel(h: &crate::ast::OnHandler) -> Option<String> {
     let ExprKind::Call { callee, .. } = &*h.event.kind else {
         return None;
@@ -1290,9 +1334,18 @@ fn lower_field(
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
     if f.bound_to.is_some() {
-        return Err(unsupported(
+        // The FIFTH copy of the `bound to` rule — the per-FIELD
+        // spelling on an env/agent/sequencer/transactor, sibling of the
+        // scoreboard one in `scoreboards.rs`. It was the last arm in
+        // the family still promising `--codegen v1`, and v1 discards
+        // the clause: with the bound and unbound sources padded to the
+        // SAME byte length (so no source-offset residue can explain
+        // it), v1's output is byte-identical.
+        return Err(not_implemented(
             &format!("a `bound to` clause on field `{comp}.{fname}`"),
-            "",
+            "v1 discards the clause — with the bound and unbound sources padded to equal \
+             length its output is byte-identical, so the binding silently does not happen",
+            V1Status::SilentlyMisLowers,
         ));
     }
     match &f.ty {
@@ -3536,7 +3589,17 @@ impl super::FuncBuilder<'_> {
                 if let Some(cid) = self.self_component {
                     let comp = &self.ctx.components[cid.index()];
                     if let Some(field) = comp.field(&id.name) {
-                        if matches!(field.kind, ComponentFieldKind::Scalar { .. }) {
+                        // A whole-RECORD field is written the same way —
+                        // v1 emits `self.cur = b;` and g++ accepts it.
+                        // Accepting only `Scalar` here sent `cur = b`
+                        // down to "assignment to unknown name `cur`",
+                        // labelled `EmitsUncompilable`, which was wrong
+                        // on both halves: `cur` is a declared field of
+                        // this very component, and v1 compiles the file.
+                        if matches!(
+                            field.kind,
+                            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+                        ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some((ComponentBase::SelfField, id.name.clone())));
                         }
@@ -3563,8 +3626,22 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, recv_tail)?;
                     let comp = &self.ctx.components[cid.index()];
                     match comp.field(&field) {
+                        // A whole-RECORD component field takes the same
+                        // path: v1 emits `_tb.s.cur = y;` for a
+                        // same-typed RHS and g++ accepts it. The caller
+                        // type-checks the RHS against the field's record
+                        // (`lower_assign`), so a mismatched one is a
+                        // precise `Invalid` rather than this arm's
+                        // blanket "not a scalar component field", which
+                        // promised `--codegen v1` for `s.cur = 5` —
+                        // "no match for 'operator=', operand types are
+                        // 'Beat' and 'int'".
                         Some(schema)
-                            if matches!(schema.kind, ComponentFieldKind::Scalar { .. }) =>
+                            if matches!(
+                                schema.kind,
+                                ComponentFieldKind::Scalar { .. }
+                                    | ComponentFieldKind::Record { .. }
+                            ) =>
                         {
                             self.require_component_activation(
                                 &path[0],
@@ -3752,7 +3829,7 @@ impl super::FuncBuilder<'_> {
     /// Walk a sub-component receiver path from a head component down
     /// `segs` (each must name a `Sub` field), returning the final
     /// ComponentId. `segs` is the path AFTER the head local segment.
-    fn resolve_component_recv(
+    pub(crate) fn resolve_component_recv(
         &self,
         head: ComponentId,
         segs: &[String],

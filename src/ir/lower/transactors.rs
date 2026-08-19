@@ -565,29 +565,27 @@ fn lower_bound_target_transactor(
     let tname = &t.name.name;
     // Resolve the bound bus.
     let bus_name = match t.bound_to.as_ref() {
-        Some(TypeExpr::Named { name, generics, .. }) => {
-            if !generics.is_empty() {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` bound to a generic-applied bus type"),
-                    "",
-                ));
-            }
-            name.segments
-                .last()
-                .map(|s| s.name.clone())
-                .unwrap_or_default()
-        }
-        _ => {
-            return Err(unsupported(
-                &format!("transactor `{tname}` bound to a non-named bus type"),
-                "",
-            ));
-        }
+        Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
+        // Both bound paths are reached only from `lower_transactor`'s
+        // `if t.bound_to.is_some()` branch.
+        None => unreachable!("a bound-transactor path entered with no `bound to` clause"),
     };
     let Some(bus) = buses.get(&bus_name) else {
-        return Err(LowerError::Invalid(format!(
-            "transactor `{tname}` is bound to `{bus_name}`, which is not a `bus` declaration"
-        )));
+        // The same shape as `bound to <builtin>` one type-variant over,
+        // and it gets the same verdict for the same reason: a
+        // NEVER-INSTANTIATED `transactor T bound to RegOp` emits an
+        // inert `struct T { … };` under v1 and the file compiles, so
+        // some configuration of the program runs and `Invalid` — which
+        // this arm used to answer — is too strong.
+        return Err(not_implemented(
+            &format!(
+                "transactor `{tname}` bound to `{bus_name}`, which is not a `bus` \
+                 declaration"
+            ),
+            "v1 rejects it at every instantiation; only a never-instantiated \
+             declaration gets through, and there it emits an inert struct",
+            V1Status::Rejects,
+        ));
     };
 
     // Walk items (and the optional `when active` body, though target
@@ -1033,29 +1031,27 @@ fn lower_bound_initiator_transactor(
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
     let bus_name = match t.bound_to.as_ref() {
-        Some(TypeExpr::Named { name, generics, .. }) => {
-            if !generics.is_empty() {
-                return Err(unsupported(
-                    &format!("transactor `{tname}` bound to a generic-applied bus type"),
-                    "",
-                ));
-            }
-            name.segments
-                .last()
-                .map(|s| s.name.clone())
-                .unwrap_or_default()
-        }
-        _ => {
-            return Err(unsupported(
-                &format!("transactor `{tname}` bound to a non-named bus type"),
-                "",
-            ));
-        }
+        Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
+        // Both bound paths are reached only from `lower_transactor`'s
+        // `if t.bound_to.is_some()` branch.
+        None => unreachable!("a bound-transactor path entered with no `bound to` clause"),
     };
     let Some(bus) = buses.get(&bus_name) else {
-        return Err(LowerError::Invalid(format!(
-            "transactor `{tname}` is bound to `{bus_name}`, which is not a `bus` declaration"
-        )));
+        // The same shape as `bound to <builtin>` one type-variant over,
+        // and it gets the same verdict for the same reason: a
+        // NEVER-INSTANTIATED `transactor T bound to RegOp` emits an
+        // inert `struct T { … };` under v1 and the file compiles, so
+        // some configuration of the program runs and `Invalid` — which
+        // this arm used to answer — is too strong.
+        return Err(not_implemented(
+            &format!(
+                "transactor `{tname}` bound to `{bus_name}`, which is not a `bus` \
+                 declaration"
+            ),
+            "v1 rejects it at every instantiation; only a never-instantiated \
+             declaration gets through, and there it emits an inert struct",
+            V1Status::Rejects,
+        ));
     };
 
     // Walk always-on + `when active` items: collect the hookable

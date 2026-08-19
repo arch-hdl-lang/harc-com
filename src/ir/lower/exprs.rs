@@ -1183,7 +1183,116 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
+            // A ternary over records (`b = c ? x : y`). `expr_type`
+            // already types this shape one line-for-line the same way
+            // (`self.expr_type(t).or_else(|| self.expr_type(e))`);
+            // leaving it out here made a whole-record ternary — which
+            // v1 emits as `b = (c ? x : y);` and g++ accepts — look
+            // like a type error to the assignment guards. Both arms
+            // must agree, or the value has no single record type.
+            Expr::Ternary(_, t, e) => {
+                let a = self.record_id_of_expr(t)?;
+                (a == self.record_id_of_expr(e)?).then_some(a)
+            }
+            // A record-typed COMPOSITE-COMPONENT field (`src.cur`,
+            // where `cur : Beat` on an agent). These are first-class —
+            // `ComponentFieldKind::Record` — and leaving them untyped
+            // here is what made a whole-record write of one look like a
+            // type error to the assignment guards.
+            Expr::ComponentField { base, field } => self.component_field_record(base, field),
             _ => None,
+        }
+    }
+
+    /// The component a `ComponentBase` names, when it can be resolved
+    /// without a diagnostic. `None` for a receiver this context cannot
+    /// resolve — callers must treat that as "cannot tell", never as
+    /// "not a record".
+    /// The record type of a component field access, or `None` if the
+    /// access is not a record.
+    ///
+    /// `field` is not always a single name. `as_component_record_field`
+    /// returns a DOTTED one for a nested subfield read
+    /// (`ComponentField { base: SelfField, field: "cur.v" }`), so the
+    /// walk mirrors that function's own `validate` closure: the head
+    /// names a component field, each further segment a record field,
+    /// and anything that is not a traversable record ends the walk.
+    /// Answering `None` for every dotted shape made `b = cur.inn` — a
+    /// nested RECORD subfield both backends copy as a struct — a type
+    /// error, and answering the HEAD's record for one made `b = cur.v`
+    /// — a scalar — lower into `b = self.cur.v;`, which g++ refuses.
+    ///
+    /// The answer is definitive in both directions. Every `field` that
+    /// reaches here was already resolved and validated by the site that
+    /// built the `ComponentField`, so a segment this walk cannot find
+    /// does not occur.
+    pub(crate) fn component_field_record(
+        &self,
+        base: &crate::ir::ComponentBase,
+        field: &str,
+    ) -> Option<crate::ir::RecordId> {
+        let cid = self.component_base_id(base)?;
+        let mut segs = field.split('.');
+        let schema = self.ctx.components.get(cid.index())?.field(segs.next()?)?;
+        let mut rid = match schema.kind {
+            crate::ir::ComponentFieldKind::Record { record } => record,
+            // A scalar / queue / sub-component field is not a record,
+            // and neither is any path through one.
+            _ => return None,
+        };
+        for seg in segs {
+            let f = self.ctx.records[rid.index()].field(seg)?;
+            match f.ty {
+                // `vec_len.is_none()` mirrors `validate`, which already
+                // refuses BOTH `Vec` positions upstream — a `Vec` leaf
+                // ("a whole-`Vec` component record field") and a `Vec`
+                // mid-segment ("is not a nested record"). Copied so the
+                // two walks cannot drift, not because a `Vec` reaches
+                // here today.
+                crate::ir::IrType::Record(next) if f.vec_len.is_none() => rid = next,
+                _ => return None,
+            }
+        }
+        Some(rid)
+    }
+
+    pub(crate) fn component_base_id(
+        &self,
+        base: &crate::ir::ComponentBase,
+    ) -> Option<crate::ir::ComponentId> {
+        match base {
+            crate::ir::ComponentBase::SelfField => self.self_component,
+            crate::ir::ComponentBase::Path(path) => {
+                // The INVERSE of `component_path_head`, which builds
+                // this base — and it has two head forms, not one. A
+                // test-scope instance heads the path by its own name; a
+                // sub-component of the METHOD'S OWN component heads it
+                // with the literal `"self"`. Resolving only the first
+                // made every `src.cur` inside a method body untypable,
+                // and `component_path_head` is checked in this same
+                // order, `component_fields` first.
+                let (head, rest) = path.split_first()?;
+                let head_cid = match self.ctx.component_fields.get(head) {
+                    Some(cid) => *cid,
+                    None if head == "self" => {
+                        let cid = self.self_component?;
+                        let comp = self.ctx.components.get(cid.index())?;
+                        match comp.field(rest.first()?)?.kind {
+                            crate::ir::ComponentFieldKind::Sub { component, .. } => {
+                                return self.resolve_component_recv(component, &rest[1..]).ok()
+                            }
+                            _ => return None,
+                        }
+                    }
+                    None => return None,
+                };
+                self.resolve_component_recv(head_cid, rest).ok()
+            }
+            // `ComponentBase::Local` (a component-typed method
+            // parameter) is built only by `as_component_method_call`,
+            // for a CALL receiver. No `Expr::ComponentField` carries
+            // one, so there is nothing here to resolve.
+            crate::ir::ComponentBase::Local(_) => None,
         }
     }
 
@@ -2100,6 +2209,36 @@ impl FuncBuilder<'_> {
             .then(|| name.name.clone())
     }
 
+    /// The record a `_tb.<field>` / bare `<field>` target names, when
+    /// that field is a testbench RECORD field.
+    ///
+    /// The scalar sibling above resolves only `ctx.tb_scalar_fields`;
+    /// a record testbench field lives in `tb_record_fields` and had no
+    /// resolver, so a whole-record write to one fell through every
+    /// lane to `lower_assign`'s catch-all.
+    pub(crate) fn tb_record_field_target(&self, e: &AstExpr) -> Option<crate::ir::RecordId> {
+        // Only the `_tb.<field>` spelling. A bare `<field>` cannot
+        // reach here: `declare_tb_record_fields` declares every
+        // testbench record field as a LOCAL of the run function, so
+        // `lookup` claims the name first — which is also why reading
+        // and subfield-writing one already worked.
+        let ExprKind::Field { target, name } = &*e.kind else {
+            return None;
+        };
+        let ExprKind::Ident(root) = &*target.kind else {
+            return None;
+        };
+        if root.name != self.ctx.tb_field.as_deref()? {
+            return None;
+        }
+        let name = name.name.clone();
+        self.ctx
+            .tb_record_fields
+            .iter()
+            .find(|(f, _)| *f == name)
+            .map(|(_, rid)| *rid)
+    }
+
     /// Resolve a record-field target root. Supports both bare record
     /// locals (`cur.value`) and desugared testbench record fields
     /// (`_tb.cur.value`), where `cur` is a synthetic local declared at
@@ -2128,6 +2267,23 @@ impl FuncBuilder<'_> {
                 self.lookup_tb_record_field_in_capture_scope(&name.name)
             }
             ExprKind::Paren(inner) => self.record_target_local(inner),
+            _ => None,
+        }
+    }
+
+    /// The record type of a bound-to responder's whole-record state
+    /// field, or `None` when the field is a scalar (or absent).
+    ///
+    /// Reads the same `ctx.target_state` map `as_transactor_state`
+    /// resolves against, so the test-scope write lane can make the
+    /// record-type check the bare-name lane already made.
+    pub(crate) fn target_state_record(
+        &self,
+        instance: &str,
+        field: &str,
+    ) -> Option<crate::ir::RecordId> {
+        match self.ctx.target_state.get(instance)?.get(field)? {
+            crate::ir::StateFieldKind::Record { record } => Some(*record),
             _ => None,
         }
     }

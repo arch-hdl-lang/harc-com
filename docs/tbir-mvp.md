@@ -6642,6 +6642,392 @@ former `transaction` group lives in
      far enough to produce it.
 
 
+108. **Five record-assignment arms, and a sixth spelling with no arm at
+     all (2026-08-18).**
+
+     Each of these rejected a whole family under one `Unsupported`, so
+     each promised `--codegen v1` for programs v1 cannot compile. Only
+     one family has a well-typed member:
+
+     | assignment | v1 emits | verdict |
+     |---|---|---|
+     | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | a real escape hatch |
+     | `b = sb.q.pop()`, `q : queue<uint<8>>` | the same line — "operand types are 'Beat' and 'long unsigned int'" | `Invalid` |
+     | `b = drv.get()` | `b = Drv_get(_tb.drv);` — "'Beat' and 'uint64_t'" | `Invalid` |
+     | `b = o` / `b = 5` | "'Beat' and 'Other'" / "'Beat' and 'int'" | `Invalid` |
+     | `rec = 5` in a method body | "'Beat' and 'int'" | `Invalid` |
+     | `drv.rec = 5` from test scope | the same — and TB-IR LOWERED it | `Invalid` |
+
+     The last row is the find. The bare-name spelling of a whole-record
+     state write was guarded; the dotted test-scope spelling was not. So
+     `drv.rec = 5` lowered, verified, and emitted `drv.rec = 5;` from the
+     DEFAULT backend — as uncompilable as v1's `_tb.drv.rec = 5;`. Test
+     scope is where a user writes that line; the guarded spelling is the
+     one they write less often. Same shape as divergence 104: one lane
+     of a construct checked, another not, and the unchecked lane is the
+     ordinary one.
+
+     **`Invalid` is only for a mismatch the compiler can SEE.** The
+     first version of these guards read the RHS with
+     `record_id_of_expr`, which answers `None` for two very different
+     things: an expression that is definitely not a record (a literal,
+     an arithmetic result), and one it could not type. It had no arm for
+     `Expr::ComponentField`, and record-typed composite-component fields
+     are first class (`ComponentFieldKind::Record`) — so
+     `drv.rec = src.cur`, a whole-record copy that BOTH backends
+     compile and that lowered cleanly before this commit, became a type
+     error. That is the same regression class as divergence 103's, one
+     divergence later.
+
+     `record_id_of_expr` types `Expr::ComponentField` now, so
+     `drv.rec = src.cur` and `b = src.cur` both lower and emit C++ that
+     compiles under both backends.
+
+     Re-review found a third member of the same class, then a fourth,
+     and the fix's own mechanism turned out to be the wrong shape:
+
+       * A record-valued TERNARY (`b = c ? x : y`) was untyped too, so
+         it was a false type error as well — v1 emits
+         `b = (c ? x : y);` and g++ accepts it. That one was
+         reconstructable from the repo: `expr_type` already types the
+         shape a hundred lines away, `expr_type(t).or_else(expr_type(e))`.
+       * `record_capable_expr` — the helper added to keep an escape
+         hatch for an RHS the compiler could not type — listed
+         `TbField` and `ComponentValue` among the shapes that might
+         hold a record. Neither can: a `TbField` is built only where
+         `ctx.tb_scalar_fields` matched (a RECORD testbench field is in
+         `tb_record_fields` and resolves to a `Local`), and a
+         `ComponentValue` is a whole component. So `b = count` and
+         `b = src` kept promising `--codegen v1` for programs v1
+         answers with "no match for 'operator='".
+
+     The hatch was the wrong shape because the untypability was not
+     real. Inside a component METHOD body `src.cur` lowered to
+     `ComponentField { base: Path(["self", "src"]) }` —
+     `component_path_head` builds a `"self"`-rooted path for a
+     sub-component of the method's own component — and
+     `component_base_id`, written as the inverse of that function,
+     resolved only its OTHER head form, the test-scope instance. One of
+     two head forms, so every component-field access in a method body
+     looked untypable and something had to catch it.
+
+     `component_base_id` inverts both head forms now, and a new
+     `component_field_record` walks the rest: `field` is not always a
+     single name — `as_component_record_field` returns a DOTTED one for
+     a nested subfield (`ComponentField { base: SelfField, field:
+     "cur.v" }`) — so it steps segment by segment exactly as that
+     function's own `validate` closure does, stopping at anything that
+     is not a traversable record. Answering the HEAD's record for a
+     dotted path would lower `b = self.mine.v;` on a scalar leaf;
+     answering `None` for every dotted path would reject `b = mine.inn`,
+     a nested-record struct copy both backends emit.
+
+     With that, every RHS shape types definitively and the hatch is
+     gone: `record_assign_mismatch` is `Invalid` in all cases, and
+     `b = src.cur`, `b = c ? x : src.cur`, `b = mine.inn` and
+     `let c = src.cur` all LOWER — none of which they did before.
+
+     Two more sites fell out. `lower_let`'s untyped tail typed its local
+     from `expr_type`, which has no arm for a record-valued component
+     field or transactor state field, so `let c = src.cur` declared
+     `uint64_t c = 0;` and the DEFAULT backend emitted C++ that does not
+     compile ("cannot convert 'Beat' to 'uint64_t'"); it asks
+     `record_id_of_expr` as a fallback now, and tbir emits `Beat c{}`
+     where v1 still emits an uncompilable `int64_t c = self.src.cur;`.
+     And the `Vec<Record, N>` ELEMENT write — the same rule stated a
+     third time — was still an `Unsupported`, promising v1 for
+     `tbl.entries[1] = 5`, which v1 emits against a
+     `std::array<Entry, 4>` and g++ refuses. It and its already-classified
+     sibling (the whole nested-record field write) both route through
+     `record_assign_mismatch` now.
+
+     The mirror of the find, one line away in the same guard: a SCALAR
+     state field assigned a record (`drv.st = b`) lowered, verified and
+     emitted `drv.st = b;` — g++ "cannot convert 'Beat' to 'uint64_t' in
+     assignment", the same failure v1 has. Also `Invalid` now.
+
+     A third review round found no false `Invalid` but four more
+     spellings of the same rule, plus one defect the `let` fix above had
+     just introduced:
+
+       * **The regression.** `record_ty` beats `declared_scalar_ty` in
+         `lower_let`'s type chain, so teaching `record_ty` the component
+         shapes made `let c : uint<8> = s.cur` type `c` as a `Beat` and
+         DISCARD the annotation — the default backend laundering a type
+         with no diagnostic, where v1 at least emitted
+         `uint64_t c = _tb.s.cur;` for g++ to reject. A disagreement
+         between a declared scalar type and a record RHS is `Invalid`
+         now; it is visible precisely because the RHS types
+         definitively. Keyed on the ANNOTATION'S PRESENCE, not on
+         `typed_let_ir_type` — that function answers `None` for `int`,
+         and `bit` parses as a `Named` type, so keying on its result
+         left both spellings laundering the type while v1 emitted
+         `uint64_t c = ...` and `Vbit* c = ...`.
+       * **Five queue-pop lanes** — testbench, component, scoreboard,
+         and the responder-body and test-scope spellings of a
+         target-state queue — each type the popped local from the queue
+         element and ignored the `let` annotation entirely, so
+         `let b : Other = sb.q.pop()` on a `queue<Beat>` declared `Beat`
+         and RAN, while v1's `Other b = _tb.sb.q.pop();` gets
+         "conversion from 'Beat' to non-scalar type 'Other' requested".
+         One shared `check_pop_let_type`, asked from all five. The first
+         pass wired it to three and left out the testbench-queue lane
+         and the TEST-SCOPE spelling of the same target-state queue
+         whose responder-body spelling it had just fixed — the same
+         one-lane-checked-one-not shape as the headline find, inside
+         the fix for it.
+       * A REGBLOCK name is in `record_ids` too (its mirror record is
+         filed under the regblock's own name) and the pop lanes run
+         BEFORE divergence 104's instantiation guard, so
+         `let z : DmaRegs = sb.q.pop()` reached a pop lane first. The
+         rule is stated once now — `regblock_instantiation_error` — and
+         asked from both places, so the actionable "requires
+         `= bind <helper>`" wins wherever the spelling lands.
+       * **The record-annotated INITIALIZER** — `let b : Beat = 5` — was
+         the `let` spelling of the write the assignment arms reject, and
+         it still promised `--codegen v1` for a program v1 answers with
+         "conversion from 'int' to non-scalar type 'Beat' requested".
+       * **A whole-record COMPONENT field** was not writable at all,
+         from either spelling, though v1 writes both. The dotted
+         test-scope one (`s.cur = y`) hit "not a scalar component
+         field", `Unsupported`; the bare method-body one (`cur = b`) hit
+         "assignment to unknown name `cur`" labelled
+         `EmitsUncompilable` — false in both halves, since `cur` is a
+         declared field of that very component and v1 emits
+         `self.cur = b;` and compiles. Both lower now, and a mismatched
+         RHS is `Invalid` through the same shared verdict.
+
+     A fifth round confirmed those and found the MIRROR of the whole
+     divergence missing at ten more sites. The record-DESTINATION
+     direction had been guarded arm by arm; the scalar-destination
+     direction was guarded at exactly one site (a scalar
+     transactor-state field), and everywhere else — a DUT port, a
+     testbench field, a scoreboard counter, a scalar component field at
+     both spellings, a scalar record field, a scalar `Vec` element, a
+     record-state scalar subfield, a scalar local, and the assignment
+     spelling of a record-queue pop — `x = <record>` LOWERED, VERIFIED
+     and emitted from the DEFAULT backend, where g++ answers "cannot
+     convert 'Beat' to 'uint64_t' in assignment". The scalar-local case
+     did not even reach a diagnostic: it tripped the VERIFIER's
+     `TypeMismatch`, which `main.rs` renders as "internal error: TB-IR
+     failed verification after lowering" — a compiler-bug report for a
+     program error. One shared `reject_record_into_scalar`, asked from
+     all ten, and callable only because `record_id_of_expr` now types
+     every record-carrying RHS. A sixth round found three more of the
+     same shape, so it is asked from fourteen: the BARE-NAME spelling
+     of a scalar state-field write (the polarity of that hole reversed
+     — there the dotted spelling was unguarded, here the bare one), and
+     all four RAL write spellings, which funnel through
+     `lower_reg_write` / `lower_field_write` and return from inside the
+     `try_lower_*` helpers, so none of `lower_assign`'s destination
+     guards ever saw them.
+
+     Deferred with its measurement: the same rule in ARGUMENT position
+     — a record pushed onto a scalar queue, passed to a scalar method
+     or hookable parameter, or emitted on a scalar-payload event. All
+     lower and emit today, and the testbench-queue push answers a
+     program error through the verifier's internal-compiler-error
+     channel. That is a different surface from assignment and gets its
+     own divergence.
+
+     One further arm was wrong in both directions at once. A
+     whole-record write of a TESTBENCH record field (`tbrec = b`) fell
+     through every lane to the catch-all, which claimed
+     `SilentlyMisLowers`. v1 emits `_tb.tbrec = b;` and g++ ACCEPTS it,
+     so a working escape hatch was being withheld; and `tbrec = 5`
+     emits a line g++ refuses, so that member is a type error. A
+     `tb_record_field_target` resolver splits it like every other
+     record destination.
+
+     `Invalid` rather than `EmitsUncompilable` for the rest, on the
+     distinction this sweep has been using: `EmitsUncompilable` is a
+     subset gap a future TB-IR could implement and v1 currently botches
+     (`Vec<uint<8>, 4> default 0` could sensibly zero-fill). A record
+     local assigned an integer is a type error — there is nothing to
+     implement, and no backend runs it.
+
+     The transactor-method arm has no well-typed member at all: a record
+     RETURN type is refused upstream, so every method reaching it
+     returns a scalar.
+
+109. **Seven `bound to` arms, three files, one rule stated three times
+     (2026-08-18).**
+
+     A `bound to <Ty>` clause has two out-of-subset type shapes, and
+     the match resolving them was copied BYTE-IDENTICALLY into three
+     lowering paths — the event-driven consumer BFM
+     (`components.rs`), the bound TARGET responder and the bound
+     INITIATOR BFM (`transactors.rs`). All six copies said
+     `Unsupported`, so all six promised `--codegen v1`. Measured on
+     each of the three paths separately:
+
+     | clause | v1 | verdict |
+     |---|---|---|
+     | `bound to Bus#(ADDR_W=12, DATA_W=64)` | byte-identical C++ to `#(ADDR_W=32, DATA_W=32)`, and to the bare `bound to Bus` | `SilentlyMisLowers` |
+     | `bound to uint<8>`, and `bound to <named-non-bus>` | refused at every instantiation; an uninstantiated declaration emits an inert struct | `Rejects` |
+     | `bound to` on an `env`/`agent`/`sequencer`/`scoreboard` | three behaviours over nine cells; the worst COMPILES and silently drops the responder | `SilentlyMisLowers` |
+
+     The generic row's evidence is the byte-identity between two
+     parameterizations of the SAME textual length — so an identical
+     emission cannot be explained away as a shifted source offset.
+     v1's `type_simple_name` reads the last path segment and never
+     looks at the argument list, so a user who writes
+     `#(ADDR_W=12, DATA_W=64)` gets the bus declaration's defaults with
+     no diagnostic.
+
+     The second row is `Rejects`, not `Invalid`. v1 refuses it at both
+     instantiation positions, but a NEVER-INSTANTIATED declaration gets
+     through and emits an inert `struct T { … };`. Some configuration
+     of that program runs, so the arm has something to implement, which
+     is what separates `Rejects` from `Invalid` (divergence 108). The
+     same argument condemns the NAMED-non-bus spelling, which was
+     answering `Invalid` for a program shape one type-variant over —
+     in all THREE copies of that check (both in `transactors.rs`, and
+     the consumer-BFM one in `mod.rs` that the first correction missed
+     because the probe's data-only transactor never routed through it).
+
+     **The third row took three attempts, and the first two were wrong
+     in opposite directions.** Version one measured it on
+     `agent Watcher { hits : uint<32> default 0 }` — no event, no
+     handler, nothing to bind — found v1's output byte-identical with
+     and without the clause, and called the whole arm
+     `SilentlyMisLowers`. That withdrew a `--codegen v1` promise which
+     is, for one shape, honest: an `in event<T>` plus an `on <ev>`
+     handler writing `bus.<ch>.<sig>`, bound at a `let x : C = bind
+     <bus>` site, emits a complete working driver. Version two split on
+     "is there a non-periodic `on bus.<ch>.handshake(...)` handler",
+     which was over-promising again for three more shapes.
+
+     The measurement that settles it counts bare `bus` identifiers
+     outside comments in v1's emitted C++, over four handler shapes ×
+     two instantiation positions:
+
+     | shape | at a `= bind` | as a testbench field |
+     |---|---|---|
+     | `on <ev>` driver | **0 — resolved, compiles** | 4 |
+     | `hookable` body | **0 — resolved, compiles** | 4 |
+     | `on <bool-expr>` cycle trigger | 1 | 1 |
+     | `on N cycles` writing the bus | 1 | 1 |
+     | `on bus.<ch>.handshake(...)` | 1 | 1 |
+
+     TWO cells resolve the bus and emit a working driver — the
+     `on <ev>` handler body and, found a round later, the `hookable`
+     body, which behaves identically (0 bare `bus` at a bind, 4 as a
+     field). v1 REFUSES the transactor spelling of that same hookable
+     program ("drives a DUT signal from the always-on body … spec
+     §8.1"); the env/agent spelling bypasses that check. `bus` is
+     declared nowhere in the non-working cells, so g++ answers "'bus'
+     was not declared in this scope". Version two's predicate missed three of
+     them, including — because `parse_on_handler` reads the trigger
+     BEFORE the `cycles` decoration — `on bus.w.handshake(d) cycles`,
+     the canonical broken shape wearing one extra word.
+
+     A NINTH cell decides the label, and it is worse than either: a
+     `thread bus.<method>(...)` responder. v1 COMPILES that one — zero
+     bare `bus` references — because it drops the responder coroutine
+     outright. Against `tlm_target_thread_if_test`, changing only the
+     keyword `transactor` to `agent` deletes the whole
+     `_target_read_target_slot` block (300 emitted lines to 242); the
+     DUT's blocking read is then never answered and the fixture's own
+     assertions fail at run time. All four declaration kinds emit
+     byte-identically. `SilentlyMisLowers` outranks the seven
+     uncompilable cells, so that is the arm's label.
+
+     A third version justified the single label by claiming a predicate
+     could not name the working cell "because the deciding fact is the
+     INSTANTIATION POSITION and this code runs per DECLARATION". That
+     was false: `lower_program` pre-scans every
+     `TestItem::Let { bind: true }` before components lower and already
+     threads five whole-file pre-scans into `lower_component_schema`,
+     and v1 does exactly this pre-scan itself
+     (`driver_bus_for_hookables`). The real reason not to split is
+     simpler and survives the ninth cell: a position split does not
+     help, because the `thread` case is silent in BOTH columns.
+
+     The scoreboard spelling in `scoreboards.rs` is a FOURTH copy of
+     the same rule, and it carried the same wrong verdict from the same
+     degenerate measurement — `on bus.w.handshake(d)` on a bound
+     scoreboard emits `(bool)(bus.w.handshake(d))` too, and a `thread`
+     responder on one is dropped just as silently. A scoreboard WITH a
+     `hookable` is a component, so it routes through `components.rs`
+     instead — a lane nothing covered until a mutation survived there.
+
+     A FIFTH copy of the rule sits on the per-FIELD spelling
+     (`seen : uint<32> bound to Drv` on an env/agent/sequencer/
+     transactor, sibling of the scoreboard one). It was the last arm in
+     the family still promising `--codegen v1`, and v1 discards the
+     clause: with the bound and unbound sources padded to the SAME byte
+     length — so no source-offset residue can explain it — v1's output
+     is byte-identical. Its per-FIELD
+     sibling (`seen : uint<32> bound to Drv`) is a different construct
+     and keeps `SilentlyMisLowers`, which the byte-identity does
+     measure.
+
+     The six copies are now one `bound_bus_name(bound_to, subject)` in
+     `lower/mod.rs`. The consolidation has its own finding: the bus is
+     the LAST path segment, and nothing tested that. A dotted
+     `bound to arc.stdlib.BusAxiLite` lowers today and v1 emits it;
+     resolving the FIRST segment instead would look up a bus named
+     `arc`, find none, and return `Invalid` — divergence 108's bug
+     class again, this time reachable through a refactor rather than a
+     new guard. Eighteen mutations, all caught — including that one, one
+     that reads the generic guard as `generics.len() > 1` (every probe
+     passed two arguments, so arity-1 was unexercised), one per label on
+     the two `bound to`-clause arms, one on the bound-INITIATOR non-bus
+     arm (its byte-identical twin on the target path was covered and it
+     was not, because a data-only probe transactor routes to the target
+     path), and one that drops the per-site `subject`, which review
+     found unpinned: the only thing the three call sites pass
+     differently was never asserted.
+
+110. **Five event-driven-transactor shape arms, one v1 naming rule, and
+     a dead arm (2026-08-18).**
+
+     v1's poke lowering hardwires the name `dut`: a `dut.<sig>` write in
+     an `on`-handler body is rewritten to the TEST's bound DUT pointer
+     (`harc_rt::harc_assign(dut->en, 1)`), and the transactor's own
+     module-typed field is emitted as an INERT `VTop* dut = nullptr;`
+     member that nothing in the file ever reads. That single fact
+     decides four of these five arms.
+
+     | arm | v1 | verdict |
+     |---|---|---|
+     | `bound to` transactor WITH a module-typed field | member inert, poke retargets to the test DUT — compiles and runs | **honest `Unsupported`, kept** |
+     | more than one DUT handle | un-poked: an inert second member. POKED: `_tb.drv.dut2.en` — a `.` on a `VTop*` | `EmitsUncompilable` |
+     | handle not named `dut` | same split; v1 rewrites only that name | `EmitsUncompilable` |
+     | `on bus.<ch>.handshake(...)` on a NON-bound component | emits the handler anyway: "'bus' was not declared in this scope" | `EmitsUncompilable` |
+     | "malformed `on bus.<ch>.handshake(...)`" | — | **dead arm** |
+
+     The first row is a correction against my own first pass. Seeing
+     `VAxiLiteRegs* dut = nullptr;` and `harc_rt::harc_assign(dut->rst,
+     0);` in one emitted file, I read it as a null dereference and
+     labelled the arm `SilentlyMisLowers`. They are two different
+     `dut`s: the one being poked is the run function's bound test DUT,
+     captured by the handler lambda's `[&]`. Checking which binding a
+     name resolves to was the missing step — the same shape as
+     measuring against a control that is equally broken. The arm's
+     `--codegen v1` promise is honest, so it keeps it, and the test
+     states the reason directly rather than resting on a byte-count.
+
+     The dead arm is the batch's find. `is_bus_handshake_monitor` and
+     `bus_handshake_monitor_channel` tested the SAME three conditions —
+     an `ExprKind::Call`, a callee `Field { name: "handshake" }`, and a
+     `Field` target — and the caller ran the predicate, then the
+     extractor, then reported "a malformed `on bus.<ch>.handshake(...)`
+     handler" if they disagreed. They cannot disagree: whenever the
+     predicate passed, the extractor returned `Some`. One rule stated
+     twice, and the second copy guarded nothing. Confirmed by
+     construction and by probe — `on bus.w.handshake()` and
+     `on bus.w.handshake(d, e)` both lower cleanly on a bound
+     transactor. The extractor is the predicate now
+     (`if let Some(channel) = ...`), so the two cannot drift back apart.
+
+     Thirteen mutations, all caught. Three needed new coverage rather
+     than a new guard: nothing tested that the predicate DECLINES a
+     different method name or a one-level target, and nothing tested
+     the arm that was deliberately left alone.
+
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

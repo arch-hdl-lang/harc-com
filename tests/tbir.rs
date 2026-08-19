@@ -75,6 +75,11 @@ fn merged_with_stdlib_bus(src: &str, bus_file: &str) -> harc::ast::SourceFile {
     merge::merge_for_sim(vec![fix, bus], None).expect("merge")
 }
 
+/// `lower_program` of one source string plus `stdlib/BusAxiLite.arch`.
+fn lower_with_stdlib_bus_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
+    lower::lower_program(&merged_with_stdlib_bus(src, "BusAxiLite.arch"))
+}
+
 /// Lower + verify + emit one registry fixture through the tbir backend
 /// with default options (the `--sv` Verilator path the equivalence
 /// harness exercises).
@@ -3992,7 +3997,9 @@ end test VecOfStructNoIndexTest
 }
 
 /// An element store with a non-matching RHS (`tbl.entries[i] = 5`) is
-/// rejected precisely — never emitted as `Entry = <scalar>`.
+/// rejected precisely — never emitted as `Entry = <scalar>`, and never
+/// with a `--codegen v1` suggestion: v1 emits `tbl.entries[0] = 5;`
+/// against a `std::array<Entry, 4>` and g++ refuses it.
 #[test]
 fn vec_of_record_element_write_with_scalar_rhs_is_rejected() {
     let src = r#"
@@ -4013,9 +4020,9 @@ test VecOfStructBadElemWriteTest
 end test VecOfStructBadElemWriteTest
 "#;
     let err = lower_src(src).expect_err("scalar RHS on a record element must be rejected");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(
-        msg.contains("element write") && msg.contains("non-`Entry` RHS"),
+        msg.contains("`Vec` record field `EntryTable.entries`") && msg.contains("not a record"),
         "names the shape mismatch: {msg}"
     );
 }
@@ -4540,10 +4547,1941 @@ end test BadFieldTest
     );
 }
 
+/// The five record-assignment arms, split on whether the program is
+/// well typed — and the sixth spelling, which had no arm at all.
+///
+/// Each of these rejected a whole family under one `Unsupported`, so
+/// each promised `--codegen v1` for programs v1 cannot compile. Only
+/// one of the families contains a well-typed program:
+///
+/// | assignment | v1 emits | |
+/// |---|---|---|
+/// | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | a real escape hatch |
+/// | `b = sb.q.pop()`, `q : queue<uint<8>>` | the same line — "operand types are 'Beat' and 'long unsigned int'" | `Invalid` |
+/// | `b = drv.get()` | `b = Drv_get(_tb.drv);` — "'Beat' and 'uint64_t'" | `Invalid` |
+/// | `b = o` / `b = 5` | "'Beat' and 'Other'" / "'Beat' and 'int'" | `Invalid` |
+/// | `rec = 5` in a method body | "'Beat' and 'int'" | `Invalid` |
+/// | `drv.rec = 5` from test scope | the same — and TB-IR used to LOWER it | `Invalid` |
+///
+/// The last row is the one that matters most: the bare-name spelling
+/// was guarded and the dotted test-scope spelling was not, so
+/// `drv.rec = 5` lowered, verified, and emitted `drv.rec = 5;` from the
+/// DEFAULT backend — as uncompilable as v1's. Test scope is where a
+/// user writes that line.
+///
+/// A transactor method can only return a scalar (a record return type
+/// is refused upstream), so that arm has no well-typed member at all.
+#[test]
+fn the_record_assignment_arms_split_on_whether_the_program_type_checks() {
+    let prog = |elem: &str, body: &str, method: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    q : queue<{elem}>
+end scoreboard Sb
+
+transactor Drv
+    dut : Top
+    st  : uint<32> default 0
+    rec : Beat
+
+    when active
+        hookable get() -> uint<8>
+            wait 1 cycle
+            return 7
+        end hookable
+{method}
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let run = |body: &str| prog("Beat", body, "");
+
+    // The controls: a same-typed copy lowers in every position.
+    lower_src(&run("        let b : Beat\n        b.v = 1")).expect("field write lowers");
+    lower_src(&run("        let b : Beat\n        drv.rec = b")).expect("same-typed copy lowers");
+    lower_src(&run("        drv.st = 5")).expect("a scalar state field takes a scalar");
+
+    // The one well-typed member of the pop family — v1 compiles it, so
+    // the suggestion is honest.
+    let pop_ok = run("        let b : Beat\n        b = sb.q.pop()");
+    let msg = assert_unsupported(&lower_src(&pop_ok).unwrap_err());
+    assert!(msg.contains("scoreboard `pop()` result"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&pop_ok))
+            .expect("v1 emits")
+            .contains("b = _tb.sb.q.pop();"),
+        "v1 emits the struct copy that makes the suggestion honest"
+    );
+
+    // Everything else under these arms is a type error: v1 emits the
+    // assignment and g++ refuses it, so no backend runs it.
+    for (label, src) in [
+        (
+            "a scalar queue popped into a record local",
+            prog("uint<8>", "        let b : Beat\n        b = sb.q.pop()", ""),
+        ),
+        (
+            "a transactor method result",
+            run("        let b : Beat\n        b = drv.get()"),
+        ),
+        (
+            "a different record",
+            run("        let b : Beat\n        let o : Other\n        b = o"),
+        ),
+        ("a bare integer", run("        let b : Beat\n        b = 5")),
+        (
+            "a scalar into a record state field, bare name",
+            prog(
+                "Beat",
+                "        drv.poke()",
+                "        hookable poke()\n            rec = 5\n            wait 1 cycle\n        end poke",
+            ),
+        ),
+        (
+            "…and the same write from test scope, which had no arm",
+            run("        drv.rec = 5"),
+        ),
+        (
+            "…including a different record from test scope",
+            run("        let o : Other\n        drv.rec = o"),
+        ),
+    ] {
+        let err = lower_src(&src).unwrap_err();
+        assert!(
+            matches!(err, lower::LowerError::Invalid(_)),
+            "{label}: Invalid, not `{err:?}`"
+        );
+    }
+
+    // `Invalid` is only for a mismatch this compiler can SEE. A
+    // record-typed COMPOSITE-COMPONENT field is a record value, and the
+    // first version of these guards could not type one — so a
+    // whole-record copy from it, which both backends compile, became a
+    // type error. `record_id_of_expr` knows `Expr::ComponentField` now,
+    // and `record_capable_expr` keeps the escape hatch for any shape it
+    // still cannot type rather than calling it wrong.
+    let with_agent = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+agent Src
+    in_ev : event<uint<8>>
+    cur   : Beat
+    oth   : Other
+    n     : uint<32> default 0
+
+    on in_ev(t)
+        cur.v = t
+    end on
+end agent Src
+
+transactor Drv
+    dut : Top
+    st  : uint<32> default 0
+    rec : Beat
+
+    when active
+        hookable step(n : uint<8>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut   : Top
+    drv   : Drv active
+    src   : Src
+    count : uint<32> default 0
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (label, body) in [
+        (
+            "a record state field from a component field",
+            "        drv.rec = src.cur",
+        ),
+        (
+            "a record local from a component field",
+            "        let b : Beat\n        b = src.cur",
+        ),
+    ] {
+        let src = with_agent(body);
+        lower_src(&src).unwrap_or_else(|e| panic!("{label} lowers: {e:?}"));
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "{label}: and v1 emits it"
+        );
+    }
+    // A component field of a DIFFERENT record is a mismatch this
+    // compiler can see, so it stays `Invalid`.
+    let cross = with_agent("        drv.rec = src.oth");
+    assert!(
+        matches!(
+            lower_src(&cross).unwrap_err(),
+            lower::LowerError::Invalid(_)
+        ),
+        "a different record from a component field is still Invalid"
+    );
+    // …and the mirror hole one line away in the same guard: a SCALAR
+    // state field assigned a record. v1 emits `drv.st = b;` and g++
+    // refuses it; TB-IR used to lower, verify and emit the same line.
+    let scalar_lhs = with_agent("        let b : Beat\n        drv.st = b");
+    let err = lower_src(&scalar_lhs).unwrap_err();
+    let lower::LowerError::Invalid(msg) = &err else {
+        panic!("a scalar state field assigned a record is Invalid, not `{err:?}`");
+    };
+    assert!(msg.contains("is a scalar state field"), "{msg}");
+
+    // A record-valued TERNARY is a record value. `expr_type` types this
+    // shape one line-for-line the same way, and leaving it out of
+    // `record_id_of_expr` made `b = c ? x : y` — which v1 emits as
+    // `b = (c ? x : y);` and g++ accepts — a type error.
+    for body in [
+        "        let b : Beat\n        let x : Beat\n        let y : Beat\n        b = 1 == 1 ? x : y",
+        "        let x : Beat\n        let y : Beat\n        drv.rec = 1 == 1 ? x : y",
+        // …including one whose arm is a component field.
+        "        let b : Beat\n        let x : Beat\n        b = 1 == 1 ? x : src.cur",
+    ] {
+        let src = with_agent(body);
+        lower_src(&src).unwrap_or_else(|e| panic!("a record ternary lowers: {e:?}"));
+        assert!(cpp_tb::emit(&merged_src(&src)).is_ok(), "and v1 emits it");
+    }
+    // Arms of different record types are a mismatch this compiler can
+    // see, so that stays `Invalid`.
+    // BOTH orderings: reading only the else-arm's record and dropping
+    // the equality check leaves the whole suite green if only the
+    // then-arm mismatch is tested.
+    for body in [
+        "        let b : Beat\n        let x : Beat\n        let o : Other\n        b = 1 == 1 ? x : o",
+        "        let b : Beat\n        let x : Beat\n        let o : Other\n        b = 1 == 1 ? o : x",
+    ] {
+        let mixed = with_agent(body);
+        assert!(
+            matches!(
+                lower_src(&mixed).unwrap_err(),
+                lower::LowerError::Invalid(_)
+            ),
+            "a ternary whose arms disagree is Invalid: {body}"
+        );
+    }
+
+    // EVERY definitely-scalar RHS is a type error, not an escape hatch.
+    // The first fix kept a hatch for `TbField` and `ComponentValue` on
+    // the theory that they might hold a record — neither can, and both
+    // spellings promised `--codegen v1` for a program v1 refuses.
+    for (body, v1_line) in [
+        (
+            "        let s : uint<8>\n        let b : Beat\n        b = s",
+            "b = s;",
+        ),
+        (
+            "        let t : Beat\n        let b : Beat\n        b = t.v",
+            "b = t.v;",
+        ),
+        // `TbField` — a testbench SCALAR field. A record testbench
+        // field is in `tb_record_fields` and resolves to a `Local`, so
+        // a `TbField` is always a scalar.
+        ("        let b : Beat\n        b = count", "b = _tb.count;"),
+        // A SCALAR component field. `record_id_of_expr` resolves the
+        // access and finds a scalar, which is definitive.
+        ("        let b : Beat\n        b = src.n", "b = _tb.src.n;"),
+    ] {
+        let src = with_agent(body);
+        assert!(
+            matches!(lower_src(&src).unwrap_err(), lower::LowerError::Invalid(_)),
+            "a scalar RHS into a record local is Invalid: {body}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`, which g++ refuses — nothing to send the user to"
+        );
+    }
+
+    // A whole component as the RHS never reaches this verdict — an
+    // earlier guard claims it — but it must not promise v1 either, and
+    // it does not: v1 emits `b = _tb.src;`, which g++ refuses.
+    let whole_comp = with_agent("        let b : Beat\n        b = src");
+    assert_not_implemented(
+        &lower_src(&whole_comp).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&whole_comp))
+            .expect("v1 emits")
+            .contains("b = _tb.src;"),
+        "v1 emits the struct copy g++ refuses"
+    );
+
+    // Inside a component METHOD body the base is `["self", <field>]`,
+    // not a test-scope instance — `component_path_head` builds it that
+    // way and `component_base_id` must invert the SAME two head forms.
+    // Resolving only the test-scope one made every `src.cur` in a
+    // method body untypable, which is why an escape hatch looked
+    // necessary at all.
+    let in_method = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct Inner
+    z : uint<8>
+end struct Inner
+
+transaction Beat
+    v   : uint<8>
+    inn : Inner
+end transaction Beat
+
+agent Src
+    cur : Beat
+    n   : uint<32> default 0
+end agent Src
+
+agent Outer
+    src  : Src
+    mine : Beat
+    seen : uint<32> default 0
+
+    function grab()
+BODY
+        seen = seen + 1
+    end function
+end agent Outer
+
+testbench Tb
+    dut : Top
+    o   : Outer
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        o.grab()
+        wait 2 cycles
+    end run
+end impl T"#;
+    let method = |body: &str| in_method.replace("BODY", body);
+
+    // Lowers, and both backends emit the struct copy.
+    for (body, v1_line) in [
+        // a `Path(["self", "src"])` base
+        (
+            "        let b : Beat\n        b = src.cur",
+            "b = self.src.cur;",
+        ),
+        // a `SelfField` base
+        ("        let b : Beat\n        b = mine", "b = self.mine;"),
+        // a `SelfField` base with a DOTTED field naming a nested record
+        // subfield — `component_field_record` walks it segment by
+        // segment, exactly as `as_component_record_field` validated it.
+        (
+            "        let b : Inner\n        b = mine.inn",
+            "b = self.mine.inn;",
+        ),
+        // an untyped `let` of the same, which typed as `uint64_t` until
+        // `lower_let` learned to ask `record_id_of_expr`
+        ("        let c = src.cur", "c = self.src.cur;"),
+    ] {
+        let src = method(body);
+        lower_src(&src).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`"
+        );
+    }
+    // The untyped `let` must declare a RECORD local. Typing it as a
+    // scalar is what made the DEFAULT backend emit
+    // `uint64_t c = 0; ... c = self.src.cur;` — "cannot convert 'Beat'
+    // to 'uint64_t'". v1 emits `int64_t c = self.src.cur;`, uncompilable
+    // the same way, so tbir is now strictly the better of the two.
+    let untyped = method("        let c = src.cur");
+    assert!(
+        emit_cpp_src(&untyped).contains("Beat c{}"),
+        "the local declares as the record"
+    );
+    // …and the same walk answers definitively the other way, so a
+    // scalar leaf is a type error rather than a v1 promise.
+    for body in [
+        "        let b : Beat\n        b = src.n",
+        "        let b : Inner\n        b = mine.v",
+        // The sharp one: the SUB-SEGMENT is a scalar but the head field
+        // is a `Beat`, so a walk that stopped at the head would answer
+        // `Beat`, match the destination, and lower `b = self.mine.v;`.
+        "        let b : Beat\n        b = mine.v",
+    ] {
+        assert!(
+            matches!(
+                lower_src(&method(body)).unwrap_err(),
+                lower::LowerError::Invalid(_)
+            ),
+            "a scalar leaf is Invalid: {body}"
+        );
+    }
+
+    // The walk stops at a `Vec`, in both positions — and does not have
+    // to enforce that itself: `as_component_record_field`'s `validate`
+    // refuses both upstream. Pinned here so the two cannot drift.
+    let vec_holder = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct Inner
+    z : uint<8>
+end struct Inner
+
+struct Holder
+    tbl : Vec<Inner, 4>
+end struct Holder
+
+agent Outer
+    mine : Holder
+    seen : uint<32> default 0
+
+    function grab()
+        let b : Inner
+BODY
+        seen = seen + 1
+    end function
+end agent Outer
+
+testbench Tb
+    dut : Top
+    o   : Outer
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        o.grab()
+        wait 2 cycles
+    end run
+end impl T"#;
+    for (body, names) in [
+        ("        b = mine.tbl", "whole-`Vec` component record field"),
+        ("        b = mine.tbl.z", "is not a nested record"),
+    ] {
+        let msg = assert_unsupported(&lower_src(&vec_holder.replace("BODY", body)).unwrap_err());
+        assert!(msg.contains(names), "{msg}");
+    }
+
+    // A NESTED path must resolve through its segments, not just its
+    // head. `Holder` declares its own `cur : Other` alongside a
+    // sub-component whose `cur` is a `Beat`, so resolving `env.src.cur`
+    // against the head alone would type it as `Other` and reject a
+    // program v1 compiles.
+    let nested = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+agent Src
+    cur : Beat
+end agent Src
+
+env Holder
+    src : Src
+    cur : Other
+end env Holder
+
+testbench Tb
+    dut : Top
+    env : Holder
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        b = env.src.cur
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(nested).expect("a nested component path lowers");
+    assert!(
+        cpp_tb::emit(&merged_src(nested))
+            .expect("v1 emits")
+            .contains("b = _tb.env.src.cur;"),
+        "v1 emits the copy from the SUB-component's field"
+    );
+
+    // The `Vec<Record, N>` ELEMENT write is the same rule stated a
+    // third time, and it was the one still promising `--codegen v1`.
+    // Its sibling one screen down (the whole nested-record field write)
+    // was already classified; both are `Invalid` now, on the same
+    // evidence.
+    let table = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct Entry
+    tag : uint<8> default 0
+end struct Entry
+
+struct Other
+    w : uint<8>
+end struct Other
+
+struct EntryTable
+    entries : Vec<Entry, 4>
+    inner   : Entry
+end struct EntryTable
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let tbl : EntryTable
+        let o   : Other
+        let en  : Entry
+BODY
+        wait 2 cycles
+    end run
+end impl T"#;
+    let tbl = |body: &str| table.replace("BODY", body);
+    lower_src(&tbl("        tbl.entries[1] = en")).expect("a same-typed element write lowers");
+    for (body, v1_operands) in [
+        ("        tbl.entries[1] = 5", "'Entry' and 'int'"),
+        ("        tbl.entries[1] = o", "'Entry' and 'Other'"),
+        ("        tbl.inner = 5", "'Entry' and 'int'"),
+        ("        tbl.inner = o", "'Entry' and 'Other'"),
+    ] {
+        let src = tbl(body);
+        assert!(
+            matches!(lower_src(&src).unwrap_err(), lower::LowerError::Invalid(_)),
+            "a mismatched record write is Invalid: {body}"
+        );
+        // The evidence, in v1's own emitted line.
+        let cpp = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            cpp.contains(body.trim_start()),
+            "v1 emits the assignment verbatim ({v1_operands} at g++): {body}"
+        );
+    }
+}
+
+/// The DECLARED type of a `let` is a contract, at all four spellings
+/// that had a type to check against and did not.
+///
+/// Three of the four typed the local from the RHS and dropped the
+/// annotation in silence — the default backend then ran a program v1
+/// refuses to compile. The fourth is the record-annotated initializer,
+/// which promised `--codegen v1` for the same programs.
+#[test]
+fn a_declared_let_type_is_checked_against_what_initialises_it() {
+    let prog = |elem: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+agent Src
+    cur : Beat
+    n   : uint<32> default 0
+end agent Src
+
+scoreboard Sb
+    q : queue<{elem}>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    s   : Src
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let rec = |body: &str| prog("Beat", body);
+    let sca = |body: &str| prog("uint<8>", body);
+
+    // The controls: agreeing annotations, and no annotation at all.
+    for src in [
+        rec("        let b : Beat = sb.q.pop()"),
+        rec("        let b = sb.q.pop()"),
+        sca("        let b : uint<8> = sb.q.pop()"),
+        rec("        let c = s.cur"),
+        rec("        let y : Beat\n        let b : Beat = y"),
+    ] {
+        lower_src(&src).unwrap_or_else(|e| panic!("an agreeing `let` lowers: {e:?}"));
+    }
+
+    // A scalar annotation over a record RHS. This one is the sharp
+    // case: `record_ty` beats `declared_scalar_ty` in the type chain,
+    // so before the check the annotation was discarded and the DEFAULT
+    // backend declared `Beat c{}` — laundering the type with no
+    // diagnostic, where v1 at least emitted something g++ rejects.
+    let scalar_ann = rec("        let c : uint<8> = s.cur");
+    let msg = assert_invalid(&lower_src(&scalar_ann).unwrap_err());
+    // Every annotation spelling, not just the ones `typed_let_ir_type`
+    // resolves: it answers `None` for `int`, and `bit` parses as a
+    // `Named` type, so keying the check on its result left both
+    // discarding the annotation in silence.
+    for ann in [
+        "uint<8>", "bits<16>", "sint<8>", "bool", "bit", "time", "int",
+    ] {
+        let src = rec(&format!("        let c : {ann} = s.cur"));
+        assert!(
+            matches!(lower_src(&src).unwrap_err(), lower::LowerError::Invalid(_)),
+            "`let c : {ann} = s.cur` is Invalid"
+        );
+    }
+    assert!(
+        msg.contains("`let c` is declared with a non-record type") && msg.contains("`Beat`"),
+        "names both sides: {msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&scalar_ann))
+            .expect("v1 emits")
+            .contains("uint64_t c = _tb.s.cur;"),
+        "v1 emits the initialization g++ refuses"
+    );
+
+    // FIVE queue-pop lanes shared one rule and none of them applied it.
+    // Three of the five are reachable from a testbench-scope `let` and
+    // are pinned here; the other two have their own fixtures below.
+    for (src, v1_line) in [
+        (
+            rec("        let b : Other = sb.q.pop()"),
+            "Other b = _tb.sb.q.pop();",
+        ),
+        (
+            rec("        let b : uint<8> = sb.q.pop()"),
+            "uint64_t b = _tb.sb.q.pop();",
+        ),
+        (
+            sca("        let b : Beat = sb.q.pop()"),
+            "Beat b = _tb.sb.q.pop();",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("scoreboard queue `q`"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`, which g++ refuses"
+        );
+    }
+
+    // The TESTBENCH-owned queue lane. Same defect, different resolver
+    // (`as_tb_queue_call`), and it was missed when the other three were
+    // fixed — the fourth of five.
+    let tbq = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+testbench Tb
+    dut     : Top
+    pending : queue<Beat>
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&tbq("        let b : Beat = pending.pop()")).expect("an agreeing pop lowers");
+    for (body, v1_line) in [
+        (
+            "        let b : Other = pending.pop()",
+            "Other b = _tb.pending.pop();",
+        ),
+        (
+            "        let b : uint<8> = pending.pop()",
+            "uint64_t b = _tb.pending.pop();",
+        ),
+    ] {
+        let src = tbq(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("testbench queue `pending`"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`, which g++ refuses"
+        );
+    }
+
+    // The COMPONENT-queue lane — a `queue<T>` field on a component
+    // reached through a composite path, a fifth resolver again.
+    let cq = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+agent Src
+    q : queue<Beat>
+end agent Src
+
+env Holder
+    s : Src
+end env Holder
+
+testbench Tb
+    dut : Top
+    h   : Holder
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&cq("        let b : Beat = h.s.q.pop()")).expect("an agreeing pop lowers");
+    for (body, v1_line) in [
+        (
+            "        let b : Other = h.s.q.pop()",
+            "Other b = _tb.h.s.q.pop();",
+        ),
+        (
+            "        let b : uint<8> = h.s.q.pop()",
+            "uint64_t b = _tb.h.s.q.pop();",
+        ),
+    ] {
+        let src = cq(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("component queue `q`"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`, which g++ refuses"
+        );
+    }
+
+    // The two TARGET-STATE lanes — the responder body's bare-name pop
+    // and the test-scope `responder.pending.pop()` spelling of the same
+    // queue on the same instance. One lane of a construct checked and
+    // the other not is the shape this whole divergence is about, so
+    // both are pinned.
+    let tgt = fixture("target_nonscalar_state_test.harc").replace(
+        "struct Beat\n    addr",
+        "struct Other\n    w : uint<8>\nend struct Other\n\nstruct Beat\n    addr",
+    );
+    lower_src(&tgt).expect("the fixture still lowers with the extra struct");
+    for (from, to, what) in [
+        // the responder BODY's bare-name pop
+        (
+            "        let out : Beat = pending.pop()",
+            "        let out : Other = pending.pop()",
+            "target-state queue `pending`",
+        ),
+        // …and the TEST-SCOPE spelling of the same queue on the same
+        // instance, which the first round of this fix left unchecked.
+        (
+            "        let logged = responder.log_addrs.pop()",
+            "        let logged : Beat = responder.log_addrs.pop()",
+            "target-state queue `responder.log_addrs`",
+        ),
+    ] {
+        assert_eq!(tgt.matches(from).count(), 1, "unique anchor: {from}");
+        let msg = assert_invalid(&lower_src(&tgt.replace(from, to)).unwrap_err());
+        assert!(msg.contains(what), "{msg}");
+    }
+
+    // A regblock name is in `record_ids` too — the mirror record is
+    // filed under it — and these lanes run BEFORE divergence 104's
+    // instantiation guard. The pop check must decline rather than
+    // answer with a sentence about queue element types, or the
+    // actionable "requires `= bind <helper>`" is lost.
+    let rb = fixture("regblock_basic_test.harc");
+    let rb = rb.replace(
+        "testbench RegblockBasicTb\n    dut : AxiLiteRegs",
+        "scoreboard PopSb\n    q : queue<uint<8>>\nend scoreboard PopSb\n\n\
+         testbench RegblockBasicTb\n    dut : AxiLiteRegs\n    sb  : PopSb",
+    );
+    let rb_pop = rb.replacen(
+        "    run\n",
+        "    run\n        let z : DmaRegs = sb.q.pop()\n",
+        1,
+    );
+    let msg = assert_invalid(&lower_with_stdlib_bus_src(&rb_pop).unwrap_err());
+    assert!(
+        msg.contains("bind <helper>"),
+        "the regblock guard keeps the actionable message: {msg}"
+    );
+
+    // The record-annotated INITIALIZER — the one that promised v1.
+    for (src, v1_line) in [
+        (rec("        let b : Beat = 5"), "Beat b = 5;"),
+        (
+            rec("        let x : Other\n        let b : Beat = x"),
+            "Beat b = x;",
+        ),
+        (rec("        let b : Beat = s.n"), "Beat b = _tb.s.n;"),
+    ] {
+        assert!(
+            matches!(lower_src(&src).unwrap_err(), lower::LowerError::Invalid(_)),
+            "a non-`Beat` initializer is Invalid"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "and v1 emits `{v1_line}`, which g++ refuses"
+        );
+    }
+}
+
+/// The MIRROR of every record-destination guard: a SCALAR destination
+/// whose RHS is a record.
+///
+/// One direction of this rule had been guarded arm by arm. The other
+/// was guarded at exactly one site, and everywhere else `x = <record>`
+/// LOWERED, VERIFIED and emitted from the DEFAULT backend — C++ that
+/// does not build. v1 emits the same line and fails the same way, so
+/// no backend runs any of these.
+#[test]
+fn a_scalar_destination_assigned_a_record_is_rejected_everywhere() {
+    let prog = |method: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+struct Holder
+    n    : uint<8>
+    nums : Vec<uint<8>, 4>
+end struct Holder
+
+agent Src
+    n   : uint<32> default 0
+    cur : Beat
+
+    function take(b : Beat)
+{method}
+    end function
+end agent Src
+
+scoreboard Sb
+    q    : queue<Beat>
+    hits : uint<32> default 0
+end scoreboard Sb
+
+transactor Drv
+    dut : Top
+    st  : uint<32> default 0
+    rec : Beat
+
+    when active
+        hookable step(n : uint<8>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut   : Top
+    s     : Src
+    sb    : Sb
+    drv   : Drv active
+    count : uint<32> default 0
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    let test = |body: &str| prog("", body);
+
+    // The control: every one of these destinations takes a scalar.
+    lower_src(&test(
+        "        let h : Holder\n        dut.en = 1\n        count = 1\n        \
+         sb.hits = 1\n        s.n = 1\n        h.n = 1\n        h.nums[1] = 1\n        \
+         drv.rec.v = 1\n        drv.st = 1",
+    ))
+    .expect("the scalar controls lower");
+
+    for (label, method, body) in [
+        ("a DUT port", "", "        let b : Beat\n        dut.en = b"),
+        // The lane-indexed port spelling takes a different resolver.
+        (
+            "a lane-indexed DUT port",
+            "",
+            "        let b : Beat\n        dut.en[0] = b",
+        ),
+        (
+            "a testbench field",
+            "",
+            "        let b : Beat\n        count = b",
+        ),
+        (
+            "a scoreboard counter",
+            "",
+            "        let b : Beat\n        sb.hits = b",
+        ),
+        (
+            "a scalar component field",
+            "",
+            "        let b : Beat\n        s.n = b",
+        ),
+        // …and the bare-name spelling of the same, in a method body
+        ("a scalar component field, bare name", "        n = b", ""),
+        (
+            "a scalar record field",
+            "",
+            "        let b : Beat\n        let h : Holder\n        h.n = b",
+        ),
+        (
+            "a scalar `Vec` element",
+            "",
+            "        let b : Beat\n        let h : Holder\n        h.nums[1] = b",
+        ),
+        (
+            "a record-state scalar subfield",
+            "",
+            "        let b : Beat\n        drv.rec.v = b",
+        ),
+        // This one reached the VERIFIER's TypeMismatch, which `main.rs`
+        // renders as "internal error: TB-IR failed verification after
+        // lowering" — a compiler-bug report for a program error.
+        (
+            "a scalar local",
+            "",
+            "        let b : Beat\n        let x : uint<8> = 0\n        x = b",
+        ),
+        // The assignment spelling of a pop whose `let` spelling was
+        // already rejected.
+        (
+            "a scalar local from a record queue",
+            "",
+            "        let x : uint<8> = 0\n        x = sb.q.pop()",
+        ),
+    ] {
+        let src = prog(method, body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("is a scalar"),
+            "{label} names the destination: {msg}"
+        );
+        // v1 emits the same assignment and fails the same way, so
+        // there is nowhere to send the user.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "{label}: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // The BARE-NAME spelling of a scalar state field, written from
+    // inside the transactor body. The polarity of this hole is reversed
+    // from the record direction — there the bare name was guarded and
+    // the dotted one was not — but it is the same
+    // one-lane-checked-one-not shape, and tbir emitted
+    // `self_state.st = b;` for it.
+    let responder = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transactor Drv
+    dut : Top
+    st  : uint<32> default 0
+    rec : Beat
+
+    when active
+        hookable poke()
+            let b : Beat
+{body}
+            wait 1 cycle
+        end poke
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        drv.poke()
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&responder("            st = 5")).expect("a scalar RHS lowers");
+    let msg = assert_invalid(&lower_src(&responder("            st = b")).unwrap_err());
+    assert!(msg.contains("state field `st` is a scalar"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&responder("            st = b")))
+            .expect("v1 emits")
+            .contains("self.st = b;"),
+        "v1 emits the same assignment g++ refuses"
+    );
+}
+
+/// All four RAL write spellings are scalar destinations too, and they
+/// return from inside the `try_lower_*` helpers — so none of the ten
+/// destination guards in `lower_assign` ever saw them.
+#[test]
+fn a_register_field_assigned_a_record_is_rejected() {
+    let with_beat = |name: &str, anchor: &str| {
+        fixture(name).replacen(
+            anchor,
+            &format!("transaction Beat\n    v : uint<8>\nend transaction Beat\n\n{anchor}"),
+            1,
+        )
+    };
+    let reg = with_beat("regblock_basic_test.harc", "testbench RegblockBasicTb");
+    let fld = with_beat("regblock_fields_test.harc", "testbench RegblockFieldsTb");
+    let put = |src: &str, line: &str| src.replacen("    run\n", &format!("    run\n{line}\n"), 1);
+
+    // The controls still lower.
+    lower_with_stdlib_bus_src(&put(&reg, "        regs.DMACR = 1"))
+        .expect("a scalar register write lowers");
+
+    for (src, line) in [
+        (&reg, "        let b : Beat\n        regs.DMACR = b"),
+        (&fld, "        let b : Beat\n        regs.DMACR.RS = b"),
+    ] {
+        let s = put(src, line);
+        let msg = assert_invalid(&lower_with_stdlib_bus_src(&s).unwrap_err());
+        assert!(msg.contains("a register field is a scalar"), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_with_stdlib_bus(&s, "BusAxiLite.arch")).is_ok(),
+            "v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
+/// A whole-record write of a TESTBENCH record field. The catch-all arm
+/// that had been claiming it was wrong in both directions.
+#[test]
+fn a_testbench_record_field_write_splits_on_the_rhs_type() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+testbench Tb
+    dut   : Top
+    tbrec : Beat
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // A same-typed RHS: v1 emits the struct copy and g++ ACCEPTS it, so
+    // the suggestion is honest. It had been `SilentlyMisLowers` —
+    // "`--codegen v1` accepts it but silently emits something else" —
+    // which withheld a hatch that works.
+    let ok = prog("        let b : Beat\n        tbrec = b");
+    let msg = assert_unsupported(&lower_src(&ok).unwrap_err());
+    assert!(msg.contains("testbench record field"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&ok))
+            .expect("v1 emits")
+            .contains("_tb.tbrec = b;"),
+        "v1 emits the struct copy that makes the suggestion honest"
+    );
+
+    // A mismatched RHS is a type error, not a silent mis-lowering: v1
+    // emits `_tb.tbrec = 5;` and g++ answers "no match for 'operator='".
+    let bad = prog("        tbrec = 5");
+    let msg = assert_invalid(&lower_src(&bad).unwrap_err());
+    assert!(msg.contains("testbench record field"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&bad))
+            .expect("v1 emits")
+            .contains("_tb.tbrec = 5;"),
+        "v1 emits the assignment g++ refuses"
+    );
+
+    // Reading and subfield-writing the same field are untouched.
+    lower_src(&prog("        tbrec.v = 3\n        let c = tbrec"))
+        .expect("field write and whole-record read still lower");
+}
+
+/// A whole-RECORD component field is written like any other component
+/// field. Both spellings were refused: the dotted test-scope one with a
+/// `--codegen v1` promise, the bare method-body one with a
+/// `NotImplemented` whose stated reason was false in both halves.
+#[test]
+fn a_whole_record_component_field_is_writable_from_both_spellings() {
+    let prog = |method: &str, body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+agent Src
+    cur : Beat
+    n   : uint<32> default 0
+
+    function take(b : Beat)
+{method}
+        n = n + 1
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // Dotted test-scope write. v1 emits the struct copy and g++ takes
+    // it, so the old blanket "not a scalar component field"
+    // `Unsupported` was refusing a program BOTH backends can run.
+    let test_scope = prog("", "        let y : Beat\n        s.cur = y");
+    lower_src(&test_scope).expect("a test-scope whole-record field write lowers");
+    assert!(
+        cpp_tb::emit(&merged_src(&test_scope))
+            .expect("v1 emits")
+            .contains("_tb.s.cur = y;"),
+        "v1 emits the same struct copy"
+    );
+    assert!(
+        emit_cpp_src(&test_scope).contains("s.cur = y;"),
+        "and so does tbir"
+    );
+
+    // Bare method-body write. This one had reached "assignment to
+    // unknown name `cur`" — `cur` is a declared field of the very
+    // component whose method this is — labelled `EmitsUncompilable`,
+    // while v1 emits `self.cur = b;` and compiles.
+    let in_method = prog("        cur = b", "");
+    lower_src(&in_method).expect("a self whole-record field write lowers");
+    assert!(
+        cpp_tb::emit(&merged_src(&in_method))
+            .expect("v1 emits")
+            .contains("self.cur = b;"),
+        "v1 emits the struct copy"
+    );
+    assert!(
+        emit_cpp_src(&in_method).contains("self.cur = b;"),
+        "and so does tbir"
+    );
+
+    // A mismatched RHS is a type error at both spellings.
+    for (body, method) in [
+        ("        s.cur = 5", ""),
+        ("        let o : Other\n        s.cur = o", ""),
+        ("", "        cur = 5"),
+    ] {
+        let src = prog(method, body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("component record field `cur`"), "{msg}");
+    }
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("", "        s.cur = 5")))
+            .expect("v1 emits")
+            .contains("_tb.s.cur = 5;"),
+        "v1 emits the assignment g++ refuses"
+    );
+}
+
+/// Seven `bound to` arms across three files, all promising `--codegen
+/// v1` for programs v1 either mis-lowers or refuses. Three dimensions:
+/// the type shape (generic-applied / non-named), the lowering path
+/// (event-driven consumer, bound initiator, bound target), and the
+/// declaration kind (transactor vs env/agent/sequencer).
+#[test]
+fn the_bound_to_arms_split_on_what_v1_does_with_the_clause() {
+    let bus_lower =
+        |src: &str| lower::lower_program(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+    let bus_emit = |src: &str| cpp_tb::emit(&merged_with_stdlib_bus(src, "BusAxiLite.arch"));
+    let sub = |src: &str, from: &str, to: &str| {
+        assert_eq!(src.matches(from).count(), 1, "`{from}` is unique");
+        src.replace(from, to)
+    };
+
+    // ---- A generic-applied bound type, on all three lowering paths.
+    //
+    // v1's `type_simple_name` reads the last path segment and never
+    // looks at the argument list, so DIFFERENT arguments emit the SAME
+    // C++. That byte-identity is the whole finding: the transactor
+    // silently gets the bus declaration's default widths.
+    for (name, decl, bus_file, subject) in [
+        // event-driven consumer BFM (`on <ev>` driving the bound bus)
+        (
+            "axilite_bound_mon_test.harc",
+            "transactor AxilXactor bound to BusAxiLite",
+            Some("BusAxiLite.arch"),
+            "event-driven transactor `AxilXactor`",
+        ),
+        // bound INITIATOR BFM (`hookable` methods driving the bus)
+        (
+            "regblock_fields_test.harc",
+            "transactor AxilHelper bound to BusAxiLite",
+            Some("BusAxiLite.arch"),
+            "transactor `AxilHelper`",
+        ),
+        // bound TARGET responder (`thread bus.<method>`)
+        (
+            "tlm_target_thread_if_test.harc",
+            "transactor TlmMemTarget bound to TlmMemBus",
+            None,
+            "transactor `TlmMemTarget`",
+        ),
+    ] {
+        let src = fixture(name);
+        let emit = |s: &str| match bus_file {
+            Some(b) => cpp_tb::emit(&merged_with_stdlib_bus(s, b)),
+            None => cpp_tb::emit(&merged_src(s)),
+        };
+        let lower = |s: &str| match bus_file {
+            Some(b) => lower::lower_program(&merged_with_stdlib_bus(s, b)),
+            None => lower::lower_program(&merged_src(s)),
+        };
+
+        // Same textual LENGTH, different values — so an identical
+        // emission cannot be explained by a shifted source offset.
+        let same = sub(&src, decl, &format!("{decl}#(ADDR_W=32, DATA_W=32)"));
+        let diff = sub(&src, decl, &format!("{decl}#(ADDR_W=12, DATA_W=64)"));
+        assert_eq!(
+            emit(&same).expect("v1 emits the parameterized form"),
+            emit(&diff).expect("v1 emits the other parameterization"),
+            "{name}: v1 emits byte-identical C++ for #(32,32) and #(12,64)"
+        );
+        let msg = assert_not_implemented(
+            &lower(&same).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("generic-applied bus type"), "{msg}");
+        // ONE argument too — every probe here passes two, so a guard
+        // reading `generics.len() > 1` instead of `!is_empty()` would
+        // let `#(ADDR_W=12)` through unnoticed, and that is exactly the
+        // program the arm exists to catch.
+        let one = sub(&src, decl, &format!("{decl}#(ADDR_W=12)"));
+        assert_not_implemented(
+            &lower(&one).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        // The SUBJECT half too — it is the only thing the three call
+        // sites pass differently, so without this the per-site
+        // parameter is unpinned.
+        assert!(msg.contains(subject), "names its own site: {msg}");
+
+        // ---- A non-named bound type (`bound to uint<8>`), same three
+        // paths. Every INSTANTIATION is refused by v1, so this one is
+        // `Rejects`, not a silent mis-lowering.
+        let nn_decl = format!(
+            "{} bound to uint<8>",
+            decl.split(" bound to ")
+                .next()
+                .expect("the decl names a bus")
+        );
+        let nn = sub(&src, decl, &nn_decl);
+        let err = format!("{}", emit(&nn).expect_err("v1 refuses the instantiation"));
+        assert!(
+            err.contains("bound to `?`"),
+            "v1's own diagnostic names the unresolvable bound type: {err}"
+        );
+        let msg = assert_not_implemented(&lower(&nn).unwrap_err(), lower::V1Status::Rejects);
+        assert!(msg.contains("non-named bus type"), "{msg}");
+
+        // ---- Between the two arms sits the resolution itself: the bus
+        // is the LAST path segment. A dotted `bound to
+        // arc.stdlib.BusAxiLite` names the same bus and both backends
+        // handle it; reading the FIRST segment would look up a bus
+        // called `arc` and call the program invalid.
+        let bus_seg = decl
+            .split(" bound to ")
+            .nth(1)
+            .expect("the decl names a bus");
+        let dotted = sub(
+            &src,
+            decl,
+            &decl.replace(bus_seg, &format!("arc.stdlib.{bus_seg}")),
+        );
+        lower(&dotted).unwrap_or_else(|e| panic!("{name}: a dotted bound-to path lowers: {e:?}"));
+        emit(&dotted).unwrap_or_else(|e| panic!("{name}: and v1 emits it: {e}"));
+    }
+
+    // …but `Rejects`, not `Invalid`: a NEVER-INSTANTIATED declaration
+    // does get through v1, which emits an inert struct for it. Some
+    // configuration of this program runs, so the arm has something to
+    // implement.
+    let base = fixture("axilite_bound_mon_test.harc");
+    let uninst = sub(
+        &base,
+        "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+        "transactor Unused bound to uint<8>\n    n : uint<32> default 0\nend transactor Unused\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>",
+    );
+    let cpp = bus_emit(&uninst).expect("v1 emits an uninstantiated bogus-bound transactor");
+    assert!(cpp.contains("struct Unused {"), "and it is inert");
+    let msg = assert_not_implemented(&bus_lower(&uninst).unwrap_err(), lower::V1Status::Rejects);
+    // A NAMED type that is not a bus is the same program one variant
+    // over, and used to get `Invalid` while the builtin got `Rejects`.
+    // Both emit the same inert struct when never instantiated.
+    for ty in ["RegOp", "AxilSb"] {
+        let src = sub(
+            &base,
+            "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+            &format!(
+                "transactor Unbussed bound to {ty}\n    n : uint<32> default 0\n\
+                 end transactor Unbussed\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>"
+            ),
+        );
+        let m = assert_not_implemented(&bus_lower(&src).unwrap_err(), lower::V1Status::Rejects);
+        assert!(m.contains(&format!("bound to `{ty}`")), "{m}");
+        assert!(
+            bus_emit(&src)
+                .expect("v1 emits")
+                .contains("struct Unbussed {"),
+            "v1 emits the same inert struct as the builtin case"
+        );
+        // …and the CONSUMER path has its own copy of the same check.
+        // The data-only shape above routes to `transactors.rs`; give it
+        // an `in event` + `on <ev>` and it lands in `mod.rs` instead,
+        // where the third copy was still answering `Invalid`.
+        let consumer = sub(
+            &base,
+            "tseq RandomTxns(n: int) -> TSeq<RegOp>",
+            &format!(
+                "transactor Consumer bound to {ty}\n    req : in event<RegOp>\n\n\
+                 \x20   on req(t)\n        wait 1 cycle\n    end on\n\
+                 end transactor Consumer\n\ntseq RandomTxns(n: int) -> TSeq<RegOp>"
+            ),
+        );
+        let m =
+            assert_not_implemented(&bus_lower(&consumer).unwrap_err(), lower::V1Status::Rejects);
+        assert!(m.contains("event-driven transactor `Consumer`"), "{m}");
+        // …and the bound-INITIATOR path has the third copy. A data-only
+        // transactor routes to the TARGET path, so nothing reached this
+        // one: it takes a `hookable` inside `when active`.
+        let init = fixture("regblock_fields_test.harc").replace(
+            "transactor AxilHelper bound to BusAxiLite",
+            &format!("transactor AxilHelper bound to {ty}"),
+        );
+        let m = assert_not_implemented(
+            &lower::lower_program(&merged_with_stdlib_bus(&init, "BusAxiLite.arch")).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
+        assert!(
+            m.contains("transactor `AxilHelper`") && m.contains(&format!("bound to `{ty}`")),
+            "{m}"
+        );
+    }
+    assert!(
+        msg.contains("transactor `Unused` bound to a non-named"),
+        "{msg}"
+    );
+
+    // ---- A `bound to` clause on an env / agent / sequencer DECL.
+    //
+    // This arm took three attempts. v1 resolves the bound-bus
+    // placeholder `bus` in exactly ONE of eight configurations and
+    // emits it verbatim in the other seven, where nothing declares it.
+    // The table is the measurement: for each cell, count bare `bus`
+    // identifiers outside comments in v1's emitted C++.
+    let bare_bus = |cpp: &str| -> usize {
+        cpp.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| {
+                l.match_indices("bus").any(|(k, _)| {
+                    let before = l[..k].chars().next_back();
+                    let after = l[k + 3..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .count()
+    };
+    let driver_body = "    req : in event<RegOp>\n\n    on req(t)\n        \
+                       bus.aw.addr = t.addr\n        bus.aw.valid = 1\n        \
+                       bus.w.send(t.value, 15)\n        bus.aw.valid = 0\n        \
+                       wait 1 cycle\n    end on";
+    for (shape, body) in [
+        ("on <ev> driver", driver_body),
+        (
+            "cycle trigger reading the bus",
+            "    hits : uint<32> default 0\n\n    on bus.w.valid == 1\n        \
+             hits = hits + 1\n    end on",
+        ),
+        (
+            "periodic handler writing the bus",
+            "    hits : uint<32> default 0\n\n    on 5 cycles\n        \
+             bus.aw.valid = 1\n    end on",
+        ),
+        // `parse_on_handler` reads the trigger BEFORE the `cycles`
+        // decoration, so this is a PERIODIC handler carrying the
+        // handshake-call trigger — the arm's own canonical uncompilable
+        // shape wearing one extra word, and the reason a predicate
+        // keyed on "non-periodic handshake handler" was wrong.
+        (
+            "handshake monitor with `cycles`",
+            "    hits : uint<32> default 0\n\n    on bus.w.handshake(d) cycles\n        \
+             hits = hits + 1\n    end on",
+        ),
+    ] {
+        for kind in ["agent", "env", "sequencer"] {
+            let decl =
+                format!("\n{kind} Watcher bound to BusAxiLite\n{body}\nend {kind} Watcher\n\n");
+            let with_decl = sub(
+                &base,
+                "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+                &format!("{decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs"),
+            );
+            let at_bind = sub(
+                &with_decl,
+                "    let mon  : AxilXactor passive = bind axil",
+                "    let mon  : AxilXactor passive = bind axil\n    let w    : Watcher = bind axil",
+            );
+            let at_field = sub(
+                &with_decl,
+                "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+                "testbench AxiLiteBoundMonTb\n    w   : Watcher\n    dut : AxiLiteRegs",
+            );
+
+            // Every cell carries the same verdict, and it promises
+            // nothing — the detail names the working one instead.
+            for src in [&at_bind, &at_field] {
+                let msg = assert_not_implemented(
+                    &bus_lower(src).unwrap_err(),
+                    lower::V1Status::SilentlyMisLowers,
+                );
+                assert!(
+                    msg.contains(&format!("a `bound to` clause on {kind} `Watcher`")),
+                    "{msg}"
+                );
+            }
+
+            // …and here is why: seven of the eight leave `bus`
+            // undeclared in v1's output. The ONE that does not is the
+            // `on <ev>` driver at a `= bind` site.
+            let n_bind = bare_bus(&bus_emit(&at_bind).expect("v1 emits"));
+            let n_field = bare_bus(&bus_emit(&at_field).expect("v1 emits"));
+            if shape == "on <ev> driver" {
+                assert_eq!(n_bind, 0, "{kind}/{shape} at a bind: v1 resolves the bus");
+                assert!(
+                    bus_emit(&at_bind)
+                        .expect("v1 emits")
+                        .contains("harc_rt::harc_assign(dut->axil_aw_addr, t.addr);"),
+                    "{kind}: and emits a working driver"
+                );
+                assert!(
+                    n_field > 0,
+                    "{kind}/{shape} as a testbench field: v1 emits `bus` verbatim"
+                );
+            } else {
+                assert!(
+                    n_bind > 0,
+                    "{kind}/{shape} at a bind leaves `bus` undeclared"
+                );
+                assert!(
+                    n_field > 0,
+                    "{kind}/{shape} as a field leaves `bus` undeclared"
+                );
+            }
+        }
+    }
+
+    // The NINTH cell, and the one that sets the label: a
+    // `thread bus.<method>(...)` responder. v1 COMPILES this one — zero
+    // bare `bus` references — because it drops the responder coroutine
+    // outright, so the target never answers and the fixture's own
+    // assertions fail at run time. Silently mis-lowering outranks
+    // failing to compile.
+    let thr = fixture("tlm_target_thread_if_test.harc");
+    let thr_ctl = cpp_tb::emit(&merged_src(&thr)).expect("v1 emits the transactor control");
+    for kind in ["agent", "env", "sequencer", "scoreboard"] {
+        let src = thr
+            .replace(
+                "transactor TlmMemTarget bound to TlmMemBus",
+                &format!("{kind} TlmMemTarget bound to TlmMemBus"),
+            )
+            .replace(
+                "end transactor TlmMemTarget",
+                &format!("end {kind} TlmMemTarget"),
+            );
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("silently dropped"), "{kind}: {msg}");
+        let cpp = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        // The evidence, both halves: the responder is GONE, and what is
+        // left has no undeclared `bus` to fail on.
+        assert!(
+            thr_ctl.contains("_target_read_target_slot")
+                && !cpp.contains("_target_read_target_slot"),
+            "{kind}: v1 drops the responder coroutine the transactor form emits"
+        );
+        assert!(
+            !cpp.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("bus.")
+            }),
+            "{kind}: and emits no undeclared `bus` — this cell COMPILES"
+        );
+    }
+
+    // A `hookable` body is a SECOND working shape, and the detail
+    // string used to deny it. It also matters for routing: a
+    // scoreboard WITH a hookable is a component
+    // (`scoreboard_is_component`), so it reaches the `components.rs`
+    // arm rather than the `scoreboards.rs` one — a lane nothing
+    // covered.
+    for kind in ["agent", "env", "sequencer", "scoreboard"] {
+        let decl = format!(
+            "\n{kind} Watcher bound to BusAxiLite\n    hits : uint<32> default 0\n\n    \
+             hookable poke(v: uint<32>)\n        bus.aw.addr = v\n        \
+             bus.aw.valid = 1\n        bus.w.send(v, 15)\n        bus.aw.valid = 0\n    \
+             end hookable\nend {kind} Watcher\n\n"
+        );
+        let with_decl = sub(
+            &base,
+            "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+            &format!("{decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs"),
+        );
+        let at_bind = sub(
+            &with_decl,
+            "    let mon  : AxilXactor passive = bind axil",
+            "    let mon  : AxilXactor passive = bind axil\n    let w    : Watcher = bind axil",
+        );
+        let msg = assert_not_implemented(
+            &bus_lower(&at_bind).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("`hookable` body"),
+            "the detail names it: {msg}"
+        );
+        // The evidence: v1 emits a real BFM lambda that drives the DUT,
+        // with no undeclared `bus` anywhere.
+        let v1 = bus_emit(&at_bind).expect("v1 emits");
+        assert!(
+            v1.contains("auto Watcher_poke = [&](Watcher& self, uint64_t v) -> void {")
+                && v1.contains("harc_rt::harc_assign(dut->axil_aw_addr, v);"),
+            "{kind}: v1 emits a working hookable BFM"
+        );
+        assert_eq!(
+            bare_bus(&v1),
+            0,
+            "{kind}: and leaves no undeclared `bus` — this cell COMPILES"
+        );
+    }
+
+    // The FIFTH copy of the rule: the per-FIELD spelling on an
+    // env/agent/sequencer. It was the last arm in the family still
+    // promising `--codegen v1`, and v1 discards the clause — proven
+    // with the two sources padded to the SAME byte length, so no
+    // source-offset residue can explain the identity.
+    for kind in ["env", "agent", "sequencer"] {
+        let bound = sub(
+            &base,
+            "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+            &format!(
+                "\n{kind} C\n    seen : uint<32> bound to AxilXactor default 0\n\n    \
+                 on 3 cycles\n        seen = seen + 1\n    end on\nend {kind} C\n\n\
+                 testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs\n    c   : C"
+            ),
+        );
+        let unbound = sub(
+            &bound,
+            "    seen : uint<32> bound to AxilXactor default 0",
+            "    seen : uint<32>                     default 0",
+        );
+        assert_eq!(
+            bound.len(),
+            unbound.len(),
+            "{kind}: the two sources must be the same length for the identity to mean \
+             anything"
+        );
+        let msg = assert_not_implemented(
+            &bus_lower(&bound).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(
+            msg.contains("a `bound to` clause on field `C.seen`"),
+            "{msg}"
+        );
+        assert_eq!(
+            bus_emit(&bound).expect("v1 emits the bound form"),
+            bus_emit(&unbound).expect("v1 emits the unbound form"),
+            "{kind}: v1's output is byte-identical, so the clause is discarded"
+        );
+    }
+
+    // The scoreboard spelling is the fourth copy of the same rule, and
+    // it carried the same "byte-identical, discarded" verdict from the
+    // same degenerate measurement.
+    let sb_decl = "\nscoreboard Watcher bound to BusAxiLite\n    hits : uint<32> default 0\n\n\
+                       on bus.w.handshake(d)\n        hits = hits + 1\n    end on\n\
+                   end scoreboard Watcher\n\n";
+    let sb_src = sub(
+        &base,
+        "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
+        &format!("{sb_decl}testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs\n    wsb : Watcher"),
+    );
+    let msg = assert_not_implemented(
+        &bus_lower(&sb_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("a `bound to` clause on scoreboard `Watcher`"),
+        "{msg}"
+    );
+    assert!(
+        bus_emit(&sb_src)
+            .expect("v1 emits")
+            .contains("(bool)(bus.w.handshake(d))"),
+        "v1 emits the trigger verbatim for a scoreboard too"
+    );
+}
+
+/// The four structural arms on an event-driven transactor's DUT
+/// handle and bus-monitor handlers, plus the fifth that no program can
+/// reach.
+///
+/// v1's poke lowering hardwires the name `dut` and rewrites it to the
+/// TEST's DUT pointer, so the transactor's own module-typed field is an
+/// inert `VTop* dut = nullptr;` member that nothing reads. That single
+/// fact splits the arms: the conventional name works, any other name
+/// (or a second handle) emits a `.` on a pointer.
+#[test]
+fn the_event_driven_transactor_shape_arms_follow_v1s_dut_name_rule() {
+    let prog = |fields: &str, poke: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+{fields}
+    fires : uint<8> default 0
+
+    when active
+        req : in event<uint<8>>
+
+        on req(n)
+            fires = fires + n
+{poke}
+        end on
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        emit drv.req(3)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The control: one handle, named `dut`. The poke resolves to the
+    // TEST's DUT, not to the transactor's member.
+    let ctl = prog("    dut : Top", "            dut.en = 1");
+    lower_src(&ctl).expect("the conventional shape lowers");
+    assert!(
+        cpp_tb::emit(&merged_src(&ctl))
+            .expect("v1 emits")
+            .contains("harc_rt::harc_assign(dut->en, 1);"),
+        "v1 rewrites the poke to the test DUT pointer"
+    );
+
+    // Any other spelling emits a `.` on that pointer instead. Both arms
+    // are `EmitsUncompilable`, and the never-poked lane is what proves
+    // the member is inert rather than bound.
+    for (fields, poke, names, v1_line) in [
+        (
+            "    dut : Top\n    dut2 : Top",
+            "            dut2.en = 1",
+            "more than one DUT handle field",
+            "_tb.drv.dut2.en = 1;",
+        ),
+        (
+            "    duv : Top",
+            "            duv.en = 1",
+            "DUT handle field named `duv`",
+            "_tb.drv.duv.en = 1;",
+        ),
+    ] {
+        let src = prog(fields, poke);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(msg.contains(names), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "v1 emits `{v1_line}` — a `.` on a `VTop*`, which g++ refuses"
+        );
+    }
+    // …and un-poked, the extra member really is inert: v1's output is
+    // the control's plus one declaration. Without this the arms could
+    // be read as "v1 binds the second handle to something wrong".
+    let unpoked = prog("    dut : Top\n    dut2 : Top", "");
+    let bare = prog("    dut : Top", "");
+    let with_extra = cpp_tb::emit(&merged_src(&unpoked)).expect("v1 emits");
+    assert_eq!(
+        with_extra.replace("    VTop* dut2 = nullptr;\n", ""),
+        cpp_tb::emit(&merged_src(&bare)).expect("v1 emits"),
+        "the second handle contributes exactly one unbound member"
+    );
+
+    // A handshake-monitor handler on a component with no bound bus. v1
+    // emits the handler against a `bus` that is not in scope.
+    let unbound_hs = format!(
+        r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut   : Top
+    fires : uint<8> default 0
+
+    on bus.w.handshake(d)
+        fires = fires + 1
+    end on
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&unbound_hs).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("non-bound component `Drv`"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&unbound_hs))
+            .expect("v1 emits")
+            .contains("bus.w"),
+        "v1 emits the handler against an out-of-scope `bus`"
+    );
+
+    // Two dotted-call shapes that are NOT handshake monitors, so the
+    // unified predicate must decline both: a different method name, and
+    // a one-level target. Each falls through to the cycle-trigger path
+    // and is claimed by the bus-method arm instead — the point being
+    // that neither is mistaken for `bus.<ch>.handshake`.
+    let bound_src = fixture("axilite_bound_mon_test.harc");
+    let hs = "    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on";
+    assert_eq!(bound_src.matches(hs).count(), 1, "unique anchor");
+    for to in [
+        "    on bus.w.settle(d)\n        sb.errors = sb.errors + 1\n    end on",
+        "    on bus.handshake(d)\n        sb.errors = sb.errors + 1\n    end on",
+    ] {
+        let err = lower_with_stdlib_bus_src(&bound_src.replace(hs, to)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("handshake-monitor handler"),
+            "not a handshake monitor: {msg}"
+        );
+    }
+
+    // The bound-to transactor WITH a module-typed field keeps its
+    // `Unsupported`, and that promise is honest for the same reason the
+    // arms above are dishonest: v1's member is inert and the poke
+    // retargets to the test DUT. Stated directly, because reading
+    // `VAxiLiteRegs* dut = nullptr;` and `dut->rst` in one file and
+    // calling it a null dereference is the mistake this row corrects.
+    let bound_dut = bound_src.replace(
+        "transactor AxilXactor bound to BusAxiLite\n    sb        : AxilSb",
+        "transactor AxilXactor bound to BusAxiLite\n    dut       : AxiLiteRegs\n    sb        : AxilSb",
+    );
+    let bound_dut = bound_dut.replace(
+        "        on req(t)\n            bus.aw.addr = t.addr",
+        "        on req(t)\n            dut.rst = 0\n            bus.aw.addr = t.addr",
+    );
+    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&bound_dut).unwrap_err());
+    assert!(msg.contains("module-typed (DUT handle) field"), "{msg}");
+    let v1 =
+        cpp_tb::emit(&merged_with_stdlib_bus(&bound_dut, "BusAxiLite.arch")).expect("v1 emits");
+    assert!(
+        v1.contains("    VAxiLiteRegs* dut = nullptr;"),
+        "v1 declares the member"
+    );
+    assert!(
+        v1.contains("harc_rt::harc_assign(dut->rst, 0);"),
+        "and the poke resolves to the TEST's bound DUT pointer, not that member"
+    );
+    assert!(
+        !v1.contains("drv.dut") && !v1.contains("xactor.dut"),
+        "nothing ever reads the member — it is inert, which is what makes \
+         `--codegen v1` an honest suggestion here"
+    );
+
+    // The fifth arm reported a "malformed" handshake handler when the
+    // predicate and the channel extractor disagreed. They tested the
+    // same three conditions, so they could not — the arm was dead. One
+    // function does both jobs now, and the spellings that looked
+    // malformed lower as they always did.
+    let bound = fixture("axilite_bound_mon_test.harc");
+    for from in ["    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on"] {
+        assert_eq!(bound.matches(from).count(), 1, "unique anchor");
+        for to in [
+            "    on bus.w.handshake()\n        sb.errors = sb.errors + 1\n    end on",
+            "    on bus.w.handshake(d, e)\n        sb.written.push(d)\n    end on",
+        ] {
+            let src = bound.replace(from, to);
+            lower_with_stdlib_bus_src(&src)
+                .unwrap_or_else(|e| panic!("no arm calls this malformed: {e:?}"));
+        }
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
-/// (C++ struct assignment in both backends); anything else is a
-/// precise lowering rejection, not a verifier error or C++ compile
-/// failure.
+/// (C++ struct assignment in both backends); anything else is a type
+/// error, rejected precisely rather than left to the verifier or to
+/// g++.
 #[test]
 fn record_whole_value_assignment_rules() {
     let copy_src = r#"
@@ -4578,10 +6516,15 @@ test BadCopyTest
     end run
 end test BadCopyTest
 "#;
+    // A type error, not a subset gap. v1 emits `t = true;` and g++
+    // refuses it ("no match for 'operator='"), so no backend runs it
+    // and the rejection must not offer `--codegen v1`.
     let err = lower_src(bad_src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let lower::LowerError::Invalid(msg) = &err else {
+        panic!("a record local assigned a non-record is Invalid, not `{err:?}`");
+    };
     assert!(
-        msg.contains("non-`Req` value"),
+        msg.contains("it is a `Req` and the value assigned to it is not a record"),
         "names the record type: {msg}"
     );
 }
@@ -4676,11 +6619,20 @@ test BadLetCopyTest
     end run
 end test BadLetCopyTest
 "#;
+    // …and it is a type error, not a subset gap: v1 emits `Req t = 7;`
+    // and g++ answers "conversion from 'int' to non-scalar type 'Req'
+    // requested", so `--codegen v1` is no help.
     let err = lower_src(bad_src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(
-        msg.contains("non-`Req` initializer"),
+        msg.contains("transaction local `t`") && msg.contains("not a record"),
         "names the non-record-initializer rejection: {msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(bad_src))
+            .expect("v1 emits")
+            .contains("Req t = 7;"),
+        "v1 emits the initializer g++ refuses"
     );
 
     // A copy from a *different* record type is rejected precisely (the
@@ -4704,10 +6656,10 @@ test MismatchCopyTest
 end test MismatchCopyTest
 "#;
     let err = lower_src(mismatch_src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(
-        msg.contains("non-`Req` initializer"),
-        "cross-type record copy rejected: {msg}"
+        msg.contains("is a `Req`") && msg.contains("is a `Other`"),
+        "cross-type record copy names both records: {msg}"
     );
 }
 
@@ -5200,7 +7152,13 @@ end impl T"#
     let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits the control");
     lower_src(&control).expect("the control lowers");
 
-    // Both `bound to` spellings are discarded — byte-identically.
+    // On a DEGENERATE scoreboard — one scalar field, no handler —
+    // both `bound to` spellings are discarded byte-identically. That
+    // is a true measurement and a misleading one: it shows only that a
+    // declaration with nothing to bind has no binding to perform, and
+    // reading the DECLARATION arm's label off it was wrong (see the
+    // `bound to` arms test, where the handler-carrying shape emits
+    // `bus` into a scope that declares no such name).
     for (what, src) in [
         (
             "declaration",
@@ -5211,18 +7169,36 @@ end impl T"#
             prog("scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb"),
         ),
     ] {
-        let msg = assert_not_implemented(
-            &lower_src(&src).unwrap_err(),
-            lower::V1Status::SilentlyMisLowers,
-        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = err.to_string();
         assert!(msg.contains("`bound to`"), "{what}: {msg}");
+        assert!(
+            !msg.contains("re-run with `--codegen v1`"),
+            "{what}: neither spelling may promise v1: {msg}"
+        );
         assert_eq!(
             cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
             control_cpp,
-            "{what}: v1's output must be byte-identical to the unbound control — that is \
-             the whole evidence that the clause is discarded"
+            "{what}: on THIS shape v1's output is byte-identical to the unbound control"
         );
     }
+    // The FIELD spelling keeps `SilentlyMisLowers` — it is a different
+    // construct (a per-instance binding) and the byte-identity above is
+    // its whole measurement. The DECLARATION spelling does not.
+    assert_not_implemented(
+        &lower_src(&prog(
+            "scoreboard Sb\n    seen : uint<32> bound to Drv default 0\nend scoreboard Sb",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert_not_implemented(
+        &lower_src(&prog(
+            "scoreboard Sb bound to Drv\n    seen : uint<32> default 0\nend scoreboard Sb",
+        ))
+        .unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
 
     // A port field keeps its name and loses everything else.
     let port = prog("scoreboard Sb\n    p : in uint<8>\nend scoreboard Sb");

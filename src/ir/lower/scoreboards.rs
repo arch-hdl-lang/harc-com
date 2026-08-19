@@ -74,14 +74,25 @@ pub(crate) fn lower_scoreboard(
         ));
     }
     if c.bound_to.is_some() {
-        // Measured: v1's output with `scoreboard Sb bound to Drv` is
-        // BYTE-IDENTICAL to the same scoreboard without the clause. It
-        // is discarded, and the program runs with no binding and no
-        // diagnostic.
+        // The fourth copy of the same rule, and it carried the same
+        // wrong verdict for the same reason: it was measured on a
+        // scoreboard with no handler ("BYTE-IDENTICAL to the same
+        // scoreboard without the clause"), which shows only that a
+        // declaration with nothing to bind has no binding to perform.
+        // Give it `on bus.w.handshake(d)` and v1 emits
+        // `(bool)(bus.w.handshake(d))` with `bus` declared nowhere —
+        // g++ "'bus' was not declared in this scope". Same evidence,
+        // same label, and the same detail as the env/agent/sequencer
+        // arm in `components.rs`.
         return Err(not_implemented(
             &format!("a `bound to` clause on scoreboard `{sb}`"),
-            "v1 discards the clause — its emitted struct is byte-identical to the \
-             unbound one, so the binding silently does not happen",
+            "v1 does three different things with this clause. A \
+             `thread bus.<method>(...)` responder COMPILES and is silently dropped — the \
+             target never answers. An `on <ev>` handler body OR a `hookable` body, on an \
+             instance bound at a `let x : C = bind <bus>` site, emits a working driver. \
+             A cycle trigger, a periodic handler, an `on bus.<ch>.handshake(...)` \
+             monitor, or either working shape instantiated as a plain testbench field, \
+             emit `bus` verbatim into a scope that declares no such name",
             V1Status::SilentlyMisLowers,
         ));
     }
