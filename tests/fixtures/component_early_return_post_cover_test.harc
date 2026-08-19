@@ -33,6 +33,7 @@ impl EarlyReturnTest for EarlyReturnTb
 
     run
         sb.take(0)
+        sb.take(1)
         wait 1 cycle
     end run
 
@@ -40,5 +41,7 @@ impl EarlyReturnTest for EarlyReturnTb
         cov.report()
         assert cov.cp_v.zero == 0
             else fail("post covergroup fired across explicit early return")
+        assert cov.cp_v.nonzero == 1
+            else fail("post covergroup did not fire exactly once after natural completion")
     end check
 end impl EarlyReturnTest
