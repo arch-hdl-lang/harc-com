@@ -5109,6 +5109,7 @@ fn lower_test(
             entry: BlockId(0),
             owner: Some(tb_id),
             ret: None,
+            implicit_returns: Vec::new(),
         });
     }
 
@@ -6754,6 +6755,7 @@ pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
         entry: BlockId(0),
         owner: None,
         ret: None,
+        implicit_returns: Vec::new(),
     }
 }
 
@@ -7075,6 +7077,12 @@ impl FuncBuilder<'_> {
                 p.bus_field, p.method
             )));
         }
+        let implicit_return_old: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.term.is_none().then_some(i))
+            .collect();
         let sealed: Vec<BasicBlock> = self
             .blocks
             .into_iter()
@@ -7106,6 +7114,11 @@ impl FuncBuilder<'_> {
         for b in &mut kept {
             remap_terminator(&mut b.terminator, &remap);
         }
+        let implicit_returns = implicit_return_old
+            .into_iter()
+            .filter(|&i| reachable[i])
+            .map(|i| remap[i])
+            .collect();
 
         Ok(TbFunction {
             id,
@@ -7117,6 +7130,7 @@ impl FuncBuilder<'_> {
             entry: BlockId(0),
             owner,
             ret: self.helper_ret,
+            implicit_returns,
         })
     }
 }

@@ -2177,9 +2177,10 @@ fn lower_method_body(
         b.helper_ret = Some(ret);
     }
     b.lower_block_stmts(&h.body)?;
-    if !b.is_terminated() {
-        b.terminate(Terminator::Return);
-    }
+    // Leave a naturally completed body unterminated. `FuncBuilder::finish`
+    // synthesizes its Return and records that block in `implicit_returns`,
+    // distinguishing it from an explicit source `return` for post-hook
+    // emission.
     let mut f = b.finish(
         fid,
         format!("comp_method_{}", fid.0),

@@ -780,6 +780,7 @@ mod tests {
                 entry: BlockId(0),
                 owner: None,
                 ret: None,
+                implicit_returns: vec![],
             }],
             ..Default::default()
         }
@@ -963,6 +964,7 @@ mod tests {
             entry: BlockId(0),
             owner: None,
             ret: None,
+            implicit_returns: vec![],
         });
         let table = run(&prog, &TargetProfile::single_site());
         assert!(table.blocks.contains_key(&(FunctionId(0), BlockId(0))));

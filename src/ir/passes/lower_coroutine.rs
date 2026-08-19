@@ -468,6 +468,7 @@ mod tests {
                 entry: BlockId(0),
                 owner: None,
                 ret: None,
+                implicit_returns: vec![],
             }],
             ..Default::default()
         }
@@ -652,6 +653,7 @@ mod tests {
             entry: BlockId(0),
             owner: None,
             ret: None,
+            implicit_returns: vec![],
         });
         let meta = run(&prog).expect("tags");
         assert!(meta.state_enum.contains_key(&FunctionId(0)));

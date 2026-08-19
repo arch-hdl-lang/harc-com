@@ -1,0 +1,32 @@
+// Regression for signed scalar parameters on component hookable methods.
+// The default TB-IR backend must preserve `sint` at the emitted C++ ABI
+// boundary, matching the legacy v1 emitter, so signed division does not
+// reinterpret a negative argument as a large unsigned value.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard SignedCalcSb
+    result : sint<8> default 0
+
+    hookable calc(x: sint<8>)
+        result = x / 2
+    end calc
+end scoreboard SignedCalcSb
+
+testbench SignedCalcTb
+    dut : Top
+    sb  : SignedCalcSb
+end testbench SignedCalcTb
+
+impl SignedCalcTest for SignedCalcTb
+    clock clk = SysDomain
+
+    run
+        sb.calc(0 - 7)
+        assert sb.result == 0 - 3
+            else fail("signed component method division: got ${sb.result}, expected -3")
+        wait 1 cycle
+    end run
+end impl SignedCalcTest

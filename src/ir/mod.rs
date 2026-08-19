@@ -1895,6 +1895,12 @@ pub struct TbFunction {
     /// the backend emits `return <ret>;` at `Terminator::Return`.
     /// `None` for run/check functions (their `Return` carries no value).
     pub ret: Option<LocalId>,
+    /// Return blocks synthesized from a source body's natural fallthrough.
+    /// Explicit source `return` statements also lower to
+    /// `Terminator::Return`, so this provenance lets hook-aware emitters
+    /// preserve v1's distinction: post hooks run after natural completion
+    /// but are bypassed by an explicit early return.
+    pub implicit_returns: Vec<BlockId>,
 }
 
 /// Straight-line statements + exactly one terminator. No statement may

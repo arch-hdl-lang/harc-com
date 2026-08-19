@@ -28,8 +28,8 @@ use super::expr::{
 use crate::ast::ExprKind;
 use crate::codegen::cpp_tb::EmitError;
 use crate::ir::{
-    BusBindingSchema, CallTarget, ConstraintRef, Expr, FileLogLevel, FmtArgs, IrType, LocalId,
-    LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, TbProgram, Terminator,
+    BlockId, BusBindingSchema, CallTarget, ConstraintRef, Expr, FileLogLevel, FmtArgs, IrType,
+    LocalId, LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, TbProgram, Terminator,
     TransactorMethodSchema, TransactorSchema, WaitMode,
 };
 use std::collections::{HashMap, HashSet};
@@ -2747,7 +2747,7 @@ fn emit_component_fn_lambda(
             // over the scalar C++ type (#453).
             IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
             IrType::Component(c) => prog.components[c.index()].name.clone(),
-            _ => "uint64_t".to_string(),
+            ref ty => super::local_scalar_cty(ty),
         };
         params.push(format!("{pty} {n}"));
     }
@@ -2818,7 +2818,11 @@ fn emit_component_fn_lambda(
             }
             Terminator::Return => match func.ret {
                 Some(r) => {
-                    if has_post_cov {
+                    if has_post_cov
+                        && func
+                            .implicit_returns
+                            .contains(&BlockId(bi as u32))
+                    {
                         let ctx = hook_ctx.as_ref().expect("post hook context present");
                         writeln!(
                             out,
@@ -2830,7 +2834,11 @@ fn emit_component_fn_lambda(
                     writeln!(out, "{pad3}return {};", names[r.index()]).ok();
                 }
                 None => {
-                    if has_post_cov {
+                    if has_post_cov
+                        && func
+                            .implicit_returns
+                            .contains(&BlockId(bi as u32))
+                    {
                         let ctx = hook_ctx.as_ref().expect("post hook context present");
                         writeln!(
                             out,

@@ -1,0 +1,44 @@
+// Regression for post-hook covergroup semantics on an explicit early return.
+// A `post` hook samples only after natural method-body completion; an explicit
+// `return` must bypass it, matching the legacy v1 emitter.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard EarlyReturnSb
+    hookable take(v: uint<8>)
+        if v == 0
+            return
+        end if
+    end take
+end scoreboard EarlyReturnSb
+
+covergroup EarlyReturnCov @(sb.take(v) post)
+    cp_v : cover v
+        bins
+            zero = {0}
+            nonzero = [1..255]
+        end bins
+end covergroup EarlyReturnCov
+
+testbench EarlyReturnTb
+    dut : Top
+    sb  : EarlyReturnSb
+    cov : EarlyReturnCov
+end testbench EarlyReturnTb
+
+impl EarlyReturnTest for EarlyReturnTb
+    clock clk = SysDomain
+
+    run
+        sb.take(0)
+        wait 1 cycle
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_v.zero == 0
+            else fail("post covergroup fired across explicit early return")
+    end check
+end impl EarlyReturnTest
