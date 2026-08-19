@@ -7923,6 +7923,59 @@ former `transaction` group lives in
      discipline as running a compiling control beside every failing
      cell, applied to the tool instead of the fixture.
 
+124. **Whole-`Vec` equality, and why the permission is an allow-list
+     (2026-08-19).**
+
+     `assert r.data == s.data` was refused with every other whole-`Vec`
+     read, under a note that already said the comparison works:
+     "`assert r.data == r.data` emits `r.data == r.data`, which compiles
+     and works (`std::array` has `operator==`)". It does, for record
+     elements too — v1 generates `operator==` for the element struct, so
+     `Vec<Kid, N>` compares element-wise. One site, several outcomes, and
+     splitting them is the better answer than labelling the site with
+     whichever outcome is true somewhere.
+
+     The IR needed nothing: `IrType` has no `Vec` variant, but the read
+     lowers as an ordinary `RecordField` with `index: None`, the verifier
+     accepts it, and the emitter prints `r.data == s.data` — the same
+     text v1 emits. Confirmed by permitting the read globally as an
+     experiment and compiling the result.
+
+     **That experiment is also what settled the shape of the fix.** With
+     the read permitted everywhere, `let d = r.data` and `${r.data}` both
+     emit C++ that g++ refuses. So the permission is keyed on the LANDING
+     and defaults to off: a landing nobody enumerated keeps today's clean
+     diagnostic. The inverse — permit at the read, block the known-bad
+     landings — would mean a landing nobody enumerated silently emits
+     code that does not build, and there is no way to check by inspection
+     that the list is complete.
+
+     Two things the first draft got wrong, both caught by running rather
+     than reading:
+
+     - **It regressed mismatched operands.** Permitting the read on any
+       equality let `r.data == s.kids` (scalar elements against record
+       ones) and `r.data == s.n` (a `Vec` against a scalar) through,
+       where both backends emit a comparison g++ refuses. The read used
+       to catch those, so the permission had to carry the pairing check
+       itself — same length, same element type.
+     - **It broke regblock lowering.** The pairing helper calls
+       `try_record_field_chain` on every `==` operand, and propagated its
+       error with `?`. A regblock access like `regs.DMACR.RS` makes that
+       resolver fail, so a working program became a hard error before its
+       real lowering path ever saw it. Errors are swallowed now: "not a
+       matching pair" is the only answer this question can give.
+
+     The second one surfaced as five failing tests, three of them in
+     regblock corpora that have nothing to do with `Vec` — a reminder
+     that a helper called speculatively on every operand of a common
+     operator is not a local change.
+
+     Two tests that pinned the old refusal were rewritten rather than
+     deleted. One had justified it with "it only worked by luck"; the
+     site's own note said `std::array::operator==` is why it works, and
+     the measurement agrees with the note.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

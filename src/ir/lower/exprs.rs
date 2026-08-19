@@ -47,6 +47,37 @@ pub(crate) struct TransactorStateRecordChain {
     pub leaf_vec_len: Option<usize>,
 }
 
+/// Whether both operands are whole-`Vec` record-field reads of the SAME
+/// length and element type — the pairing `==`/`!=` needs before the read
+/// is permitted at all.
+///
+/// `false` (not an error) when either side is anything else, including
+/// an ordinary scalar comparison: this only ever widens what `==`
+/// accepts, so a `false` here leaves every existing verdict untouched.
+impl super::FuncBuilder<'_> {
+    fn same_whole_vec_shape(
+        &mut self,
+        lhs: &crate::ast::Expr,
+        rhs: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        // Errors are SWALLOWED, not propagated. This runs on every
+        // `==`/`!=` operand, including ones that belong to a different
+        // lowering path entirely — a regblock field access like
+        // `regs.DMACR.RS` makes this resolver fail, and a `?` here turned
+        // a working program into a hard error before the real path ever
+        // saw it. "Not a matching pair" is the only answer this question
+        // can give; whether the operand lowers at all is decided later,
+        // by whoever owns it.
+        let (Ok(Some(l)), Ok(Some(r))) = (
+            self.try_record_field_chain(lhs),
+            self.try_record_field_chain(rhs),
+        ) else {
+            return Ok(false);
+        };
+        Ok(l.leaf_vec_len.is_some() && l.leaf_vec_len == r.leaf_vec_len && l.leaf_ty == r.leaf_ty)
+    }
+}
+
 /// `pop()` in a nested expression, at any of the five queue spellings.
 ///
 /// The verdict is `Unsupported` and it is not a placeholder: v1 evaluates
@@ -404,17 +435,25 @@ impl FuncBuilder<'_> {
                     // is handled in the `Index` arm. A whole nested-record
                     // leaf read (`let d = s.inner`) IS allowed — it yields
                     // the nested struct value (emitted as `local.field.p…`).
-                    if chain.leaf_vec_len.is_some() {
-                        // Stays an `Unsupported`: what v1 does with the
-                        // read depends on where it LANDS. `assert r.data
-                        // == r.data` emits `r.data == r.data`, which
-                        // compiles and works (`std::array` has
-                        // `operator==`); `let d = r.data` emits
-                        // `int64_t d = _tb.r.data;` and `${r.data}` emits
-                        // `harc_printf_ll(r.data)`, neither of which
-                        // does. One site, several outcomes — so the
-                        // suggestion stays, and the detail leads with the
-                        // fix that works everywhere.
+                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                        // What v1 does with the read depends on where it
+                        // LANDS, and the equality landing is now
+                        // implemented rather than refused with the rest:
+                        // `assert r.data == s.data` emits
+                        // `r.data == s.data` from BOTH backends and
+                        // compiles (`std::array` has `operator==`, and v1
+                        // generates one for a record element type, so
+                        // `Vec<Kid, N>` compares too).
+                        //
+                        // The others still do not. `let d = r.data` and
+                        // `${r.data}` each emit C++ that g++ refuses,
+                        // under both backends — measured by permitting
+                        // the read everywhere and compiling the result.
+                        // So the permission is an ALLOW-list keyed on the
+                        // landing (`vec_read_ok`), not a deny-list: a
+                        // landing nobody enumerated keeps this
+                        // diagnostic instead of silently emitting code
+                        // that does not build.
                         return Err(unsupported(
                             &format!("a whole-`Vec` read of record field `{}`", chain.dotted),
                             "index the field element-wise (`{rec}.{field}[i]`)",
@@ -456,8 +495,34 @@ impl FuncBuilder<'_> {
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let ir_op = lower_bin_op(*op)?;
-                let l = self.lower_expr(lhs)?;
-                let r = self.lower_expr(rhs)?;
+                // `==`/`!=` is the one landing a whole-`Vec` read works
+                // in — see `vec_read_ok`. Set for BOTH operands and
+                // restored after, so a nested expression inside one of
+                // them does not inherit the permission.
+                // …and only when BOTH sides are the same `Vec` shape.
+                // Permitting the read on an equality alone let
+                // `r.data == s.kids` (scalar elements vs record ones) and
+                // `r.data == s.n` (a `Vec` against a scalar) through,
+                // where both backends emit a comparison g++ refuses —
+                // trading a clean diagnostic for an uncompilable one.
+                // Before this arm existed they were refused by the read
+                // itself, so the permission had to carry the pairing
+                // check the read no longer does.
+                let eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                    && self.same_whole_vec_shape(lhs, rhs)?;
+                let saved = self.vec_read_ok;
+                self.vec_read_ok = eq;
+                let l = self.lower_expr(lhs);
+                let r = if l.is_ok() {
+                    self.lower_expr(rhs)
+                } else {
+                    Ok(Expr::Literal {
+                        value: 0,
+                        ty: IrType::Unknown,
+                    })
+                };
+                self.vec_read_ok = saved;
+                let (l, r) = (l?, r?);
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
                 // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
                 // to `max(W(lhs), W(rhs))` bits, matching ARCH's

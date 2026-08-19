@@ -4418,10 +4418,20 @@ end test WholeVecReadTest
     );
 }
 
-/// A whole-`Vec` record-field READ compared in an `assert` must be
-/// rejected too (it only "worked" by luck before this guard).
+/// A whole-`Vec` record-field READ compared in an `assert` LOWERS, and
+/// the comparison is the reason the read is allowed there at all.
+///
+/// This test used to require the opposite, on the parenthetical that it
+/// "only worked by luck". The site's own note said the other thing —
+/// "`assert r.data == r.data` emits `r.data == r.data`, which compiles
+/// and works (`std::array` has `operator==`)" — and measurement agrees
+/// with the note: both backends emit that comparison and g++ accepts it.
+/// `std::array::operator==` is a specified element-wise compare, not
+/// luck. See `whole_vec_equality_lowers_only_where_it_compiles` for the
+/// landings that are still refused, and for the mismatched-operand
+/// pairing this permission has to carry itself.
 #[test]
-fn whole_vec_field_read_in_assert_is_rejected() {
+fn whole_vec_field_read_in_assert_lowers() {
     let src = r#"
 struct Bundle
     data : Vec<uint<32>, 4>
@@ -4436,12 +4446,12 @@ test WholeVecAssertTest
     end run
 end test WholeVecAssertTest
 "#;
-    let err = lower_src(src).expect_err("whole-Vec field read in assert must be rejected");
-    let msg = assert_unsupported(&err);
+    let cpp = emit_cpp_src(src);
     assert!(
-        msg.contains("whole-`Vec` read of record field"),
-        "names the read: {msg}"
+        cpp.contains("r.data == r.data"),
+        "the comparison reaches the output:\n{cpp}"
     );
+    cpp_tb::emit(&merged_src(src)).expect("v1 emits the same comparison");
 }
 
 /// A scalar RHS assigned into a whole-`Vec` record field
@@ -8633,6 +8643,99 @@ end impl T"#;
     );
     emit_cpp_src(&bound);
     cpp_tb::emit(&merged_src(&bound)).expect("v1 emits the bound form");
+}
+
+/// Whole-`Vec` equality — `r.data == s.data`. v1 emits `r.data == s.data`
+/// and it compiles: `std::array` has `operator==`, and v1 generates one
+/// for a record element type, so `Vec<Kid, N>` compares element-wise too.
+/// TB-IR refused it along with every other whole-`Vec` read.
+///
+/// The permission is an ALLOW-list keyed on the landing, and that is the
+/// load-bearing choice. The read itself lowers and verifies fine
+/// everywhere — measured by permitting it globally and compiling the
+/// result — but `let d = r.data` and `${r.data}` emit C++ g++ refuses.
+/// Refusing at the read and permitting one landing means a landing
+/// nobody enumerated keeps the clean diagnostic; permitting at the read
+/// and blocking known-bad landings would mean a missed one silently
+/// emits code that does not build.
+#[test]
+fn whole_vec_equality_lowers_only_where_it_compiles() {
+    let prog = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Rec
+    data : Vec<uint<8>, 4>
+    kids : Vec<Kid, 4>
+    n    : uint<8>
+end struct Rec
+
+test T
+    let dut : Top
+    run
+        let r : Rec
+        let s : Rec
+        {body}
+        wait 2 cycles
+    end run
+end test T
+"#
+        )
+    };
+    // Both element kinds, both operators, and the scalar control.
+    for ok in [
+        "assert r.data == s.data else fail(\"x\")",
+        "assert r.kids == s.kids else fail(\"x\")",
+        "assert r.data != s.data else fail(\"x\")",
+        "assert r.n == s.n else fail(\"x\")",
+        "assert r.data[0] == s.data[0] else fail(\"x\")",
+    ] {
+        let src = prog(ok);
+        let cpp = emit_cpp_src(&src);
+        cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
+        if ok.contains("r.data == s.data") {
+            assert!(
+                cpp.contains("r.data == s.data"),
+                "the comparison reaches the output, as v1's does:\n{cpp}"
+            );
+        }
+    }
+
+    // The landings that do NOT work keep the diagnostic.
+    for bad in ["let d = r.data", "log(info, \"d=${r.data}\")"] {
+        let msg = assert_unsupported(&lower_src(&prog(bad)).unwrap_err());
+        assert!(
+            msg.contains("whole-`Vec` read"),
+            "`{bad}` still names the whole-`Vec` read: {msg}"
+        );
+    }
+
+    // The permission must not OUTLIVE the two operands. An `assert`
+    // lowers its condition and then its `else fail(...)` message, so a
+    // `${r.data}` in that message is a whole-`Vec` read arriving after
+    // a comparison at the same level — refused, as it is anywhere else.
+    let msg = assert_unsupported(
+        &lower_src(&prog("assert r.data == s.data else fail(\"d=${r.data}\")")).unwrap_err(),
+    );
+    assert!(
+        msg.contains("whole-`Vec` read"),
+        "the permission is scoped to the operands: {msg}"
+    );
+
+    // …and so do MISMATCHED operands. Permitting the read on an equality
+    // alone let these through, where both backends emit a comparison g++
+    // refuses — the read used to catch them, so the permission has to
+    // carry the pairing check itself.
+    for bad in [
+        "assert r.data == s.kids else fail(\"x\")",
+        "assert r.data == s.n else fail(\"x\")",
+    ] {
+        let msg = assert_unsupported(&lower_src(&prog(bad)).unwrap_err());
+        assert!(msg.contains("whole-`Vec` read"), "`{bad}`: {msg}");
+    }
 }
 
 /// Whole-record assignment: a same-typed record-local copy lowers
@@ -19550,12 +19653,17 @@ end impl T"#
     }
 }
 
-/// A whole-`Vec` READ keeps its `--codegen v1` suggestion, because what
-/// v1 does with one depends on where it lands: `assert r.data == r.data`
-/// emits `r.data == r.data`, which compiles and works (`std::array` has
-/// `operator==`). One site, several outcomes — so the honest label is
-/// the one that is true somewhere, and the detail leads with the fix
-/// that works everywhere.
+/// A whole-`Vec` READ keeps its `--codegen v1` suggestion at the
+/// landings that still need it — but not at the comparison, which is
+/// implemented now.
+///
+/// This test's own rationale said the equality case "compiles and works
+/// (`std::array` has `operator==`)" and then used that as the reason to
+/// refuse it, along with the landings that do not work: "one site,
+/// several outcomes — so the honest label is the one that is true
+/// somewhere". Splitting the outcomes is the better answer, and the
+/// note had already done the measurement that says which is which.
+/// The fixture below moves to a landing that genuinely does not work.
 #[test]
 fn a_whole_vec_read_keeps_its_v1_suggestion() {
     let err = lower_src(
@@ -19569,7 +19677,7 @@ end testbench Tb
 impl T for Tb
     run
         let r : Bundle
-        assert r.data == r.data else fail("nope")
+        let d = r.data
         wait 1 cycle
     end run
 end impl T"#,

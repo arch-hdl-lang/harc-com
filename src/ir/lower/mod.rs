@@ -6522,6 +6522,23 @@ pub(crate) struct FuncBuilder<'a> {
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
     pub(crate) in_fmt_args: bool,
+    /// True while lowering the two operands of an `==`/`!=`, which is
+    /// the one landing where a WHOLE-`Vec` record-field read works.
+    ///
+    /// An ALLOW-list, and deliberately so. The read itself lowers, the
+    /// verifier accepts it, and the emitter prints `r.data == s.data` —
+    /// byte-identical to v1, which compiles because `std::array` has
+    /// `operator==` (and because v1 generates `operator==` for a record
+    /// element type, so a `Vec<Kid, N>` compares too). But the same read
+    /// landing anywhere else emits C++ that g++ refuses: measured,
+    /// `let d = r.data` and `${r.data}` both do, under BOTH backends.
+    ///
+    /// Refusing at the read and permitting one landing means a landing
+    /// nobody enumerated keeps today's clean diagnostic. Permitting at
+    /// the read and refusing the known-bad landings would mean a missed
+    /// one silently emits uncompilable code instead — worse, and not
+    /// checkable by inspection.
+    pub(crate) vec_read_ok: bool,
     /// True while lowering a transactor method body. Methods keep v1's
     /// synchronous hookable semantics (waits emit as `tick()` loops),
     /// so the constructs whose sync emission is out of this slice —
@@ -6940,6 +6957,7 @@ impl<'a> FuncBuilder<'a> {
             helper_ret: None,
             in_pure_helper: false,
             in_fmt_args: false,
+            vec_read_ok: false,
             in_transactor_method: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),
