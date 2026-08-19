@@ -6980,6 +6980,53 @@ former `transaction` group lives in
      found unpinned: the only thing the three call sites pass
      differently was never asserted.
 
+110. **Five event-driven-transactor shape arms, one v1 naming rule, and
+     a dead arm (2026-08-18).**
+
+     v1's poke lowering hardwires the name `dut`: a `dut.<sig>` write in
+     an `on`-handler body is rewritten to the TEST's bound DUT pointer
+     (`harc_rt::harc_assign(dut->en, 1)`), and the transactor's own
+     module-typed field is emitted as an INERT `VTop* dut = nullptr;`
+     member that nothing in the file ever reads. That single fact
+     decides four of these five arms.
+
+     | arm | v1 | verdict |
+     |---|---|---|
+     | `bound to` transactor WITH a module-typed field | member inert, poke retargets to the test DUT — compiles and runs | **honest `Unsupported`, kept** |
+     | more than one DUT handle | un-poked: an inert second member. POKED: `_tb.drv.dut2.en` — a `.` on a `VTop*` | `EmitsUncompilable` |
+     | handle not named `dut` | same split; v1 rewrites only that name | `EmitsUncompilable` |
+     | `on bus.<ch>.handshake(...)` on a NON-bound component | emits the handler anyway: "'bus' was not declared in this scope" | `EmitsUncompilable` |
+     | "malformed `on bus.<ch>.handshake(...)`" | — | **dead arm** |
+
+     The first row is a correction against my own first pass. Seeing
+     `VAxiLiteRegs* dut = nullptr;` and `harc_rt::harc_assign(dut->rst,
+     0);` in one emitted file, I read it as a null dereference and
+     labelled the arm `SilentlyMisLowers`. They are two different
+     `dut`s: the one being poked is the run function's bound test DUT,
+     captured by the handler lambda's `[&]`. Checking which binding a
+     name resolves to was the missing step — the same shape as
+     measuring against a control that is equally broken. The arm's
+     `--codegen v1` promise is honest, so it keeps it, and the test
+     states the reason directly rather than resting on a byte-count.
+
+     The dead arm is the batch's find. `is_bus_handshake_monitor` and
+     `bus_handshake_monitor_channel` tested the SAME three conditions —
+     an `ExprKind::Call`, a callee `Field { name: "handshake" }`, and a
+     `Field` target — and the caller ran the predicate, then the
+     extractor, then reported "a malformed `on bus.<ch>.handshake(...)`
+     handler" if they disagreed. They cannot disagree: whenever the
+     predicate passed, the extractor returned `Some`. One rule stated
+     twice, and the second copy guarded nothing. Confirmed by
+     construction and by probe — `on bus.w.handshake()` and
+     `on bus.w.handshake(d, e)` both lower cleanly on a bound
+     transactor. The extractor is the predicate now
+     (`if let Some(channel) = ...`), so the two cannot drift back apart.
+
+     Thirteen mutations, all caught. Three needed new coverage rather
+     than a new guard: nothing tested that the predicate DECLINES a
+     different method name or a one-level target, and nothing tested
+     the arm that was deliberately left alone.
+
 
 ## Next steps
 

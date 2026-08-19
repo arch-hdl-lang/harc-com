@@ -5936,6 +5936,216 @@ fn the_bound_to_arms_split_on_what_v1_does_with_the_clause() {
     );
 }
 
+/// The four structural arms on an event-driven transactor's DUT
+/// handle and bus-monitor handlers, plus the fifth that no program can
+/// reach.
+///
+/// v1's poke lowering hardwires the name `dut` and rewrites it to the
+/// TEST's DUT pointer, so the transactor's own module-typed field is an
+/// inert `VTop* dut = nullptr;` member that nothing reads. That single
+/// fact splits the arms: the conventional name works, any other name
+/// (or a second handle) emits a `.` on a pointer.
+#[test]
+fn the_event_driven_transactor_shape_arms_follow_v1s_dut_name_rule() {
+    let prog = |fields: &str, poke: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+{fields}
+    fires : uint<8> default 0
+
+    when active
+        req : in event<uint<8>>
+
+        on req(n)
+            fires = fires + n
+{poke}
+        end on
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        emit drv.req(3)
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The control: one handle, named `dut`. The poke resolves to the
+    // TEST's DUT, not to the transactor's member.
+    let ctl = prog("    dut : Top", "            dut.en = 1");
+    lower_src(&ctl).expect("the conventional shape lowers");
+    assert!(
+        cpp_tb::emit(&merged_src(&ctl))
+            .expect("v1 emits")
+            .contains("harc_rt::harc_assign(dut->en, 1);"),
+        "v1 rewrites the poke to the test DUT pointer"
+    );
+
+    // Any other spelling emits a `.` on that pointer instead. Both arms
+    // are `EmitsUncompilable`, and the never-poked lane is what proves
+    // the member is inert rather than bound.
+    for (fields, poke, names, v1_line) in [
+        (
+            "    dut : Top\n    dut2 : Top",
+            "            dut2.en = 1",
+            "more than one DUT handle field",
+            "_tb.drv.dut2.en = 1;",
+        ),
+        (
+            "    duv : Top",
+            "            duv.en = 1",
+            "DUT handle field named `duv`",
+            "_tb.drv.duv.en = 1;",
+        ),
+    ] {
+        let src = prog(fields, poke);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(msg.contains(names), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_line),
+            "v1 emits `{v1_line}` — a `.` on a `VTop*`, which g++ refuses"
+        );
+    }
+    // …and un-poked, the extra member really is inert: v1's output is
+    // the control's plus one declaration. Without this the arms could
+    // be read as "v1 binds the second handle to something wrong".
+    let unpoked = prog("    dut : Top\n    dut2 : Top", "");
+    let bare = prog("    dut : Top", "");
+    let with_extra = cpp_tb::emit(&merged_src(&unpoked)).expect("v1 emits");
+    assert_eq!(
+        with_extra.replace("    VTop* dut2 = nullptr;\n", ""),
+        cpp_tb::emit(&merged_src(&bare)).expect("v1 emits"),
+        "the second handle contributes exactly one unbound member"
+    );
+
+    // A handshake-monitor handler on a component with no bound bus. v1
+    // emits the handler against a `bus` that is not in scope.
+    let unbound_hs = format!(
+        r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Drv
+    dut   : Top
+    fires : uint<8> default 0
+
+    on bus.w.handshake(d)
+        fires = fires + 1
+    end on
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+    end run
+end impl T"#
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&unbound_hs).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("non-bound component `Drv`"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&unbound_hs))
+            .expect("v1 emits")
+            .contains("bus.w"),
+        "v1 emits the handler against an out-of-scope `bus`"
+    );
+
+    // Two dotted-call shapes that are NOT handshake monitors, so the
+    // unified predicate must decline both: a different method name, and
+    // a one-level target. Each falls through to the cycle-trigger path
+    // and is claimed by the bus-method arm instead — the point being
+    // that neither is mistaken for `bus.<ch>.handshake`.
+    let bound_src = fixture("axilite_bound_mon_test.harc");
+    let hs = "    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on";
+    assert_eq!(bound_src.matches(hs).count(), 1, "unique anchor");
+    for to in [
+        "    on bus.w.settle(d)\n        sb.errors = sb.errors + 1\n    end on",
+        "    on bus.handshake(d)\n        sb.errors = sb.errors + 1\n    end on",
+    ] {
+        let err = lower_with_stdlib_bus_src(&bound_src.replace(hs, to)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("handshake-monitor handler"),
+            "not a handshake monitor: {msg}"
+        );
+    }
+
+    // The bound-to transactor WITH a module-typed field keeps its
+    // `Unsupported`, and that promise is honest for the same reason the
+    // arms above are dishonest: v1's member is inert and the poke
+    // retargets to the test DUT. Stated directly, because reading
+    // `VAxiLiteRegs* dut = nullptr;` and `dut->rst` in one file and
+    // calling it a null dereference is the mistake this row corrects.
+    let bound_dut = bound_src.replace(
+        "transactor AxilXactor bound to BusAxiLite\n    sb        : AxilSb",
+        "transactor AxilXactor bound to BusAxiLite\n    dut       : AxiLiteRegs\n    sb        : AxilSb",
+    );
+    let bound_dut = bound_dut.replace(
+        "        on req(t)\n            bus.aw.addr = t.addr",
+        "        on req(t)\n            dut.rst = 0\n            bus.aw.addr = t.addr",
+    );
+    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&bound_dut).unwrap_err());
+    assert!(msg.contains("module-typed (DUT handle) field"), "{msg}");
+    let v1 =
+        cpp_tb::emit(&merged_with_stdlib_bus(&bound_dut, "BusAxiLite.arch")).expect("v1 emits");
+    assert!(
+        v1.contains("    VAxiLiteRegs* dut = nullptr;"),
+        "v1 declares the member"
+    );
+    assert!(
+        v1.contains("harc_rt::harc_assign(dut->rst, 0);"),
+        "and the poke resolves to the TEST's bound DUT pointer, not that member"
+    );
+    assert!(
+        !v1.contains("drv.dut") && !v1.contains("xactor.dut"),
+        "nothing ever reads the member — it is inert, which is what makes \
+         `--codegen v1` an honest suggestion here"
+    );
+
+    // The fifth arm reported a "malformed" handshake handler when the
+    // predicate and the channel extractor disagreed. They tested the
+    // same three conditions, so they could not — the arm was dead. One
+    // function does both jobs now, and the spellings that looked
+    // malformed lower as they always did.
+    let bound = fixture("axilite_bound_mon_test.harc");
+    for from in ["    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on"] {
+        assert_eq!(bound.matches(from).count(), 1, "unique anchor");
+        for to in [
+            "    on bus.w.handshake()\n        sb.errors = sb.errors + 1\n    end on",
+            "    on bus.w.handshake(d, e)\n        sb.written.push(d)\n    end on",
+        ] {
+            let src = bound.replace(from, to);
+            lower_with_stdlib_bus_src(&src)
+                .unwrap_or_else(|e| panic!("no arm calls this malformed: {e:?}"));
+        }
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to

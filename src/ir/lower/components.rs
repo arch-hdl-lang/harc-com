@@ -810,20 +810,36 @@ pub(crate) fn lower_component_schema(
         ));
     }
     if dut_fields.len() > 1 {
-        return Err(unsupported(
+        // v1's poke lowering hardwires the name `dut` and resolves it
+        // to the TEST's DUT pointer, so the transactor's own module
+        // field is an inert `VTop* dut = nullptr;` member. A SECOND
+        // handle is inert too while unread — but a poke through it
+        // emits `_tb.drv.dut2.en`, a `.` on a `VTop*`: "request for
+        // member 'en' ... which is of pointer type".
+        return Err(not_implemented(
             &format!(
                 "an event-driven transactor `{name}` with more than one DUT handle field \
                  ({})",
                 dut_fields.join(", ")
             ),
-            "the consumer BFM drives exactly one DUT instance",
+            "the consumer BFM drives exactly one DUT instance; v1 emits the extra handle \
+             as an unbound `VTop* <name> = nullptr;` member and a poke through it as \
+             `_tb.<inst>.<name>.<sig>` — a `.` on a pointer, which g++ refuses",
+            V1Status::EmitsUncompilable,
         ));
     }
     if let Some(&df) = dut_fields.first() {
         if df != "dut" {
-            return Err(unsupported(
+            // Same mechanism, one handle: v1 only rewrites a poke into
+            // `dut->...` when the field is literally named `dut`.
+            // Under any other name it emits `_tb.<inst>.<name>.<sig>`
+            // against a `VTop*`.
+            return Err(not_implemented(
                 &format!("an event-driven transactor DUT handle field named `{df}`"),
-                "name the DUT handle `dut` (the handler body resolves DUT pokes through it)",
+                "name the DUT handle `dut` (the handler body resolves DUT pokes through \
+                 it); v1 rewrites a poke to the test DUT only for that name, and emits \
+                 `_tb.<inst>.<name>.<sig>` on a `VTop*` for any other",
+                V1Status::EmitsUncompilable,
             ));
         }
     }
@@ -838,26 +854,27 @@ pub(crate) fn lower_component_schema(
     // theirs AFTER the periodic block (kept contiguous for pass 2).
     let mut on_handlers: Vec<crate::ir::OnHandlerSchema> = Vec::new();
     for (h, activation) in &on_asts {
-        if is_bus_handshake_monitor(h) {
+        if let Some(channel) = bus_handshake_monitor_channel(h) {
             // `on bus.<ch>.handshake(arg)` — desugars to a cycle-trigger
             // handler (valid && ready, rising edge) observing the bound
             // bus channel. Only valid on a `bound to <Bus>` transactor.
             if bound_bus.is_none() {
-                return Err(unsupported(
+                // v1 emits the handler anyway, against a `bus` that
+                // does not exist in the emitted scope: "'bus' was not
+                // declared in this scope", and the same for the
+                // payload argument. Nothing to re-run with.
+                return Err(not_implemented(
                     &format!(
                         "an `on bus.<ch>.handshake(...)` handshake-monitor handler on \
                          non-bound component `{name}`"
                     ),
                     "handshake-monitor handlers observe a `bound to <Bus>` transactor's \
-                     channels; an unbound component has no bus to observe",
+                     channels; an unbound component has no bus to observe, and v1 emits \
+                     the handler regardless — g++ answers \"'bus' was not declared in \
+                     this scope\"",
+                    V1Status::EmitsUncompilable,
                 ));
             }
-            let channel = bus_handshake_monitor_channel(h).ok_or_else(|| {
-                unsupported(
-                    &format!("a malformed `on bus.<ch>.handshake(...)` handler on `{name}`"),
-                    "the trigger must be `bus.<channel>.handshake(<arg>)`",
-                )
-            })?;
             cycle_asts.push((h, Some(channel), *activation));
         } else if let Some((event, arg_payload, args)) = event_subscription(h, &fields) {
             validate_event_handler(name, h, &event, args)?;
@@ -1051,32 +1068,17 @@ fn event_subscription<'a>(
     Some((id.name.clone(), payload, args.as_slice()))
 }
 
-/// True when `h` is an `on bus.<ch>.handshake(arg)` passive bus-monitor
-/// handler: its trigger is a `Call` whose callee is a `<bus>.<ch>.handshake`
-/// field-path. (The `bus` head is the bound-bus placeholder keyword inside
-/// a bound transactor; any dotted `.handshake(...)` call is the monitor
-/// shape — distinct from a bare-ident event subscription.)
-fn is_bus_handshake_monitor(h: &crate::ast::OnHandler) -> bool {
-    let ExprKind::Call { callee, .. } = &*h.event.kind else {
-        return false;
-    };
-    let ExprKind::Field {
-        target,
-        name: method,
-    } = &*callee.kind
-    else {
-        return false;
-    };
-    if method.name != "handshake" {
-        return false;
-    }
-    // `<x>.<ch>.handshake` — the target must itself be a `<x>.<ch>` field.
-    matches!(&*target.kind, ExprKind::Field { .. })
-}
-
 /// The channel name of an `on bus.<ch>.handshake(arg)` monitor handler
 /// (`<ch>` from the `<bus>.<ch>.handshake` callee), or `None` if `h` is
-/// not a well-formed handshake-monitor.
+/// not a handshake-monitor at all.
+///
+/// This is also the PREDICATE. A separate `is_bus_handshake_monitor`
+/// used to test the same three conditions — a `Call`, a callee
+/// `Field { name: "handshake" }`, and a `Field` target — and the caller
+/// ran the predicate first, then this function, then reported "a
+/// malformed `on bus.<ch>.handshake(...)` handler" if they disagreed.
+/// They cannot: whenever the predicate passed, this returned `Some`.
+/// One rule stated twice, and the second copy guarded nothing.
 fn bus_handshake_monitor_channel(h: &crate::ast::OnHandler) -> Option<String> {
     let ExprKind::Call { callee, .. } = &*h.event.kind else {
         return None;
