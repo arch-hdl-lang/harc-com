@@ -4485,9 +4485,14 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         if args.len() != 1 {
-            return Err(unsupported(
+            // v1 raises its OWN error here — "`_tb.p.idle`: expected 1
+            // cycle-count arg, got 0" — so `--codegen v1` is not an
+            // escape hatch, it is the same refusal with a different
+            // message. Measured at 0 and 2 arguments.
+            return Err(not_implemented(
                 &format!("`{}(...)` with {} arguments", name.name, args.len()),
-                "idle predicates take exactly one cycle-count argument",
+                "idle predicates take exactly one cycle-count argument".to_string(),
+                V1Status::Rejects,
             ));
         }
         // A named argument binds by position, because there is only one
@@ -4550,9 +4555,17 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         if args.len() != 1 {
-            return Err(unsupported(
+            // NOT the same as its `idle` sibling, measured rather than
+            // assumed from the shared shape: v1's
+            // `resolve_component_quiesced_predicate` returns `None` on a
+            // wrong argument count, so the call falls through to the
+            // generic method shape and emits `if (!(_tb.p.quiesced()))`
+            // — g++: "`struct Prod` has no member named `quiesced`".
+            // v1 emits, and what it emits does not build.
+            return Err(not_implemented(
                 &format!("`quiesced(...)` with {} arguments", args.len()),
-                "the quiesce predicate takes exactly one cycle-count argument",
+                "the quiesce predicate takes exactly one cycle-count argument".to_string(),
+                V1Status::EmitsUncompilable,
             ));
         }
         // Same as the idle predicates one screen up: one argument, so a

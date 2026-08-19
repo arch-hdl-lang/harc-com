@@ -8407,8 +8407,15 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
 ///
 /// Pinned as the property that actually matters — the named form and the
 /// positional form must emit the SAME program — rather than by asserting
-/// a remembered line. Both whole files come out identical, under both
-/// backends.
+/// a remembered line.
+///
+/// "Both whole files come out identical" is how this was first put, and
+/// that holds only for the shape below. `wait until` embeds the
+/// predicate's SOURCE TEXT in its timeout breakdown, so
+/// `wait until p.idle(n = 2)` reports "not yet true: _tb.p.idle(n=2)"
+/// where the positional form reports "_tb.p.idle(2)" — a
+/// diagnostic-text difference, present in both backends, not a
+/// difference in what runs.
 ///
 /// The name is deliberately not checked against anything. No parameter
 /// name is stated anywhere for these predicates (the arity diagnostic
@@ -8448,6 +8455,13 @@ end impl T"#
     for pred in ["idle", "quiesced"] {
         let positional = emit_cpp_src(&prog(&format!("p.{pred}(2)")));
         let named = emit_cpp_src(&prog(&format!("p.{pred}(n = 2)")));
+        // The anchor its sibling test insists on: the predicate has to
+        // REACH the output, or a byte-identity between two spellings is
+        // satisfied by both of them lowering the call away.
+        assert!(
+            positional.contains("_last_in_cycle"),
+            "`{pred}(2)` emits the cycle-stamp comparison:\n{positional}"
+        );
         assert_eq!(
             positional, named,
             "`{pred}(n = 2)` must emit exactly what `{pred}(2)` emits"
@@ -8464,12 +8478,29 @@ end impl T"#
         );
     }
 
-    // Arity is still checked — the name buys nothing there.
-    for bad in ["p.idle(1, 2)", "p.quiesced()"] {
+    // Arity is still checked, and the two predicates do NOT share a
+    // verdict there — measured rather than assumed from the shared
+    // shape. This cell used to assert only "not `Invalid`", which
+    // certified the `Unsupported` both arms then carried; `Unsupported`
+    // promises a `--codegen v1` escape hatch that neither arm has.
+    for bad in ["p.idle()", "p.idle(1, 2)"] {
+        // v1 raises its own error: "expected 1 cycle-count arg, got N".
         let err = lower_src(&prog(bad)).unwrap_err();
+        assert_not_implemented(&err, lower::V1Status::Rejects);
         assert!(
-            !matches!(err, lower::LowerError::Invalid(_)),
-            "`{bad}` is an arity gap, not a type error: {err:?}"
+            cpp_tb::emit(&merged_src(&prog(bad))).is_err(),
+            "`{bad}`: v1 refuses to emit"
+        );
+    }
+    for bad in ["p.quiesced()", "p.quiesced(1, 2)"] {
+        // v1's resolver returns `None` on a wrong count, so the call
+        // falls through to the generic method shape and emits
+        // `if (!(_tb.p.quiesced()))` — g++: no such member.
+        let err = lower_src(&prog(bad)).unwrap_err();
+        assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(bad))).is_ok(),
+            "`{bad}`: v1 emits it (and g++ refuses)"
         );
     }
 }

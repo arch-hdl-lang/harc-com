@@ -7808,8 +7808,23 @@ former `transaction` group lives in
      would be a false explanation. `Invalid` rests on "no backend can
      HONOUR it" rather than "no backend runs it", and re-deciding a
      question already measured and written down is the mistake
-     divergence 120 was about. Likewise the arity arms, which reject
-     genuine errors.
+     divergence 120 was about.
+
+     The arity arms reject genuine errors — but this entry first added
+     "likewise the arity arms", certifying them as fine, and they were
+     not. Both carried `Unsupported`, promising a `--codegen v1` escape
+     hatch neither has, and they do not even share a verdict. Measured:
+
+     | call | v1 |
+     |---|---|
+     | `p.idle()`, `p.idle(1, 2)` | its own error, "expected 1 cycle-count arg, got N" — **rejects** |
+     | `p.quiesced()`, `p.quiesced(1, 2)` | falls through `resolve_component_quiesced_predicate` (`None` on a wrong count) to the generic method shape, emits `if (!(_tb.p.quiesced()))` — g++: no such member |
+
+     So `NotImplemented { Rejects }` and
+     `NotImplemented { EmitsUncompilable }` respectively. Blessing two
+     sites because they sat next to the one being fixed, and pinning
+     that with a test, is worse than leaving them unexamined: the test
+     made the wrong verdict load-bearing.
 
 122. **A refusal worth keeping, and the measurement that says so
      (2026-08-19).**
@@ -7837,18 +7852,34 @@ former `transaction` group lives in
      fail an assert v1 passes — a silent behavioural divergence, the one
      outcome worth refusing a program over.
 
-     Repeated evaluation, which looks like the obstacle, is not one:
-     TB-IR places a hoisted call in the loop HEAD rather than ahead of
-     the loop. Measured on `while tick() < 3`, whose back-edge jumps to
-     the block holding the call, so a pop in a loop condition would
-     re-run each iteration as it should. Worth stating because "it's in
-     a loop" is the objection that comes to mind first, and it is the
-     wrong one.
+     Repeated evaluation is an obstacle at ONE of the two looping
+     constructs, and this entry first claimed it was neither.
 
-     Implementable, but not by hoisting: it needs `&&`/`||` lowered to
-     branches whenever a side-effecting call sits under them, which the
-     IR can express and the expression lowerer does not do. Recorded as
-     scoped work rather than attempted.
+     `while` is fine: `lower_while` opens the header block before
+     lowering the condition, so a hoisted call lands IN the header and
+     the back-edge targets it. Measured on `while tick() < 3` over a
+     TESTBENCH METHOD — `b1` holds the inlined body
+     (`TbFieldWrite(_tb.n, (_tb.n + 1))`, `Assign(%__t0, _tb.n)`) and
+     `b5` jumps back to `b1`. The distinction matters: a pure file-scope
+     helper does not CFG-inline and is not a witness for this.
+
+     `wait until` is not fine. `lower_wait_until` lowers the predicate
+     into the block PRECEDING the terminator, so a hoisted call runs
+     exactly once — while v1 emits the predicate as a lambda,
+     `wait_until_timeout(_slot, [&]{ return _tb.sb.q.pop() == 7; }, …)`,
+     and re-runs it every cycle. That same function already says so
+     thirty lines up, about transactor edges: "hoisting would run it
+     exactly once, the wrong semantics".
+
+     So "it's in a loop" is the wrong objection at one construct and
+     exactly the right one at the other, and implementing this needs
+     BOTH: `&&`/`||` lowered to branches when a side-effecting call sits
+     under them, and a `wait until` predicate that re-evaluates rather
+     than hoists. `wait until sb.q.pop() == 7` contains no short-circuit
+     at all, so the first alone would never reach it — the scoped work
+     as first recorded was not just incomplete but insufficient for the
+     case that motivated it. Recorded as scoped work rather than
+     attempted.
 
      The five copies of the reason are now one function carrying the
      measurement, and a test pins v1's short-circuited output — so the
