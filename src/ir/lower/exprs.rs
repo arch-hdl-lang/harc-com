@@ -70,6 +70,40 @@ pub(crate) struct TransactorStateRecordChain {
 /// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
 ///
 /// (`q.size()` compiles, which is why it never reaches this arm.)
+/// `pop()` in a nested expression, at any of the five queue spellings.
+///
+/// The verdict is `Unsupported` and it is not a placeholder: v1 evaluates
+/// the call where it is written, and TB-IR has no way to. Lowering an
+/// expression-position call means hoisting it into a statement before
+/// the expression, and for a MUTATING call that is only equivalent when
+/// the surrounding expression evaluates it unconditionally, exactly once.
+///
+/// Short-circuit operators break that, and C++ preserves them. Measured —
+/// `assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1` emits from
+/// v1 as `if (!((guard == 1 && _tb.sb.q.pop() == 7) || _tb.sb.q.size() == 1))`,
+/// so with `guard == 0` the pop NEVER RUNS and the queue keeps its
+/// element. A hoisted lowering would pop first, empty the queue, and
+/// fail an assert v1 passes — a silent behavioural divergence, which is
+/// the one outcome worth refusing a program over.
+///
+/// Repeated evaluation is NOT the obstacle, and it is worth saying so
+/// because it looks like one: TB-IR places a hoisted call in the loop
+/// HEAD, not ahead of the loop (measured on a `while tick() < 3`, whose
+/// back-edge jumps to the block holding the call), so a pop in a loop
+/// condition would re-run each iteration as it should.
+///
+/// Implementable, but not by hoisting: it needs `&&`/`||` lowered to
+/// branches whenever a side-effecting call sits under them, which the IR
+/// can express and the expression lowerer currently does not do.
+fn queue_pop_in_expression_position(what: &str) -> LowerError {
+    unsupported(
+        &format!("{what} in a nested expression"),
+        "bind it to its own `let` first — `pop` mutates the queue, and TB-IR would have \
+         to hoist the call out of the expression, which changes whether a short-circuited \
+         one runs at all",
+    )
+}
+
 fn queue_method_in_expression_position(what: &str, method: &str) -> LowerError {
     if method == "push" {
         return LowerError::Invalid(format!(
@@ -1724,10 +1758,9 @@ impl FuncBuilder<'_> {
                 queue: queue.clone(),
             },
             "pop" => {
-                return Err(unsupported(
-                    &format!("scoreboard `{field}.{queue}.pop()` in a nested expression"),
-                    "bind it to its own `let` first — `pop` mutates the queue",
-                ));
+                return Err(queue_pop_in_expression_position(&format!(
+                    "scoreboard `{field}.{queue}.pop()`"
+                )));
             }
             other => {
                 return Err(queue_method_in_expression_position(
@@ -1774,10 +1807,9 @@ impl FuncBuilder<'_> {
                 queue: field.clone(),
             },
             "pop" => {
-                return Err(unsupported(
-                    &format!("testbench queue `{field}.pop()` in a nested expression"),
-                    "bind it to its own `let` first — `pop` mutates the queue",
-                ));
+                return Err(queue_pop_in_expression_position(&format!(
+                    "testbench queue `{field}.pop()`"
+                )));
             }
             other => {
                 return Err(queue_method_in_expression_position(
@@ -1810,10 +1842,9 @@ impl FuncBuilder<'_> {
                 queue: queue.clone(),
             },
             "pop" => {
-                return Err(unsupported(
-                    &format!("component `{queue}.pop()` in a nested expression"),
-                    "bind it to its own `let` first — `pop` mutates the queue",
-                ));
+                return Err(queue_pop_in_expression_position(&format!(
+                    "component `{queue}.pop()`"
+                )));
             }
             other => {
                 return Err(queue_method_in_expression_position(
@@ -1869,10 +1900,9 @@ impl FuncBuilder<'_> {
                 queue: field.clone(),
             },
             "pop" => {
-                return Err(unsupported(
-                    &format!("target-state `{field}.pop()` in a nested expression"),
-                    "bind it to its own `let` first — `pop` mutates the queue",
-                ));
+                return Err(queue_pop_in_expression_position(&format!(
+                    "target-state `{field}.pop()`"
+                )));
             }
             other => {
                 return Err(queue_method_in_expression_position(
@@ -2366,10 +2396,9 @@ impl FuncBuilder<'_> {
                 queue: field.clone(),
             },
             "pop" => {
-                return Err(unsupported(
-                    &format!("target-state `{instance}.{field}.pop()` in a nested expression"),
-                    "bind it to its own `let` first — `pop` mutates the queue",
-                ));
+                return Err(queue_pop_in_expression_position(&format!(
+                    "target-state `{instance}.{field}.pop()`"
+                )));
             }
             other => {
                 return Err(queue_method_in_expression_position(

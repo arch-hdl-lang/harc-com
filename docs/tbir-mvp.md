@@ -7811,6 +7811,50 @@ former `transaction` group lives in
      divergence 120 was about. Likewise the arity arms, which reject
      genuine errors.
 
+122. **A refusal worth keeping, and the measurement that says so
+     (2026-08-19).**
+
+     Five sites refuse `pop()` in a nested expression — scoreboard,
+     testbench, component and target-state queues (two spellings) — each
+     with the same one-line reason, "bind it to its own `let` first —
+     `pop` mutates the queue". v1 compiles every nested form, which is
+     the profile of an implementable gap, and the previous two batches
+     had both turned out to be exactly that.
+
+     This one is not, and the difference is worth recording because the
+     surface looks identical. Lowering an expression-position call means
+     hoisting it into a statement ahead of the expression. For a MUTATING
+     call that is equivalent only when the surrounding expression
+     evaluates it unconditionally, exactly once — and C++ short-circuits:
+
+     | | |
+     |---|---|
+     | source | `assert (guard == 1 && sb.q.pop() == 7) \|\| sb.q.size() == 1` |
+     | v1 emits | `if (!((guard == 1 && _tb.sb.q.pop() == 7) \|\| _tb.sb.q.size() == 1))` |
+
+     With `guard == 0` the pop never runs and the queue keeps its
+     element. A hoisted lowering would pop first, empty the queue, and
+     fail an assert v1 passes — a silent behavioural divergence, the one
+     outcome worth refusing a program over.
+
+     Repeated evaluation, which looks like the obstacle, is not one:
+     TB-IR places a hoisted call in the loop HEAD rather than ahead of
+     the loop. Measured on `while tick() < 3`, whose back-edge jumps to
+     the block holding the call, so a pop in a loop condition would
+     re-run each iteration as it should. Worth stating because "it's in
+     a loop" is the objection that comes to mind first, and it is the
+     wrong one.
+
+     Implementable, but not by hoisting: it needs `&&`/`||` lowered to
+     branches whenever a side-effecting call sits under them, which the
+     IR can express and the expression lowerer does not do. Recorded as
+     scoped work rather than attempted.
+
+     The five copies of the reason are now one function carrying the
+     measurement, and a test pins v1's short-circuited output — so the
+     obvious "fix" fails a test that explains itself rather than
+     silently changing what a program means.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

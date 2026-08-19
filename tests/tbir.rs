@@ -8474,6 +8474,63 @@ end impl T"#
     }
 }
 
+/// `pop()` in a nested expression stays refused, and this pins WHY so the
+/// obvious "fix" is foreclosed. Lowering an expression-position call means
+/// hoisting it into a statement, and for a MUTATING call that is only
+/// equivalent when the expression evaluates it unconditionally, exactly
+/// once. C++ short-circuits, so v1 does too.
+#[test]
+fn a_nested_pop_is_refused_because_hoisting_it_would_change_when_it_runs() {
+    let src = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard Sb
+    q : queue<uint<8>>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        sb.q.push(7)
+        let guard = 0
+        assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1
+            else fail("queue was popped despite the short circuit")
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_unsupported(&lower_src(src).unwrap_err());
+    assert!(
+        msg.contains("in a nested expression"),
+        "refused for its position: {msg}"
+    );
+
+    // The evidence. v1 emits the pop INSIDE the `&&`, so with `guard == 0`
+    // it never runs and the queue keeps its element. Hoisting it — the
+    // only way TB-IR could lower an expression-position call — would pop
+    // first and fail an assert v1 passes.
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    assert!(
+        v1.contains("guard == 1 && _tb.sb.q.pop() == 7"),
+        "the pop sits under the short circuit in v1's output:\n{v1}"
+    );
+
+    // …and the `let`-bound form, which is what the diagnostic asks for,
+    // lowers and emits from both backends.
+    let bound = src.replacen(
+        "        assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1\n            else fail(\"queue was popped despite the short circuit\")",
+        "        let v = sb.q.pop()\n        assert v == 7 else fail(\"popped ${v}\")",
+        1,
+    );
+    emit_cpp_src(&bound);
+    cpp_tb::emit(&merged_src(&bound)).expect("v1 emits the bound form");
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
