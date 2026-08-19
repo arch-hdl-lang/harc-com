@@ -738,7 +738,25 @@ impl FuncBuilder<'_> {
         // site (v1 emits `T x = {};`), so reads between fork and join_all
         // see a defined-but-zero local. `Discard` carries no dest.
         let dest_local = match dest {
-            BusCallDest::Declare(name) => Some(self.declare(name)),
+            BusCallDest::Declare(name) => {
+                let id = self.declare(name);
+                // The same typing the NON-fork path one screen up does.
+                // Dropping it left a `let r = fork mem.read(5)` on a
+                // record-returning `tlm_method` untyped, and that is not
+                // merely a missing annotation: tbir emitted
+                // `uint64_t r = 0; r = harc_read(dut->mem_read_rsp_data);`
+                // where v1 emits `Resp r = {}; r = harc_unpack_Resp(...)`.
+                // BOTH compile, so for a multi-field struct the two
+                // backends silently computed DIFFERENT values — worse
+                // than the uncompilable emissions elsewhere in this
+                // family, because nothing fails.
+                if let Some(rid) = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t)) {
+                    self.set_local_type(id, crate::ir::IrType::Record(rid));
+                } else if let Some(ret) = m.ret.as_ref() {
+                    self.set_local_type(id, super::helpers::ir_type_of(Some(ret)));
+                }
+                Some(id)
+            }
             BusCallDest::Discard => None,
         };
         let desc = crate::ir::TlmForkDesc {

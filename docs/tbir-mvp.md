@@ -7027,6 +7027,118 @@ former `transaction` group lives in
      different method name or a one-level target, and nothing tested
      the arm that was deliberately left alone.
 
+111. **The assignment rule at the other half of the surface: a typed
+     SLOT (2026-08-19).**
+
+     Divergences 104 and 108 swept assignment destinations. The mirror
+     of that rule — a value entering a queue element, a method
+     parameter or an event payload — was open at every family, in BOTH
+     directions. Measured across four slot families × the combinations
+     each admits, on both backends:
+
+     | slot | value | v1 / tbir C++ |
+     |---|---|---|
+     | `queue<uint<8>>` | a record | "cannot convert 'Beat' to 'long unsigned int'" |
+     | `queue<Beat>` | the same record | **compiles** |
+     | `queue<Beat>` | a different record | "cannot convert 'Other' to 'Beat'" |
+     | `queue<Beat>` | a scalar | "cannot convert 'long unsigned int' to 'Beat'" |
+     | scalar parameter | a record | "no match for call to ..." |
+     | record parameter | a scalar / other record | "no match for call to ..." |
+     | `event<uint<8>>` payload | a record | "no match for call to ..." |
+     | `event<Beat>` payload | a scalar / other record | "no match for call to ..." |
+
+     Sixteen mismatched cells; five matching ones compile. Every
+     mismatch is refused by BOTH backends, so all sixteen are `Invalid`
+     — a type error with nothing to implement.
+
+     Three things this turned up that a single probe would have missed:
+
+       * **The testbench queue answered a PROGRAM error through the
+         COMPILER-BUG channel.** Two of its four cells reached the
+         verifier's `BadProgramRef` — "internal error: TB-IR failed
+         verification after lowering" — for a program the user wrote
+         wrong. The other two lowered and emitted freely, so the
+         verifier check was not merely misplaced, it was asymmetric.
+       * **The `emit` shape check that existed was keyed on
+         `expr_type`,** whose `(_, IrType::Unknown) => true` arm waved
+         through exactly the record-carrying shapes divergence 108 had
+         just taught the compiler to type. It reads `record_id_of_expr`
+         now. The other two `emit` lanes (`ComponentEmit`, both the
+         dotted and self-relative spellings) checked arity and never
+         the payload type at all.
+       * **`TransactorMethodSchema` carried `param_names` but not
+         `param_tys`,** so the transactor call site had nothing to
+         type-check against — the same gap its own doc comment records
+         for names ("this was `n_params` and the names were dropped on
+         the floor at construction"). Extended the same way.
+
+     The queue family has SIX lanes, not three. Beyond the scoreboard,
+     component and testbench pushes, a bound-to TLM responder's
+     target-state queue takes a push in two spellings — bare
+     (`pending.push(x)`, inside the responder body) and test-scope
+     (`responder.pending.push(x)`) — and both were open. Its element
+     lives in `target_state_fields` rather than a queue table, which is
+     why it reads differently at each site.
+
+     A note on how that one was measured, because the first attempt
+     proved nothing: all four target-state cells failed to compile,
+     which looked like confirmation until the error turned out to be a
+     missing `VTlmReadInitiator.h` — the CONTROLS were failing too. With
+     a stub written from the `dut->` references in the generated file,
+     the two matching cells compile and the two mismatched ones fail in
+     both backends, which is the actual evidence.
+
+     **The guards found a pre-existing bug by breaking on it.** An
+     untyped `let` bound from a RECORD-returning component method
+     (`let b = s.mk(1)`) never applied the method's `ret_ty`, so the
+     local carried no record type: tbir emitted `uint64_t b; b =
+     Src_mk(...)` — which does not compile — while v1's
+     `auto b = Src_mk(_tb.s, 1);` does. Silent, and invisible until the
+     slot guards started reading that local's type, saw "a scalar", and
+     called five well-typed programs `Invalid`. `lower_let` applies
+     `m.ret_ty` now, which fixes the false rejections and the silent
+     mis-emission together.
+
+     A second review round found the same shape twice more. The
+     TESTBENCH-METHOD spelling of that `let` was untyped for the same
+     reason and broke the same way. And the `ret_ty` inference itself
+     regressed: gated on `declared_scalar_ty`, which
+     `typed_let_ir_type` answers `None` for on `int` and `bit`, it
+     typed `let n : int = s.mk(1)` as the method's RECORD — the default
+     backend emitted `Beat n{}` and RAN while v1 refused to build it.
+     That is the defect the untyped-`let` guard one screen up keys on
+     `l.ty` to prevent; the same mistake was made in code written next
+     to the fix for it. Both now key on `l.ty`.
+
+     A third round found the defect a THIRD time, at the `fork`
+     spelling: `try_lower_tlm_fork` declared its destination without
+     typing it, where the non-fork path one screen up computes
+     `tlm_ret_record_id(m.ret)`. That one is the worst of the three,
+     because with no slot involved nothing fails — tbir emitted
+     `uint64_t r = 0; r = harc_read(...)` and v1
+     `Resp r = {}; r = harc_unpack_Resp(...)`, and BOTH compile, so for
+     a multi-field struct the two backends silently computed different
+     values.
+
+     One `check_slot_type(value, want, what)` behind all of it, with a
+     `check_queue_push` adapter for `QueueElem`. Twenty-six mutations,
+     all caught — but only after review found FOUR of the eight advertised
+     call sites unpinned: the test exercised statement-position calls
+     and the dotted `emit` spelling only, so removing the guard at the
+     record-annotated `let`, the untyped `let`, the assignment site, the
+     self-relative `emit`, or the bound-initiator `param_tys` left the
+     suite green. Each spelling needed its own case.
+
+     **Deferred, measured:** three slot families whose type table does
+     not exist yet — the transactor SIBLING-method call
+     (`self_transactor_methods` carries names, not types), testbench-
+     method parameters, and `tseq` call arguments. All lower and emit
+     today; both backends refuse every mismatch. One testbench-method
+     cell reaches the verifier's `TypeMismatch`, so it answers a program
+     error through the compiler-bug channel — the same pathology this
+     divergence fixed for the testbench queue, still live one spelling
+     over.
+
 
 ## Next steps
 

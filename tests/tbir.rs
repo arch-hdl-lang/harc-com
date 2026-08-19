@@ -6478,6 +6478,683 @@ end impl T"#
     }
 }
 
+/// The assignment rule at the other half of the surface: a value
+/// entering a TYPED SLOT — a queue element, a method parameter, an
+/// event payload — must match that slot's type.
+///
+/// Both directions were open, at every slot family. Only the matching
+/// combination compiles; every other one is refused by BOTH backends,
+/// so all of them are `Invalid`. The testbench queue was the sharpest
+/// case: two of its four cells reached the verifier's `BadProgramRef`,
+/// which renders as "internal error: TB-IR failed verification after
+/// lowering" — a PROGRAM error answered through the compiler-bug
+/// channel.
+#[test]
+fn a_value_entering_a_typed_slot_must_match_that_slot() {
+    let prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+scoreboard Sb
+    sq : queue<uint<8>>
+    rq : queue<Beat>
+end scoreboard Sb
+
+agent Src
+    cq   : queue<uint<8>>
+    crq  : queue<Beat>
+    obs  : out event<uint<8>>
+    robs : out event<Beat>
+    seen : uint<32> default 0
+
+    function takes(x: uint<8>)
+        seen = seen + x
+    end function
+
+    function takesr(t: Beat)
+        seen = seen + t.v
+    end function
+end agent Src
+
+transactor Drv
+    dut : Top
+
+    when active
+        hookable step(n: uint<8>)
+            dut.en = 1
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+    s   : Src
+    drv : Drv active
+    tq  : queue<uint<8>>
+    trq : queue<Beat>
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+
+    // The controls: a matching value at every family.
+    for body in [
+        "        sb.rq.push(b)",
+        "        s.crq.push(b)",
+        "        trq.push(b)",
+        "        sb.sq.push(1)",
+        "        s.takesr(b)",
+        "        s.takes(1)",
+        "        emit s.robs(b)",
+        "        emit s.obs(1)",
+        "        drv.step(1)",
+    ] {
+        lower_src(&prog(body)).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+    }
+
+    // Each component-call SITE separately: the statement position, the
+    // record-annotated `let`, the untyped/scalar `let`, and assignment
+    // into an existing local. Only the first was covered, so removing
+    // the guard at any of the other three left the suite green.
+    let call_prog = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    seen : uint<32> default 0
+
+    function takes(x: uint<8>) -> uint<8>
+        seen = seen + x
+        return x
+    end function
+
+    function mk(x: uint<8>) -> Beat
+        let r : Beat
+        r.v = x
+        return r
+    end function
+
+    function robs(t: Beat)
+        seen = seen + t.v
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (body, site) in [
+        ("        s.takes(b)", "statement position"),
+        ("        let r : Beat = s.mk(b)", "record-annotated `let`"),
+        ("        let n = s.takes(b)", "untyped `let`"),
+        (
+            "        let n : uint<8> = s.takes(b)",
+            "scalar-annotated `let`",
+        ),
+        (
+            "        let n : uint<8> = 0\n        n = s.takes(b)",
+            "assignment into an existing local",
+        ),
+    ] {
+        let src = call_prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("parameter `x` of `Src.takes`")
+                || msg.contains("parameter `x` of `Src.mk`"),
+            "{site}: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "{site}: v1 emits it (and g++ refuses)"
+        );
+    }
+    // An untyped `let` bound from a RECORD-returning method takes the
+    // method's own return type. Leaving it untyped made tbir emit
+    // `uint64_t b; b = Src_mk(...)` — which does not compile — and then
+    // made every slot guard above call five well-typed programs
+    // `Invalid`, because the local read as a scalar.
+    let inferred = call_prog("        let r = s.mk(1)\n        s.robs(r)");
+    lower_src(&inferred).expect("an untyped record-returning `let` lowers");
+    assert!(
+        emit_cpp_src(&inferred).contains("Beat r{}"),
+        "the local declares as the method's return record"
+    );
+
+    // A TESTBENCH-METHOD `let` takes the method's return record too —
+    // the same rule as the component-method one, at the spelling one
+    // screen over in the source. Leaving it untyped made every slot
+    // guard read the local as a scalar and reject a program v1
+    // compiles (`auto r = Tb_make_result(_tb, 7);`).
+    let tb_method = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+scoreboard Sb
+    rq : queue<Beat>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+
+    function make_result(value: uint<8>) -> Beat
+        let result : Beat
+        result.v = value
+        return result
+    end make_result
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for ok in [
+        "        let r = make_result(7)\n        sb.rq.push(r)",
+        "        let r : Beat = make_result(7)\n        sb.rq.push(r)",
+        "        sb.rq.push(make_result(7))",
+    ] {
+        lower_src(&tb_method(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    let msg =
+        assert_invalid(&lower_src(&tb_method("        let r : int = make_result(7)")).unwrap_err());
+    assert!(
+        msg.contains("non-matching type") && msg.contains("`Beat`"),
+        "{msg}"
+    );
+
+    // …and the component-method `let` must NOT retype past its own
+    // annotation. `typed_let_ir_type` answers `None` for `int` and
+    // `bit`, so keying the inference on it silently discarded the
+    // annotation and the DEFAULT backend ran a program v1 refuses to
+    // build — the very defect the untyped-`let` guard keys on `l.ty` to
+    // prevent.
+    for ann in ["int", "bit"] {
+        let src = call_prog(&format!("        let n : {ann} = s.mk(1)"));
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("declared with a non-record type") && msg.contains("`Beat`"),
+            "`let n : {ann} = s.mk(1)`: {msg}"
+        );
+    }
+
+    // The FORK spelling of a record-returning call. `try_lower_tlm_fork`
+    // declared its destination without typing it, where the non-fork
+    // path one screen up computes `tlm_ret_record_id(m.ret)` — so this
+    // is the third instance of the same defect, and the worst: with no
+    // slot involved the two backends BOTH compiled and silently
+    // computed different values, tbir reading a raw `uint64_t` where v1
+    // unpacks the struct.
+    let forked = fixture("tlm_method_blocking_fork_bus_test.harc")
+        .replacen(
+            "bus TlmMemBlockingForkBus\n    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+            "struct Resp\n    data : uint<32>\n    flag : uint<8>\nend struct Resp\n\n\
+             scoreboard Sb\n    rq : queue<Resp>\nend scoreboard Sb\n\n\
+             bus TlmMemBlockingForkBus\n    tlm_method read(addr: uint<8>) -> Resp: blocking;",
+            1,
+        )
+        .replacen(
+            "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory",
+            "testbench TlmMethodBlockingForkBusTb\n    dut : TlmMemory\n    sb  : Sb",
+            1,
+        )
+        .replacen(
+            "        assert forked == 261\n            else fail(\"forked blocking read got \
+             0x${forked:08x}, expected 0x00000105\")",
+            "        sb.rq.push(forked)",
+            1,
+        );
+    lower_src(&forked)
+        .unwrap_or_else(|e| panic!("a record-returning fork result keeps its record type: {e:?}"));
+    assert!(
+        emit_cpp_src(&forked).contains("Resp forked"),
+        "and the fork destination declares as the record, not a `uint64_t`"
+    );
+
+    // Parameter index > 0. Every mismatch cell above sits at
+    // parameter #1, so truncating BOTH parameter loops to `.take(1)`
+    // left the whole suite green — and the `i`/`param_names.get(i)`
+    // indexing was exercised only at zero.
+    let two_param = |body: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    seen : uint<32> default 0
+    function two(a: uint<8>, b: uint<8>)
+        seen = seen + a + b
+    end function
+    function tworec(a: uint<8>, t: Beat)
+        seen = seen + a + t.v
+    end function
+end agent Src
+
+transactor Drv
+    dut : Top
+    when active
+        hookable step2(m: uint<8>, n: uint<8>)
+            dut.en = m
+            wait 1 cycle
+        end hookable
+    end when
+end transactor Drv
+
+testbench Tb
+    dut : Top
+    s   : Src
+    drv : Drv active
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+{body}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (body, pname) in [
+        ("        s.two(1, b)", "`b` of `Src.two`"),
+        ("        s.tworec(1, 1)", "`t` of `Src.tworec`"),
+        ("        drv.step2(1, b)", "`n` of `Drv.step2`"),
+    ] {
+        let msg = assert_invalid(&lower_src(&two_param(body)).unwrap_err());
+        assert!(
+            msg.contains(pname),
+            "the SECOND parameter is checked, and named: {msg}"
+        );
+    }
+    lower_src(&two_param("        s.tworec(1, b)")).expect("the matching two-arg call lowers");
+
+    // A record-payload local event — the OTHER arm of the test-scope
+    // `emit` shape check. Replacing it with `true` left the suite
+    // green, because the case below only exercised the scalar arm.
+    let rec_event = |line: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+transaction Other
+    w : uint<8>
+end transaction Other
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let b : Beat
+        let o : Other
+        let e : event<Beat>
+        on e(t)
+            log(info, "v=${{t.v}}")
+        end on
+{line}
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    lower_src(&rec_event("        emit e(b)")).expect("a matching record payload lowers");
+    for line in ["        emit e(o)", "        emit e(1)"] {
+        let msg = assert_invalid(&lower_src(&rec_event(line)).unwrap_err());
+        assert!(
+            msg.contains("the channel carries `event<Beat>`"),
+            "`{line}`: {msg}"
+        );
+    }
+
+    // The TEST-SCOPE `let e : event<T>` emit lane. Its check already
+    // existed but was keyed on `expr_type`, whose `Unknown` arm waved
+    // through exactly the record-carrying shapes divergence 108 taught
+    // the compiler to type — so reverting it to `expr_type` left the
+    // suite green. A record-valued COMPONENT FIELD is the payload that
+    // separates the two.
+    let local_event = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    cur : Beat
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        let e : event<uint<8>>
+        on e(x)
+            log(info, "x=${x}")
+        end on
+        emit e(s.cur)
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(local_event).unwrap_err());
+    assert!(
+        msg.contains("does not match that shape"),
+        "a record component field into a scalar-payload local event: {msg}"
+    );
+
+    // The SELF-RELATIVE `emit` spelling, inside a component method body
+    // — a different lane from the dotted one, and unpinned until now.
+    let self_emit = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    v : uint<8>
+end transaction Beat
+
+agent Src
+    obs  : out event<uint<8>>
+    seen : uint<32> default 0
+
+    function fire()
+        let b : Beat
+        emit obs(b)
+        seen = seen + 1
+    end function
+end agent Src
+
+testbench Tb
+    dut : Top
+    s   : Src
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        s.fire()
+        wait 2 cycles
+    end run
+end impl T"#;
+    let msg = assert_invalid(&lower_src(self_emit).unwrap_err());
+    assert!(
+        msg.contains("event `obs` takes a non-record value and was given a `Beat`"),
+        "{msg}"
+    );
+
+    // The BOUND-INITIATOR transactor is a second `param_tys`
+    // construction site. Emptying only that one leaves the other's
+    // tests green.
+    let helper = fixture("regblock_fields_test.harc").replacen(
+        "impl RegblockFieldsTest for RegblockFieldsTb",
+        "transaction Beat\n    v : uint<8>\nend transaction Beat\n\n\
+         impl RegblockFieldsTest for RegblockFieldsTb",
+        1,
+    );
+    let bad = helper.replacen(
+        "    run\n",
+        "    run\n        let bt : Beat\n        helper.write(bt, 1)\n",
+        1,
+    );
+    let msg = assert_invalid(&lower_with_stdlib_bus_src(&bad).unwrap_err());
+    assert!(
+        msg.contains("parameter `addr` of `AxilHelper.write`"),
+        "the bound-initiator schema carries its parameter types too: {msg}"
+    );
+
+    // The target-state queue is a FIFTH and SIXTH lane, on a bound-to
+    // TLM responder. Its element lives in `target_state_fields`, not a
+    // queue table, so it took its own wiring — and the controls needed
+    // their own DUT stub before they proved anything: the first run
+    // showed all four cells failing to compile, which was a missing
+    // `VTlmReadInitiator.h`, not the push.
+    let responder = |line: &str| {
+        fixture("target_record_state_test.harc")
+            .replacen(
+                "    last : Beat\n",
+                "    last : Beat\n    sq   : queue<uint<8>>\n    rq   : queue<Beat>\n",
+                1,
+            )
+            .replacen(
+                "        wait 1 cycle\n",
+                &format!("        wait 1 cycle\n{line}\n"),
+                1,
+            )
+    };
+    for ok in ["        sq.push(3)", "        rq.push(last)"] {
+        lower_src(&responder(ok)).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
+    }
+    for (line, want, got) in [
+        ("        sq.push(last)", "a non-record value", "a `Beat`"),
+        ("        rq.push(1)", "a `Beat`", "a non-record value"),
+    ] {
+        let msg = assert_invalid(&lower_src(&responder(line)).unwrap_err());
+        assert!(
+            msg.contains("target-state queue")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{line}`: {msg}"
+        );
+    }
+    // …and the TEST-SCOPE spelling of the same push
+    // (`responder.sq.push(x)`), which is a separate lane. Covering only
+    // the bare-name one left this one's guard unpinned — a mutation
+    // that removed it kept the suite green.
+    let at_test_scope = |line: &str| {
+        responder("").replacen(
+            "        dut.rst = 1\n",
+            &format!("        dut.rst = 1\n{line}\n"),
+            1,
+        )
+    };
+    lower_src(&at_test_scope("        responder.sq.push(3)"))
+        .expect("a matching test-scope push lowers");
+    for (line, want, got) in [
+        (
+            "        let t : Beat\n        responder.sq.push(t)",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        responder.rq.push(1)",
+            "a `Beat`",
+            "a non-record value",
+        ),
+    ] {
+        let msg = assert_invalid(&lower_src(&at_test_scope(line)).unwrap_err());
+        assert!(
+            msg.contains("target-state queue `responder.")
+                && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{line}`: {msg}"
+        );
+    }
+
+    // Every mismatch, both directions, at every family. Each row names
+    // the slot and both types, and v1 emits it for g++ to refuse.
+    for (body, slot, want, got) in [
+        // queue element scalar <- record
+        (
+            "        sb.sq.push(b)",
+            "scoreboard queue `sq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        s.cq.push(b)",
+            "component queue `cq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        tq.push(b)",
+            "testbench queue `tq`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        // queue element record <- a DIFFERENT record
+        (
+            "        sb.rq.push(o)",
+            "scoreboard queue `rq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        (
+            "        s.crq.push(o)",
+            "component queue `crq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        (
+            "        trq.push(o)",
+            "testbench queue `trq`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        // queue element record <- scalar. Not one the verifier caught
+        // even where it caught the other two, so it emitted freely.
+        (
+            "        sb.rq.push(1)",
+            "scoreboard queue `rq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        s.crq.push(1)",
+            "component queue `crq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        trq.push(1)",
+            "testbench queue `trq`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        // component method parameter
+        (
+            "        s.takes(b)",
+            "parameter `x` of `Src.takes`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        s.takesr(1)",
+            "parameter `t` of `Src.takesr`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        s.takesr(o)",
+            "parameter `t` of `Src.takesr`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+        // transactor/hookable parameter — the schema had to learn
+        // `param_tys` for this one; it carried only names.
+        (
+            "        drv.step(b)",
+            "parameter `n` of `Drv.step`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        // event payload
+        (
+            "        emit s.obs(b)",
+            "event `obs`",
+            "a non-record value",
+            "a `Beat`",
+        ),
+        (
+            "        emit s.robs(1)",
+            "event `robs`",
+            "a `Beat`",
+            "a non-record value",
+        ),
+        (
+            "        emit s.robs(o)",
+            "event `robs`",
+            "a `Beat`",
+            "a `Other`",
+        ),
+    ] {
+        let src = prog(body);
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains(slot) && msg.contains(&format!("takes {want} and was given {got}")),
+            "`{body}` names the slot and both types: {msg}"
+        );
+        // v1 emits it, and g++ refuses — so there is nowhere to send
+        // the user, which is what makes this `Invalid` and not a gap.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to

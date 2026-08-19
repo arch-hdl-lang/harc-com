@@ -4229,6 +4229,21 @@ impl super::FuncBuilder<'_> {
                     )));
                 }
                 let lowered = self.lower_component_call_args(args, None)?;
+                // The payload TYPE, not just the arity. The channel
+                // renders as `std::function<void(uint64_t)>` or
+                // `std::function<void(<Record>)>`, and passing one where
+                // the other is expected is a hard C++ error in both
+                // backends — measured on all four combinations.
+                if let Some(payload) = self.component_event_payload(cid, &event) {
+                    self.check_slot_type(
+                        &lowered[0],
+                        match payload {
+                            EventPayload::Record(r) => Some(r),
+                            EventPayload::Scalar { .. } => None,
+                        },
+                        &format!("event `{event}`"),
+                    )?;
+                }
                 self.push(IrStmt::ComponentEmit {
                     base: ComponentBase::Path(recv),
                     event,
@@ -4259,13 +4274,16 @@ impl super::FuncBuilder<'_> {
                     // scalar payload to a 64-bit slot, so `sint` into an
                     // `event<uint<8>>` is the same benign conversion v1
                     // performs.
-                    let arg_ty = self.expr_type(&lowered[0]).unwrap_or(IrType::Unknown);
-                    let shape_ok = match (payload, &arg_ty) {
-                        (_, IrType::Unknown) => true,
-                        (EventPayload::Record(want), IrType::Record(got)) => want == *got,
-                        (EventPayload::Record(_), _) => false,
-                        (EventPayload::Scalar { .. }, IrType::Record(_)) => false,
-                        (EventPayload::Scalar { .. }, _) => true,
+                    // `record_id_of_expr`, not `expr_type`: the latter
+                    // has no arm for a record-valued component field,
+                    // transactor-state field or ternary, and this match
+                    // waved `Unknown` straight through — so exactly the
+                    // shapes divergence 108 taught the compiler to type
+                    // were the ones this check could not see.
+                    let got = self.record_id_of_expr(&lowered[0]);
+                    let shape_ok = match payload {
+                        EventPayload::Record(want) => got == Some(want),
+                        EventPayload::Scalar { .. } => got.is_none(),
                     };
                     if !shape_ok {
                         let want = match payload {
@@ -4329,12 +4347,31 @@ impl super::FuncBuilder<'_> {
             )));
         }
         let lowered = self.lower_component_call_args(args, None)?;
+        if let Some(payload) = self.component_event_payload(cid, &event) {
+            self.check_slot_type(
+                &lowered[0],
+                match payload {
+                    EventPayload::Record(r) => Some(r),
+                    EventPayload::Scalar { .. } => None,
+                },
+                &format!("event `{event}`"),
+            )?;
+        }
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
             event,
             args: lowered,
         });
         Ok(())
+    }
+
+    /// The record an `event` field of `cid` carries, or `None` for a
+    /// scalar payload. `Err` when the field is not a resolvable event.
+    fn component_event_payload(&self, cid: ComponentId, event: &str) -> Option<EventPayload> {
+        match self.ctx.components.get(cid.index())?.field(event)?.kind {
+            ComponentFieldKind::Event { payload, .. } => Some(payload),
+            _ => None,
+        }
     }
 
     /// Whether the receiver's own declaration beats the built-in

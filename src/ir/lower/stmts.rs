@@ -299,6 +299,12 @@ impl FuncBuilder<'_> {
                                 )));
                             };
                             let value = self.lower_expr_no_ports(arg)?;
+                            let elem = self.tb_queue_elem(&field)?;
+                            self.check_queue_push(
+                                &value,
+                                &elem,
+                                &format!("testbench queue `{field}`"),
+                            )?;
                             self.push(Stmt::TbQueuePush { field, value });
                             return Ok(());
                         }
@@ -356,6 +362,12 @@ impl FuncBuilder<'_> {
                                 )));
                             };
                             let value = self.lower_expr_no_ports(arg)?;
+                            let elem = self.scoreboard_queue_elem(sb, &queue)?;
+                            self.check_queue_push(
+                                &value,
+                                &elem,
+                                &format!("scoreboard queue `{queue}`"),
+                            )?;
                             self.push(Stmt::ScoreboardOp {
                                 sb,
                                 field,
@@ -398,6 +410,12 @@ impl FuncBuilder<'_> {
                                 )));
                             };
                             let value = self.lower_expr_no_ports(arg)?;
+                            let elem = self.component_queue_elem(&base, &queue)?;
+                            self.check_queue_push(
+                                &value,
+                                &elem,
+                                &format!("component queue `{queue}`"),
+                            )?;
                             self.push(Stmt::ComponentQueuePush { base, queue, value });
                             return Ok(());
                         }
@@ -430,6 +448,19 @@ impl FuncBuilder<'_> {
                                 )));
                             };
                             let value = self.lower_expr_no_ports(arg)?;
+                            // The FIFTH queue lane. Same rule as the
+                            // scoreboard/component/testbench pushes; it
+                            // reads its element from `target_state_fields`
+                            // rather than a queue table.
+                            if let Some(crate::ir::StateFieldKind::Queue { elem }) =
+                                self.target_state_fields.get(&field).cloned()
+                            {
+                                self.check_queue_push(
+                                    &value,
+                                    &elem,
+                                    &format!("target-state queue `{field}`"),
+                                )?;
+                            }
                             self.push(Stmt::TransactorStateQueuePush {
                                 instance: String::new(),
                                 field,
@@ -478,6 +509,17 @@ impl FuncBuilder<'_> {
                                         )));
                                     };
                                     let value = self.lower_expr_no_ports(arg)?;
+                                    // The SIXTH lane — the test-scope
+                                    // spelling of the same push. `kind`
+                                    // is already the queue's, from the
+                                    // `matches!` this branch gated on.
+                                    if let crate::ir::StateFieldKind::Queue { elem } = &kind {
+                                        self.check_queue_push(
+                                            &value,
+                                            elem,
+                                            &format!("target-state queue `{instance}.{field}`"),
+                                        )?;
+                                    }
                                     self.push(Stmt::TransactorStateQueuePush {
                                         instance,
                                         field,
@@ -523,6 +565,7 @@ impl FuncBuilder<'_> {
                             .method(&method)
                             .map(|m| m.param_names.clone());
                         let lowered = self.lower_component_call_args(args, declared.as_deref())?;
+                        self.check_component_call_args(component, &method, &lowered)?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -954,6 +997,7 @@ impl FuncBuilder<'_> {
                             )?;
                             let declared = m.param_names.clone();
                             let lowered = self.lower_component_call_args(args, Some(&declared))?;
+                            self.check_component_call_args(component, &method, &lowered)?;
                             let id = self.declare(&l.name.name);
                             self.set_local_type(id, IrType::Record(rid));
                             self.push(Stmt::ComponentCall {
@@ -1185,11 +1229,52 @@ impl FuncBuilder<'_> {
                 }
                 let declared = m.param_names.clone();
                 let lowered = self.lower_component_call_args(args, Some(&declared))?;
+                self.check_component_call_args(component, &method, &lowered)?;
                 let id = self.declare(&l.name.name);
                 if let Some(w) = declared_width {
                     self.let_widths.insert(id, w);
                 }
-                if let Some(ty) = declared_scalar_ty.clone() {
+                // The method's OWN return type when the `let` carries
+                // no annotation. `ret_ty` was sitting right here unused,
+                // so `let b = s.mk(1)` on a `-> Beat` method declared an
+                // untyped local: tbir emitted `uint64_t b; b =
+                // Src_mk(...)` — "cannot convert 'Beat' to 'uint64_t'" —
+                // while v1's `auto b = Src_mk(_tb.s, 1);` compiles.
+                //
+                // That silent mis-emission became visible the moment the
+                // slot guards below started reading the local's type:
+                // they saw "a scalar" and called five well-typed
+                // programs `Invalid`. Typing the local fixes both.
+                // Gated on `l.ty`, NOT on `declared_scalar_ty` —
+                // `typed_let_ir_type` answers `None` for `int` and for
+                // `bit`, so keying on it made the annotation invisible
+                // and typed the local as the method's record. The
+                // default backend then emitted `Beat n{}` for
+                // `let n : int = s.mk(1)` and RAN, while v1 refused to
+                // build it: a silent mis-lowering, and the exact defect
+                // the untyped-`let` guard a screen up keys on `l.ty` to
+                // prevent.
+                if let (Some(_), Some(IrType::Record(rid))) = (&l.ty, &m.ret_ty) {
+                    if declared_scalar_ty.is_none() {
+                        return Err(LowerError::Invalid(format!(
+                            "`let {}` is declared with a non-record type and initialised \
+                             from a `{}`",
+                            l.name.name,
+                            self.ctx.records[rid.index()].name
+                        )));
+                    }
+                }
+                // No need to re-test `l.ty`: `declared_scalar_ty` is
+                // `l.ty.and_then(typed_let_ir_type)`, so `l.ty == None`
+                // implies it is `None` too, and the pair
+                // `(None, Some(_))` is uninhabited. (An earlier comment
+                // credited the guard above for this; that was the wrong
+                // reason for a right conclusion.)
+                let inferred = declared_scalar_ty.clone().or_else(|| match &m.ret_ty {
+                    Some(ty @ IrType::Record(_)) => Some(ty.clone()),
+                    _ => None,
+                });
+                if let Some(ty) = inferred {
                     self.set_local_type(id, ty);
                 }
                 self.push(Stmt::ComponentCall {
@@ -1223,7 +1308,7 @@ impl FuncBuilder<'_> {
         self.reject_out_of_subset_regblock_access(value, "read")?;
         self.reject_out_of_subset_addrmap_access(value, "read")?;
         // Testbench method call RHS: `let x = _tb.m(...)`, CFG-inlined.
-        if self.try_lower_tb_method_let(&l.name.name, value)? {
+        if self.try_lower_tb_method_let(l, value)? {
             return Ok(());
         }
         let e = self.lower_expr_no_ports(value)?;
@@ -1514,6 +1599,93 @@ impl FuncBuilder<'_> {
             ))),
             None => Ok(()),
         }
+    }
+
+    /// Each argument of a component-method call must match its
+    /// parameter's type. The lambda renders as
+    /// `<Comp>_<method>(Comp&, uint64_t)` or `(Comp&, <Record>)`, and
+    /// handing it the other kind is "no match for call to ..." in both
+    /// backends — measured on a scalar parameter given a record, and a
+    /// record parameter given a scalar and given a different record.
+    ///
+    /// Arity is NOT checked here: a call with the wrong count is a
+    /// separate diagnostic, and `zip` simply stops at the shorter side.
+    pub(crate) fn check_component_call_args(
+        &self,
+        component: crate::ir::ComponentId,
+        method: &str,
+        args: &[crate::ir::Expr],
+    ) -> Result<(), LowerError> {
+        let Some(m) = self.ctx.components[component.index()].method(method) else {
+            return Ok(());
+        };
+        let comp_name = &self.ctx.components[component.index()].name;
+        for (i, (a, ty)) in args.iter().zip(m.param_tys.iter()).enumerate() {
+            let want = match ty {
+                IrType::Record(r) => Some(*r),
+                _ => None,
+            };
+            let pname = m
+                .param_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", i + 1));
+            self.check_slot_type(
+                a,
+                want,
+                &format!("parameter `{pname}` of `{comp_name}.{method}`"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A value entering a TYPED SLOT — a queue element, a method
+    /// parameter, an event payload — must match that slot's type.
+    ///
+    /// `want` is the slot's record, or `None` for a scalar slot. Both
+    /// directions are wrong and both were open: a record into a scalar
+    /// slot, and a scalar (or a DIFFERENT record) into a record slot.
+    ///
+    /// This is the assignment rule at the other half of the surface.
+    /// Every combination was measured on both backends, and only the
+    /// matching one compiles — for instance on a `queue<Beat>`,
+    /// `q.push(b)` compiles while `q.push(1)` gets "cannot convert
+    /// 'long unsigned int' to 'Beat'" and `q.push(o)` "cannot convert
+    /// 'Other' to 'Beat'". So `Invalid` throughout: no backend runs any
+    /// of them, and there is nothing for a future TB-IR to implement.
+    pub(crate) fn check_slot_type(
+        &self,
+        value: &crate::ir::Expr,
+        want: Option<crate::ir::RecordId>,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let got = self.record_id_of_expr(value);
+        if got == want {
+            return Ok(());
+        }
+        let name = |r: Option<crate::ir::RecordId>| match r {
+            Some(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
+            None => "a non-record value".to_string(),
+        };
+        Err(LowerError::Invalid(format!(
+            "{what} takes {} and was given {}",
+            name(want),
+            name(got)
+        )))
+    }
+
+    /// `check_slot_type` for a queue element.
+    pub(crate) fn check_queue_push(
+        &self,
+        value: &crate::ir::Expr,
+        elem: &crate::ir::QueueElem,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let want = match elem {
+            crate::ir::QueueElem::Record(rid) => Some(*rid),
+            crate::ir::QueueElem::Scalar { .. } => None,
+        };
+        self.check_slot_type(value, want, what)
     }
 
     /// The verdict for a whole-record assignment whose RHS did not type
@@ -1913,6 +2085,7 @@ impl FuncBuilder<'_> {
                         )?;
                         let declared = m.param_names.clone();
                         let lowered = self.lower_component_call_args(args, Some(&declared))?;
+                        self.check_component_call_args(component, &method, &lowered)?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
@@ -2679,6 +2852,26 @@ impl FuncBuilder<'_> {
         for a in args {
             let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
             lowered.push(self.lower_expr_no_ports(e)?);
+        }
+        // Same rule as the component-method call one screen up, at the
+        // transactor spelling of it. The schema had to learn
+        // `param_tys` for this — it carried only names, so there was
+        // nothing here to type-check against.
+        for (i, (a, ty)) in lowered.iter().zip(m.param_tys.iter()).enumerate() {
+            let want = match ty {
+                IrType::Record(r) => Some(*r),
+                _ => None,
+            };
+            let pname = m
+                .param_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", i + 1));
+            self.check_slot_type(
+                a,
+                want,
+                &format!("parameter `{pname}` of `{}.{method}`", schema.name),
+            )?;
         }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
@@ -3934,7 +4127,7 @@ impl FuncBuilder<'_> {
     /// the inlined return value).
     pub(crate) fn try_lower_tb_method_let(
         &mut self,
-        name: &str,
+        l: &crate::ast::LetStmt,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         let ExprKind::Call { callee, args } = &*value.kind else {
@@ -3944,7 +4137,30 @@ impl FuncBuilder<'_> {
             return Ok(false);
         };
         let v = self.lower_tb_method_call(&m, args)?;
-        let id = self.declare(name);
+        // The TESTBENCH-METHOD spelling of the component-method rule a
+        // screen up. `lower_tb_method_call` already typed its return
+        // temp, and this dropped that on the floor: an unannotated
+        // `let r = make_result(7)` on a `-> Beat` method left `r`
+        // untyped, so every slot guard read it as a scalar and called
+        // the program `Invalid` — while v1 emits
+        // `auto r = Tb_make_result(_tb, 7);` and compiles.
+        let ret_record = self.record_id_of_expr(&v);
+        if let (Some(_), Some(rid)) = (&l.ty, ret_record) {
+            if typed_let_ir_type_is_record(l.ty.as_ref(), rid, &self.ctx.record_ids) {
+                // annotation names the same record — fine
+            } else {
+                return Err(LowerError::Invalid(format!(
+                    "`let {}` is declared with a non-matching type and initialised from \
+                     a `{}`",
+                    l.name.name,
+                    self.ctx.records[rid.index()].name
+                )));
+            }
+        }
+        let id = self.declare(&l.name.name);
+        if let Some(rid) = ret_record {
+            self.set_local_type(id, IrType::Record(rid));
+        }
         self.push(Stmt::Assign(id, v));
         Ok(true)
     }
@@ -4279,6 +4495,24 @@ fn typed_let_width(t: &TypeExpr) -> Option<u32> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether a `let` annotation names exactly `rid`.
+fn typed_let_ir_type_is_record(
+    ty: Option<&TypeExpr>,
+    rid: crate::ir::RecordId,
+    record_ids: &std::collections::HashMap<String, crate::ir::RecordId>,
+) -> bool {
+    match ty {
+        Some(TypeExpr::Named { name, .. }) => {
+            name.segments
+                .last()
+                .and_then(|s| record_ids.get(s.name.as_str()))
+                .copied()
+                == Some(rid)
+        }
+        _ => false,
     }
 }
 

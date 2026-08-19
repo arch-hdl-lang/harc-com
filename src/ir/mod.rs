@@ -545,6 +545,14 @@ pub struct TransactorMethodSchema {
     /// the names rather than a second count also means arity and names
     /// cannot disagree.
     pub param_names: Vec<String>,
+    /// Declared parameter TYPES, in order — duplicated from the function
+    /// for the same reason as `param_names`: a call site lowers under a
+    /// schema snapshot, without the functions table, so it had nothing
+    /// to type-check an argument against. Without this, passing a record
+    /// to a scalar parameter (or a scalar to a record one) lowered and
+    /// emitted `AxilXactor_step(_tb.drv, <Beat>)` — "no match for call
+    /// to" in both backends.
+    pub param_tys: Vec<IrType>,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
     /// True only when the source declaration used `hookable` rather than
