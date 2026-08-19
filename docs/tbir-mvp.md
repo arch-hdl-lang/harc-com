@@ -7704,29 +7704,57 @@ former `transaction` group lives in
      byte-identical to v1's — verified by diffing the emitted
      `push_back` sets, not by reading them.
 
-     Nothing downstream needed changing, which is the part worth
-     recording: `src_path`/`sink_path` are documented as relative to the
-     owning scope, so the EMPTY path already meant "the owner".
+     The EXECUTING layers needed no changing, which is most of the
+     point: `src_path`/`sink_path` are relative to the owning scope, so
+     the empty path already meant "the owner" —
      `resolve_component_path_mode` returns the start component untouched
-     for an empty path, and the emitter chains it onto the instance
-     prefix. The gap was one `len() < 2` guard rejecting a shape three
-     other layers already handled.
+     for it, and the emitter chains it onto the instance prefix. The gap
+     was one `len() < 2` guard rejecting a shape those layers already
+     handled.
+
+     "Nothing downstream needed changing" was the first draft of that
+     sentence, and it was false in the way this file keeps having to
+     record. Three of the four `ConnectEdgeSchema` doc comments said
+     "sub-component", which the change falsifies; and `display.rs`
+     rendered these paths with a naive `join(".")`, so `dump-ir` printed
+
+         connect .own_ev -> sb.write_obs (method) (c1)
+
+     — the exact leading dot `endpoint_label` had just been written to
+     prevent, in the one renderer the change did not look at. Adding a
+     helper does not fix the sites that never call it; `dump-ir` is also
+     the tool this sweep uses as its own verdict oracle, so the bug was
+     in front of it the whole time.
 
      **Two things this did NOT license.** Splitting a feature out of a
      mixed arm routes new shapes into the neighbouring arms, and those
      were measured on different inputs:
 
      - A single segment naming something that is neither a hookable nor
-       an event — a sub-component field, say — started reaching the
-       sub-component arm and inheriting its
-       `NotImplemented { EmitsUncompilable }`. Measured on
-       `src.observed -> sink`: instantiated, g++ refuses; UNINSTANTIATED,
-       v1 compiles. `EmitsUncompilable` would be false half the time, so
-       it keeps `connect`'s standing placement verdict instead.
+       an event — a sub-component field, say — reaches the arm that
+       already covered the sub-component spelling, and takes its
+       `NotImplemented { EmitsUncompilable }`. A first pass carved it out
+       to `Unsupported`, reasoning that `EmitsUncompilable` "would be
+       false half the time" because an uninstantiated env compiles. True,
+       and true of every shape that arm already covered, so it justified
+       nothing — and the split fell in the wrong place besides, leaving
+       an owner-relative non-`hookable` method on the other side of it.
+       Measured across all four (instantiated; every one compiles
+       uninstantiated): `-> source`, `-> own_scalar`, `-> own_fn` and
+       `-> sb.count` all get the same g++ refusal. Whether that arm
+       should be `EmitsUncompilable` at all is a question about the
+       family, answered where the arm is.
      - The testbench-owned `connect` resolver gets `None` for the owner
        id, because a testbench is not itself a component in the table.
-       Its own-relative form is UNMEASURED, and the comment says so
-       rather than implying it is impossible.
+       The first draft called that form "unmeasured", which was doing
+       the same work as calling it impossible. Measured: v1 implements
+       it — a testbench declaring `own_ev : out event<uint<8>>` with
+       `own_ev -> direct.accept` emits
+       `_tb.own_ev.push_back([&](auto _t) { TbSink_accept(_tb.direct, _t); });`
+       and compiles. tbir refuses earlier, on an unrelated pre-existing
+       gap ("testbench field `own_ev` with a non-scalar, non-named
+       type"), so `None` is unobservable rather than right. The fix is
+       to give a testbench an id, and it belongs with that field gap.
 
      The placement rule the old note recorded still governs everything
      else, and this round re-measured it across six malformations × two

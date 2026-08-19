@@ -2130,11 +2130,12 @@ fn lower_method_body(
 }
 
 /// Resolve an env's `connect` block into `ConnectEdgeSchema`s. The env
-/// is `env_schema` (id `env_cid`); the test reaches it through the
+/// is `env_schema` (id `env_id`); the test reaches it through the
 /// test-field local. `components` is the program snapshot for resolving
-/// sink sub-component types. Paths are relative to the env field (the
-/// first segment is the env local; here we record the sub-component path
-/// from the env down, e.g. `["source"]`).
+/// sink component types. Paths are relative to the env field (the first
+/// segment is the env local; here we record the path from the env down,
+/// e.g. `["source"]`) — and the EMPTY path records the env's OWN port,
+/// which is why `env_id` is passed at all.
 pub(crate) fn resolve_connects(
     env: &ComponentDecl,
     env_id: ComponentId,
@@ -2173,9 +2174,21 @@ pub(crate) fn resolve_testbench_connects(
         };
         for e in &block.edges {
             // `None`: a testbench is not itself a component in the
-            // table, so it has no id for a single-segment endpoint to
-            // resolve against. Its own-relative form is UNMEASURED, not
-            // known-impossible — the env one below is what was probed.
+            // table, so there is no id here for a single-segment
+            // endpoint to resolve against.
+            //
+            // That is a table artifact, NOT a v1 limitation, and saying
+            // "unmeasured" was doing the same work as saying
+            // "impossible". Measured: a testbench declaring
+            // `own_ev : out event<uint<8>>` with `own_ev -> direct.accept`
+            // makes v1 emit the vector into the testbench struct and
+            // wire it — `_tb.own_ev.push_back([&](auto _t) {
+            // TbSink_accept(_tb.direct, _t); });` — and it compiles.
+            // tbir never reaches this arm for it, refusing earlier on an
+            // unrelated pre-existing gap ("testbench field `own_ev` with
+            // a non-scalar, non-named type"), so `None` is currently
+            // unobservable rather than correct. Giving a testbench an id
+            // is the fix, and it belongs with that field gap, not here.
             edges.push(resolve_one_connect(tb, None, components, e, |path| {
                 resolve_testbench_path(roots, components, path)
             })?);
@@ -2188,7 +2201,13 @@ pub(crate) fn resolve_testbench_connects(
 /// owning scope, so an EMPTY one is the owner's own port — `own_ev`, not
 /// `.own_ev`, which is what naive `join(".")` produces once single-segment
 /// endpoints are allowed to reach these messages.
-fn endpoint_label(path: &[String], leaf: &str) -> String {
+///
+/// Public because the IR dump renders the same paths and had the same
+/// naive join. Adding this helper and then leaving one renderer to do it
+/// by hand is how `dump-ir` came to print `connect .own_ev -> sb.write_obs`
+/// — the exact string this exists to prevent, in the one place the first
+/// pass forgot to look.
+pub(crate) fn endpoint_label(path: &[String], leaf: &str) -> String {
     if path.is_empty() {
         leaf.to_string()
     } else {
@@ -2435,21 +2454,26 @@ where
             *activation,
         )
     } else {
-        // An OWNER-relative name that resolves to neither is a malformed
-        // single-segment endpoint, not the sub-component shape this arm
-        // was measured on, and it does not share its v1 profile.
-        // Measured on `src.observed -> sink`, where `sink` names a
-        // sub-component FIELD of the owner: instantiated, g++ refuses;
-        // UNINSTANTIATED, v1 compiles. So `EmitsUncompilable` would be
-        // false half the time, and this falls under `connect`'s standing
-        // placement rule instead — the same verdict the other malformed
-        // endpoints get, for the same measured reason.
-        if sink_path.is_empty() {
-            return Err(unsupported(
-                &format!("a `connect` sink `{sink_name}` without a method"),
-                "",
-            ));
-        }
+        // Owner-relative names land here too, on the SAME verdict as the
+        // sub-component ones. A first pass carved them out to
+        // `Unsupported`, reasoning that `EmitsUncompilable` "would be
+        // false half the time" because an uninstantiated env compiles.
+        // True — and true of every shape this arm already covered, which
+        // is why it justifies nothing. Measured across the family, all
+        // four are identical (instantiated; every one compiles when the
+        // env is not instantiated):
+        //
+        //   `-> source`      owner-rel, names a sub-component field  g++ refuses
+        //   `-> own_scalar`  owner-rel, names a scalar               g++ refuses
+        //   `-> own_fn`      owner-rel, non-`hookable` method        g++ refuses
+        //   `-> sb.count`    sub-component, names a scalar           g++ refuses
+        //
+        // The carve-out also split the family in the wrong place:
+        // `own_fn` is owner-relative and was never in it. Whether this
+        // arm should be `EmitsUncompilable` or fall under `connect`'s
+        // placement rule is a question about all four together, decided
+        // where the arm is, not one to answer differently for two of
+        // them.
         return Err(not_implemented(
             &format!(
                 "a `connect` sink `{}` that is neither a `hookable` sink \

@@ -100,6 +100,32 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+/// Every `connect` wiring line each backend emits, sorted. The claim
+/// worth making about an owner-relative endpoint is that tbir wires it
+/// the way v1 does — so DERIVE v1's lines here rather than pasting a
+/// remembered string into an assertion, which pins what the author
+/// recalled instead of what the other backend does.
+fn connect_wiring(cpp: &str) -> Vec<String> {
+    let mut v: Vec<String> = cpp
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains(".push_back([&](auto _t)"))
+        .map(str::to_string)
+        .collect();
+    v.sort();
+    v
+}
+
+fn assert_wiring_matches_v1(src: &str, what: &str) {
+    let v1 = connect_wiring(&cpp_tb::emit(&merged_src(src)).expect("v1 emits"));
+    let tb = connect_wiring(&emit_cpp_src(src));
+    assert!(
+        !v1.is_empty(),
+        "{what}: v1 emits no wiring — fixture is inert"
+    );
+    assert_eq!(v1, tb, "{what}: tbir must wire it exactly as v1 does");
+}
+
 fn emit_cpp_src_result(src: &str) -> Result<String, String> {
     let merged = merged_src(src);
     let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
@@ -8325,11 +8351,7 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
             "        own_ev -> sb.write_obs\n",
             1,
         );
-    let cpp = emit_cpp_src(&own_src);
-    assert!(
-        cpp.contains("env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });"),
-        "the owner's own event is wired, and exactly as v1 wires it:\n{cpp}"
-    );
+    assert_wiring_matches_v1(&own_src, "the owner's own event");
 
     // SINK direction: a sub-component's event feeds the env's own hookable.
     let own_sink = base
@@ -8348,30 +8370,31 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
             "        source.observed -> own_sink\n",
             1,
         );
-    let cpp = emit_cpp_src(&own_sink);
-    assert!(
-        cpp.contains(
-            "env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });"
-        ),
-        "the owner's own hookable is wired, and exactly as v1 wires it:\n{cpp}"
-    );
+    assert_wiring_matches_v1(&own_sink, "the owner's own hookable");
 
-    // …and a single segment that names NEITHER — a sub-component field,
-    // say — is still the malformed edge it always was. Measured on
-    // `src.observed -> sink`: instantiated, g++ refuses; UNINSTANTIATED,
-    // v1 compiles. So it keeps `connect`'s standing placement verdict
-    // rather than borrowing the sub-component arm's `EmitsUncompilable`,
-    // which would be false half the time.
+    // …and a single segment naming NEITHER a hookable nor an event takes
+    // the same verdict as the sub-component spelling of the same
+    // mistake. A first pass carved the owner-relative ones out to
+    // `Unsupported`, on the ground that `EmitsUncompilable` is false for
+    // an uninstantiated env — which is true of every shape that arm
+    // covers, so it separated nothing, and left an owner-relative
+    // non-`hookable` method on the other side of the split besides.
+    // Measured (instantiated; all four compile uninstantiated): every
+    // one gets a g++ refusal from v1.
     let not_a_port = base.replacen(
         "        source.observed -> sb.write_obs\n",
         "        source.observed -> source\n",
         1,
     );
     let err = lower_src(&not_a_port).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
-        msg.contains("sink `source` without a method"),
-        "names the endpoint the user wrote: {msg}"
+        msg.contains("sink `source` that is neither a `hookable` sink method nor an `event` field"),
+        "names the endpoint the user wrote, without a leading dot: {msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&not_a_port)).is_ok(),
+        "v1 emits it (and g++ refuses)"
     );
 }
 
@@ -19764,8 +19787,20 @@ end impl T"#
     // The control: the well-formed edge lowers.
     emit_cpp_src(&src("src.observed -> sink.take", "    top : E"));
 
+    // `-> sink` names a sub-component where a port belongs. Since
+    // single-segment endpoints became a real spelling it is checked
+    // against the OWNER, finds neither a hookable nor an event, and
+    // takes that arm's verdict — the same one the sub-component
+    // spelling of the mistake gets. Not part of the placement family
+    // below, which is about paths that resolve to nothing at all.
+    let err = lower_src(&src("src.observed -> sink", "    top : E")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("sink `sink` that is neither a `hookable` sink method nor an `event` field"),
+        "{msg}"
+    );
+
     for (edge, want) in [
-        ("src.observed -> sink", "sink `sink` without a method"),
         // Reported against the OWNER now: a single-segment source is a
         // real spelling (see the owner-relative test below), so `src`
         // gets checked as one and fails on being a sub-component field

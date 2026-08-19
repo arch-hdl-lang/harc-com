@@ -323,13 +323,14 @@ impl Display for TbProgram {
                     crate::ir::ConnectSink::Method { method } => format!("{method} (method)"),
                     crate::ir::ConnectSink::Event { event } => format!("{event} (event)"),
                 };
+                // Through the same labeller the diagnostics use: an
+                // owner-relative endpoint has an EMPTY path, and a naive
+                // join renders it `.own_ev`.
                 writeln!(
                     f,
-                    "    connect {}.{} -> {}.{} (c{})",
-                    e.src_path.join("."),
-                    e.src_event,
-                    e.sink_path.join("."),
-                    sink,
+                    "    connect {} -> {} (c{})",
+                    crate::ir::lower::endpoint_label(&e.src_path, &e.src_event),
+                    crate::ir::lower::endpoint_label(&e.sink_path, &sink),
                     e.sink_component.0
                 )?;
             }
