@@ -28653,6 +28653,9 @@ end impl T"#;
 fn component_fixed_vec_literal_bounds_and_defaults_are_precise() {
     let base = r#"scoreboard Table
     words : Vec<uint<8>, 2>
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
 end scoreboard Table
 testbench Tb
     dut : Top

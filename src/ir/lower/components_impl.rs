@@ -3763,7 +3763,9 @@ impl super::FuncBuilder<'_> {
                 {
                     let (recv_tail, last) = tail.split_at(tail.len() - 1);
                     if !self.recv_is_scoreboard_sub(head_cid, recv_tail) {
-                        let cid = self.resolve_component_recv(head_cid, recv_tail)?;
+                        let Ok(cid) = self.resolve_component_recv(head_cid, recv_tail) else {
+                            return Ok(None);
+                        };
                         if let Some(schema) = self.ctx.components[cid.index()].field(&last[0]) {
                             if let ComponentFieldKind::FixedVec(vec) = &schema.kind {
                                 self.require_component_activation(
