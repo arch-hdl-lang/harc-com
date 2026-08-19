@@ -1608,8 +1608,12 @@ impl FuncBuilder<'_> {
     /// backends — measured on a scalar parameter given a record, and a
     /// record parameter given a scalar and given a different record.
     ///
-    /// Arity is NOT checked here: a call with the wrong count is a
-    /// separate diagnostic, and `zip` simply stops at the shorter side.
+    /// Arity IS checked here, first. The comment that used to sit in
+    /// this spot claimed a wrong count was "a separate diagnostic" —
+    /// there was none, and `zip` silently stopped at the shorter side,
+    /// so an under-supplied call disabled the type check on every
+    /// parameter past the last supplied one. Both backends refuse the
+    /// wrong-arity call, so it is `Invalid`.
     pub(crate) fn check_component_call_args(
         &self,
         component: crate::ir::ComponentId,
@@ -1620,19 +1624,28 @@ impl FuncBuilder<'_> {
             return Ok(());
         };
         let comp_name = &self.ctx.components[component.index()].name;
+        if args.len() != m.param_tys.len() {
+            return Err(LowerError::Invalid(format!(
+                "component method `{comp_name}.{method}` takes {} argument(s), call passes {}",
+                m.param_tys.len(),
+                args.len()
+            )));
+        }
         for (i, (a, ty)) in args.iter().zip(m.param_tys.iter()).enumerate() {
-            let want = match ty {
-                IrType::Record(r) => Some(*r),
-                _ => None,
-            };
             let pname = m
                 .param_names
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", i + 1));
-            self.check_slot_type(
+            // `param_tys` already carries the schema's `TSeq<T>` as a
+            // `RecordSeq`/`Seq`, so reading it through `check_slot_ir`
+            // rather than collapsing it to "record or not" is what lets
+            // `k.feed(1)` on a `TSeq<Beat>` parameter be rejected at all
+            // — and stops the `Beat` case from being told the slot takes
+            // a non-record value.
+            self.check_slot_ir(
                 a,
-                want,
+                ty,
                 &format!("parameter `{pname}` of `{comp_name}.{method}`"),
             )?;
         }
@@ -1653,25 +1666,71 @@ impl FuncBuilder<'_> {
     /// 'long unsigned int' to 'Beat'" and `q.push(o)` "cannot convert
     /// 'Other' to 'Beat'". So `Invalid` throughout: no backend runs any
     /// of them, and there is nothing for a future TB-IR to implement.
+    ///
+    /// For a slot that is a sequence rather than a record-or-scalar, use
+    /// `check_slot_ir`: this spelling would describe a `TSeq<Beat>`
+    /// parameter as taking "a non-record value", which is false.
     pub(crate) fn check_slot_type(
         &self,
         value: &crate::ir::Expr,
         want: Option<crate::ir::RecordId>,
         what: &str,
     ) -> Result<(), LowerError> {
-        let got = self.record_id_of_expr(value);
+        self.check_slot_shape(value, Slot::of_record(want), what)
+    }
+
+    /// `check_slot_type` for a slot whose declared `IrType` is in hand —
+    /// the method-parameter positions, where the declaration may name a
+    /// `TSeq<T>` as well as a record or a scalar.
+    pub(crate) fn check_slot_ir(
+        &self,
+        value: &crate::ir::Expr,
+        want: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        self.check_slot_shape(value, Slot::of_ir(want), what)
+    }
+
+    fn check_slot_shape(
+        &self,
+        value: &crate::ir::Expr,
+        want: Slot,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let got = self.slot_shape_of(value);
         if got == want {
             return Ok(());
         }
-        let name = |r: Option<crate::ir::RecordId>| match r {
-            Some(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
-            None => "a non-record value".to_string(),
-        };
         Err(LowerError::Invalid(format!(
             "{what} takes {} and was given {}",
-            name(want),
-            name(got)
+            self.slot_name(want),
+            self.slot_name(got)
         )))
+    }
+
+    /// The slot shape a lowered value presents. A sequence is read off
+    /// the value's `IrType` (only a tseq call result and a local bound
+    /// from one carry `RecordSeq`/`Seq`), so nothing else changes shape.
+    fn slot_shape_of(&self, value: &crate::ir::Expr) -> Slot {
+        if let Some(rid) = self.record_id_of_expr(value) {
+            return Slot::Record(rid);
+        }
+        match self.expr_type(value) {
+            Some(IrType::RecordSeq(rid)) => Slot::Seq(Some(rid)),
+            Some(IrType::Seq(_)) => Slot::Seq(None),
+            _ => Slot::Scalar,
+        }
+    }
+
+    fn slot_name(&self, s: Slot) -> String {
+        match s {
+            Slot::Record(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
+            Slot::Seq(Some(rid)) => {
+                format!("a `TSeq<{}>`", self.ctx.records[rid.index()].name)
+            }
+            Slot::Seq(None) => "a scalar `TSeq`".to_string(),
+            Slot::Scalar => "a non-record value".to_string(),
+        }
     }
 
     /// `check_slot_type` for a queue element.
@@ -2953,17 +3012,13 @@ impl FuncBuilder<'_> {
         // instance spelling is `drv.inner(1)`. Arity is checked above,
         // so the zip is total.
         for (i, (a, ty)) in lowered.iter().zip(param_tys.iter()).enumerate() {
-            let want = match ty {
-                IrType::Record(r) => Some(*r),
-                _ => None,
-            };
             let pname = param_names
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", i + 1));
-            self.check_slot_type(
+            self.check_slot_ir(
                 a,
-                want,
+                ty,
                 &format!("parameter `{pname}` of `{transactor}.{name}`"),
             )?;
         }
@@ -4178,17 +4233,24 @@ impl FuncBuilder<'_> {
         // the program `Invalid` — while v1 emits
         // `auto r = Tb_make_result(_tb, 7);` and compiles.
         let ret_record = self.record_id_of_expr(&v);
+        // No "…unless the annotation names that same record" escape,
+        // because by construction the annotation here never can. A `let`
+        // whose declared type names a record is claimed a thousand lines
+        // up, by the record-typed-local branch of `lower_let`, which
+        // returns on every path: same record → the struct-copy `Assign`,
+        // different record → `record_assign_mismatch`. So the only
+        // annotations that reach this lane are the ones that name no
+        // record at all — `int`, `bit`, an enum, an unknown name — and
+        // for those a record-returning RHS is always the mismatch.
+        // (Probed: `let r : Beat` and `let r : Pkg.Beat` lower, `let r :
+        // Other` reports the transaction-local mismatch, and only
+        // `let r : int` lands here.)
         if let (Some(_), Some(rid)) = (&l.ty, ret_record) {
-            if typed_let_ir_type_is_record(l.ty.as_ref(), rid, &self.ctx.record_ids) {
-                // annotation names the same record — fine
-            } else {
-                return Err(LowerError::Invalid(format!(
-                    "`let {}` is declared with a non-matching type and initialised from \
-                     a `{}`",
-                    l.name.name,
-                    self.ctx.records[rid.index()].name
-                )));
-            }
+            return Err(LowerError::Invalid(format!(
+                "`let {}` is declared with a non-record type and initialised from a `{}`",
+                l.name.name,
+                self.ctx.records[rid.index()].name
+            )));
         }
         let id = self.declare(&l.name.name);
         if let Some(rid) = ret_record {
@@ -4485,6 +4547,43 @@ fn pop_call_parts(value: &Option<crate::ast::Expr>) -> Option<(&crate::ast::Expr
     }
 }
 
+/// What a typed slot accepts, to the precision lowering can decide.
+///
+/// `Scalar` is also where every type this compiler cannot name lands —
+/// an enum parameter, an unresolved path. That is deliberate and it is
+/// the pre-existing behaviour: an enum lowers to an `int64_t` member
+/// (`field_ir_type`), so calling it non-record is true for the case that
+/// actually reaches here. A `TSeq<T>` is NOT such a case — it lowers to
+/// a `std::vector`, and describing it as a non-record value was simply
+/// wrong — so it gets its own variant rather than falling in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// A declared record — `t: Beat`, `queue<Beat>`, `event<Beat>`.
+    Record(crate::ir::RecordId),
+    /// A `TSeq<T>`; `Some(rid)` when the element is a declared record.
+    Seq(Option<crate::ir::RecordId>),
+    /// A scalar, or a type named by no table (see above).
+    Scalar,
+}
+
+impl Slot {
+    fn of_record(want: Option<crate::ir::RecordId>) -> Self {
+        match want {
+            Some(rid) => Slot::Record(rid),
+            None => Slot::Scalar,
+        }
+    }
+
+    fn of_ir(want: &IrType) -> Self {
+        match want {
+            IrType::Record(rid) => Slot::Record(*rid),
+            IrType::RecordSeq(rid) => Slot::Seq(Some(*rid)),
+            IrType::Seq(_) => Slot::Seq(None),
+            _ => Slot::Scalar,
+        }
+    }
+}
+
 /// `pop` removes and returns the front element, so it takes nothing.
 ///
 /// Every `pop` branch used to check only the method NAME and drop the
@@ -4528,24 +4627,6 @@ fn typed_let_width(t: &TypeExpr) -> Option<u32> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-/// Whether a `let` annotation names exactly `rid`.
-fn typed_let_ir_type_is_record(
-    ty: Option<&TypeExpr>,
-    rid: crate::ir::RecordId,
-    record_ids: &std::collections::HashMap<String, crate::ir::RecordId>,
-) -> bool {
-    match ty {
-        Some(TypeExpr::Named { name, .. }) => {
-            name.segments
-                .last()
-                .and_then(|s| record_ids.get(s.name.as_str()))
-                .copied()
-                == Some(rid)
-        }
-        _ => false,
     }
 }
 

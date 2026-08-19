@@ -208,8 +208,10 @@ impl FuncBuilder<'_> {
 
         if entry.pure {
             let mut lowered = Vec::with_capacity(arg_exprs.len());
-            for e in arg_exprs {
-                lowered.push(self.lower_expr(e)?);
+            for (p, e) in decl.params.iter().zip(arg_exprs) {
+                let v = self.lower_expr(e)?;
+                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                lowered.push(v);
             }
             return Ok(Expr::Call(CallTarget::Helper(name.to_string()), lowered));
         }
@@ -268,7 +270,16 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                bound.push(Bound::Val(self.lower_expr_no_ports(e)?));
+                let v = self.lower_expr_no_ports(e)?;
+                // The INLINED spelling is the one that mattered most:
+                // without this, `poke(b)` on a `x: uint<8>` parameter
+                // reached `verify_program`'s `TypeMismatch` and
+                // surfaced as "internal error: TB-IR failed
+                // verification after lowering" — a program error
+                // answered through the compiler-bug channel, the third
+                // place in this sweep that has happened.
+                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                bound.push(Bound::Val(v));
             }
         }
 
@@ -318,6 +329,23 @@ impl FuncBuilder<'_> {
         Ok(Expr::Local(dest))
     }
 
+    /// One declared parameter's slot check, shared by the helper,
+    /// extern-fn and testbench-method arms. `ir_type_of_param` is the
+    /// same resolver those arms already use to spot a module-typed
+    /// parameter; `tseq_ir_type` in front of it is what the schema-side
+    /// resolver does too, so a `TSeq<T>` parameter is described here as
+    /// the sequence it is rather than as "a non-record value".
+    pub(crate) fn check_param_slot(
+        &self,
+        v: &Expr,
+        p: &crate::ast::Param,
+        owner: &str,
+    ) -> Result<(), LowerError> {
+        let want = tseq_ir_type(p.ty.as_ref(), &self.ctx.record_ids)
+            .unwrap_or_else(|| ir_type_of_param(p.ty.as_ref(), self.ctx));
+        self.check_slot_ir(v, &want, &format!("parameter `{}` of {owner}", p.name.name))
+    }
+
     /// Lower a call to an `extern function name(...) -> ret` (spec §9).
     /// Mirrors v1: arguments lower as plain scalar values and the call
     /// stays an `Expr::Call(CallTarget::ExternFn, ...)`, emitted with the
@@ -340,11 +368,25 @@ impl FuncBuilder<'_> {
                 &format!("extern fn call `{name}(...)`"),
             )?;
         }
+        let pnames = self.ctx.extern_fns.get(name).cloned().unwrap_or_default();
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             match a {
                 CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
-                    lowered.push(self.lower_expr_no_ports(e)?)
+                    let v = self.lower_expr_no_ports(e)?;
+                    // Every extern-fn parameter is a scalar — this
+                    // module's own header says so ("Extern fns are pure
+                    // scalar C functions"), and `ctx.extern_fns`
+                    // consequently carries names only. So the slot is
+                    // always `None`, and both backends emit
+                    // `ref_add(1, <Beat>)` for a record argument:
+                    // "cannot convert 'Beat' to 'uint64_t'".
+                    let slot = match pnames.get(i) {
+                        Some(pn) => format!("parameter `{pn}` of extern fn `{name}`"),
+                        None => format!("an argument of extern fn `{name}`"),
+                    };
+                    self.check_slot_type(&v, None, &slot)?;
+                    lowered.push(v)
                 }
             }
         }
@@ -464,15 +506,7 @@ impl FuncBuilder<'_> {
                 // `TypeMismatch` and surfaced as "internal error: TB-IR
                 // failed verification after lowering" — a program error
                 // answered through the compiler-bug channel.
-                let want = match ir_type_of_param(p.ty.as_ref(), self.ctx) {
-                    IrType::Record(r) => Some(r),
-                    _ => None,
-                };
-                self.check_slot_type(
-                    &v,
-                    want,
-                    &format!("parameter `{}` of testbench method `{name}`", p.name.name),
-                )?;
+                self.check_param_slot(&v, p, &format!("testbench method `{name}`"))?;
                 bound.push(Bound::Val(v));
             }
         }
@@ -592,6 +626,47 @@ pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
         _ => IrType::Unknown,
     }
+}
+
+/// `TSeq<T>` as an `IrType` — `RecordSeq(r)` for a declared record
+/// element, `Seq(scalar)` for a scalar one, `Unknown` for an element
+/// this compiler cannot name. `None` when `ty` is not a `TSeq` at all.
+///
+/// Shared by the component-method schema (which types the sequence a
+/// `hookable`/`function` parameter or return declares) and by the slot
+/// check that decides whether an argument may enter such a parameter,
+/// so the two cannot disagree about what `TSeq<Beat>` means.
+pub(crate) fn tseq_ir_type(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
+    let Some(TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    }) = ty
+    else {
+        return None;
+    };
+    let elem_name: Option<&str> = match args.first() {
+        Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
+            name.segments.last().map(|s| s.name.as_str())
+        }
+        Some(TypeArg::Expr(e)) => match &*e.kind {
+            ExprKind::Ident(id) => Some(id.name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(rid) = elem_name.and_then(|s| record_ids.get(s)) {
+        return Some(IrType::RecordSeq(*rid));
+    }
+    if let Some(TypeArg::Type(inner)) = args.first() {
+        if let ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) = ir_type_of(Some(inner)) {
+            return Some(IrType::Seq(Box::new(ty)));
+        }
+    }
+    Some(IrType::Unknown)
 }
 
 pub(crate) fn ir_type_of_with_records(

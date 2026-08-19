@@ -7192,6 +7192,71 @@ former `transaction` group lives in
      by the other's test) and one that maps a record parameter to a
      scalar slot.
 
+     That "all caught" was measured over five mutants and stated as if
+     it covered the change. It did not: a later round truncating each
+     parameter loop to `.take(1)` found the sibling spelling had no
+     mismatched cell past parameter #1, so the whole loop index was
+     tested only at zero. The five mutants were the ones this entry
+     thought to write, which is not the same as the ones the code
+     admits. See divergence 113.
+
+113. **A slot rule with a third value shape it could not name
+     (2026-08-19).**
+
+     Divergences 111 and 112 built the slot check around one question —
+     "is this a record, and if so which?" — because the two shapes they
+     had measured were a record and a scalar. A `TSeq<T>` parameter is
+     neither, and flattening it into "not a record" was wrong in both
+     directions at once:
+
+     | call, on `function fseq(s: TSeq<Beat>)` | before | v1 |
+     |---|---|---|
+     | `k.fseq(xs)` | lowers | compiles |
+     | `k.fseq(b)` | rejected: "takes a non-record value" — **false** | "no match for call to `<lambda(Sink&, const std::vector<Beat>&)>`" |
+     | `k.fseq(1)` | **lowered clean** | same "no match for call to" |
+
+     The second row states something untrue about the declaration the
+     user wrote; the third is the hole that wording was hiding, since an
+     `int` is not a record either.
+
+     Nothing new was needed to fix it. `IrType` already had `RecordSeq`
+     and `Seq`, and `method_schema_ir_type` already resolved `TSeq<T>`
+     into them for the component-method schema — `param_tys` was
+     carrying the right type all along and the slot check was throwing
+     it away. The fix names the three shapes the check can actually
+     decide (record, sequence, everything else) and routes the parameter
+     positions through the declared `IrType` instead of a boolean. The
+     `TSeq` resolver moved to `helpers::tseq_ir_type` so the schema side
+     and the check side cannot disagree about what `TSeq<Beat>` means.
+
+     Enumerated mechanically rather than sampled — 3 value shapes (a
+     scalar, a `Beat`, a `TSeq<Beat>`) into 8 slots (scalar, record and
+     sequence parameters at the component and testbench-method
+     spellings, plus a scalar and a record scoreboard queue), on both
+     backends. 24 cells, a clean diagonal: the 8 matching cells compile
+     under v1 and lower under tbir, all 16 mismatches get a g++ error
+     from v1. `Invalid` throughout, as everywhere else in this family.
+
+     "Everything else" — an enum parameter, an unresolved path — still
+     reports as a non-record value. That is deliberate rather than
+     overlooked: an enum lowers to an `int64_t` member (`field_ir_type`),
+     so the wording is true for the case that reaches it. A `TSeq` was
+     the case where it was not.
+
+     Three further mutants from the same round, each a real gap:
+
+     - the sibling-transactor parameter loop truncated to `.take(1)` —
+       every mismatched cell in the suite sat at parameter #1;
+     - the scalar half of divergence 111's `fork` destination typing
+       deleted — the record cell kept it green while a
+       `-> uint<128>` fork silently declared `uint64_t` and truncated;
+     - `.last()` → `.first()` on a `let` annotation's type path, which
+       chased down a better answer than a test: the guard it sat in can
+       never see a record-naming annotation at all, because
+       `lower_let`'s record-typed-local branch claims every one of them
+       first and returns on every path. The check was a condition with
+       one reachable verdict dressed as two, and is now written as one.
+
 
 ## Next steps
 

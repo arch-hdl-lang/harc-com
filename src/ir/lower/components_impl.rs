@@ -2090,36 +2090,8 @@ fn method_schema_ir_type(
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,
 ) -> IrType {
-    if let Some(TypeExpr::Builtin {
-        name: BuiltinTy::TSeq,
-        args,
-        ..
-    }) = ty
-    {
-        let elem_name: Option<&str> = match args.first() {
-            Some(TypeArg::Type(TypeExpr::Named { name, .. })) => {
-                name.segments.last().map(|s| s.name.as_str())
-            }
-            Some(TypeArg::Expr(e)) => match &*e.kind {
-                ExprKind::Ident(id) => Some(id.name.as_str()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(simple) = elem_name {
-            if let Some(rid) = record_ids.get(simple) {
-                return IrType::RecordSeq(*rid);
-            }
-        }
-        if let Some(TypeArg::Type(inner)) = args.first() {
-            match helpers::ir_type_of(Some(inner)) {
-                ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
-                    return IrType::Seq(Box::new(ty));
-                }
-                _ => {}
-            }
-        }
-        return IrType::Unknown;
+    if let Some(seq) = helpers::tseq_ir_type(ty, record_ids) {
+        return seq;
     }
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -4365,8 +4337,11 @@ impl super::FuncBuilder<'_> {
         Ok(())
     }
 
-    /// The record an `event` field of `cid` carries, or `None` for a
-    /// scalar payload. `Err` when the field is not a resolvable event.
+    /// The payload an `event` field of `cid` carries — `Record` or
+    /// `Scalar`. `None` when the field is not a resolvable event, which
+    /// leaves the emit unchecked rather than rejecting it: an
+    /// unresolvable field is already diagnosed on its own, and guessing
+    /// a payload for one would put a second, wrong verdict on top.
     fn component_event_payload(&self, cid: ComponentId, event: &str) -> Option<EventPayload> {
         match self.ctx.components.get(cid.index())?.field(event)?.kind {
             ComponentFieldKind::Event { payload, .. } => Some(payload),
