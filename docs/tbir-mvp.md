@@ -7765,6 +7765,52 @@ former `transaction` group lives in
      the same evidence, now separated from the feature it was tangled
      with.
 
+121. **"No hazard here" is a reason not to warn, not a reason to refuse
+     (2026-08-19).**
+
+     `idle(n = 2)` and `quiesced(n = 2)` were `Unsupported`, under a note
+     that worked the case out correctly and then stopped one step short:
+     the arity check above has already established exactly one argument,
+     so v1's name-dropping positional binding "lands the value in the
+     only slot there is and emits code identical to the positional form
+     … it emits the predicate correctly". Every clause of that describes
+     something to implement.
+
+     The reasoning it came from was about a different question. The
+     general named-argument guard splits three ways — a name at its own
+     position (inert), a REORDERED name (a silent swap, and the hazard
+     the guard exists for), and a name matching no parameter. These
+     predicates take one argument, so no reordering is expressible, and
+     the note recorded that as "they keep `Unsupported`". Absence of the
+     hazard is a reason the verdict is not `SilentlyMisLowers`; it was
+     never a reason to refuse, and nothing anywhere argued for the
+     refusal itself.
+
+     Implemented, and pinned by the property that made it safe rather
+     than by a remembered string: the named and positional spellings
+     must emit the SAME program. They do — the whole emitted file is
+     byte-identical, under both backends, for both predicates.
+
+     The name is still checked against nothing, and that half of the old
+     note stands unchanged: no parameter name is stated anywhere for
+     these (the arity diagnostic says "exactly one cycle-count
+     argument"; the docs write `idle(N)`, a value placeholder), so there
+     is nothing to check against and inventing one would be the
+     `record_write` mistake. v1 accepts `nosuch = 4` here too, and emits
+     the same predicate.
+
+     **Two neighbours were left alone, deliberately.** The probe that
+     found this also re-opened `p.two(bogus = 1, 2)`, which is `Invalid`
+     while v1 compiles it and emits the correct positional call — the
+     shape of a false `Invalid`. It is not one: the note there had
+     already considered `SilentlyMisLowers` and refuted it in writing,
+     because v1 emits exactly the right code and claiming otherwise
+     would be a false explanation. `Invalid` rests on "no backend can
+     HONOUR it" rather than "no backend runs it", and re-deciding a
+     question already measured and written down is the mistake
+     divergence 120 was about. Likewise the arity arms, which reject
+     genuine errors.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

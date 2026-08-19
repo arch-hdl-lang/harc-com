@@ -8398,6 +8398,82 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
     );
 }
 
+/// `idle(n = 2)` / `quiesced(n = 2)`. The note that refused these
+/// reasoned the case through correctly and then stopped one step short:
+/// the arity check above has already established exactly one argument,
+/// so a name can only bind where the position already put it, and v1
+/// "emits the predicate correctly". That describes a feature working,
+/// not a gap.
+///
+/// Pinned as the property that actually matters — the named form and the
+/// positional form must emit the SAME program — rather than by asserting
+/// a remembered line. Both whole files come out identical, under both
+/// backends.
+///
+/// The name is deliberately not checked against anything. No parameter
+/// name is stated anywhere for these predicates (the arity diagnostic
+/// says "exactly one cycle-count argument"; the docs write `idle(N)`,
+/// a value placeholder), so there is nothing to check against, and
+/// inventing one would be the `record_write` mistake. v1 accepts any
+/// name here too.
+#[test]
+fn a_single_argument_predicate_accepts_the_named_spelling() {
+    let prog = |call: &str| {
+        format!(
+            r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Prod
+    n : uint<32> default 0
+    function bump(v: uint<8>)
+        n = n + v
+    end function
+end agent Prod
+
+testbench Tb
+    dut : Top
+    p   : Prod
+end testbench Tb
+
+impl T for Tb
+    clock clk = SysDomain
+    run
+        assert {call} else fail("not idle")
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for pred in ["idle", "quiesced"] {
+        let positional = emit_cpp_src(&prog(&format!("p.{pred}(2)")));
+        let named = emit_cpp_src(&prog(&format!("p.{pred}(n = 2)")));
+        assert_eq!(
+            positional, named,
+            "`{pred}(n = 2)` must emit exactly what `{pred}(2)` emits"
+        );
+        // …and v1 agrees, which is why this is a gap to close rather
+        // than a divergence to report.
+        let v1_positional =
+            cpp_tb::emit(&merged_src(&prog(&format!("p.{pred}(2)")))).expect("v1 emits");
+        let v1_named =
+            cpp_tb::emit(&merged_src(&prog(&format!("p.{pred}(n = 2)")))).expect("v1 emits");
+        assert_eq!(
+            v1_positional, v1_named,
+            "v1 binds `{pred}`'s single argument by position either way"
+        );
+    }
+
+    // Arity is still checked — the name buys nothing there.
+    for bad in ["p.idle(1, 2)", "p.quiesced()"] {
+        let err = lower_src(&prog(bad)).unwrap_err();
+        assert!(
+            !matches!(err, lower::LowerError::Invalid(_)),
+            "`{bad}` is an arity gap, not a type error: {err:?}"
+        );
+    }
+}
+
 /// Whole-record assignment: a same-typed record-local copy lowers
 /// (C++ struct assignment in both backends); anything else is a type
 /// error, rejected precisely rather than left to the verifier or to
@@ -24198,9 +24274,19 @@ fn named_arguments_are_bound_by_position_by_v1() {
 
 /// The single-argument heartbeat and quiesce predicates share the
 /// named-argument construct but not its hazard, for the same reason the
-/// one-argument method call does not have it. They keep `Unsupported`.
+/// one-argument method call does not have it.
+///
+/// This test used to conclude "they keep `Unsupported`", which read the
+/// absent hazard as a reason to refuse. It is a reason the verdict is
+/// not `SilentlyMisLowers`; the refusal itself was never argued for, and
+/// the note attached to it said v1 "emits the predicate correctly" —
+/// a description of something to implement. It is implemented now, so
+/// what this pins is the property that made it safe: v1 drops the name
+/// and emits the same predicate either way, for a real name and a bogus
+/// one alike. tbir matching that is checked in
+/// `a_single_argument_predicate_accepts_the_named_spelling`.
 #[test]
-fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
+fn a_named_argument_to_a_one_argument_predicate_binds_by_position() {
     let fixture = fixture("agent_on_handler_test.harc");
     const IDLE: &str = "assert tagger.idle_in(4)\n";
     assert!(fixture.contains(IDLE), "fixture shape changed");
@@ -24215,8 +24301,7 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
 
     for arg in ["n = 4", "nosuch = 4"] {
         let src = fixture.replacen(IDLE, &format!("assert tagger.idle_in({arg})\n"), 1);
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
-        assert!(msg.contains("a named argument to `idle_in`"), "{msg}");
+        lower_src(&src).unwrap_or_else(|e| panic!("`idle_in({arg})` lowers: {e:?}"));
         assert_eq!(
             cpp_tb::emit(&merged_src(&src)).expect("v1 emits"),
             v1_ctl,
@@ -24244,8 +24329,7 @@ fn a_named_argument_to_a_one_argument_predicate_is_a_real_v1_escape_hatch() {
         "the quiesce cycle count reaches the emitted predicate"
     );
     for arg in ["n = 4", "nosuch = 4"] {
-        let msg = assert_unsupported(&lower_src(&quiesce(arg)).unwrap_err());
-        assert!(msg.contains("a named argument to `quiesced`"), "{msg}");
+        lower_src(&quiesce(arg)).unwrap_or_else(|e| panic!("`quiesced({arg})` lowers: {e:?}"));
         assert_eq!(
             cpp_tb::emit(&merged_src(&quiesce(arg))).expect("v1 emits"),
             v1_q_ctl,

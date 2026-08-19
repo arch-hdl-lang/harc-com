@@ -4490,29 +4490,24 @@ impl super::FuncBuilder<'_> {
                 "idle predicates take exactly one cycle-count argument",
             ));
         }
-        let CallArg::Expr(n_expr) = &args[0] else {
-            // Stays `Unsupported`, unlike the general component-method
-            // arm above. The arity check three lines up has already
-            // established exactly one argument, so v1's name-dropping
-            // positional binding lands the value in the only slot there
-            // is and emits code identical to the positional form. No
-            // reordering hazard exists here.
-            // Deliberately NOT name-checked, unlike `record_read`, which
-            // was given a hand-written `["addr"]` so that an unknown
-            // name becomes `Invalid`. The difference is whether there
-            // is a name to check AGAINST: the compiler's own arity
-            // message here says "exactly one cycle-count argument" and
-            // the docs write `idle(N)`, where `N` is a value
-            // placeholder — no parameter name is stated anywhere.
-            // `record_read`'s `addr` came from the compiler's own
-            // diagnostic AND the docs. Inventing one here is the
-            // `record_write` mistake, so this stays as `bitbash` does.
-            return Err(unsupported(
-                &format!("a named argument to `{}`", name.name),
-                "v1 ignores the name and binds by position; with one parameter that is \
-                 the same thing, so it emits the predicate correctly",
-            ));
-        };
+        // A named argument binds by position, because there is only one
+        // position. This used to be refused, on a note that reasoned the
+        // case through correctly and then stopped short: the arity check
+        // three lines up has already established exactly one argument,
+        // so v1's name-dropping positional binding lands the value in
+        // the only slot there is and emits code identical to the
+        // positional form. That is a description of a feature working,
+        // not of a gap — measured, `p.idle(n = 2)` compiles under v1 and
+        // emits the same predicate as `p.idle(2)`.
+        //
+        // The name is NOT checked against anything, and that part of the
+        // old note stands: the compiler's own arity message says
+        // "exactly one cycle-count argument" and the docs write
+        // `idle(N)`, where `N` is a value placeholder. No parameter name
+        // is stated anywhere, so there is nothing to check against and
+        // inventing one would be the `record_write` mistake. v1 accepts
+        // any name here too.
+        let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
         Ok(Some(IrExpr::ComponentIdle {
             base: ComponentBase::Path(path),
@@ -4560,15 +4555,9 @@ impl super::FuncBuilder<'_> {
                 "the quiesce predicate takes exactly one cycle-count argument",
             ));
         }
-        let CallArg::Expr(n_expr) = &args[0] else {
-            // Same as the idle predicates: one argument, so v1's
-            // positional binding is correct and the name is decoration.
-            return Err(unsupported(
-                "a named argument to `quiesced`",
-                "v1 ignores the name and binds by position; with one parameter that is \
-                 the same thing, so it emits the predicate correctly",
-            ));
-        };
+        // Same as the idle predicates one screen up: one argument, so a
+        // name can only bind where the position already put it.
+        let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
 
         // Collect every leaf sub-component instance path under the receiver.
