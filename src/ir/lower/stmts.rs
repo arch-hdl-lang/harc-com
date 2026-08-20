@@ -1506,9 +1506,47 @@ impl FuncBuilder<'_> {
                 }
                 format!("a `{}`", self.ctx.records[rid.index()].name)
             }
-            crate::ir::QueueElem::Scalar { .. } => {
+            crate::ir::QueueElem::Scalar { ty: actual } => {
                 if declared_record.is_none() {
-                    return Ok(());
+                    let Some(expected) = typed_let_ir_type(ty) else {
+                        return Ok(());
+                    };
+                    if component_method_result_compatible(&expected, actual) {
+                        return Ok(());
+                    }
+                    let scalar_shape = |ty: &IrType| match ty {
+                        IrType::UInt(Some(width)) => Some((*width, false)),
+                        IrType::SInt(Some(width)) => Some((*width, true)),
+                        _ => None,
+                    };
+                    if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+                        (scalar_shape(&expected), scalar_shape(actual))
+                    {
+                        if dest_signed != src_signed {
+                            return Err(LowerError::Invalid(format!(
+                                "{what} yields a {} {src_width}-bit value, but `let {}` is \
+                                 declared as {} {dest_width}-bit. Signedness must match — \
+                                 relabel the value explicitly with `as {}<{dest_width}>`.",
+                                if src_signed { "signed" } else { "unsigned" },
+                                l.name.name,
+                                if dest_signed { "signed" } else { "unsigned" },
+                                if dest_signed { "sint" } else { "uint" },
+                            )));
+                        }
+                        if src_width > dest_width {
+                            return Err(LowerError::Invalid(format!(
+                                "{what} yields a {src_width}-bit value, but `let {}` is \
+                                 declared {dest_width}-bit, so the pop assignment narrows. \
+                                 Use `.trunc<{dest_width}>()` explicitly after popping into \
+                                 a {src_width}-bit local, or widen the declaration.",
+                                l.name.name
+                            )));
+                        }
+                    }
+                    return Err(LowerError::Invalid(format!(
+                        "{what} yields {actual:?}, but `let {}` is declared {expected:?}",
+                        l.name.name
+                    )));
                 }
                 "a scalar".to_string()
             }

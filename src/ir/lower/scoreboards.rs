@@ -15,8 +15,8 @@
 //!     materialization — rejected at the call site, but the declaration
 //!     itself is also rejected here so an unreferenced method-bearing
 //!     scoreboard does not lower to a struct missing its methods);
-//!   - queue element types that are not scalars ≤ 64 bits (e.g.
-//!     `queue<SomeStruct>` — needs the record-payload-in-queue seam);
+//!   - queue element types other than exact scalars through the 1024-bit
+//!     language ceiling or value-records (enum/Vec/list/event/nested);
 //!   - non-scalar / >64-bit scalar fields.
 //!
 //! `NotImplemented { v1: SilentlyMisLowers }` (v1 is not a way out):

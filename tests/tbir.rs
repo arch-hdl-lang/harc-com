@@ -2984,6 +2984,154 @@ fn wide_queue_verifier_rejects_lossy_scalar_transfers() {
     );
 }
 
+/// The two C++ storage transitions are exact: 64 -> 65 bits moves from a
+/// native carrier to `_harc_u128`, and 128 -> 129 bits moves from
+/// `_harc_u128` to `HarcWide`. Signed queues use the same bit carriers but
+/// retain signedness in the inferred pop locals, including non-word-aligned
+/// widths on both sides of the second transition.
+#[test]
+fn scalar_queue_storage_preserves_64_65_and_128_129_boundaries() {
+    let src = r#"
+testbench QueueBoundaryTb
+    dut  : Top
+    u64  : queue<uint<64>>
+    u65  : queue<uint<65>>
+    u128 : queue<uint<128>>
+    u129 : queue<uint<129>>
+    s65  : queue<sint<65>>
+    s129 : queue<sint<129>>
+end testbench QueueBoundaryTb
+
+impl QueueBoundaryTest for QueueBoundaryTb
+    run
+        let got_u64 = u64.pop()
+        let got_u65 = u65.pop()
+        let got_u128 = u128.pop()
+        let got_u129 = u129.pop()
+        let got_s65 = s65.pop()
+        let got_s129 = s129.pop()
+    end run
+end impl QueueBoundaryTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("scalar queue boundaries lower");
+    verify::verify_program(&prog).expect("scalar queue boundaries verify");
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("got_u64", ir::IrType::UInt(Some(64))),
+        ("got_u65", ir::IrType::UInt(Some(65))),
+        ("got_u128", ir::IrType::UInt(Some(128))),
+        ("got_u129", ir::IrType::UInt(Some(129))),
+        ("got_s65", ir::IrType::SInt(Some(65))),
+        ("got_s129", ir::IrType::SInt(Some(129))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "queue pop `{name}` retains its exact scalar type"
+        );
+    }
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("scalar queue boundaries emit");
+    for declaration in [
+        "harc_rt::HarcQueue<uint64_t> u64;",
+        "harc_rt::HarcQueue<_harc_u128> u65;",
+        "harc_rt::HarcQueue<_harc_u128> u128;",
+        "harc_rt::HarcQueue<harc_rt::HarcWide<5>> u129;",
+        "harc_rt::HarcQueue<_harc_u128> s65;",
+        "harc_rt::HarcQueue<harc_rt::HarcWide<5>> s129;",
+    ] {
+        assert!(
+            cpp.contains(declaration),
+            "expected boundary storage `{declaration}` in:\n{cpp}"
+        );
+    }
+}
+
+/// Direct scalar queues deliberately widen only the scalar element subset.
+/// Aggregate elements other than value records remain explicit
+/// `Unsupported` diagnostics instead of being flattened into scalar storage.
+#[test]
+fn scalar_queue_rollout_keeps_aggregate_elements_unsupported() {
+    for elem in ["Color", "Vec", "list"] {
+        let src = format!(
+            r#"
+enum Color {{ RED, GREEN }}
+
+testbench AggregateQueueTb
+    dut    : Top
+    values : queue<{elem}>
+end testbench AggregateQueueTb
+
+impl AggregateQueueTest for AggregateQueueTb
+    run
+        wait 1 cycle
+    end run
+end impl AggregateQueueTest
+"#
+        );
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("non-scalar queue element")
+                && msg.contains("enum/Vec/nested elements gate on a later slice"),
+            "`queue<{elem}>` must stay explicitly unsupported: {msg}"
+        );
+    }
+}
+
+/// A source-level type annotation on `queue.pop()` is an assignment slot.
+/// Narrowing or changing signedness is a program error, so it must be
+/// reported by lowering rather than surfacing as an internal verifier error.
+#[test]
+fn scalar_queue_pop_type_changes_are_source_diagnostics() {
+    let program = |queue_ty: &str, local_ty: &str| {
+        format!(
+            r#"
+testbench QueueDiagTb
+    dut    : Top
+    values : queue<{queue_ty}>
+end testbench QueueDiagTb
+
+impl QueueDiagTest for QueueDiagTb
+    run
+        let got : {local_ty} = values.pop()
+    end run
+end impl QueueDiagTest
+"#
+        )
+    };
+
+    let narrowing = assert_invalid(
+        &lower_src(&program("uint<65>", "uint<64>"))
+            .expect_err("a 65-bit queue pop must not narrow into 64 bits"),
+    );
+    assert!(
+        narrowing.contains("testbench queue `values`")
+            && narrowing.contains("65-bit")
+            && narrowing.contains("64-bit")
+            && narrowing.contains("narrows"),
+        "narrowing diagnostic must name the queue and both widths: {narrowing}"
+    );
+
+    let signedness = assert_invalid(
+        &lower_src(&program("sint<129>", "uint<129>"))
+            .expect_err("a signed queue pop must not relabel into unsigned storage"),
+    );
+    assert!(
+        signedness.contains("testbench queue `values`")
+            && signedness.contains("signed 129-bit")
+            && signedness.contains("unsigned 129-bit")
+            && signedness.contains("Signedness must match"),
+        "signedness diagnostic must name the queue and both types: {signedness}"
+    );
+}
+
 /// A data-only scoreboard queue uses the same exact scalar descriptor as a
 /// direct testbench queue. This pins inferred, assigned, and discarded pop
 /// destinations plus verifier assignment direction at the owner-specific IR

@@ -651,9 +651,9 @@ impl RecordSchema {
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields and `queue<T>` fields where `T` is a scalar up to 64
-/// bits or a value-record lower; the test body manipulates them through
-/// `Stmt::ScoreboardOp`
+/// Scalar fields and `queue<T>` fields where `T` is `bool`, an explicitly
+/// sized `uint`/`sint` in the language range 1..=1024, or a value-record
+/// lower; the test body manipulates them through `Stmt::ScoreboardOp`
 /// (scalar read/write, queue push/pop/size/empty). Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
 /// state and therefore need per-instance materialization — are NOT
@@ -679,7 +679,8 @@ pub enum ScoreboardFieldKind {
     /// `default` is the declared initializer literal (0 fallback, v1).
     Scalar { ty: IrType, default: u64 },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is an exact scalar type up to 64 bits or a value-record.
+    /// FIFO whose element is an exact scalar type through the 1024-bit
+    /// language ceiling or a value-record.
     Queue { elem: QueueElem },
 }
 
@@ -689,9 +690,10 @@ pub enum ScoreboardFieldKind {
 /// storage descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
-    /// `queue<uint<256>>` / `queue<sint<8>>` / `queue<bool>` — the exact
-    /// scalar type drives inferred pop locals and the width-aware C++ storage
-    /// mapping (`uint64_t`, `_harc_u128`, or `HarcWide<N>`).
+    /// `queue<uint<256>>` / `queue<sint<65>>` / `queue<bool>` — the exact
+    /// scalar type (1..=1024 bits when sized) drives inferred pop locals and
+    /// the width-aware C++ storage mapping (`uint64_t`, `_harc_u128`, or
+    /// `HarcWide<N>`).
     Scalar { ty: IrType },
     /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
     /// `TbProgram::records`; the C++ element type is the record struct.
@@ -1287,10 +1289,10 @@ pub enum ComponentFieldKind {
     /// component/transactor state.
     Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is an exact scalar or a value-record (`elem`
-    /// selects the C element type). Manipulated through the component-queue
-    /// ops (`Stmt::ComponentQueuePush`/`ComponentQueuePop`,
-    /// `Expr::ComponentQueueSize`).
+    /// FIFO whose element is an exact scalar through 1024 bits or a
+    /// value-record (`elem` selects the C element type). Manipulated through
+    /// the component-queue ops (`Stmt::ComponentQueuePush`/
+    /// `ComponentQueuePop`, `Expr::ComponentQueueSize`).
     Queue { elem: QueueElem },
     /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
     /// `std::vector<std::function<void(<payload>)>>` member; `payload`
@@ -1712,7 +1714,8 @@ pub struct TbScalarFieldSchema {
 }
 
 /// One testbench-owned FIFO (`pending : queue<uint<32>>` or
-/// `pending : queue<Record>`). Queue elements reuse the shared queue shape
+/// `pending : queue<Record>`). Scalar elements retain their exact type through
+/// the 1024-bit language ceiling. Queue elements reuse the shared queue shape
 /// used by scoreboards, components, and transactor state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TbQueueFieldSchema {
@@ -1745,9 +1748,10 @@ pub enum StateFieldKind {
     /// `default` is the declared initializer literal (0 fallback).
     Scalar { ty: IrType, default: u64 },
     /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
-    /// whose element is an exact scalar type or a value-record. Manipulated
-    /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
-    /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
+    /// whose element is an exact scalar type through 1024 bits or a
+    /// value-record. Manipulated through the state-queue ops
+    /// (`Stmt::TransactorStateQueuePush`/`TransactorStateQueuePop`,
+    /// `Expr::TransactorStateQueueQuery`).
     Queue { elem: QueueElem },
     /// `last : Beat` — a whole value-record held as persistent state.
     /// `RecordId` indexes `TbProgram::records`; the C++ member is the

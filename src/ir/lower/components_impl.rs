@@ -2742,29 +2742,12 @@ pub(crate) fn lower_queue_elem(
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<crate::ir::QueueElem, LowerError> {
-    lower_queue_elem_with_policy(comp, fname, arg, record_ids, true)
-}
-
-fn lower_queue_elem_with_policy(
-    comp: &str,
-    fname: &str,
-    arg: Option<&TypeArg>,
-    record_ids: &HashMap<String, RecordId>,
-    allow_wide_scalar: bool,
-) -> Result<crate::ir::QueueElem, LowerError> {
     use crate::ir::QueueElem;
-    let scalar_subset = if allow_wide_scalar {
-        "`queue<scalar>`"
-    } else {
-        "`queue<scalar ≤ 64 bits>`"
-    };
     let reject_named = |named: &str| -> LowerError {
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
-            &format!(
-                "only {scalar_subset} and `queue<transaction|struct>` elements are \
-                 lowered; enum/Vec/nested elements gate on a later slice"
-            ),
+            "only `queue<scalar>` and `queue<transaction|struct>` elements are \
+             lowered; enum/Vec/nested elements gate on a later slice",
         )
     };
     match arg {
@@ -2777,13 +2760,7 @@ fn lower_queue_elem_with_policy(
                 }
             }
             match decoded_scalar_ir_type(ty) {
-                Some(ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool))
-                    if allow_wide_scalar
-                        || !matches!(
-                            &ty,
-                            IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64
-                        ) =>
-                {
+                Some(ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)) => {
                     Ok(QueueElem::Scalar { ty })
                 }
                 _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
@@ -2799,9 +2776,7 @@ fn lower_queue_elem_with_policy(
             }
             Err(unsupported(
                 &format!("a non-identifier queue element on `{comp}.{fname}`"),
-                &format!(
-                    "only {scalar_subset} and `queue<transaction|struct>` elements are lowered"
-                ),
+                "only `queue<scalar>` and `queue<transaction|struct>` elements are lowered",
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
