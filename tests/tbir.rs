@@ -9363,7 +9363,13 @@ end impl T
     // Checking the default first handed this the weaker
     // `EmitsUncompilable` while v1 compiled it and flattened the
     // payload to `void(uint64_t)`.
-    let both = "    ev2 : out event<string>\n    ev : out event<string> default ev2";
+    // The both-arms field must be declared FIRST. With `ev2` first,
+    // lowering errors on `ev2` — itself uncertified with no default —
+    // and the assertion below is met by the wrong field under EITHER
+    // guard order; measured, swapping the guards back passed all 553
+    // tests. Declared first, `ev` gives `EmitsUncompilable` under the
+    // old order and `SilentlyMisLowers` under the shipped one.
+    let both = "    ev : out event<string> default ev2\n    ev2 : out event<string>";
     let err = lower_src(&prog(both)).unwrap_err();
     let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("uncertified payload"), "{msg}");
@@ -9548,15 +9554,18 @@ end impl T
         "the initiator form names itself: {msg}"
     );
 
-    // A DIRECTIONAL field on the initiator owner. There was none
-    // anywhere in the suite, so reinstating the pre-check that used to
-    // shadow the shared rule — the exact regression this series fixed —
-    // passed every test.
-    let msg = lower_with_stdlib_bus_src(
+    // A DIRECTIONAL field on the INITIATOR owner. The suite had none,
+    // so reinstating the pre-check that used to shadow the shared rule
+    // on this path passed every test. (The unbound owner already had
+    // two such cases — an earlier claim that the suite could not catch
+    // ANY reinstated pre-check was wrong, and named the wrong owner.)
+    let err = lower_with_stdlib_bus_src(
         &initiator.replace("    v : Vec<uint<8>, 4>", "    p : in uint<8>"),
     )
-    .unwrap_err()
-    .to_string();
+    .unwrap_err();
+    // `Unsupported`'s Display carries the same construct substring, so
+    // `contains` alone would pass if the arm flipped back.
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(
         msg.contains(
             "initiator-side bound-to transactor `AxilHelper` directional non-event field `p`"
@@ -9564,15 +9573,22 @@ end impl T
         "the initiator owner reaches the shared directional rule: {msg}"
     );
 
-    // …and one on the UNBOUND owner whose type is NAMED, which the
+    // …and a directional module handle on the UNBOUND owner, which the
     // named-type branches would otherwise swallow: `in TlmReadInitiator`
     // lowered for one commit, tbir dropping the `in` itself.
-    let msg =
-        lower_src(&unbound.replace("    v : Vec<uint<8>, 4>", "    d2 : in TlmReadInitiator"))
-            .unwrap_err()
-            .to_string();
+    //
+    // It must be the SOLE handle. A second one alongside `dut` is
+    // refused by the handle-COUNT arm instead, so that spelling passed
+    // whether or not the directional dispatch existed — measured, a
+    // mutant leaking exactly the sole-handle shape survived the suite.
+    let sole = unbound.replace("    v : Vec<uint<8>, 4>\n", "").replace(
+        "    dut : TlmReadInitiator",
+        "    dut : in TlmReadInitiator",
+    );
+    let err = lower_src(&sole).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(
-        msg.contains("transactor `Poker` directional non-event field `d2`"),
+        msg.contains("transactor `Poker` directional non-event field `dut`"),
         "a directional module handle is still refused: {msg}"
     );
 

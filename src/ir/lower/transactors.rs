@@ -1693,14 +1693,25 @@ fn lower_state_field(
             }
             return Err(unsupported(
                 &format!("{who} `{tname}` directional event field `{fname}`"),
-                "event-driven transactors await the event slice; a directional `event<T>` \
-                 field needs an `on <ev>` handler to drive it, which is a follow-up slice",
+                "event-driven transactors await the event slice; an `in event<T>` needs an \
+                 `on <ev>` handler and an `out event<T>` needs an `emit` site and a \
+                 subscriber, and neither is lowered yet",
             ));
         }
         // NOT "scalar": this is everything directional that is not an
-        // event, which includes `in Vec<uint<8>, 4>` and `in Beat`. What
-        // they share is that v1 emits the member for the underlying type
-        // and DROPS the direction.
+        // event — `in Vec<uint<8>, 4>`, `in Beat`, `in Color`, and a
+        // module handle (`dut : in Top`), which is routed here
+        // deliberately by the dispatch at the top of
+        // `lower_unbound_item`.
+        //
+        // What most of them share is that v1 emits the member for the
+        // underlying type and DROPS the direction. The module handle is
+        // the exception and the reason text below does NOT describe it:
+        // v1's output for `dut : in Top` is byte-identical to
+        // `dut : Top` and correct, since the handle is bound by the
+        // test. It sits under this arm because `SilentlyMisLowers` is
+        // the arm's WORST landing (`p : in uint<8>` genuinely does mean
+        // something else), not because v1 mis-lowers this one.
         return Err(not_implemented(
             &format!("{who} `{tname}` directional non-event field `{fname}`"),
             "event-driven transactors await the event slice; v1 emits the member for the \

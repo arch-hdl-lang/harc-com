@@ -8418,16 +8418,36 @@ former `transaction` group lives in
      trusting it; these two arms still trust it.
 
      **Out of scope, also unfixed:** a FOURTH owner. A transactor
-     carrying an `on` handler routes through `lower_component_field`
-     (`components_impl.rs`), whose four directional arms still answer a
-     blanket `Unsupported` for landings where v1 drops the direction and
+     carrying an `on` handler routes through `lower_field`
+     (`components_impl.rs:1321` — an earlier draft of this entry named
+     a `lower_component_field` that does not exist anywhere in the
+     tree), whose four directional arms still answer a blanket
+     `Unsupported` for landings where v1 drops the direction and
      compiles — the defect this whole series was opened to remove,
      three of them shipping an empty reason string.
 
-     The suite could not previously catch a reinstated pre-check: there
-     was no directional-field case on the initiator owner at all, so
-     re-adding the shadowing check passed every test. There is one on
-     each of the three owners now.
+     The suite could not previously catch a reinstated pre-check on the
+     INITIATOR owner: there was no directional-field case there at all.
+     The sentence this entry first carried — that the suite could not
+     catch a reinstated pre-check at all — is false, and names the
+     wrong owner besides: the check this round restored was on the
+     UNBOUND owner, which already had two directional cases with their
+     `V1Status` pinned, and reinstating it fails them. There is a case
+     on each of the three owners now.
+
+     Two of the tests added for this round did not test what they
+     claimed, which a mutant showed and the assertions did not:
+
+     - the both-arms event probe declared the SECOND field first, so
+       lowering errored on the wrong field and the assertion was met
+       under either guard order — swapping the guards back passed all
+       553 tests;
+     - the unbound directional row used a SECOND module handle, which
+       the handle-count arm refuses before the directional dispatch is
+       reached, so it passed whether or not the dispatch existed.
+
+     Both now fail when their guard is removed. A test written in the
+     same edit as its guard is not automatically a test OF that guard.
 
 ## Next steps
 
