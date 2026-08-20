@@ -895,19 +895,7 @@ impl FuncBuilder<'_> {
                     };
                     self.check_pop_let_type(l, &elem, &format!("target-state queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                self.set_local_type(id, ty);
-                            }
-                        }
-                    }
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::TransactorStateQueuePop {
                         instance: String::new(),
                         field,
@@ -935,19 +923,7 @@ impl FuncBuilder<'_> {
                                 &format!("target-state queue `{instance}.{field}`"),
                             )?;
                             let id = self.declare(&l.name.name);
-                            match elem {
-                                crate::ir::QueueElem::Record(rid) => {
-                                    self.set_local_type(id, IrType::Record(rid));
-                                }
-                                crate::ir::QueueElem::Scalar { .. } => {
-                                    if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                        self.let_widths.insert(id, w);
-                                    }
-                                    if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                        self.set_local_type(id, ty);
-                                    }
-                                }
-                            }
+                            self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                             self.push(Stmt::TransactorStateQueuePop {
                                 instance,
                                 field,
@@ -2348,6 +2324,78 @@ impl FuncBuilder<'_> {
                         nested_path,
                     });
                     return Ok(());
+                }
+                // `v = pending.pop()` inside a target responder. Scalar
+                // state queues support the same existing-local assignment
+                // spelling as the other direct queue owners; record-result
+                // assignment remains on its established fresh-`let` path.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((field, method)) = self.as_state_queue_call(callee) {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{field}`"),
+                                args,
+                            )?;
+                            let crate::ir::StateFieldKind::Queue { elem } =
+                                self.target_state_fields[&field].clone()
+                            else {
+                                unreachable!("as_state_queue_call gated on the Queue kind");
+                            };
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and target-state queue \
+                                         `{field}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::TransactorStateQueuePop {
+                                    instance: String::new(),
+                                    field,
+                                    dest: local,
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                // `v = responder.pending.pop()` at test scope: the same
+                // scalar assignment operation with an already-resolved
+                // persistent-state instance.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if name.name == "pop" {
+                            if let Some((instance, field, kind)) =
+                                self.as_transactor_state_any(target)
+                            {
+                                if let crate::ir::StateFieldKind::Queue { elem } = kind {
+                                    queue_pop_takes_no_arguments(
+                                        &format!("target-state queue `{instance}.{field}`"),
+                                        args,
+                                    )?;
+                                    if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                        let expected = self.local_type(local).clone();
+                                        let actual = elem.ir_type();
+                                        if !component_method_result_compatible(&expected, &actual) {
+                                            return Err(LowerError::Invalid(format!(
+                                                "local `{}` is declared {:?} and target-state \
+                                                 queue `{instance}.{field}` yields {:?}",
+                                                id.name, expected, actual
+                                            )));
+                                        }
+                                        self.push(Stmt::TransactorStateQueuePop {
+                                            instance,
+                                            field,
+                                            dest: local,
+                                        });
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // `v = xact.method(...)` — call edge into an existing
                 // local.

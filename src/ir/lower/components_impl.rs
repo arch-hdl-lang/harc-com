@@ -2745,18 +2745,6 @@ pub(crate) fn lower_queue_elem(
     lower_queue_elem_with_policy(comp, fname, arg, record_ids, true)
 }
 
-/// The pre-#634 queue-owner surface remains capped at 64-bit scalar elements.
-/// Its descriptors still retain the exact narrow `IrType`; only direct
-/// testbench queues opt into the wide scalar policy in this vertical slice.
-pub(crate) fn lower_bounded_queue_elem(
-    comp: &str,
-    fname: &str,
-    arg: Option<&TypeArg>,
-    record_ids: &HashMap<String, RecordId>,
-) -> Result<crate::ir::QueueElem, LowerError> {
-    lower_queue_elem_with_policy(comp, fname, arg, record_ids, false)
-}
-
 fn lower_queue_elem_with_policy(
     comp: &str,
     fname: &str,

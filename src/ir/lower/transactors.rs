@@ -1578,7 +1578,7 @@ fn lower_bound_initiator_transactor(
 /// composite components already carry:
 ///   * a scalar `≤64`-bit counter/latch (`read_count : uint<32> default
 ///     0`) with a plain-integer/bool default (or no default → 0);
-///   * a typed FIFO `queue<scalar ≤ 64 bits>` / `queue<Record>`
+///   * a typed FIFO `queue<scalar>` / `queue<Record>`
 ///     (`pending : queue<uint<32>>` / `queue<Beat>`), whose element type
 ///     resolves through the shared `lower_queue_elem` seam.
 /// Event/directional fields, module/transaction-typed fields, a `default`
@@ -1600,9 +1600,10 @@ fn lower_state_field(
         ));
     }
     // A `queue<T>` state field → the shared queue-element machinery
-    // (an exact scalar type up to 64 bits or a value-record), reused verbatim from the
-    // scoreboard/component queue seam so all three lower `queue<Record>`
-    // through the identical `harc_rt::HarcQueue<Rec>` shape.
+    // (an exact scalar type or a value-record), reused verbatim from the
+    // direct-testbench/scoreboard/component queue seam. This call opts
+    // persistent transactor state into that already-shipped scalar policy;
+    // non-queue state and event/field policies remain unchanged.
     if let TypeExpr::Builtin {
         name: crate::ast::BuiltinTy::Queue,
         args,
@@ -1617,8 +1618,7 @@ fn lower_state_field(
                 "a `queue<T>` state field starts empty; drop the `default`",
             ));
         }
-        let elem =
-            super::components::lower_bounded_queue_elem(tname, fname, args.first(), record_ids)?;
+        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
         return Ok(StateFieldSchema {
             name: fname.clone(),
             kind: StateFieldKind::Queue { elem },
@@ -1660,7 +1660,7 @@ fn lower_state_field(
         return Err(unsupported(
             &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
             "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits), \
-             a whole value-record, or a `queue<scalar ≤ 64 bits>` / `queue<Record>`",
+             a whole value-record, or a `queue<scalar>` / `queue<Record>`",
         ));
     };
     // Same rule as the component/scoreboard field defaults, and the

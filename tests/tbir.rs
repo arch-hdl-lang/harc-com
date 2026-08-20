@@ -15653,6 +15653,166 @@ fn target_nonscalar_queue_state_emits_harcqueue() {
     );
 }
 
+/// Wide scalar target-state queues use their declared element type at every
+/// owner-specific seam: declaration, responder-local operations,
+/// instance-qualified operations, inferred/typed/assigned/discarded pops,
+/// verifier transfers, and generated per-instance storage.
+#[test]
+fn target_nonscalar_queue_wide_scalar_behavior_is_exact() {
+    let src = fixture("target_wide_queue_state_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide target-state queues lower");
+    verify::verify_program(&prog).expect("wide target-state queues verify");
+
+    let transactor = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "WideQueueResponder")
+        .expect("fixture has the target responder");
+    for (field, ty) in [
+        ("wide_values", ir::IrType::UInt(Some(256))),
+        ("odd_values", ir::IrType::UInt(Some(65))),
+    ] {
+        assert!(matches!(
+            transactor
+                .state_fields
+                .iter()
+                .find(|state| state.name == field)
+                .map(|state| &state.kind),
+            Some(ir::StateFieldKind::Queue {
+                elem: ir::QueueElem::Scalar { ty: actual }
+            }) if *actual == ty
+        ));
+    }
+
+    let responder = prog.function(transactor.target_methods[0].function);
+    for (name, ty) in [
+        ("bare_inferred", ir::IrType::UInt(Some(256))),
+        ("bare_typed", ir::IrType::UInt(Some(256))),
+        ("bare_assigned", ir::IrType::UInt(Some(256))),
+    ] {
+        assert_eq!(
+            responder
+                .locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "responder-local pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let bare_discard = responder
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop { field, dest, .. }
+                if field == "wide_values" && responder.local(*dest).name.starts_with("__t") =>
+            {
+                Some(responder.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a responder-local discarded pop");
+    assert_eq!(bare_discard.ty, ir::IrType::UInt(Some(256)));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("instance_inferred", ir::IrType::UInt(Some(65))),
+        ("instance_typed", ir::IrType::UInt(Some(65))),
+        ("instance_assigned", ir::IrType::UInt(Some(65))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "instance-qualified pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let instance_discard = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop {
+                instance,
+                field,
+                dest,
+            } if instance == "responder"
+                && field == "odd_values"
+                && run.local(*dest).name.starts_with("__t") =>
+            {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has an instance-qualified discarded pop");
+    assert_eq!(instance_discard.ty, ir::IrType::UInt(Some(65)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide target-state queues emit");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "256-bit per-instance queue storage must be exact: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<_harc_u128> odd_values;"),
+        "65-bit per-instance queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let responder_id = transactor.target_methods[0].function.index();
+    let value = bad_push.functions[responder_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePush { field, value, .. } if field == "wide_values" => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("fixture has a responder-local target-state push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit target-state queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop {
+                instance,
+                field,
+                dest,
+            } if instance == "responder"
+                && field == "odd_values"
+                && bad_pop.functions[run_id].local(*dest).name == "instance_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an instance-qualified inferred pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(64));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 65-bit target-state queue cannot pop into a 64-bit local"
+    );
+}
+
 /// #494 P0a follow-up: a WHOLE value-record target-transactor state field
 /// (`last : Beat`) lowers to `StateFieldKind::Record`, and its subfield
 /// read/write ops are instance-filled to the bound `responder` actor.

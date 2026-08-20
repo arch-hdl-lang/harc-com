@@ -1745,7 +1745,7 @@ pub enum StateFieldKind {
     /// `default` is the declared initializer literal (0 fallback).
     Scalar { ty: IrType, default: u64 },
     /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
-    /// whose element is an exact scalar type up to 64 bits or a value-record. Manipulated
+    /// whose element is an exact scalar type or a value-record. Manipulated
     /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
     /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
     Queue { elem: QueueElem },
