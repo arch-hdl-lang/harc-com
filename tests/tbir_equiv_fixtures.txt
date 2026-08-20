@@ -69,6 +69,7 @@ top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass
+call_return_type_test | Top | top_counter.sv | - | pass | - | call_return_type_ref.cpp
 signed_host_state_test | Top | top_counter.sv | top_counter.arch | pass
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 msg_call_hoist_test | Top | top_counter.sv | top_counter.arch | pass
@@ -131,6 +132,7 @@ packed_vec_lane_test | PackedVecLane | packed_vec_lane.sv | - | pass
 vec_lane_var_index_test | PackedVecLane | packed_vec_lane.sv | - | pass
 width_methods_test | Top | top_counter.sv | - | pass
 wide_cast_test | Top | top_counter.sv | - | pass
+wide_record_test | Top | top_counter.sv | - | pass
 wrapping_arithmetic_operator_test | Top | top_counter.sv | - | pass
 bitslice_uninit_test | Top | top_counter.sv | - | pass
 record_let_copy_test | Top | top_counter.sv | - | pass
@@ -236,6 +238,7 @@ bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass
 wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
+component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
 
 # Added by the harc#551 coverage audit. These ran under run_fixtures.sh
 # (default backend only) and were never trace-diffed across the two
@@ -250,4 +253,4 @@ passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
 soft_constraint_randomize_test | Top | top_counter.sv | - | pass
 target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
-uint64_unique_randomize_test | Top | top_counter.sv | - | pass
+uint64_unique_randomize_test | Top | top_counter.sv | - | pass | - | uint64_unique_randomize_ref.cpp

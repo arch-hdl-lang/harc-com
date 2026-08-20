@@ -1508,10 +1508,12 @@ impl FuncBuilder<'_> {
         // Only the expression shapes invariant 15's own `expr_type`
         // resolves — exactly the set that would otherwise reach the
         // internal-error channel, so this adds no rejection the verifier
-        // was not already making. A binary/ternary/call RHS is
-        // deliberately excluded: lowering's `expr_type` over-approximates
-        // one as its left operand's declared width, which would reject a
-        // provably narrowed value such as `(wide & 0xFF) >> 4`.
+        // was not already making. A binary/ternary RHS is deliberately
+        // excluded: lowering's `expr_type` over-approximates one as its
+        // left operand's declared width, which would reject a provably
+        // narrowed value such as `(wide & 0xFF) >> 4`. Pure-helper and
+        // extern calls are included because their CallTarget carries the
+        // exact declared return type.
         if !matches!(
             e,
             Expr::Literal { .. }
@@ -1519,6 +1521,10 @@ impl FuncBuilder<'_> {
                 | Expr::Local(_)
                 | Expr::BitSlice { .. }
                 | Expr::WidthCast { .. }
+                | Expr::Call(
+                    crate::ir::CallTarget::Helper { .. } | crate::ir::CallTarget::ExternFn { .. },
+                    _,
+                )
         ) {
             return Ok(());
         }
@@ -1988,6 +1994,12 @@ impl FuncBuilder<'_> {
         if self.lower_component_dut_bind(target, value)? {
             return Ok(());
         }
+        if let Some((_, field, _)) = self.as_component_vec_field(target)? {
+            return Err(unsupported(
+                &format!("whole-vector write to component field `{field}`"),
+                "write one element with `<field>[index]`; whole-vector assignment is not lowered yet",
+            ));
+        }
         // Composite-component scalar/record-leaf field write — self-relative
         // inside a method body (`count = ...`) or a dotted path from a
         // test-scope component local (`env.src.current.value = ...`). Record
@@ -2336,6 +2348,24 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
+            if let Some((base, field, vec)) = self.as_component_vec_field(it)? {
+                let index = self.lower_expr_no_ports(index)?;
+                super::exprs::check_literal_component_vec_index_bounds(
+                    &base, &field, &index, vec.len,
+                )?;
+                let value = self.lower_expr_no_ports(value)?;
+                self.reject_record_into_scalar(
+                    &value,
+                    &format!("element of component `Vec` field `{field}`"),
+                )?;
+                self.push(Stmt::ComponentVecElementWrite {
+                    base,
+                    field,
+                    index,
+                    value,
+                });
+                return Ok(());
+            }
             if let Some(chain) = self.try_record_field_chain(it)? {
                 if chain.leaf_vec_len.is_none() {
                     // v1 emits `b.v[1] = 3;` — a subscript on a

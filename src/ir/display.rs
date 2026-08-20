@@ -262,6 +262,9 @@ impl Display for TbProgram {
                     ComponentFieldKind::Scalar { default, .. } => {
                         format!("scalar = {default}")
                     }
+                    ComponentFieldKind::FixedVec(vec) => {
+                        format!("fixed-vec<{:?}, {}>", vec.elem, vec.len)
+                    }
                     ComponentFieldKind::Record { record } => {
                         format!("record {}", self.records[record.index()].name)
                     }
@@ -510,6 +513,7 @@ static EMPTY_CHECK_SCOPE: std::sync::LazyLock<TbFunction> =
         blocks: Vec::new(),
         entry: crate::ir::BlockId(0),
         ret: None,
+        implicit_returns: Vec::new(),
     });
 
 impl Display for TbFunction {
@@ -764,6 +768,10 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             "ComponentFieldWrite({}.{field}, {})",
             comp_base_str(base),
             expr_str(func, value)
+        ),
+        Stmt::ComponentVecElementWrite { base, field, index, value } => format!(
+            "ComponentVecElementWrite({}.{field}[{}], {})",
+            comp_base_str(base), expr_str(func, index), expr_str(func, value)
         ),
         Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
@@ -1145,6 +1153,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
         }
+        Expr::ComponentVecElement { base, field, index } => {
+            format!("{}.{field}[{}]", comp_base_str(base), expr_str(func, index))
+        }
         Expr::ComponentValue { base } => {
             format!("ComponentValue({})", comp_base_str(base))
         }
@@ -1225,9 +1236,9 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         }
         Expr::Call(target, args) => {
             let t = match target {
-                CallTarget::Helper(n) => n.clone(),
+                CallTarget::Helper { name, .. } => name.clone(),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
-                CallTarget::ExternFn(n) => format!("extern:{n}"),
+                CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")
                 }
@@ -1298,8 +1309,8 @@ fn cover_expr_str(e: &Expr) -> String {
         },
         Expr::Call(target, args) => {
             let t = match target {
-                CallTarget::Helper(n) => n.clone(),
-                CallTarget::ExternFn(n) => format!("extern:{n}"),
+                CallTarget::Helper { name, .. } => name.clone(),
+                CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
                 CallTarget::TransactorMethod { bus_field, method } => {
                     format!("{bus_field}.{method}")

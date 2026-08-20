@@ -800,6 +800,7 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
         ComponentIdle { n, .. } => expr_has_probe(n),
+        ComponentVecElement { index, .. } => expr_has_probe(index),
         _ => false,
     }
 }
@@ -823,6 +824,9 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
+        ComponentVecElementWrite { index, value, .. } => {
+            expr_has_probe(index) || expr_has_probe(value)
+        }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             expr_has_probe(cond) || fmt_has_probe(on_fail)
         }
@@ -1082,6 +1086,10 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        ComponentVecElementWrite { index, value, .. } => {
+            for_each_port_in_expr(index, f);
+            for_each_port_in_expr(value, f);
+        }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             for_each_port_in_expr(cond, f);
             for_each_port_in_fmt(on_fail, f);
@@ -1180,21 +1188,17 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
+        ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
         _ => {}
     }
 }
 
-/// One transaction value-record struct. Field C types follow v1's
-/// `txn_field_c_type` for the lowered (≤64-bit scalar) subset:
-/// unsigned → `uint64_t`, signed → `int64_t`, bool/bit → `bool`.
 /// C++ storage type for a record field's scalar (or Vec element) type,
-/// mirroring v1's `record_field_c_type` / `txn_field_c_type` choices:
-/// `bool` for Bool, `int64_t` for SInt, `uint64_t` otherwise.
-fn field_scalar_cty(ty: &ir::IrType) -> &'static str {
+/// using the same width-aware integer policy as standalone locals.
+fn field_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
-        ir::IrType::Bool => "bool",
-        ir::IrType::SInt(_) => "int64_t",
-        _ => "uint64_t",
+        ir::IrType::Bool => "bool".to_string(),
+        _ => local_scalar_cty(ty),
     }
 }
 
@@ -1439,12 +1443,114 @@ fn emit_unpack_field(
     }
     let w = field_packed_width(ty, records).unwrap_or(0);
     let cty = field_scalar_cty(ty);
-    writeln!(
-        out,
-        "{INDENT}{target_expr} = ({cty})harc_rt::harc_bits(_packed, {hi}, {offset});",
-        hi = offset + w - 1
-    )
-    .ok();
+    let rhs = if w <= 64 {
+        format!(
+            "({cty})harc_rt::harc_bits(_packed, {}, {offset})",
+            offset + w - 1
+        )
+    } else if w <= 128 {
+        format!(
+            "static_cast<_harc_u128>(harc_rt::harc_wide_extract_bits<4>(_packed, {offset}, {w}))"
+        )
+    } else {
+        let words = w.div_ceil(32);
+        format!("harc_rt::harc_wide_extract_bits<{words}>(_packed, {offset}, {w})")
+    };
+    writeln!(out, "{INDENT}{target_expr} = {rhs};").ok();
+}
+
+fn emit_structured_unpack_field(
+    out: &mut String,
+    records: &[ir::RecordSchema],
+    ty: &ir::IrType,
+    vec_len: Option<usize>,
+    target_expr: &str,
+    raw_expr: &str,
+    depth: usize,
+) {
+    let pad = INDENT.repeat(depth);
+    if let Some(n) = vec_len {
+        for i in 0..n {
+            emit_structured_unpack_field(
+                out,
+                records,
+                ty,
+                None,
+                &format!("{target_expr}[{i}]"),
+                &format!("{raw_expr}[{i}]"),
+                depth,
+            );
+        }
+        return;
+    }
+    if let ir::IrType::Record(rid) = ty {
+        let inner = &records[rid.index()];
+        writeln!(out, "{pad}{target_expr} = harc_unpack_{}({raw_expr});", inner.name).ok();
+        return;
+    }
+    let rhs = match ty {
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
+            let words = w.div_ceil(32);
+            format!(
+                "harc_rt::harc_wide_trunc<{words}>(harc_rt::harc_read({raw_expr}), {w})"
+            )
+        }
+        ir::IrType::SInt(Some(w)) if *w <= 64 => format!(
+            "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({raw_expr})), {w}, 64))"
+        ),
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => {
+            let cty = field_scalar_cty(ty);
+            format!(
+                "static_cast<{cty}>(harc_rt::harc_trunc_u128(static_cast<_harc_u128>(harc_rt::harc_read({raw_expr})), {w}))"
+            )
+        }
+        _ => {
+            let cty = field_scalar_cty(ty);
+            format!("static_cast<{cty}>(harc_rt::harc_read({raw_expr}))")
+        }
+    };
+    writeln!(out, "{pad}{target_expr} = {rhs};").ok();
+}
+
+fn emit_structured_drive_field(
+    out: &mut String,
+    records: &[ir::RecordSchema],
+    ty: &ir::IrType,
+    vec_len: Option<usize>,
+    sig_expr: &str,
+    value_expr: &str,
+    depth: usize,
+) {
+    let pad = INDENT.repeat(depth);
+    if let Some(n) = vec_len {
+        for i in 0..n {
+            emit_structured_drive_field(
+                out,
+                records,
+                ty,
+                None,
+                &format!("{sig_expr}[{i}]"),
+                &format!("{value_expr}[{i}]"),
+                depth,
+            );
+        }
+        return;
+    }
+    if let ir::IrType::Record(rid) = ty {
+        let inner = &records[rid.index()];
+        writeln!(out, "{pad}harc_drive_{}({sig_expr}, {value_expr});", inner.name).ok();
+    } else {
+        let normalized = match ty {
+            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
+                format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
+            }
+            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => format!(
+                "harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})"
+            ),
+            _ => value_expr.to_string(),
+        };
+        writeln!(out, "{pad}harc_rt::harc_assign({sig_expr}, {normalized});").ok();
+    }
 }
 
 /// Emit `harc_pack_<R>` / `harc_unpack_<R>` / `harc_drive_<R>` for a
@@ -1504,13 +1610,15 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema, records: &[ir::Re
         .ok();
         writeln!(out, "{0}{0}{name} value{{}};", INDENT).ok();
         for f in &r.fields {
-            if let Some(n) = f.vec_len {
-                for i in 0..n {
-                    writeln!(out, "{0}{0}value.{1}[{i}] = raw.{1}[{i}];", INDENT, f.name).ok();
-                }
-            } else {
-                writeln!(out, "{0}{0}value.{1} = raw.{1};", INDENT, f.name).ok();
-            }
+            emit_structured_unpack_field(
+                out,
+                records,
+                &f.ty,
+                f.vec_len,
+                &format!("value.{}", f.name),
+                &format!("raw.{}", f.name),
+                2,
+            );
         }
         writeln!(out, "{0}{0}return value;", INDENT).ok();
         writeln!(out, "{INDENT}}} else {{").ok();
@@ -1557,13 +1665,15 @@ fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema, records: &[ir::Re
         )
         .ok();
         for f in &r.fields {
-            if let Some(n) = f.vec_len {
-                for i in 0..n {
-                    writeln!(out, "{0}{0}sig.{1}[{i}] = value.{1}[{i}];", INDENT, f.name).ok();
-                }
-            } else {
-                writeln!(out, "{0}{0}sig.{1} = value.{1};", INDENT, f.name).ok();
-            }
+            emit_structured_drive_field(
+                out,
+                records,
+                &f.ty,
+                f.vec_len,
+                &format!("sig.{}", f.name),
+                &format!("value.{}", f.name),
+                2,
+            );
         }
         writeln!(out, "{INDENT}}} else {{").ok();
         writeln!(

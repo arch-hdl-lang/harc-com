@@ -353,23 +353,32 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let a_width = expr_shift_width(cx, a);
             let a = expr_cpp(cx, a)?;
             let b = expr_cpp(cx, b)?;
-            // Both shift directions share the guard: the emitter's shift
-            // implementation is 64-bit, so a >64-bit operand must reject
-            // loudly instead of silently truncating (`<<` previously had
-            // no guard and emitted a wrong `((uint64_t)(wide)) << n`).
-            if matches!(op, BinOp::Shl | BinOp::Shr) && a_width.is_some_and(|width| width > 64) {
-                let dir = if matches!(op, BinOp::Shl) {
-                    "left"
-                } else {
-                    "right"
-                };
-                return Err(EmitError(format!(
-                    "{dir} shift above 64 bits is not supported by the TB-IR C++ value model; \
-                     use --codegen v1 for wide shifts"
-                )));
-            }
             match op {
+                BinOp::Shl if a_width.is_some_and(|w| w > 128) => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_wide_mask_bits((({a}) << ({b})), {width})")
+                }
+                BinOp::Shl if a_width.is_some_and(|w| w > 64) => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_shl_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                }
                 BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
+                BinOp::Shr if a_width.is_some_and(|w| w > 128) && a_signed => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_wide_ashr(({a}), (uint64_t)({b}), {width})")
+                }
+                BinOp::Shr if a_width.is_some_and(|w| w > 128) => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_wide_mask_bits((({a}) >> ({b})), {width})")
+                }
+                BinOp::Shr if a_width.is_some_and(|w| w > 64) && a_signed => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_ashr_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                }
+                BinOp::Shr if a_width.is_some_and(|w| w > 64) => {
+                    let width = a_width.unwrap();
+                    format!("harc_rt::harc_shr_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                }
                 BinOp::Shr if a_signed => {
                     format!("(((int64_t)({a})) >> {b})")
                 }
@@ -394,14 +403,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             format!("({c} ? {t} : {e2})")
         }
         Expr::BitSlice { target, hi, lo } => {
-            let t = expr_cpp(cx, target)?;
-            let width = hi - lo + 1;
-            let mask = if width >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << width) - 1
+            let t = match &**target {
+                Expr::Port(p) if p.lane.is_none() => {
+                    format!("harc_rt::harc_read({})", port_signal(cx, p))
+                }
+                other => format!("({})", expr_cpp(cx, other)?),
             };
-            format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
+            let width = hi - lo + 1;
+            if width <= 64 {
+                format!("harc_rt::harc_bits({t}, {hi}, {lo})")
+            } else if width <= 128 {
+                format!(
+                    "static_cast<_harc_u128>(harc_rt::harc_wide_extract_bits<4>({t}, {lo}, {width}))"
+                )
+            } else {
+                let words = width.div_ceil(32);
+                format!("harc_rt::harc_wide_extract_bits<{words}>({t}, {lo}, {width})")
+            }
         }
         // Runtime bounds go through the same helper v1 emits. The target
         // is passed UNCAST so overload resolution picks the right
@@ -459,6 +477,10 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // struct members (v1's `emit_component_struct` shape).
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
+        }
+        Expr::ComponentVecElement { base, field, index } => {
+            let index = expr_cpp(cx, index)?;
+            format!("{}.{field}[{index}]", comp_base_cpp_subst_cx(cx, base))
         }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
@@ -523,12 +545,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         }
         Expr::Call(target, args) => {
             let name = match target {
-                CallTarget::Helper(n) => helper_cpp_name(n),
+                CallTarget::Helper { name, .. } => helper_cpp_name(name),
                 // Extern reference functions emit with the RAW symbol
                 // name (no `harc_helper_` mangling) so the call binds to
                 // the user's `extern "C"` definition supplied via
                 // `--ref-src`; the forward decl is emitted file-scope.
-                CallTarget::ExternFn(n) => n.clone(),
+                CallTarget::ExternFn { name, .. } => name.clone(),
                 CallTarget::Builtin(_) => {
                     return Err(EmitError(
                         "tbir: builtin calls are not emitted yet (lowering should \
@@ -811,6 +833,70 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             .get(id.0 as usize)
             .and_then(|l| ir_type_width(&l.ty)),
         Expr::Port(p) => p.width,
+        Expr::RecordField {
+            local, field, path, ..
+        } => cx
+            .func
+            .locals
+            .get(local.index())
+            .and_then(|l| {
+                record_path_type(cx, l.ty.clone(), std::iter::once(field).chain(path.iter()))
+            })
+            .and_then(|ty| ir_type_width(&ty)),
+        Expr::TbField(field) => owner_tb(cx)
+            .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
+            .and_then(|f| ir_type_width(&f.ty)),
+        Expr::TransactorState { instance, field } => state_transactor(cx, instance)
+            .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
+            .and_then(|f| match &f.kind {
+                crate::ir::StateFieldKind::Scalar { ty, .. } => ir_type_width(ty),
+                _ => None,
+            }),
+        Expr::TransactorStateRecordField {
+            instance,
+            field,
+            path,
+        } => state_transactor(cx, instance)
+            .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
+            .and_then(|f| match f.kind {
+                crate::ir::StateFieldKind::Record { record } => {
+                    record_path_type(cx, crate::ir::IrType::Record(record), path.iter())
+                }
+                _ => None,
+            })
+            .and_then(|ty| ir_type_width(&ty)),
+        Expr::ComponentField { base, field } => {
+            let path: Vec<String> = field.split('.').map(str::to_string).collect();
+            let root = path.first().map(String::as_str).unwrap_or_default();
+            component_of_base(cx, base)
+                .and_then(|c| c.fields.iter().find(|f| f.name == root))
+                .and_then(|f| match f.kind {
+                    crate::ir::ComponentFieldKind::Scalar { ref ty, .. } => ir_type_width(ty),
+                    crate::ir::ComponentFieldKind::Record { record } => {
+                        record_path_type(cx, crate::ir::IrType::Record(record), path[1..].iter())
+                            .and_then(|ty| ir_type_width(&ty))
+                    }
+                    _ => None,
+                })
+        }
+        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
+            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
+            .and_then(|f| match &f.kind {
+                crate::ir::ComponentFieldKind::FixedVec(vec) => ir_type_width(&vec.elem),
+                _ => None,
+            }),
+        Expr::ScoreboardQuery {
+            sb,
+            query: crate::ir::ScoreboardQuery::Scalar { scalar },
+            ..
+        } => cx
+            .prog
+            .and_then(|p| p.scoreboards.get(sb.index()))
+            .and_then(|s| s.fields.iter().find(|f| f.name == *scalar))
+            .and_then(|f| match &f.kind {
+                crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => ir_type_width(ty),
+                _ => None,
+            }),
         Expr::Binary(op, a, b) => match op {
             BinOp::Eq
             | BinOp::Ne
@@ -826,6 +912,9 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::Ternary(_, t, f) => expr_static_width(cx, t).or_else(|| expr_static_width(cx, f)),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
         Expr::WidthCast { width, .. } => Some(*width),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            ir_type_width(ret)
+        }
         Expr::CycleCount => Some(64),
         _ => None,
     }
@@ -880,6 +969,9 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             .locals
             .get(id.0 as usize)
             .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            matches!(ret, crate::ir::IrType::SInt(_))
+        }
         // Host-state member reads are real C++ struct members whose C
         // type already carries the declared signedness (`int64_t` for a
         // `sint` field — every host-state struct emission maps SInt so).
@@ -941,6 +1033,14 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     _ => false,
                 })
         }
+        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
+            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
+            .is_some_and(|f| matches!(
+                &f.kind,
+                crate::ir::ComponentFieldKind::FixedVec(crate::ir::FixedVecSchema {
+                    elem: crate::ir::IrType::SInt(_), ..
+                })
+            )),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -977,20 +1077,28 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
 /// element reads use the element type carried in the field's `ty`.
 fn record_path_is_sint<'a>(
     cx: &ECx<'_>,
-    mut ty: crate::ir::IrType,
+    ty: crate::ir::IrType,
     segs: impl Iterator<Item = &'a String>,
 ) -> bool {
-    let Some(prog) = cx.prog else { return false };
+    record_path_type(cx, ty, segs).is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
+}
+
+fn record_path_type<'a>(
+    cx: &ECx<'_>,
+    mut ty: crate::ir::IrType,
+    segs: impl Iterator<Item = &'a String>,
+) -> Option<crate::ir::IrType> {
+    let prog = cx.prog?;
     for seg in segs {
         let crate::ir::IrType::Record(rid) = ty else {
-            return false;
+            return None;
         };
         let Some(f) = prog.records.get(rid.index()).and_then(|r| r.field(seg)) else {
-            return false;
+            return None;
         };
         ty = f.ty.clone();
     }
-    matches!(ty, crate::ir::IrType::SInt(_))
+    Some(ty)
 }
 
 /// The testbench schema owning the function being emitted, when known.
@@ -1067,10 +1175,26 @@ fn component_of_base<'a>(
             prog.components.get(cid.index())
         }
         crate::ir::ComponentBase::Path(path) => {
-            let tb = owner_tb(cx)?;
             let (first, rest) = path.split_first()?;
-            let root = tb.component_fields.iter().find(|b| b.field == *first)?;
-            let mut c = prog.components.get(root.component.index())?;
+            let test_root = owner_tb(cx).and_then(|tb| {
+                tb.component_fields
+                    .iter()
+                    .find(|b| b.field == *first)
+                    .and_then(|root| prog.components.get(root.component.index()))
+            });
+            let mut c = if let Some(root) = test_root {
+                root
+            } else if first == "self" {
+                prog.components.iter().find(|c| {
+                    c.methods.iter().any(|m| m.function == cx.func.id)
+                        || c.on_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.periodic_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.cycle_handlers.iter().any(|h| h.function == cx.func.id)
+                        || c.watchdog.as_ref().is_some_and(|w| w.function == cx.func.id)
+                })?
+            } else {
+                return None;
+            };
             for seg in rest {
                 let f = c.fields.iter().find(|f| f.name == *seg)?;
                 let crate::ir::ComponentFieldKind::Sub { component, .. } = f.kind else {

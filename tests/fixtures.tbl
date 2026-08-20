@@ -11,6 +11,8 @@ backend_parity_test     | Top            | top_counter.sv         |
 const_expr_init_test    | Top            | top_counter.sv         |
 signed_use_site_test    | Top            | top_counter.sv         |
 signed_helper_param_test | Top           | top_counter.sv         |
+call_return_type_test  | Top            | top_counter.sv         | | call_return_type_ref.cpp |
+signed_component_method_param_test | Top | top_counter.sv         |
 signed_host_state_test  | Top            | top_counter.sv         |
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 msg_call_hoist_test     | Top            | top_counter.sv         |
@@ -34,6 +36,7 @@ check_phase_shadow_let_test | Top        | top_counter.sv         |
 watchdog_quiesce_test   | Top            | top_counter.sv         |
 agent_periodic_test     | Top            | top_counter.sv         |
 component_method_randomize_test | Top     | top_counter.sv         |
+component_early_return_post_cover_test | Top | top_counter.sv      |
 env_quiesced_phase_test | Top            | top_counter.sv         |
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchSmoke
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchEnableToggle
@@ -42,6 +45,7 @@ testbench_lifecycle_test | Top           | top_counter.sv         | | | Lifecycl
 testbench_lifecycle_test | Top           | top_counter.sv         | | | LifecycleBumpFive
 width_methods_test      | Top            | top_counter.sv         |
 wide_cast_test          | Top            | top_counter.sv         |
+wide_record_test        | Top            | top_counter.sv         |
 bitslice_uninit_test    | Top            | top_counter.sv         |
 record_let_copy_test    | Top            | top_counter.sv         |
 record_vec_field_copy_test | Top         | top_counter.sv         |
@@ -54,7 +58,7 @@ keep_constraints_test   | Top            | top_counter.sv         |
 wrapping_keep_constraint_test | Top      | top_counter.sv         |
 sized_literal_keep_test | Top            | top_counter.sv         |
 soft_constraint_randomize_test | Top      | top_counter.sv         |
-uint64_unique_randomize_test | Top        | top_counter.sv         |
+uint64_unique_randomize_test | Top        | top_counter.sv         | | uint64_unique_randomize_ref.cpp |
 extern_fn_ref_test      | Top            | top_counter.sv         |     | extern_fn_ref.cpp
 relation_inlining_test  | Top            | top_counter.sv         |
 tseq_scalar_test        | Top            | top_counter.sv         |
@@ -151,3 +155,4 @@ multi_active_instance_test | Top            | top_counter.sv         |
 tlm_method_blocking_bus_test | TlmMemory | TlmMemory.sv           |
 record_vec_field_iter_test | Top         | top_counter.sv         |
 transactor_record_field_test | Top       | top_counter.sv         |
+component_fixed_vec_test | Top           | top_counter.sv         |

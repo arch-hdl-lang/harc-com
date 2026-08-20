@@ -18,10 +18,31 @@ domain SysDomain
   freq_mhz: 100
 end domain SysDomain
 
+// The reference helper makes the uniqueness policy observable: HARC's
+// queue subset has no membership query, so the C++ model records each value
+// and rejects repeats within this test process.
+extern function ref_unique_u8(value: uint<8>) -> uint<1>
+extern function ref_unique_multi_u8(value: uint<8>) -> uint<1>
+
 transaction Uint64UniqueStim
     data : uint<64> with [unique within test]
     sample : uint<64>
 end transaction Uint64UniqueStim
+
+// Keep the bounded uniqueness probe at a separate randomize site so its
+// auto-coverage goals do not compete with the high-half regression's goals.
+transaction TinyUniqueStim
+    token : uint<8> with [dist {[0] :/ 100}] [unique within test]
+end transaction TinyUniqueStim
+
+transaction RecycleUniqueStim
+    token : uint<2> with [unique within test]
+end transaction RecycleUniqueStim
+
+transaction MultiRecycleUniqueStim
+    small : uint<2> with [dist {[0] :/ 100}] [unique within test]
+    wide  : uint<8> with [dist {[200] :/ 100}] [unique within test]
+end transaction MultiRecycleUniqueStim
 
 // Sample the randomized value at each `observe` call. Covering the sample's
 // high half directly asserts that model extraction preserves bits 63..32;
@@ -63,6 +84,33 @@ impl Uint64UniqueRandomizeTest for Uint64UniqueTb
         wait 2 cycles
         dut.rst = 0
         wait 1 cycle
+
+        // The uint<8> auto-coverage plan has 18 targets (0, 255, and the
+        // walking-one/walking-zero values). On the 19th call those targets
+        // are exhausted, but the 256-value unique history is not; the fixed
+        // preference would repeat zero unless [unique] blocks it.
+        for i in 0 .. 18
+            let tiny : TinyUniqueStim
+            randomize(tiny)
+            assert ref_unique_u8(tiny.token) == 1
+                else fail("uint<8> unique randomize repeated token at iteration ${i}")
+        end for
+
+        // A five-value run exhausts the four-value history and verifies that
+        // the solver recycles it instead of returning UNSAT.
+        for i in 0 .. 4
+            let recycle : RecycleUniqueStim
+            randomize(recycle)
+        end for
+
+        // Recycling `small` must not clear `wide`: the wide field still has
+        // unused values when the small field exhausts its four-value domain.
+        for i in 0 .. 20
+            let multi : MultiRecycleUniqueStim
+            randomize(multi)
+            assert ref_unique_multi_u8(multi.wide) == 1
+                else fail("multi-field unique randomize repeated wide at iteration ${i}")
+        end for
 
         for i in 0 .. 33
             let s : Uint64UniqueStim

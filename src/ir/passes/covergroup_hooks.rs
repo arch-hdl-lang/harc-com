@@ -383,7 +383,7 @@ fn coverpoint_expr_type(
             Ok(field_schema.ty.clone())
         }
         Expr::Call(target, args) => match target {
-            CallTarget::Helper(name) => {
+            CallTarget::Helper { name, ret } => {
                 let helper = prog
                     .functions
                     .iter()
@@ -407,14 +407,19 @@ fn coverpoint_expr_type(
                         ));
                     }
                 }
-                let ret = helper
+                let actual_ret = helper
                     .ret
                     .map(|r| helper.locals[r.index()].ty.clone())
                     .ok_or_else(|| format!("helper `{name}` has no return value"))?;
-                require_scalar(prog, &ret, &format!("helper `{name}` return"))?;
-                Ok(ret)
+                require_scalar(prog, &actual_ret, &format!("helper `{name}` return"))?;
+                if actual_ret != *ret {
+                    return Err(format!(
+                        "helper `{name}` call return type disagrees with declaration"
+                    ));
+                }
+                Ok(ret.clone())
             }
-            CallTarget::ExternFn(name) => {
+            CallTarget::ExternFn { name, ret } => {
                 for (idx, arg) in args.iter().enumerate() {
                     let actual = coverpoint_expr_type(prog, hook_params, arg)?;
                     require_scalar(
@@ -423,7 +428,8 @@ fn coverpoint_expr_type(
                         &format!("extern function `{name}` argument {}", idx + 1),
                     )?;
                 }
-                Ok(IrType::UInt(Some(64)))
+                require_scalar(prog, ret, &format!("extern function `{name}` return"))?;
+                Ok(ret.clone())
             }
             other => Err(format!("unsupported coverpoint call target `{other:?}`")),
         },

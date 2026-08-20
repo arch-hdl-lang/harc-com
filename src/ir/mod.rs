@@ -1268,10 +1268,18 @@ pub struct ComponentFieldSchema {
     pub activation: Activation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedVecSchema {
+    pub elem: IrType,
+    pub len: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
     Scalar { ty: IrType, default: u64 },
+    /// `words : Vec<uint<64>, 4>` — fixed, by-value component state.
+    FixedVec(FixedVecSchema),
     /// `current : Sample` — a value-record held as persistent host-side
     /// component/transactor state.
     Record { record: RecordId },
@@ -1912,6 +1920,12 @@ pub struct TbFunction {
     /// the backend emits `return <ret>;` at `Terminator::Return`.
     /// `None` for run/check functions (their `Return` carries no value).
     pub ret: Option<LocalId>,
+    /// Return blocks synthesized from a source body's natural fallthrough.
+    /// Explicit source `return` statements also lower to
+    /// `Terminator::Return`, so this provenance lets hook-aware emitters
+    /// preserve v1's distinction: post hooks run after natural completion
+    /// but are bypassed by an explicit early return.
+    pub implicit_returns: Vec<BlockId>,
 }
 
 /// Straight-line statements + exactly one terminator. No statement may
@@ -2185,6 +2199,12 @@ pub enum Stmt {
     ComponentFieldWrite {
         base: ComponentBase,
         field: String,
+        value: Expr,
+    },
+    ComponentVecElementWrite {
+        base: ComponentBase,
+        field: String,
+        index: Expr,
         value: Expr,
     },
     /// `emit observed(v)` — fan the args out to every callback registered
@@ -2586,6 +2606,11 @@ pub enum Expr {
         base: ComponentBase,
         field: String,
     },
+    ComponentVecElement {
+        base: ComponentBase,
+        field: String,
+        index: Box<Expr>,
+    },
     /// A whole composite-component value, passed by value as a method
     /// argument: `sb.observe(addr, model)` reads `model` here, where the
     /// callee parameter is component-typed. `base` resolves the receiver
@@ -2777,14 +2802,16 @@ pub enum ScoreboardQuery {
 
 #[derive(Debug, Clone)]
 pub enum CallTarget {
-    Helper(String),
+    /// Pure helper call plus the declared return type used by caller-side
+    /// local inference and signed/width-sensitive expression emission.
+    Helper { name: String, ret: IrType },
     Builtin(String),
     /// Call to a `extern function name(...) -> ret` (spec §9) — a C
     /// reference model linked in via `--ref-src`. Emitted with the RAW
     /// symbol name (no `harc_helper_` mangling) so it resolves against
     /// the user-provided `extern "C"` definition; the forward
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
-    ExternFn(String),
+    ExternFn { name: String, ret: IrType },
     TransactorMethod {
         bus_field: String,
         method: String,

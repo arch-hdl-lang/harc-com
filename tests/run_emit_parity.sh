@@ -107,12 +107,10 @@ flatten_log() {
 # Is a rejection one where `--codegen v1` is a REAL escape hatch?
 #
 # It is not enough to look for the flag. Five distinct diagnostics name
-# it, and only two of them mean "use v1 instead":
+# it, and only one means "use v1 instead":
 #
 #   ESCAPE HATCHES
 #     LowerError::Unsupported     "; re-run with `--codegen v1`"
-#     tbir emitter (EmitError)    "use --codegen v1 for wide shifts"
-#                                 (src/codegen/tbir/expr.rs)
 #   NOT ESCAPE HATCHES — v1 is broken on the construct
 #     NotImplemented/Rejects            "`--codegen v1` does not implement it either"
 #     NotImplemented/EmitsUncompilable  "`--codegen v1` accepts it but emits C++ that does not compile"
@@ -126,7 +124,6 @@ is_subset_gap() {
     f="$(flatten_log "$1")"
     case "$f" in
         *'re-runwith`--codegenv1`'*) return 0 ;;
-        *'use--codegenv1for'*)       return 0 ;;
     esac
     return 1
 }

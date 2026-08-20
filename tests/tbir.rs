@@ -444,8 +444,8 @@ end test T"#,
 /// shift operand's width, so `(wide & 0xFF) >> 4` is a 64-bit-safe shift
 /// even when `wide` is `uint<128>` — the guard must not reject it (it
 /// did, by taking the max over `&` operands). The unmasked wide operand
-/// must still reject, in BOTH directions — `<<` previously had no guard
-/// and silently emitted a wrong 64-bit shift.
+/// must use width-aware helpers in BOTH directions — `<<` previously had
+/// no guard and silently emitted a wrong 64-bit shift.
 #[test]
 fn wide_shift_guard_is_mask_aware_and_symmetric() {
     let masked = r#"const M : uint<8> = 0xF0
@@ -464,7 +464,10 @@ end test T"#;
         "masked wide operand must emit a plain 64-bit shift; got:\n{cpp}"
     );
 
-    for (expr, dir) in [("wide >> 1", "right"), ("wide << 1", "left")] {
+    for (expr, helper) in [
+        ("wide >> 1", "harc_rt::harc_shr_u128"),
+        ("wide << 1", "harc_rt::harc_shl_u128"),
+    ] {
         let src = format!(
             r#"test T
     let dut : Top
@@ -475,15 +478,10 @@ end test T"#;
     end run
 end test T"#
         );
-        let merged = merged_src(&src);
-        let prog = lower::lower_program(&merged).expect("lowers");
-        verify::verify_program(&prog).expect("verifies");
-        let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
-            .expect_err("unmasked wide shift must fail emission");
-        let msg = format!("{err:?}");
+        let cpp = emit_cpp_src(&src);
         assert!(
-            msg.contains(&format!("{dir} shift above 64 bits")),
-            "wide `{expr}` must reject with a {dir}-shift emit error; got: {msg}"
+            cpp.contains(helper),
+            "wide `{expr}` must use `{helper}`; got:\n{cpp}"
         );
     }
 }
@@ -965,8 +963,8 @@ end test T"#,
 }
 
 #[test]
-fn signed_wide_right_shift_is_rejected_in_tbir() {
-    let err = emit_cpp_src_result(
+fn signed_wide_right_shift_uses_declared_width_arithmetic_helper() {
+    let cpp = emit_cpp_src(
         r#"test T
         let dut : Top
     run
@@ -976,11 +974,10 @@ fn signed_wide_right_shift_is_rejected_in_tbir() {
         assert ((1 + wide) >> 1) == 0 else fail("wide-rhs-shr")
     end run
 end test T"#,
-    )
-    .expect_err("TB-IR must not silently truncate signed shifts above 64 bits");
+    );
     assert!(
-        err.contains("right shift above 64 bits"),
-        "wide signed shift must have a targeted diagnostic; got: {err}"
+        cpp.matches("harc_rt::harc_ashr_u128").count() >= 3,
+        "wide signed shifts must use the arithmetic helper: {cpp}"
     );
 }
 
@@ -9280,12 +9277,6 @@ end test T"#
     // draw that fills it — a working escape hatch. A scalar row is
     // width-correct at any width; a container row keeps its shape.
     for (ty, shape, draw) in [
-        ("uint<65>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("uint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("sint<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("bits<128>", "_harc_u128 data = 0;", "harc_rng_u128"),
-        ("uint<200>", "harc_rt::HarcWide<7> data = 0;", "harc_rng_wide<7>"),
-        ("uint<256>", "harc_rt::HarcWide<8> data = 0;", "harc_rng_wide<8>"),
         ("list<uint<8>>", "std::vector<uint64_t> data", "data[_i] = harc_rt::random::harc_rng_uint"),
         (
             "list<uint<256>>",
@@ -9310,12 +9301,6 @@ end test T"#
         // mirrors. Pinned because the `Int` arm of `scalar_leaf_c_type`
         // had nothing measuring it.
         ("Vec<int, 4>", "std::array<uint64_t, 4> data", "data = {}"),
-        ("Vec<uint<128>, 4>", "std::array<_harc_u128, 4> data", "data = {}"),
-        (
-            "Vec<uint<256>, 4>",
-            "std::array<harc_rt::HarcWide<8>, 4> data",
-            "data = {}",
-        ),
         (
             "Vec<Vec<uint<8>, 2>, 4>",
             "std::array<std::array<uint64_t, 2>, 4> data",
@@ -9397,6 +9382,116 @@ end test T"#
         let v1 = cpp_tb::emit(&merged_src(&field(ty))).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
         assert!(v1.contains(marker), "`{ty}`: v1 emits `{marker}`");
     }
+}
+
+#[test]
+fn wide_scalar_record_leaves_reuse_the_standalone_storage_and_unpack_model() {
+    let src = r#"
+struct WideState
+    value : uint<256>
+    mid   : uint<128>
+    odd   : uint<65>
+    tag   : uint<3>
+    lanes : Vec<uint<130>, 2>
+end struct WideState
+
+test WideRecordTest
+    let dut : Top
+    run
+        let src : uint<256> = 1
+        let a : WideState
+        a.value = src << 200
+        a.tag = 5
+        let b : WideState = a
+        assert b == a else fail("record copy changed the value")
+        assert b.value[207:193] == 128 else fail("high slice changed")
+    end run
+end test WideRecordTest
+"#;
+    let prog = lower_src(src).expect("wide record lowers");
+    let record = prog.records.iter().find(|r| r.name == "WideState").unwrap();
+    assert!(matches!(record.field("value").unwrap().ty, ir::IrType::UInt(Some(256))));
+    assert!(matches!(record.field("mid").unwrap().ty, ir::IrType::UInt(Some(128))));
+    assert!(matches!(record.field("odd").unwrap().ty, ir::IrType::UInt(Some(65))));
+    assert_eq!(record.field("lanes").unwrap().vec_len, Some(2));
+
+    let cpp = emit_cpp_src(src);
+    for want in [
+        "harc_rt::HarcWide<8> value = 0;",
+        "_harc_u128 mid = 0;",
+        "_harc_u128 odd = 0;",
+        "std::array<harc_rt::HarcWide<5>, 2> lanes = {};",
+        "harc_wide_extract_bits<8>(_packed, 456, 256)",
+        "harc_wide_extract_bits<5>(_packed, 0, 130)",
+        "harc_wide_mask_bits(((src) << (200)), 256)",
+        "harc_bits((b.value), 207, 193)",
+    ] {
+        assert!(cpp.contains(want), "expected `{want}` in:\n{cpp}");
+    }
+
+}
+
+#[test]
+fn wide_record_fields_in_transactor_and_component_state_keep_their_declared_width() {
+    let src = r#"
+struct WideState
+    odd  : uint<130>
+    sign : sint<65>
+end struct WideState
+
+transactor WideTransactor
+    cur : WideState
+
+    hookable verify()
+        assert (cur.odd << 1) == 0 else fail("transactor unsigned shift")
+        assert (cur.sign >> 64) == 0 - 1 else fail("transactor signed shift")
+    end verify
+end transactor WideTransactor
+
+agent WideAgent
+    cur : WideState
+end agent WideAgent
+
+testbench WideStateTb
+    dut : Top
+    tx  : WideTransactor active
+    ag  : WideAgent
+end testbench WideStateTb
+
+impl WideStateTest for WideStateTb
+    run
+        let one : uint<130> = 1
+        tx.cur.odd = one << 129
+        tx.cur.sign = (one.trunc<65>() << 64) as sint<65>
+        tx.verify()
+
+        ag.cur.odd = one << 129
+        ag.cur.sign = (one.trunc<65>() << 64) as sint<65>
+        assert (ag.cur.odd << 1) == 0 else fail("component unsigned shift")
+        assert (ag.cur.sign >> 64) == 0 - 1 else fail("component signed shift")
+    end run
+end impl WideStateTest
+"#;
+
+    let cpp = emit_cpp_src(src);
+    for want in [
+        "harc_rt::harc_wide_mask_bits(((self.cur.odd) << (1)), 130)",
+        "harc_rt::harc_ashr_u128((_harc_u128)(self.cur.sign), (uint64_t)(64), 65)",
+        "harc_rt::harc_wide_mask_bits(((ag.cur.odd) << (1)), 130)",
+        "harc_rt::harc_ashr_u128((_harc_u128)(ag.cur.sign), (uint64_t)(64), 65)",
+    ] {
+        assert!(cpp.contains(want), "expected `{want}` in:\n{cpp}");
+    }
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits persistent wide record shifts");
+    assert!(
+        v1.matches("harc_rt::harc_wide_mask_bits").count() >= 2,
+        "v1 must mask both declared-width record left shifts:\n{v1}"
+    );
+    assert!(
+        v1.matches("harc_rt::harc_ashr_u128").count() >= 2,
+        "v1 must arithmetic-shift both signed record fields:\n{v1}"
+    );
 }
 
 /// A width slot this compiler cannot read as a plain decimal.
@@ -10767,11 +10862,49 @@ fn helper_categorization_pure_vs_impure() {
     assert_eq!(waits, 2, "one inlined wait per read_addr call:\n{run}");
     let calls_double_it = run.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| {
-            matches!(s, ir::Stmt::Assign(_, e)
-                if format!("{:?}", e).contains("Helper(\"double_it\")"))
+            matches!(s, ir::Stmt::Assign(
+                _,
+                ir::Expr::Call(ir::CallTarget::Helper { name, .. }, _)
+            ) if name == "double_it")
         })
     });
     assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
+}
+
+/// Declared call-result metadata participates in invariant 15 just like
+/// literals and locals, so a pass cannot silently route an unsigned helper
+/// result into a signed destination of the same width.
+#[test]
+fn verifier_rejects_call_result_type_mismatch() {
+    let mut prog = lower_src(HELPER_MIX_SRC).expect("lowers");
+    let run_idx = prog.tests[0].run.index();
+    let call_dest = prog.functions[run_idx]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Helper { name, .. }, _))
+                if name == "double_it" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("run calls the pure helper");
+    prog.functions[run_idx].locals[call_dest.index()].ty = ir::IrType::SInt(Some(8));
+
+    let errs = verify::verify_program(&prog).expect_err("call result mismatch is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::TypeMismatch {
+                expected: ir::IrType::SInt(Some(8)),
+                actual: ir::IrType::UInt(Some(8)),
+                ..
+            }
+        )),
+        "{errs:?}"
+    );
 }
 
 /// Param remapping: each inline site gets fresh locals for the helper's
@@ -11894,6 +12027,57 @@ end impl HookHelperCovTest
     assert!(
         sb_decl < hook_registration,
         "component instance must be declared before hook sampler registration: {cpp}"
+    );
+}
+
+#[test]
+fn covergroup_hook_helper_int_and_time_returns_use_helper_local_types() {
+    let src = r#"
+function as_int(x: uint<8>) -> int
+    return x
+end function as_int
+
+function as_time(x: uint<8>) -> time
+    return x
+end function as_time
+
+scoreboard SampleSb
+    hookable observe(v: uint<8>)
+    end observe
+end scoreboard SampleSb
+
+covergroup IntTimeHookCov @(sb.observe(v) post)
+    cp_int : cover as_int(v)
+        bins
+            one = {1}
+        end bins
+    cp_time : cover as_time(v)
+        bins
+            one = {1}
+        end bins
+end covergroup IntTimeHookCov
+
+testbench CoverIntTimeHookTb
+    dut : Top
+    sb  : SampleSb
+    cov : IntTimeHookCov
+end testbench CoverIntTimeHookTb
+
+impl CoverIntTimeHook for CoverIntTimeHookTb
+    run
+        sb.observe(1)
+        wait 1 cycle
+    end run
+end impl CoverIntTimeHook
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("int/time helper coverpoints lower");
+    verify::verify_program(&prog).expect("int/time helper coverpoints verify");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("int/time helper coverpoints emit");
+    assert!(
+        cpp.contains("harc_helper_as_int(v)") && cpp.contains("harc_helper_as_time(v)"),
+        "both helper calls survive in the hook sampler: {cpp}"
     );
 }
 
@@ -17162,6 +17346,54 @@ end test T"#,
     }
 }
 
+/// Helper and extern call targets carry their exact declared result type,
+/// so incompatible explicit destinations get the source-level assignment
+/// diagnostic while ordinary same-signed widening remains valid.
+#[test]
+fn call_result_assignment_checks_signedness_and_narrowing() {
+    lower_src(
+        r#"extern function ext_u8() -> uint<8>
+
+test T
+    let dut : Top
+    run
+        let widened : uint<16> = ext_u8()
+    end run
+end test T"#,
+    )
+    .expect("same-signed call result widening lowers");
+
+    for (src, want) in [
+        (
+            r#"function helper_u8() -> uint<8>
+    return 1
+end function helper_u8
+
+test T
+    let dut : Top
+    run
+        let signed : sint<8> = helper_u8()
+    end run
+end test T"#,
+            "Signedness must match",
+        ),
+        (
+            r#"extern function ext_u16() -> uint<16>
+
+test T
+    let dut : Top
+    run
+        let narrow : uint<8> = ext_u16()
+    end run
+end test T"#,
+            "narrows",
+        ),
+    ] {
+        let err = lower_src(src).expect_err("incompatible call result is rejected");
+        assert!(err.to_string().contains(want), "{err}");
+    }
+}
+
 /// The narrowing check is scoped to the shapes the verifier itself types.
 /// A value provably masked below the declared width (`(wide & 0xFF) >> 4`
 /// into a `uint<8>`) must still lower — lowering's own expression typing
@@ -18827,8 +19059,8 @@ end impl T"#
         );
     }
 
-    // Literal bounds keep folding into the shift-and-mask form — the
-    // helper is the fallback for unknown widths, not a replacement.
+    // Literal bounds use the same width-aware helper so high and
+    // cross-word slices never cast their source down to uint64_t.
     let cpp = emit_cpp_src(
         r#"testbench Tb
     dut : Top
@@ -18841,8 +19073,8 @@ impl T for Tb
 end impl T"#,
     );
     assert!(
-        !cpp.contains("harc_rt::harc_bits("),
-        "a constant slice must still fold to a shift and mask:\n{cpp}"
+        cpp.contains("harc_rt::harc_bits("),
+        "a constant slice must use the width-aware helper:\n{cpp}"
     );
 }
 
@@ -29324,5 +29556,157 @@ end impl T"#;
     assert!(
         assert_invalid(&err).contains("does not name a `hookable`"),
         "the diagnostic must distinguish a plain function from a hookable: {err}"
+    );
+}
+
+#[test]
+fn component_fixed_vec_elements_lower_emit_and_remain_per_instance() {
+    let src = r#"scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable store(index: uint<32>, value: uint<64>)
+        words[index] = value
+        flags[index] = true
+    end store
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        a.store(2, 0x1234)
+        b.store(2, 0x5678)
+        assert a.flags[2] else fail("a flag")
+        assert a.words[2] == 0x1234 else fail("a value")
+        assert b.words[2] == 0x5678 else fail("b value")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("direct component Vec lowers");
+    let table = prog.components.iter().find(|c| c.name == "Table").unwrap();
+    assert!(matches!(
+        &table.field("words").unwrap().kind,
+        ir::ComponentFieldKind::FixedVec(v)
+            if v.elem == ir::IrType::UInt(Some(64)) && v.len == 4
+    ));
+    verify::verify_program(&prog).expect("component Vec IR verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("std::array<uint64_t, 4> words{};"), "{cpp}");
+    assert!(cpp.contains("std::array<bool, 4> flags{};"), "{cpp}");
+    assert!(cpp.contains("self.words[index] = value;"), "{cpp}");
+    assert!(cpp.contains("a.words[2]"), "{cpp}");
+    assert!(cpp.contains("b.words[2]"), "{cpp}");
+}
+
+#[test]
+fn component_fixed_vec_literal_bounds_and_defaults_are_precise() {
+    let base = r#"scoreboard Table
+    words : Vec<uint<8>, 2>
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+testbench Tb
+    dut : Top
+    table : Table
+end testbench Tb
+impl T for Tb
+    run
+        table.words[2] = 1
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(base).expect_err("literal index equal to length is rejected");
+    assert!(
+        err.to_string().contains(
+            "element index 2 is out of range for component `Vec` field `table.words` of length 2"
+        ),
+        "{err}"
+    );
+
+    let defaulted = base.replace(
+        "words : Vec<uint<8>, 2>",
+        "words : Vec<uint<8>, 2> default 0",
+    );
+    let err = lower_src(&defaulted).expect_err("aggregate default is rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("default value on fixed-vector field `Table.words`"), "{msg}");
+}
+
+#[test]
+fn nested_self_component_vec_preserves_element_width_and_signedness() {
+    let src = r#"scoreboard Leaf
+    bytes : Vec<uint<8>, 2>
+    signed_values : Vec<sint<8>, 2>
+    hookable seed()
+        bytes[0] = bytes[0]
+    end seed
+end scoreboard Leaf
+
+scoreboard Parent
+    child : Leaf
+    inverted : uint<8> default 0
+    shifted : sint<8> default 0
+    hookable update()
+        inverted = ~child.bytes[0]
+        shifted = child.signed_values[0] >> 1
+    end update
+end scoreboard Parent
+
+testbench Tb
+    dut : Top
+    parent : Parent
+end testbench Tb
+
+impl T for Tb
+    run
+        parent.child.bytes[0] = 0
+        parent.child.signed_values[0] = -8
+        parent.update()
+        assert parent.inverted == 255 else fail("narrow bit-not")
+        assert parent.shifted == -4 else fail("signed shift")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("~(self.child.bytes[0]) & 0xFFULL"),
+        "nested vector width must drive bit-not masking:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("((int64_t)(self.child.signed_values[0])) >> 1"),
+        "nested signed vector element must use arithmetic shift:\n{cpp}"
+    );
+}
+
+#[test]
+fn test_scope_component_named_self_keeps_vector_element_metadata() {
+    let src = r#"scoreboard Values
+    signed_values : Vec<sint<8>, 1>
+    hookable seed()
+        signed_values[0] = signed_values[0]
+    end seed
+end scoreboard Values
+testbench Tb
+    dut : Top
+    self : Values
+end testbench Tb
+impl T for Tb
+    run
+        self.signed_values[0] = -8
+        assert (self.signed_values[0] >> 1) == -4 else fail("signed shift")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("((int64_t)(self.signed_values[0])) >> 1"),
+        "a real test-scope `self` binding must win over the component sentinel:\n{cpp}"
     );
 }

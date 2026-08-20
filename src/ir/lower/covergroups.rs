@@ -638,7 +638,16 @@ fn lower_point_target(
                             extern_fns,
                             consts,
                         )?;
-                        return Ok(Expr::Call(CallTarget::Helper(id.name.clone()), args));
+                        return Ok(Expr::Call(
+                            CallTarget::Helper {
+                                name: id.name.clone(),
+                                ret: super::helpers::ir_type_of_with_records(
+                                    entry.decl.return_ty.as_ref(),
+                                    &HashMap::new(),
+                                ),
+                            },
+                            args,
+                        ));
                     }
                     if let Some(decl) = extern_fns.get(&id.name) {
                         if args.len() != decl.params.len() {
@@ -662,7 +671,16 @@ fn lower_point_target(
                             extern_fns,
                             consts,
                         )?;
-                        return Ok(Expr::Call(CallTarget::ExternFn(id.name.clone()), args));
+                        return Ok(Expr::Call(
+                            CallTarget::ExternFn {
+                                name: id.name.clone(),
+                                ret: super::helpers::slot_ir_type(
+                                    decl.return_ty.as_ref(),
+                                    &HashMap::new(),
+                                ),
+                            },
+                            args,
+                        ));
                     }
                 }
                 if let ExprKind::Field { target: recv, name } = &*callee.kind {

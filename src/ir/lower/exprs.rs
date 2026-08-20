@@ -322,6 +322,12 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
+                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
+                    return Err(unsupported(
+                        &format!("whole-vector read of component field `{field}`"),
+                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
+                    ));
+                }
                 // Whole composite-component value read — a self sub-component
                 // field passed by value as a method arg (`sb.observe(addr,
                 // model)`). Locals shadow (checked above).
@@ -447,6 +453,12 @@ impl FuncBuilder<'_> {
                 // path (`env.sb.count`).
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
+                }
+                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
+                    return Err(unsupported(
+                        &format!("whole-vector read of component field `{field}`"),
+                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
+                    ));
                 }
                 // `r.field` read on a `recv()`-captured payload local
                 // (`let r = bus.<ch>.recv(); ... r.data`). Each payload
@@ -834,6 +846,15 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::Index { target, index } => {
+                if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
+                    let index = self.lower_expr(index)?;
+                    check_literal_component_vec_index_bounds(&base, &field, &index, vec.len)?;
+                    return Ok(Expr::ComponentVecElement {
+                        base,
+                        field,
+                        index: Box::new(index),
+                    });
+                }
                 // `rec.data[i]` — element read of a `Vec<T, N>` record
                 // field. The target is a record-field access on a
                 // record-typed local; lower it to an indexed
@@ -1643,6 +1664,10 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
+            Expr::ComponentVecElement { base, field, index } => {
+                let index = self.hoist_ports_with_hint(*index, None);
+                Expr::ComponentVecElement { base, field, index: Box::new(index) }
+            }
             // An indexed `Vec`-field read carries index sub-exprs (the
             // leaf `[i]` and any mid-chain `entries[i].…` selections),
             // which may hold DUT ports; hoist into each. A plain scalar
@@ -1741,6 +1766,11 @@ impl FuncBuilder<'_> {
                 WidthCastKind::Sext => IrType::SInt(Some(*width)),
                 _ => IrType::UInt(Some(*width)),
             }),
+            Expr::Call(
+                crate::ir::CallTarget::Helper { ret, .. }
+                | crate::ir::CallTarget::ExternFn { ret, .. },
+                _,
+            ) => Some(ret.clone()),
             // A record-field chain types as its leaf: the leaf field's own
             // scalar/record type, or the element type when the leaf `Vec`
             // is indexed. A whole (unindexed) `Vec` leaf is an array — it
@@ -1771,6 +1801,13 @@ impl FuncBuilder<'_> {
                     }
                 }
                 None
+            }
+            Expr::ComponentVecElement { base, field, .. } => {
+                let cid = self.component_base_id(base)?;
+                match &self.ctx.components.get(cid.index())?.field(field)?.kind {
+                    crate::ir::ComponentFieldKind::FixedVec(vec) => Some(vec.elem.clone()),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -1880,6 +1917,10 @@ impl FuncBuilder<'_> {
                     seq,
                     index: Box::new(index),
                 }
+            }
+            Expr::ComponentVecElement { base, field, index } => {
+                let index = self.hoist_transactor_calls(*index);
+                Expr::ComponentVecElement { base, field, index: Box::new(index) }
             }
             Expr::Call(t, args) => {
                 let args = args
@@ -3176,6 +3217,32 @@ pub(crate) fn check_literal_vec_index_bounds(
     Err(LowerError::Invalid(format!(
         "element index {value} is out of range for `Vec` record field \
          `{dotted}` of length {len} (valid indices are 0..={})",
+        len.saturating_sub(1)
+    )))
+}
+
+pub(crate) fn check_literal_component_vec_index_bounds(
+    base: &crate::ir::ComponentBase,
+    field: &str,
+    idx: &Expr,
+    len: usize,
+) -> Result<(), LowerError> {
+    let Expr::Literal { value, .. } = idx else {
+        return Ok(());
+    };
+    if (*value as u128) < len as u128 {
+        return Ok(());
+    }
+    let access = match base {
+        crate::ir::ComponentBase::SelfField => field.to_string(),
+        crate::ir::ComponentBase::Path(path) => {
+            format!("{}.{field}", path.join("."))
+        }
+        crate::ir::ComponentBase::Local(_) => field.to_string(),
+    };
+    Err(LowerError::Invalid(format!(
+        "element index {value} is out of range for component `Vec` field \
+         `{access}` of length {len} (valid indices are 0..={})",
         len.saturating_sub(1)
     )))
 }
