@@ -3416,9 +3416,7 @@ pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
 fn const_eval_width(e: &AstExpr) -> Option<u32> {
     match &*e.kind {
         ExprKind::Paren(inner) => const_eval_width(inner),
-        // v1 folds a sized bound here: `dut.count_out[4'd3:0]` emits
-        // `harc_bits(..., (uint32_t)(3), (uint32_t)(0))`. Measured.
-        ExprKind::Int(s) => parse_sized_or_plain_literal(s).and_then(|v| u32::try_from(v).ok()),
+        ExprKind::Int(s) => parse_int_literal(s).and_then(|v| u32::try_from(v).ok()),
         _ => None,
     }
 }
@@ -3646,36 +3644,8 @@ fn wide_literal_bits(words: &[u32]) -> u32 {
     (idx as u32) * 32 + (32 - word.leading_zeros())
 }
 
-/// Parse a plain integer literal (decimal / `0x` / `0b` / `0o`, `_`
-/// separators). Verilog-style SIZED literals are deliberately not
-/// handled here — see [`parse_sized_or_plain_literal`], which is what
-/// the positions v1 also folds use.
-/// The value of a literal in a position where v1 ALSO folds it: an
-/// ARCH-style sized literal (`8'hFF`, `4'b1010`, `8'd42`) as well as
-/// every plain form.
-///
-/// Normalized by `cpp_tb::normalized_int_literal` — the same function
-/// v1 folds through — rather than by a second parser here, so the two
-/// backends cannot disagree about what a literal means.
-///
-/// **Only for a literal that is the WHOLE expression.** v1's
-/// `c_int_literal_from` matches `ExprKind::Int` and nothing else, so a
-/// sized literal that is merely parenthesised, or one operand of an
-/// arithmetic expression, hits v1's `"0"` arm and silently yields ZERO.
-/// Folding those in TB-IR would make the backends disagree on a
-/// program both accept — measured: `@ (32'h18)` is offset 24 if this
-/// is used blindly and offset 0 under v1. Callers that walk into a
-/// sub-expression must keep using [`parse_int_literal`].
-///
-/// `None` when the value does not fit 64 bits: as
-/// `normalized_int_literal`'s own doc says, "the width prefix is NOT
-/// the value" — `4'd3` is a correct `3`, while `128'hFF…FF` is a
-/// 128-bit composite a 64-bit domain would truncate. An overflowing
-/// parse answers `None`, so every caller keeps its existing refusal.
-pub(crate) fn parse_sized_or_plain_literal(s: &str) -> Option<u64> {
-    parse_int_literal(&crate::codegen::cpp_tb::normalized_int_literal(s))
-}
-
+/// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
+/// separators). Verilog-style sized literals are not lowered.
 pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     let t = s.replace('_', "");
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {

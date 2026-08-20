@@ -8253,52 +8253,6 @@ former `transaction` group lives in
      suspicious — but it is the reason the sweep measures rather than
      reasons about what v1 "must" do.
 
-129. **Sized literals: one cause, five sites, and a rule that is not
-     global (2026-08-20).**
-
-     Seventeen refusals across five files said "TB-IR does not lower
-     sized literals". All of them traced to one function: the lowerer's
-     `parse_int_literal` handled `0x` / `0b` / `0o` / decimal and
-     stopped at the apostrophe. `const CH : uint<32> = 8'hFF` was
-     refused with "does not fit the 64-bit constant-evaluation domain",
-     which is not even the reason — 0xFF plainly fits.
-
-     The fix routes through `cpp_tb::normalized_int_literal`, the SAME
-     function v1 folds with, rather than a second parser. Its own doc
-     names the trap: "the width prefix is NOT the value" — `4'd3` is a
-     correct `3`, while `128'hFF…FF` is a 128-bit composite a 64-bit
-     domain would truncate. Going through it means an overflowing parse
-     answers `None`, so every caller keeps its existing refusal there.
-
-     **The first cut was global, and it would have shipped a
-     divergence.** v1 does not answer the same way in every context:
-
-     | context | `(32'h18)` under v1 |
-     |---|---|
-     | regblock/addrmap address TABLE | **0** — `c_int_literal_from` matches a bare `ExprKind::Int` and nothing else |
-     | coverpoint sample | correct — rendered by `emit_expr` |
-
-     Flipping the shared parser made tbir fold `(32'h18)` to 24 where
-     v1 yields 0: two backends silently disagreeing on a program both
-     accept, which is what the equivalence gate exists to prevent. An
-     existing test pinned that measurement and caught it.
-
-     So the fold lives in a second function,
-     `parse_sized_or_plain_literal`, wired only where v1's behaviour was
-     measured: coverpoint target, bin bound, bin range end, BARE
-     regblock/addrmap address, record field default. The strict parser
-     stays everywhere else, including one detector
-     (`first_unfoldable_int_literal`) that feeds a folder which still
-     reads plain literals only — accepting a literal there that
-     `fold_const` then rejects would report "not a compile-time
-     constant" for something just called foldable.
-
-     The general expression position (`let z = dut.count_out[4'd3:0]`)
-     is still refused, by a third site again. Each remaining position
-     needs its own measurement; "v1 folds sized literals" is not a fact
-     about the language, it is a fact about a particular emitter
-     function in a particular context.
-
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
