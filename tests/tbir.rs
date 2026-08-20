@@ -9328,30 +9328,65 @@ end impl T
     lower_src(&control_src).expect("the control lowers");
     let control_v1 = cpp_tb::emit(&merged_src(&control_src)).expect("v1 emits the control");
 
-    // ── the directional guard admits two shapes ───────────────────
-    // An EVENT field: v1 emits the subscriber vector and it works, so
-    // `--codegen v1` is a real way out.
-    let msg = assert_unsupported(&lower_src(&prog("    ev : out event<uint<8>>")).unwrap_err());
-    assert!(msg.contains("directional event field"), "{msg}");
+    // ── the directional guard: the EVENT half is itself mixed ────────
+    // `Unsupported` holds only where v1 declares the payload AND there
+    // is no default. Probing `out event<uint<8>>` alone said the whole
+    // event half was a real escape hatch; it is not.
+    for ok in [
+        "    ev : out event<uint<8>>",
+        "    ev : out event<uint<128>>",
+        // v1 DECLARES a record, so the subscriber signature resolves.
+        "    ev : out event<Beat>",
+    ] {
+        let msg = assert_unsupported(&lower_src(&prog(ok)).unwrap_err());
+        assert!(msg.contains("directional event field"), "`{ok}`: {msg}");
+        cpp_tb::emit(&merged_src(&prog(ok))).expect("v1 emits");
+    }
     assert!(
         cpp_tb::emit(&merged_src(&prog("    ev : out event<uint<8>>")))
             .expect("v1 emits")
             .contains("std::vector<std::function<void(uint64_t)>> ev;"),
         "v1 gives an event field a real subscriber vector"
     );
-
-    // A directional SCALAR: v1 emits `uint64_t p;` — the direction
-    // DROPPED — and the file compiles. Pointing there hands the user a
-    // program that means something else.
-    let err = lower_src(&prog("    p : in uint<8>")).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("directional scalar field"), "{msg}");
+    // An ENUM payload: v1 emits no C++ enum at all, so the name in the
+    // subscriber signature is undeclared (measured: 5 g++ errors).
+    let err = lower_src(&prog("    ev : out event<Color>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("undeclared payload type"), "{msg}");
     assert!(
-        cpp_tb::emit(&merged_src(&prog("    p : in uint<8>")))
+        !cpp_tb::emit(&merged_src(&prog("    ev : out event<Color>")))
             .expect("v1 emits")
-            .contains("uint64_t p;"),
-        "v1 drops the direction and emits a plain scalar member"
+            .contains("enum Color"),
+        "v1 never declares the enum it names"
     );
+    // …and a `default` on an event field: pasted into the vector's
+    // initialiser, which does not convert.
+    let err = lower_src(&prog("    ev : out event<uint<8>> default 0")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("event field"), "{msg}");
+    assert!(msg.contains("with a default"), "{msg}");
+
+    // A directional NON-EVENT field: v1 emits the member for the
+    // field's own type and DROPS the direction, and the file compiles.
+    // Pointing there hands the user a program that means something else.
+    for (field, needle) in [
+        ("    p : in uint<8>", "uint64_t p;"),
+        // Not a "scalar" — the arm catches every non-event shape.
+        ("    v : in Vec<uint<8>, 4>", "std::array<uint64_t, 4> v{};"),
+    ] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("directional non-event field"),
+            "`{field}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(field)))
+                .expect("v1 emits")
+                .contains(needle),
+            "`{field}`: v1 emits `{needle}` with the direction gone"
+        );
+    }
 
     // ── the non-scalar guard admits five, and `stream` sets the label ─
     for (field, needle) in [
@@ -9429,13 +9464,60 @@ impl T for Tb
 end impl T
 "#;
     let msg = lower_src(unbound).unwrap_err().to_string();
+    // `contains("transactor `Poker` …")` alone would be satisfied by the
+    // OLD wrong message, which contains it as a suffix. The label has to
+    // be pinned exactly.
     assert!(
-        msg.contains("transactor `Poker` state field `v`"),
-        "the unbound form names itself: {msg}"
+        msg.contains("HARC does not implement transactor `Poker` state field `v`"),
+        "the unbound form names itself exactly: {msg}"
     );
+
+    // …and the two initiator-side sites, which say something different
+    // again. Without a case each, a mutant that collapses
+    // `StateFieldOwner` to one string survives the whole test — the
+    // first round's did.
+    let initiator = r#"
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    n : uint<32> default 0
+    v : Vec<uint<8>, 4>
+
+    hookable poke()
+        n = n + 1
+    end poke
+end transactor AxilHelper
+
+testbench Tb
+    dut : AxiLiteRegs
+end testbench Tb
+
+impl T for Tb
+    let axil : BusAxiLite = bind dut
+    let h : AxilHelper active = bind axil
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    let msg = lower_with_stdlib_bus_src(initiator)
+        .unwrap_err()
+        .to_string();
     assert!(
-        !msg.contains("bound-to transactor `Poker`"),
-        "…and does not claim to be bound to anything: {msg}"
+        msg.contains("initiator-side bound-to transactor `AxilHelper` state field `v`"),
+        "the initiator form names itself: {msg}"
+    );
+
+    // The bound-TARGET label, pinned on a row above that only checked
+    // the construct.
+    let msg = lower_src(&prog("    v : Vec<uint<8>, 4>"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("bound-to transactor `TlmMemTarget` state field `v`")
+            && !msg.contains("initiator-side"),
+        "the bound-target form names itself: {msg}"
     );
 
     // ── generic application: dropped without a word ──────────────────

@@ -8237,9 +8237,10 @@ former `transaction` group lives in
      | `f.direction.is_some()` | `out event<T>` — v1 emits a real subscriber vector | a directional SCALAR — v1 emits `uint64_t p;`, the direction DROPPED, and it compiles |
      | `tb_scalar_field_ir_type(..) == None` | `Vec<uint<8>, 4>` — v1 emits a usable `std::array` | `stream`/`buffer` — v1 emits a bare `uint64_t`, which compiles and is not a stream; and enums, which do not compile at all |
 
-     Both arms take `SilentlyMisLowers` now, because an arm's verdict is
-     the worst thing v1 does anywhere under it and both extra landings
-     are that.
+     The non-event and non-scalar arms take `SilentlyMisLowers`, because
+     an arm's verdict is the worst thing v1 does anywhere under it. The
+     directional arm was SPLIT rather than relabelled — see below, where
+     the event half turned out to be mixed too.
 
      **The directional split already existed in this file.**
      `lower_unbound_item` separates the event half from the scalar half
@@ -8254,10 +8255,9 @@ former `transaction` group lives in
      - **The two `default` arms are mixed.** `default 0` gives
        `HarcQueue<uint64_t> q = 0;` and g++ refuses it, but
        `format_simple_expr` pastes a bare `Ident` verbatim, so
-       `default q0` naming another queue field compiles. The label
-       (`EmitsUncompilable`, the worst) is unchanged; the comment
-       claiming "there is no `--codegen v1` to send anyone to" was
-       false and is gone.
+       `default q0` naming another queue field compiles. The label is
+       `EmitsUncompilable` — the worst under the arm — where the tree
+       this lands on had `Unsupported`.
      - **`lower_state_field` has four callers**, and every message said
        "bound-to transactor" — including on the unbound DUT-poking form,
        which is bound to nothing, and on the two initiator-side paths,
@@ -8280,6 +8280,54 @@ former `transaction` group lives in
      goes with every row; the control caught an invalid `enum` in the
      probe skeleton that had every row, including itself, reporting "v1
      rejects".
+
+131. **The event half was mixed too, and the fix was unreachable
+     (2026-08-20).**
+
+     Divergence 130 split the directional guard and kept `Unsupported`
+     for the event half, with a comment saying it had been measured. It
+     had been measured on ONE landing — `out event<uint<8>>` — which is
+     the method 130 exists to condemn, applied inside 130 itself.
+
+     The event guard says nothing about the payload type or about
+     `default`, and both vary:
+
+     | landing | v1 |
+     |---|---|
+     | `event<uint<8>>`, `event<uint<128>>`, `event<Beat>` | subscriber vector, 0 g++ errors |
+     | `event<Color>` | v1 emits no C++ enum at all, so the payload name in the signature is undeclared — 5 errors |
+     | `event<T> default 0` | pasted into the vector's initialiser — 1 error |
+
+     `Unsupported` now holds only where v1 declares the payload AND
+     there is no default. `record_ids` is the "does v1 declare this
+     type" test, which is the same map the `queue<Record>` lowering
+     already uses.
+
+     Reading the payload took a second correction: `event<Color>`
+     arrives as `TypeArg::Expr(Ident)`, not `TypeArg::Type`, so the
+     first check silently passed the enum through and the probe still
+     reported `Unsupported`. A guard that cannot see its input is
+     indistinguishable from one that approves of it.
+
+     **And the split was dead code on three of its four call sites.**
+     Both initiator-side paths tested `f.direction.is_some()` and
+     refused two lines above the call, so a directional scalar kept a
+     blanket `Unsupported` there while v1 dropped the direction and
+     compiled — the exact defect 130 opens by describing, still live in
+     the same function. Adding a rule is not the same as reaching the
+     code that needs it: the pre-checks are gone, and
+     `lower_state_field` owns the directional case for all three owners.
+
+     Smaller, same round: the non-event arm called itself "scalar" while
+     catching `in Vec<…>` and `in Beat`; the `uint<N>` wider than 64
+     bits landing was missing from the non-scalar enumeration, and it is
+     one where v1 is CORRECT, so the reason now says so; the generic
+     arm's reason said "a struct type" for an arm spanning transactions
+     and regblock mirrors; and `lower_state_field`'s doc comment had
+     been orphaned onto the new `StateFieldOwner` enum, taking three
+     false claims with it (a transaction-typed field is not out of
+     subset, there is no `guard`/`reset` clause to reject, and
+     `record_ids` is never empty).
 
 ## Next steps
 
