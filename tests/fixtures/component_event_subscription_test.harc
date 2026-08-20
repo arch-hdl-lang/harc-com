@@ -1,0 +1,44 @@
+// Statement-position subscription to an event field on a nested component.
+// The signed payload catches accidental uint64_t coercion in the callback.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent SubscriptionSource
+    obs : out event<sint<8>>
+
+    hookable fire(v: sint<8>)
+        emit obs(v)
+    end fire
+end agent SubscriptionSource
+
+env SubscriptionEnv
+    source : SubscriptionSource
+end env SubscriptionEnv
+
+testbench ComponentEventSubscriptionTb
+    dut  : Top
+    env  : SubscriptionEnv
+    seen : sint<32> default 0
+end testbench ComponentEventSubscriptionTb
+
+impl ComponentEventSubscriptionTest for ComponentEventSubscriptionTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        on env.source.obs(v)
+            seen = seen + v
+        end on
+
+        env.source.fire(-3)
+        wait 1 cycle
+        assert seen == -3 else fail("component event subscriber saw ${seen}, expected -3")
+        log(info, "PASS: component event subscription")
+    end run
+end impl ComponentEventSubscriptionTest

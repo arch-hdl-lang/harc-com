@@ -351,7 +351,9 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             // wherever this block is placed.
             // Fanning out to subscribers is host-side work; the
             // subscriber bodies are their own functions.
-            Stmt::EventSubscribe { .. } | Stmt::EventEmit { .. } => {
+            Stmt::EventSubscribe { .. }
+            | Stmt::MethodHookSubscribe { .. }
+            | Stmt::EventEmit { .. } => {
                 host_service_only = false;
             }
             Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {

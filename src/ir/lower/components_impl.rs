@@ -4137,11 +4137,11 @@ impl super::FuncBuilder<'_> {
     /// The mode context a TEST-SCOPE binding name carries (`env.mon.x`,
     /// rooted at the `env` local). A self-relative head is not keyed here
     /// — see `component_path_head`.
-    fn binding_mode(&self, head_name: &str) -> Option<ComponentInstanceMode> {
+    pub(crate) fn binding_mode(&self, head_name: &str) -> Option<ComponentInstanceMode> {
         self.ctx.component_modes.get(head_name).copied().flatten()
     }
 
-    fn require_component_activation(
+    pub(crate) fn require_component_activation(
         &self,
         head_name: &str,
         head: ComponentId,

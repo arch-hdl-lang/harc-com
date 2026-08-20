@@ -522,9 +522,9 @@ pub(crate) fn lower_transactor(
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
-        if !b.is_terminated() {
-            b.terminate(Terminator::Return);
-        }
+        // Leave natural completion unterminated so `finish` records the
+        // synthesized return in `implicit_returns`. Post hooks fire there,
+        // but must bypass an explicit source `return`.
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
@@ -540,8 +540,6 @@ pub(crate) fn lower_transactor(
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
-            pre_hooks: Vec::new(),
-            post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
@@ -1472,9 +1470,8 @@ fn lower_bound_initiator_transactor(
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
-        if !b.is_terminated() {
-            b.terminate(Terminator::Return);
-        }
+        // Preserve natural-vs-explicit return provenance for post-hook
+        // fan-out (same contract as unbound/component hookable methods).
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
@@ -1495,8 +1492,6 @@ fn lower_bound_initiator_transactor(
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
-            pre_hooks: Vec::new(),
-            post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
