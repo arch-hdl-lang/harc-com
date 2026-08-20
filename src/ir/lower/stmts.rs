@@ -1508,10 +1508,12 @@ impl FuncBuilder<'_> {
         // Only the expression shapes invariant 15's own `expr_type`
         // resolves — exactly the set that would otherwise reach the
         // internal-error channel, so this adds no rejection the verifier
-        // was not already making. A binary/ternary/call RHS is
-        // deliberately excluded: lowering's `expr_type` over-approximates
-        // one as its left operand's declared width, which would reject a
-        // provably narrowed value such as `(wide & 0xFF) >> 4`.
+        // was not already making. A binary/ternary RHS is deliberately
+        // excluded: lowering's `expr_type` over-approximates one as its
+        // left operand's declared width, which would reject a provably
+        // narrowed value such as `(wide & 0xFF) >> 4`. Pure-helper and
+        // extern calls are included because their CallTarget carries the
+        // exact declared return type.
         if !matches!(
             e,
             Expr::Literal { .. }
@@ -1519,6 +1521,10 @@ impl FuncBuilder<'_> {
                 | Expr::Local(_)
                 | Expr::BitSlice { .. }
                 | Expr::WidthCast { .. }
+                | Expr::Call(
+                    crate::ir::CallTarget::Helper { .. } | crate::ir::CallTarget::ExternFn { .. },
+                    _,
+                )
         ) {
             return Ok(());
         }

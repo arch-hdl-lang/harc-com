@@ -580,32 +580,25 @@ pub(super) fn emit_tseq(
 }
 
 /// C++ scalar type for a pure-helper local (param, internal local, or
-/// return slot). Helper values live in the 64-bit loop-switch domain, so
-/// this is a 64-bit-rank mapping: a `sint` local declares `int64_t` (v1's
-/// `c_type_for` → `cpp_sint_for_width`), everything else `uint64_t`. This
-/// makes the C++ variable's signedness match `expr_is_signed(Local)` —
-/// without it, `sint` values routed through a helper computed `/`, `%`,
-/// and ordered comparisons UNSIGNED, diverging from `--codegen v1`
-/// (harc#532). `>>` was already saved by the forced `(int64_t)` cast the
-/// shift emitter inserts, so only the cast-less operators diverged.
-fn helper_local_cty(ty: &crate::ir::IrType) -> &'static str {
-    match ty {
-        crate::ir::IrType::SInt(_) => "int64_t",
-        _ => "uint64_t",
-    }
+/// return slot). Reuse the ordinary TBIR local mapping so helper ABIs keep
+/// both signedness and declared widths, including `_harc_u128` and
+/// `HarcWide<N>` values. A separate 64-bit-only helper mapping truncated
+/// wide arguments and returns before the helper body could observe them.
+fn helper_local_cty(ty: &crate::ir::IrType) -> String {
+    super::local_scalar_cty(ty)
 }
 
 /// Return type for a helper: the declared type of its return slot, or
 /// `void` when it has none. Kept identical between the prototype and the
 /// definition so the two C++ signatures match.
-fn helper_ret_cty(func: &TbFunction) -> &'static str {
+fn helper_ret_cty(func: &TbFunction) -> String {
     match func.ret {
         Some(r) => func
             .locals
             .get(r.index())
             .map(|l| helper_local_cty(&l.ty))
-            .unwrap_or("uint64_t"),
-        None => "void",
+            .unwrap_or_else(|| "uint64_t".to_string()),
+        None => "void".to_string(),
     }
 }
 
@@ -621,7 +614,7 @@ fn helper_param_list(func: &TbFunction, names: &[String]) -> String {
                 .locals
                 .get(i)
                 .map(|l| helper_local_cty(&l.ty))
-                .unwrap_or("uint64_t");
+                .unwrap_or_else(|| "uint64_t".to_string());
             format!("{cty} {n}")
         })
         .collect::<Vec<_>>()
@@ -651,8 +644,9 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 ///
 /// Signature convention: the first `params.len()` locals ARE the
 /// parameters (TB-IR convention), so they emit as parameters and are
-/// not re-declared in the body. Everything is `uint64_t`, matching the
-/// loop-switch local model.
+/// not re-declared in the body. Parameters, internal locals, and the
+/// return slot use the ordinary TBIR scalar mapping so declared
+/// signedness and widths are preserved across the helper ABI.
 pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
     // Pure helpers are scalar-only: no DUT access, so no lane table, no
@@ -684,7 +678,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
             .locals
             .get(i)
             .map(|l| helper_local_cty(&l.ty))
-            .unwrap_or("uint64_t");
+            .unwrap_or_else(|| "uint64_t".to_string());
         writeln!(out, "{INDENT}{cty} {n} = 0; (void){n};").ok();
     }
     writeln!(out, "{INDENT}int __bb = {};", func.entry.0).ok();

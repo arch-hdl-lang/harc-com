@@ -225,8 +225,8 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
         Expr::CovHookArg { param } => param.clone(),
         Expr::Call(target, args) => {
             let name = match target {
-                CallTarget::Helper(n) => super::expr::helper_cpp_name(n),
-                CallTarget::ExternFn(n) => n.clone(),
+                CallTarget::Helper { name, .. } => super::expr::helper_cpp_name(name),
+                CallTarget::ExternFn { name, .. } => name.clone(),
                 other => {
                     return Err(EmitError(format!(
                         "tbir: covergroup target call is outside the sampler subset: {other:?}"

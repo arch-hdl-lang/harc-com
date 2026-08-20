@@ -1994,6 +1994,9 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
             crate::ir::WidthCastKind::Sext => IrType::SInt(Some(*width)),
             _ => IrType::UInt(Some(*width)),
         }),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            Some(ret.clone())
+        }
         _ => None,
     }
 }
