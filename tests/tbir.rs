@@ -126,13 +126,6 @@ fn assert_wiring_matches_v1(src: &str, what: &str) {
     assert_eq!(v1, tb, "{what}: tbir must wire it exactly as v1 does");
 }
 
-fn emit_cpp_src_result(src: &str) -> Result<String, String> {
-    let merged = merged_src(src);
-    let prog = lower::lower_program(&merged).map_err(|e| e.to_string())?;
-    verify::verify_program(&prog).map_err(|e| format!("{e:?}"))?;
-    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).map_err(|e| e.to_string())
-}
-
 /// The negative-test contract: every out-of-subset fixture must produce
 /// `LowerError::Unsupported` whose rendered message names the offending
 /// construct and points the user at `--codegen v1`.
@@ -4519,49 +4512,103 @@ test ScalarRhsTest
 end test ScalarRhsTest
 "#;
     let err = lower_src(src).expect_err("scalar RHS into whole-Vec field must be rejected");
-    // Same site as the width-mismatch case above, which v1 compiles —
-    // one rejection covering landings with different v1 outcomes cannot
-    // claim `EmitsUncompilable`, even for the arm where that is true.
-    let msg = assert_unsupported(&err);
+    // `EmitsUncompilable` since the one landing on this arm that v1
+    // COULD compile — an element-width mismatch, both members
+    // `std::array<uint64_t, N>` — is lowered rather than refused. What
+    // is left is uniformly uncompilable: v1 emits `dst.data = 5;` and
+    // g++ answers "no match for `operator=` … `std::array<long unsigned
+    // int, 4>` and `int`".
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("whole-`Vec` write of record field"),
         "names the write: {msg}"
     );
     assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(src)).is_ok(),
+        "v1 emits it (and g++ refuses)"
+    );
 }
 
-/// A whole-`Vec` field copy whose RHS field has a MISMATCHED shape
-/// (different element width) must be rejected — the C++ `std::array`
-/// copy would be ill-typed.
+/// A whole-`Vec` field copy is refused exactly when the two members
+/// are DIFFERENT C++ types — which is not the same question as "different
+/// HARC types".
+///
+/// Both backends declare a `Vec<T, N>` record field as
+/// `std::array<elem, N>` and collapse every unsigned scalar of 64 bits
+/// or fewer to `uint64_t`, so `Vec<uint<32>, 4> = Vec<uint<16>, 4>` is a
+/// copy between two identical members: v1 emits `a.data = b.w16;` and
+/// g++ accepts it (0 errors, measured), and so does tbir. Refusing it
+/// was a gap, and the site's own comment had said so.
+///
+/// What is left — a length mismatch, a signedness split at or below 64
+/// bits, a record-vs-scalar element, a scalar RHS — has v1 emitting an
+/// assignment g++ refuses (one error each, measured on all four), so the
+/// arm carries `EmitsUncompilable` rather than the `--codegen v1` it
+/// used to promise.
 #[test]
-fn mismatched_shape_whole_vec_copy_is_rejected() {
-    let src = r#"
-struct Wide
+fn whole_vec_copy_is_refused_only_when_the_members_differ() {
+    let prog = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct A
     data : Vec<uint<32>, 4>
-end struct Wide
+end struct A
 
-struct Narrow
-    data : Vec<uint<16>, 4>
-end struct Narrow
+struct B
+    w16  : Vec<uint<16>, 4>
+    lng  : Vec<uint<32>, 8>
+    sgn  : Vec<sint<32>, 4>
+    kids : Vec<Kid, 4>
+    n    : uint<32>
+end struct B
 
-test MismatchTest
+test T
     let dut : Top
     run
-        let w : Wide
-        let n : Narrow
-        n.data[0] = 1
-        w.data = n.data
+        let a : A
+        let b : B
+        {body}
+        wait 2 cycles
     end run
-end test MismatchTest
-"#;
-    let err = lower_src(src).expect_err("mismatched-shape whole-Vec copy must be rejected");
-    // Keeps its `--codegen v1` suggestion: "non-matching" is a HARC
-    // judgement, and v1 collapses every scalar of 64 bits or fewer to
-    // `uint64_t`. `Vec<uint<32>, 4> = Vec<uint<16>, 4>` really does
-    // emit `std::array<uint64_t, 4> = std::array<uint64_t, 4>` there,
-    // which compiles.
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("non-matching RHS"), "names the reason: {msg}");
+end test T
+"#
+        )
+    };
+    // The width mismatch is the same C++ member on both sides.
+    let src = prog("a.data = b.w16");
+    let cpp = emit_cpp_src(&src);
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits the copy");
+    assert!(
+        cpp.contains("a.data = b.w16"),
+        "tbir emits the copy:\n{cpp}"
+    );
+    assert!(v1.contains("a.data = b.w16"), "…and so does v1:\n{v1}");
+    assert!(
+        v1.contains("std::array<uint64_t, 4> data") && v1.contains("std::array<uint64_t, 4> w16"),
+        "…because both members ARE `std::array<uint64_t, 4>`:\n{v1}"
+    );
+
+    // Everything else is a different member, and v1 cannot compile it.
+    for bad in [
+        "a.data = b.lng",
+        "a.data = b.sgn",
+        "a.data = b.kids",
+        "a.data = b.n",
+    ] {
+        let err = lower_src(&prog(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("non-matching RHS"), "`{bad}`: {msg}");
+        assert!(!msg.contains("{rec}"), "no literal braces: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(bad))).is_ok(),
+            "`{bad}`: v1 emits it (and g++ refuses)"
+        );
+    }
 }
 
 /// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
@@ -8844,6 +8891,114 @@ end test T
     }
 }
 
+/// The two record-traversal arms that had no cell of their own.
+///
+/// `indexing the non-`Vec` record field` had its verdict flipped to
+/// `EmitsUncompilable` with nothing in the suite naming either the
+/// message or the `V1Status`, so a mutant flipping it back was not
+/// caught. Same for the responder-state lane's mid-segment split, which
+/// was swept one commit after its two siblings.
+#[test]
+fn the_record_traversal_arms_without_a_cell() {
+    // 1. An index on a non-`Vec` leaf, in both spellings the loop
+    //    distinguishes: a nested-record field and a scalar field.
+    let local = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Rec
+    inner : Kid
+    n     : uint<8>
+end struct Rec
+
+test T
+    let dut : Top
+    run
+        let r : Rec
+        {body}
+        wait 1 cycle
+    end run
+end test T
+"#
+        )
+    };
+    for bad in ["let z = r.inner[0].p", "let z = r.n[0].p"] {
+        let src = local(bad);
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains("indexing the non-`Vec` record field"),
+            "`{bad}`: {msg}"
+        );
+        // v1 emits `r.inner[0].p` / `r.n[0].p` and g++ refuses each
+        // ("no match for `operator[]`"; "invalid types … for array
+        // subscript"), so there is no `--codegen v1` to offer.
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{bad}`: v1 emits it (and g++ refuses)"
+        );
+    }
+
+    // 2. The responder-state lane's mid-segment split — the THIRD walk,
+    //    named in the same commit as the other two and left alone.
+    let state = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Bundle
+    kids : Vec<Kid, 4>
+    n    : uint<8>
+end struct Bundle
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    ba : Bundle
+
+    thread bus.read(addr: uint<8>)
+        {body}
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+    for (bad, names) in [
+        ("let z = ba.kids.p", "without an element index"),
+        ("let z = ba.n.p", "which is not a nested record"),
+    ] {
+        let src = state(bad);
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains(names), "`{bad}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{bad}`: v1 emits it (and g++ refuses)"
+        );
+    }
+}
+
 /// The pairing check must not LOWER either operand.
 ///
 /// It asks `try_record_field_chain` for the leaf shape, and that
@@ -8975,22 +9130,48 @@ end test T
         let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
         assert!(msg.contains("whole-`Vec` component record field"), "{msg}");
     }
-    // The WRITE keeps `Unsupported`, and that is not an oversight.
-    // `a.data = b.data` emits `self.a.data = self.b.data;` from v1 and
-    // g++ accepts it, so the escape hatch is real. The same arm also
-    // covers `a.data = 5`, which v1 emits and g++ refuses — a rejection
-    // spanning landings with different v1 outcomes cannot claim
-    // `EmitsUncompilable`, so it keeps the weaker, still-true one.
-    for w in ["a.data = b.data", "a.data = 5"] {
-        let msg = assert_unsupported(&lower_src(&comp(w)).unwrap_err());
-        assert!(msg.contains("whole-`Vec` component record field"), "{msg}");
-    }
+    // The WRITE lowers too, in this lane as in the other two: v1 emits
+    // `self.a.data = self.b.data;` and g++ accepts it, so refusing it
+    // was a gap and not a subset boundary.
+    let wsrc = comp("a.data = b.data");
+    let wcpp = emit_cpp_src(&wsrc);
     assert!(
-        cpp_tb::emit(&merged_src(&comp("a.data = b.data")))
+        wcpp.contains("self.a.data = self.b.data"),
+        "tbir emits the copy:\n{wcpp}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&wsrc))
             .expect("v1 emits the copy")
             .contains("self.a.data = self.b.data"),
-        "the `--codegen v1` the write suggests is a real one"
+        "…and so does v1"
     );
+    // With the copy lowered, what is left on the write arm is
+    // uniformly uncompilable — `a.data = 5` gives "no match for
+    // `operator=` … `std::array<long unsigned int, 4>` and `int`".
+    for w in ["a.data = 5", "a.data = b.wide", "a.data = b.n"] {
+        let err = lower_src(&comp(w)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("non-matching RHS"), "`{w}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&comp(w))).is_ok(),
+            "`{w}`: v1 emits it (and g++ refuses)"
+        );
+    }
+    // …and the element access the read diagnostic points at lowers,
+    // through the same `ComponentVecElement` node a fixed-vector
+    // component FIELD uses.
+    for ok in ["let z = a.data[0]", "a.data[1] = 7"] {
+        let src = comp(ok);
+        let cpp = emit_cpp_src(&src);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
+        let rendered = if ok.starts_with("let") {
+            "self.a.data[0]"
+        } else {
+            "self.a.data[1] = 7"
+        };
+        assert!(cpp.contains(rendered), "`{ok}`: tbir emits it:\n{cpp}");
+        assert!(v1.contains(rendered), "`{ok}`: …and so does v1:\n{v1}");
+    }
 
     // --- lane 3: a bound responder's record STATE field ---
     let state = |body: &str| {
@@ -9038,6 +9219,27 @@ end impl T
         "the responder-body read is instance-filled and compared:\n{cpp}"
     );
     assert!(v1.contains("target.ba.data == target.bb.data"), "{v1}");
+    // The WRITE lowers in this lane too — the mutation round found this
+    // unpinned: removing the copy entirely left every test passing.
+    // v1 emits `target.ba.data = target.bb.data;` and g++ accepts it.
+    let wsrc = state("ba.data = bb.data");
+    let wcpp = emit_cpp_src(&wsrc);
+    assert!(
+        wcpp.contains("target.ba.data = target.bb.data"),
+        "tbir emits the responder-state copy:\n{wcpp}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&wsrc))
+            .expect("v1 emits it")
+            .contains("target.ba.data = target.bb.data"),
+        "…and so does v1"
+    );
+    // …and what is left on that arm is uniformly uncompilable under v1.
+    let werr = lower_src(&state("ba.data = bb.n")).unwrap_err();
+    let wmsg = assert_not_implemented(&werr, lower::V1Status::EmitsUncompilable);
+    assert!(wmsg.contains("non-matching RHS"), "{wmsg}");
+    assert!(!wmsg.contains("{field}"), "no literal braces: {wmsg}");
+
     // Same two exclusions in this lane.
     for bad in ["assert ba.data == bb.n else fail(\"x\")", "let d = ba.data"] {
         let err = lower_src(&state(bad)).unwrap_err();
@@ -9410,9 +9612,18 @@ end test WideRecordTest
 "#;
     let prog = lower_src(src).expect("wide record lowers");
     let record = prog.records.iter().find(|r| r.name == "WideState").unwrap();
-    assert!(matches!(record.field("value").unwrap().ty, ir::IrType::UInt(Some(256))));
-    assert!(matches!(record.field("mid").unwrap().ty, ir::IrType::UInt(Some(128))));
-    assert!(matches!(record.field("odd").unwrap().ty, ir::IrType::UInt(Some(65))));
+    assert!(matches!(
+        record.field("value").unwrap().ty,
+        ir::IrType::UInt(Some(256))
+    ));
+    assert!(matches!(
+        record.field("mid").unwrap().ty,
+        ir::IrType::UInt(Some(128))
+    ));
+    assert!(matches!(
+        record.field("odd").unwrap().ty,
+        ir::IrType::UInt(Some(65))
+    ));
     assert_eq!(record.field("lanes").unwrap().vec_len, Some(2));
 
     let cpp = emit_cpp_src(src);
@@ -9428,7 +9639,6 @@ end test WideRecordTest
     ] {
         assert!(cpp.contains(want), "expected `{want}` in:\n{cpp}");
     }
-
 }
 
 #[test]
@@ -20237,13 +20447,39 @@ end impl T"#,
         msg.contains("whole-`Vec` read of record field") && msg.contains("element-wise"),
         "{msg}"
     );
-    // …and the detail names the user's own field rather than printing
-    // `{rec}.{field}` literally, which is what a plain string with braces
-    // in it did.
+    // The CONSTRUCT names the field by its record (`Bundle.data`) —
+    // that is an identity, and fine. The SUGGESTION must be something
+    // the user could type: `r.data[i]`, rooted at their own local.
+    // `Bundle.data[i]` is not an expression that parses, and pasting the
+    // record-rooted path into the detail handed one back.
     assert!(
-        msg.contains("`Bundle.data[i]`"),
-        "the suggestion names the field: {msg}"
+        msg.contains("record field `Bundle.data`"),
+        "the construct names the field: {msg}"
     );
+    assert!(
+        msg.contains("(`r.data[i]`)"),
+        "the suggestion is written the way the user writes it: {msg}"
+    );
+    // …and it lowers, so the advice terminates.
+    lower_src(
+        r#"
+struct Bundle
+    data : Vec<uint<32>, 4>
+end struct Bundle
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let r : Bundle
+        let d = r.data[0]
+        wait 1 cycle
+    end run
+end impl T"#,
+    )
+    .expect("the suggested spelling lowers");
 }
 
 /// The loop-element write rejection covers every statement that names a
@@ -29468,11 +29704,22 @@ end test T
     );
 }
 
-/// A diagnostic must not recommend element-wise `Vec` access while indexed
-/// component-record members are themselves still outside the TBIR subset.
+/// Every whole-`Vec` diagnostic must recommend a spelling that
+/// actually lowers. The suggestion is "index the field element-wise
+/// (`X[i]`)", so the test follows its own advice and checks the
+/// indexed form gets through — in the component lane, where the
+/// suggestion was added and the indexed form did NOT lower until the
+/// element-access node was wired up.
+///
+/// This is the guard, not a restatement of it: with the element lane
+/// removed, the whole-`Vec` read still refuses and still says
+/// "element-wise", and the indexed follow-up fails — which is the
+/// dead-end loop this exists to forbid.
 #[test]
 fn component_record_vec_diagnostic_does_not_promise_an_unsupported_workaround() {
-    let whole = r#"
+    let prog = |body: &str| {
+        format!(
+            r#"
 struct Inner
     bytes : Vec<uint<8>, 2>
 end struct Inner
@@ -29485,7 +29732,7 @@ transactor VecSource
     current  : Outer
     when active
         hookable touch()
-            current.inner.bytes = current.inner.bytes
+            {body}
         end touch
     end when
 end transactor VecSource
@@ -29497,18 +29744,34 @@ test T
         src.touch()
     end run
 end test T
-"#;
-    let indexed = whole.replace(
-        "current.inner.bytes = current.inner.bytes",
-        "current.inner.bytes[0] = 1",
+"#
+        )
+    };
+
+    // A landing that is still refused, and whose message carries the
+    // suggestion.
+    let err = lower_src(&prog("let z = current.inner.bytes")).expect_err("whole-`Vec` read");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("element-wise"),
+        "carries the suggestion: {msg}"
+    );
+    // The suggestion names the path the USER wrote, not the record
+    // type it resolved to and not the emission suffix.
+    assert!(
+        msg.contains("`current.inner.bytes[i]`"),
+        "names the user's own path: {msg}"
     );
 
-    let whole_err = lower_src(whole).expect_err("whole Vec state is outside this subset");
-    if let Err(indexed_err) = lower_src(&indexed) {
-        assert!(
-            !whole_err.to_string().contains("element-wise"),
-            "diagnostic recommends indexed access that also fails ({indexed_err}): {whole_err}"
-        );
+    // …and following it lowers, under both backends.
+    for ok in [
+        "let z = current.inner.bytes[0]",
+        "current.inner.bytes[0] = 1",
+        "current.inner.bytes = current.inner.bytes",
+    ] {
+        let src = prog(ok);
+        lower_src(&src).unwrap_or_else(|e| panic!("`{ok}` lowers: {e}"));
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ok}`: v1 emits: {e:?}"));
     }
 }
 
@@ -29636,7 +29899,10 @@ end impl T"#;
     );
     let err = lower_src(&defaulted).expect_err("aggregate default is rejected");
     let msg = err.to_string();
-    assert!(msg.contains("default value on fixed-vector field `Table.words`"), "{msg}");
+    assert!(
+        msg.contains("default value on fixed-vector field `Table.words`"),
+        "{msg}"
+    );
 }
 
 #[test]

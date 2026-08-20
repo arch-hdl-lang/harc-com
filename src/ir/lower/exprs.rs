@@ -29,8 +29,14 @@ pub(crate) struct RecordFieldChain {
     pub leaf_vec_len: Option<usize>,
     /// The leaf field's element/scalar/record type.
     pub leaf_ty: IrType,
-    /// Dotted `Rec.f1.f2` spelling for diagnostics.
+    /// Dotted `Rec.f1.f2` spelling — names the FIELD (record type +
+    /// path), which is what a construct name wants.
     pub dotted: String,
+    /// The path as the user WROTE it (`r.f1.f2`), for a suggestion.
+    /// `dotted` cannot serve: `Rec.f1[i]` is not an expression anyone
+    /// can type, and a detail that says "index the field element-wise
+    /// (`Rec.data[i]`)" hands back something that does not parse.
+    pub spelled: String,
 }
 
 /// Resolution of a subfield access onto a bound-to target responder's
@@ -63,7 +69,7 @@ impl super::FuncBuilder<'_> {
     /// propagating that turned a working program into a hard error
     /// before its own lowering path ever saw it. Whether an operand
     /// lowers at all is decided later, by whoever owns it.
-    fn whole_vec_leaf(&mut self, e: &crate::ast::Expr) -> Option<(usize, IrType)> {
+    pub(crate) fn whole_vec_leaf(&mut self, e: &crate::ast::Expr) -> Option<(usize, String)> {
         // PURE DOTTED PATHS ONLY, checked before anything else, because
         // `try_record_field_chain` is not an oracle — it LOWERS every
         // mid-chain index it walks past, pushing statements and
@@ -91,16 +97,54 @@ impl super::FuncBuilder<'_> {
         while let ExprKind::Paren(inner) = &*e.kind {
             e = inner;
         }
-        if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
-            return c.leaf_vec_len.map(|n| (n, c.leaf_ty));
-        }
-        if let Ok(Some(rf)) = self.as_component_record_field(e) {
-            return rf.leaf_vec;
-        }
-        let Ok(Some(l)) = self.try_record_field_chain(e) else {
+        let (len, ty) = if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
+            (c.leaf_vec_len?, c.leaf_ty)
+        } else if let Ok(Some(rf)) = self.as_component_record_field(e) {
+            rf.leaf_vec?
+        } else if let Ok(Some(l)) = self.try_record_field_chain(e) {
+            (l.leaf_vec_len?, l.leaf_ty)
+        } else {
             return None;
         };
-        l.leaf_vec_len.map(|n| (n, l.leaf_ty))
+        // The C++ CLASS, not the `IrType`. Both backends declare the
+        // member as `std::array<elem, N>` and collapse every unsigned
+        // scalar of 64 bits or fewer to `uint64_t`, so
+        // `Vec<uint<8>, 4> == Vec<uint<32>, 4>` compiles and compares
+        // element-wise — v1 emits it and g++ accepts, measured. Pairing
+        // on `IrType` equality refused that program and, because the
+        // read refusal claims `EmitsUncompilable`, told the user no
+        // backend runs it. The write arm one file over
+        // (`stmts.rs`) had already written this rule down; it is called
+        // from there now rather than restated.
+        Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&ty)?))
+    }
+
+    /// Lower the RHS of a whole-`Vec` field WRITE, or `None` when it is
+    /// not a whole-`Vec` field read of the same shape as `dst_shape`.
+    ///
+    /// One helper for all three write lanes (record local, responder
+    /// record state field, component record field), asking the same
+    /// question `==`/`!=` asks: do the two fields render as the same
+    /// `std::array<elem, N>` member? A copy between two that do is what
+    /// v1 emits and g++ accepts; anything else it emits, g++ refuses.
+    ///
+    /// The RHS is lowered with the read permission ON, because a whole-
+    /// `Vec` read is exactly what an admissible RHS is. Restoring the
+    /// flag afterwards keeps the permission from reaching the next
+    /// statement.
+    pub(crate) fn whole_vec_copy_rhs(
+        &mut self,
+        dst_shape: (usize, String),
+        value: &crate::ast::Expr,
+    ) -> Result<Option<Expr>, LowerError> {
+        if self.whole_vec_leaf(value) != Some(dst_shape) {
+            return Ok(None);
+        }
+        let saved = self.vec_read_ok;
+        self.vec_read_ok = true;
+        let r = self.lower_expr_no_ports(value);
+        self.vec_read_ok = saved;
+        r.map(Some)
     }
 
     /// Whether both operands are whole-`Vec` record-field reads of the
@@ -487,18 +531,22 @@ impl FuncBuilder<'_> {
                 // `t.field` read on a record-typed local (and nested
                 // `t.a.b`). Resolve the field chain to its leaf schema.
                 if let Some(chain) = self.try_record_field_chain(e)? {
-                    // A whole-`Vec` leaf read has no scalar value: in any
-                    // scalar/format/assert context the tbir backend would
-                    // emit the raw `std::array` member into a position that
-                    // expects an integer, which miscompiles as a raw clang
-                    // error rather than a structured HARC diagnostic. Reject
-                    // it here. The ONLY sanctioned whole-`Vec` field use is a
-                    // `dst.field = src.field` array copy, which the write arm
-                    // (`stmts.rs`) special-cases without routing the RHS
-                    // through this read path. Element access (`rec.data[i]`)
-                    // is handled in the `Index` arm. A whole nested-record
-                    // leaf read (`let d = s.inner`) IS allowed — it yields
-                    // the nested struct value (emitted as `local.field.p…`).
+                    // A whole-`Vec` leaf read has no SCALAR value: in a
+                    // scalar/format context the emitter would put the raw
+                    // `std::array` member where an integer is expected,
+                    // which fails as a raw g++ error rather than a
+                    // structured HARC diagnostic. So the read is refused
+                    // by default and permitted per landing.
+                    //
+                    // Two landings are sanctioned. `==`/`!=` against a
+                    // matching-shape field is permitted right here, via
+                    // `vec_read_ok`. A `dst.field = src.field` copy is
+                    // permitted by the write arm (`stmts.rs`), which
+                    // turns the same flag on for its RHS. Element access
+                    // (`rec.data[i]`) never reaches this arm at all — the
+                    // `Index` arm handles it. A whole nested-RECORD leaf
+                    // read (`let d = s.inner`) is unrelated and always
+                    // allowed: it yields the nested struct value.
                     if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
                         // What v1 does with the read depends on where it
                         // LANDS, and the equality landing is now
@@ -529,10 +577,14 @@ impl FuncBuilder<'_> {
                         // no longer true anywhere it is still printed.
                         return Err(not_implemented(
                             &format!("a whole-`Vec` read of record field `{}`", chain.dotted),
-                            // Real names, not `{rec}.{field}` — this is
-                            // a plain string, so the braces printed
-                            // literally at the user.
-                            format!("index the field element-wise (`{}[i]`)", chain.dotted),
+                            // The path the USER wrote, not `dotted`.
+                            // `dotted` is rooted at the record TYPE, so
+                            // it would suggest `Rec.data[i]` — not an
+                            // expression anyone can type. (The original
+                            // bug here was worse: a `format!`-shaped
+                            // sentence in a plain `&str` slot printed
+                            // `{rec}.{field}` braces and all.)
+                            format!("index the field element-wise (`{}[i]`)", chain.spelled),
                             V1Status::EmitsUncompilable,
                         ));
                     }
@@ -854,6 +906,29 @@ impl FuncBuilder<'_> {
                         field,
                         index: Box::new(index),
                     });
+                }
+                // `a.data[i]` — element read of a `Vec<T, N>` LEAF
+                // inside a component record field, the spelling every
+                // whole-`Vec` diagnostic in this lane tells the user to
+                // write. It has to lower, or the advice is a dead end:
+                // v1 emits `int64_t z = self.a.data[0];` and g++ accepts
+                // it, so refusing it also carried a false
+                // `EmitsUncompilable`. Renders through the same
+                // `ComponentVecElement` node a fixed-vector component
+                // FIELD uses; the only difference is that `field` is a
+                // dotted member suffix (`a.data`) rather than one name.
+                if let Some(rf) = self.as_component_record_field(target)? {
+                    if let Some((len, _)) = rf.leaf_vec {
+                        let index = self.lower_expr(index)?;
+                        check_literal_component_vec_index_bounds(
+                            &rf.base, &rf.dotted, &index, len,
+                        )?;
+                        return Ok(Expr::ComponentVecElement {
+                            base: rf.base,
+                            field: rf.field,
+                            index: Box::new(index),
+                        });
+                    }
                 }
                 // `rec.data[i]` — element read of a `Vec<T, N>` record
                 // field. The target is a record-field access on a
@@ -1209,6 +1284,14 @@ impl FuncBuilder<'_> {
             mid_indices.push((pos, idx));
         }
         let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
+        // The user's own root: the local's name, or — under the `_tb`
+        // testbench-field prefix, where `field_start` skipped a segment
+        // — the bare field name they actually wrote.
+        let mut spelled = if field_start == 0 {
+            root.name.clone()
+        } else {
+            segs[field_start - 1].clone()
+        };
         let fields = &segs[field_start..];
         let last = fields.len() - 1;
         let mut leaf_vec_len = None;
@@ -1223,6 +1306,8 @@ impl FuncBuilder<'_> {
             };
             dotted.push('.');
             dotted.push_str(seg);
+            spelled.push('.');
+            spelled.push_str(seg);
             if i == last {
                 // The walk attaches an index to the segment BELOW it, so
                 // the leaf never carries a mid index (an outermost `[i]`
@@ -1305,6 +1390,7 @@ impl FuncBuilder<'_> {
             leaf_vec_len,
             leaf_ty,
             dotted,
+            spelled,
         }))
     }
 
@@ -1414,10 +1500,6 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// The component a `ComponentBase` names, when it can be resolved
-    /// without a diagnostic. `None` for a receiver this context cannot
-    /// resolve — callers must treat that as "cannot tell", never as
-    /// "not a record".
     /// The record type of a component field access, or `None` if the
     /// access is not a record.
     ///
@@ -1467,6 +1549,12 @@ impl FuncBuilder<'_> {
         Some(rid)
     }
 
+    /// The component a `ComponentBase` names, when it can be resolved
+    /// without a diagnostic. `None` for a receiver this context cannot
+    /// resolve — callers must treat that as "cannot tell", never as
+    /// "not a record". (This paragraph had been stacked on top of
+    /// `component_field_record`'s doc, describing a function two
+    /// definitions away.)
     pub(crate) fn component_base_id(
         &self,
         base: &crate::ir::ComponentBase,
@@ -1920,7 +2008,11 @@ impl FuncBuilder<'_> {
             }
             Expr::ComponentVecElement { base, field, index } => {
                 let index = self.hoist_transactor_calls(*index);
-                Expr::ComponentVecElement { base, field, index: Box::new(index) }
+                Expr::ComponentVecElement {
+                    base,
+                    field,
+                    index: Box::new(index),
+                }
             }
             Expr::Call(t, args) => {
                 let args = args
@@ -2756,14 +2848,37 @@ impl FuncBuilder<'_> {
             }
             match fld.ty {
                 IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
-                _ => {
-                    return Err(unsupported(
+                // The THIRD lane's copy of the mid-segment split. The
+                // record-LOCAL walk (`try_record_field_chain`) and the
+                // COMPONENT walk (`as_component_record_field`) already
+                // separate these two shapes and word them this way;
+                // this one was named in the same commit and left alone.
+                // Measured in a bound responder's thread: v1 emits
+                // `target.ba.lng.p` / `target.ba.n.p` and g++ refuses
+                // each, so the `--codegen v1` this promised was a dead
+                // end for every landing it covered.
+                IrType::Record(_) if fld.vec_len.is_some() => {
+                    return Err(not_implemented(
                         &format!(
-                            "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                            "traversing the `Vec` record field `{}.{seg}` without an \
+                             element index; cannot access `.{}`",
                             schema.name,
                             sub[i + 1]
                         ),
-                        "only nested struct/transaction fields can be traversed further",
+                        format!("select one element first (`{seg}[i].{}`)", sub[i + 1]),
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
+                _ => {
+                    return Err(not_implemented(
+                        &format!(
+                            "field access `.{}` on `{}.{seg}`, which is not a nested record",
+                            sub[i + 1],
+                            schema.name
+                        ),
+                        "only nested struct/transaction fields can be traversed further"
+                            .to_string(),
+                        V1Status::EmitsUncompilable,
                     ));
                 }
             }

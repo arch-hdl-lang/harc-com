@@ -1439,10 +1439,12 @@ fn lower_field(
                 _ => None,
             }
             .filter(|n| *n != 0)
-            .ok_or_else(|| unsupported(
-                &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
-                "the length must be a nonzero decimal compile-time literal",
-            ))?;
+            .ok_or_else(|| {
+                unsupported(
+                    &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
+                    "the length must be a nonzero decimal compile-time literal",
+                )
+            })?;
             Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
         }
         // Scalar counter, or a nested sub-component (`source :
@@ -2992,10 +2994,26 @@ use crate::ir::{ComponentBase, Expr as IrExpr, Stmt as IrStmt};
 /// field is a `Vec<T, N>` — its `(N, T)` shape. The shape is REPORTED,
 /// not judged: read and write disagree about whether a whole-`Vec` leaf
 /// is admissible, so each caller decides.
+/// A resolved component field WRITE target. Same three parts as
+/// `ComponentRecordField`, carried through so the assignment site can
+/// decide what a whole-`Vec` leaf means instead of the resolver
+/// deciding for it.
+pub(crate) struct ComponentFieldTarget {
+    pub base: ComponentBase,
+    pub field: String,
+    pub leaf_vec: Option<(usize, IrType)>,
+    pub dotted: String,
+}
+
 pub(crate) struct ComponentRecordField {
     pub base: ComponentBase,
     pub field: String,
     pub leaf_vec: Option<(usize, IrType)>,
+    /// The full dotted path as the user wrote it (`env.source.current.data`).
+    /// `field` is only the suffix after the emission base, which is what
+    /// codegen renders — naming that in a diagnostic told the user about
+    /// `current.data` when they had written the longer path.
+    pub dotted: String,
 }
 
 impl super::FuncBuilder<'_> {
@@ -3643,6 +3661,7 @@ impl super::FuncBuilder<'_> {
                             base: ComponentBase::SelfField,
                             field: path.join("."),
                             leaf_vec,
+                            dotted: path.join("."),
                         }));
                     }
                 }
@@ -3685,6 +3704,7 @@ impl super::FuncBuilder<'_> {
                 base: ComponentBase::Path(base),
                 field: tail[recv_len..].join("."),
                 leaf_vec,
+                dotted: path.join("."),
             }));
         }
         Ok(None)
@@ -3693,15 +3713,14 @@ impl super::FuncBuilder<'_> {
     pub(crate) fn as_component_field_target(
         &self,
         target: &AstExpr,
-    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+    ) -> Result<Option<ComponentFieldTarget>, LowerError> {
         if let Some(rf) = self.as_component_record_field(target)? {
-            if rf.leaf_vec.is_some() {
-                return Err(unsupported(
-                    &format!("a whole-`Vec` component record field `{}`", rf.field),
-                    "indexed component-record `Vec` access is not lowered by TB-IR yet",
-                ));
-            }
-            return Ok(Some((rf.base, rf.field)));
+            return Ok(Some(ComponentFieldTarget {
+                base: rf.base,
+                field: rf.field,
+                leaf_vec: rf.leaf_vec,
+                dotted: rf.dotted,
+            }));
         }
         // Self-relative bare field (only inside a method body, and only
         // when the name is NOT a shadowing local).
@@ -3722,7 +3741,12 @@ impl super::FuncBuilder<'_> {
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
                         ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
-                            return Ok(Some((ComponentBase::SelfField, id.name.clone())));
+                            return Ok(Some(ComponentFieldTarget {
+                                base: ComponentBase::SelfField,
+                                field: id.name.clone(),
+                                leaf_vec: None,
+                                dotted: id.name.clone(),
+                            }));
                         }
                     }
                 }
@@ -3775,7 +3799,12 @@ impl super::FuncBuilder<'_> {
                             )?;
                             let mut base = base_head;
                             base.extend_from_slice(recv_tail);
-                            return Ok(Some((ComponentBase::Path(base), field)));
+                            return Ok(Some(ComponentFieldTarget {
+                                base: ComponentBase::Path(base),
+                                field: field.clone(),
+                                leaf_vec: None,
+                                dotted: path.join("."),
+                            }));
                         }
                         // A whole sub-component copy is resolved after field
                         // writes. Decline here so `checker.sb = sb` reaches
@@ -3820,8 +3849,8 @@ impl super::FuncBuilder<'_> {
                 // `static_cast`. No backend compiles either, so there is
                 // nothing to send the user to.
                 return Err(not_implemented(
-                    &format!("a whole-`Vec` component record field `{}`", rf.field),
-                    format!("index the field element-wise (`{}[i]`)", rf.field),
+                    &format!("a whole-`Vec` component record field `{}`", rf.dotted),
+                    format!("index the field element-wise (`{}[i]`)", rf.dotted),
                     V1Status::EmitsUncompilable,
                 ));
             }
@@ -3917,8 +3946,7 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(e) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some((head_cid, mut base, tail, head_mode)) =
-                    self.component_path_head(&path)
+                if let Some((head_cid, mut base, tail, head_mode)) = self.component_path_head(&path)
                 {
                     let (recv_tail, last) = tail.split_at(tail.len() - 1);
                     if !self.recv_is_scoreboard_sub(head_cid, recv_tail) {
@@ -3928,11 +3956,20 @@ impl super::FuncBuilder<'_> {
                         if let Some(schema) = self.ctx.components[cid.index()].field(&last[0]) {
                             if let ComponentFieldKind::FixedVec(vec) = &schema.kind {
                                 self.require_component_activation(
-                                    &path[0], head_cid, head_mode, recv_tail,
-                                    schema.activation, "field", &last[0],
+                                    &path[0],
+                                    head_cid,
+                                    head_mode,
+                                    recv_tail,
+                                    schema.activation,
+                                    "field",
+                                    &last[0],
                                 )?;
                                 base.extend_from_slice(recv_tail);
-                                return Ok(Some((ComponentBase::Path(base), last[0].clone(), vec.clone())));
+                                return Ok(Some((
+                                    ComponentBase::Path(base),
+                                    last[0].clone(),
+                                    vec.clone(),
+                                )));
                             }
                         }
                     }

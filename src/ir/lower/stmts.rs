@@ -55,9 +55,7 @@ fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHand
     };
     if let Some(xid) = b.ctx.transactor_fields.get(field) {
         let x = &b.ctx.transactors[xid.index()];
-        return x.methods
-            .iter()
-            .any(|m| m.name == *method && m.hookable);
+        return x.methods.iter().any(|m| m.name == *method && m.hookable);
     }
     b.ctx
         .component_fields
@@ -1917,15 +1915,45 @@ impl FuncBuilder<'_> {
         // record `as_transactor_state` write lane, which only fires when
         // there is no further subfield.
         if let Some(chain) = self.as_transactor_state_record_field(target)? {
-            if chain.leaf_vec_len.is_some() {
-                return Err(unsupported(
-                    &format!(
-                        "a whole-`Vec` write of record state field `{}.{}`",
-                        chain.field,
-                        chain.path.join(".")
-                    ),
-                    "assign a `Vec` record field element-wise (`{field}.{vec}[i] = ...`)",
-                ));
+            if let Some(len) = chain.leaf_vec_len {
+                let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                // A matching-shape copy lowers, as it does in the other
+                // two lanes: v1 emits `target.ba.data = target.bb.data;`
+                // and g++ accepts it (measured, 0 errors), so refusing
+                // it was a gap rather than a subset boundary. "Matching"
+                // is `ir_vec_elem_class`, the C++ member type — which
+                // makes `Vec<uint<8>, 4> = Vec<uint<32>, 4>` a copy too,
+                // exactly as v1 renders it.
+                let shape =
+                    crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty).map(|cls| (len, cls));
+                let rhs = match shape {
+                    Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
+                    None => None,
+                };
+                let Some(rhs) = rhs else {
+                    // What is left is uniformly uncompilable under v1,
+                    // measured: a length mismatch and a scalar RHS each
+                    // give "no match for `operator=`" on the
+                    // `std::array` member. The `--codegen v1` this used
+                    // to promise was a dead end.
+                    return Err(not_implemented(
+                        &format!(
+                            "a whole-`Vec` write of record state field `{dotted}` \
+                             with a non-matching RHS"
+                        ),
+                        // Real names: this detail was a plain string, so
+                        // `{field}.{vec}` printed the braces at the user.
+                        format!("assign the field element-wise (`{dotted}[i] = ...`)"),
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                self.push(Stmt::TransactorStateRecordFieldWrite {
+                    instance: chain.instance,
+                    field: chain.field,
+                    path: chain.path,
+                    value: rhs,
+                });
+                return Ok(());
             }
             let e = self.lower_expr_no_ports(value)?;
             self.reject_record_into_scalar(
@@ -2005,7 +2033,43 @@ impl FuncBuilder<'_> {
         // test-scope component local (`env.src.current.value = ...`). Record
         // leaves must be claimed before whole-sub-component assignment:
         // otherwise that resolver mistakes `current` for a `Sub` receiver.
-        if let Some((base, field)) = self.as_component_field_target(target)? {
+        if let Some(tgt) = self.as_component_field_target(target)? {
+            let (base, field) = (tgt.base, tgt.field);
+            // A whole-`Vec` component record field takes a whole-`Vec`
+            // read of the same `std::array<elem, N>` shape — the third
+            // spelling of the copy the record-local and responder-state
+            // lanes already lower. v1 emits
+            // `self.a.data = self.b.data;` and g++ accepts it (0 errors,
+            // measured), so refusing it was a gap.
+            if let Some((len, elem)) = tgt.leaf_vec {
+                let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&elem).map(|c| (len, c));
+                let rhs = match shape {
+                    Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
+                    None => None,
+                };
+                let Some(rhs) = rhs else {
+                    // Everything else this arm covers has v1 emitting an
+                    // assignment g++ refuses — `a.data = 5` gives "no
+                    // match for `operator=` … `std::array<long unsigned
+                    // int, 4>` and `int`", measured. The `--codegen v1`
+                    // it used to promise was true only for the copy,
+                    // which is no longer refused.
+                    return Err(not_implemented(
+                        &format!(
+                            "a whole-`Vec` write of component record field `{}` with a non-matching RHS",
+                            tgt.dotted
+                        ),
+                        format!("assign the field element-wise (`{}[i] = ...`)", tgt.dotted),
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                self.push(Stmt::ComponentFieldWrite {
+                    base,
+                    field,
+                    value: rhs,
+                });
+                return Ok(());
+            }
             let e = self.lower_expr_no_ports(value)?;
             // A whole-record component field takes a record value. The
             // same rule as the transactor-state write above, at the
@@ -2366,6 +2430,33 @@ impl FuncBuilder<'_> {
                 });
                 return Ok(());
             }
+            // `a.data[i] = v` — element write to a `Vec<T, N>` LEAF
+            // inside a component RECORD field. The read side of the same
+            // spelling lowers through `ComponentVecElement`; without
+            // this the write fell all the way to "assignment to a target
+            // that is neither a DUT port nor a local", labelled
+            // `SilentlyMisLowers` — the loudest verdict in the enum, and
+            // false: v1 emits `self.a.data[0] = 1;` and g++ accepts it.
+            if let Some(rf) = self.as_component_record_field(it)? {
+                if let Some((len, _)) = rf.leaf_vec {
+                    let index = self.lower_expr_no_ports(index)?;
+                    super::exprs::check_literal_component_vec_index_bounds(
+                        &rf.base, &rf.dotted, &index, len,
+                    )?;
+                    let value = self.lower_expr_no_ports(value)?;
+                    self.reject_record_into_scalar(
+                        &value,
+                        &format!("element of component `Vec` field `{}`", rf.dotted),
+                    )?;
+                    self.push(Stmt::ComponentVecElementWrite {
+                        base: rf.base,
+                        field: rf.field,
+                        index,
+                        value,
+                    });
+                    return Ok(());
+                }
+            }
             if let Some(chain) = self.try_record_field_chain(it)? {
                 if chain.leaf_vec_len.is_none() {
                     // v1 emits `b.v[1] = 3;` — a subscript on a
@@ -2437,42 +2528,66 @@ impl FuncBuilder<'_> {
                 // `std::array` copy, mirroring v1's C++ member assignment.
                 // The ONLY admissible RHS is a whole-`Vec` read of a record
                 // field with a MATCHING shape (same `vec_len`, same element
-                // type/width). We do NOT route a Vec-target RHS through
-                // `lower_expr_no_ports`, because the read arm (correctly)
-                // rejects every whole-`Vec` field read — including the
-                // matching one. Resolve the RHS chain directly here after
-                // verifying the shape, and reject any other RHS (scalar,
-                // mismatched-shape field, …) with a structured diagnostic so
-                // the tbir backend never emits a `std::array = <scalar>`
-                // miscompile. (Element writes `rec.data[i] = v` are handled
-                // earlier.)
+                // type/width). The RHS is lowered with the whole-`Vec`
+                // read permission ON (`whole_vec_copy_rhs`), because a
+                // whole-`Vec` read is exactly what an admissible RHS is
+                // — the read arm refuses one by default, and this is one
+                // of the two landings that lift that. Verify the shape
+                // FIRST and reject any other RHS (scalar,
+                // mismatched-shape field, …) with a structured
+                // diagnostic, so the tbir backend never emits a
+                // `std::array = <scalar>` miscompile. (Element writes
+                // `rec.data[i] = v` are handled earlier.)
                 if let Some(dst_len) = chain.leaf_vec_len {
                     let dst_dotted = chain.dotted.clone();
-                    // Stays an `Unsupported`: "non-matching" is a HARC
-                    // judgement, and v1 collapses every scalar of 64
-                    // bits or fewer to `uint64_t`. A length mismatch
-                    // (`Vec<T, 4> = Vec<T, 8>`) or a scalar RHS really
-                    // does fail to compile there, but an
-                    // ELEMENT-WIDTH mismatch (`Vec<uint<8>, 4> =
-                    // Vec<uint<32>, 4>`) emits
+                    // The suggestion uses the user's spelling; the
+                    // construct name uses the record-rooted one.
+                    let dst_spelled = chain.spelled.clone();
+                    // The ELEMENT-WIDTH mismatch that used to land here
+                    // no longer does. v1 collapses every scalar of 64
+                    // bits or fewer to `uint64_t`, so
+                    // `Vec<uint<32>, 4> = Vec<uint<16>, 4>` emits
                     // `std::array<uint64_t, 4> = std::array<uint64_t, 4>`
-                    // and compiles. One site, several outcomes — the
-                    // same reason the whole-`Vec` READ keeps its
-                    // suggestion.
+                    // and compiles — the shape check below asks
+                    // `ir_vec_elem_class`, which IS that collapse, so
+                    // the copy lowers instead of being refused. Both
+                    // backends emit `a.data = b.w16;`, measured.
+                    //
+                    // With that landing gone the arm is no longer mixed,
+                    // and it stopped being entitled to `Unsupported`:
+                    // every mismatch that still reaches it — a length
+                    // mismatch, a signedness mismatch at or below 64
+                    // bits, a record-vs-scalar element, a scalar RHS —
+                    // has v1 emitting an assignment g++ refuses (one
+                    // error each, measured on all four). There is no
+                    // `--codegen v1` left to send anyone to.
                     let mismatch = || {
-                        unsupported(
+                        not_implemented(
                             &format!(
                                 "a whole-`Vec` write of record field `{dst_dotted}` \
                                  with a non-matching RHS"
                             ),
-                            "assign the field element-wise (`{rec}.{field}[i] = ...`)",
+                            // The user's own spelling, and a real
+                            // `format!`: this detail was a plain string,
+                            // so `{rec}.{field}` printed the braces at
+                            // the user verbatim.
+                            format!("assign the field element-wise (`{dst_spelled}[i] = ...`)"),
+                            V1Status::EmitsUncompilable,
                         )
                     };
                     // RHS must be a whole-`Vec` field read of matching shape.
                     let Some(rhs) = self.try_record_field_chain(value)? else {
                         return Err(mismatch());
                     };
-                    if rhs.leaf_vec_len != Some(dst_len) || rhs.leaf_ty != chain.leaf_ty {
+                    // Same predicate the `==`/`!=` read pairing uses
+                    // (`whole_vec_leaf`): two whole-`Vec` fields are
+                    // assignable exactly when both render as the same
+                    // `std::array<elem, N>` member.
+                    let same_shape = rhs.leaf_vec_len == Some(dst_len)
+                        && crate::codegen::cpp_tb::ir_vec_elem_class(&rhs.leaf_ty)
+                            == crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty)
+                        && crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty).is_some();
+                    if !same_shape {
                         return Err(mismatch());
                     }
                     self.push(Stmt::RecordFieldWrite {
@@ -2717,7 +2832,7 @@ impl FuncBuilder<'_> {
         };
         (self.ctx.tb_field.as_deref() == Some(root.name.as_str())
             && self.ctx.tb_queue_fields.contains_key(&field.name))
-            .then(|| (field.name.clone(), method.name.clone()))
+        .then(|| (field.name.clone(), method.name.clone()))
     }
 
     pub(crate) fn tb_queue_elem(&self, field: &str) -> Result<crate::ir::QueueElem, LowerError> {

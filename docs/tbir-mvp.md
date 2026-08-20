@@ -8019,14 +8019,13 @@ former `transaction` group lives in
        nested record"), with the same wording — copied, not
        reconstructed.
 
-     One verdict deliberately did NOT change. The component whole-`Vec`
-     WRITE keeps `Unsupported`: `a.data = b.data` emits
-     `self.a.data = self.b.data;` from v1 and compiles, so the escape
-     hatch is real. The same arm also covers `a.data = 5`, which v1
-     emits and g++ refuses — a rejection spanning landings with
-     different v1 outcomes cannot claim `EmitsUncompilable`, so it keeps
-     the weaker claim that is still true. (`a.data = b.data` from tbir,
-     and component-record `Vec` ELEMENT access, remain open.)
+     One verdict was deliberately left alone and should not have been.
+     The component whole-`Vec` WRITE kept `Unsupported` on the reasoning
+     that `a.data = b.data` compiles under v1, so the escape hatch is
+     real — while the same arm also covers `a.data = 5`, which v1 emits
+     and g++ refuses. "Mixed, so keep the weaker claim" is not a rule
+     the repo has: `Unsupported` is the STRONGER claim, and divergence
+     126 splits the arm instead.
 
      Two smaller things, same root:
 
@@ -8051,6 +8050,73 @@ former `transaction` group lives in
      first, because `cargo test` prints "error: test failed" to stderr
      and a NOBUILD check keyed on `"error: "` scored every CAUGHT mutant
      as unbuildable.
+
+126. **A pairing rule that asked the wrong question, and the three
+     writes behind it (2026-08-20).**
+
+     Divergence 125 paired whole-`Vec` equality operands on `IrType`
+     equality. That is not the question. Both backends declare a
+     `Vec<T, N>` record field as `std::array<elem, N>` and collapse
+     every unsigned scalar of 64 bits or fewer to `uint64_t`, so
+     `Vec<uint<8>, 4>` and `Vec<uint<32>, 4>` are the SAME C++ member
+     and compare element-wise fine. Pairing on `IrType` refused that
+     program — and because 125 had just flipped the read refusal to
+     `EmitsUncompilable`, it refused it while telling the user no
+     backend runs it. Measured: v1 emits `r.data == s.eight` with both
+     members `std::array<uint64_t, 4>`, g++ 0 errors.
+
+     **The rule was already written down, one file over.** The whole-
+     `Vec` WRITE arm in `stmts.rs` carried a comment spelling out the
+     `uint64_t` collapse in full, as the reason it kept `Unsupported`.
+     It was read during 124 and reconstructed anyway. The predicate now
+     lives in `cpp_tb::ir_vec_elem_class`, beside the
+     `cpp_uint_for_width` / `cpp_sint_for_width` / `scalar_leaf_c_type`
+     family it has to agree with, and BOTH the read pairing and the
+     write shape check call it. Two things follow from having one
+     predicate:
+
+     - `Vec<uint<32>, 4> = Vec<uint<16>, 4>` is a copy, not a refusal —
+       the gap the old comment described but did not close.
+     - With that landing gone the write arm is no longer mixed, and it
+       loses `Unsupported`: a length mismatch, a signedness split at or
+       below 64 bits, a record-vs-scalar element and a scalar RHS each
+       have v1 emitting an assignment g++ refuses (one error apiece,
+       measured on all four).
+
+     The same "one landing, three lanes" sweep 125 claimed then had to
+     be finished for real:
+
+     - the responder-state lane's mid-segment traversal arm still said
+       `Unsupported` (v1 emits `target.ba.kids.p` / `target.ba.n.p`,
+       g++ refuses each);
+     - the whole-`Vec` WRITE now lowers in all three lanes, through one
+       `whole_vec_copy_rhs` helper that turns the read permission on for
+       the RHS — the responder-state and component spellings each emit
+       what v1 emits and compile;
+     - component-record `Vec` ELEMENT access lowers, reusing the
+       `ComponentVecElement` / `ComponentVecElementWrite` nodes a fixed-
+       vector component FIELD already had. It was carrying two false
+       verdicts: `let z = a.data[0]` claimed `EmitsUncompilable` and
+       `a.data[0] = 1` claimed `SilentlyMisLowers`, the loudest verdict
+       in the enum, while v1 emitted `self.a.data[0]` and g++ accepted.
+
+     That last one closed a loop rather than a gap. The whole-`Vec`
+     diagnostics say "index the field element-wise (`X[i]`)", and in the
+     component lane `X[i]` did not lower — the suggestion sent the user
+     to a second refusal. There is a test whose whole purpose is to
+     forbid that; it only exercised the write arm, so the two read
+     details added in 125 walked straight past it. It now follows its
+     own advice and checks the suggested spelling lowers.
+
+     **And the suggestion has to be typeable.** `chain.dotted` is rooted
+     at the record TYPE, so "index the field element-wise
+     (`Bundle.data[i]`)" handed back something that does not parse. The
+     chain carries the user's own spelling now (`r.data[i]`) for
+     details, and keeps the record-rooted one for construct names, where
+     naming the field by its record is the point. The predecessor of
+     this bug was the same sentence in a plain `&str` slot printing
+     `{rec}.{field}` braces and all — one detail string, two ways to
+     hand the user a path they cannot use.
 
 ## Next steps
 
