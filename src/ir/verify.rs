@@ -605,8 +605,17 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // testbench transactor field resolves. Emission indexes both
     // tables directly off these links.
     for (xi, x) in prog.transactors.iter().enumerate() {
-        for m in &x.methods {
-            match prog.functions.get(m.function.index()) {
+        for (name, function) in x
+            .methods
+            .iter()
+            .map(|m| (m.name.as_str(), m.function))
+            .chain(
+                x.target_methods
+                    .iter()
+                    .map(|m| (m.name.as_str(), m.function)),
+            )
+        {
+            match prog.functions.get(function.index()) {
                 Some(f)
                     if f.kind
                         == (FunctionKind::TransactorBody {
@@ -615,13 +624,13 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 Some(f) => errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "transactor x{xi} method `{}` points at fn{} with kind {:?}",
-                        m.name, m.function.0, f.kind
+                        name, function.0, f.kind
                     ),
                 }),
                 None => errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "transactor x{xi} method `{}` references missing fn{}",
-                        m.name, m.function.0
+                        name, function.0
                     ),
                 }),
             }
@@ -727,6 +736,25 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        for binding in &tb.component_fields {
+            if !component_binding_names.insert(&binding.field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares component field `{}` more than once",
+                        binding.field
+                    ),
+                });
+            }
+            match prog.components.get(binding.component.index()) {
+                Some(_) => {}
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} component field `{}` references missing c{}",
+                        binding.field, binding.component.0
+                    ),
+                }),
+            }
+        }
         let mut target_names = std::collections::HashSet::new();
         for actor in &tb.target_tlm_actors {
             if transactor_binding_names.contains(&actor.instance)
@@ -764,24 +792,74 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     ),
                 }),
             }
-        }
-        for binding in &tb.component_fields {
-            if !component_binding_names.insert(&binding.field) {
-                errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "tb{ti} declares component field `{}` more than once",
-                        binding.field
-                    ),
-                });
-            }
-            match prog.components.get(binding.component.index()) {
-                Some(_) => {}
-                None => errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "tb{ti} component field `{}` references missing c{}",
-                        binding.field, binding.component.0
-                    ),
-                }),
+            if let Some(host) = actor.host_component {
+                let Some(component) = prog.components.get(host.index()) else {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} target transactor `{}` references missing host c{}",
+                            actor.instance, host.0
+                        ),
+                    });
+                    continue;
+                };
+                match tb
+                    .component_fields
+                    .iter()
+                    .find(|field| field.field == actor.instance)
+                {
+                    Some(field)
+                        if field.component == host
+                            && field.mode
+                                == Some(if actor.active {
+                                    ComponentInstanceMode::Active
+                                } else {
+                                    ComponentInstanceMode::Passive
+                                }) => {}
+                    Some(field) => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} target transactor `{}` stores host c{} / active={} but its component field binds c{} / mode {:?}",
+                            actor.instance, host.0, actor.active, field.component.0, field.mode
+                        ),
+                    }),
+                    None => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} target transactor `{}` has host c{} but no same-named component field",
+                            actor.instance, host.0
+                        ),
+                    }),
+                }
+                if !matches!(component.kind, ComponentKindTag::Transactor)
+                    || component.name != schema.name
+                    || !target_state_matches_component(schema, component)
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} target transactor `{}` host c{} is not state-compatible with x{}",
+                            actor.instance, host.0, actor.transactor.0
+                        ),
+                    });
+                }
+            } else {
+                if actor.active {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} standalone target transactor `{}` is unexpectedly active",
+                            actor.instance
+                        ),
+                    });
+                }
+                if tb
+                    .component_fields
+                    .iter()
+                    .any(|field| field.field == actor.instance)
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} target transactor `{}` aliases a component field but stores no host component",
+                            actor.instance
+                        ),
+                    });
+                }
             }
         }
         if let Err(detail) =
@@ -852,6 +930,57 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     } else {
         Err(errs)
     }
+}
+
+fn target_state_matches_component(target: &TransactorSchema, component: &ComponentSchema) -> bool {
+    let host_state: Vec<_> = component
+        .fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.kind,
+                ComponentFieldKind::Scalar { .. }
+                    | ComponentFieldKind::Queue { .. }
+                    | ComponentFieldKind::Record { .. }
+            )
+        })
+        .collect();
+    if target.state_fields.len() != host_state.len() {
+        return false;
+    }
+    let mut target_names = HashSet::new();
+    let mut host_names = HashSet::new();
+    if target
+        .state_fields
+        .iter()
+        .any(|field| !target_names.insert(field.name.as_str()))
+        || host_state
+            .iter()
+            .any(|field| !host_names.insert(field.name.as_str()))
+    {
+        return false;
+    }
+    target.state_fields.iter().all(|state| {
+        host_state.iter().any(|field| {
+            if field.name != state.name {
+                return false;
+            }
+            match (&state.kind, &field.kind) {
+                (
+                    StateFieldKind::Scalar { ty: a, default: ad },
+                    ComponentFieldKind::Scalar { ty: b, default: bd },
+                ) => a == b && ad == bd,
+                (StateFieldKind::Queue { elem: a }, ComponentFieldKind::Queue { elem: b }) => {
+                    a == b
+                }
+                (
+                    StateFieldKind::Record { record: a },
+                    ComponentFieldKind::Record { record: b },
+                ) => a == b,
+                _ => false,
+            }
+        })
+    })
 }
 
 fn verify_testbench_connect(

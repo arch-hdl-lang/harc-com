@@ -173,6 +173,17 @@ pub(crate) fn transactor_is_component(
     env_held && has_hookable && has_module_field && !has_event
 }
 
+/// Whether a transactor declaration carries at least one target-side TLM
+/// responder. A bound transactor that also has an `on` handler has two
+/// orthogonal runtime roles: component IR owns the handler/lifecycle surface,
+/// while `TransactorSchema` owns these responder bodies and actor topology.
+pub(crate) fn transactor_has_target_threads(t: &TransactorDecl) -> bool {
+    t.items
+        .iter()
+        .chain(t.when_active.iter().flatten())
+        .any(|it| matches!(it, ComponentItem::TargetTlmThread(_)))
+}
+
 /// True for the reusable analysis-source form addressed by issue #534:
 /// an unbound transactor with an output event surface and no module/DUT
 /// handle. It is stored as a `ComponentSchema`, but its instance mode is
@@ -753,29 +764,12 @@ pub(crate) fn lower_component_schema(
                     watchdog_ast = Some((w, activation));
                 }
 
-                // Two variants shared one message and one classification.
-                // Only the first is probed at THIS landing, so only the first
-                // is reclassified — the second keeps what it had rather than
-                // inheriting a verdict it did not earn.
-                // A `thread` on a BOUND transactor is the construct working
-                // as designed — `emit_bound_tlm_target_actors` emits the
-                // target actor for it, and this component path is reached
-                // only because the transactor also has a non-periodic `on`
-                // handler. v1 is a real escape hatch, so it keeps
-                // `Unsupported` and the `--codegen v1` pointer with it.
-                //
-                // The first version of this split reclassified the whole arm
-                // from a probe that only ever put a `thread` on an env.
-                ComponentItem::TargetTlmThread(_) if is_bound_transactor => {
-                    return Err(unsupported(
-                        &format!(
-                            "a `thread` item on bound transactor `{name}` reached through the \
-                             component path"
-                        ),
-                        "the target actor lowers on the transactor path; this component path is \
-                         taken because the transactor also has a non-periodic `on` handler",
-                    ));
-                }
+                // A bound transactor with both an `on` handler and a target
+                // thread intentionally has two IR views. This component view
+                // owns fields + handlers; the parallel TransactorSchema view
+                // owns the responder body and actor topology. The binding
+                // joins both views onto one component-hosted instance.
+                ComponentItem::TargetTlmThread(_) if is_bound_transactor => {}
                 ComponentItem::TargetTlmThread(_) => {
                     // v1 accepts a `thread` on an env/agent/scoreboard and
                     // emits the component struct WITHOUT it: no

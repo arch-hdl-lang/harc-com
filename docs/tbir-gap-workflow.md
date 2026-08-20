@@ -35,7 +35,7 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Method-hook paths: statement-position registration, nested component
   receivers, and non-transactor component receivers.
 - [x] Heartbeat predicates on transactor receivers.
-- [ ] Bound-transactor `thread` items routed through the component path.
+- [x] Bound-transactor `thread` items routed through the component path.
 - [ ] Coverpoint target/value gaps with working v1 behavior (sized literals,
   supported width forms, and other explicitly probed cases).
 - [ ] Record/state/helper gaps whose tests contain a positive v1 control.
@@ -46,8 +46,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 166 remaining constructor call sites (167 textual matches including
-the `unsupported` helper definition) as an inventory, not 166 separate tasks.
+Treat the 165 remaining constructor call sites (166 textual matches including
+the `unsupported` helper definition) as an inventory, not 165 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -66,10 +66,10 @@ shared IR primitive, and equivalence fixture. Then:
    (diagnostic cleanup). A falling raw count alone can hide no user-visible
    progress.
 
-Bound-transactor `thread` items routed through the component path are the
-recommended next family. The remaining positive-v1 controls converge on one
-classification/routing seam, after which the existing target-thread IR and
-actor emission should carry the behavior.
+Coverpoint target/value gaps with positive v1 controls are the recommended
+next family. The completed bound-transactor thread slice keeps monitor fields
+and lifecycle in component IR while routing responder bodies through the
+existing target-thread IR/actor emission, with one verified shared host.
 
 ## Review-derived semantic gates
 
@@ -129,9 +129,9 @@ not applicable before requesting review:
    - the complete Rust test suite.
 
 8. Recount `unsupported(...)` sites and record which family disappeared.
-   The completed event, queue-query, method-hook, and transactor-heartbeat
-   slices reduce the call-site count from 174 to 166. Nested bus expressions
-   were also reclassified because v1 rejects them too.
+   The completed event, queue-query, method-hook, transactor-heartbeat, and
+   bound-thread slices reduce the call-site count from 174 to 165. Nested bus
+   expressions were also reclassified because v1 rejects them too.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

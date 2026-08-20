@@ -505,6 +505,10 @@ pub struct TargetTlmMethodSchema {
     /// `params` mirror the thread's declared parameters and its `ret`
     /// is the return-value slot for value-returning methods.
     pub function: FunctionId,
+    /// Whether the source thread is always present or declared inside
+    /// `when active`. Passive bindings must not schedule active-only
+    /// responder actors.
+    pub activation: Activation,
     /// Declared argument names (one per thread parameter), in order —
     /// the request-payload wire bases (`<bus>_<method>_<arg>`).
     pub args: Vec<String>,
@@ -1635,7 +1639,7 @@ pub struct ComponentFieldBinding {
 /// bus binding's blocking req/rsp wire protocol on the DUT.
 #[derive(Debug, Clone)]
 pub struct TargetTlmActorSchema {
-    /// Passive instance name (the per-instance struct + actor prefix).
+    /// Instance name (the per-instance struct + actor prefix).
     pub instance: String,
     /// The test-scope bus-binding field this responder serves — also
     /// the flat DUT signal prefix (`mem` → `mem_read_req_valid`, ...).
@@ -1643,6 +1647,13 @@ pub struct TargetTlmActorSchema {
     /// The bound-to transactor type providing the responder bodies and
     /// state fields (`TbProgram::transactors[transactor]`).
     pub transactor: TransactorId,
+    /// Component IR host for a mixed bound transactor that also declares
+    /// `on` handlers. `None` means the actor owns its generated target-state
+    /// object; `Some(c)` means the matching component field owns storage.
+    pub host_component: Option<ComponentId>,
+    /// Effective source binding mode. Standalone target responders are
+    /// currently passive; a mixed component-hosted responder may be active.
+    pub active: bool,
 }
 
 /// Per-instance storage for an unbound DUT-poking or initiator transactor.

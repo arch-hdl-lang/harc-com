@@ -2609,6 +2609,9 @@ fn emit_test(
     // and the actor coroutines capture it by reference, then one
     // background-coroutine actor per target method.
     for actor in &tb.target_tlm_actors {
+        if actor.host_component.is_some() {
+            continue;
+        }
         let schema = prog.transactor(actor.transactor);
         runtime::target_state_struct_inst(out, schema, &actor.instance, &prog.records);
     }

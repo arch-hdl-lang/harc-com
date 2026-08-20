@@ -1428,7 +1428,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             // A pure analysis-source transactor (event port + no DUT
             // field) routes to the composite-component table instead of
             // the DUT-poking `TransactorSchema` (classified below).
-            if components::transactor_is_component(t, env_held(t), &record_ids) {
+            if components::transactor_is_component(t, env_held(t), &record_ids)
+                && !components::transactor_has_target_threads(t)
+            {
                 continue;
             }
             if transactor_ids
@@ -2017,7 +2019,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // are rejected here rather than dropped.
     for it in &file.items {
         let Item::Transactor(t) = it else { continue };
-        if components::transactor_is_component(t, env_held(t), &record_ids) {
+        if components::transactor_is_component(t, env_held(t), &record_ids)
+            && !components::transactor_has_target_threads(t)
+        {
             continue;
         }
         let id = TransactorId(prog.transactors.len() as u32);
@@ -3222,7 +3226,8 @@ fn lower_test(
     // Bound-to target-side TLM responder instances (`let target : X
     // passive = bind <busbinding>`), collected as (instance, transactor
     // id, bus-binding field). Validated after the bus bindings are known.
-    let mut target_tlm_binds: Vec<(String, TransactorId, String)> = Vec::new();
+    let mut target_tlm_binds: Vec<(String, TransactorId, String, Option<ir::ComponentId>, bool)> =
+        Vec::new();
     // Bound-to initiator-side BFM instances (`let helper : H active =
     // bind <busbinding>`), collected as (instance, transactor id, bus-
     // binding field). The helper's `hookable` methods drive the bound
@@ -3541,15 +3546,14 @@ fn lower_test(
                 let has_monitor = prog.components[cid_probe.index()]
                     .cycle_handlers
                     .iter()
-                    .any(|ch| ch.monitor_channel.is_some());
+                    .any(|ch| matches!(ch.activation, ir::Activation::Always));
                 // Mode rules:
                 //   * `active`  — the `on <ev>` driver (under `when active`)
                 //     fires on `emit <inst>.<ev>`. Always permitted.
-                //   * `passive` — no driver; only the always-on
-                //     `on bus.<ch>.handshake` monitor observers fire. Valid
-                //     only when the transactor declares monitor handlers (a
-                //     pure-driver transactor with no monitor half has nothing
-                //     for a passive instance to do).
+                //   * `passive` — no driver; only always-on cycle/handshake
+                //     monitor observers fire. Valid only when the transactor
+                //     declares such a monitor (a pure driver has nothing for
+                //     a passive instance to do).
                 let instance_active = match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
@@ -3566,9 +3570,9 @@ fn lower_test(
                                      {simple} passive` with no monitor half",
                                     l.name.name
                                 ),
-                                "a `passive` instance only runs the always-on \
-                                 `on bus.<ch>.handshake(...)` observers; this transactor declares \
-                                 none, so a passive instance is inert — annotate it `active`",
+                                "a `passive` instance only runs always-on cycle/handshake \
+                                 observers; this transactor declares none, so a passive instance \
+                                 is inert — annotate it `active`",
                             ));
                         }
                         false
@@ -3597,9 +3601,26 @@ fn lower_test(
                 bound_event_component_binds.push((
                     l.name.name.clone(),
                     cid,
-                    bus_field,
+                    bus_field.clone(),
                     instance_active,
                 ));
+                // Mixed monitor + target responder: bind the target actor
+                // view to the same source instance. Component IR owns the
+                // storage; the explicit host id makes the join verifiable.
+                if let Some((xidx, _)) = prog
+                    .transactors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, x)| x.name == simple && !x.target_methods.is_empty())
+                {
+                    target_tlm_binds.push((
+                        l.name.name.clone(),
+                        TransactorId(xidx as u32),
+                        bus_field,
+                        Some(cid),
+                        instance_active,
+                    ));
+                }
             }
             // Bound-to target-side TLM responder: `let target : MemTarget
             // passive = bind <busbinding>`. The instance is a passive
@@ -3682,7 +3703,7 @@ fn lower_test(
                         .position(|x| x.name == simple)
                         .unwrap() as u32,
                 );
-                target_tlm_binds.push((l.name.name.clone(), xid, bus_field));
+                target_tlm_binds.push((l.name.name.clone(), xid, bus_field, None, false));
             }
             // Test-scope composite-component instance: `let env :
             // AnalysisEnv`. Emitted as a plain run-scope local (v1's
@@ -4680,7 +4701,7 @@ fn lower_test(
     occupied_storage_names.extend(
         target_tlm_binds
             .iter()
-            .map(|(instance, _, _)| instance.clone()),
+            .map(|(instance, _, _, _, _)| instance.clone()),
     );
     occupied_storage_names.extend(regblock_binds.iter().map(|(binding, _, _)| binding.clone()));
     occupied_storage_names.extend(addrmap_binds.iter().map(|(binding, _, _)| binding.clone()));
@@ -4718,7 +4739,7 @@ fn lower_test(
     let mut target_tlm_actors: Vec<ir::TargetTlmActorSchema> = Vec::new();
     let mut target_state: HashMap<String, HashMap<String, crate::ir::StateFieldKind>> =
         HashMap::new();
-    for (instance, xid, bus_field) in &target_tlm_binds {
+    for (instance, xid, bus_field, host_component, active) in &target_tlm_binds {
         if target_state.contains_key(instance) {
             return Err(LowerError::Invalid(format!(
                 "duplicate target-TLM responder instance `{instance}` in test `{}`",
@@ -4782,6 +4803,8 @@ fn lower_test(
             instance: instance.clone(),
             bus_field: bus_field.clone(),
             transactor: *xid,
+            host_component: *host_component,
+            active: *active,
         });
     }
 

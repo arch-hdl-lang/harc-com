@@ -45,6 +45,7 @@
 # This is inherent to the parallel model and affects v1 too — v1-mt is
 # itself run-to-run order-nondeterministic and differs from v1's own
 # cooperative trace. The actor-exercising rows — `tlm_target_thread_test`,
+# `tlm_target_thread_monitor_test` (target actor + shared-host monitor),
 # `axilite_bound_mon_test` (active bound DRIVER + bound monitor),
 # `tlm_target_ooo_lanes_test` (OOO lanes), `tlm_pairing_arch_initiator_test`
 # (multi same-bus actors) — are the load-bearing ones for the MT sweep.
@@ -155,6 +156,7 @@ regblock_subset_test | Top | top_counter.sv | - | pass
 struct_basic_test | Top | top_counter.sv | - | pass
 struct_nested_test | Top | top_counter.sv | - | pass
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+tlm_target_thread_monitor_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - | pass
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass

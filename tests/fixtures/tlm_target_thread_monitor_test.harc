@@ -1,0 +1,63 @@
+// A bound transactor may combine a target-side TLM responder thread with an
+// always-on handshake monitor and an event-driven handler. The monitor aliases
+// the TLM request channel so all three behaviors share one component instance.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    handshake_channel observed_req: receive kind: valid_ready
+        addr: uint<8>
+    end handshake_channel observed_req
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    observed : uint<32> default 0
+    event_seen : uint<32> default 0
+    in_ev : in event<uint<8>>
+
+    on in_ev(v)
+        event_seen = v
+    end on
+
+    on bus.observed_req.handshake(req)
+        observed = req.addr
+    end on
+
+    when active
+        thread bus.read(addr: uint<8>)
+            wait 1 cycle
+            return 256 + addr
+        end thread
+    end when
+end transactor TlmMemTarget
+
+testbench TlmTargetThreadMonitorTb
+    dut : TlmReadInitiator
+end testbench TlmTargetThreadMonitorTb
+
+impl TlmTargetThreadMonitorTest for TlmTargetThreadMonitorTb
+    let mem : TlmMemBus = bind dut with {
+        observed_req.valid: "mem_read_req_valid",
+        observed_req.ready: "mem_read_req_ready",
+        observed_req.addr: "mem_read_addr"
+    }
+    let target : TlmMemTarget active = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        emit target.in_ev(7)
+        wait until target.event_seen == 7 timeout 5 cycles
+            fail("bound target event handler did not share component state")
+
+        wait until dut.done == 1 timeout 40 cycles fail("DUT initiator did not receive HARC target response")
+        wait 1 cycle
+        assert dut.result == 261
+            else fail("target TLM response mismatch got=0x${dut.result:08x}, expected 0x00000105")
+        assert target.observed == 5
+            else fail("bound target monitor missed request got=0x${target.observed:08x}")
+
+        log(info, "PASS: bound target thread and monitor share one instance")
+    end run
+end impl TlmTargetThreadMonitorTest
