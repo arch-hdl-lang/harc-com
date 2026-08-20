@@ -729,10 +729,38 @@ fn lower_bound_target_transactor(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
-                return Err(unsupported(
-                    &format!("bound-to transactor `{tname}` lifecycle/apply items"),
-                    "",
+            // `apply <Aspect>` and a lifecycle block are two
+            // different situations wearing one arm.
+            //
+            // A lifecycle block never reaches here at all: the parser
+            // (`parser.rs`, "lifecycle blocks are currently supported
+            // only inside `test`/`impl` and `testbench`") rejects
+            // `setup`/`check`/`teardown` in every component that is not
+            // a `testbench`, so neither backend ever sees one on a
+            // transactor. Measured: both backends print that same
+            // parser error, byte for byte.
+            //
+            // `apply` DOES reach here, and v1 does not implement it:
+            // `ComponentItem::Apply(_) => {}` in `cpp_tb`, so v1 emits
+            // the file with no trace of the aspect and without even
+            // checking that the name resolves — `apply Whatever`,
+            // naming nothing, emits clean. That is the `connect` arm's
+            // situation one step above, and it takes the same verdict.
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
+            ComponentItem::Apply(_) => {
+                return Err(not_implemented(
+                    &format!("bound-to transactor `{tname}` `apply` items"),
+                    "v1 parses the item and emits NOTHING for it — the aspect is silently \
+                     dropped, and its name is never resolved",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -1175,10 +1203,25 @@ fn lower_bound_initiator_transactor(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
-                return Err(unsupported(
-                    &format!("initiator-side bound-to transactor `{tname}` lifecycle/apply items"),
-                    "",
+            // Same split as the target-side arm: the lifecycle
+            // half is unreachable (the parser refuses a lifecycle block
+            // outside `test`/`impl`/`testbench`), and v1 drops `apply`
+            // silently.
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
+            ComponentItem::Apply(_) => {
+                return Err(not_implemented(
+                    &format!("initiator-side bound-to transactor `{tname}` `apply` items"),
+                    "v1 parses the item and emits NOTHING for it — the aspect is silently \
+                     dropped, and its name is never resolved",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -1270,10 +1313,25 @@ fn lower_bound_initiator_transactor(
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            ComponentItem::Lifecycle(..) | ComponentItem::Apply(_) => {
-                return Err(unsupported(
-                    &format!("initiator-side bound-to transactor `{tname}` lifecycle/apply items"),
-                    "",
+            // Same split as the target-side arm: the lifecycle
+            // half is unreachable (the parser refuses a lifecycle block
+            // outside `test`/`impl`/`testbench`), and v1 drops `apply`
+            // silently.
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
+            ComponentItem::Apply(_) => {
+                return Err(not_implemented(
+                    &format!("initiator-side bound-to transactor `{tname}` `apply` items"),
+                    "v1 parses the item and emits NOTHING for it — the aspect is silently \
+                     dropped, and its name is never resolved",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }

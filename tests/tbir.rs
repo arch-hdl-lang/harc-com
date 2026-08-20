@@ -9163,6 +9163,107 @@ end test T
     );
 }
 
+/// `apply` and a lifecycle block shared one arm on three transactor
+/// paths, and only one of them can ever reach it.
+///
+/// A lifecycle block is refused by the PARSER in any component that is
+/// not a `testbench`, so neither backend ever sees one on a transactor
+/// — the arm was promising `--codegen v1` for a program that does not
+/// parse anywhere. `apply` does reach it, and v1 does not implement it:
+/// `ComponentItem::Apply(_) => {}` in `cpp_tb`, so v1 emits the file
+/// with no trace of the aspect and without resolving its name.
+#[test]
+fn a_transactor_apply_is_dropped_by_v1_and_a_lifecycle_block_never_parses() {
+    let target = |item: &str| {
+        format!(
+            r#"
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    n : uint<32> default 0
+{item}
+    thread bus.read(addr: uint<8>)
+        n = n + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+    // Initiator side: `hookable` methods instead of a `thread`, bound
+    // `active`. Two more copies of the same arm live on this path.
+    let initiator = |item: &str| {
+        target(item)
+            .replace(
+                "    thread bus.read(addr: uint<8>)
+        n = n + 1
+        return 1
+    end thread",
+                "    hookable poke()
+        n = n + 1
+    end poke",
+            )
+            .replace("TlmMemTarget passive", "TlmMemTarget active")
+    };
+
+    for (label, prog) in [
+        ("target", &target as &dyn Fn(&str) -> String),
+        ("initiator", &initiator),
+    ] {
+        // The CONTROL: the same program without the `apply` lowers
+        // under both backends, so the item is the only difference.
+        lower_src(&prog("")).unwrap_or_else(|e| panic!("{label} control lowers: {e}"));
+        cpp_tb::emit(&merged_src(&prog(""))).expect("v1 emits the control");
+
+        let src = prog(
+            "    apply Whatever
+",
+        );
+        let err = lower_src(&src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("`apply` items"), "{label}: {msg}");
+        // v1 emits, and the aspect is nowhere in the output — it is not
+        // even resolved, so a name that exists nowhere emits clean.
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it");
+        assert!(
+            !v1.contains("Whatever"),
+            "{label}: the aspect is dropped without a word"
+        );
+    }
+
+    // The lifecycle half cannot reach that arm at all: the parser
+    // rejects the block before any backend runs.
+    for kw in ["setup", "check", "teardown"] {
+        let src = target(&format!(
+            "    {kw}
+        n = 5
+    end {kw}
+"
+        ));
+        let err = parse_source(&src).expect_err("the parser refuses a transactor lifecycle block");
+        assert!(
+            err.to_string()
+                .contains("lifecycle blocks are currently supported only inside"),
+            "`{kw}`: {err}"
+        );
+    }
+}
+
 /// The two record-traversal arms that had no cell of their own.
 ///
 /// `indexing the non-`Vec` record field` had its verdict flipped to
