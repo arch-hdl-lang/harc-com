@@ -8891,6 +8891,278 @@ end test T
     }
 }
 
+/// A component-record `Vec` element is not a plain `uint64_t`, and the
+/// emitter has to know that.
+///
+/// `ComponentVecElement`'s `field` is a member SUFFIX. For a `Vec` LEAF
+/// inside a component RECORD field it is dotted (`a.data`), and every
+/// consumer looked it up with `fields.iter().find(|f| f.name == *field)`
+/// — which can never match a dotted name. Width came back unknown and
+/// signedness `false`, which is not a missing optimisation: it decided
+/// `>>` between an arithmetic and a logical shift, and whether a
+/// >64-bit element was truncated to `uint64_t` first. Both files
+/// compiled; both silently disagreed with v1.
+#[test]
+fn a_component_record_vec_element_keeps_its_width_and_signedness() {
+    let prog = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Bundle
+    signed_  : Vec<sint<32>, 4>
+    wide     : Vec<uint<128>, 2>
+    kids     : Vec<Kid, 4>
+    small    : Vec<uint<8>, 4>
+end struct Bundle
+
+agent Cmp
+    a : Bundle
+    b : Bundle
+
+    hookable step()
+        {body}
+    end step
+end agent Cmp
+
+test T
+    let dut : Top
+    let c   : Cmp
+    run
+        c.step()
+        wait 2 cycles
+    end run
+end test T
+"#
+        )
+    };
+    // A SIGNED element shifts arithmetically, as v1's `int64_t` member
+    // read does. The logical shift the broken lookup produced turns
+    // -8 >> 1 from -4 into 9223372036854775804.
+    let cpp = emit_cpp_src(&prog("let z = a.signed_[0] >> 1"));
+    assert!(
+        cpp.contains("((int64_t)(self.a.signed_[0])) >> 1"),
+        "signed element gets an arithmetic shift:\n{cpp}"
+    );
+    // A >64-bit element keeps its width. Truncating to `uint64_t` first
+    // turns (1<<100) >> 1 into 0.
+    let cpp = emit_cpp_src(&prog("let w = a.wide[0] >> 1"));
+    assert!(
+        cpp.contains("harc_shr_u128((_harc_u128)(self.a.wide[0])"),
+        "wide element keeps its 128-bit shift:\n{cpp}"
+    );
+
+    // A `Vec<Record, N>` leaf is a record value, in both directions.
+    // Without the element type the write guard was inert and
+    // `a.kids[0] = 5` emitted `self.a.kids[0] = 5;` — "no match for
+    // `operator=` … `Kid` and `int`" — for a program that had been
+    // cleanly refused.
+    let err = lower_src(&prog("a.kids[0] = 5")).unwrap_err();
+    assert!(
+        err.to_string().contains("component `Vec` record field"),
+        "{err}"
+    );
+    let err = lower_src(&prog("a.small[0] = b.kids[0]")).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)) && err.to_string().contains("Kid"),
+        "a record element into a scalar element is a type error: {err:?}"
+    );
+    // …and the scalar element write still lowers.
+    emit_cpp_src(&prog("a.small[0] = 7"));
+}
+
+/// An element selection INSIDE a component-record or responder-state
+/// path (`ba.data[0]`, `c.b.tbl[0].data`) is refused with the verdict
+/// that is true of it: v1 compiles the whole family.
+///
+/// Neither resolver carries mid-path `[i]`, so these shapes used to fall
+/// past every lane onto whichever generic arm caught the leftovers —
+/// "index expressions" (`EmitsUncompilable`), "assignment to a target
+/// that is neither a DUT port nor a local" (`SilentlyMisLowers`, the
+/// loudest verdict in the enum), "field access on a non-DUT value"
+/// (`EmitsUncompilable`). All three were false. Those arms cover much
+/// else, so the answer comes before them rather than by relabelling
+/// them.
+#[test]
+fn an_index_inside_a_component_or_state_record_path_says_so() {
+    let state = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Bundle
+    data : Vec<uint<8>, 4>
+    kids : Vec<Kid, 4>
+end struct Bundle
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    ba : Bundle
+
+    thread bus.read(addr: uint<8>)
+        {body}
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+    for bad in [
+        "let z = ba.data[0]",
+        "ba.data[0] = 1",
+        "let z = ba.kids[0].p",
+    ] {
+        let src = state(bad);
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("an element selection inside"),
+            "`{bad}`: {msg}"
+        );
+        // The `--codegen v1` this offers is a real one: v1 emits
+        // `target.ba.data[0]` / `target.ba.kids[0].p` and g++ accepts.
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{bad}`: v1 emits: {e:?}"));
+    }
+
+    // A record LOCAL is unaffected — it carries mid-path selections and
+    // always has.
+    lower_src(
+        r#"
+struct Kid
+    data : Vec<uint<8>, 4>
+end struct Kid
+
+struct Bundle
+    tbl : Vec<Kid, 4>
+end struct Bundle
+
+test T
+    let dut : Top
+    run
+        let r : Bundle
+        let z = r.tbl[0].data[1]
+        wait 1 cycle
+    end run
+end test T
+"#,
+    )
+    .expect("a record local still indexes mid-path");
+}
+
+/// A whole-`Vec` copy pairs on the C++ member, wherever each side lives.
+///
+/// The record-local write arm resolved its RHS with
+/// `try_record_field_chain`, which sees record LOCALS only — so
+/// `r.data = c.a.data` was reported "non-matching" and, since that arm
+/// claims `EmitsUncompilable`, told the user no backend runs a program
+/// v1 compiles. Every write lane goes through `whole_vec_copy_rhs` now,
+/// which lowers the RHS ONCE and asks the resulting IR for its shape —
+/// so an indexed RHS (`r.tbl[0].data`) pairs too, instead of being
+/// refused for its spelling.
+#[test]
+fn a_whole_vec_copy_pairs_across_lanes() {
+    let prog = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    data : Vec<uint<8>, 4>
+end struct Kid
+
+struct Bundle
+    data : Vec<uint<8>, 4>
+    tbl  : Vec<Kid, 4>
+    n    : uint<8>
+end struct Bundle
+
+agent Cmp
+    a : Bundle
+    b : Bundle
+end agent Cmp
+
+test T
+    let dut : Top
+    let c   : Cmp
+    run
+        let r : Bundle
+        {body}
+        wait 2 cycles
+    end run
+end test T
+"#
+        )
+    };
+    for (ok, rendered) in [
+        // (A test-scope component instance renders bare, not under
+        // `self` — that is a method-body base.)
+        ("r.data = c.a.data", "r.data = c.a.data"),
+        ("c.a.data = r.data", "c.a.data = r.data"),
+        ("r.data = r.tbl[0].data", "r.data = r.tbl[0].data"),
+    ] {
+        let src = prog(ok);
+        let cpp = emit_cpp_src(&src);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it");
+        assert!(cpp.contains(rendered), "`{ok}`: tbir emits it:\n{cpp}");
+        assert!(v1.contains(rendered), "`{ok}`: …and so does v1:\n{v1}");
+    }
+    // A scalar RHS is still refused, and v1 still cannot compile it.
+    let err = lower_src(&prog("r.data = c.a.n")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("non-matching RHS"), "{msg}");
+}
+
+/// A suggestion for an indexed chain has to say where the index goes.
+/// `spelled` was built from the field names alone, so `r.tbl[0].data`
+/// came back as `r.tbl.data[i]` — a DIFFERENT field, refused by a
+/// different diagnostic.
+#[test]
+fn a_suggestion_for_an_indexed_chain_keeps_its_selection() {
+    let err = lower_src(
+        r#"
+struct Kid
+    data : Vec<uint<8>, 4>
+end struct Kid
+
+struct Bundle
+    tbl : Vec<Kid, 4>
+end struct Bundle
+
+test T
+    let dut : Top
+    run
+        let r : Bundle
+        let d = r.tbl[0].data
+        wait 1 cycle
+    end run
+end test T
+"#,
+    )
+    .unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("`r.tbl[…].data[i]`"),
+        "the selection survives into the suggestion: {msg}"
+    );
+}
+
 /// The two record-traversal arms that had no cell of their own.
 ///
 /// `indexing the non-`Vec` record field` had its verdict flipped to

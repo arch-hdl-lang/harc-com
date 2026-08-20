@@ -2438,12 +2438,34 @@ impl FuncBuilder<'_> {
             // `SilentlyMisLowers` — the loudest verdict in the enum, and
             // false: v1 emits `self.a.data[0] = 1;` and g++ accepts it.
             if let Some(rf) = self.as_component_record_field(it)? {
-                if let Some((len, _)) = rf.leaf_vec {
+                if let Some((len, elem)) = rf.leaf_vec.clone() {
                     let index = self.lower_expr_no_ports(index)?;
                     super::exprs::check_literal_component_vec_index_bounds(
                         &rf.base, &rf.dotted, &index, len,
                     )?;
                     let value = self.lower_expr_no_ports(value)?;
+                    // BOTH halves of the guard pair the record-local
+                    // element write carries, not just the first. A
+                    // `Vec<Record, N>` leaf takes a value of the
+                    // ELEMENT's record type and nothing else: without
+                    // the second half `a.kids[0] = 5` lowered into
+                    // `self.a.kids[0] = 5;`, which g++ refuses ("no
+                    // match for `operator=` … `Kid` and `int`") — a
+                    // program cleanly refused before this lane existed.
+                    if let IrType::Record(elem_rid) = elem {
+                        if self.record_id_of_expr(&value) != Some(elem_rid) {
+                            return Err(self.record_assign_mismatch(
+                                &value,
+                                elem_rid,
+                                format!(
+                                    "an element of component `Vec` record field `{}`",
+                                    rf.dotted
+                                ),
+                                "assign a value of the element's record type, or set the \
+                                 element's fields individually",
+                            ));
+                        }
+                    }
                     self.reject_record_into_scalar(
                         &value,
                         &format!("element of component `Vec` field `{}`", rf.dotted),
@@ -2575,34 +2597,31 @@ impl FuncBuilder<'_> {
                             V1Status::EmitsUncompilable,
                         )
                     };
-                    // RHS must be a whole-`Vec` field read of matching shape.
-                    let Some(rhs) = self.try_record_field_chain(value)? else {
+                    // The RHS goes through the SAME helper the other
+                    // two write lanes use. Resolving it here with
+                    // `try_record_field_chain` saw record LOCALS only,
+                    // so a cross-lane RHS — `r.data = c.a.data`, a
+                    // component record field — was reported as
+                    // "non-matching" and, since this arm now claims
+                    // `EmitsUncompilable`, told the user no backend runs
+                    // it. v1 emits `r.data = c.a.data;` and g++ accepts
+                    // it (0 errors, measured).
+                    let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty)
+                        .map(|cls| (dst_len, cls));
+                    let rhs = match shape {
+                        Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
+                        None => None,
+                    };
+                    let Some(rhs) = rhs else {
                         return Err(mismatch());
                     };
-                    // Same predicate the `==`/`!=` read pairing uses
-                    // (`whole_vec_leaf`): two whole-`Vec` fields are
-                    // assignable exactly when both render as the same
-                    // `std::array<elem, N>` member.
-                    let same_shape = rhs.leaf_vec_len == Some(dst_len)
-                        && crate::codegen::cpp_tb::ir_vec_elem_class(&rhs.leaf_ty)
-                            == crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty)
-                        && crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty).is_some();
-                    if !same_shape {
-                        return Err(mismatch());
-                    }
                     self.push(Stmt::RecordFieldWrite {
                         local: chain.local,
                         field: chain.field,
                         path: chain.path,
                         mid_indices: chain.mid_indices,
                         index: None,
-                        value: Expr::RecordField {
-                            local: rhs.local,
-                            field: rhs.field,
-                            path: rhs.path,
-                            mid_indices: rhs.mid_indices,
-                            index: None,
-                        },
+                        value: rhs,
                     });
                     return Ok(());
                 }
@@ -2701,6 +2720,7 @@ impl FuncBuilder<'_> {
         // The second is why this is not `Invalid`: v1 runs that program,
         // just not the one that was written. Worst-under-arm, and a
         // silent write to the DUT is the worst thing here.
+        self.reject_indexed_component_record_path(target, "a write through")?;
         Err(not_implemented(
             "assignment to a target that is neither a DUT port nor a local",
             "v1 either emits an assignment to a non-place, which does not compile, or — \

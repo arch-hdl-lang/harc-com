@@ -8092,7 +8092,9 @@ former `transaction` group lives in
      - the whole-`Vec` WRITE now lowers in all three lanes, through one
        `whole_vec_copy_rhs` helper that turns the read permission on for
        the RHS — the responder-state and component spellings each emit
-       what v1 emits and compile;
+       what v1 emits and compile. (The record-local lane was left
+       resolving its own RHS with `try_record_field_chain`, which sees
+       record LOCALS only; divergence 127 finishes that.);
      - component-record `Vec` ELEMENT access lowers, reusing the
        `ComponentVecElement` / `ComponentVecElementWrite` nodes a fixed-
        vector component FIELD already had. It was carrying two false
@@ -8117,6 +8119,70 @@ former `transaction` group lives in
      this bug was the same sentence in a plain `&str` slot printing
      `{rec}.{field}` braces and all — one detail string, two ways to
      hand the user a path they cannot use.
+
+127. **Two silent miscompiles behind one convenience (2026-08-20).**
+
+     Divergence 126 lowered component-record `Vec` element access by
+     reusing the `ComponentVecElement` / `ComponentVecElementWrite`
+     nodes a fixed-vector component FIELD already had. The node's
+     `field` is a member SUFFIX, and for the new lane it is DOTTED
+     (`a.data`). Every consumer resolved it with
+     `fields.iter().find(|f| f.name == *field)` — a lookup that can
+     never match a dotted name. Width came back unknown, signedness
+     `false`, type `None`.
+
+     None of that surfaced as a diagnostic. It decided:
+
+     - `>>` between an ARITHMETIC and a LOGICAL shift. With a
+       `Vec<sint<32>, 4>` element holding `-8`, v1 answers `-4` and tbir
+       answered `9223372036854775804`.
+     - whether a >64-bit element was truncated to `uint64_t` before use.
+       With a `Vec<uint<128>, 2>` element holding `1 << 100`, v1 answers
+       `1 << 99` and tbir answered `0`.
+     - whether the write guards could see a record element at all. The
+       record-local element write carries a matched PAIR of guards — a
+       scalar-leaf check and a record-leaf check — and the new lane
+       copied one of them, which was inert anyway because it routes
+       through the same broken type lookup. `a.kids[0] = 5` emitted
+       `self.a.kids[0] = 5;`, which g++ refuses, for a program that had
+       been cleanly refused before the lane existed.
+
+     Both files compiled. **A reused node is not a free implementation:
+     the reuse changed what its key field can contain, and every reader
+     of that field was part of the change.** The type walk lives in one
+     helper now (`component_vec_elem_type`), and `record_id_of_expr`
+     answers through `expr_type` so the two cannot disagree.
+
+     Two more false verdicts came out of the same "resolvers stop at
+     `[`" fact, in the opposite direction. An element selection INSIDE a
+     component-record or responder-state path (`ba.data[0]`,
+     `c.b.tbl[0].data`, `ba.kids[0].p`) resolves in neither lane, so it
+     fell past every one of them onto whichever generic arm caught the
+     leftovers: "index expressions" (`EmitsUncompilable`), "assignment
+     to a target that is neither a DUT port nor a local"
+     (`SilentlyMisLowers` — the loudest verdict in the enum), "field
+     access on a non-DUT value" (`EmitsUncompilable`). v1 compiles the
+     whole family, measured at 0 errors each. Those arms cover much
+     else, so the answer comes BEFORE them, as one precise `Unsupported`
+     — which is true, and names the gap instead of mislabelling it.
+
+     And the write pairing was still asking the wrong resolver.
+     `r.data = c.a.data` — a record local copied from a component record
+     field — was reported "non-matching RHS" under
+     `EmitsUncompilable`, because that arm resolved its RHS with
+     `try_record_field_chain`, which sees record locals only. v1 emits
+     `r.data = c.a.data;` and compiles. Every write lane now goes
+     through `whole_vec_copy_rhs`, which lowers the RHS ONCE and asks
+     the resulting IR for its shape rather than the AST — so an indexed
+     RHS (`r.tbl[0].data`) pairs too, instead of being refused for its
+     spelling. The read-side pairing still has to ask the AST, because
+     both operands are lowered again afterwards; the two positions get
+     different mechanisms for a reason, and the comments say which.
+
+     Smaller, same root: `spelled` was built from field names alone, so
+     `r.tbl[0].data` suggested `r.tbl.data[i]` — a DIFFERENT field,
+     refused by a different diagnostic. It carries the selection now
+     (`r.tbl[…].data[i]`), as a template rather than a paste.
 
 ## Next steps
 

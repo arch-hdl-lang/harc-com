@@ -2989,12 +2989,7 @@ pub(crate) fn fold_field_default(
 use crate::ast::{CallArg, Expr as AstExpr};
 use crate::ir::{ComponentBase, Expr as IrExpr, Stmt as IrStmt};
 
-/// A resolved component record-field access: the emission base, the
-/// validated C++ member suffix (`current.value`), and — when the leaf
-/// field is a `Vec<T, N>` — its `(N, T)` shape. The shape is REPORTED,
-/// not judged: read and write disagree about whether a whole-`Vec` leaf
-/// is admissible, so each caller decides.
-/// A resolved component field WRITE target. Same three parts as
+/// A resolved component field WRITE target. Same four parts as
 /// `ComponentRecordField`, carried through so the assignment site can
 /// decide what a whole-`Vec` leaf means instead of the resolver
 /// deciding for it.
@@ -3005,6 +3000,12 @@ pub(crate) struct ComponentFieldTarget {
     pub dotted: String,
 }
 
+/// A resolved component record-field access: the emission base, the
+/// validated C++ member suffix (`current.value`), the full dotted path
+/// as written, and — when the leaf field is a `Vec<T, N>` — its `(N, T)`
+/// shape. The shape is REPORTED, not judged: read and write disagree
+/// about whether a whole-`Vec` leaf is admissible, so each caller
+/// decides.
 pub(crate) struct ComponentRecordField {
     pub base: ComponentBase,
     pub field: String,
