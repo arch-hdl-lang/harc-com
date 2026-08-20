@@ -136,6 +136,164 @@ pub fn vec_lane_widths_from_sv(
     out
 }
 
+/// Top-module DUT port name → total packed width. This reuses the same
+/// tolerant ANSI/non-ANSI scanner as the DPI accessor path. TBIR cover
+/// emission needs the total width to reject untyped C++ composition over a
+/// raw `HarcWide<N>` port once the SV interface is available.
+pub fn dut_port_widths_from_sv(
+    sv_sources: &[std::path::PathBuf],
+    top: &str,
+) -> std::collections::HashMap<String, u32> {
+    cosim_ports_from_sv(sv_sources, top)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|port| (port.name, port.width_bits))
+        .collect()
+}
+
+/// Top-module DUT scalar port name → declared packed width from native
+/// `.archi`/`.arch` interfaces. This complements [`dut_port_widths_from_sv`]
+/// on the `--dut` path, where no generated SystemVerilog is available to
+/// scan. Concrete scalar widths are retained; a parameter-dependent scalar
+/// uses an out-of-language sentinel so width-sensitive cover composition is
+/// rejected conservatively until an elaborated `.archi` supplies its width.
+/// Aggregate bus widths are discovered from the flattened SV interface.
+pub fn dut_port_widths_from_files(
+    dut_files: &[std::path::PathBuf],
+    top: &str,
+) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for f in dut_files {
+        let mut candidates = Vec::new();
+        if f.extension().and_then(|e| e.to_str()) == Some("arch") {
+            let archi = f.with_extension("archi");
+            if archi.exists() {
+                candidates.push(archi);
+            }
+        }
+        candidates.push(f.clone());
+        for cand in candidates {
+            if !seen.insert(cand.clone()) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&cand) else {
+                continue;
+            };
+            if collect_port_widths_from_src(&src, top, &mut out) {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn collect_port_widths_from_src(
+    src: &str,
+    top: &str,
+    out: &mut std::collections::HashMap<String, u32>,
+) -> bool {
+    let mut in_top = false;
+    let mut found_top = false;
+    for raw in src.lines() {
+        let line = raw.split("//").next().unwrap_or(raw).trim();
+        if let Some(rest) = line.strip_prefix("module ") {
+            in_top = rest.split_whitespace().next() == Some(top);
+            found_top |= in_top;
+            continue;
+        }
+        if line.starts_with("end module") {
+            in_top = false;
+            continue;
+        }
+        if !in_top {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("port ") else {
+            continue;
+        };
+        let Some(colon) = rest.find(':') else {
+            continue;
+        };
+        let name = rest[..colon].trim();
+        if name.is_empty() || !is_simple_ident(name) {
+            continue;
+        }
+        let after_colon = rest[colon + 1..].trim();
+        let ty_tail = if let Some(t) = after_colon.strip_prefix("in ") {
+            t
+        } else if let Some(t) = after_colon.strip_prefix("out ") {
+            t
+        } else {
+            // Bus perspectives flatten to multiple physical signals; their
+            // widths come from the generated SV table when that path is used.
+            continue;
+        };
+        let ty_tail = ty_tail.split(';').next().unwrap_or(ty_tail).trim();
+        let ty_str = leading_arch_type_str(ty_tail);
+        let ty_str = outer_element_type_str(&ty_str, "pipe_reg").unwrap_or(ty_str);
+        let Ok(ty) = crate::parser::parse_type_expr_fragment(&ty_str) else {
+            continue;
+        };
+        let width = concrete_port_type_bit_width(&ty)
+            .or_else(|| scalar_port_type_has_unresolved_width(&ty).then_some(u32::MAX));
+        if let Some(width) = width {
+            out.entry(name.to_string()).or_insert(width);
+        }
+    }
+    found_top
+}
+
+fn leading_arch_type_str(ty_tail: &str) -> String {
+    let mut depth = 0i32;
+    for (i, c) in ty_tail.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => return ty_tail[..i].trim().to_string(),
+            _ => {}
+        }
+    }
+    ty_tail.trim().to_string()
+}
+
+fn concrete_port_type_bit_width(ty: &TypeExpr) -> Option<u32> {
+    let TypeExpr::Builtin { name, args, .. } = ty else {
+        return None;
+    };
+    match name {
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::SInt
+        | BuiltinTy::SIntCap
+        | BuiltinTy::Bits => {
+            if args.is_empty() {
+                Some(64)
+            } else {
+                type_arg_width(args)
+            }
+        }
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(1),
+        BuiltinTy::Int => Some(32),
+        _ => None,
+    }
+}
+
+fn scalar_port_type_has_unresolved_width(ty: &TypeExpr) -> bool {
+    matches!(
+        ty,
+        TypeExpr::Builtin {
+            name: BuiltinTy::UInt
+                | BuiltinTy::UIntCap
+                | BuiltinTy::SInt
+                | BuiltinTy::SIntCap
+                | BuiltinTy::Bits,
+            args,
+            ..
+        } if !args.is_empty() && type_arg_width(args).is_none()
+    )
+}
+
 /// Core of `vec_lane_widths_from_sv` over a single SV source string.
 /// Returns `None` if `top` isn't declared in this source.
 fn scan_sv_module_lane_widths(
@@ -360,6 +518,11 @@ pub struct EmitOpts {
     /// path — there the existing direct `port[i]` array indexing is
     /// already correct.
     pub vec_lane_widths: std::collections::HashMap<String, u32>,
+    /// Total packed width of each DUT top-module port discovered from `--sv`.
+    /// Coverpoint schemas lower before a DUT interface is available, so this
+    /// late metadata prevents raw wide ports from reaching scalar C++
+    /// operators without the required `HarcWide<N>` coercion.
+    pub dut_port_widths: std::collections::HashMap<String, u32>,
     /// DUT-port-level bus param overrides, keyed by DUT port name (which by
     /// convention equals the HARC `let <name> : Bus = bind dut` bind name and
     /// the flattened SV signal prefix). Inner map is `param-name → folded i64`.
@@ -3967,7 +4130,11 @@ fn bus_port_generics(te: &TypeExpr) -> Option<&[TypeArg]> {
 /// Returns `None` if `ty` is not a `Vec<...>` form (a bare `BusName<...>` port
 /// type passes straight through to the parser unchanged).
 fn vec_element_type_str(ty: &str) -> Option<String> {
-    let inner = ty.strip_prefix("Vec")?.trim_start();
+    outer_element_type_str(ty, "Vec")
+}
+
+fn outer_element_type_str(ty: &str, wrapper: &str) -> Option<String> {
+    let inner = ty.strip_prefix(wrapper)?.trim_start();
     let inner = inner.strip_prefix('<')?;
     let inner = inner.strip_suffix('>')?;
     // Find the last top-level (depth-0) comma — separates ELEM from the count.
@@ -23652,8 +23819,72 @@ end bus B"#,
 
     use super::{
         bus_param_env_with_port_override, collect_port_overrides_from_src,
-        dut_bus_port_overrides_from_files,
+        collect_port_widths_from_src, dut_bus_port_overrides_from_files,
+        dut_port_widths_from_files,
     };
+
+    #[test]
+    fn concrete_arch_scalar_port_widths_are_ingested() {
+        let archi = "module M\n  port clk: in Clock<SysDomain>;\n  port data: out UInt<1024>;\n  port flag: in Bool;\n  port symbolic: out UInt<WIDTH>;\n  port bus: target SomeBus;\nend module M\n";
+        let mut widths = std::collections::HashMap::new();
+        collect_port_widths_from_src(archi, "M", &mut widths);
+        assert_eq!(widths.get("data"), Some(&1024));
+        assert_eq!(widths.get("flag"), Some(&1));
+        assert_eq!(widths.get("symbolic"), Some(&u32::MAX));
+        assert_eq!(widths.get("bus"), None);
+    }
+
+    #[test]
+    fn arch_port_widths_are_scoped_to_the_selected_top_and_unwrap_pipe_reg() {
+        let archi = "module Helper\n  port data: out UInt<8>;\nend module Helper\nmodule M\n  port data: out pipe_reg<UInt<1024>, 1> reset rst => 0;\nend module M\n";
+        let mut widths = std::collections::HashMap::new();
+        collect_port_widths_from_src(archi, "M", &mut widths);
+        assert_eq!(widths.get("data"), Some(&1024));
+    }
+
+    #[test]
+    fn archi_scalar_width_is_preferred_over_arch_source() {
+        let dir =
+            std::env::temp_dir().join(format!("harc_archi_port_width_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join("M.arch");
+        std::fs::write(
+            &arch,
+            "module M\n  port data: out UInt<128>;\nend module M\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("M.archi"),
+            "module M\n  port data: out UInt<1024>;\nend module M\n",
+        )
+        .unwrap();
+        let widths = dut_port_widths_from_files(&[arch], "M");
+        assert_eq!(widths.get("data"), Some(&1024));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arch_source_is_fallback_when_archi_omits_selected_top() {
+        let dir = std::env::temp_dir().join(format!(
+            "harc_archi_missing_top_width_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join("M.arch");
+        std::fs::write(
+            &arch,
+            "module Primary\n  port data: out UInt<8>;\nend module Primary\nmodule Secondary\n  port data: out UInt<1024>;\nend module Secondary\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("M.archi"),
+            "module Primary\n  port data: out UInt<8>;\nend module Primary\n",
+        )
+        .unwrap();
+        let widths = dut_port_widths_from_files(&[arch], "Secondary");
+        assert_eq!(widths.get("data"), Some(&1024));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The realistic case: the DUT module's own port carries the override
     /// (`port s: target BusAxiG<WRITE=0>`, as recorded in its `.arch`/`.archi`),
@@ -23766,7 +23997,7 @@ end bus B"#,
 
 #[cfg(test)]
 mod vec_lane_sv_scan_tests {
-    use super::scan_sv_module_lane_widths;
+    use super::{scan_sv_module_lane_widths, scan_sv_module_ports};
 
     fn scan(src: &str, top: &str) -> std::collections::HashMap<String, u32> {
         scan_sv_module_lane_widths(src, top).unwrap_or_default()
@@ -23818,6 +24049,19 @@ mod vec_lane_sv_scan_tests {
         assert_eq!(m.get("flag"), Some(&1));
         // `data` belongs to `Other`, not `M`.
         assert_eq!(m.get("data"), None);
+    }
+
+    #[test]
+    fn total_port_scan_retains_raw_wide_width() {
+        let sv = "module M (\n  input logic clk,\n  output logic [1023:0] data,\n);\nendmodule\n";
+        let ports = scan_sv_module_ports(sv, "M").expect("top module scans");
+        assert_eq!(
+            ports
+                .iter()
+                .find(|port| port.name == "data")
+                .map(|port| port.width_bits),
+            Some(1024)
+        );
     }
 }
 

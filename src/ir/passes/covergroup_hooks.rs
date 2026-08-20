@@ -42,6 +42,17 @@ enum HookTarget {
 /// subscription on the matching transactor method. Mutating; leaves the
 /// program ready for emission.
 pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
+    // Clock-triggered schemas have no hook-parameter environment, so their
+    // complete expression typing can run immediately. Previously only hook
+    // schemas reached this checker, allowing malformed helper calls in an
+    // otherwise identical posedge covergroup to pass verification.
+    let no_hook_params = HashMap::new();
+    for (index, schema) in prog.covgroups.iter().enumerate() {
+        if matches!(schema.trigger, CovTrigger::PosedgeDutClk) {
+            validate_covergroup_expr_types(prog, index, &no_hook_params, false)?;
+        }
+    }
+
     // Collect (covgroup, receiver_path, method, side) for every cov field
     // bound to a hook-triggered covergroup, per testbench. A covergroup
     // schema is shared by id; the subscription is recorded once per
@@ -206,54 +217,7 @@ pub fn run(prog: &mut TbProgram) -> Result<(), LowerError> {
             .iter()
             .map(|p| (p.name.clone(), p.ty.clone()))
             .collect();
-        for point in &prog.covgroups[p.covgroup.index()].points {
-            let ty =
-                coverpoint_expr_type(prog, &hook_param_types, &point.target).map_err(|msg| {
-                    LowerError::Invalid(format!(
-                        "covergroup `{cg_name}` point `{}` hook target type error: {msg}",
-                        point.name
-                    ))
-                })?;
-            if !is_scalar(&ty) {
-                return Err(LowerError::Invalid(format!(
-                    "covergroup `{cg_name}` point `{}` hook target must be scalar, got {}",
-                    point.name,
-                    type_name(prog, &ty)
-                )));
-            }
-            // Bin members and range bounds need the same check as the
-            // target, and for the same reason: a bin compares `_v`
-            // against the bound, so a record-typed hook param
-            // (`one = {cmd}`) emits `_v == cmd` — `uint64_t` against a
-            // struct, which g++ rejects. v1 emits exactly the same
-            // thing, so this is a malformed program under BOTH backends
-            // (`Invalid`, not a subset gap), and pointing at
-            // `--codegen v1` would be a false promise.
-            //
-            // Bins reached this only after exact values were allowed to
-            // be runtime expressions; before that a bare non-const name
-            // was rejected in lowering, which caught it by accident.
-            for bin in &point.bins {
-                for bound in bin.values.iter().flat_map(bin_bounds) {
-                    let ty =
-                        coverpoint_expr_type(prog, &hook_param_types, bound).map_err(|msg| {
-                            LowerError::Invalid(format!(
-                                "covergroup `{cg_name}` point `{}` bin `{}` hook type error: {msg}",
-                                point.name, bin.name
-                            ))
-                        })?;
-                    if !is_scalar(&ty) {
-                        return Err(LowerError::Invalid(format!(
-                            "covergroup `{cg_name}` point `{}` bin `{}` must compare against a \
-                             scalar, got {}",
-                            point.name,
-                            bin.name,
-                            type_name(prog, &ty)
-                        )));
-                    }
-                }
-            }
-        }
+        validate_covergroup_expr_types(prog, p.covgroup.index(), &hook_param_types, true)?;
         match target {
             HookTarget::Transactor { xid, midx, .. } => prog.transactors[xid.index()].methods[midx]
                 .cov_hook_subs
@@ -288,21 +252,85 @@ fn bin_bounds(v: &crate::ir::CovBinValue) -> Vec<&Expr> {
     }
 }
 
+fn validate_covergroup_expr_types(
+    prog: &TbProgram,
+    covgroup: usize,
+    hook_params: &HashMap<String, IrType>,
+    hook_context: bool,
+) -> Result<(), LowerError> {
+    let schema = &prog.covgroups[covgroup];
+    for point in &schema.points {
+        let ty = coverpoint_expr_type(prog, hook_params, &point.target).map_err(|msg| {
+            LowerError::Invalid(format!(
+                "covergroup `{}` point `{}` {}target type error: {msg}",
+                schema.name,
+                point.name,
+                if hook_context { "hook " } else { "" }
+            ))
+        })?;
+        if !is_scalar(&ty) {
+            return Err(LowerError::Invalid(format!(
+                "covergroup `{}` point `{}` {}target must be scalar, got {}",
+                schema.name,
+                point.name,
+                if hook_context { "hook " } else { "" },
+                type_name(prog, &ty)
+            )));
+        }
+
+        // Bin members and range bounds need the same check as the target:
+        // each is compared against the sampler's scalar `_v`.
+        for bin in &point.bins {
+            for bound in bin.values.iter().flat_map(bin_bounds) {
+                let ty = coverpoint_expr_type(prog, hook_params, bound).map_err(|msg| {
+                    LowerError::Invalid(format!(
+                        "covergroup `{}` point `{}` bin `{}` {}type error: {msg}",
+                        schema.name,
+                        point.name,
+                        bin.name,
+                        if hook_context { "hook " } else { "" }
+                    ))
+                })?;
+                if !is_scalar(&ty) {
+                    return Err(LowerError::Invalid(format!(
+                        "covergroup `{}` point `{}` bin `{}` must compare against a scalar, got {}",
+                        schema.name,
+                        point.name,
+                        bin.name,
+                        type_name(prog, &ty)
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn coverpoint_expr_type(
     prog: &TbProgram,
     hook_params: &HashMap<String, IrType>,
     expr: &Expr,
 ) -> Result<IrType, String> {
     match expr {
-        Expr::Literal { ty, .. } => Ok(if matches!(ty, IrType::Unknown) {
-            IrType::UInt(Some(64))
-        } else {
-            ty.clone()
-        }),
-        Expr::Port(_) => Ok(IrType::UInt(Some(64))),
+        Expr::Literal { ty, .. } => Ok(ty.clone()),
+        Expr::WideLiteral(words) => Ok(IrType::UInt(
+            words
+                .len()
+                .checked_mul(32)
+                .and_then(|w| u32::try_from(w).ok()),
+        )),
+        Expr::Port(port) => {
+            if let Some(crate::ir::LaneIndex::Var(index)) = &port.lane {
+                let index_ty = coverpoint_expr_type(prog, hook_params, index)?;
+                require_scalar(prog, &index_ty, "DUT lane index")?;
+                reject_wide_composition_type(&index_ty, "DUT lane index")?;
+            }
+            Ok(IrType::UInt(port.width))
+        }
         Expr::Unary(_, inner) => {
             let ty = coverpoint_expr_type(prog, hook_params, inner)?;
             require_scalar(prog, &ty, "unary operand")?;
+            reject_wide_composition_type(&ty, "unary expression")?;
             Ok(ty)
         }
         Expr::Binary(_, lhs, rhs) => {
@@ -310,6 +338,8 @@ fn coverpoint_expr_type(
             let rhs_ty = coverpoint_expr_type(prog, hook_params, rhs)?;
             require_scalar(prog, &lhs_ty, "binary lhs")?;
             require_scalar(prog, &rhs_ty, "binary rhs")?;
+            reject_wide_composition_type(&lhs_ty, "binary expression lhs")?;
+            reject_wide_composition_type(&rhs_ty, "binary expression rhs")?;
             Ok(IrType::UInt(Some(64)))
         }
         Expr::Ternary(cond, then_expr, else_expr) => {
@@ -319,12 +349,26 @@ fn coverpoint_expr_type(
             require_scalar(prog, &cond_ty, "ternary condition")?;
             require_scalar(prog, &then_ty, "ternary then branch")?;
             require_scalar(prog, &else_ty, "ternary else branch")?;
+            reject_wide_composition_type(&cond_ty, "ternary condition")?;
+            reject_wide_composition_type(&then_ty, "ternary then branch")?;
+            reject_wide_composition_type(&else_ty, "ternary else branch")?;
             Ok(common_scalar_type(&then_ty, &else_ty))
         }
         Expr::BitSlice { hi, lo, target } => {
             let target_ty = coverpoint_expr_type(prog, hook_params, target)?;
             require_scalar(prog, &target_ty, "bit-slice target")?;
             Ok(IrType::UInt(Some(hi - lo + 1)))
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            let target_ty = coverpoint_expr_type(prog, hook_params, target)?;
+            let hi_ty = coverpoint_expr_type(prog, hook_params, hi)?;
+            let lo_ty = coverpoint_expr_type(prog, hook_params, lo)?;
+            require_scalar(prog, &target_ty, "runtime bit-slice target")?;
+            require_scalar(prog, &hi_ty, "runtime bit-slice high bound")?;
+            require_scalar(prog, &lo_ty, "runtime bit-slice low bound")?;
+            reject_wide_composition_type(&hi_ty, "runtime bit-slice high bound")?;
+            reject_wide_composition_type(&lo_ty, "runtime bit-slice low bound")?;
+            Ok(IrType::UInt(None))
         }
         Expr::WidthCast {
             kind, width, inner, ..
@@ -379,6 +423,7 @@ fn coverpoint_expr_type(
             if let Some(index) = index {
                 let index_ty = coverpoint_expr_type(prog, hook_params, index)?;
                 require_scalar(prog, &index_ty, "hook field index")?;
+                reject_wide_composition_type(&index_ty, "hook field index")?;
             }
             Ok(field_schema.ty.clone())
         }
@@ -448,6 +493,16 @@ fn require_scalar(prog: &TbProgram, ty: &IrType, what: &str) -> Result<(), Strin
     }
 }
 
+fn reject_wide_composition_type(ty: &IrType, what: &str) -> Result<(), String> {
+    if matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 64) {
+        Err(format!(
+            "{what} uses a value wider than 64 bits; composed wide cover expressions need type-directed operand coercion"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_scalar(ty: &IrType) -> bool {
     matches!(
         ty,
@@ -462,6 +517,8 @@ fn scalar_compatible(expected: &IrType, actual: &IrType) -> bool {
     if expected == actual
         || matches!(expected, IrType::Unknown)
         || matches!(actual, IrType::Unknown)
+        || matches!(expected, IrType::UInt(None) | IrType::SInt(None))
+        || matches!(actual, IrType::UInt(None) | IrType::SInt(None))
     {
         return true;
     }

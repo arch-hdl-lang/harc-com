@@ -350,6 +350,204 @@ fn check_temporal_slots(e: &Expr, n_slots: usize, what: &str, errs: &mut Vec<Ver
     }
 }
 
+fn cover_expr_type_hint(expr: &Expr) -> Option<IrType> {
+    match expr {
+        Expr::Literal { ty, .. } => Some(ty.clone()),
+        Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
+        Expr::Port(port) => Some(IrType::UInt(port.width)),
+        Expr::Unary(_, inner) => cover_expr_type_hint(inner),
+        Expr::Binary(_, _, _) => Some(IrType::UInt(Some(64))),
+        Expr::Ternary(_, then_expr, else_expr) => {
+            let then_ty = cover_expr_type_hint(then_expr)?;
+            let else_ty = cover_expr_type_hint(else_expr)?;
+            (then_ty == else_ty).then_some(then_ty)
+        }
+        Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
+        Expr::BitSliceDyn { .. } => Some(IrType::UInt(None)),
+        Expr::WidthCast { kind, width, .. } => Some(match kind {
+            crate::ir::WidthCastKind::Sext => IrType::SInt(Some(*width)),
+            _ => IrType::UInt(Some(*width)),
+        }),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            Some(ret.clone())
+        }
+        _ => None,
+    }
+}
+
+fn cover_scalar_type(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown
+    )
+}
+
+fn cover_call_compatible(expected: &IrType, actual: &IrType) -> bool {
+    cover_scalar_type(expected)
+        && cover_scalar_type(actual)
+        && (matches!(expected, IrType::Unknown)
+            || matches!(actual, IrType::Unknown)
+            || assign_compatible(expected, actual))
+}
+
+fn check_cover_expr(
+    prog: &TbProgram,
+    covgroup: usize,
+    what: &str,
+    hook_params: &[String],
+    expr: &Expr,
+    errs: &mut Vec<VerifyError>,
+) {
+    let bad = |detail: String, errs: &mut Vec<VerifyError>| {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!("cg{covgroup} {what}: {detail}"),
+        });
+    };
+    let recurse = |child: &Expr, errs: &mut Vec<VerifyError>| {
+        check_cover_expr(prog, covgroup, what, hook_params, child, errs)
+    };
+    match expr {
+        Expr::Literal { .. } => {}
+        Expr::WideLiteral(words) => {
+            if words.len() <= 2 {
+                bad(
+                    "wide literal must contain more than two 32-bit words".to_string(),
+                    errs,
+                );
+            }
+        }
+        Expr::Port(port) => {
+            if let Some(LaneIndex::Var(index)) = &port.lane {
+                recurse(index, errs);
+            }
+        }
+        Expr::Binary(_, lhs, rhs) => {
+            recurse(lhs, errs);
+            recurse(rhs, errs);
+        }
+        Expr::Unary(_, inner) => recurse(inner, errs),
+        Expr::Ternary(cond, then_expr, else_expr) => {
+            recurse(cond, errs);
+            recurse(then_expr, errs);
+            recurse(else_expr, errs);
+        }
+        Expr::BitSlice { target, hi, lo } => {
+            recurse(target, errs);
+            if hi < lo {
+                bad(
+                    format!("constant bit slice has reversed bounds [{hi}:{lo}]"),
+                    errs,
+                );
+            }
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            recurse(target, errs);
+            recurse(hi, errs);
+            recurse(lo, errs);
+        }
+        Expr::WidthCast {
+            width,
+            src_width,
+            inner,
+            ..
+        } => {
+            recurse(inner, errs);
+            if *width == 0
+                || *width > crate::MAX_WIDTH_METHOD_BITS
+                || src_width.is_some_and(|w| w == 0)
+            {
+                bad(
+                    format!("width cast has invalid destination {width} or source {src_width:?}"),
+                    errs,
+                );
+            }
+        }
+        Expr::CovHookArg { param } | Expr::CovHookParam { param, .. }
+            if !hook_params.contains(param) =>
+        {
+            bad(format!("references unknown hook parameter `{param}`"), errs);
+        }
+        Expr::CovHookParam {
+            index: Some(index), ..
+        } => recurse(index, errs),
+        Expr::CovHookArg { .. } | Expr::CovHookParam { index: None, .. } => {}
+        Expr::Call(CallTarget::Helper { name, ret }, args) => {
+            let helper = prog
+                .functions
+                .iter()
+                .find(|f| f.kind == FunctionKind::Helper && f.name == *name);
+            let Some(helper) = helper else {
+                bad(format!("references missing helper `{name}`"), errs);
+                for arg in args {
+                    recurse(arg, errs);
+                }
+                return;
+            };
+            if helper.params.len() != args.len() {
+                bad(
+                    format!(
+                        "helper `{name}` arity mismatch: function has {}, call carries {}",
+                        helper.params.len(),
+                        args.len()
+                    ),
+                    errs,
+                );
+            }
+            for (index, (arg, param)) in args.iter().zip(&helper.params).enumerate() {
+                if let Some(actual) = cover_expr_type_hint(arg) {
+                    if !cover_call_compatible(&param.ty, &actual) {
+                        bad(
+                            format!(
+                                "helper `{name}` argument {} type mismatch: expected {:?}, got {:?}",
+                                index + 1,
+                                param.ty,
+                                actual
+                            ),
+                            errs,
+                        );
+                    }
+                }
+            }
+            let actual_ret = helper
+                .ret
+                .and_then(|local| helper.locals.get(local.index()))
+                .map(|local| &local.ty);
+            match actual_ret {
+                None => bad(format!("helper `{name}` has no return value"), errs),
+                Some(actual) if actual != ret => bad(
+                    format!(
+                        "helper `{name}` return metadata mismatch: function has {actual:?}, call carries {ret:?}"
+                    ),
+                    errs,
+                ),
+                Some(actual) if !cover_scalar_type(actual) => bad(
+                    format!("helper `{name}` return must be scalar, got {actual:?}"),
+                    errs,
+                ),
+                Some(_) => {}
+            }
+            for arg in args {
+                recurse(arg, errs);
+            }
+        }
+        Expr::Call(CallTarget::ExternFn { .. }, args) => {
+            for arg in args {
+                recurse(arg, errs);
+            }
+        }
+        Expr::Call(target, _) => {
+            bad(
+                format!("uses unsupported coverpoint call target {target:?}"),
+                errs,
+            );
+        }
+        other => bad(
+            format!("contains expression outside the cover subset: {other:?}"),
+            errs,
+        ),
+    }
+}
+
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
     for t in &prog.tests {
@@ -412,6 +610,47 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // points, all binned (lowering validates this; a pass that edits
     // schemas must not break it — emission indexes `points` directly).
     for (ci, cg) in prog.covgroups.iter().enumerate() {
+        let hook_params = match &cg.trigger {
+            CovTrigger::Hook { param_names, .. } => param_names.as_slice(),
+            CovTrigger::PosedgeDutClk => &[],
+        };
+        for point in &cg.points {
+            check_cover_expr(
+                prog,
+                ci,
+                &format!("point `{}` target", point.name),
+                hook_params,
+                &point.target,
+                &mut errs,
+            );
+            for bin in &point.bins {
+                for value in &bin.values {
+                    let mut check_bound = |bound: &CovBinBound| {
+                        if let CovBinBound::Runtime(expr) = bound {
+                            check_cover_expr(
+                                prog,
+                                ci,
+                                &format!("bin `{}.{}` runtime bound", point.name, bin.name),
+                                hook_params,
+                                expr,
+                                &mut errs,
+                            );
+                        }
+                    };
+                    match value {
+                        CovBinValue::Eq(bound) => check_bound(bound),
+                        CovBinValue::Range { lo, hi } => {
+                            if let Some(bound) = lo {
+                                check_bound(bound);
+                            }
+                            if let Some(bound) = hi {
+                                check_bound(bound);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for cross in &cg.crosses {
             if cross.point_indices.len() < 2 {
                 errs.push(VerifyError::BadProgramRef {

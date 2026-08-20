@@ -3769,6 +3769,37 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     }
 }
 
+/// Parse the VALUE of a validated HARC/Verilog-style sized literal such
+/// as `8'hAB`, `8'd42`, or `4'b1010` when it fits the scalar IR domain.
+///
+/// This deliberately stays separate from [`parse_int_literal`]. Most TB-IR
+/// expression positions still treat sized literals as a distinct migration
+/// gap because their declared width participates in wrapping/type inference.
+/// Coverpoint values only sample the resulting integer, so callers there can
+/// use this value parser without erasing width semantics elsewhere.
+pub(crate) fn parse_sized_int_literal(s: &str) -> Option<u64> {
+    parse_sized_int_literal_with_width(s).map(|(_, value)| value)
+}
+
+/// Parse both the declared width and value of a sized literal. Coverpoint
+/// lowering retains the width on `Expr::Literal` so later width methods do
+/// not mistake `4'd15` for an untyped 64-bit value.
+pub(crate) fn parse_sized_int_literal_with_width(s: &str) -> Option<(u32, u64)> {
+    let t = s.replace('_', "");
+    let tick = t.find('\'')?;
+    let width = t[..tick].parse::<u32>().ok()?;
+    let rest = &t[tick + 1..];
+    let (radix_ch, digits) = rest.split_at(rest.chars().next()?.len_utf8());
+    let radix = match radix_ch {
+        "h" | "H" => 16,
+        "d" | "D" => 10,
+        "b" | "B" => 2,
+        _ => return None,
+    };
+    let value = u64::from_str_radix(digits, radix).ok()?;
+    Some((width, value))
+}
+
 /// True when `e` contains a (nested) transactor call edge anywhere. Used
 /// to reject a transactor method call in positions that cannot hoist it
 /// into a preceding call statement — notably a `wait until` predicate,

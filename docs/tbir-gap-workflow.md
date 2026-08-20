@@ -36,8 +36,9 @@ family of rejections over a one-site exception. Current implementation order:
   receivers, and non-transactor component receivers.
 - [x] Heartbeat predicates on transactor receivers.
 - [x] Bound-transactor `thread` items routed through the component path.
-- [ ] Coverpoint target/value gaps with working v1 behavior (sized literals,
-  supported width forms, and other explicitly probed cases).
+- [x] Direct coverpoint value gaps with working v1 behavior (sized literals,
+  runtime slice/lane selectors, and directly sampled or narrowed wide values).
+- [ ] Composed wide cover expressions and width-preserving wrapping arithmetic.
 - [ ] Record/state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -46,8 +47,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 165 remaining constructor call sites (166 textual matches including
-the `unsupported` helper definition) as an inventory, not 165 separate tasks.
+Treat the 159 remaining constructor call sites (160 textual matches including
+the `unsupported` helper definition) as an inventory, not 159 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -66,10 +67,16 @@ shared IR primitive, and equivalence fixture. Then:
    (diagnostic cleanup). A falling raw count alone can hide no user-visible
    progress.
 
-Coverpoint target/value gaps with positive v1 controls are the recommended
-next family. The completed bound-transactor thread slice keeps monitor fields
-and lifecycle in component IR while routing responder bodies through the
-existing target-thread IR/actor emission, with one verified shared host.
+Composed wide cover expressions are the recommended next family: carry scalar
+widths into unary/binary/ternary operand coercion, then reuse the general
+`HarcWide<N>` operations. The completed direct-value slice accepts validated
+sized values, runtime slice/lane selectors, and directly sampled or narrowed
+65..1024-bit intermediates. A direct coverpoint sample intentionally observes
+the low 64 bits, matching v1's sample storage; wide casts and slices retain the
+full intermediate width until that final sample. Its self-checking fixtures run
+under both emitters and exercise the same runtime helpers as general TB-IR
+expressions. Wrapping cover arithmetic remains gated until the cover IR
+preserves both operand widths.
 
 ## Review-derived semantic gates
 
@@ -130,8 +137,9 @@ not applicable before requesting review:
 
 8. Recount `unsupported(...)` sites and record which family disappeared.
    The completed event, queue-query, method-hook, transactor-heartbeat, and
-   bound-thread slices reduce the call-site count from 174 to 165. Nested bus
-   expressions were also reclassified because v1 rejects them too.
+   bound-thread, and direct coverpoint-value slices reduce the call-site count
+   from 174 to 159. Nested bus expressions and sized cover widths were also
+   reclassified because v1 rejects or silently mis-lowers them.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

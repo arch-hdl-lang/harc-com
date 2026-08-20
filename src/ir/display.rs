@@ -1065,7 +1065,7 @@ fn port_str(func: Option<&TbFunction>, p: &PortRef) -> String {
         None => {}
         Some(crate::ir::LaneIndex::Const(c)) => out.push_str(&format!("[{c}]")),
         Some(crate::ir::LaneIndex::Var(e)) => {
-            let idx = func.map_or_else(|| "?".to_string(), |f| expr_str(f, e));
+            let idx = func.map_or_else(|| cover_expr_str(e), |f| expr_str(f, e));
             out.push_str(&format!("[{idx}]"));
         }
     }
@@ -1294,8 +1294,6 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
 fn cover_expr_str(e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => value.to_string(),
-        // Covergroup lane indices are constant-only (no runtime scope at
-        // schema-lower time), so `port_str` needs no function context.
         Expr::Port(p) => port_str(None, p),
         Expr::Binary(op, a, b) => {
             format!(

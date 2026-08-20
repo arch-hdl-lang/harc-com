@@ -2390,6 +2390,27 @@ fn cmd_sim(
     } else {
         std::collections::HashMap::new()
     };
+    let mut dut_port_widths = if !sv.is_empty() {
+        let top_for_scan = top
+            .clone()
+            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
+        match top_for_scan {
+            Some(t) => harc::codegen::cpp_tb::dut_port_widths_from_sv(&sv, &t),
+            None => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+    if let Some(top_for_scan) = top
+        .clone()
+        .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source))
+    {
+        for (name, width) in
+            harc::codegen::cpp_tb::dut_port_widths_from_files(&dut_iface, &top_for_scan)
+        {
+            dut_port_widths.entry(name).or_insert(width);
+        }
+    }
     // Ingest DUT-port-level bus param overrides from the DUT `.arch`/`.archi`
     // interface (the authoritative source post arch#567). When a DUT module
     // declares `port s: target BusRw<WRITE=0>`, `arch build` flattens `s`
@@ -2451,6 +2472,7 @@ fn cmd_sim(
     let emit_opts = harc::codegen::cpp_tb::EmitOpts {
         mt,
         vec_lane_widths,
+        dut_port_widths,
         dut_bus_port_overrides,
         cosim: cosim_opts.clone(),
     };
