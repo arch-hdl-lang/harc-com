@@ -1,0 +1,41 @@
+// A reusable testbench owns direct scalar queues whose element widths and
+// signedness survive every push/pop form in the default TB-IR backend.
+
+testbench WideQueueTb
+    dut           : Top
+    wide_values   : queue<uint<256>>
+    signed_values : queue<sint<8>>
+end testbench WideQueueTb
+
+impl WideQueueTest for WideQueueTb
+    run
+        let one : uint<256> = 1
+        wide_values.push(one << 200)
+        wide_values.push(one << 201)
+        wide_values.push(one << 202)
+        wide_values.push(one << 203)
+
+        let typed_wide : uint<256> = wide_values.pop()
+        let inferred_wide = wide_values.pop()
+        let assigned_wide : uint<256> = 0
+        assigned_wide = wide_values.pop()
+        wide_values.pop()
+
+        assert (typed_wide >> 200) == 1
+            else fail("typed wide queue pop lost bit 200")
+        assert (inferred_wide >> 201) == 1
+            else fail("inferred wide queue pop lost bit 201")
+        assert (assigned_wide >> 202) == 1
+            else fail("assigned wide queue pop lost bit 202")
+        assert wide_values.empty()
+            else fail("discarded wide queue pop did not drain the queue")
+
+        let negative : sint<8> = (0 - 1) as sint<8>
+        signed_values.push(negative)
+        let signed_value = signed_values.pop()
+        assert signed_value < 0
+            else fail("inferred signed queue pop lost signedness")
+
+        log(info, "PASS: testbench wide scalar queues preserve exact element types")
+    end run
+end impl WideQueueTest

@@ -1389,12 +1389,12 @@ fn lower_field(
                     "",
                 ));
             }
-            // The element is a scalar ≤ 64 bits or a value-record
+            // The element is an exact scalar type up to 64 bits or a value-record
             // (`errors : queue<CheckerError>`). A record element lowers to a
             // `harc_rt::HarcQueue<Rec>` and is manipulated through the
             // component-queue ops; anything else (enum / Vec / >64-bit /
             // unknown named type) is rejected precisely.
-            let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
+            let elem = lower_bounded_queue_elem(comp, fname, args.first(), record_ids)?;
             Ok(ComponentFieldKind::Queue { elem })
         }
         TypeExpr::Builtin {
@@ -2728,7 +2728,7 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
 
 /// Resolve the `<T>` inside a `queue<T>` component-field element to its
 /// `QueueElem`. Mirrors `lower_event_payload`:
-///   * a scalar (`uint<W>`/`sint<W>`/`bool` ≤ 64 bits) → `Scalar`;
+///   * a scalar (`uint<W>`/`sint<W>`/`bool`) → `Scalar { ty }`;
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value).
 ///
 /// A scalar element parses as `TypeArg::Type`; a user-named record element
@@ -2742,12 +2742,41 @@ pub(crate) fn lower_queue_elem(
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<crate::ir::QueueElem, LowerError> {
+    lower_queue_elem_with_policy(comp, fname, arg, record_ids, true)
+}
+
+/// The pre-#634 queue-owner surface remains capped at 64-bit scalar elements.
+/// Its descriptors still retain the exact narrow `IrType`; only direct
+/// testbench queues opt into the wide scalar policy in this vertical slice.
+pub(crate) fn lower_bounded_queue_elem(
+    comp: &str,
+    fname: &str,
+    arg: Option<&TypeArg>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<crate::ir::QueueElem, LowerError> {
+    lower_queue_elem_with_policy(comp, fname, arg, record_ids, false)
+}
+
+fn lower_queue_elem_with_policy(
+    comp: &str,
+    fname: &str,
+    arg: Option<&TypeArg>,
+    record_ids: &HashMap<String, RecordId>,
+    allow_wide_scalar: bool,
+) -> Result<crate::ir::QueueElem, LowerError> {
     use crate::ir::QueueElem;
+    let scalar_subset = if allow_wide_scalar {
+        "`queue<scalar>`"
+    } else {
+        "`queue<scalar ≤ 64 bits>`"
+    };
     let reject_named = |named: &str| -> LowerError {
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
-            "only `queue<scalar ≤ 64 bits>` and `queue<transaction|struct>` elements \
-             are lowered; enum/Vec/nested elements gate on a later slice",
+            &format!(
+                "only {scalar_subset} and `queue<transaction|struct>` elements are \
+                 lowered; enum/Vec/nested elements gate on a later slice"
+            ),
         )
     };
     match arg {
@@ -2759,10 +2788,15 @@ pub(crate) fn lower_queue_elem(
                     return Ok(QueueElem::Record(*rid));
                 }
             }
-            match scalar_ir_type(ty) {
-                Some(IrType::SInt(_)) => Ok(QueueElem::Scalar { signed: true }),
-                Some(IrType::UInt(_)) | Some(IrType::Bool) => {
-                    Ok(QueueElem::Scalar { signed: false })
+            match decoded_scalar_ir_type(ty) {
+                Some(ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool))
+                    if allow_wide_scalar
+                        || !matches!(
+                            &ty,
+                            IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64
+                        ) =>
+                {
+                    Ok(QueueElem::Scalar { ty })
                 }
                 _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
@@ -2777,8 +2811,9 @@ pub(crate) fn lower_queue_elem(
             }
             Err(unsupported(
                 &format!("a non-identifier queue element on `{comp}.{fname}`"),
-                "only `queue<scalar ≤ 64 bits>` and `queue<transaction|struct>` elements \
-                 are lowered",
+                &format!(
+                    "only {scalar_subset} and `queue<transaction|struct>` elements are lowered"
+                ),
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
@@ -2866,7 +2901,7 @@ fn type_arg_simple_name(t: &TypeExpr) -> Option<&str> {
 
 // --- shared scalar-field helpers (mirroring scoreboards.rs) ---
 
-fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
     };
@@ -2878,7 +2913,7 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
         Some(_) => return None,
         None => None,
     };
-    if width.is_some_and(|w| w == 0 || w > 64) {
+    if width == Some(0) {
         return None;
     }
     match name {
@@ -2889,6 +2924,14 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
         _ => None,
     }
+}
+
+/// The component/event/fixed-vector scalar subset remains capped at 64 bits.
+/// Queue elements call `decoded_scalar_ir_type` directly because their shared
+/// storage path already supports `_harc_u128` and `HarcWide<N>`.
+fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t)
+        .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {
@@ -3468,7 +3511,7 @@ impl super::FuncBuilder<'_> {
         };
         let comp = &self.ctx.components[cid.index()];
         match comp.field(queue).map(|f| &f.kind) {
-            Some(ComponentFieldKind::Queue { elem }) => Ok(*elem),
+            Some(ComponentFieldKind::Queue { elem }) => Ok(elem.clone()),
             _ => Err(unsupported(
                 &format!("`{queue}` is not a queue field of `{}`", comp.name),
                 "",

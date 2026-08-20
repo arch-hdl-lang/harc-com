@@ -343,13 +343,12 @@ fn emit_state_struct_body(
     writeln!(out, "{pad}uint64_t _last_out_cycle = 0;").ok();
 }
 
-/// The C++ element type for a `queue<T>` field. Mirrors `event_payload_cty`:
-/// a scalar widens to `uint64_t`/`int64_t`; a value-record element is the
-/// record struct (carried by value, matching v1's `HarcQueue<Rec>`).
+/// The C++ element type for a `queue<T>` field. Scalars reuse the exact
+/// width-aware local mapping; a value-record element is the record struct
+/// (carried by value, matching v1's `HarcQueue<Rec>`).
 fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
     match elem {
-        crate::ir::QueueElem::Scalar { signed: true } => "int64_t".to_string(),
-        crate::ir::QueueElem::Scalar { signed: false } => "uint64_t".to_string(),
+        crate::ir::QueueElem::Scalar { ty } => super::local_scalar_cty(ty),
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }
 }
