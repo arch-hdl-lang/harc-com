@@ -42,39 +42,79 @@ pub(crate) struct TransactorStateRecordChain {
     pub instance: String,
     pub field: String,
     pub path: Vec<String>,
-    /// `Some(N)` when the leaf is a `Vec<T, N>` field (rejected: whole-Vec
-    /// state-record access is out of subset; index element-wise instead).
+    /// `Some(N)` when the leaf is a `Vec<T, N>` field. Only the
+    /// `==`/`!=` landing reads one; see `vec_read_ok`.
     pub leaf_vec_len: Option<usize>,
+    /// The leaf field's element/scalar/record type — the other half of
+    /// the shape the equality pairing has to match.
+    pub leaf_ty: IrType,
 }
 
-/// Whether both operands are whole-`Vec` record-field reads of the SAME
-/// length and element type — the pairing `==`/`!=` needs before the read
-/// is permitted at all.
-///
-/// `false` (not an error) when either side is anything else, including
-/// an ordinary scalar comparison: this only ever widens what `==`
-/// accepts, so a `false` here leaves every existing verdict untouched.
 impl super::FuncBuilder<'_> {
-    fn same_whole_vec_shape(
-        &mut self,
-        lhs: &crate::ast::Expr,
-        rhs: &crate::ast::Expr,
-    ) -> Result<bool, LowerError> {
-        // Errors are SWALLOWED, not propagated. This runs on every
-        // `==`/`!=` operand, including ones that belong to a different
-        // lowering path entirely — a regblock field access like
-        // `regs.DMACR.RS` makes this resolver fail, and a `?` here turned
-        // a working program into a hard error before the real path ever
-        // saw it. "Not a matching pair" is the only answer this question
-        // can give; whether the operand lowers at all is decided later,
-        // by whoever owns it.
-        let (Ok(Some(l)), Ok(Some(r))) = (
-            self.try_record_field_chain(lhs),
-            self.try_record_field_chain(rhs),
-        ) else {
-            return Ok(false);
+    /// The `(len, element type)` of a whole-`Vec` record-field read, in
+    /// whichever of the three lanes that spells one — a record LOCAL
+    /// (`r.data`), a bound responder's record STATE field (`t.ba.data`),
+    /// or a COMPONENT record field (`a.data` in an agent method). The
+    /// lanes are tried in the order `lower_expr`'s `Field` arm resolves
+    /// them, so the shape reported is the one that would be lowered.
+    ///
+    /// `None` for anything else, errors included: a regblock access like
+    /// `regs.DMACR.RS` makes the record-local resolver fail, and
+    /// propagating that turned a working program into a hard error
+    /// before its own lowering path ever saw it. Whether an operand
+    /// lowers at all is decided later, by whoever owns it.
+    fn whole_vec_leaf(&mut self, e: &crate::ast::Expr) -> Option<(usize, IrType)> {
+        // PURE DOTTED PATHS ONLY, checked before anything else, because
+        // `try_record_field_chain` is not an oracle — it LOWERS every
+        // mid-chain index it walks past, pushing statements and
+        // allocating temps. Running it speculatively on both operands of
+        // every `==` and discarding the result therefore duplicated any
+        // side effect in an index: `r.kids[bump(dut)].p == 0` inlined
+        // `bump` TWICE, driving the DUT twice and burning an extra clock
+        // cycle, with no diagnostic and compiling C++ on both sides.
+        // Measured at 4 emitted inlines against the parent commit's 2.
+        //
+        // `dotted_path` accepts only `Ident`/`Field`/`Paren`, so an
+        // operand that passes it has no index for a resolver to lower
+        // and every call below is inert. A `Vec` element selection in
+        // the path (`r.tbl[0].data == s.tbl[1].data`) is refused by this
+        // gate rather than permitted — v1 compiles that one, so it keeps
+        // an honest `--codegen v1` suggestion, which is the right side to
+        // err on against silently running a helper twice.
+        super::components::dotted_path(e)?;
+        // `dotted_path` sees through parentheses; two of the three
+        // resolvers below do not. Peeling first keeps the answer a
+        // property of the PATH rather than of how it was written, so
+        // `(r.data) == s.data` pairs with `r.data == s.data` instead of
+        // falling back to a refusal on a spelling difference.
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &*e.kind {
+            e = inner;
+        }
+        if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
+            return c.leaf_vec_len.map(|n| (n, c.leaf_ty));
+        }
+        if let Ok(Some(rf)) = self.as_component_record_field(e) {
+            return rf.leaf_vec;
+        }
+        let Ok(Some(l)) = self.try_record_field_chain(e) else {
+            return None;
         };
-        Ok(l.leaf_vec_len.is_some() && l.leaf_vec_len == r.leaf_vec_len && l.leaf_ty == r.leaf_ty)
+        l.leaf_vec_len.map(|n| (n, l.leaf_ty))
+    }
+
+    /// Whether both operands are whole-`Vec` record-field reads of the
+    /// SAME length and element type — the pairing `==`/`!=` needs before
+    /// the read is permitted at all.
+    ///
+    /// A `false` restores the verdict each operand had before this
+    /// permission existed; it never turns a lowering program into a
+    /// rejected one.
+    fn same_whole_vec_shape(&mut self, lhs: &crate::ast::Expr, rhs: &crate::ast::Expr) -> bool {
+        match (self.whole_vec_leaf(lhs), self.whole_vec_leaf(rhs)) {
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        }
     }
 }
 
@@ -264,7 +304,13 @@ impl FuncBuilder<'_> {
                 if let Some(v) = self.ctx.consts.get(&id.name) {
                     return Ok(Expr::Literal {
                         value: *v,
-                        ty: if self.ctx.const_signed.get(&id.name).copied().unwrap_or(false) {
+                        ty: if self
+                            .ctx
+                            .const_signed
+                            .get(&id.name)
+                            .copied()
+                            .unwrap_or(false)
+                        {
                             IrType::SInt(None)
                         } else {
                             IrType::UInt(None)
@@ -333,14 +379,20 @@ impl FuncBuilder<'_> {
                 // whole-record `as_transactor_state` lane, which only fires
                 // when there is NO further subfield.
                 if let Some(chain) = self.as_transactor_state_record_field(e)? {
-                    if chain.leaf_vec_len.is_some() {
-                        return Err(unsupported(
-                            &format!(
-                                "a whole-`Vec` read of record state field `{}.{}`",
-                                chain.field,
-                                chain.path.join(".")
-                            ),
-                            "read a `Vec` record field element-wise (`{field}.{vec}[i]`)",
+                    // Same allow-list as the other two whole-`Vec` read
+                    // lanes: only an `==`/`!=` against a matching shape
+                    // gets through, and only because both backends emit
+                    // `target.ba.data == target.bb.data`, which g++
+                    // accepts. See `vec_read_ok`.
+                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                        let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                        return Err(not_implemented(
+                            &format!("a whole-`Vec` read of record state field `{dotted}`"),
+                            // Real names: this detail was a plain string,
+                            // so its `{field}.{vec}` placeholders printed
+                            // the braces at the user verbatim.
+                            format!("read the field element-wise (`{dotted}[i]`)"),
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                     return Ok(Expr::TransactorStateRecordField {
@@ -454,9 +506,22 @@ impl FuncBuilder<'_> {
                         // landing nobody enumerated keeps this
                         // diagnostic instead of silently emitting code
                         // that does not build.
-                        return Err(unsupported(
+                        // Every landing that still reaches here fails
+                        // under v1 too, measured: `let d = r.data` gives
+                        // "cannot convert `std::array<…,4>` to `int64_t`",
+                        // `${r.data}` an invalid `static_cast`, and a
+                        // mismatched comparison "no match for `operator==`".
+                        // The one landing where v1 genuinely compiled is
+                        // the equality above, which is implemented — so
+                        // the `--codegen v1` suggestion this carried is
+                        // no longer true anywhere it is still printed.
+                        return Err(not_implemented(
                             &format!("a whole-`Vec` read of record field `{}`", chain.dotted),
-                            "index the field element-wise (`{rec}.{field}[i]`)",
+                            // Real names, not `{rec}.{field}` — this is
+                            // a plain string, so the braces printed
+                            // literally at the user.
+                            format!("index the field element-wise (`{}[i]`)", chain.dotted),
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                     return Ok(Expr::RecordField {
@@ -496,9 +561,15 @@ impl FuncBuilder<'_> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let ir_op = lower_bin_op(*op)?;
                 // `==`/`!=` is the one landing a whole-`Vec` read works
-                // in — see `vec_read_ok`. Set for BOTH operands and
-                // restored after, so a nested expression inside one of
-                // them does not inherit the permission.
+                // in — see `vec_read_ok`. It is set for BOTH operands
+                // and restored after, which scopes the permission to
+                // this comparison: an ENCLOSING expression's remaining
+                // parts, and any statement lowered after it, see the
+                // saved value again. What keeps a nested expression
+                // INSIDE an operand from inheriting it is a different
+                // mechanism — the pairing check below admits pure
+                // dotted paths only, which have no nested expression to
+                // inherit anything.
                 // …and only when BOTH sides are the same `Vec` shape.
                 // Permitting the read on an equality alone let
                 // `r.data == s.kids` (scalar elements vs record ones) and
@@ -509,7 +580,7 @@ impl FuncBuilder<'_> {
                 // itself, so the permission had to carry the pairing
                 // check the read no longer does.
                 let eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
-                    && self.same_whole_vec_shape(lhs, rhs)?;
+                    && self.same_whole_vec_shape(lhs, rhs);
                 let saved = self.vec_read_ok;
                 self.vec_read_ok = eq;
                 let l = self.lower_expr(lhs);
@@ -1104,10 +1175,7 @@ impl FuncBuilder<'_> {
         // — not this lane's chain. Checked for every entry before any
         // index lowers, so the fall-through leaves no hoisted temps.
         let total = segs.len();
-        if raw_indices
-            .iter()
-            .any(|(p, _)| total - 1 - p < field_start)
-        {
+        if raw_indices.iter().any(|(p, _)| total - 1 - p < field_start) {
             return Ok(None);
         }
         // Lower the index expressions left-to-right (chain order — the
@@ -1150,18 +1218,22 @@ impl FuncBuilder<'_> {
                 IrType::Record(next) if fld.vec_len.is_none() && !indexed => cur_rid = next,
                 IrType::Record(next) if fld.vec_len.is_some() && indexed => {
                     if let Some((_, idx)) = mid_indices.iter().find(|(p, _)| *p == i) {
-                        check_literal_vec_index_bounds(
-                            &dotted,
-                            idx,
-                            fld.vec_len.unwrap_or(0),
-                        )?;
+                        check_literal_vec_index_bounds(&dotted, idx, fld.vec_len.unwrap_or(0))?;
                     }
                     cur_rid = next;
                 }
                 _ if indexed && fld.vec_len.is_none() => {
-                    return Err(unsupported(
+                    // The fourth arm of this loop, missed when its three
+                    // siblings were swept. Same criterion, same answer:
+                    // `r.inner[0].p` emits from v1 and g++ refuses ("no
+                    // match for `operator[]` (`Kid` and `int`)"), and
+                    // `r.n[0].p` gives "invalid types `uint64_t[int]` for
+                    // array subscript". The precedent is the OUTERMOST-index
+                    // spelling `r.n[0]`, which already carries this verdict.
+                    return Err(not_implemented(
                         &format!("indexing the non-`Vec` record field `{dotted}`"),
-                        "only `Vec<T, N>` record fields are indexable",
+                        "only `Vec<T, N>` record fields are indexable".to_string(),
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 _ if indexed => {
@@ -1360,12 +1432,13 @@ impl FuncBuilder<'_> {
         for seg in segs {
             let f = self.ctx.records[rid.index()].field(seg)?;
             match f.ty {
-                // `vec_len.is_none()` mirrors `validate`, which already
-                // refuses BOTH `Vec` positions upstream — a `Vec` leaf
-                // ("a whole-`Vec` component record field") and a `Vec`
-                // mid-segment ("is not a nested record"). Copied so the
-                // two walks cannot drift, not because a `Vec` reaches
-                // here today.
+                // `vec_len.is_none()` mirrors `validate`, which refuses
+                // a `Vec` MID-segment upstream ("traversing the `Vec`
+                // record field … without an element index") — copied so
+                // the two walks cannot drift. A `Vec` LEAF does reach
+                // here, since the `==`/`!=` landing is permitted, and
+                // falls to `None`: `Vec<T, N>` is not a record type, so
+                // "no record" is the answer, not a missed rejection.
                 crate::ir::IrType::Record(next) if f.vec_len.is_none() => rid = next,
                 _ => return None,
             }
@@ -2442,7 +2515,9 @@ impl FuncBuilder<'_> {
         // `as_transactor_state_record_field` lane, so both are excluded.
         matches!(
             fields.get(&name.name),
-            Some(crate::ir::StateFieldKind::Scalar { .. } | crate::ir::StateFieldKind::Record { .. })
+            Some(
+                crate::ir::StateFieldKind::Scalar { .. } | crate::ir::StateFieldKind::Record { .. }
+            )
         )
         .then(|| (instance, name.name.clone()))
     }
@@ -2584,15 +2659,15 @@ impl FuncBuilder<'_> {
         } else {
             // Test-scope: `responder.last.addr` (instance=root) or
             // `_tb.xact.last.addr` (instance=segs[0]).
-            let (instance, rest_start) =
-                if Some(root.name.as_str()) == self.ctx.tb_field.as_deref() {
-                    match segs.first() {
-                        Some(mid) => (mid.clone(), 1usize),
-                        None => return Ok(None),
-                    }
-                } else {
-                    (root.name.clone(), 0usize)
-                };
+            let (instance, rest_start) = if Some(root.name.as_str()) == self.ctx.tb_field.as_deref()
+            {
+                match segs.first() {
+                    Some(mid) => (mid.clone(), 1usize),
+                    None => return Ok(None),
+                }
+            } else {
+                (root.name.clone(), 0usize)
+            };
             if !self.ctx.target_state.contains_key(&instance) {
                 return Ok(None);
             }
@@ -2624,6 +2699,7 @@ impl FuncBuilder<'_> {
         let mut cur_rid = *record;
         let last = sub.len() - 1;
         let mut leaf_vec_len = None;
+        let mut leaf_ty = IrType::Unknown;
         for (i, seg) in sub.iter().enumerate() {
             let schema = &self.ctx.records[cur_rid.index()];
             let Some(fld) = schema.field(seg) else {
@@ -2634,6 +2710,7 @@ impl FuncBuilder<'_> {
             };
             if i == last {
                 leaf_vec_len = fld.vec_len;
+                leaf_ty = fld.ty.clone();
                 break;
             }
             match fld.ty {
@@ -2655,6 +2732,7 @@ impl FuncBuilder<'_> {
             field: state_field,
             path: sub,
             leaf_vec_len,
+            leaf_ty,
         }))
     }
 

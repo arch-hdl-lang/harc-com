@@ -2387,7 +2387,10 @@ end impl RelayTest
     let mode_less = src.replace("active_relay : Relay active", "active_relay : Relay");
     let mode_less_err = lower_src(&mode_less).expect_err("mode-less relay is invalid");
     let msg = assert_invalid(&mode_less_err);
-    assert!(msg.contains("active_relay") && msg.contains("mode"), "{msg}");
+    assert!(
+        msg.contains("active_relay") && msg.contains("mode"),
+        "{msg}"
+    );
 
     let structural = src.replace("active_relay : Relay active", "active_relay : Sink active");
     let structural_err = lower_src(&structural).expect_err("mode on scoreboard is invalid");
@@ -2447,10 +2450,17 @@ end impl RelayTest
         .iter()
         .find(|component| component.name == "Relay")
         .expect("relay schema");
-    assert_eq!(relay.methods.len(), 2, "one always-on and one active method");
+    assert_eq!(
+        relay.methods.len(),
+        2,
+        "one always-on and one active method"
+    );
     assert_eq!(relay.methods[0].activation, ir::Activation::Always);
     assert_eq!(relay.methods[1].activation, ir::Activation::ActiveOnly);
-    assert_eq!(relay.periodic_handlers[0].activation, ir::Activation::ActiveOnly);
+    assert_eq!(
+        relay.periodic_handlers[0].activation,
+        ir::Activation::ActiveOnly
+    );
 
     let cpp = emit_cpp_src(src);
     assert!(cpp.contains("_per_active_relay_"), "{cpp}");
@@ -2459,7 +2469,10 @@ end impl RelayTest
     let passive_call = src.replace("active_relay.bump()", "passive_relay.bump()");
     let err = lower_src(&passive_call).expect_err("passive active-only call is invalid");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("passive_relay") && msg.contains("active-only"), "{msg}");
+    assert!(
+        msg.contains("passive_relay") && msg.contains("active-only"),
+        "{msg}"
+    );
 }
 
 /// A test-scope structural env root can carry inherited mode context. A nested
@@ -2511,12 +2524,18 @@ end test RelayEnvTest
     let passive_call = src.replace("env.inherited.bump()", "env.overridden.bump()");
     let err = lower_src(&passive_call).expect_err("override is passive");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("env.overridden") && msg.contains("active-only"), "{msg}");
+    assert!(
+        msg.contains("env.overridden") && msg.contains("active-only"),
+        "{msg}"
+    );
 
     let passive_field = src.replace("env.inherited.bump()", "assert env.overridden.ticks == 0");
     let err = lower_src(&passive_field).expect_err("active-only field is unavailable on passive");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("env.overridden") && msg.contains("active-only"), "{msg}");
+    assert!(
+        msg.contains("env.overridden") && msg.contains("active-only"),
+        "{msg}"
+    );
 
     let structural_field = src.replace(
         "test RelayEnvTest\n    let dut : Top\n    let env : RelayEnv active",
@@ -2525,25 +2544,33 @@ end test RelayEnvTest
     .replace("end test RelayEnvTest", "end impl RelayEnvTest");
     let err = lower_src(&structural_field).expect_err("mode on structural field is invalid");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("mode") && msg.contains("RelayEnvTb.env"), "{msg}");
+    assert!(
+        msg.contains("mode") && msg.contains("RelayEnvTb.env"),
+        "{msg}"
+    );
 
     let passive_structural_field = structural_field.replace("RelayEnv active", "RelayEnv passive");
     let err = lower_src(&passive_structural_field)
         .expect_err("passive mode on structural field is invalid");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("RelayEnvTb.env") && msg.contains("mode"), "{msg}");
+    assert!(
+        msg.contains("RelayEnvTb.env") && msg.contains("mode"),
+        "{msg}"
+    );
 
     // An otherwise-unused mode-sensitive leaf must still be rejected. This
     // proves validation walks the composed instance tree, rather than only
     // noticing the missing mode when a run/check body reaches the leaf.
-    let unresolved_leaf = src.replace("let env : RelayEnv active", "let env : RelayEnv").replace(
-        "        env.inherited.bump()",
-        "        assert 1 == 1",
-    );
+    let unresolved_leaf = src
+        .replace("let env : RelayEnv active", "let env : RelayEnv")
+        .replace("        env.inherited.bump()", "        assert 1 == 1");
     let err = lower_src(&unresolved_leaf)
         .expect_err("a nested mode-sensitive transactor leaf needs an inherited or declared mode");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("env.inherited") && msg.contains("effective"), "{msg}");
+    assert!(
+        msg.contains("env.inherited") && msg.contains("effective"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -2593,7 +2620,10 @@ end test SourceEnvTest
     );
     let err = lower_src(&always_on).expect_err("always-on member cannot access active-only state");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("always-on") && msg.contains("active-only"), "{msg}");
+    assert!(
+        msg.contains("always-on") && msg.contains("active-only"),
+        "{msg}"
+    );
 }
 
 /// `connect` belongs to env/agent/testbench composition. The component
@@ -2626,7 +2656,10 @@ end impl RelayTest
 "#;
     let err = lower_src(src).expect_err("active transactor connects cannot be silently dropped");
     let msg = assert_unsupported(&err);
-    assert!(msg.contains("when active") && msg.contains("connect") && msg.contains("Relay"), "{msg}");
+    assert!(
+        msg.contains("when active") && msg.contains("connect") && msg.contains("Relay"),
+        "{msg}"
+    );
 }
 
 /// A hook trigger subscribes to its target method during compilation. That
@@ -2661,9 +2694,13 @@ impl RelayTest for RelayTb
     end run
 end impl RelayTest
 "#;
-    let err = lower_src(src).expect_err("a passive binding cannot subscribe to an active-only hook");
+    let err =
+        lower_src(src).expect_err("a passive binding cannot subscribe to an active-only hook");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("relay.bump") && msg.contains("active-only") && msg.contains("passive"), "{msg}");
+    assert!(
+        msg.contains("relay.bump") && msg.contains("active-only") && msg.contains("passive"),
+        "{msg}"
+    );
 
     // Emission remains defensive when a later pass corrupts a previously
     // valid active binding after hook subscriptions have been recorded.
@@ -2690,8 +2727,8 @@ fn testbench_owned_state_connect_dump_ir_snapshot() {
 /// state/connect metadata introduced by a later pass.
 #[test]
 fn verifier_rejects_malformed_testbench_queue_and_connect_metadata() {
-    let mut queue_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
-        .expect("lowers");
+    let mut queue_prog =
+        lower_src(&fixture("testbench_owned_state_connect_test.harc")).expect("lowers");
     let run = queue_prog
         .tests
         .iter()
@@ -2714,13 +2751,13 @@ fn verifier_rejects_malformed_testbench_queue_and_connect_metadata() {
     };
     assert!(verify::verify_program(&queue_prog).is_err());
 
-    let mut connect_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
-        .expect("lowers");
+    let mut connect_prog =
+        lower_src(&fixture("testbench_owned_state_connect_test.harc")).expect("lowers");
     connect_prog.testbenches[0].connects[0].sink_component = ir::ComponentId(999);
     assert!(verify::verify_program(&connect_prog).is_err());
 
-    let mut query_prog = lower_src(&fixture("testbench_owned_state_connect_test.harc"))
-        .expect("lowers");
+    let mut query_prog =
+        lower_src(&fixture("testbench_owned_state_connect_test.harc")).expect("lowers");
     let run = query_prog
         .tests
         .iter()
@@ -3097,11 +3134,12 @@ fn modeless_analysis_monitor_testbench_field_lowers() {
     assert_eq!(modeless.testbenches[0].component_fields[0].mode, None);
 
     let modeless_dump = format!("{modeless}");
-    let passive_dump = format!("{passive}").replace(
-        "component lifecycle=c0 passive",
-        "component lifecycle=c0",
+    let passive_dump =
+        format!("{passive}").replace("component lifecycle=c0 passive", "component lifecycle=c0");
+    assert_eq!(
+        modeless_dump, passive_dump,
+        "only binding metadata may differ"
     );
-    assert_eq!(modeless_dump, passive_dump, "only binding metadata may differ");
 
     let modeless_cpp = tbir::emit(
         &modeless,
@@ -3115,7 +3153,10 @@ fn modeless_analysis_monitor_testbench_field_lowers() {
         &cpp_tb::EmitOpts::default(),
     )
     .expect("passive emits");
-    assert_eq!(modeless_cpp, passive_cpp, "ownership metadata is behaviorally inert");
+    assert_eq!(
+        modeless_cpp, passive_cpp,
+        "ownership metadata is behaviorally inert"
+    );
 }
 
 /// `active` on a composite-component field stays rejected, and is
@@ -3147,7 +3188,10 @@ fn active_mode_on_analysis_monitor_field_is_rejected() {
     );
     let err = lower_src(&reactive).expect_err("active periodic analysis monitor is invalid");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("active") && msg.contains("LargeTb.lifecycle"), "{msg}");
+    assert!(
+        msg.contains("active") && msg.contains("LargeTb.lifecycle"),
+        "{msg}"
+    );
 }
 
 /// A relay type with an always-on analysis surface and an active-only
@@ -3386,8 +3430,8 @@ end impl MTest
             .unwrap_or_else(|e| panic!("out_event={out_event}: active lowers: {e:?}"));
         verify::verify_program(&prog).expect("verifies");
         let src = consumer(out_event, true, "active");
-        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
-            .expect("emits");
+        let cpp =
+            tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
         assert!(
             cpp.contains("req.push_back"),
             "out_event={out_event}: the active instance subscribes"
@@ -3406,8 +3450,8 @@ end impl MTest
         let src = consumer(out_event, false, "passive");
         let prog = lower_src(&src)
             .unwrap_or_else(|e| panic!("out_event={out_event}: always-on passive lowers: {e:?}"));
-        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
-            .expect("emits");
+        let cpp =
+            tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
         assert!(
             cpp.contains("req.push_back"),
             "out_event={out_event}: an always-on handler wires a passive instance"
@@ -3524,7 +3568,10 @@ end test MonitorTest
 "#;
     let err = lower_src(nested).expect_err("nested active monitor is invalid");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("wrapper.monitor") && msg.contains("active"), "{msg}");
+    assert!(
+        msg.contains("wrapper.monitor") && msg.contains("active"),
+        "{msg}"
+    );
 }
 
 /// A method-bearing scoreboard lowers as a composite component
@@ -4076,20 +4123,16 @@ end test VecOfStructNoIndexTest
         );
     }
 
-    // The controls. Each of these compiles under both backends, so the
-    // verdict above is about the missing index rather than about `Vec`
-    // record fields as such.
-    for ok in ["tbl.entries[1].tag = 1", "tbl.n = 1"] {
-        let good = src
-            .replacen(
-                "struct EntryTable
-    entries : Vec<Entry, 4>",
-                "struct EntryTable
-    n : uint<8>
-    entries : Vec<Entry, 4>",
-                1,
-            )
-            .replacen("        tbl.entries.tag = 1", &format!("        {ok}"), 1);
+    // The three controls named above. Each lowers under BOTH backends,
+    // so the verdict is about the missing index and not about `Vec`
+    // record fields as such: the same field WITH an index, a plain
+    // nested-record field, and a scalar-`Vec` element read.
+    for ok in [
+        "tbl.entries[1].tag = 1",
+        "let z = tbl.one.tag",
+        "let z = tbl.data[2]",
+    ] {
+        let good = sib("    one     : Entry", ok);
         lower_src(&good).unwrap_or_else(|e| panic!("`{ok}` lowers: {e:?}"));
         cpp_tb::emit(&merged_src(&good)).expect("v1 emits the control");
     }
@@ -4407,7 +4450,11 @@ test WholeVecReadTest
 end test WholeVecReadTest
 "#;
     let err = lower_src(src).expect_err("whole-Vec field read must be rejected");
-    let msg = assert_unsupported(&err);
+    // `EmitsUncompilable`, not `Unsupported`: v1 emits an invalid
+    // `static_cast` from `const std::array<…>` for this landing. The
+    // suggestion this used to carry was only ever true of the equality
+    // landing, which is implemented now.
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("whole-`Vec` read of record field"),
         "names the read: {msg}"
@@ -5115,10 +5162,23 @@ impl T for Tb
 end impl T"#;
     for (body, names) in [
         ("        b = mine.tbl", "whole-`Vec` component record field"),
-        ("        b = mine.tbl.z", "is not a nested record"),
+        ("        b = mine.tbl.z", "without an element index"),
     ] {
-        let msg = assert_unsupported(&lower_src(&vec_holder.replace("BODY", body)).unwrap_err());
+        let src = vec_holder.replace("BODY", body);
+        // `EmitsUncompilable`, not `Unsupported`: v1 emits
+        // `b = self.mine.tbl;` / `self.mine.tbl.z` and g++ refuses each
+        // ("cannot convert `std::array<Inner, 4>` to `Inner`";
+        // "`std::array<Inner, 4>` has no member named `z`"), so the
+        // `--codegen v1` escape these used to promise was not one.
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
         assert!(msg.contains(names), "{msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{body}`: v1 emits it (and g++ refuses)"
+        );
     }
 
     // A NESTED path must resolve through its segments, not just its
@@ -8685,28 +8745,77 @@ end test T
 "#
         )
     };
-    // Both element kinds, both operators, and the scalar control.
-    for ok in [
-        "assert r.data == s.data else fail(\"x\")",
-        "assert r.kids == s.kids else fail(\"x\")",
-        "assert r.data != s.data else fail(\"x\")",
-        "assert r.n == s.n else fail(\"x\")",
-        "assert r.data[0] == s.data[0] else fail(\"x\")",
+    // Both element kinds, both operators, the scalar control, the
+    // element-wise control, and the parenthesized spelling — which must
+    // pair like the bare one, since the answer is a property of the
+    // PATH and not of how it was written.
+    // (`tbir` prints the redundant parentheses of the fourth case
+    // away, so it and v1 are given their own expected renderings.)
+    for (ok, tb_rendered, v1_rendered) in [
+        (
+            "assert r.data == s.data else fail(\"x\")",
+            "r.data == s.data",
+            "r.data == s.data",
+        ),
+        (
+            "assert r.kids == s.kids else fail(\"x\")",
+            "r.kids == s.kids",
+            "r.kids == s.kids",
+        ),
+        (
+            "assert r.data != s.data else fail(\"x\")",
+            "r.data != s.data",
+            "r.data != s.data",
+        ),
+        (
+            "assert (r.data) == s.data else fail(\"x\")",
+            "r.data == s.data",
+            "(r.data) == s.data",
+        ),
+        (
+            "assert r.n == s.n else fail(\"x\")",
+            "r.n == s.n",
+            "r.n == s.n",
+        ),
+        (
+            "assert r.data[0] == s.data[0] else fail(\"x\")",
+            "r.data[0] == s.data[0]",
+            "r.data[0] == s.data[0]",
+        ),
     ] {
         let src = prog(ok);
         let cpp = emit_cpp_src(&src);
-        cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
-        if ok.contains("r.data == s.data") {
-            assert!(
-                cpp.contains("r.data == s.data"),
-                "the comparison reaches the output, as v1's does:\n{cpp}"
-            );
-        }
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
+        // Both backends must reach the SAME comparison. Emitting from
+        // tbir without checking what it emitted would pass on any
+        // output at all, `r.data` silently dropped included.
+        assert!(
+            cpp.contains(tb_rendered),
+            "`{ok}`: the comparison reaches tbir's output:\n{cpp}"
+        );
+        assert!(v1.contains(v1_rendered), "`{ok}`: …and v1's:\n{v1}");
     }
+
+    // The anchor for the `Vec<Kid, N>` half. `std::array::operator==`
+    // compares element-wise, so `r.kids == s.kids` only compiles
+    // because v1 GENERATES an `operator==` for the record element type
+    // — this is that generated operator, in the output both backends
+    // share (`emit_extern_fn_decls` and the record preamble come from
+    // `cpp_tb`). Without it the claim rests on the comparison text
+    // alone, which would also be there if it did not build.
+    let v1 = cpp_tb::emit(&merged_src(&prog(
+        "assert r.kids == s.kids else fail(\"x\")",
+    )))
+    .expect("v1 emits");
+    assert!(
+        v1.contains("bool operator==(const Kid& a, const Kid& b)"),
+        "the record element type has a generated `operator==`:\n{v1}"
+    );
 
     // The landings that do NOT work keep the diagnostic.
     for bad in ["let d = r.data", "log(info, \"d=${r.data}\")"] {
-        let msg = assert_unsupported(&lower_src(&prog(bad)).unwrap_err());
+        let err = lower_src(&prog(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
         assert!(
             msg.contains("whole-`Vec` read"),
             "`{bad}` still names the whole-`Vec` read: {msg}"
@@ -8717,9 +8826,8 @@ end test T
     // lowers its condition and then its `else fail(...)` message, so a
     // `${r.data}` in that message is a whole-`Vec` read arriving after
     // a comparison at the same level — refused, as it is anywhere else.
-    let msg = assert_unsupported(
-        &lower_src(&prog("assert r.data == s.data else fail(\"d=${r.data}\")")).unwrap_err(),
-    );
+    let err = lower_src(&prog("assert r.data == s.data else fail(\"d=${r.data}\")")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("whole-`Vec` read"),
         "the permission is scoped to the operands: {msg}"
@@ -8733,8 +8841,217 @@ end test T
         "assert r.data == s.kids else fail(\"x\")",
         "assert r.data == s.n else fail(\"x\")",
     ] {
-        let msg = assert_unsupported(&lower_src(&prog(bad)).unwrap_err());
+        let err = lower_src(&prog(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
         assert!(msg.contains("whole-`Vec` read"), "`{bad}`: {msg}");
+    }
+}
+
+/// The pairing check must not LOWER either operand.
+///
+/// It asks `try_record_field_chain` for the leaf shape, and that
+/// resolver is not an oracle: it lowers every mid-chain index it walks
+/// past. Run speculatively on both operands of every `==` and then
+/// discarded, it duplicated any side effect in an index — the DUT
+/// driven twice, an extra clock burned — silently, with compiling C++
+/// on both sides. The fix is a `dotted_path` gate, and this is the
+/// count that pins it: ONE emitted inline of `bump()`, not two.
+#[test]
+fn the_equality_pairing_check_does_not_lower_its_operands() {
+    let src = r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Rec
+    kids : Vec<Kid, 4>
+end struct Rec
+
+testbench Tb
+    dut : Top
+
+    function bump() -> uint<8>
+        dut.en = 1
+        wait 1 cycle
+        return 0
+    end function bump
+end testbench Tb
+
+impl T for Tb
+    run
+        let r : Rec
+        assert r.kids[bump()].p == 0 else fail("x")
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    let cpp = emit_cpp_src(src);
+    // A testbench `function` CFG-inlines into the caller, so its body
+    // appears verbatim once per lowering of the call. (A file-scope pure
+    // helper does not inline, which is why the witness is written this
+    // way.)
+    let inlines = cpp.matches("harc_assign(dut->en, 1)").count();
+    assert_eq!(inlines, 1, "`bump()` is inlined exactly once:\n{cpp}");
+}
+
+/// The whole-`Vec` equality permission has to be read by every lane
+/// that spells a whole-`Vec` READ, not just the record-local one.
+///
+/// Three lanes resolve the same landing — a record local (`r.data`), a
+/// bound responder's record STATE field (`t.ba.data`), and a COMPONENT
+/// record field (`a.data` in an agent method) — and each carries its
+/// own refusal. Gating one left the other two rejecting
+/// `assert a.data == b.data` while v1 emitted
+/// `self.a.data == self.b.data` and g++ accepted it: measured, 0 errors
+/// on the v1 output, 0 on the tbir output once permitted.
+#[test]
+fn whole_vec_equality_is_permitted_in_every_read_lane() {
+    // --- lane 2: a component (agent) record field ---
+    let comp = |body: &str| {
+        format!(
+            r#"
+struct Kid
+    p : uint<8>
+end struct Kid
+
+struct Bundle
+    data : Vec<uint<8>, 4>
+    kids : Vec<Kid, 4>
+    wide : Vec<uint<8>, 8>
+    n    : uint<8>
+end struct Bundle
+
+agent Cmp
+    a : Bundle
+    b : Bundle
+
+    hookable step()
+        {body}
+    end step
+end agent Cmp
+
+test T
+    let dut : Top
+    let c   : Cmp
+    run
+        c.step()
+        wait 2 cycles
+    end run
+end test T
+"#
+        )
+    };
+    for (ok, rendered) in [
+        (
+            "assert a.data == b.data else fail(\"x\")",
+            "self.a.data == self.b.data",
+        ),
+        (
+            "assert a.kids == b.kids else fail(\"x\")",
+            "self.a.kids == self.b.kids",
+        ),
+    ] {
+        let src = comp(ok);
+        let cpp = emit_cpp_src(&src);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
+        assert!(cpp.contains(rendered), "`{ok}`: tbir emits it:\n{cpp}");
+        assert!(v1.contains(rendered), "`{ok}`: …and so does v1:\n{v1}");
+    }
+    // Mismatched operands stay refused — the pairing check is the same
+    // one, and it has to be, since v1 emits a comparison g++ refuses
+    // for each of these (measured: 7 errors apiece).
+    for bad in [
+        "assert a.data == b.kids else fail(\"x\")",
+        "assert a.data == b.wide else fail(\"x\")",
+        "assert a.data == b.n else fail(\"x\")",
+    ] {
+        let err = lower_src(&comp(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("whole-`Vec` component record field"), "{msg}");
+    }
+    // …and so do the landings that are not an equality. v1 emits
+    // `int64_t d = self.a.data;` ("cannot convert `std::array<…, 4>` to
+    // `int64_t` in initialization") and an invalid `static_cast` for the
+    // format capture, so neither has a `--codegen v1` to offer.
+    for bad in ["let d = a.data", "log(info, \"d=${a.data}\")"] {
+        let err = lower_src(&comp(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("whole-`Vec` component record field"), "{msg}");
+    }
+    // The WRITE keeps `Unsupported`, and that is not an oversight.
+    // `a.data = b.data` emits `self.a.data = self.b.data;` from v1 and
+    // g++ accepts it, so the escape hatch is real. The same arm also
+    // covers `a.data = 5`, which v1 emits and g++ refuses — a rejection
+    // spanning landings with different v1 outcomes cannot claim
+    // `EmitsUncompilable`, so it keeps the weaker, still-true one.
+    for w in ["a.data = b.data", "a.data = 5"] {
+        let msg = assert_unsupported(&lower_src(&comp(w)).unwrap_err());
+        assert!(msg.contains("whole-`Vec` component record field"), "{msg}");
+    }
+    assert!(
+        cpp_tb::emit(&merged_src(&comp("a.data = b.data")))
+            .expect("v1 emits the copy")
+            .contains("self.a.data = self.b.data"),
+        "the `--codegen v1` the write suggests is a real one"
+    );
+
+    // --- lane 3: a bound responder's record STATE field ---
+    let state = |body: &str| {
+        format!(
+            r#"
+struct Bundle
+    data : Vec<uint<8>, 4>
+    n    : uint<8>
+end struct Bundle
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    ba : Bundle
+    bb : Bundle
+
+    thread bus.read(addr: uint<8>)
+        {body}
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+    let src = state("assert ba.data == bb.data else fail(\"differ\")");
+    let cpp = emit_cpp_src(&src);
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
+    assert!(
+        cpp.contains("target.ba.data == target.bb.data"),
+        "the responder-body read is instance-filled and compared:\n{cpp}"
+    );
+    assert!(v1.contains("target.ba.data == target.bb.data"), "{v1}");
+    // Same two exclusions in this lane.
+    for bad in ["assert ba.data == bb.n else fail(\"x\")", "let d = ba.data"] {
+        let err = lower_src(&state(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains("whole-`Vec` read of record state field"),
+            "{msg}"
+        );
+        // The detail names the real field, not the `{field}.{vec}`
+        // placeholders it used to print at the user verbatim.
+        assert!(!msg.contains("{field}"), "no literal braces: {msg}");
     }
 }
 
@@ -19653,19 +19970,19 @@ end impl T"#
     }
 }
 
-/// A whole-`Vec` READ keeps its `--codegen v1` suggestion at the
-/// landings that still need it — but not at the comparison, which is
-/// implemented now.
+/// A whole-`Vec` READ no longer suggests `--codegen v1`, because there is
+/// no longer a landing where that suggestion is true.
 ///
-/// This test's own rationale said the equality case "compiles and works
-/// (`std::array` has `operator==`)" and then used that as the reason to
-/// refuse it, along with the landings that do not work: "one site,
-/// several outcomes — so the honest label is the one that is true
-/// somewhere". Splitting the outcomes is the better answer, and the
-/// note had already done the measurement that says which is which.
-/// The fixture below moves to a landing that genuinely does not work.
+/// The label was justified by "one site, several outcomes — so the
+/// honest label is the one that is true somewhere", and the outcome that
+/// made it true somewhere was the equality, which is implemented now.
+/// Every landing that still reaches the refusal fails under v1 too:
+/// `let d = r.data` ("cannot convert `std::array<…,4>` to `int64_t`"),
+/// `${r.data}` (an invalid `static_cast`), and a mismatched comparison
+/// ("no match for `operator==`"). Splitting a mixed site means
+/// re-deciding the leftovers, not inheriting the old label for them.
 #[test]
-fn a_whole_vec_read_keeps_its_v1_suggestion() {
+fn a_whole_vec_read_no_longer_suggests_v1() {
     let err = lower_src(
         r#"struct Bundle
     data : Vec<uint<32>, 4>
@@ -19683,10 +20000,17 @@ impl T for Tb
 end impl T"#,
     )
     .unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("whole-`Vec` read of record field") && msg.contains("element-wise"),
         "{msg}"
+    );
+    // …and the detail names the user's own field rather than printing
+    // `{rec}.{field}` literally, which is what a plain string with braces
+    // in it did.
+    assert!(
+        msg.contains("`Bundle.data[i]`"),
+        "the suggestion names the field: {msg}"
     );
 }
 
@@ -19979,7 +20303,10 @@ end impl T"#
     // declaration rejects, reported the same way.
     for (init, want) in [
         ("1 / 0", "division by zero"),
-        ("-1", "negative values cannot initialize an unsigned constant"),
+        (
+            "-1",
+            "negative values cannot initialize an unsigned constant",
+        ),
         ("300", "does not fit `uint<8>` (max 255)"),
     ] {
         let err = lower_src(&src(init)).unwrap_err();
@@ -20011,7 +20338,6 @@ end impl T"#,
     );
     assert!(cpp.contains("n = 8;"), "{cpp}");
 }
-
 
 // ---------------------------------------------------------------------
 // Batch 6: record-typed fields on an unbound transactor, and the
@@ -20058,7 +20384,10 @@ impl T for Tb
     end run
 end impl T"#,
     );
-    assert!(cpp.contains("Beat cur{};"), "the member is declared:\n{cpp}");
+    assert!(
+        cpp.contains("Beat cur{};"),
+        "the member is declared:\n{cpp}"
+    );
     assert!(
         cpp.contains("self_state.cur.tag = 5;"),
         "the self-write resolves its receiver — a raw empty instance emitted \
@@ -20068,7 +20397,10 @@ end impl T"#,
         !cpp.contains(" .cur."),
         "no leading-dot member access survives:\n{cpp}"
     );
-    assert!(cpp.contains("xt.cur.tag == 5"), "the test reads it back:\n{cpp}");
+    assert!(
+        cpp.contains("xt.cur.tag == 5"),
+        "the test reads it back:\n{cpp}"
+    );
 }
 
 /// A malformed `connect` endpoint keeps its `--codegen v1` suggestion,
@@ -20682,9 +21014,10 @@ impl T for Tb
 end impl T"#
         )
     };
-    let env_with =
-        cpp_tb::emit(&merged_src(&env_src("    connect\n        src.observed -> sink.take\n    end connect\n")))
-            .expect("v1 emits");
+    let env_with = cpp_tb::emit(&merged_src(&env_src(
+        "    connect\n        src.observed -> sink.take\n    end connect\n",
+    )))
+    .expect("v1 emits");
     let env_without = cpp_tb::emit(&merged_src(&env_src(""))).expect("v1 emits");
     assert_ne!(
         env_with, env_without,
@@ -20785,7 +21118,8 @@ impl T for Tb
 end impl T"#
         )
     };
-    const THREAD: &str = "    thread bus.read(addr)\n        n = n + 1\n        return 7\n    end thread\n";
+    const THREAD: &str =
+        "    thread bus.read(addr)\n        n = n + 1\n        return 7\n    end thread\n";
 
     let err = lower_src(&src(THREAD)).unwrap_err();
     let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
@@ -20798,7 +21132,10 @@ end impl T"#
         without.contains("struct Xt") && without.contains("Xt_go"),
         "the control compares real output:\n{without}"
     );
-    assert_eq!(with, without, "v1 discards the thread on an unbound transactor");
+    assert_eq!(
+        with, without,
+        "v1 discards the thread on an unbound transactor"
+    );
 
     // Negative anchor: the SAME item on a bound-to transactor DOES
     // change v1's output. Without this, the equality above would be
@@ -20837,7 +21174,6 @@ end impl T"#
          what makes the unbound byte-identity meaningful"
     );
 }
-
 
 /// An addrmap instance `@ <base>` / `size` now FOLDS through the file
 /// constant table, so `@ BASE + 0x10` means what it says. This is one of
@@ -21847,10 +22183,7 @@ fn a_const_coverpoint_slice_bound_folds() {
     .expect("read the registered fixture");
     let with_const = |k: u32| {
         format!("const K = {k}\n\n")
-            + &fixture.replace(
-                "cover dut.count_out[3:0]\n",
-                "cover dut.count_out[K:0]\n",
-            )
+            + &fixture.replace("cover dut.count_out[3:0]\n", "cover dut.count_out[K:0]\n")
     };
 
     // The fold gives byte-identical output to the literal bound…
@@ -22091,9 +22424,7 @@ fn a_const_record_field_default_folds() {
     .expect("read the registered fixture");
     const OLD: &str = "a : uint<8>  default 0";
 
-    let with = |decl: &str, pre: &str| {
-        format!("{pre}{}", fixture.replace(OLD, decl))
-    };
+    let with = |decl: &str, pre: &str| format!("{pre}{}", fixture.replace(OLD, decl));
 
     // Control: the unmutated registered fixture lowers.
     emit_cpp_src(&fixture);

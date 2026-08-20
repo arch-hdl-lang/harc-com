@@ -4339,14 +4339,9 @@ fn lower_test(
                         path.join(".")
                     ))
                 })?;
-            ir::resolve_component_path_mode(
-                &prog.components,
-                binding.component,
-                binding.mode,
-                tail,
-            )
-            .map(|resolved| resolved.effective_mode)
-            .map_err(|err| LowerError::Invalid(format!("invalid testbench `connect`: {err}")))
+            ir::resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
+                .map(|resolved| resolved.effective_mode)
+                .map_err(|err| LowerError::Invalid(format!("invalid testbench `connect`: {err}")))
         };
         let source_mode = endpoint_mode(&edge.src_path)?;
         let sink_mode = endpoint_mode(&edge.sink_path)?;
@@ -6538,6 +6533,14 @@ pub(crate) struct FuncBuilder<'a> {
     /// the read and refusing the known-bad landings would mean a missed
     /// one silently emits uncompilable code instead — worse, and not
     /// checkable by inspection.
+    ///
+    /// All THREE whole-`Vec` read lanes consult it, because all three
+    /// spell the same landing: a record LOCAL (`r.data`, `exprs.rs`), a
+    /// bound responder's record STATE field (`t.ba.data`, same file),
+    /// and a COMPONENT record field (`a.data` in an agent method,
+    /// `components_impl.rs`). Gating one of them left the other two
+    /// refusing `assert a.data == b.data` while v1 emitted
+    /// `self.a.data == self.b.data` and g++ accepted it.
     pub(crate) vec_read_ok: bool,
     /// True while lowering a transactor method body. Methods keep v1's
     /// synchronous hookable semantics (waits emit as `tick()` loops),

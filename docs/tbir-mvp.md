@@ -7976,6 +7976,82 @@ former `transaction` group lives in
      site's own note said `std::array::operator==` is why it works, and
      the measurement agrees with the note.
 
+125. **One landing, three lanes: what "gated" turned out to mean
+     (2026-08-20).**
+
+     Divergence 124 permitted a whole-`Vec` record-field read in the
+     `==`/`!=` landing and called the job done. It had gated ONE of the
+     three sites that refuse such a read. `grep vec_read_ok src/` showed
+     a single gate; the other two never saw the flag. Measured:
+     `assert a.data == b.data` inside an agent method, and
+     `assert ba.data == bb.data` inside a bound responder's thread, were
+     both still refused, while v1 emitted `self.a.data == self.b.data` /
+     `target.ba.data == target.bb.data` and g++ accepted each with zero
+     errors.
+
+     The three lanes spell the same landing and are three functions: a
+     record LOCAL (`try_record_field_chain`), a bound responder's record
+     STATE field (`as_transactor_state_record_field`), and a COMPONENT
+     record field (`as_component_record_field`). Nothing about the first
+     one said "there are two more"; the flag's own doc comment described
+     the landing, not its coverage. **A permission is not implemented
+     until every site that refuses the thing consults it** — and the way
+     to know is to grep for the flag and count the refusals, not to read
+     the one you edited.
+
+     The fix also had to change the shape of the component resolver.
+     `as_component_record_field` served BOTH the read and the write path
+     and erred on a `Vec` leaf itself, which hid the leaf's shape from
+     the pairing check that needs it. It now REPORTS the shape and each
+     caller judges: the write refuses unconditionally, the read consults
+     the flag. Reporting rather than judging is what let one resolver
+     serve two callers that disagree.
+
+     Verdicts corrected on measurement, all `Unsupported` →
+     `NotImplemented { EmitsUncompilable }`:
+
+     - the two remaining whole-`Vec` read refusals (`let d = a.data`
+       gives "cannot convert `std::array<…, 4>` to `int64_t`" from v1's
+       own output);
+     - the component walk's nested-record arm, split into the same two
+       arms the record-local walk already had ("traversing the `Vec`
+       record field … without an element index" vs "… which is not a
+       nested record"), with the same wording — copied, not
+       reconstructed.
+
+     One verdict deliberately did NOT change. The component whole-`Vec`
+     WRITE keeps `Unsupported`: `a.data = b.data` emits
+     `self.a.data = self.b.data;` from v1 and compiles, so the escape
+     hatch is real. The same arm also covers `a.data = 5`, which v1
+     emits and g++ refuses — a rejection spanning landings with
+     different v1 outcomes cannot claim `EmitsUncompilable`, so it keeps
+     the weaker claim that is still true. (`a.data = b.data` from tbir,
+     and component-record `Vec` ELEMENT access, remain open.)
+
+     Two smaller things, same root:
+
+     - **A detail string printed its own placeholders.** The state-field
+       refusal's detail was a plain `&str` containing
+       "`{field}.{vec}[i]`" — no `format!`, so the braces reached the
+       user verbatim. The identical bug had just been fixed one site
+       over. A message written by copying a `format!`-shaped sentence
+       into a non-`format!` slot fails silently in both directions.
+     - **The pairing check answered on spelling, not on path.**
+       `(r.data) == s.data` was refused because `dotted_path` sees
+       through parentheses and two of the three resolvers do not. The
+       oracle peels parentheses first, so the answer is a property of
+       the path.
+
+     The regression guard for divergence 124's critical bug is now a
+     test rather than a note: a testbench `function` CFG-inlines into
+     its caller, so `assert r.kids[bump()].p == 0` emits `bump()`'s body
+     exactly once — the count that fails the moment the pairing check
+     starts lowering its operands again. Eleven mutants over the guards
+     in this round, all caught; the harness itself had to be fixed
+     first, because `cargo test` prints "error: test failed" to stderr
+     and a NOBUILD check keyed on `"error: "` scored every CAUGHT mutant
+     as unbuildable.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

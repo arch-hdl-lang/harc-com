@@ -2943,6 +2943,17 @@ pub(crate) fn fold_field_default(
 use crate::ast::{CallArg, Expr as AstExpr};
 use crate::ir::{ComponentBase, Expr as IrExpr, Stmt as IrStmt};
 
+/// A resolved component record-field access: the emission base, the
+/// validated C++ member suffix (`current.value`), and — when the leaf
+/// field is a `Vec<T, N>` — its `(N, T)` shape. The shape is REPORTED,
+/// not judged: read and write disagree about whether a whole-`Vec` leaf
+/// is admissible, so each caller decides.
+pub(crate) struct ComponentRecordField {
+    pub base: ComponentBase,
+    pub field: String,
+    pub leaf_vec: Option<(usize, IrType)>,
+}
+
 impl super::FuncBuilder<'_> {
     /// Normalize a component-access dotted path to the form the component
     /// machinery resolves: rooted at the BARE component-field name.
@@ -3500,10 +3511,10 @@ impl super::FuncBuilder<'_> {
     /// component member access stores the validated C++ member suffix as
     /// one string (`current.value`); emission already renders it after the
     /// resolved component base.
-    fn as_component_record_field(
+    pub(crate) fn as_component_record_field(
         &self,
         e: &AstExpr,
-    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+    ) -> Result<Option<ComponentRecordField>, LowerError> {
         let Some(path) = dotted_path(e) else {
             return Ok(None);
         };
@@ -3512,7 +3523,15 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
 
-        let validate = |record: RecordId, sub: &[String]| -> Result<(), LowerError> {
+        // Returns the leaf's `Vec` shape when the leaf IS one. The
+        // verdict on a whole-`Vec` leaf belongs to the caller, not here:
+        // this resolver serves both the read and the write path, and
+        // `==`/`!=` may read one (see `vec_read_ok`) while a write may
+        // not. Erroring here also hid the shape from the equality
+        // pairing check, which has to see it to permit anything.
+        let validate = |record: RecordId,
+                        sub: &[String]|
+         -> Result<Option<(usize, IrType)>, LowerError> {
             let mut rid = record;
             for (i, seg) in sub.iter().enumerate() {
                 let schema = &self.ctx.records[rid.index()];
@@ -3525,25 +3544,46 @@ impl super::FuncBuilder<'_> {
                 if i + 1 < sub.len() {
                     match field.ty {
                         IrType::Record(next) if field.vec_len.is_none() => rid = next,
-                        _ => {
-                            return Err(unsupported(
+                        // The same two mid-segment shapes the record-LOCAL
+                        // walk separates (`try_record_field_chain`), split
+                        // here the same way and worded the same way, so a
+                        // reader who has seen one diagnostic recognises the
+                        // other. Both measured on a component method: v1
+                        // emits `self.a.kids.p` / `self.a.n.p` and g++
+                        // refuses each ("'std::array<Kid, 4>' has no member
+                        // named 'p'"; "request for member 'p' in
+                        // '...', which is of non-class type 'uint64_t'"),
+                        // so the `--codegen v1` escape this used to promise
+                        // was not one.
+                        IrType::Record(_) if field.vec_len.is_some() => {
+                            return Err(not_implemented(
                                 &format!(
-                                    "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                                    "traversing the `Vec` record field `{}.{seg}` without an element index; cannot access `.{}`",
                                     schema.name,
                                     sub[i + 1]
                                 ),
-                                "only nested struct/transaction fields can be traversed further",
+                                format!("select one element first (`{seg}[i].{}`)", sub[i + 1]),
+                                V1Status::EmitsUncompilable,
+                            ));
+                        }
+                        _ => {
+                            return Err(not_implemented(
+                                &format!(
+                                    "field access `.{}` on `{}.{seg}`, which is not a nested record",
+                                    sub[i + 1],
+                                    schema.name
+                                ),
+                                "only nested struct/transaction fields can be traversed further"
+                                    .to_string(),
+                                V1Status::EmitsUncompilable,
                             ));
                         }
                     }
-                } else if field.vec_len.is_some() {
-                    return Err(unsupported(
-                        &format!("a whole-`Vec` component record field `{}`", path.join(".")),
-                        "indexed component-record `Vec` access is not lowered by TB-IR yet",
-                    ));
+                } else if let Some(n) = field.vec_len {
+                    return Ok(Some((n, field.ty.clone())));
                 }
             }
-            Ok(())
+            Ok(None)
         };
 
         // Method-body form: `current.value`, where `current` is a field
@@ -3554,8 +3594,12 @@ impl super::FuncBuilder<'_> {
                 if let Some(schema) = comp.field(&path[0]) {
                     if let ComponentFieldKind::Record { record } = schema.kind {
                         self.require_self_activation(schema.activation, "field", &path[0])?;
-                        validate(record, &path[1..])?;
-                        return Ok(Some((ComponentBase::SelfField, path.join("."))));
+                        let leaf_vec = validate(record, &path[1..])?;
+                        return Ok(Some(ComponentRecordField {
+                            base: ComponentBase::SelfField,
+                            field: path.join("."),
+                            leaf_vec,
+                        }));
                     }
                 }
             }
@@ -3591,12 +3635,13 @@ impl super::FuncBuilder<'_> {
                 "field",
                 &tail[recv_len],
             )?;
-            validate(record, sub)?;
+            let leaf_vec = validate(record, sub)?;
             base.extend_from_slice(&tail[..recv_len]);
-            return Ok(Some((
-                ComponentBase::Path(base),
-                tail[recv_len..].join("."),
-            )));
+            return Ok(Some(ComponentRecordField {
+                base: ComponentBase::Path(base),
+                field: tail[recv_len..].join("."),
+                leaf_vec,
+            }));
         }
         Ok(None)
     }
@@ -3605,8 +3650,14 @@ impl super::FuncBuilder<'_> {
         &self,
         target: &AstExpr,
     ) -> Result<Option<(ComponentBase, String)>, LowerError> {
-        if let Some(record_field) = self.as_component_record_field(target)? {
-            return Ok(Some(record_field));
+        if let Some(rf) = self.as_component_record_field(target)? {
+            if rf.leaf_vec.is_some() {
+                return Err(unsupported(
+                    &format!("a whole-`Vec` component record field `{}`", rf.field),
+                    "indexed component-record `Vec` access is not lowered by TB-IR yet",
+                ));
+            }
+            return Ok(Some((rf.base, rf.field)));
         }
         // Self-relative bare field (only inside a method body, and only
         // when the name is NOT a shadowing local).
@@ -3711,8 +3762,29 @@ impl super::FuncBuilder<'_> {
         &self,
         e: &AstExpr,
     ) -> Result<Option<IrExpr>, LowerError> {
-        if let Some((base, field)) = self.as_component_record_field(e)? {
-            return Ok(Some(IrExpr::ComponentField { base, field }));
+        if let Some(rf) = self.as_component_record_field(e)? {
+            // A whole-`Vec` leaf read is admissible in exactly one
+            // landing — `==`/`!=` against another `Vec` of the same
+            // shape, which both backends emit and g++ accepts
+            // (`self.a.data == self.b.data`). See `vec_read_ok`; the
+            // pairing check is what sets it.
+            if rf.leaf_vec.is_some() && !self.vec_read_ok {
+                // Measured on the landings that still reach here:
+                // `let d = a.data` gives "cannot convert
+                // `std::array<…,4>` to `int64_t` in initialization" from
+                // v1's own output, and `${a.data}` an invalid
+                // `static_cast`. No backend compiles either, so there is
+                // nothing to send the user to.
+                return Err(not_implemented(
+                    &format!("a whole-`Vec` component record field `{}`", rf.field),
+                    format!("index the field element-wise (`{}[i]`)", rf.field),
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            return Ok(Some(IrExpr::ComponentField {
+                base: rf.base,
+                field: rf.field,
+            }));
         }
         if let ExprKind::Ident(id) = &*e.kind {
             if self.lookup(&id.name).is_none() {
