@@ -38,7 +38,10 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Bound-transactor `thread` items routed through the component path.
 - [x] Direct coverpoint value gaps with working v1 behavior (sized literals,
   runtime slice/lane selectors, and directly sampled or narrowed wide values).
-- [ ] Composed wide cover expressions and width-preserving wrapping arithmetic.
+- [x] Composed wide cover expressions and width-preserving wrapping arithmetic
+  (wide unary/binary/ternary operands are coerced through the 1024-bit scalar
+  model; known-width `+%`/`-%`/`*%` cover expressions retain their 1–64-bit
+  mask; wider wraps remain excluded because v1 rejects them).
 - [ ] Record/state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -47,8 +50,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 159 remaining constructor call sites (160 textual matches including
-the `unsupported` helper definition) as an inventory, not 159 separate tasks.
+Treat the 158 remaining constructor call sites (159 textual matches including
+the `unsupported` helper definition) as an inventory, not 158 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -67,16 +70,21 @@ shared IR primitive, and equivalence fixture. Then:
    (diagnostic cleanup). A falling raw count alone can hide no user-visible
    progress.
 
-Composed wide cover expressions are the recommended next family: carry scalar
-widths into unary/binary/ternary operand coercion, then reuse the general
-`HarcWide<N>` operations. The completed direct-value slice accepts validated
-sized values, runtime slice/lane selectors, and directly sampled or narrowed
-65..1024-bit intermediates. A direct coverpoint sample intentionally observes
-the low 64 bits, matching v1's sample storage; wide casts and slices retain the
-full intermediate width until that final sample. Its self-checking fixtures run
-under both emitters and exercise the same runtime helpers as general TB-IR
-expressions. Wrapping cover arithmetic remains gated until the cover IR
-preserves both operand widths.
+Composed wide cover expressions are complete: scalar widths now flow through
+unary, binary, and ternary cover expressions, and the sampler coerces mixed
+operands to `_harc_u128` or `HarcWide<N>` before applying the operator. A direct
+coverpoint sample intentionally observes the low 64 bits, matching v1's sample
+storage, while wide intermediates retain their width until that boundary.
+Known-width wrapping cover arithmetic lowers through the same explicit
+`WidthCast::Trunc` representation as general expressions. The self-checking
+fixture runs under both emitters and trace-diffs wide add, bit-not, ternary, and
+wrapped-nibble samples. Wrapping above 64 bits remains a measured v1 rejection,
+not a retirement blocker.
+
+The recommended next family is record/state/helper gaps with a positive v1
+control. Cluster those sites by the missing shared IR value shape rather than
+by source spelling, and keep verifier type metadata in the same patch as each
+new lowering path.
 
 ## Review-derived semantic gates
 

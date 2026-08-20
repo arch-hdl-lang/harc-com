@@ -638,7 +638,6 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
-                reject_wide_cover_composition(group, point, "unary expression", &[&inner])?;
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -661,16 +660,43 @@ fn lower_point_target(
                     let rhs_width = cover_wrap_operand_width(rhs);
                     if let (Some(lhs_width), Some(rhs_width)) = (lhs_width, rhs_width) {
                         let width = lhs_width.max(rhs_width);
-                        if width <= 64 {
-                            return Err(unsupported(
+                        if width > 64 {
+                            return Err(not_implemented(
                                 &format!(
                                     "covergroup `{group}` point `{point}` wrapping operator \
                                      `{symbol}` at width {width}"
                                 ),
-                                "v1 preserves the operand widths and applies the wrapping mask; \
-                                 the TB-IR coverpoint path does not carry that mask yet",
+                                "v1 rejects wrapping arithmetic above 64 bits because its \
+                                 wrapping mask is limited to a uint64_t carrier",
+                                V1Status::Rejects,
                             ));
                         }
+
+                        let ir_op = super::exprs::lower_bin_op(*op)?;
+                        let lhs = lower_point_target(
+                            group,
+                            point,
+                            lhs,
+                            hook_params,
+                            helpers,
+                            extern_fns,
+                            consts,
+                        )?;
+                        let rhs = lower_point_target(
+                            group,
+                            point,
+                            rhs,
+                            hook_params,
+                            helpers,
+                            extern_fns,
+                            consts,
+                        )?;
+                        return Ok(Expr::WidthCast {
+                            kind: WidthCastKind::Trunc,
+                            width,
+                            src_width: None,
+                            inner: Box::new(Expr::Binary(ir_op, Box::new(lhs), Box::new(rhs))),
+                        });
                     }
                     return Err(not_implemented(
                         &format!(
@@ -699,7 +725,6 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
-                reject_wide_cover_composition(group, point, "binary expression", &[&lhs, &rhs])?;
                 return Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)));
             }
             ExprKind::Ternary {
@@ -733,12 +758,6 @@ fn lower_point_target(
                     helpers,
                     extern_fns,
                     consts,
-                )?;
-                reject_wide_cover_composition(
-                    group,
-                    point,
-                    "ternary expression",
-                    &[&cond, &then_branch, &else_branch],
                 )?;
                 return Ok(Expr::Ternary(
                     Box::new(cond),
@@ -831,10 +850,29 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
+                let signed = matches!(
+                    ty,
+                    crate::ast::TypeExpr::Builtin {
+                        name: crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::SIntCap,
+                        ..
+                    }
+                );
                 return Ok(Expr::WidthCast {
-                    kind: WidthCastKind::Resize,
+                    // Like the general expression path, `as sint<W>` is
+                    // a signedness relabel rather than a value-changing
+                    // sign extension. `Sext` carries the signed marker;
+                    // `src_width = W` prevents the emitter from filling.
+                    kind: if signed {
+                        WidthCastKind::Sext
+                    } else {
+                        WidthCastKind::Resize
+                    },
                     width,
-                    src_width: cover_infer_expr_width(group, point, expr, consts, hook_params)?,
+                    src_width: if signed {
+                        Some(width)
+                    } else {
+                        cover_infer_expr_width(group, point, expr, consts, hook_params)?
+                    },
                     inner: Box::new(inner),
                 });
             }

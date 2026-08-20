@@ -327,20 +327,32 @@ fn coverpoint_expr_type(
             }
             Ok(IrType::UInt(port.width))
         }
-        Expr::Unary(_, inner) => {
+        Expr::Unary(op, inner) => {
             let ty = coverpoint_expr_type(prog, hook_params, inner)?;
             require_scalar(prog, &ty, "unary operand")?;
-            reject_wide_composition_type(&ty, "unary expression")?;
-            Ok(ty)
+            Ok(if matches!(op, crate::ir::UnOp::Not) {
+                IrType::Bool
+            } else {
+                ty
+            })
         }
-        Expr::Binary(_, lhs, rhs) => {
+        Expr::Binary(op, lhs, rhs) => {
             let lhs_ty = coverpoint_expr_type(prog, hook_params, lhs)?;
             let rhs_ty = coverpoint_expr_type(prog, hook_params, rhs)?;
             require_scalar(prog, &lhs_ty, "binary lhs")?;
             require_scalar(prog, &rhs_ty, "binary rhs")?;
-            reject_wide_composition_type(&lhs_ty, "binary expression lhs")?;
-            reject_wide_composition_type(&rhs_ty, "binary expression rhs")?;
-            Ok(IrType::UInt(Some(64)))
+            Ok(match op {
+                crate::ir::BinOp::Eq
+                | crate::ir::BinOp::Ne
+                | crate::ir::BinOp::Lt
+                | crate::ir::BinOp::Le
+                | crate::ir::BinOp::Gt
+                | crate::ir::BinOp::Ge
+                | crate::ir::BinOp::And
+                | crate::ir::BinOp::Or => IrType::Bool,
+                crate::ir::BinOp::Shl | crate::ir::BinOp::Shr => lhs_ty,
+                _ => common_scalar_type(&lhs_ty, &rhs_ty),
+            })
         }
         Expr::Ternary(cond, then_expr, else_expr) => {
             let cond_ty = coverpoint_expr_type(prog, hook_params, cond)?;
@@ -349,9 +361,6 @@ fn coverpoint_expr_type(
             require_scalar(prog, &cond_ty, "ternary condition")?;
             require_scalar(prog, &then_ty, "ternary then branch")?;
             require_scalar(prog, &else_ty, "ternary else branch")?;
-            reject_wide_composition_type(&cond_ty, "ternary condition")?;
-            reject_wide_composition_type(&then_ty, "ternary then branch")?;
-            reject_wide_composition_type(&else_ty, "ternary else branch")?;
             Ok(common_scalar_type(&then_ty, &else_ty))
         }
         Expr::BitSlice { hi, lo, target } => {
@@ -534,8 +543,10 @@ fn common_scalar_type(lhs: &IrType, rhs: &IrType) -> IrType {
     match (lhs, rhs) {
         (IrType::SInt(Some(lw)), IrType::SInt(Some(rw))) => IrType::SInt(Some((*lw).max(*rw))),
         (IrType::UInt(Some(lw)), IrType::UInt(Some(rw))) => IrType::UInt(Some((*lw).max(*rw))),
+        (IrType::SInt(Some(lw)), IrType::UInt(Some(rw)))
+        | (IrType::UInt(Some(lw)), IrType::SInt(Some(rw))) => IrType::UInt(Some((*lw).max(*rw))),
+        (IrType::SInt(_), IrType::SInt(_)) => IrType::SInt(None),
         (IrType::Bool, IrType::Bool) => IrType::Bool,
-        (IrType::SInt(_), _) | (_, IrType::SInt(_)) => IrType::SInt(None),
         _ => IrType::UInt(None),
     }
 }

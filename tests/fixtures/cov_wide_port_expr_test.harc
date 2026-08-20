@@ -1,0 +1,50 @@
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup WidePortExprCov @(posedge dut.clk)
+    cp_add : cover dut.data + (1 as uint<200>)
+        bins
+            sixteen = {16}
+        end bins
+    cp_not : cover (~dut.data)[3:0]
+        bins
+            zero = {0}
+        end bins
+    cp_ternary : cover dut.data[0:0] ? dut.data : (0 as uint<200>)
+        bins
+            fifteen = {15}
+        end bins
+    cp_shift : cover (dut.data << 130)[133:130]
+        bins
+            fifteen = {15}
+        end bins
+    cp_nested_narrow_shift : cover ((dut.data[0:0] << 1) == (2 as uint<200>))
+        bins
+            hit = {1}
+        end bins
+end covergroup WidePortExprCov
+
+testbench WidePortExprTb
+    dut : WideCoverExprTop
+    cov : WidePortExprCov
+end testbench WidePortExprTb
+
+impl WidePortExprTest for WidePortExprTb
+    clock clk = SysDomain
+
+    run
+        wait 2 cycles
+        log(info, "PASS: raw wide DUT cover expressions sampled")
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_add.sixteen > 0 else fail("raw wide add hole")
+        assert cov.cp_not.zero > 0 else fail("raw wide unary hole")
+        assert cov.cp_ternary.fifteen > 0 else fail("raw wide ternary hole")
+        assert cov.cp_shift.fifteen > 0 else fail("raw wide shift hole")
+        assert cov.cp_nested_narrow_shift.hit > 0 else fail("nested narrow shift hole")
+        log(info, "raw wide cover assertions passed")
+    end check
+end impl WidePortExprTest

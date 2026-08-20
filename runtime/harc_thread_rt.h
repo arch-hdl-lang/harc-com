@@ -445,6 +445,36 @@ inline bool harc_wide_is_zero(const HarcWide<N>& value) {
     return true;
 }
 
+inline uint64_t harc_u64_shift_count(uint64_t value, uint64_t limit) {
+    return value >= limit ? limit : value;
+}
+
+inline uint64_t harc_u128_shift_count(_harc_u128 value, uint64_t limit) {
+    if ((value >> 64) != 0) return limit;
+    return harc_u64_shift_count(static_cast<uint64_t>(value), limit);
+}
+
+template<std::size_t N>
+inline uint64_t harc_wide_shift_count(const HarcWide<N>& value, uint64_t limit) {
+    for (std::size_t i = 2; i < N; ++i) {
+        if (value.words[i] != 0) return limit;
+    }
+    uint64_t low = value.words[0];
+    if constexpr (N > 1) low |= static_cast<uint64_t>(value.words[1]) << 32;
+    return harc_u64_shift_count(low, limit);
+}
+
+template<std::size_t N>
+inline bool harc_wide_slt(HarcWide<N> lhs, HarcWide<N> rhs, unsigned width) {
+    lhs = harc_wide_mask_bits(lhs, width);
+    rhs = harc_wide_mask_bits(rhs, width);
+    if (width == 0) return false;
+    const bool lhs_negative = harc_wide_get_bit(lhs, width - 1);
+    const bool rhs_negative = harc_wide_get_bit(rhs, width - 1);
+    if (lhs_negative != rhs_negative) return lhs_negative;
+    return lhs < rhs;
+}
+
 template<std::size_t N>
 inline HarcWide<N> harc_wide_divmod(const HarcWide<N>& lhs, const HarcWide<N>& rhs, HarcWide<N>* rem_out) {
     HarcWide<N> q;
@@ -475,6 +505,38 @@ inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     HarcWide<N> r;
     (void)harc_wide_divmod(lhs, rhs, &r);
     return r;
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_negate(HarcWide<N> value, unsigned width) {
+    value = harc_wide_mask_bits(value, width);
+    return harc_wide_mask_bits((~value) + HarcWide<N>(1), width);
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_sdiv(HarcWide<N> lhs, HarcWide<N> rhs, unsigned width) {
+    lhs = harc_wide_mask_bits(lhs, width);
+    rhs = harc_wide_mask_bits(rhs, width);
+    if (harc_wide_is_zero(rhs) || width == 0) return HarcWide<N>();
+    const bool lhs_negative = harc_wide_get_bit(lhs, width - 1);
+    const bool rhs_negative = harc_wide_get_bit(rhs, width - 1);
+    if (lhs_negative) lhs = harc_wide_negate(lhs, width);
+    if (rhs_negative) rhs = harc_wide_negate(rhs, width);
+    HarcWide<N> quotient = lhs / rhs;
+    return lhs_negative != rhs_negative ? harc_wide_negate(quotient, width) : quotient;
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_smod(HarcWide<N> lhs, HarcWide<N> rhs, unsigned width) {
+    lhs = harc_wide_mask_bits(lhs, width);
+    rhs = harc_wide_mask_bits(rhs, width);
+    if (harc_wide_is_zero(rhs) || width == 0) return lhs;
+    const bool lhs_negative = harc_wide_get_bit(lhs, width - 1);
+    const bool rhs_negative = harc_wide_get_bit(rhs, width - 1);
+    if (lhs_negative) lhs = harc_wide_negate(lhs, width);
+    if (rhs_negative) rhs = harc_wide_negate(rhs, width);
+    HarcWide<N> remainder = lhs % rhs;
+    return lhs_negative ? harc_wide_negate(remainder, width) : remainder;
 }
 
 template<typename Sig, typename Val>
@@ -532,6 +594,46 @@ inline _harc_u128 harc_mask_u128(unsigned width) {
     if (width >= 128) return ~static_cast<_harc_u128>(0);
     if (width == 0) return 0;
     return (static_cast<_harc_u128>(1) << width) - 1;
+}
+
+inline _harc_u128 harc_negate_u128(_harc_u128 value, unsigned width) {
+    return (~value + 1) & harc_mask_u128(width);
+}
+
+inline _harc_u128 harc_sdiv_u128(_harc_u128 lhs, _harc_u128 rhs, unsigned width) {
+    const _harc_u128 mask = harc_mask_u128(width);
+    lhs &= mask;
+    rhs &= mask;
+    if (rhs == 0 || width == 0) return 0;
+    const bool lhs_negative = ((lhs >> (width - 1)) & 1u) != 0;
+    const bool rhs_negative = ((rhs >> (width - 1)) & 1u) != 0;
+    if (lhs_negative) lhs = harc_negate_u128(lhs, width);
+    if (rhs_negative) rhs = harc_negate_u128(rhs, width);
+    const _harc_u128 quotient = lhs / rhs;
+    return lhs_negative != rhs_negative ? harc_negate_u128(quotient, width) : quotient;
+}
+
+inline _harc_u128 harc_smod_u128(_harc_u128 lhs, _harc_u128 rhs, unsigned width) {
+    const _harc_u128 mask = harc_mask_u128(width);
+    lhs &= mask;
+    rhs &= mask;
+    if (rhs == 0 || width == 0) return lhs;
+    const bool lhs_negative = ((lhs >> (width - 1)) & 1u) != 0;
+    const bool rhs_negative = ((rhs >> (width - 1)) & 1u) != 0;
+    if (lhs_negative) lhs = harc_negate_u128(lhs, width);
+    if (rhs_negative) rhs = harc_negate_u128(rhs, width);
+    const _harc_u128 remainder = lhs % rhs;
+    return lhs_negative ? harc_negate_u128(remainder, width) : remainder;
+}
+
+inline bool harc_slt_u128(_harc_u128 lhs, _harc_u128 rhs, unsigned width) {
+    lhs &= harc_mask_u128(width);
+    rhs &= harc_mask_u128(width);
+    if (width == 0) return false;
+    const bool lhs_negative = ((lhs >> (width - 1)) & 1u) != 0;
+    const bool rhs_negative = ((rhs >> (width - 1)) & 1u) != 0;
+    if (lhs_negative != rhs_negative) return lhs_negative;
+    return lhs < rhs;
 }
 
 inline _harc_u128 harc_trunc_u128(_harc_u128 value, unsigned width) {
