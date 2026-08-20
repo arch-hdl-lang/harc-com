@@ -10444,7 +10444,9 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         let src = prog(&format!(
             "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
         ));
-        assert_unsupported(&lower_src(&src).unwrap_err());
+        // Lowers now — the value is read through the same normalizer v1
+        // folds with, so the two agree by construction.
+        lower_src(&src).unwrap_or_else(|e| panic!("`{lit}` lowers: {e}"));
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
     }
@@ -22462,9 +22464,45 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     );
     assert!(msg.contains("over-wide literal"), "{msg}");
 
+    // A sized slice bound inside a COVERPOINT still refuses, and the
+    // split is by context rather than by spelling. A slice bound in an
+    // ordinary expression folds one now (`const_eval_width` reads it,
+    // and v1 emits `harc_bits(..., (uint32_t)(3), (uint32_t)(0))` —
+    // measured); a coverpoint bound folds through the shared
+    // `fold_const`, which still reads plain literals only. Teaching
+    // that one is a separate change, so the detector here stays strict
+    // and the diagnostic stays honest rather than promising a fold that
+    // does not happen.
     let sized = slice("dut.count_out[4'd3:0]");
     let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
     assert!(msg.contains("sized literal"), "{msg}");
+    // The same bound outside a covergroup is refused too, by a
+    // different site again ("`4'd3` is not a plain literal", from the
+    // general literal lowering). Sized-literal support went in at the
+    // five positions where v1's behaviour was MEASURED — coverpoint
+    // target, bin bound and range end, regblock/addrmap bare address,
+    // record field default — and nowhere else. The remaining positions
+    // each need their own measurement, because v1 does not answer the
+    // same way in all of them: the regblock address TABLE folds only a
+    // bare literal and yields 0 for `(32'h18)`, while a coverpoint
+    // renders `(0x7)` and `0x4 + 3` correctly.
+    let err = lower_src(
+        r#"
+test SliceT
+    let dut : Top
+    run
+        let z = dut.count_out[4'd3:0]
+        assert z >= 0 else fail("x")
+        wait 1 cycle
+    end run
+end test SliceT
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not a plain literal"),
+        "an unwired position keeps its own refusal: {err}"
+    );
 
     // NESTED, both kinds. The walk that finds a name or a literal
     // inside `[K + N:0]` is what makes any of the above work on a
@@ -23286,19 +23324,25 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
     let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("non-constant `@ <addr>` offset"), "{msg}");
 
-    // A BARE Verilog-sized literal is the one shape here v1 gets right,
-    // and TB-IR does not lower them HERE — `let z = 32'h18` is refused
-    // the same way, though a `keep` constraint lowers them under both
-    // backends. So it stays `Unsupported`, pointing at v1,
-    // and must not be swept in with the fold-to-zero shapes around it.
-    let err = lower_src(&offset("", "32'h18")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("is a Verilog-sized literal"), "{msg}");
+    // A BARE Verilog-sized literal LOWERS now, to the offset v1 folds
+    // it to. It used to be the one shape here v1 got right and TB-IR
+    // refused; the refusal came from `parse_int_literal` stopping at
+    // the apostrophe, not from anything about addresses.
+    lower_src(&offset("", "32'h18")).expect("a sized address offset lowers");
     assert!(
         cpp_tb::emit(&merged_src(&offset("", "32'h18")))
             .expect("v1 emits a sized literal")
             .contains(r#"{ "SRC", 0x18, 32 }"#),
-        "v1 lowers a bare sized literal to the right offset, which is why this points at it"
+        "v1 folds it to 0x18"
+    );
+    // tbir has no `{ "SRC", …, 32 }` descriptor to grep — its regblock
+    // emission is shaped differently — so the check is behavioural:
+    // the sized spelling and the plain one must produce IDENTICAL
+    // output, which is what "folds to the same value" means.
+    assert_eq!(
+        emit_cpp_src(&offset("", "32'h18")),
+        emit_cpp_src(&offset("", "0x18")),
+        "`32'h18` and `0x18` are the same offset to tbir"
     );
 
     // …but ONLY the bare SIZED form, and the arm narrows twice for two
@@ -23787,15 +23831,16 @@ fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
 ///
 /// | spec | v1 emits | verdict |
 /// |---|---|---|
-/// | `4'd0` | folds to `_v == 0` — correct | `Unsupported`: v1 really is a way out |
+/// | `4'd0` | folds to `_v == 0` — correct | LOWERS (both backends fold it) |
 /// | `99999999999999999999999` | verbatim; g++ warns and truncates | `SilentlyMisLowers` |
 #[test]
 fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     let spec = |b: &str| fixture.replace("en0 = {0}", &format!("en0 = {{{b}}}"));
 
-    let msg = assert_unsupported(&lower_src(&spec("4'd0")).unwrap_err());
-    assert!(msg.contains("sized literal"), "{msg}");
+    // `4'd0` lowers now: the bin bound folds to 0, which is what v1
+    // has always emitted for it.
+    lower_src(&spec("4'd0")).expect("a sized bin bound lowers");
     // …and the claim behind that suggestion: v1 folds it to the same
     // comparison the plain literal produces.
     assert_eq!(
@@ -23816,9 +23861,18 @@ fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     );
 
     // Both landings — a member and a range end — share one
-    // implementation, so both are checked.
+    // implementation, so both are checked. A sized bound lowers at
+    // each, and to the same value v1 folds it to.
     let range = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [4'd1 .. 7]");
-    assert!(assert_unsupported(&lower_src(&range).unwrap_err()).contains("sized literal"));
+    lower_src(&range).expect("a sized range end lowers");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&range)).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(
+            &fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [1 .. 7]")
+        ))
+        .expect("v1 emits"),
+        "v1 folds `4'd1` exactly like `1`"
+    );
 }
 
 /// A bin spec is a constant EXPRESSION, not just a literal or a name.
@@ -24212,25 +24266,34 @@ fn parentheses_do_not_hide_the_failing_node_from_the_classifier() {
     );
 }
 
-/// A Verilog-sized literal in a coverpoint target keeps pointing at v1,
-/// which lowers a bare one correctly — the same split the addrmap and
-/// regblock address folds carry.
+/// A Verilog-sized literal in a coverpoint target LOWERS, to the value
+/// v1 folds it to.
+///
+/// This used to point at `--codegen v1`, and the suggestion was honest
+/// — v1 emitted `(uint64_t)(0x7)` and it worked. The refusal came from
+/// the lowerer's own `parse_int_literal`, which handled `0x` / `0b` /
+/// decimal and stopped at the apostrophe; every sized-literal refusal
+/// in the compiler traced back to that one function. It normalizes
+/// through `cpp_tb::normalized_int_literal` now — the SAME function v1
+/// folds through — so the two backends cannot disagree about what a
+/// literal means.
 #[test]
-fn a_sized_literal_coverpoint_target_still_points_at_v1() {
+fn a_sized_literal_coverpoint_target_lowers_to_v1s_value() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     let src = fixture.replace("cp_en : cover dut.en", "cp_en : cover 32'h7");
 
-    let err = lower_src(&src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("sampling the sized literal"), "{msg}");
-
-    // v1's evidence: it lowers the sized literal to the right value.
+    lower_src(&src).expect("a sized-literal coverpoint target lowers");
+    // Both backends reach the same VALUE. v1 spells it `0x7` (it
+    // rewrites the literal), tbir folds it to `7`; what matters is that
+    // the sampler sees 7 either way.
     assert!(
         cpp_tb::emit(&merged_src(&src))
             .expect("v1 emits a sized literal")
             .contains("(uint64_t)(0x7)"),
-        "v1 lowers a bare sized literal correctly, which is why this points at it"
+        "v1 folds it to 7"
     );
+    let cpp = emit_cpp_src(&src);
+    assert!(cpp.contains("(uint64_t)(7)"), "…and so does tbir:\n{cpp}");
 
     // An OVER-WIDE literal shares the same `ExprKind::Int` arm and gets
     // the opposite classification: v1 emits a `_harc_u128` composite

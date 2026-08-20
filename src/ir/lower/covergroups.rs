@@ -453,8 +453,16 @@ fn lower_point_target(
         match &*cur.kind {
             ExprKind::Paren(inner) => cur = inner,
             ExprKind::Int(s) => {
-                let value =
-                    super::exprs::parse_int_literal(s).ok_or_else(|| unsupported_target(cur))?;
+                // A coverpoint target is rendered by v1's `emit_expr`,
+                // not by the `c_int_literal_from` the regblock address
+                // TABLE uses — so a sized literal is correct there in
+                // EVERY position, measured: `32'h7` → `(uint64_t)(0x7)`,
+                // `(32'h7)` → `((0x7))`, `32'h4 + 3` → `(0x4 + 3)`.
+                // That is why this site folds one wherever the walk
+                // finds it, while `fold_addr_const` folds one only when
+                // it is the whole expression.
+                let value = super::exprs::parse_sized_or_plain_literal(s)
+                    .ok_or_else(|| unsupported_target(cur))?;
                 return Ok(Expr::Literal {
                     value,
                     ty: IrType::Unknown,
@@ -1337,6 +1345,13 @@ fn first_unfoldable_int_literal(e: &AstExpr) -> Option<String> {
     let mut over_wide = None;
     walk_expr(e, &mut |x| {
         if let ExprKind::Int(lit) = &*x.kind {
+            // Deliberately the STRICT parser. This detector feeds the
+            // covergroup slice-bound path, which folds through
+            // `fold_const` — and that still reads plain literals only.
+            // Accepting a sized literal here without teaching
+            // `fold_const` the same would report "not a compile-time
+            // constant" for a literal this function had just called
+            // foldable.
             if super::exprs::parse_int_literal(lit).is_none() {
                 let slot = if lit.contains('\'') {
                     &mut sized
@@ -1640,7 +1655,7 @@ fn cover_infer_expr_width(
             }
             Ok(None)
         }
-        ExprKind::Int(s) => Ok(super::exprs::parse_int_literal(s).map(|v| {
+        ExprKind::Int(s) => Ok(super::exprs::parse_sized_or_plain_literal(s).map(|v| {
             if v == 0 {
                 1
             } else {
@@ -1903,7 +1918,10 @@ fn bin_bound_fallback(
 /// is reached first because `fold_const` is not consulted for a shape
 /// that is already a literal.
 fn parse_bound(group: &str, bin: &str, s: &str) -> Result<u64, LowerError> {
-    super::exprs::parse_int_literal(s).ok_or_else(|| {
+    // v1 folds a sized bin bound to the same comparison the plain
+    // literal produces — measured by emitting `{4'd0}` and `{0}` and
+    // diffing the two outputs, which are identical.
+    super::exprs::parse_sized_or_plain_literal(s).ok_or_else(|| {
         if s.contains('\'') {
             return unsupported(
                 &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),

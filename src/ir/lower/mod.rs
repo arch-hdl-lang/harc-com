@@ -6376,8 +6376,13 @@ pub(crate) fn fold_addr_const(
     what: &str,
 ) -> Result<u64, LowerError> {
     // Fast path: a plain literal, which is what almost every address is.
+    // The literal IS the whole expression here, which is the one shape
+    // v1's `c_int_literal_from` folds — so a sized literal
+    // (`@ 32'h18`) is read the same way by both backends. Parenthesised
+    // or arithmetic spellings fall past this and keep their refusal,
+    // because v1 answers ZERO for those.
     if let crate::ast::ExprKind::Int(lit) = &*e.kind {
-        if let Some(bits) = exprs::parse_int_literal(lit) {
+        if let Some(bits) = exprs::parse_sized_or_plain_literal(lit) {
             return Ok(bits);
         }
     }

@@ -180,7 +180,9 @@ fn non_scalar_record_leaf(
 fn record_default_literal(kind: &str, owner: &str, fname: &str, lit: &str) -> LowerError {
     let what = format!("{kind} field default `{owner}.{fname} default {lit}`");
     let normalized = crate::codegen::cpp_tb::normalized_int_literal(lit);
-    if super::exprs::parse_int_literal(&normalized).is_some() {
+    // v1 folds a sized default into the member initialiser
+    // (`uint64_t a = 0xFF;`), measured for `8'hFF` / `4'd3` / `4'b1010`.
+    if super::exprs::parse_sized_or_plain_literal(&normalized).is_some() {
         return unsupported(
             &what,
             "TB-IR does not lower sized literals yet; v1 folds this one to the same value",
@@ -504,7 +506,7 @@ fn lower_record_field(
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s)
+            ExprKind::Int(s) => super::exprs::parse_sized_or_plain_literal(s)
                 .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
             ExprKind::Bool(b) => *b as u64,
             _ => super::components::fold_field_default(
