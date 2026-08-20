@@ -128,22 +128,12 @@ fn lower_unbound_item<'a>(
         ComponentItem::Hookable(h) => methods_ast.push((h, from_when_active)),
         ComponentItem::Field(f) => {
             let fname = &f.name.name;
-            if f.direction.is_some() {
-                if super::components::is_event_field(f) {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` directional event field `{fname}`"),
-                        "event-driven transactors await the event slice",
-                    ));
-                }
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` directional scalar field `{fname}`"),
-                    "event-driven transactors await the event slice; v1 emits a plain \
-                     scalar member and DROPS the direction, so the field means something \
-                     other than what was written (and reads indeterminate unless it also \
-                     carries a `default`)",
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
+            // The directional rule lives in `lower_state_field`. This
+            // was the THIRD pre-check shadowing it — the previous commit
+            // deleted the two on the initiator paths, said "all three
+            // owners" and left this one, so the unbound form kept the
+            // pre-split blanket `Unsupported` for `event<Color>` and
+            // `event<T> default 0`, both of which v1 fails to compile.
             if let TypeExpr::Named { name, .. } = &f.ty {
                 let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                 // A whole value-record held as transactor state
@@ -1125,9 +1115,7 @@ fn lower_bound_initiator_transactor(
                 // An event/directional field (`req : in event<T>`) on a
                 // bound-to transactor is the event-driven driver form —
                 // it routes to the component path, which does not yet
-                // carry the bound-bus handshake context. Reject it
-                // precisely (the unbound event-driven form is #382;
-                // bound-to event-driven is a follow-up slice).
+                // carry the bound-bus handshake context.
                 // The directional rule lives in `lower_state_field`,
                 // which every state field already goes through. This
                 // site used to answer first, which made the split there
@@ -1552,8 +1540,11 @@ impl StateFieldOwner {
 ///   * a typed FIFO `queue<scalar <=64 bits>` / `queue<Record>`, whose
 ///     element type resolves through the shared `lower_queue_elem` seam.
 ///
-/// `record_ids` resolves `queue<Record>` element names, and doubles as
-/// the "does v1 declare this type" test for an event payload. It is the
+/// `record_ids` resolves `queue<Record>` element names. It is NOT a
+/// "does v1 declare this type" oracle — it also holds regblock MIRRORS,
+/// which v1 declares under a different name and flattens in an event
+/// signature, which is why the event allow-list does not consult it. It
+/// is the
 /// same non-empty map at all four call sites — the previous version of
 /// this comment claimed it was empty for the unbound form, which it
 /// never was.
@@ -1572,9 +1563,9 @@ fn lower_state_field(
     let fname = &f.name.name;
     let who = owner.label();
     if f.direction.is_some() {
-        // The split `lower_unbound_item` already made for the identical
-        // `f.direction.is_some()` test, copied rather than re-derived.
-        // The guard admits TWO shapes and they get opposite verdicts:
+        // `f.direction.is_some()` admits an EVENT field and everything
+        // else, and they get different verdicts. The event half is
+        // itself mixed — see the allow-list below.
         //
         //   * an EVENT field — v1 emits the subscriber vector
         //     (`std::vector<std::function<void(uint64_t)>>`) and it
@@ -1587,66 +1578,89 @@ fn lower_state_field(
         // the scalar case at a backend that silently changes what the
         // field means.
         if super::components::is_event_field(f) {
-            // The event half is MIXED, which one probe of
-            // `out event<uint<8>>` did not show. Enumerated over the two
-            // things that vary — the payload type and the `default`:
+            // An ALLOW-LIST, after a blacklist grew three times.
             //
-            //   `event<uint<8>>`  -> `std::vector<std::function<void(uint64_t)>> ev;`
-            //                        g++ 0 errors, and `emit ev(x)` works
-            //   `event<uint<128>>`-> same shape, 0 errors
-            //   `event<Beat>`     -> v1 DECLARES the record, 0 errors
-            //   `event<Color>`    -> v1 never emits a C++ enum, so the
-            //                        payload name is undeclared: 5 errors
-            //   `... default 0`   -> the default is pasted into the
-            //                        vector's initialiser: 1 error
+            // `Unsupported` promises v1 handles the program, so it may
+            // only be given to a payload shape whose v1 behaviour is
+            // certified HERE. What can be certified at this site is a
+            // single positional BUILTIN scalar payload with no
+            // `default`: v1 emits `std::vector<std::function<void(
+            // uint64_t)>> ev;` and it compiles and works.
             //
-            // So `Unsupported` holds only where v1 declares the payload
-            // AND there is no default. Everywhere else it was promising
-            // an escape hatch that does not compile.
-            // The payload can arrive as `TypeArg::Type` OR, when the
-            // parser reads a bare name as a value, as `TypeArg::Expr`
-            // holding an `Ident` — `event<Color>` takes the second
-            // route, which is why keying on `Type` alone let the enum
-            // payload through as if it were fine.
-            let payload_name: Option<String> = match &f.ty {
-                TypeExpr::Builtin { args, .. } => match args.first() {
-                    Some(crate::ast::TypeArg::Type(TypeExpr::Named { name, .. })) => {
-                        name.segments.last().map(|s| s.name.clone())
-                    }
-                    Some(crate::ast::TypeArg::Expr(e)) => match &*e.kind {
-                        crate::ast::ExprKind::Ident(id) => Some(id.name.clone()),
-                        _ => None,
-                    },
-                    _ => None,
+            // Everything else v1 does one of two things to, measured:
+            //   `event<Color>`            5 g++ errors — v1 emits no
+            //                             C++ enum, so the payload name
+            //                             in the signature is undeclared
+            //   `event<string>`,
+            //   `event<BusName>`,
+            //   `event<TransactorName>`,
+            //   `event<queue<T>>`,
+            //   `event<stream<T>>`,
+            //   `event<pkg.Beat>`,
+            //   `event<T, U>`,
+            //   `event<depth=16>`,
+            //   `event<RegblockMirror>`   0 errors — the payload is
+            //                             silently FLATTENED to
+            //                             `void(uint64_t)`
+            //
+            // The flattening rows are `SilentlyMisLowers`, which
+            // outranks the enum row's `EmitsUncompilable`, so one label
+            // covers the lot.
+            //
+            // A record payload (`event<Beat>`) does work under v1, and
+            // this refuses it too — because `record_ids` cannot tell a
+            // struct from a REGBLOCK MIRROR, and the mirror is one of
+            // the flattening rows. Certifying it needs a regblock set
+            // that does not reach this function. Over-cautious beats
+            // actively false: the alternative is an `Unsupported` that
+            // promises v1 works for a shape where it silently does not.
+            let payload_certified = match &f.ty {
+                TypeExpr::Builtin { args, .. } => match args.as_slice() {
+                    [] => false,
+                    [crate::ast::TypeArg::Type(TypeExpr::Builtin { name, .. })] => matches!(
+                        name,
+                        crate::ast::BuiltinTy::UInt
+                            | crate::ast::BuiltinTy::UIntCap
+                            | crate::ast::BuiltinTy::SInt
+                            | crate::ast::BuiltinTy::SIntCap
+                            | crate::ast::BuiltinTy::Bits
+                            | crate::ast::BuiltinTy::Bool
+                            | crate::ast::BuiltinTy::BoolLower
+                            | crate::ast::BuiltinTy::Bit
+                    ),
+                    _ => false,
                 },
-                _ => None,
+                _ => false,
             };
-            let payload_declared = payload_name
-                .as_ref()
-                .is_none_or(|n| record_ids.contains_key(n));
             if f.default.is_some() {
                 return Err(not_implemented(
                     &format!("{who} `{tname}` event field `{fname}` with a default"),
+                    // NOT "which does not convert": `format_simple_expr`
+                    // pastes a bare `Ident` verbatim, so `default ev2`
+                    // naming another event field emits
+                    // `... ev = ev2;` and compiles. `EmitsUncompilable`
+                    // is the worst under the arm, which is what sets it.
                     "an event field is a subscriber list, not a value; v1 pastes the \
-                     default into its initialiser, which does not convert"
+                     default into its initialiser, which does not convert for a literal"
                         .to_string(),
                     V1Status::EmitsUncompilable,
                 ));
             }
-            if !payload_declared {
+            if !payload_certified {
                 return Err(not_implemented(
-                    &format!(
-                        "{who} `{tname}` event field `{fname}` with an undeclared payload type"
-                    ),
-                    "v1 emits the payload's name into the subscriber signature but never \
-                     declares it (it emits no C++ enum at all), so the file does not build"
+                    &format!("{who} `{tname}` event field `{fname}` with an uncertified payload"),
+                    "TB-IR lowers an event payload that is a single builtin scalar; for \
+                     anything else v1 either flattens the payload to a 64-bit integer \
+                     without a word, or names a type it never declares"
                         .to_string(),
-                    V1Status::EmitsUncompilable,
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             return Err(unsupported(
                 &format!("{who} `{tname}` directional event field `{fname}`"),
-                "event-driven transactors await the event slice",
+                "event-driven transactors await the event slice; an `in event<T>` field \
+                 driving the bound bus needs an `on <ev>` handler, which is a follow-up \
+                 slice",
             ));
         }
         // NOT "scalar": this is everything directional that is not an

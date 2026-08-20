@@ -9335,8 +9335,7 @@ end impl T
     for ok in [
         "    ev : out event<uint<8>>",
         "    ev : out event<uint<128>>",
-        // v1 DECLARES a record, so the subscriber signature resolves.
-        "    ev : out event<Beat>",
+        "    ev : out event<bool>",
     ] {
         let msg = assert_unsupported(&lower_src(&prog(ok)).unwrap_err());
         assert!(msg.contains("directional event field"), "`{ok}`: {msg}");
@@ -9348,16 +9347,36 @@ end impl T
             .contains("std::vector<std::function<void(uint64_t)>> ev;"),
         "v1 gives an event field a real subscriber vector"
     );
-    // An ENUM payload: v1 emits no C++ enum at all, so the name in the
-    // subscriber signature is undeclared (measured: 5 g++ errors).
-    let err = lower_src(&prog("    ev : out event<Color>")).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("undeclared payload type"), "{msg}");
+    // Everything else is UNCERTIFIED, and the label is the worst thing
+    // under that arm. Two v1 behaviours share it: the enum payload does
+    // not compile (5 g++ errors — v1 emits no C++ enum, so the name in
+    // the subscriber signature is undeclared), and the rest are
+    // silently FLATTENED to `void(uint64_t)` and compile.
+    for bad in [
+        "    ev : out event<Color>",
+        "    ev : out event<string>",
+        "    ev : out event<queue<uint<8>>>",
+        "    ev : out event<uint<8>, uint<16>>",
+        // A record payload v1 actually handles — refused because this
+        // arm also covers a regblock mirror, which v1 flattens, and
+        // `record_ids` cannot tell the two apart here.
+        "    ev : out event<Beat>",
+    ] {
+        let err = lower_src(&prog(bad)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("uncertified payload"), "`{bad}`: {msg}");
+    }
     assert!(
         !cpp_tb::emit(&merged_src(&prog("    ev : out event<Color>")))
             .expect("v1 emits")
             .contains("enum Color"),
         "v1 never declares the enum it names"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    ev : out event<string>")))
+            .expect("v1 emits")
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "…and flattens an uncertified payload to a 64-bit integer"
     );
     // …and a `default` on an event field: pasted into the vector's
     // initialiser, which does not convert.
@@ -11062,7 +11081,7 @@ end impl T"#
                 &lower_src(&src).unwrap_err(),
                 lower::V1Status::SilentlyMisLowers,
             );
-            assert!(msg.contains("directional scalar field"), "{msg}");
+            assert!(msg.contains("directional non-event field"), "{msg}");
             let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
             assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
         }
@@ -15963,16 +15982,28 @@ impl EvTest for EvTb
     end run
 end impl EvTest
 "#;
-    let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
+    // A RECORD payload is not certified. v1 handles this one — it
+    // declares `Req` and emits `void(Req)` — but the arm also covers a
+    // regblock mirror, which v1 flattens to `void(uint64_t)` without a
+    // word, and `record_ids` cannot tell the two apart at that site.
+    // Worst wins, so the arm is `SilentlyMisLowers`; a builtin-scalar
+    // payload is the certified shape and keeps `Unsupported`.
+    let msg = assert_not_implemented(
+        &lower_src(event_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("uncertified payload"), "{msg}");
+    let certified = event_src.replace("req : in event<Req>", "req : in event<uint<8>>");
+    let msg = assert_unsupported(&lower_src(&certified).unwrap_err());
     assert!(msg.contains("directional event field `req`"), "{msg}");
-    // The directional SCALAR spelling is a different verdict — v1
-    // models the event field and flattens the scalar one.
+    // The directional NON-EVENT spelling is a different verdict — v1
+    // models the event field and flattens this one.
     let scalar_src = event_src.replace("req : in event<Req>", "req : in uint<8>");
     let msg = assert_not_implemented(
         &lower_src(&scalar_src).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("directional scalar field `req`"), "{msg}");
+    assert!(msg.contains("directional non-event field `req`"), "{msg}");
 
     // A scalar state field now lowers: the transactor carries it on its
     // schema and the testbench records the instance for per-instance

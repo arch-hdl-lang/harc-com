@@ -8315,8 +8315,8 @@ former `transaction` group lives in
      blanket `Unsupported` there while v1 dropped the direction and
      compiled — the exact defect 130 opens by describing, still live in
      the same function. Adding a rule is not the same as reaching the
-     code that needs it: the pre-checks are gone, and
-     `lower_state_field` owns the directional case for all three owners.
+     code that needs it. (Two of the three pre-checks were deleted at
+     this point; the third survived another round — see 132.)
 
      Smaller, same round: the non-event arm called itself "scalar" while
      catching `in Vec<…>` and `in Beat`; the `uint<N>` wider than 64
@@ -8328,6 +8328,50 @@ former `transaction` group lives in
      false claims with it (a transaction-typed field is not out of
      subset, there is no `guard`/`reset` clause to reject, and
      `record_ids` is never empty).
+
+132. **A blacklist that grew three times, and the pre-check that was
+     never counted (2026-08-20).**
+
+     Divergence 131 said "the pre-checks are gone, and
+     `lower_state_field` owns the directional case for all three
+     owners". It deleted TWO. The third, in `lower_unbound_item`,
+     survived — so the unbound form kept the pre-split blanket
+     `Unsupported` for exactly the two landings 131 had just measured as
+     uncompilable (`event<Color>`, `event<T> default 0`). The sentence
+     was false when it was written, and its own analysis ("dead on three
+     of four call sites") said so.
+
+     **The event guard is an allow-list now, after the blacklist grew in
+     three consecutive rounds.** Each round added the landings the
+     previous one had missed, and each time the next round found more:
+     enum payloads, then `string` / bus names / transactor names, then
+     `queue` / `stream` / dotted paths / multi-arg / `TypeArg::Named` /
+     regblock mirrors — all silently FLATTENED by v1 to
+     `void(uint64_t)`. Enumerating a blacklist means proving a negative
+     over a space the parser keeps extending.
+
+     What can be certified at that site is a single positional BUILTIN
+     scalar payload with no `default`. That keeps `Unsupported`.
+     Everything else takes the arm's worst, `SilentlyMisLowers`.
+
+     `event<Beat>` is over-refused by this: v1 declares the record and
+     emits `void(Beat)` correctly. It is refused because `record_ids`
+     **cannot tell a struct from a regblock MIRROR**, and the mirror is
+     one of the flattening rows — a fact stated in a comment 70 lines
+     below the guard that 131's doc comment nonetheless described as the
+     "does v1 declare this type" test. Certifying a record payload needs
+     a regblock set that does not reach this function. Over-cautious
+     under a mixed arm is the repo's own worst-wins rule; an
+     `Unsupported` promising v1 works where it silently does not is not.
+
+     Two tests were ENTRENCHING the old blanket verdicts
+     (`in event<uint<8>>` and `in event<Req>` asserted as `Unsupported`
+     on the unbound path). A test that pins a wrong verdict is worse
+     than no test: it makes the next sweep read the mistake as settled.
+
+     Four rounds on five arms. The method that finally held was not a
+     better enumeration — it was giving up on enumerating the bad cases
+     and certifying the good ones instead.
 
 ## Next steps
 
