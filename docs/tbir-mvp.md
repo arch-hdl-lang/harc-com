@@ -8217,6 +8217,42 @@ former `transaction` group lives in
      identically. Every case in the test now runs its own no-`apply`
      control first.
 
+129. **Five state-field arms, five separate measurements (2026-08-20).**
+
+     The `bound to` transactor's state-field lowering has five refusals,
+     and they had all been written as `Unsupported`. Probed one at a
+     time, with a control (the same transactor carrying a plain
+     `b : Beat` field), they split three ways:
+
+     - `q : queue<uint<8>> default 0` and `b : Beat default 0` — v1
+       emits the default's source text into the member initialiser
+       (`HarcQueue<uint64_t> q = 0;`, `Beat b = 0;`) and g++ answers
+       "could not convert `0` from `int`" to each. `EmitsUncompilable`.
+     - `b : Beat<uint<8>>` — a record declaration has no slot for
+       generic parameters at all, so the application is meaningless
+       wherever it is written. v1 does not reject it: it emits `Beat b;`,
+       dropping the argument list without a word, and the file compiles.
+       The program that runs is the one `b : Beat` would have produced.
+       `SilentlyMisLowers`.
+     - `ev : out event<uint<8>>` and `v : Vec<uint<8>, 4>` — v1 gives
+       each a real, usable member (`std::vector<std::function<void(
+       uint64_t)>> ev;`, `std::array<uint64_t, 4> v{};`) and the file
+       compiles. These are TRUE `Unsupported`: genuine TB-IR gaps with a
+       working escape hatch.
+
+     The last two are the point of the exercise. Two of the five
+     verdicts were right, and there was no way to know which without
+     measuring each. **They carry their measurement in the source now**
+     — what v1 emits, and that it compiles — so the next sweep neither
+     re-probes them nor "fixes" a verdict that was already correct.
+
+     Same batch, same file: the three `lifecycle/apply` arms
+     (divergence 128) and this cluster came to seven probed sites, of
+     which five were mislabelled. That ratio is not evidence about the
+     remaining sites — these clusters were chosen because they looked
+     suspicious — but it is the reason the sweep measures rather than
+     reasons about what v1 "must" do.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

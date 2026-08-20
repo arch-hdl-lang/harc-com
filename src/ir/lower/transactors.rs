@@ -1517,6 +1517,11 @@ fn lower_state_field(
 ) -> Result<StateFieldSchema, LowerError> {
     let fname = &f.name.name;
     if f.direction.is_some() {
+        // A true `Unsupported`, measured rather than assumed: v1 emits
+        // `std::vector<std::function<void(uint64_t)>> ev;` — the same
+        // subscriber-vector member it gives an event field anywhere
+        // else — and the file compiles. This is a gap in TB-IR, not a
+        // dead end.
         return Err(unsupported(
             &format!("bound-to transactor `{tname}` event/directional field `{fname}`"),
             "",
@@ -1533,11 +1538,16 @@ fn lower_state_field(
     } = &f.ty
     {
         if f.default.is_some() {
-            return Err(unsupported(
+            // v1 emits the default's source text into the member
+            // initialiser — `harc_rt::HarcQueue<uint64_t> q = 0;` —
+            // and g++ answers "could not convert `0` from `int`".
+            // There is no `--codegen v1` to send anyone to.
+            return Err(not_implemented(
                 &format!(
                     "bound-to transactor `{tname}` queue state field `{fname}` with a default"
                 ),
-                "a `queue<T>` state field starts empty; drop the `default`",
+                "a `queue<T>` state field starts empty; drop the `default`".to_string(),
+                V1Status::EmitsUncompilable,
             ));
         }
         let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
@@ -1556,20 +1566,33 @@ fn lower_state_field(
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(&rid) = record_ids.get(simple) {
             if !generics.is_empty() {
-                return Err(unsupported(
+                // A record declaration cannot take generic parameters
+                // (the struct grammar has no slot for them), so an
+                // application like `b : Beat<uint<8>>` is meaningless
+                // wherever it appears. v1 does not reject it — it emits
+                // `Beat b;`, dropping the argument list without a word,
+                // and the file compiles. The program that runs is the
+                // one the user would have got from `b : Beat`, which is
+                // not the one they wrote.
+                return Err(not_implemented(
                     &format!(
                         "bound-to transactor `{tname}` record state field `{fname}` of a \
                          generic-applied type"
                     ),
-                    "",
+                    "a record type takes no generic arguments; drop them".to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             if f.default.is_some() {
-                return Err(unsupported(
+                // Same shape, same measurement as the `queue` default
+                // above: v1 emits `Beat b = 0;` and g++ answers "could
+                // not convert `0` from `int`".
+                return Err(not_implemented(
                     &format!(
                         "bound-to transactor `{tname}` record state field `{fname}` with a default"
                     ),
-                    "a record state field is default-constructed; drop the `default`",
+                    "a record state field is default-constructed; drop the `default`".to_string(),
+                    V1Status::EmitsUncompilable,
                 ));
             }
             return Ok(StateFieldSchema {
@@ -1579,6 +1602,10 @@ fn lower_state_field(
         }
     }
     let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
+        // Also a true `Unsupported`. Measured on the shape most likely
+        // to reach it: a `Vec<uint<8>, 4>` state field emits
+        // `std::array<uint64_t, 4> v{};` from v1 — a real, usable
+        // member — and the file compiles.
         return Err(unsupported(
             &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
             "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits), \
