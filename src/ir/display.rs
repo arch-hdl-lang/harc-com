@@ -196,18 +196,9 @@ impl Display for TbProgram {
                 }
             }
             for m in &x.methods {
-                let hooks = if m.pre_hooks.is_empty() && m.post_hooks.is_empty() {
-                    String::new()
-                } else {
-                    let pre: Vec<String> =
-                        m.pre_hooks.iter().map(|h| format!("fn{}", h.0)).collect();
-                    let post: Vec<String> =
-                        m.post_hooks.iter().map(|h| format!("fn{}", h.0)).collect();
-                    format!(" [pre={}] [post={}]", pre.join(","), post.join(","))
-                };
                 writeln!(
                     f,
-                    "    method {}({} arg{}){} = fn{}{hooks}",
+                    "    method {}({} arg{}){} = fn{}",
                     m.name,
                     m.param_names.len(),
                     if m.param_names.len() == 1 { "" } else { "s" },
@@ -715,11 +706,39 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::PropertyCheck(p) => format!("PropertyCheck(p{})", p.0),
         Stmt::CoverCheck(c) => format!("CoverCheck(c{})", c.0),
         Stmt::CycleHandler(h) => format!("CycleHandler(h{})", h.0),
-        Stmt::EventSubscribe { event, handler } => format!(
-            "EventSubscribe({} <- fn{})",
-            local_str(func, *event),
-            handler.0
-        ),
+        Stmt::EventSubscribe { event, handler } => {
+            let event = match event {
+                crate::ir::EventChannelRef::Local(event) => local_str(func, *event),
+                crate::ir::EventChannelRef::Component { base, event, .. } => {
+                    format!("{}.{event}", comp_base_str(base))
+                }
+            };
+            format!("EventSubscribe({event} <- fn{})", handler.0)
+        }
+        Stmt::MethodHookSubscribe {
+            target,
+            side,
+            handler,
+            captures,
+        } => {
+            let target = match target {
+                crate::ir::MethodHookTarget::Transactor { field, method, .. } => {
+                    format!("{field}.{method}")
+                }
+                crate::ir::MethodHookTarget::Component { base, method, .. } => {
+                    format!("{}.{method}", comp_base_str(base))
+                }
+            };
+            let captures = captures
+                .iter()
+                .map(|local| local_str(func, *local))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "MethodHookSubscribe({target} {side:?} <- fn{} captures=[{captures}])",
+                handler.0
+            )
+        }
         Stmt::EventEmit { event, args } => format!(
             "EventEmit({}({}))",
             local_str(func, *event),
@@ -769,9 +788,16 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             comp_base_str(base),
             expr_str(func, value)
         ),
-        Stmt::ComponentVecElementWrite { base, field, index, value } => format!(
+        Stmt::ComponentVecElementWrite {
+            base,
+            field,
+            index,
+            value,
+        } => format!(
             "ComponentVecElementWrite({}.{field}[{}], {})",
-            comp_base_str(base), expr_str(func, index), expr_str(func, value)
+            comp_base_str(base),
+            expr_str(func, index),
+            expr_str(func, value)
         ),
         Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();

@@ -14770,11 +14770,10 @@ fn transactor_method_sync_only_waits() {
     );
 }
 
-/// Bus calls suspend, so they are statement-level only: nesting one in
-/// an expression is a precise rejection, not the generic method-call
-/// message.
+/// A nested blocking bus call is rejected by v1 as well, so this is not
+/// a TB-IR subset gap and must not advertise v1 as an escape hatch.
 #[test]
-fn bus_call_in_expression_position_is_unsupported() {
+fn bus_call_in_expression_position_is_rejected_by_v1_too() {
     let src = r#"
 bus MemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
@@ -14792,10 +14791,14 @@ impl ExprTest for ExprTb
 end impl ExprTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
     assert!(
         msg.contains("bus method calls in expression position"),
         "{msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(src)).is_err(),
+        "v1 must reject the nested bus call too"
     );
 }
 
@@ -16275,7 +16278,8 @@ end impl TbRecordHookShadowTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("Driver_observe_pre = [&](Txn cur_2) -> void"),
+        cpp.contains("std::function<void(Txn)> _on_method_hook_")
+            && cpp.contains("= [&](Txn cur_2) -> void"),
         "hook parameter should remain first and be renamed away from shared cur:\n{cpp}"
     );
     assert!(
@@ -18607,12 +18611,11 @@ end test T"#,
     );
 }
 
-/// The two `on` shapes that need machinery a statement position cannot
-/// provide are rejected with messages that say what to do instead.
+/// Statement-position method hooks register at their runtime position;
+/// unsupported periodic periods still fail precisely.
 #[test]
 fn unsupported_on_shapes_are_rejected_precisely() {
-    let hook = lower_src(
-        r#"transactor Drv
+    let hook_src = r#"transactor Drv
     dut : Top
     when active
         hookable send(v: uint<8>)
@@ -18633,13 +18636,11 @@ impl T for Tb
         end on
         wait 1 cycle
     end run
-end impl T"#,
-    )
-    .expect_err("a statement-position method hook must be rejected");
+end impl T"#;
+    let hook_cpp = emit_cpp_src(hook_src);
     assert!(
-        assert_unsupported(&hook).contains("pre/post` hook in statement position"),
-        "got: {}",
-        assert_unsupported(&hook)
+        hook_cpp.contains("Drv_send_post.push_back"),
+        "statement-position hook must emit a runtime registration"
     );
 
     let period = lower_src(
@@ -18844,28 +18845,14 @@ end test T"#
 #[test]
 fn constructs_v1_implements_still_suggest_v1() {
     let err = lower_src(
-        r#"transactor Drv
-    dut : Top
-    when active
-        hookable send(v: uint<8>)
-            dut.a = v
-        end send
-    end when
-end transactor Drv
+        r#"const BAD : uint<32> = some_call()
 
-testbench Tb
-    dut : Top
-    drv : Drv active
-end testbench Tb
-
-impl T for Tb
+test T
+    let dut : Top
     run
-        on drv.send post
-            log(info, "sent")
-        end on
-        wait 1 cycle
+        assert BAD == 0
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap_err();
     assert_unsupported(&err);
@@ -25036,16 +25023,16 @@ fn a_testbench_scoped_handler_hook_is_dropped_by_v1() {
     );
 }
 
-/// A hook in STATEMENT position, by contrast, v1 really does implement:
-/// it emits the same `Sender_send_pre.push_back` registration the
-/// working test-scope placement gets. So this one keeps `Unsupported` —
-/// and its suggestion must name a destination that works, which the two
-/// obvious readings of "the component or testbench" do not.
+/// A hook in STATEMENT position registers at that exact runtime point in
+/// both backends.
 #[test]
-fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination() {
+fn a_statement_position_hook_registers_at_its_runtime_position() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send", "        "));
-    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
-    assert!(msg.contains("statement position"), "{msg}");
+    let tbir_stmt = emit_cpp_src(&stmt);
+    assert!(
+        tbir_stmt.contains("Sender_send_pre.push_back"),
+        "tbir registers the statement-position hook"
+    );
 
     // v1 is a real escape hatch: it emits the same registration the
     // test-scope placement gets, which tbir itself lowers. Not
@@ -25074,14 +25061,7 @@ fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination()
         );
     }
 
-    // The destination the message names must be the one that works. It
-    // used to say "the component or testbench"; a hook in a component
-    // body and a hook in a `testbench` declaration BOTH fail.
-    assert!(
-        msg.contains("test scope") && msg.contains("transactor"),
-        "the suggestion must name the placement that actually lowers: {msg}"
-    );
-    // Each rejected placement is checked against ITS OWN hook-free
+    // Each still-rejected placement is checked against ITS OWN hook-free
     // control. Asserting only `is_err()` would pass on a source that
     // fails for an unrelated reason, which is how a placement gets
     // recommended by accident.
@@ -25206,14 +25186,16 @@ fn a_phase_modifier_on_a_method_hook_is_refused_by_v1() {
     }
 }
 
-/// The same split at test scope, where the target resolver takes only
-/// `<field>.<method>`. A DEEPER path is a subset gap — v1 walks the
-/// whole path and wires it — while a non-path trigger is refused by v1.
+/// At test scope a nested path is wired, while a non-path trigger is
+/// refused by both backends.
 #[test]
-fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
+fn a_nested_hook_path_registers_but_a_non_path_trigger_is_refused() {
     let nested = hook_positions("", &pre_hook_on("e.inner.note", "    "), "");
-    let msg = assert_unsupported(&lower_src(&nested).unwrap_err());
-    assert!(msg.contains("nested component path"), "{msg}");
+    let tbir = emit_cpp_src(&nested);
+    assert!(
+        tbir.contains("Watcher_note_pre.push_back"),
+        "tbir registers the nested component hook"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&nested))
             .expect("v1 emits")
@@ -25245,14 +25227,11 @@ fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
     }
 }
 
-/// The hook-target resolver used to answer every non-transactor field
-/// with `Invalid` — "your program is broken under every backend". That
-/// is false for an agent / env / method-bearing scoreboard field, which
-/// v1 wires into a working `<Type>_<method>_pre` vector. The site now
-/// splits on v1's own condition, and only the half v1 also refuses
-/// stays `Invalid`.
+/// Agent / env / method-bearing scoreboard fields are valid hook targets,
+/// just like direct transactor fields. Only paths v1 also refuses remain
+/// invalid.
 #[test]
-fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
+fn a_hook_on_a_non_transactor_field_registers() {
     let hook = |target: &str| hook_positions("", &pre_hook_on(target, "    "), "");
 
     // v1 wires these, so they are subset gaps and `--codegen v1` is honest.
@@ -25264,9 +25243,12 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         assert!(v1.contains(vector), "v1 must register `{target}`");
     }
-    let msg = assert_unsupported(&lower_src(&hook("w.note")).unwrap_err());
-    assert!(msg.contains("non-transactor component field"), "{msg}");
-    // The transactor case is the control: it is not a gap at all.
+    let component_cpp = emit_cpp_src(&hook("w.note"));
+    assert!(
+        component_cpp.contains("Watcher_note_pre.push_back"),
+        "component hook must register on its type-scoped vector"
+    );
+    // The transactor case remains the control.
     lower_src(&hook("s.send")).expect("a transactor field lowers");
 
     // A bare field with no method: the desugarer rewrites it to
@@ -25537,8 +25519,11 @@ fn a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1() {
 #[test]
 fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send cycles", "        "));
-    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
-    assert!(msg.contains("statement position"), "{msg}");
+    let tbir = emit_cpp_src(&stmt);
+    assert!(
+        tbir.contains("Sender_send_pre.push_back"),
+        "tbir wires the statement-position spelling"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&stmt))
             .expect("v1 emits")
@@ -27930,11 +27915,13 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         )
     };
 
-    // The one that resolves: v1 EMITS, so `--codegen v1` is a real
-    // escape hatch and the arm keeps its suggestion.
+    // The one that resolves emits a runtime registration in both backends.
     cpp_tb::emit(&merged_src(&with("drv.send"))).expect("v1 emits a resolving hook path");
-    let msg = assert_unsupported(&lower_src(&with("drv.send")).unwrap_err());
-    assert!(msg.contains("hook in statement position"), "{msg}");
+    let tbir = emit_cpp_src(&with("drv.send"));
+    assert!(
+        tbir.contains("HookXactor_send_pre.push_back"),
+        "tbir emits the resolving runtime hook"
+    );
 
     // The four that do not. Same SHAPE, and v1 refuses each one, so a
     // suggestion would send the user to a second error.
@@ -29290,18 +29277,16 @@ end test PTest"#;
     }
 }
 
-/// Two statement-position `on <event>(...)` subscription arms, side by
-/// side in one function, and they take opposite verdicts.
+/// Statement-position subscriptions accept both a test-scope event local
+/// and a component event field. Unknown names remain program errors.
 ///
 /// | subscription | v1 |
 /// |---|---|
 /// | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
 /// | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
 ///
-/// The first row was built and RUN, not just emitted: `seen=3`. So v1
-/// implements it and the suggestion is honest — the arm's advice
-/// ("subscribe from the component that owns the `event` field") is
-/// about TB-IR's subset, not about v1 being broken.
+/// The component-path row was built and RUN under v1 (`seen=3`) before
+/// the TB-IR implementation was added.
 ///
 /// The second is an undefined identifier, which is a program error
 /// under both backends. That it IS only that was checked rather than
@@ -29309,7 +29294,7 @@ end test PTest"#;
 /// reaching here, and a local that is not an event falls to the
 /// `Invalid` immediately below.
 #[test]
-fn a_statement_position_subscription_splits_on_whether_the_channel_exists() {
+fn a_statement_position_subscription_accepts_component_event_paths() {
     let src = |on: &str| {
         format!(
             r#"domain SysDomain
@@ -29348,8 +29333,7 @@ end impl SubTest"#
     // The control: subscribing to the test-scope channel lowers.
     lower_src(&src("ch")).expect("the in-scope channel lowers");
 
-    // A component's event field by path: TB-IR's subset gap, and v1
-    // really is the way out.
+    // A component's event field by path now lowers too.
     //
     // The stimulus matters, and an earlier version of this test got it
     // wrong: it subscribed to `s.obs` and then emitted on `ch`, so the
@@ -29362,10 +29346,12 @@ end impl SubTest"#
         path.contains("s.fire(3)"),
         "the stimulus must actually fire"
     );
-    let msg = assert_unsupported(&lower_src(&path).unwrap_err());
+    let prog = lower_src(&path).expect("component event subscription lowers");
+    verify::verify_program(&prog).expect("component event subscription verifies");
+    let tbir = emit_cpp_src(&path);
     assert!(
-        msg.contains("`on <path>.<event>(arg)` subscription"),
-        "{msg}"
+        tbir.contains("s.obs.push_back(") && tbir.contains("Src_fire("),
+        "TB-IR registers against the component member and emits the stimulus: {tbir}"
     );
     let v1 = cpp_tb::emit(&merged_src(&path)).expect("v1 emits the path form");
     assert!(
@@ -29441,6 +29427,365 @@ end impl SubTest"#
     );
 }
 
+/// Event-subscription metadata is consumed directly by C++ emission. The
+/// verifier must reject stale path/schema/payload links introduced by a later
+/// IR pass, and signed handler parameters must stay signed end-to-end.
+#[test]
+fn component_event_subscription_metadata_is_verified() {
+    fn assert_event_corruption_rejected<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::EventChannelRef),
+    {
+        let event = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::EventSubscribe { event, .. } => Some(event),
+                _ => None,
+            })
+            .expect("fixture has an event subscription");
+        mutate(event);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted component-event metadata must not verify"
+        );
+    }
+
+    let src = fixture("component_event_subscription_test.harc");
+    let prog = lower_src(&src).expect("signed nested component event lowers");
+    verify::verify_program(&prog).expect("signed nested component event verifies");
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("env.source.obs.push_back([&](int64_t _p)")
+            && cpp.contains("std::function<void(int64_t)>")
+            && cpp.contains("int64_t v"),
+        "signed event payload and hook parameter remain signed:\n{cpp}"
+    );
+
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { component, .. } => *component = ir::ComponentId(999),
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { base, .. } => *base = ir::ComponentBase::SelfField,
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { event, .. } => *event = "missing".to_string(),
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { payload, .. } => {
+            *payload = ir::EventPayload::Scalar { signed: false }
+        }
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { payload, .. } => {
+            *payload = ir::EventPayload::Record(ir::RecordId(999))
+        }
+        _ => panic!("fixture subscription must target a component event"),
+    });
+
+    let mut bad_owner = prog.clone();
+    let owner_handler = bad_owner
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has an event subscriber");
+    bad_owner.functions[owner_handler.index()].owner = None;
+    assert!(
+        verify::verify_program(&bad_owner).is_err(),
+        "an event handler owned by a different flow must not verify"
+    );
+
+    let mut bad_handler = prog.clone();
+    let handler = bad_handler
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has an event subscriber");
+    bad_handler.functions[handler.index()].params[0].ty = ir::IrType::UInt(Some(8));
+    bad_handler.functions[handler.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "a handler parameter with the wrong signedness must not verify"
+    );
+}
+
+/// Method-hook subscriptions carry backend-critical target and signature
+/// metadata. Later IR passes must not be able to leave a stale component path,
+/// method id, or signed handler ABI undetected.
+#[test]
+fn method_hook_subscription_metadata_is_verified() {
+    fn assert_target_corruption_rejected<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::MethodHookTarget),
+    {
+        let target = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::MethodHookSubscribe { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("fixture has a method-hook subscription");
+        mutate(target);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted method-hook metadata must not verify"
+        );
+    }
+
+    let src = fixture("method_hook_family_test.harc");
+    let prog = lower_src(&src).expect("nested component method hooks lower");
+    verify::verify_program(&prog).expect("nested component method hooks verify");
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("std::function<void(int64_t)>")
+            && cpp.contains("MethodHookWatcher_note_pre.push_back([&](int64_t _h0)")
+            && cpp.contains("MethodHookWatcher_note_post.push_back([&](int64_t _h0)")
+            && cpp.contains("std::function<void(int64_t, int64_t&)> _on_method_hook_")
+            && cpp.contains("(_h0, __harc_hook_capture_fn"),
+        "signed method-hook parameters remain signed:\n{cpp}"
+    );
+
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { component, .. } => *component = ir::ComponentId(999),
+        _ => panic!("fixture hook must target a component"),
+    });
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { base, .. } => *base = ir::ComponentBase::SelfField,
+        _ => panic!("fixture hook must target a component"),
+    });
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { method, .. } => *method = "missing".to_string(),
+        _ => panic!("fixture hook must target a component"),
+    });
+
+    let mut bad_handler = prog.clone();
+    let handler = bad_handler
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::MethodHookSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has a method-hook subscriber");
+    bad_handler.functions[handler.index()].params[0].ty = ir::IrType::UInt(Some(8));
+    bad_handler.functions[handler.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "a method-hook parameter with the wrong signedness must not verify"
+    );
+
+    let mut bad_capture = lower_src(&src).expect("capture fixture lowers twice");
+    let (handler, capture) = bad_capture
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::MethodHookSubscribe {
+                handler, captures, ..
+            } if !captures.is_empty() => Some((*handler, captures[0])),
+            _ => None,
+        })
+        .expect("fixture has a captured method-hook local");
+    let last = bad_capture.functions[handler.index()].params.len() - 1;
+    bad_capture.functions[handler.index()].params[last].ty = ir::IrType::UInt(Some(32));
+    bad_capture.functions[handler.index()].locals[last].ty = ir::IrType::UInt(Some(32));
+    assert!(
+        verify::verify_program(&bad_capture).is_err(),
+        "a capture parameter that disagrees with source local %{} must not verify",
+        capture.0
+    );
+
+    let method = prog
+        .functions
+        .iter()
+        .find(|func| {
+            !func.implicit_returns.is_empty()
+                && func
+                    .blocks
+                    .iter()
+                    .any(|block| !matches!(block.terminator, ir::Terminator::Return))
+        })
+        .expect("fixture has a transactor method with natural completion");
+    let method_id = method.id;
+    let non_return = method
+        .blocks
+        .iter()
+        .position(|block| !matches!(block.terminator, ir::Terminator::Return))
+        .expect("early-return fixture method has a branch");
+
+    let mut bad_return_id = prog.clone();
+    bad_return_id.functions[method_id.index()]
+        .implicit_returns
+        .push(ir::BlockId(999));
+    assert!(
+        verify::verify_program(&bad_return_id).is_err(),
+        "an out-of-range implicit-return block must not verify"
+    );
+
+    let mut bad_return_kind = prog;
+    bad_return_kind.functions[method_id.index()].implicit_returns =
+        vec![ir::BlockId(non_return as u32)];
+    assert!(
+        verify::verify_program(&bad_return_kind).is_err(),
+        "implicit-return metadata naming a non-Return block must not verify"
+    );
+}
+
+#[test]
+fn method_hook_vectors_preserve_sequence_and_component_parameter_abis() {
+    let src = r#"
+tseq One() -> TSeq<uint<8>>
+    yield 1
+end tseq One
+
+transactor Provider
+    hookable touch()
+        log(info, "touch")
+    end touch
+end transactor Provider
+
+scoreboard HookShapes
+    hookable feed(xs: TSeq<uint<8>>)
+        log(info, "seq")
+    end feed
+
+    hookable comp(model: Provider)
+        model.touch()
+    end comp
+end scoreboard HookShapes
+
+testbench ShapeTb
+    dut  : Top
+    sink : HookShapes
+end testbench ShapeTb
+
+impl ShapeTest for ShapeTb
+    run
+        on sink.feed pre
+            log(info, "seq hook")
+        end on
+        on sink.comp pre
+            log(info, "component hook")
+        end on
+        let xs = One()
+        sink.feed(xs)
+    end run
+end impl ShapeTest
+"#;
+    let prog = lower_src(src).expect("sequence/component method hooks lower");
+    verify::verify_program(&prog).expect("sequence/component method hooks verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::function<void(std::vector<uint64_t>)>> HookShapes_feed_pre")
+            && cpp.contains("std::vector<std::function<void(Provider)>> HookShapes_comp_pre")
+            && cpp.contains("std::function<void(std::vector<uint64_t>)> _on_method_hook_")
+            && cpp.contains("std::function<void(Provider)> _on_method_hook_"),
+        "hook vector and handler signatures must match aggregate method ABIs:\n{cpp}"
+    );
+}
+
+#[test]
+fn method_hook_subscriptions_do_not_leak_between_tests_sharing_a_schema() {
+    let src = r#"
+agent SharedHookAgent
+    hookable ping()
+        log(info, "ping")
+    end ping
+end agent SharedHookAgent
+
+testbench SharedHookTb
+    dut  : Top
+    node : SharedHookAgent
+end testbench SharedHookTb
+
+impl HookedTest for SharedHookTb
+    on node.ping pre
+        log(info, "hooked")
+    end on
+    run
+        node.ping()
+    end run
+end impl HookedTest
+
+impl PlainTest for SharedHookTb
+    run
+        node.ping()
+    end run
+end impl PlainTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert_eq!(
+        cpp.matches("std::vector<std::function<void()>> SharedHookAgent_ping_pre;")
+            .count(),
+        1,
+        "only the owning test should declare the type-scoped hook vector:\n{cpp}"
+    );
+    assert_eq!(
+        cpp.matches("for (auto& _h : SharedHookAgent_ping_pre) _h();")
+            .count(),
+        1,
+        "only the owning test should fan out the hook vector:\n{cpp}"
+    );
+}
+
+#[test]
+fn hoisted_method_hook_capture_cannot_shadow_a_check_phase_component() {
+    let src = fixture("method_hook_family_test.harc");
+    let merged = merged_src(&src);
+    let mut prog = lower::lower_program(&merged).expect("method-hook fixture lowers");
+    let (run_id, capture) = prog
+        .functions
+        .iter()
+        .find_map(|func| {
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::MethodHookSubscribe { captures, .. } if !captures.is_empty() => {
+                        Some((func.id, captures[0]))
+                    }
+                    _ => None,
+                })
+        })
+        .expect("fixture has a captured run local");
+    // Mutation pins the backend invariant directly: regardless of what
+    // front-end shadowing rules currently admit, an IR local name must not
+    // collide with the enclosing component instance used by Check.
+    prog.functions[run_id.index()].locals[capture.index()].name = "env".to_string();
+    verify::verify_program(&prog).expect("local spelling does not invalidate IR");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("int64_t __harc_hook_capture_fn")
+            && cpp.contains("MethodHookWatcher_note(env.watcher, 3)")
+            && !cpp.contains("uint64_t env = 0"),
+        "capture storage must not shadow the check-phase component instance:\n{cpp}"
+    );
+}
+
 /// A queue method in STATEMENT position that is neither `push` nor
 /// `pop`. Five arms — testbench-owned field, scoreboard queue,
 /// component queue, bare target-state field, instance-qualified
@@ -29455,8 +29800,8 @@ end impl SubTest"#
 /// | `sb.q.clear()` | `_tb.sb.q.clear();` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
 /// | `sb.q.front()` | `_tb.sb.q.front();` | same, no `front` |
 ///
-/// So `size`/`empty` keep the suggestion — v1 runs those programs — and
-/// everything else is a program error no backend runs.
+/// TB-IR now accepts the `size`/`empty` no-ops; everything else remains a
+/// program error no backend runs.
 ///
 /// All FIVE landings were probed independently rather than four
 /// inferred from one — testbench-owned field, scoreboard queue,
@@ -29468,7 +29813,7 @@ end impl SubTest"#
 /// `model.pending.size()` emits `_tb.model.pending.size();`, and g++
 /// compiles all three.
 #[test]
-fn a_queue_method_in_statement_position_splits_on_the_runtime_api() {
+fn a_queue_method_in_statement_position_tracks_the_runtime_api() {
     let sb = |method: &str| {
         format!(
             r#"domain SysDomain
@@ -29564,14 +29909,13 @@ end impl TbQTest"#
         ("bare target-state field", &bare_state),
         ("instance-qualified target-state field", &inst_state),
     ] {
-        // `size`/`empty` — v1 emits a legal no-op and runs the program.
+        // `size`/`empty` — both backends accept the legal no-op.
         for method in ["size", "empty"] {
             let s = src(method);
-            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-            assert!(
-                msg.contains("in statement position"),
-                "{what}/{method}: {msg}"
-            );
+            let prog = lower_src(&s)
+                .unwrap_or_else(|e| panic!("{what}/{method}: TB-IR lowers the no-op: {e}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("{what}/{method}: TB-IR verifies: {e:?}"));
             let v1 = cpp_tb::emit(&merged_src(&s))
                 .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
             assert!(
@@ -29859,7 +30203,7 @@ end impl T"#;
 
     let err = lower_src(src).expect_err("TB-IR must also refuse a hook on `function`");
     assert!(
-        assert_invalid(&err).contains("does not name a `hookable`"),
+        assert_invalid(&err).contains("names no `hookable`"),
         "the diagnostic must distinguish a plain function from a hookable: {err}"
     );
 }

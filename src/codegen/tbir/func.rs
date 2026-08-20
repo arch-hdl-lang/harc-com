@@ -235,11 +235,17 @@ pub(super) fn emit_function(
     lanes: &HashMap<String, u32>,
     randomize_snippets: &[String],
     dut_type: &str,
+    predeclared: &HashSet<LocalId>,
     depth: usize,
 ) -> Result<(), EmitError> {
-    let names = cpp_local_names(func);
+    let mut names = cpp_local_names(func);
+    for local in predeclared {
+        if let Some(name) = names.get_mut(local.index()) {
+            *name = flow_hook_capture_name(func, *local);
+        }
+    }
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes,
@@ -254,7 +260,7 @@ pub(super) fn emit_function(
     let pad3 = INDENT.repeat(depth + 3);
 
     writeln!(out, "{pad}{{ // {} (TB-IR loop-switch)", func.name).ok();
-    declare_locals(out, prog, func, &names, 0, depth + 1)?;
+    declare_locals_except(out, prog, func, &names, 0, predeclared, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}bool __done = false;").ok();
     writeln!(out, "{pad1}while (!__done) {{").ok();
@@ -442,7 +448,7 @@ pub(super) fn emit_tseq(
     // probe access either (`dut_type` unused → `""`).
     let empty_lanes = HashMap::new();
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -978,6 +984,16 @@ fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<S
     }
 }
 
+fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> String {
+    match ty {
+        IrType::Record(r) => prog.records[r.index()].name.clone(),
+        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+        IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+        IrType::Component(c) => prog.components[c.index()].name.clone(),
+        other => super::local_scalar_cty(other),
+    }
+}
+
 fn emit_stmt(
     out: &mut String,
     prog: &TbProgram,
@@ -1360,7 +1376,6 @@ fn emit_stmt(
         // test-scope lambda (like a cycle handler's) so the pushed
         // closure outlives the block that registered it.
         Stmt::EventSubscribe { event, handler } => {
-            let chan = &names[event.index()];
             let body = &prog
                 .functions
                 .get(handler.index())
@@ -1371,10 +1386,99 @@ fn emit_stmt(
                     ))
                 })?
                 .name;
-            let ty = event_payload_cty(prog, cx, *event)?;
+            let (chan, ty) = match event {
+                crate::ir::EventChannelRef::Local(event) => (
+                    names[event.index()].clone(),
+                    event_payload_cty(prog, cx, *event)?,
+                ),
+                crate::ir::EventChannelRef::Component {
+                    base,
+                    event,
+                    payload,
+                    ..
+                } => (
+                    format!("{}.{event}", comp_base_cpp_subst_cx(cx, base)),
+                    super::runtime::event_payload_cty(payload, records),
+                ),
+            };
             writeln!(
                 out,
                 "{pad}{chan}.push_back([&]({ty} _p) {{ {body}(_p); }});"
+            )
+            .ok();
+        }
+        Stmt::MethodHookSubscribe {
+            target,
+            side,
+            handler,
+            captures,
+        } => {
+            let body = prog.functions.get(handler.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: {} subscribes method hook to fn{} which does not resolve",
+                    func.name, handler.0
+                ))
+            })?;
+            let side = match side {
+                crate::ast::HookSide::Pre => "pre",
+                crate::ast::HookSide::Post => "post",
+            };
+            let vector = match target {
+                crate::ir::MethodHookTarget::Transactor {
+                    transactor, method, ..
+                } => {
+                    let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: method hook references missing transactor x{}",
+                            transactor.0
+                        ))
+                    })?;
+                    format!("{}_{}_{side}", schema.name, method)
+                }
+                crate::ir::MethodHookTarget::Component {
+                    component, method, ..
+                } => {
+                    let schema = prog.components.get(component.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: method hook references missing component c{}",
+                            component.0
+                        ))
+                    })?;
+                    format!("{}_{}_{side}", schema.name, method)
+                }
+            };
+            let method_param_count =
+                body.params
+                    .len()
+                    .checked_sub(captures.len())
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: method hook fn{} has fewer parameters than captures",
+                            handler.0
+                        ))
+                    })?;
+            let mut decls = Vec::with_capacity(method_param_count);
+            let mut args = Vec::with_capacity(body.params.len());
+            for (i, local) in body.locals.iter().take(method_param_count).enumerate() {
+                let name = format!("_h{i}");
+                decls.push(format!("{} {name}", hook_param_cty(prog, &local.ty)));
+                args.push(name);
+            }
+            for capture in captures {
+                let name = names.get(capture.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: method hook captures missing local %{} in {}",
+                        capture.0, func.name
+                    ))
+                })?;
+                args.push(name.clone());
+            }
+            writeln!(
+                out,
+                "{pad}{vector}.push_back([&]({}) {{ {}({}); }});",
+                decls.join(", "),
+                body.name,
+                args.join(", ")
             )
             .ok();
         }
@@ -1466,10 +1570,20 @@ fn emit_stmt(
             )
             .ok();
         }
-        Stmt::ComponentVecElementWrite { base, field, index, value } => {
+        Stmt::ComponentVecElementWrite {
+            base,
+            field,
+            index,
+            value,
+        } => {
             let index = expr_cpp(cx, index)?;
             let value = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{}.{field}[{index}] = {value};", comp_base_cpp_subst_cx(cx, base)).ok();
+            writeln!(
+                out,
+                "{pad}{}.{field}[{index}] = {value};",
+                comp_base_cpp_subst_cx(cx, base)
+            )
+            .ok();
         }
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
@@ -2059,9 +2173,24 @@ fn declare_locals(
     skip: usize,
     depth: usize,
 ) -> Result<(), EmitError> {
+    declare_locals_except(out, prog, func, names, skip, &HashSet::new(), depth)
+}
+
+fn declare_locals_except(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    names: &[String],
+    skip: usize,
+    excluded: &HashSet<LocalId>,
+    depth: usize,
+) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
     let shared = shared_record_names(prog, func);
-    for (l, n) in func.locals.iter().zip(names).skip(skip) {
+    for (index, (l, n)) in func.locals.iter().zip(names).enumerate().skip(skip) {
+        if excluded.contains(&LocalId(index as u32)) {
+            continue;
+        }
         // Shared test-scope record state is declared once by the enclosing
         // test; skip its per-function declaration so references resolve to
         // the captured object.
@@ -2095,6 +2224,15 @@ fn declare_locals(
             IrType::Seq(ref scalar) => {
                 let cty = super::local_scalar_cty(scalar);
                 writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
+            }
+            IrType::Component(c) => {
+                let component = prog.components.get(c.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: local `{n}` in {} references missing component c{}",
+                        func.name, c.0
+                    ))
+                })?;
+                writeln!(out, "{pad}{} {n}{{}}; (void){n};", component.name).ok();
             }
             // A test-scope event channel — v1's subscriber vector.
             IrType::Event(payload) => {
@@ -2131,6 +2269,36 @@ fn declare_locals(
     Ok(())
 }
 
+/// Declare run locals captured by statement-position hooks in the enclosing
+/// coroutine scope. Their references can then remain valid while the later
+/// check phase fires a hook registered during run.
+pub(super) fn declare_flow_hook_captures(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    captures: &HashSet<LocalId>,
+    depth: usize,
+) -> Result<(), EmitError> {
+    if captures.is_empty() {
+        return Ok(());
+    }
+    let mut names = cpp_local_names(func);
+    for local in captures {
+        if let Some(name) = names.get_mut(local.index()) {
+            *name = flow_hook_capture_name(func, *local);
+        }
+    }
+    let excluded: HashSet<LocalId> = (0..func.locals.len())
+        .map(|index| LocalId(index as u32))
+        .filter(|local| !captures.contains(local))
+        .collect();
+    declare_locals_except(out, prog, func, &names, 0, &excluded, depth)
+}
+
+fn flow_hook_capture_name(func: &TbFunction, local: LocalId) -> String {
+    format!("__harc_hook_capture_fn{}_l{}", func.id.0, local.0)
+}
+
 /// Whether a transactor type's methods use the per-instance state-receiver
 /// ABI (#494 P1b): the shared body takes a leading `<Type>_state&
 /// self_state` param and each call site passes its instance's struct.
@@ -2163,7 +2331,10 @@ pub(super) fn declare_method_slot(
     // method takes its per-instance state struct by reference as the
     // leading param, so one shared body serves any number of instances.
     if uses_state_receiver(schema) {
-        param_tys.push(format!("{}&", super::runtime::unbound_state_struct_ty(schema)));
+        param_tys.push(format!(
+            "{}&",
+            super::runtime::unbound_state_struct_ty(schema)
+        ));
     }
     param_tys.extend((0..func.params.len()).map(|i| match func.locals[i].ty {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
@@ -2192,15 +2363,15 @@ pub(super) fn declare_method_slot(
 /// suspension terminators emit v1's sync shapes (`for (...) tick();`,
 /// `while (!(pred)) tick();`) and `Return` is a real `return`.
 ///
-/// Deliberately NOT emitted (v1 emits them, but they are inert dead
-/// text under this subset and land with their constructs): the
-/// `<Type>_<method>_pre`/`_post` hook vectors and their fan-out loops
-/// (statement-level `on obj.method pre/post` hooks are rejected at
-/// lowering), the transactor instance struct, and the per-instance
-/// heartbeat stamps (no `idle()` predicates in the subset).
+/// The remaining intentionally omitted v1 machinery is the transactor
+/// instance struct and per-instance heartbeat stamps (`idle()` predicates
+/// are still outside the TBIR subset). Method-hook vectors and their fan-out
+/// loops are emitted below.
 pub(super) fn emit_method(
     out: &mut String,
     prog: &TbProgram,
+    owner: crate::ir::TestbenchId,
+    transactor: crate::ir::TransactorId,
     schema: &TransactorSchema,
     m: &TransactorMethodSchema,
     randomize_snippets: &[String],
@@ -2224,7 +2395,7 @@ pub(super) fn emit_method(
     // receiver.
     let has_state = uses_state_receiver(schema);
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2256,16 +2427,21 @@ pub(super) fn emit_method(
             super::runtime::unbound_state_struct_ty(schema)
         ));
     }
-    param_list.extend(names[..nparams].iter().enumerate().map(|(i, n)| {
-        match func.locals[i].ty {
-            IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
-            IrType::RecordSeq(r) => format!("std::vector<{}> {n}", prog.records[r.index()].name),
-            IrType::Seq(ref scalar) => {
-                format!("std::vector<{}> {n}", super::local_scalar_cty(scalar))
-            }
-            ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
-        }
-    }));
+    param_list.extend(
+        names[..nparams]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| match func.locals[i].ty {
+                IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
+                IrType::RecordSeq(r) => {
+                    format!("std::vector<{}> {n}", prog.records[r.index()].name)
+                }
+                IrType::Seq(ref scalar) => {
+                    format!("std::vector<{}> {n}", super::local_scalar_cty(scalar))
+                }
+                ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
+            }),
+    );
     let params = param_list.join(", ");
     writeln!(
         out,
@@ -2274,28 +2450,15 @@ pub(super) fn emit_method(
     )
     .ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
-    // Pre-hooks (`on <obj>.<method> pre`) fire BEFORE the body, with the
-    // same args the method received (mirrors v1's `<Type>_<method>_pre`
-    // fan-out loop). The hook lambdas are emitted just before this method.
     let hook_args = names[..nparams].join(", ");
-    for fid in &m.pre_hooks {
-        writeln!(out, "{pad1}{}({hook_args});", prog.function(*fid).name).ok();
-    }
-    // Hook-vector fan-out for hook-triggered covergroups
-    // (`covergroup G @(drv.send(t) pre)`): fire the `<Type>_<method>_pre`
-    // subscribers before the body, with the method's args. The vector is
-    // only declared when `cov_hook_subs` is non-empty, so guard the
-    // fan-out the same way (v1's `emit_hook_vectors` + fan-out). `pre`
-    // and `post` subscribers are partitioned by side.
-    let has_pre_cov = m
-        .cov_hook_subs
-        .iter()
-        .any(|(_, s)| matches!(s, crate::ast::HookSide::Pre));
-    let has_post_cov = m
-        .cov_hook_subs
-        .iter()
-        .any(|(_, s)| matches!(s, crate::ast::HookSide::Post));
-    if has_pre_cov {
+    // Fan out covergroup and user-hook subscriptions before/after the body.
+    // Vectors are type-scoped, matching v1, while declaration is restricted
+    // to tests that actually install a subscription for this method.
+    let has_hook_vector = !m.cov_hook_subs.is_empty()
+        || super::has_transactor_method_hook_subscription(prog, owner, transactor, &m.name);
+    let has_pre_hooks = has_hook_vector;
+    let has_post_hooks = has_hook_vector;
+    if has_pre_hooks {
         writeln!(
             out,
             "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
@@ -2353,19 +2516,9 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
-                // Post-hooks (`on <obj>.<method> post`) fire AFTER the
-                // body, before returning — with the same args (mirrors
-                // v1's `<Type>_<method>_post` fan-out at the lambda end).
-                // v1 places the fan-out at the body's natural end, so an
-                // early `return` skips it; in this subset hooked methods
-                // are void and fall through to a single terminal Return,
-                // so firing at every void return matches v1 exactly.
-                for fid in &m.post_hooks {
-                    writeln!(out, "{pad3}{}({hook_args});", prog.function(*fid).name).ok();
-                }
                 // Hook-vector fan-out for hook-triggered covergroups
                 // sampled on this method's `post` boundary.
-                if has_post_cov {
+                if has_post_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
                     writeln!(
                         out,
                         "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
@@ -2474,6 +2627,8 @@ pub(super) fn emit_method(
 pub(super) fn emit_component_method(
     out: &mut String,
     prog: &TbProgram,
+    owner: crate::ir::TestbenchId,
+    component: crate::ir::ComponentId,
     comp: &crate::ir::ComponentSchema,
     m: &crate::ir::ComponentMethodSchema,
     randomize_snippets: &[String],
@@ -2487,8 +2642,12 @@ pub(super) fn emit_component_method(
         m.function,
         &lambda,
         Some(ComponentHookCtx {
+            owner_name: &comp.name,
             method_name: &m.name,
-            cov_hook_subs: &m.cov_hook_subs,
+            has_instance_hook_vector: !m.cov_hook_subs.is_empty(),
+            has_method_hook_vector: super::has_component_method_hook_subscription(
+                prog, owner, component, &m.name,
+            ),
         }),
         randomize_snippets,
         depth,
@@ -2645,7 +2804,7 @@ pub(super) fn clause_expr_cpp(
     let empty_lanes = HashMap::new();
     // Component clause exprs read component fields, not DUT probes.
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2672,7 +2831,7 @@ pub(super) fn tb_service_expr_cpp(
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2687,8 +2846,10 @@ pub(super) fn tb_service_expr_cpp(
 /// Shared lambda emission for component methods and on-handlers: a free
 /// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
 struct ComponentHookCtx<'a> {
+    owner_name: &'a str,
     method_name: &'a str,
-    cov_hook_subs: &'a [(crate::ir::CovgroupId, crate::ast::HookSide)],
+    has_instance_hook_vector: bool,
+    has_method_hook_vector: bool,
 }
 
 fn emit_component_fn_lambda(
@@ -2706,7 +2867,7 @@ fn emit_component_fn_lambda(
     let empty_lanes = HashMap::new();
     // Component method/on-handler bodies are host-side; no DUT probes.
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -2754,22 +2915,27 @@ fn emit_component_fn_lambda(
     writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
     let hook_args = names[..nparams].join(", ");
-    let has_pre_cov = hook_ctx.as_ref().is_some_and(|ctx| {
-        ctx.cov_hook_subs
-            .iter()
-            .any(|(_, s)| matches!(s, crate::ast::HookSide::Pre))
-    });
-    let has_post_cov = hook_ctx.as_ref().is_some_and(|ctx| {
-        ctx.cov_hook_subs
-            .iter()
-            .any(|(_, s)| matches!(s, crate::ast::HookSide::Post))
-    });
-    if has_pre_cov {
+    let has_instance_hooks = hook_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.has_instance_hook_vector);
+    let has_method_hooks = hook_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.has_method_hook_vector);
+    if has_instance_hooks {
         let ctx = hook_ctx.as_ref().expect("pre hook context present");
         writeln!(
             out,
             "{pad1}for (auto& _h : self._harc_cov_{}_pre) _h({hook_args});",
             ctx.method_name
+        )
+        .ok();
+    }
+    if has_method_hooks {
+        let ctx = hook_ctx.as_ref().expect("pre hook context present");
+        writeln!(
+            out,
+            "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
+            ctx.owner_name, ctx.method_name
         )
         .ok();
     }
@@ -2817,11 +2983,7 @@ fn emit_component_fn_lambda(
             }
             Terminator::Return => match func.ret {
                 Some(r) => {
-                    if has_post_cov
-                        && func
-                            .implicit_returns
-                            .contains(&BlockId(bi as u32))
-                    {
+                    if has_instance_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
                         let ctx = hook_ctx.as_ref().expect("post hook context present");
                         writeln!(
                             out,
@@ -2830,19 +2992,33 @@ fn emit_component_fn_lambda(
                         )
                         .ok();
                     }
+                    if has_method_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
+                        let ctx = hook_ctx.as_ref().expect("post hook context present");
+                        writeln!(
+                            out,
+                            "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
+                            ctx.owner_name, ctx.method_name
+                        )
+                        .ok();
+                    }
                     writeln!(out, "{pad3}return {};", names[r.index()]).ok();
                 }
                 None => {
-                    if has_post_cov
-                        && func
-                            .implicit_returns
-                            .contains(&BlockId(bi as u32))
-                    {
+                    if has_instance_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
                         let ctx = hook_ctx.as_ref().expect("post hook context present");
                         writeln!(
                             out,
                             "{pad3}for (auto& _h : self._harc_cov_{}_post) _h({hook_args});",
                             ctx.method_name
+                        )
+                        .ok();
+                    }
+                    if has_method_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
+                        let ctx = hook_ctx.as_ref().expect("post hook context present");
+                        writeln!(
+                            out,
+                            "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
+                            ctx.owner_name, ctx.method_name
                         )
                         .ok();
                     }
@@ -3750,7 +3926,7 @@ pub(super) fn emit_test_hook(
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
     let cx = ECx {
-            prog: Some(prog),
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -3760,6 +3936,19 @@ pub(super) fn emit_test_hook(
         state_receiver: None,
     };
     let nparams = func.params.len();
+    let capture_count = prog
+        .functions
+        .iter()
+        .flat_map(|owner| &owner.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            Stmt::MethodHookSubscribe {
+                handler, captures, ..
+            } if *handler == func.id => Some(captures.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let capture_base = nparams.saturating_sub(capture_count);
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
@@ -3767,16 +3956,14 @@ pub(super) fn emit_test_hook(
 
     // Hooks are void in this subset; a value-returning hook is never
     // produced by lowering (the firing site discards any result).
-    let param_ty = |i: usize| match func.locals[i].ty {
-        IrType::Record(r) => prog.records[r.index()].name.clone(),
-        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
-        _ => "uint64_t".to_string(),
-    };
+    let param_ty = |i: usize| hook_param_cty(prog, &func.locals[i].ty);
     let params = names[..nparams]
         .iter()
         .enumerate()
-        .map(|(i, n)| format!("{} {n}", param_ty(i)))
+        .map(|(i, n)| {
+            let reference = if i >= capture_base { "&" } else { "" };
+            format!("{}{reference} {n}", param_ty(i))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     // A per-register `on regs.REG` write callback can re-enter
@@ -3785,7 +3972,13 @@ pub(super) fn emit_test_hook(
     // declared as a forward `std::function` slot, then assigned (mirrors
     // v1's `std::function` callback holder). Method pre/post hooks never
     // self-recurse but use the same shape uniformly.
-    let sig_params = (0..nparams).map(param_ty).collect::<Vec<_>>().join(", ");
+    let sig_params = (0..nparams)
+        .map(|i| {
+            let reference = if i >= capture_base { "&" } else { "" };
+            format!("{}{reference}", param_ty(i))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     writeln!(out, "{pad}std::function<void({sig_params})> {};", func.name).ok();
     writeln!(out, "{pad}{} = [&]({params}) -> void {{", func.name).ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;

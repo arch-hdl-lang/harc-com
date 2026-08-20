@@ -566,20 +566,6 @@ pub struct TransactorMethodSchema {
     /// rejects it (mirroring v1's "`<m>` is declared inside `when
     /// active`" diagnostic). Always-on methods are callable on both.
     pub active_only: bool,
-    /// Test-scope `on <obj>.<method> pre` hook bodies, registration
-    /// order. Each is a `FunctionKind::TransactorBody` function sharing
-    /// the method's parameter signature (the hook sees the same args).
-    /// The hook bodies mutate promoted host state (`_tb` scalar fields)
-    /// by reference and read the firing instance's transactor state
-    /// (`drv.last_read`); host-state promotion (a captured run-scope
-    /// `let` becomes a `_tb` field) is what lets the function-per-CFG IR
-    /// express v1's `[&]`-capturing hook closure. Fired BEFORE the body
-    /// at the `emit_method` call site (mirrors v1's `<Type>_<method>_pre`
-    /// fan-out loop). Empty for a method with no registered hooks.
-    pub pre_hooks: Vec<FunctionId>,
-    /// Test-scope `on <obj>.<method> post` hook bodies — fired AFTER the
-    /// body. See `pre_hooks`.
-    pub post_hooks: Vec<FunctionId>,
     /// Covergroup auto-samplers that subscribe to this method's pre/post
     /// hook boundary (`covergroup G @(drv.send(t) post)`). Populated by
     /// the `covergroup_hooks` pass after transactors are lowered. Each
@@ -1105,9 +1091,9 @@ pub fn resolve_component_path_mode(
             schema
                 .field(segment)
                 .ok_or_else(|| ComponentPathResolutionError::NotSubcomponent {
-                component: schema.name.clone(),
-                segment: segment.clone(),
-        })?;
+                    component: schema.name.clone(),
+                    segment: segment.clone(),
+                })?;
         let ComponentFieldKind::Sub {
             component: child,
             mode: declared_mode,
@@ -2117,14 +2103,26 @@ pub enum Stmt {
     /// `_post_eval_services` closure installed at this statement's
     /// position, exactly where v1's `emit_cycle_trigger` pushes it.
     CycleHandler(CycleHandlerId),
-    /// `on e(v) ... end on` on a test-scope event local — push a
-    /// subscriber onto the channel. `handler` is a one-parameter
+    /// `on e(v) ... end on` on a test-scope event local, or
+    /// `on comp.event(v)` on a component event field — push a subscriber
+    /// onto the channel. `handler` is a one-parameter
     /// `FunctionKind::TestHook` function (the payload is its parameter),
     /// declared at test scope so the pushed closure outlives the block
     /// that registered it.
     EventSubscribe {
-        event: LocalId,
+        event: EventChannelRef,
         handler: FunctionId,
+    },
+    /// Register a pre/post subscriber on a hookable method at this
+    /// statement's runtime position.
+    MethodHookSubscribe {
+        target: MethodHookTarget,
+        side: crate::ast::HookSide,
+        handler: FunctionId,
+        /// Enclosing flow locals captured by reference at this registration
+        /// point. The handler's trailing parameters have matching types and
+        /// are emitted as C++ reference parameters.
+        captures: Vec<LocalId>,
     },
     /// `emit e(x)` on a test-scope event local — call every subscriber
     /// synchronously, in subscription order. Mirrors v1's
@@ -2288,6 +2286,39 @@ pub enum Stmt {
     /// Mixing tagged and untagged forks before one join_all is rejected
     /// at lowering. An empty list is a no-op (v1's "no pending forks").
     TlmJoinAll(Vec<TlmForkDesc>),
+}
+
+/// Event channel targeted by a statement-position subscription.
+#[derive(Debug, Clone)]
+pub enum EventChannelRef {
+    /// A test-scope `let e : event<T>` local.
+    Local(LocalId),
+    /// An event field on a test-scope component path (`env.src.obs`).
+    Component {
+        base: ComponentBase,
+        /// Resolved schema of the component that owns `event`.
+        component: ComponentId,
+        event: String,
+        payload: EventPayload,
+    },
+}
+
+/// Hookable method targeted by a statement-position subscription.
+#[derive(Debug, Clone)]
+pub enum MethodHookTarget {
+    /// A method on a direct transactor testbench field. Transactor hook
+    /// vectors are type-scoped, matching v1's `<Type>_<method>_pre/post`.
+    Transactor {
+        field: String,
+        transactor: TransactorId,
+        method: String,
+    },
+    /// A hookable method on a component path (`env.source.publish`).
+    Component {
+        base: ComponentBase,
+        component: ComponentId,
+        method: String,
+    },
 }
 
 /// One deferred bus-bound `tlm_method` fork: the request payload plus
@@ -2804,14 +2835,20 @@ pub enum ScoreboardQuery {
 pub enum CallTarget {
     /// Pure helper call plus the declared return type used by caller-side
     /// local inference and signed/width-sensitive expression emission.
-    Helper { name: String, ret: IrType },
+    Helper {
+        name: String,
+        ret: IrType,
+    },
     Builtin(String),
     /// Call to a `extern function name(...) -> ret` (spec §9) — a C
     /// reference model linked in via `--ref-src`. Emitted with the RAW
     /// symbol name (no `harc_helper_` mangling) so it resolves against
     /// the user-provided `extern "C"` definition; the forward
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
-    ExternFn { name: String, ret: IrType },
+    ExternFn {
+        name: String,
+        ret: IrType,
+    },
     TransactorMethod {
         bus_field: String,
         method: String,

@@ -1006,13 +1006,14 @@ impl FuncBuilder<'_> {
                         // `try_lower_bus_call`; anything nested deeper
                         // gets this precise rejection.
                         if let Some(bind) = self.bus_call_root(callee) {
-                            return Err(unsupported(
+                            return Err(not_implemented(
                                 "bus method calls in expression position",
                                 format!(
                                     "only `let x = {bind}.{}(...)` and statement \
-                                     position are lowered (v1's surface)",
+                                     position are lowered; v1 also rejects the nested form",
                                     name.name
                                 ),
+                                V1Status::Rejects,
                             ));
                         }
                         // Transactor method calls are call EDGES that may

@@ -30,8 +30,8 @@ mod tseqs;
 
 use crate::ast::{
     AddrmapDecl, Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
-    HookSide, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind,
-    TestDecl, TestItem, TransactorMode, TypeExpr,
+    HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind, TestDecl,
+    TestItem, TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
@@ -189,15 +189,19 @@ impl SideTables {
         for h in &mut self.cycle_handlers {
             h.function = FunctionId(base + h.function.0);
         }
-        // `Stmt::EventSubscribe` carries its handler's placeholder id
+        // Subscription statements carry their handler's placeholder id
         // inline in a function body rather than in a schema, so the
         // rewrite is a walk over every body — including the ones just
         // pushed, since an `on` handler may itself subscribe.
         for f in &mut prog.functions {
             for b in &mut f.blocks {
                 for s in &mut b.stmts {
-                    if let ir::Stmt::EventSubscribe { handler, .. } = s {
-                        *handler = FunctionId(base + handler.0);
+                    match s {
+                        ir::Stmt::EventSubscribe { handler, .. }
+                        | ir::Stmt::MethodHookSubscribe { handler, .. } => {
+                            *handler = FunctionId(base + handler.0);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3017,6 +3021,88 @@ fn item_component_label(it: &ComponentItem) -> &'static str {
     }
 }
 
+struct ResolvedTestMethodHook {
+    params: Vec<TypedParam>,
+}
+
+/// Resolve a test-scope method hook against either a direct transactor field
+/// or an arbitrarily nested composite-component path. This is the static
+/// counterpart of the statement-position resolver in `stmts.rs`.
+fn resolve_test_method_hook<'a>(
+    prog: &TbProgram,
+    transactor_fields: &HashMap<String, TransactorId>,
+    passive_transactor_fields: &HashSet<String>,
+    component_fields: &HashMap<String, ir::ComponentId>,
+    component_modes: &HashMap<String, Option<ir::ComponentInstanceMode>>,
+    handler: &crate::ast::OnHandler,
+) -> Result<Option<ResolvedTestMethodHook>, LowerError> {
+    let Some(mut path) = strict_method_hook_path(&handler.event) else {
+        return Ok(None);
+    };
+    if path.first().map(String::as_str) == Some("_tb") {
+        path.remove(0);
+    }
+    if path.len() < 2 {
+        return Ok(None);
+    }
+    let method = path.pop().expect("method-hook path has a method");
+    let receiver = path;
+    let root = &receiver[0];
+
+    if receiver.len() == 1 {
+        if let Some(&xid) = transactor_fields.get(root) {
+            let schema = prog.transactor(xid);
+            let Some(target_method) = schema.method(&method) else {
+                return Ok(None);
+            };
+            if !target_method.hookable
+                || (target_method.active_only && passive_transactor_fields.contains(root))
+            {
+                return Ok(None);
+            }
+            let params = prog.function(target_method.function).params.clone();
+            return Ok(Some(ResolvedTestMethodHook { params }));
+        }
+    }
+
+    let Some(&head) = component_fields.get(root) else {
+        return Ok(None);
+    };
+    let tail = &receiver[1..];
+    let resolved = ir::resolve_component_path_mode(
+        &prog.components,
+        head,
+        component_modes.get(root).copied().flatten(),
+        tail,
+    )
+    .map_err(|err| {
+        LowerError::Invalid(format!(
+            "`on {}.{method}` hook has an invalid component path: {err}",
+            receiver.join(".")
+        ))
+    })?;
+    let schema = &prog.components[resolved.component.index()];
+    let Some(target_method) = schema.method(&method) else {
+        return Ok(None);
+    };
+    if !target_method.hookable {
+        return Ok(None);
+    }
+    if matches!(target_method.activation, ir::Activation::ActiveOnly)
+        && !matches!(
+            resolved.effective_mode,
+            Some(ir::ComponentInstanceMode::Active)
+        )
+    {
+        return Err(LowerError::Invalid(format!(
+            "active-only method hook `{}.{method}` is used through a passive component path",
+            receiver.join(".")
+        )));
+    }
+    let params = prog.function(target_method.function).params.clone();
+    Ok(Some(ResolvedTestMethodHook { params }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_test(
     t: &TestDecl,
@@ -3082,10 +3168,11 @@ fn lower_test(
     // that ordering by routing the pre-scope bare stmts to the front of
     // the run list and the post-scope ones to the tail of the check list.
     let mut n_bare_before_scope: usize = 0;
-    // Test-scope `on <obj>.<method> pre/post` method hooks, in source
-    // order. Resolved to a transactor field + method and lowered as
-    // `FunctionKind::TestHook` bodies once the test ctx is built.
-    let mut method_hook_asts: Vec<(HookSide, &crate::ast::OnHandler)> = Vec::new();
+    // Test-scope `on <obj>.<method> pre/post` method hooks, retained in
+    // `bare_stmts` so registration executes in exact test-item order. This
+    // separate list exists only for early target validation and captured-let
+    // promotion before the run/check functions are lowered.
+    let mut method_hook_asts: Vec<&crate::ast::OnHandler> = Vec::new();
     // Candidate `on regs.REG` per-register write callbacks (`on
     // <ident>.<name>`, no hook side / period), carried as whole
     // statements so a non-regblock candidate can fall back to the
@@ -3793,15 +3880,12 @@ fn lower_test(
             }
             TestItem::Stmt(s) => {
                 // Test-scope pre/post method hook (`on drv.send pre ...
-                // end on`): a hookable-method hook registration. Collected
-                // here and lowered as a `FunctionKind::TestHook` body after
-                // the test ctx is built (host-state promotion lets the
-                // function-per-CFG IR express v1's `[&]`-capturing hook
-                // closure — captured run-scope `let`s become `_tb` fields).
-                // Routing it out of `bare_stmts` also pre-empts the generic
-                // bare-statement/scope mixing error below.
+                // end on`): retain the statement in the executable item
+                // stream. The handler body still lowers out of line, but the
+                // subscription itself must remain between the surrounding
+                // calls exactly where v1 emits it.
                 if let StmtKind::On(h) = &s.kind {
-                    if let Some(side) = h.hook {
+                    if h.hook.is_some() {
                         if h.phase == OnPhase::PostEval {
                             // v1 refuses this by name ("`on
                             // <obj>.<method> phase post_eval` is not
@@ -3820,8 +3904,7 @@ fn lower_test(
                                 V1Status::Rejects,
                             ));
                         }
-                        method_hook_asts.push((side, h));
-                        continue;
+                        method_hook_asts.push(h);
                     }
                     // Candidate per-register `on regs.REG` write callback
                     // (`on <ident>.<name>`, no hook side / period): collect
@@ -4703,131 +4786,57 @@ fn lower_test(
     // Resolve each collected hook to its transactor field + method, then
     // promote the test-scope `let`s the hook bodies capture by reference
     // into `_tb` scalar host fields (host-state promotion). The hook
-    // bodies are lowered as `FunctionKind::TestHook` functions AFTER the
-    // ctx is built (below, alongside run/check) so they share the same
+    // bodies are lowered out of line while their subscription statements
+    // remain in the run/check flow, so they share the same
     // resolution (`_tb.<field>` host state, the firing transactor's
     // `_tb.drv.last_read` state, the method's by-value params). v1 emits
     // these as `<Type>_<method>_pre/_post` `[&]`-capturing closures; the
     // promotion is what lets the function-per-CFG IR express them.
     let transactor_field_map: HashMap<String, TransactorId> =
         transactor_fields.iter().cloned().collect();
-    // Resolved hooks: (transactor, method, side, &OnHandler).
-    let mut resolved_hooks: Vec<(TransactorId, String, HookSide, &crate::ast::OnHandler)> =
-        Vec::new();
     let mut promoted_lets: HashSet<String> = HashSet::new();
-    for (side, h) in &method_hook_asts {
-        let (xfield, method) = resolve_method_hook_target(&h.event).ok_or_else(|| {
-            // Two shapes miss, and v1 separates them the same way the
-            // statement-position arm in `stmts.rs` does.
-            //
-            //   * A DEEPER path (`on e.inner.note pre`, an env's
-            //     sub-component). The resolver here accepts only
-            //     `<field>.<method>` / `_tb.<field>.<method>`; v1 walks
-            //     the whole path and emits a working
-            //     `Watcher_note_pre.push_back`, so `--codegen v1` is a
-            //     real escape hatch.
-            //   * A trigger that is not a path at all — `on <bool-expr>
-            //     pre`, `on <N> cycles pre`, `on ev(x) pre`. v1 refuses
-            //     these outright; naming it would send the user to a
-            //     second error.
-            if is_v1_method_hook_shape(h) {
-                unsupported(
-                    "an `on <obj>.<method> pre/post` hook on a nested component path",
-                    "the hook target must resolve to a method on a DIRECT transactor \
-                     testbench field in this subset",
-                )
-            } else {
-                not_implemented(
+    for h in &method_hook_asts {
+        let Some(resolved) = resolve_test_method_hook(
+            prog,
+            &transactor_field_map,
+            &passive_transactor_fields,
+            &component_field_map,
+            &component_field_modes,
+            h,
+        )?
+        else {
+            if let Some(path) = strict_method_hook_path(&h.event) {
+                if path.len() == 2 && path.first().map(String::as_str) == Some("_tb") {
+                    return Err(LowerError::Invalid(format!(
+                        "`on {}` hook: a `pre`/`post` hook names a method to wrap \
+                         (`on <field>.<method> pre`), but this path names only a testbench \
+                         field",
+                        path[1]
+                    )));
+                }
+            }
+            if !is_v1_method_hook_shape(h) {
+                return Err(not_implemented(
                     "a `pre`/`post` hook on a non-method-path `on` handler at test scope",
                     "a hook side names a method to wrap; v1 routes every hooked `on` through \
                      its method-hook resolver and refuses a trigger that is not an \
                      `<obj>.<method>` path",
                     V1Status::Rejects,
-                )
+                ));
             }
-        })?;
-        // Not a transactor field. Two very different programs land here
-        // and v1 separates them exactly, so this must not answer with
-        // one verdict:
-        //
-        //   * `on w.note pre` where `w : Watcher` is an agent / env /
-        //     method-bearing scoreboard field declaring `hookable note`.
-        //     v1 emits a real `Watcher_note_pre.push_back` and the hook
-        //     fires. Calling that program Invalid accuses the user of a
-        //     bug that only TB-IR has; `--codegen v1` is a genuine
-        //     escape hatch, so say so.
-        //   * an undeclared field, the DUT handle, or a `function`
-        //     (non-`hookable`) method. v1 refuses these itself
-        //     ("obj.method must resolve to a `hookable` on a known
-        //     component type"), so they really are program errors and
-        //     `Invalid` is right.
-        //
-        // The gate below is v1's own condition, and it is checked in the
-        // recoverable direction: a miss in `component_field_map` falls
-        // back to `Invalid`, which is what the site said before, while a
-        // hit only ever downgrades a hard error to a suggestion.
-        let xid = transactor_field_map.get(&xfield).copied().ok_or_else(|| {
-            let v1_wires_it = component_field_map.get(&xfield).is_some_and(|cid| {
-                prog.components[cid.index()]
-                    .methods
-                    .iter()
-                    .any(|m| m.name == method && m.hookable)
-            });
-            if v1_wires_it {
-                unsupported(
-                    &format!(
-                        "an `on {xfield}.{method} pre/post` hook on a non-transactor \
-                         component field"
-                    ),
-                    "test-scope method hooks resolve only against a transactor testbench \
-                     field in this subset",
-                )
-            } else {
-                // `xfield` can be the desugarer's synthetic `_tb` root
-                // when the user wrote a bare `on <field> pre` with no
-                // method — quoting it back would name something they
-                // never typed, so that shape gets its own sentence.
-                //
-                // A source `_tb` is indistinguishable from the synthetic
-                // one here (both arrive as `_tb.<name>`), so the wording
-                // covers BOTH readings rather than asserting which one
-                // happened. A real transactor field named `_tb` never
-                // reaches this branch — it resolves in
-                // `transactor_field_map` above — and a real component
-                // field named `_tb` declaring the hookable is caught by
-                // `v1_wires_it`, so the only reachable source `_tb` is
-                // one v1 refuses too.
-                if xfield == "_tb" {
-                    LowerError::Invalid(format!(
-                        "`on {method}` hook: a `pre`/`post` hook names a method to wrap \
-                         (`on <field>.<method> pre`), and `{method}` does not resolve to a \
-                         `hookable` on a testbench field. (If you wrote `_tb.{method}` \
-                         literally, `_tb` is neither a transactor field nor a component \
-                         field declaring a `hookable` `{method}`.)"
-                    ))
-                } else {
-                    LowerError::Invalid(format!(
-                        "`on {xfield}.{method}` hook: `{xfield}` is not a transactor testbench \
-                         field, and no component field of that name declares a `hookable` \
-                         named `{method}`"
-                    ))
-                }
-            }
-        })?;
-        let xschema = prog.transactor(xid);
-        let Some(target_method) = xschema.method(&method) else {
+            let path = strict_method_hook_path(&h.event)
+                .map(|mut segments| {
+                    if segments.first().map(String::as_str) == Some("_tb") {
+                        segments.remove(0);
+                    }
+                    segments.join(".")
+                })
+                .unwrap_or_else(|| "<expression>".to_string());
             return Err(LowerError::Invalid(format!(
-                "`on {xfield}.{method}` hook: transactor `{}` declares no method `{method}`",
-                xschema.name
+                "`on {path}` hook path names no `hookable` method on a known transactor or \
+                 component testbench field"
             )));
         };
-        if !target_method.hookable {
-            return Err(LowerError::Invalid(format!(
-                "`on {xfield}.{method}` hook: `{xfield}.{method}` does not name a `hookable` \
-                 method on transactor `{}`",
-                xschema.name
-            )));
-        }
         // Promote a captured run-scope `let` read (bare, un-shadowed) in the
         // hook body. Scope-aware (issue #458, same class as #452): an inner
         // same-named `let` shadows only its own lexical scope — the read-site
@@ -4837,11 +4846,10 @@ fn lower_test(
         // method's param names (a test-let sharing a param name resolves to
         // the param, not the promoted cell).
         let mut hook_scope = HashSet::new();
-        for p in &prog.function(target_method.function).params {
+        for p in &resolved.params {
             hook_scope.insert(p.name.clone());
         }
         collect_promotable_check_reads(&h.body, &test_let_names, &hook_scope, &mut promoted_lets);
-        resolved_hooks.push((xid, method, *side, h));
     }
     // Resolve `on regs.REG` per-register write callbacks against the
     // regblock bindings. A candidate `on <ident>.<name>` whose `<ident>`
@@ -5120,16 +5128,16 @@ fn lower_test(
     // Reserve `FunctionId`s for the `on regs.REG` write callbacks so
     // `try_lower_record_write` (run during run/check/callback lowering)
     // can reference the matching callback that hasn't been lowered yet.
-    // Pushes after the ctx, in this order: samplers, run, check?, method
-    // hooks, then reg callbacks — so the callback base is fixed now.
+    // Pushes after the ctx, in this order: samplers, run, check?, then reg
+    // callbacks. Statement hook bodies are pending functions and therefore
+    // do not consume ids until the final side-table drain.
     let mut regblock_callbacks: HashMap<String, Vec<(String, FunctionId)>> = HashMap::new();
     {
         let n_check = if check_stmts.is_empty() { 0 } else { 1 };
         let cb_base = prog.functions.len()
             + cov_fields.len()
             + 1 // run
-            + n_check
-            + resolved_hooks.len();
+            + n_check;
         for (i, (binding, reg, _)) in resolved_reg_cbs.iter().enumerate() {
             regblock_callbacks
                 .entry(binding.clone())
@@ -5251,50 +5259,6 @@ fn lower_test(
         prog.functions.push(check_fn);
         Some(check_id)
     };
-
-    // Lower each `on <obj>.<method> pre/post` hook body as a
-    // `FunctionKind::TestHook` function sharing the method's parameter
-    // signature, then back-patch its FunctionId onto the target method's
-    // `pre_hooks`/`post_hooks` (fired at the `emit_method` call site).
-    for (xid, method, side, h) in &resolved_hooks {
-        // Snapshot the method's typed params (names + IR types) from its
-        // lowered body — the hook sees the same args by the same names.
-        let mparams: Vec<TypedParam> = {
-            let xschema = prog.transactor(*xid);
-            let m = xschema.method(method).expect("hook method resolved above");
-            prog.function(m.function).params.clone()
-        };
-        let hook_id = FunctionId(prog.functions.len() as u32);
-        let hook_fn = lower_method_hook_body(
-            hook_id,
-            format!(
-                "{}_{method}_{}",
-                prog.transactor(*xid).name,
-                match side {
-                    HookSide::Pre => "pre",
-                    HookSide::Post => "post",
-                }
-            ),
-            Some(tb_id),
-            &mparams,
-            &h.body,
-            &ctx,
-            helpers,
-            side_tables,
-        )?;
-        prog.functions.push(hook_fn);
-        // Back-patch onto the method schema.
-        let xschema = &mut prog.transactors[xid.index()];
-        let m = xschema
-            .methods
-            .iter_mut()
-            .find(|m| &m.name == method)
-            .expect("hook method resolved above");
-        match side {
-            HookSide::Pre => m.pre_hooks.push(hook_id),
-            HookSide::Post => m.post_hooks.push(hook_id),
-        }
-    }
 
     // Lower each `on regs.REG` per-register write callback as a
     // `FunctionKind::TestHook` function (single `data` param), then
@@ -5700,62 +5664,34 @@ pub(crate) fn reject_misplaced_named_args(
 /// made `on s.send cycles pre` disagree with v1 (and with the test-scope
 /// arm, which lowers it).
 pub(crate) fn is_v1_method_hook_shape(h: &crate::ast::OnHandler) -> bool {
-    /// `<ident>(.<ident>)*` with no parens, indexing or calls anywhere.
-    fn strict_path(e: &crate::ast::Expr) -> Option<Vec<&str>> {
-        match &*e.kind {
-            ExprKind::Ident(id) => Some(vec![id.name.as_str()]),
-            ExprKind::Field { target, name } => {
-                let mut p = strict_path(target)?;
-                p.push(name.name.as_str());
-                Some(p)
-            }
-            _ => None,
-        }
-    }
     if h.phase == OnPhase::PostEval {
         return false;
     }
-    let Some(p) = strict_path(&h.event) else {
+    let Some(p) = strict_method_hook_path(&h.event) else {
         return false;
     };
     // The impl-for desugarer rewrites a bare testbench field to
     // `_tb.<field>`, so a length test alone counts the synthetic root as
     // a real segment and lets `on w pre` — one identifier, no method —
     // through as if it were `<obj>.<method>`. v1 refuses that. Mirror
-    // `resolve_method_hook_target`'s two accepted forms exactly:
+    // The resolvers' two accepted direct forms exactly:
     // `<field>.<method>` and `_tb.<field>.<method>`.
-    let min = if p.first() == Some(&"_tb") { 3 } else { 2 };
+    let min = if p.first().map(String::as_str) == Some("_tb") {
+        3
+    } else {
+        2
+    };
     p.len() >= min
 }
 
-/// Resolve an `on <obj>.<method> pre/post` hook target expression to
-/// `(transactor-field, method)`. The impl-form desugarer has already
-/// rewritten the transactor testbench field to `_tb.<field>`, so the
-/// event is either `_tb.<field>.<method>` (impl form) or `<field>.<method>`
-/// (classic form). Returns `None` for any other shape.
-fn resolve_method_hook_target(event: &crate::ast::Expr) -> Option<(String, String)> {
-    let ExprKind::Field {
-        target,
-        name: method,
-    } = &*event.kind
-    else {
-        return None;
-    };
-    match &*target.kind {
-        // Classic form: `<field>.<method>`.
-        ExprKind::Ident(field) => Some((field.name.clone(), method.name.clone())),
-        // Impl form: `_tb.<field>.<method>`.
-        ExprKind::Field {
-            target: root,
-            name: field,
-        } => {
-            let ExprKind::Ident(root) = &*root.kind else {
-                return None;
-            };
-            if root.name != "_tb" {
-                return None;
-            }
-            Some((field.name.clone(), method.name.clone()))
+/// `<ident>(.<ident>)*` with no parens, indexing or calls anywhere.
+pub(crate) fn strict_method_hook_path(event: &crate::ast::Expr) -> Option<Vec<String>> {
+    match &*event.kind {
+        ExprKind::Ident(id) => Some(vec![id.name.clone()]),
+        ExprKind::Field { target, name } => {
+            let mut path = strict_method_hook_path(target)?;
+            path.push(name.name.clone());
+            Some(path)
         }
         _ => None,
     }
@@ -6724,11 +6660,12 @@ fn lower_function<'a>(
 /// desugared `_tb.<inst>.<field>` form, regblock bindings). Mirrors v1's
 /// `<Type>_<method>_pre/_post` `[&]`-capturing closure body.
 #[allow(clippy::too_many_arguments)]
-fn lower_method_hook_body<'a>(
+pub(crate) fn lower_method_hook_body<'a>(
     id: FunctionId,
     name: String,
     owner: Option<TestbenchId>,
     params: &[TypedParam],
+    capture_params: &[TypedParam],
     body: &Block,
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
@@ -6740,13 +6677,17 @@ fn lower_method_hook_body<'a>(
         let local = b.declare(&p.name);
         b.set_local_type(local, p.ty.clone());
     }
+    for p in capture_params {
+        let local = b.declare(&p.name);
+        b.set_local_type(local, p.ty.clone());
+    }
     declare_tb_record_fields(&mut b, ctx);
     b.lower_block_stmts(body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
     }
     let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
-    f.params = params.to_vec();
+    f.params = params.iter().chain(capture_params).cloned().collect();
     Ok(f)
 }
 
@@ -7137,6 +7078,36 @@ impl FuncBuilder<'_> {
         None
     }
 
+    /// Locals from the enclosing flow that a statement-position method-hook
+    /// body reads or writes. Method arguments and declarations inside the
+    /// handler shadow outer names; captures retain point-of-registration
+    /// lexical scope and are passed to the out-of-line handler by reference.
+    pub(crate) fn method_hook_captures(
+        &self,
+        method_params: &[TypedParam],
+        body: &Block,
+    ) -> Vec<(String, LocalId)> {
+        let mut visible = HashMap::<String, LocalId>::new();
+        for scope in self.scopes.iter().rev() {
+            for (name, local) in scope {
+                visible.entry(name.clone()).or_insert(*local);
+            }
+        }
+        let candidates: HashSet<String> = visible.keys().cloned().collect();
+        let method_scope: HashSet<String> = method_params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect();
+        let mut captured = HashSet::new();
+        collect_promotable_check_reads(body, &candidates, &method_scope, &mut captured);
+        let mut result: Vec<(String, LocalId)> = captured
+            .into_iter()
+            .filter_map(|name| visible.get(&name).copied().map(|local| (name, local)))
+            .collect();
+        result.sort_by_key(|(_, local)| local.0);
+        result
+    }
+
     /// Lookup for transaction/struct-typed testbench fields captured by
     /// `_tb.<method>` bodies. Ordinary `lookup` intentionally fences
     /// inlined helper bodies from caller locals; testbench record fields
@@ -7445,6 +7416,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // A test-scope event channel is a run-function local, not
                 // per-instance transactor state.
                 | ir::Stmt::EventSubscribe { .. }
+                | ir::Stmt::MethodHookSubscribe { .. }
                 | ir::Stmt::EventEmit { .. }
                 | ir::Stmt::ProbeRelease(_) => None,
             };
@@ -7648,6 +7620,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 | ir::Stmt::CoverCheck(_)
                 | ir::Stmt::CycleHandler(_)
                 | ir::Stmt::EventSubscribe { .. }
+                | ir::Stmt::MethodHookSubscribe { .. }
                 | ir::Stmt::EventEmit { .. }
                 | ir::Stmt::ProbeRelease(_) => {}
             }
@@ -7934,6 +7907,7 @@ fn fill_initiator_bus_prefix(
                     | Stmt::CoverCheck(_)
                     | Stmt::CycleHandler(_)
                     | Stmt::EventSubscribe { .. }
+                    | Stmt::MethodHookSubscribe { .. }
                     | Stmt::EventEmit { .. } => {}
                 }
             }

@@ -58,6 +58,10 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             let bump = i + 1               // 1, 2, 3 cycles of en
             total = total + bump
             sb.expected.push(total)
+            // Pure queue queries are also legal when their result is
+            // deliberately discarded (a host-side no-op in both backends).
+            sb.expected.size()
+            sb.expected.empty()
             sb.writes = sb.writes + 1
 
             dut.en = 1

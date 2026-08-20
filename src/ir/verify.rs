@@ -39,6 +39,7 @@
 //!   synthesis dropped its body.
 
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
@@ -480,8 +481,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         if let Some(handler) = &component.watchdog {
             check_component_function("watchdog", handler.function);
         }
-        if component.has_active_surface()
-            && !matches!(component.kind, ComponentKindTag::Transactor)
+        if component.has_active_surface() && !matches!(component.kind, ComponentKindTag::Transactor)
         {
             errs.push(VerifyError::BadProgramRef {
                 what: format!(
@@ -691,7 +691,8 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }),
             }
         }
-        if let Err(detail) = validate_component_binding_modes(&prog.components, &tb.component_fields)
+        if let Err(detail) =
+            validate_component_binding_modes(&prog.components, &tb.component_fields)
         {
             errs.push(VerifyError::BadProgramRef {
                 what: format!("tb{ti} has invalid component instance modes: {detail}"),
@@ -755,7 +756,8 @@ fn verify_testbench_connect(
         .ok_or_else(|| format!("source component c{} does not resolve", src_id.0))?;
     let payload = match src.field(&edge.src_event) {
         Some(ComponentFieldSchema {
-            kind: ComponentFieldKind::Event { payload }, activation,
+            kind: ComponentFieldKind::Event { payload },
+            activation,
             ..
         }) if *activation == edge.src_activation => *payload,
         _ => {
@@ -786,7 +788,9 @@ fn verify_testbench_connect(
                 return Err(format!("sink method `{method}` does not resolve"));
             };
             if m.activation != edge.sink_activation {
-                return Err(format!("sink method `{method}` has mismatched activation metadata"));
+                return Err(format!(
+                    "sink method `{method}` has mismatched activation metadata"
+                ));
             }
             if !m.hookable || m.param_names.len() != 1 || m.has_ret || m.param_tys.len() != 1 {
                 return Err(format!(
@@ -858,6 +862,203 @@ fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     }
 }
 
+fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> bool {
+    match (payload, ty) {
+        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
+    }
+}
+
+fn verify_event_payload_ref(prog: &TbProgram, payload: EventPayload) -> Result<(), String> {
+    if let EventPayload::Record(record) = payload {
+        if record.index() >= prog.records.len() {
+            return Err(format!("references missing record r{}", record.0));
+        }
+    }
+    Ok(())
+}
+
+fn verify_component_event_ref(
+    prog: &TbProgram,
+    func: &TbFunction,
+    base: &ComponentBase,
+    component: ComponentId,
+    event: &str,
+    payload: EventPayload,
+) -> Result<(), String> {
+    verify_event_payload_ref(prog, payload)?;
+    let ComponentBase::Path(path) = base else {
+        return Err("component event target must use a test-scope component path".to_string());
+    };
+    let (root, tail) = path
+        .split_first()
+        .ok_or_else(|| "component event target has an empty path".to_string())?;
+    let owner = func
+        .owner
+        .ok_or_else(|| "component event subscription has no owning testbench".to_string())?;
+    let tb = prog
+        .testbenches
+        .get(owner.index())
+        .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
+    let binding = tb
+        .component_fields
+        .iter()
+        .find(|binding| binding.field == *root)
+        .ok_or_else(|| format!("root `{root}` is not a testbench component field"))?;
+    let resolved =
+        resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
+            .map_err(|err| err.to_string())?;
+    if resolved.component != component {
+        return Err(format!(
+            "component path `{}` resolves to c{}, not stored c{}",
+            path.join("."),
+            resolved.component.0,
+            component.0
+        ));
+    }
+    let schema = prog
+        .components
+        .get(component.index())
+        .ok_or_else(|| format!("references missing component c{}", component.0))?;
+    match schema.field(event) {
+        Some(ComponentFieldSchema {
+            kind: ComponentFieldKind::Event {
+                payload: field_payload,
+            },
+            activation,
+            ..
+        }) if *field_payload == payload => {
+            if !component_mode_includes_activation(resolved.effective_mode, *activation) {
+                return Err(format!(
+                    "component event `{}.{event}` is disabled by its instance mode",
+                    path.join(".")
+                ));
+            }
+        }
+        Some(ComponentFieldSchema {
+            kind: ComponentFieldKind::Event { .. },
+            ..
+        }) => {
+            return Err(format!(
+                "component event `{}.{event}` has a mismatched payload",
+                path.join(".")
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "`{}.{event}` is not an event field",
+                path.join(".")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_method_hook_target(
+    prog: &TbProgram,
+    func: &TbFunction,
+    target: &MethodHookTarget,
+) -> Result<Vec<IrType>, String> {
+    let owner = func
+        .owner
+        .ok_or_else(|| "method-hook subscription has no owning testbench".to_string())?;
+    let tb = prog
+        .testbenches
+        .get(owner.index())
+        .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
+    match target {
+        MethodHookTarget::Transactor {
+            field,
+            transactor,
+            method,
+        } => {
+            let bound = tb
+                .transactor_fields
+                .iter()
+                .find(|(name, _)| name == field)
+                .ok_or_else(|| format!("`{field}` is not a testbench transactor field"))?;
+            if bound.1 != *transactor {
+                return Err(format!(
+                    "transactor field `{field}` resolves to x{}, not stored x{}",
+                    bound.1 .0, transactor.0
+                ));
+            }
+            let schema = prog
+                .transactors
+                .get(transactor.index())
+                .ok_or_else(|| format!("references missing transactor x{}", transactor.0))?;
+            let method = schema
+                .method(method)
+                .filter(|method| method.hookable)
+                .ok_or_else(|| {
+                    format!("`{field}.{method}` does not resolve to a hookable transactor method")
+                })?;
+            if method.active_only && tb.passive_transactor_fields.contains(field) {
+                return Err(format!(
+                    "active-only hookable `{field}.{}` is disabled on a passive instance",
+                    method.name
+                ));
+            }
+            Ok(method.param_tys.clone())
+        }
+        MethodHookTarget::Component {
+            base,
+            component,
+            method,
+        } => {
+            let ComponentBase::Path(path) = base else {
+                return Err("component method hook must use a test-scope path".to_string());
+            };
+            let (root, tail) = path
+                .split_first()
+                .ok_or_else(|| "component method hook has an empty path".to_string())?;
+            let binding = tb
+                .component_fields
+                .iter()
+                .find(|binding| binding.field == *root)
+                .ok_or_else(|| format!("root `{root}` is not a testbench component field"))?;
+            let resolved = resolve_component_path_mode(
+                &prog.components,
+                binding.component,
+                binding.mode,
+                tail,
+            )
+            .map_err(|err| err.to_string())?;
+            if resolved.component != *component {
+                return Err(format!(
+                    "component path `{}` resolves to c{}, not stored c{}",
+                    path.join("."),
+                    resolved.component.0,
+                    component.0
+                ));
+            }
+            let schema = prog
+                .components
+                .get(component.index())
+                .ok_or_else(|| format!("references missing component c{}", component.0))?;
+            let method = schema
+                .method(method)
+                .filter(|method| method.hookable)
+                .ok_or_else(|| {
+                    format!(
+                        "`{}.{method}` does not resolve to a hookable component method",
+                        path.join(".")
+                    )
+                })?;
+            if !component_mode_includes_activation(resolved.effective_mode, method.activation) {
+                return Err(format!(
+                    "component hookable `{}.{}` is disabled by its instance mode",
+                    path.join("."),
+                    method.name
+                ));
+            }
+            Ok(method.param_tys.clone())
+        }
+    }
+}
+
 pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
     let nblocks = func.blocks.len();
@@ -883,6 +1084,28 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                     succ: s,
                 });
             }
+        }
+    }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+
+    // Backend-critical return provenance: post method hooks and hooked
+    // covergroups fire only for the Return blocks listed here. A stale block
+    // id (or a non-Return block) would silently suppress or move fan-out.
+    let mut seen_implicit_returns = HashSet::new();
+    for block in &func.implicit_returns {
+        let valid = func
+            .blocks
+            .get(block.index())
+            .is_some_and(|basic| matches!(basic.terminator, Terminator::Return));
+        if !valid || !seen_implicit_returns.insert(*block) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} implicit return b{} must name one distinct Return block",
+                    fid.0, block.0
+                ),
+            });
         }
     }
     if !errs.is_empty() {
@@ -1119,28 +1342,103 @@ impl Checker<'_> {
                     }
                 }
                 // The handler body is its own function (verified in its
-                // own right); here only the link is checked — the id
-                // resolves and points at a zero-parameter `TestHook`,
-                // which is what the registration closure can call.
-                // The channel local must resolve and be event-typed, and
-                // a subscriber body must be a one-parameter `TestHook`
-                // whose parameter matches the channel's payload — emission
-                // pushes it into a `std::function<void(payload)>` vector.
+                // own right); here the id must resolve to a one-parameter
+                // `TestHook` whose parameter matches the event payload. Both
+                // local and component channels are re-resolved so a later IR
+                // pass cannot leave stale metadata for emission to trust.
                 Stmt::EventSubscribe { event, handler } => {
-                    self.check_local(*event);
-                    let payload = self.event_payload(*event);
-                    if payload.is_none() {
-                        self.errs.push(VerifyError::BadConcurrentCheck {
-                            func: self.fid,
-                            block: self.bid,
-                            detail: format!(
-                                "EventSubscribe target {} is not an event channel",
-                                event.0
-                            ),
-                        });
-                    }
+                    let payload = match event {
+                        crate::ir::EventChannelRef::Local(event) => {
+                            self.check_local(*event);
+                            match self.event_payload(*event) {
+                                Some(payload) => {
+                                    if let Err(detail) =
+                                        verify_event_payload_ref(self.prog, payload)
+                                    {
+                                        self.errs.push(VerifyError::BadConcurrentCheck {
+                                            func: self.fid,
+                                            block: self.bid,
+                                            detail: format!(
+                                                "EventSubscribe target {} {detail}",
+                                                event.0
+                                            ),
+                                        });
+                                    }
+                                    Some(payload)
+                                }
+                                None => {
+                                    self.errs.push(VerifyError::BadConcurrentCheck {
+                                        func: self.fid,
+                                        block: self.bid,
+                                        detail: format!(
+                                            "EventSubscribe target {} is not an event channel",
+                                            event.0
+                                        ),
+                                    });
+                                    None
+                                }
+                            }
+                        }
+                        crate::ir::EventChannelRef::Component {
+                            base,
+                            component,
+                            event,
+                            payload,
+                        } => {
+                            if let Err(detail) = verify_component_event_ref(
+                                self.prog,
+                                self.func,
+                                base,
+                                *component,
+                                event,
+                                *payload,
+                            ) {
+                                self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!("EventSubscribe component target: {detail}"),
+                                });
+                            }
+                            Some(*payload)
+                        }
+                    };
                     match self.prog.functions.get(handler.index()) {
-                        Some(f) if f.kind == FunctionKind::TestHook && f.params.len() == 1 => {}
+                        Some(f) if f.kind == FunctionKind::TestHook && f.params.len() == 1 => {
+                            if f.locals.first().map(|local| &local.ty)
+                                != f.params.first().map(|param| &param.ty)
+                            {
+                                self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "event subscriber fn{} parameter/local types disagree",
+                                        f.id.0
+                                    ),
+                                });
+                            }
+                            if let Some(payload) = payload {
+                                if !event_payload_handler_matches_type(payload, &f.params[0].ty) {
+                                    self.errs.push(VerifyError::BadConcurrentCheck {
+                                        func: self.fid,
+                                        block: self.bid,
+                                        detail: format!(
+                                            "event subscriber fn{} parameter {:?} does not match payload {:?}",
+                                            f.id.0, f.params[0].ty, payload
+                                        ),
+                                    });
+                                }
+                            }
+                            if f.owner != self.func.owner {
+                                self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "event subscriber fn{} belongs to {:?}, expected {:?}",
+                                        f.id.0, f.owner, self.func.owner
+                                    ),
+                                });
+                            }
+                        }
                         Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
                             func: self.fid,
                             block: self.bid,
@@ -1156,6 +1454,109 @@ impl Checker<'_> {
                             func: self.fid,
                             block: self.bid,
                             detail: format!("event subscriber references missing fn{}", handler.0),
+                        }),
+                    }
+                }
+                Stmt::MethodHookSubscribe {
+                    target,
+                    handler,
+                    captures,
+                    ..
+                } => {
+                    for capture in captures {
+                        self.check_local(*capture);
+                    }
+                    let expected = match verify_method_hook_target(self.prog, self.func, target) {
+                        Ok(params) => Some(params),
+                        Err(detail) => {
+                            self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!("MethodHookSubscribe target: {detail}"),
+                            });
+                            None
+                        }
+                    };
+                    match self.prog.functions.get(handler.index()) {
+                        Some(f) if f.kind == FunctionKind::TestHook => {
+                            let actual: Vec<IrType> =
+                                f.params.iter().map(|param| param.ty.clone()).collect();
+                            let locals: Vec<IrType> = f
+                                .locals
+                                .iter()
+                                .take(f.params.len())
+                                .map(|local| local.ty.clone())
+                                .collect();
+                            if locals != actual {
+                                self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "method-hook subscriber fn{} parameter/local types disagree",
+                                        f.id.0
+                                    ),
+                                });
+                            }
+                            if let Some(expected) = &expected {
+                                let method_count = expected.len();
+                                if actual.get(..method_count) != Some(expected.as_slice())
+                                    || actual.len() != method_count + captures.len()
+                                {
+                                    self.errs.push(VerifyError::BadConcurrentCheck {
+                                        func: self.fid,
+                                        block: self.bid,
+                                        detail: format!(
+                                            "method-hook subscriber fn{} parameters {:?} do not match target {:?}",
+                                            f.id.0, actual, expected
+                                        ),
+                                    });
+                                }
+                                for (capture, param_ty) in
+                                    captures.iter().zip(actual.iter().skip(method_count))
+                                {
+                                    if self
+                                        .func
+                                        .locals
+                                        .get(capture.index())
+                                        .is_some_and(|local| &local.ty != param_ty)
+                                    {
+                                        self.errs.push(VerifyError::BadConcurrentCheck {
+                                            func: self.fid,
+                                            block: self.bid,
+                                            detail: format!(
+                                                "method-hook capture %{} type does not match handler fn{} parameter {:?}",
+                                                capture.0, f.id.0, param_ty
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            if f.owner != self.func.owner {
+                                self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "method-hook subscriber fn{} belongs to {:?}, expected {:?}",
+                                        f.id.0, f.owner, self.func.owner
+                                    ),
+                                });
+                            }
+                        }
+                        Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "method-hook subscriber fn{} is {:?}, not a TestHook",
+                                f.id.0, f.kind
+                            ),
+                        }),
+                        None => self.errs.push(VerifyError::BadConcurrentCheck {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "method-hook subscription references missing fn{}",
+                                handler.0
+                            ),
                         }),
                     }
                 }
@@ -2281,6 +2682,17 @@ fn check_def_before_use(
                 // and reading it is not an expression, so there is
                 // nothing for `check_e` to walk. The payload args are.
                 Stmt::EventSubscribe { .. } => {}
+                Stmt::MethodHookSubscribe { captures, .. } => {
+                    for capture in captures {
+                        if capture.index() < nlocals && !bit_get(&defined, capture.index()) {
+                            errs.push(VerifyError::LocalUseBeforeDef {
+                                func: fid,
+                                block: bid,
+                                local: *capture,
+                            });
+                        }
+                    }
+                }
                 Stmt::EventEmit { args, .. } => {
                     for a in args {
                         check_e(a, &defined, errs);
