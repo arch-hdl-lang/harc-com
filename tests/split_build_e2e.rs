@@ -22,7 +22,7 @@
 //! duplicate-symbol or undefined-symbol link error on a real build.
 //!
 //! This file drives the real CLI end to end:
-//!   1. `--cpp-split tests` at the default group size (6 tests → 2 shards
+//!   1. `--cpp-split tests` at the default group size (8 tests → 2 shards
 //!      + dispatcher) must build, link, and dispatch every test by name.
 //!   2. `--cpp-split-group-size 1` (the per-test shard path, which the
 //!      default group size never exercises) must also build, link, and
@@ -37,13 +37,24 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Names of the tests emitted into the testbench below. Seven tests at
+/// Names of the tests emitted into the testbench below. Eight tests at
 /// the default group size of 4 yields two shards, so the default path
 /// genuinely links more than one shard TU. `T7VecRecord` carries a
 /// `Vec<Record, N>` struct field plus indexed element access — the
 /// issue-523 blocker shape whose mere presence in the suite used to
-/// abort whole-program TB-IR lowering and emit ZERO shards.
-const TEST_NAMES: [&str; 7] = ["T1", "T2", "T3", "T4", "T5", "T6", "T7VecRecord"];
+/// abort whole-program TB-IR lowering and emit ZERO shards. `T8WideQueue`
+/// adds direct `queue<uint<129>>` and non-word-aligned `queue<sint<65>>`
+/// state, so split emission has to retain the wide runtime types in a shard.
+const TEST_NAMES: [&str; 8] = [
+    "T1",
+    "T2",
+    "T3",
+    "T4",
+    "T5",
+    "T6",
+    "T7VecRecord",
+    "T8WideQueue",
+];
 
 fn harc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_harc"))
@@ -127,6 +138,16 @@ fn adder_tb() -> String {
          assert table.entries[0].tag == 5\n        \
          dut.a = 1\n        dut.b = 2\n        wait 1 cycle\n        \
          assert dut.sum == 3\n    end run\nend test T7VecRecord\n",
+    );
+    s.push_str(
+        "testbench SplitWideQueueTb\n    dut : SplitAdder\n    values : queue<uint<129>>\n    \
+         signed_values : queue<sint<65>>\nend testbench SplitWideQueueTb\n\n\
+         impl T8WideQueue for SplitWideQueueTb\n    run\n        let one : uint<129> = 1\n        \
+         values.push(one << 128)\n        let got = values.pop()\n        \
+         assert (got >> 128) == 1\n        let signed_value : sint<65> = 5 as sint<65>\n        \
+         signed_values.push(signed_value)\n        let signed_got = signed_values.pop()\n        \
+         assert signed_got == signed_value\n        dut.a = 1\n        dut.b = 2\n        wait 1 cycle\n        \
+         assert dut.sum == 3\n    end run\nend impl T8WideQueue\n",
     );
     s
 }
@@ -286,7 +307,7 @@ fn split_build_links_and_dispatches_e2e() {
 
     let mut outdirs = Vec::new();
     for codegen in ["v1", "tbir"] {
-        // 1. Default group size (4): 6 tests → 2 shards + dispatcher. This is
+        // 1. Default group size (4): 8 tests → 2 shards + dispatcher. This is
         //    the path that links more than one shard TU together.
         let out_default = fresh_outdir(&format!("{codegen}_default"));
         let (ok, log) = run_split_build(&out_default, &sv, &tb, codegen, None);
