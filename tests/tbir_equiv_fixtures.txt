@@ -161,6 +161,7 @@ tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_monitor_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_always_mixed_passive_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+target_wide_queue_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - | pass
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass

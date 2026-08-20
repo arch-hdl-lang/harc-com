@@ -1373,6 +1373,93 @@ fn resolve_testbench_component_path(
     Ok(cid)
 }
 
+/// Resolve a persistent transactor-state queue from either a shared
+/// transactor/responder body (by function id) or a test-scope instance name.
+/// This mirrors the backend's state-receiver resolution so verification can
+/// enforce the queue element type before emission indexes the same schema.
+fn resolve_transactor_state_queue_elem(
+    prog: &TbProgram,
+    func: &TbFunction,
+    instance: &str,
+    field: &str,
+) -> Result<QueueElem, String> {
+    let by_function = prog.transactors.iter().find(|transactor| {
+        transactor
+            .methods
+            .iter()
+            .any(|method| method.function == func.id)
+            || transactor
+                .target_methods
+                .iter()
+                .any(|method| method.function == func.id)
+    });
+
+    let transactor = if let Some(transactor) = by_function {
+        transactor
+    } else {
+        if instance.is_empty() {
+            return Err(format!(
+                "fn{} target-state queue `.{field}` has no owning transactor body",
+                func.id.0
+            ));
+        }
+        let owner = func
+            .owner
+            .ok_or_else(|| format!("target-state instance `{instance}` has no owning testbench"))?;
+        let tb = prog
+            .testbenches
+            .get(owner.index())
+            .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
+        let transactor = tb
+            .transactor_fields
+            .iter()
+            .find(|(name, _)| name == instance)
+            .map(|(_, transactor)| *transactor)
+            .or_else(|| {
+                tb.target_tlm_actors
+                    .iter()
+                    .find(|actor| actor.instance == instance)
+                    .map(|actor| actor.transactor)
+            })
+            .or_else(|| {
+                tb.unbound_state_actors
+                    .iter()
+                    .find(|(name, _)| name == instance)
+                    .map(|(_, transactor)| *transactor)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "target-state instance `{instance}` does not resolve on tb{}",
+                    owner.0
+                )
+            })?;
+        prog.transactors.get(transactor.index()).ok_or_else(|| {
+            format!(
+                "target-state instance `{instance}` references missing transactor x{}",
+                transactor.0
+            )
+        })?
+    };
+
+    transactor
+        .state_fields
+        .iter()
+        .find(|state| state.name == field)
+        .ok_or_else(|| {
+            format!(
+                "transactor `{}` has no state field `{field}`",
+                transactor.name
+            )
+        })
+        .and_then(|state| match &state.kind {
+            StateFieldKind::Queue { elem } => Ok(elem.clone()),
+            _ => Err(format!(
+                "transactor `{}` state field `{field}` is not a queue",
+                transactor.name
+            )),
+        })
+}
+
 fn resolve_component_queue_elem(
     prog: &TbProgram,
     func: &TbFunction,
@@ -1873,13 +1960,68 @@ impl Checker<'_> {
                 Stmt::TransactorStateRecordFieldWrite { value, .. } => {
                     self.check_expr(value, false, "TransactorStateRecordFieldWrite value");
                 }
-                Stmt::TransactorStateQueuePush { value, .. } => {
+                Stmt::TransactorStateQueuePush {
+                    instance,
+                    field,
+                    value,
+                } => {
                     // Target-state queue host state — the pushed value
                     // follows the no-inline-port rule like any Assign value.
                     self.check_expr(value, false, "TransactorStateQueuePush value");
+                    match resolve_transactor_state_queue_elem(
+                        self.prog,
+                        self.func,
+                        instance,
+                        field,
+                    ) {
+                        Ok(elem) => {
+                            if let Some(actual) = expr_type(self.func, value) {
+                                if !queue_elem_accepts_type(&elem, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pushes {:?} into target-state queue \
+                                             `{instance}.{field}` with element {:?}",
+                                            self.fid.0, self.bid.0, actual, elem
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Err(what) => self.errs.push(VerifyError::BadProgramRef { what }),
+                    }
                 }
-                Stmt::TransactorStateQueuePop { dest, .. } => {
+                Stmt::TransactorStateQueuePop {
+                    instance,
+                    field,
+                    dest,
+                } => {
                     self.check_local(*dest);
+                    match resolve_transactor_state_queue_elem(
+                        self.prog,
+                        self.func,
+                        instance,
+                        field,
+                    ) {
+                        Ok(elem) => {
+                            if let Some(local) = self.func.locals.get(dest.index()) {
+                                if !queue_elem_fits_dest(&elem, &local.ty) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pops target-state queue \
+                                             `{instance}.{field}` with element {:?} into local \
+                                             %{} declared {:?}",
+                                            self.fid.0,
+                                            self.bid.0,
+                                            elem,
+                                            dest.0,
+                                            local.ty
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Err(what) => self.errs.push(VerifyError::BadProgramRef { what }),
+                    }
                 }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
