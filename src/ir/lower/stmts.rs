@@ -825,7 +825,7 @@ impl FuncBuilder<'_> {
                     let elem = self.tb_queue_elem(&field)?;
                     self.check_pop_let_type(l, &elem, &format!("testbench queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
-                    self.type_tb_queue_pop_local(id, &elem, l.ty.as_ref());
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::TbQueuePop { field, dest: id });
                     return Ok(());
                 }
@@ -845,16 +845,7 @@ impl FuncBuilder<'_> {
                     let elem = self.component_queue_elem(&base, &queue)?;
                     self.check_pop_let_type(l, &elem, &format!("component queue `{queue}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                        }
-                    }
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::ComponentQueuePop {
                         base,
                         queue,
@@ -877,19 +868,7 @@ impl FuncBuilder<'_> {
                 let elem = self.scoreboard_queue_elem(sb, &queue)?;
                 self.check_pop_let_type(l, &elem, &format!("scoreboard queue `{queue}`"))?;
                 let id = self.declare(&l.name.name);
-                match elem {
-                    crate::ir::QueueElem::Record(rid) => {
-                        self.set_local_type(id, IrType::Record(rid));
-                    }
-                    crate::ir::QueueElem::Scalar { .. } => {
-                        if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                            self.let_widths.insert(id, w);
-                        }
-                        if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                            self.set_local_type(id, ty);
-                        }
-                    }
-                }
+                self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -1568,11 +1547,11 @@ impl FuncBuilder<'_> {
         )))
     }
 
-    /// Type a direct testbench queue-pop destination from the queue element
-    /// unless the source `let` supplied a scalar annotation. Record handling
-    /// is unchanged; scalar inference preserves the field's exact width and
-    /// signedness.
-    fn type_tb_queue_pop_local(
+    /// Type a direct testbench, scoreboard, or composite-component queue-pop
+    /// destination from the queue element unless the source `let` supplied a
+    /// scalar annotation. Record handling is unchanged; scalar inference
+    /// preserves the field's exact width and signedness.
+    fn type_queue_pop_local(
         &mut self,
         dest: crate::ir::LocalId,
         elem: &crate::ir::QueueElem,
@@ -2278,6 +2257,38 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
+                // `v = <component>.<queue>.pop()` into an existing scalar
+                // local. Record-result assignment remains outside the shipped
+                // component-queue surface; a fresh record-typed `let` is the
+                // existing supported spelling.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((base, queue, method)) = self.as_component_queue_call(callee)? {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("component queue `{queue}`"),
+                                args,
+                            )?;
+                            let elem = self.component_queue_elem(&base, &queue)?;
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and component queue \
+                                         `{queue}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::ComponentQueuePop {
+                                    base,
+                                    queue,
+                                    dest: local,
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 // NOTE: `x = bus.m(...)` (bus call into an existing
                 // local) is deliberately NOT lowered — v1 supports bus
                 // calls only in `let`-RHS and statement position, and
@@ -2285,6 +2296,7 @@ impl FuncBuilder<'_> {
                 // below rejects it with a precise message.
                 // `v = sb.q.pop()` — pop into an existing local.
                 if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
+                    let elem = self.scoreboard_queue_elem(sb, &queue)?;
                     // The mirror, first: a SCALAR local taking a
                     // RECORD element. v1 emits `x = _tb.sb.q.pop();`
                     // under a `uint64_t x` — "cannot convert 'Beat' to
@@ -2293,9 +2305,7 @@ impl FuncBuilder<'_> {
                     // rejected by `check_pop_let_type`; the assignment
                     // spelling was the unchecked lane.
                     if self.record_of_local(local).is_none() {
-                        if let crate::ir::QueueElem::Record(rid) =
-                            self.scoreboard_queue_elem(sb, &queue)?
-                        {
+                        if let crate::ir::QueueElem::Record(rid) = &elem {
                             return Err(LowerError::Invalid(format!(
                                 "local `{}` is a scalar and scoreboard queue `{queue}` \
                                  yields a `{}`",
@@ -2313,9 +2323,7 @@ impl FuncBuilder<'_> {
                         // type error, and v1's identical line then gets
                         // "no match for 'operator=', operand types are
                         // 'Beat' and 'long unsigned int'".
-                        if self.scoreboard_queue_elem(sb, &queue)?
-                            != crate::ir::QueueElem::Record(rid)
-                        {
+                        if elem != crate::ir::QueueElem::Record(rid) {
                             return Err(LowerError::Invalid(format!(
                                 "transaction local `{}` is a `{}`, and scoreboard queue \
                                  `{queue}` does not hold that record type",
@@ -2323,6 +2331,15 @@ impl FuncBuilder<'_> {
                                 self.ctx.records[rid.index()].name
                             )));
                         }
+                    }
+                    let expected = self.local_type(local).clone();
+                    let actual = elem.ir_type();
+                    if !component_method_result_compatible(&expected, &actual) {
+                        return Err(LowerError::Invalid(format!(
+                            "local `{}` is declared {:?} and scoreboard queue `{queue}` \
+                             yields {:?}",
+                            id.name, expected, actual
+                        )));
                     }
                     self.push(Stmt::ScoreboardOp {
                         sb,

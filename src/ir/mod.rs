@@ -1287,7 +1287,7 @@ pub enum ComponentFieldKind {
     /// component/transactor state.
     Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is a scalar ≤ 64 bits or a value-record (`elem`
+    /// FIFO whose element is an exact scalar or a value-record (`elem`
     /// selects the C element type). Manipulated through the component-queue
     /// ops (`Stmt::ComponentQueuePush`/`ComponentQueuePop`,
     /// `Expr::ComponentQueueSize`).

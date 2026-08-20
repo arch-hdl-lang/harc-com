@@ -1,5 +1,6 @@
 ---
 source: tests/tbir.rs
+assertion_line: 2103
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -12,7 +13,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     %1 i : unknown
     %2 bump : unknown
     %3 _anon : unknown
-    %4 want : unknown
+    %4 want : uint<32>
     %5 got : unknown
   entry = b0
 

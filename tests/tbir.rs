@@ -2984,6 +2984,255 @@ fn wide_queue_verifier_rejects_lossy_scalar_transfers() {
     );
 }
 
+/// A data-only scoreboard queue uses the same exact scalar descriptor as a
+/// direct testbench queue. This pins inferred, assigned, and discarded pop
+/// destinations plus verifier assignment direction at the owner-specific IR
+/// operation.
+#[test]
+fn scoreboard_queue_wide_scalar_behavior_is_exact() {
+    let src = fixture("scoreboard_component_wide_queue_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide scoreboard queue lowers");
+    verify::verify_program(&prog).expect("wide scoreboard queue verifies");
+
+    let scoreboard = prog
+        .scoreboards
+        .iter()
+        .find(|schema| schema.name == "WideDataScoreboard")
+        .expect("fixture has the data-only scoreboard");
+    assert!(matches!(
+        scoreboard.field("wide_values").map(|field| &field.kind),
+        Some(ir::ScoreboardFieldKind::Queue {
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(256))
+            }
+        })
+    ));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("sb_inferred", ir::IrType::UInt(Some(256))),
+        ("sb_assigned", ir::IrType::UInt(Some(256))),
+        ("sb_signed", ir::IrType::SInt(Some(8))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "scoreboard pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, dest },
+                ..
+            } if queue == "wide_values" && run.local(*dest).name.starts_with("__t") => {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded scoreboard pop");
+    assert_eq!(discarded.ty, ir::IrType::UInt(Some(256)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide scoreboard queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide scoreboard queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let run_id = bad_push.tests[0].run.index();
+    let value = bad_push.functions[run_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePush { queue, value },
+                ..
+            } if queue == "wide_values" => Some(value),
+            _ => None,
+        })
+        .expect("fixture has a scoreboard push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit scoreboard queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, dest },
+                ..
+            } if queue == "wide_values"
+                && bad_pop.functions[run_id].local(*dest).name == "sb_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an inferred scoreboard pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 256-bit scoreboard queue cannot pop into a 128-bit local"
+    );
+}
+
+/// A composite-component queue has the same exact scalar semantics as the
+/// scoreboard owner, including assignment into an existing local.
+#[test]
+fn component_queue_wide_scalar_behavior_is_exact() {
+    let src = r#"
+agent WideQueueComponent
+    wide_values   : queue<uint<256>>
+    signed_values : queue<sint<8>>
+end agent WideQueueComponent
+
+testbench WideComponentQueueTb
+    dut  : Top
+    comp : WideQueueComponent
+end testbench WideComponentQueueTb
+
+impl WideComponentQueueTest for WideComponentQueueTb
+    run
+        let one : uint<256> = 1
+        comp.wide_values.push(one << 210)
+        comp.wide_values.push(one << 211)
+        comp.wide_values.push(one << 212)
+        let comp_inferred = comp.wide_values.pop()
+        let comp_assigned : uint<256> = 0
+        comp_assigned = comp.wide_values.pop()
+        comp.wide_values.pop()
+        assert (comp_inferred >> 210) == 1
+        assert (comp_assigned >> 211) == 1
+        assert comp.wide_values.empty()
+
+        let negative : sint<8> = (0 - 1) as sint<8>
+        comp.signed_values.push(negative)
+        let comp_signed = comp.signed_values.pop()
+        assert comp_signed < 0
+    end run
+end impl WideComponentQueueTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("wide component queue lowers");
+    verify::verify_program(&prog).expect("wide component queue verifies");
+
+    let component = prog
+        .components
+        .iter()
+        .find(|schema| schema.name == "WideQueueComponent")
+        .expect("fixture has the composite component");
+    assert!(matches!(
+        component.field("wide_values").map(|field| &field.kind),
+        Some(ir::ComponentFieldKind::Queue {
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(256))
+            }
+        })
+    ));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("comp_inferred", ir::IrType::UInt(Some(256))),
+        ("comp_assigned", ir::IrType::UInt(Some(256))),
+        ("comp_signed", ir::IrType::SInt(Some(8))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "component pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. }
+                if queue == "wide_values" && run.local(*dest).name.starts_with("__t") =>
+            {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded component pop");
+    assert_eq!(discarded.ty, ir::IrType::UInt(Some(256)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide component queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide component queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let run_id = bad_push.tests[0].run.index();
+    let value = bad_push.functions[run_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePush { queue, value, .. } if queue == "wide_values" => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("fixture has a component push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit component queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. }
+                if queue == "wide_values"
+                    && bad_pop.functions[run_id].local(*dest).name == "comp_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an inferred component pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 256-bit component queue cannot pop into a 128-bit local"
+    );
+}
+
 /// A queue pop defines its destination for every successor block, just like
 /// scoreboard/component queue pops. This source puts the read after a branch
 /// so the verifier must propagate the definition through its dataflow `gens`.
