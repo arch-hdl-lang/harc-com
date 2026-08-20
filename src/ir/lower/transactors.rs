@@ -134,8 +134,29 @@ fn lower_unbound_item<'a>(
             // owners" and left this one, so the unbound form kept the
             // pre-split blanket `Unsupported` for `event<Color>` and
             // `event<T> default 0`, both of which v1 fails to compile.
+            // A DIRECTIONAL field goes to `lower_state_field`, which
+            // owns that rule, before any of the named-type branches
+            // below get a look. Deleting the old pre-check without this
+            // was a regression: `dut : in TlmReadInitiator` fell into
+            // the module-handle branch and LOWERED, tbir dropping the
+            // `in` marker itself — byte-identical output to the
+            // undirected spelling — where it had been refused.
+            if f.direction.is_some() {
+                return push_state(f);
+            }
             if let TypeExpr::Named { name, .. } = &f.ty {
                 let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                // KNOWN GAP, measured and deliberately not fixed here:
+                // `record_ids` also holds regblock MIRRORS, so
+                // `b : DmaRegs` is accepted as a value-record — tbir
+                // emits `DmaRegs b{};` and compiles, while v1 emits
+                // `VDmaRegs* b = nullptr;` and g++ refuses it (1 error).
+                // `queue<DmaRegs>` is the same hole: tbir gives
+                // `HarcQueue<DmaRegs>`, v1 `HarcQueue<uint64_t>`, both
+                // building. Gating it needs a regblock-name set that
+                // does not reach this function; the event allow-list
+                // above sidesteps the same map rather than trusting it.
+                //
                 // A whole value-record held as transactor state
                 // (`cur : Beat`), legal in BOTH declaration positions —
                 // v1 compiles one written inside `when active` exactly
@@ -1616,7 +1637,15 @@ fn lower_state_field(
             // promises v1 works for a shape where it silently does not.
             let payload_certified = match &f.ty {
                 TypeExpr::Builtin { args, .. } => match args.as_slice() {
-                    [] => false,
+                    // A bare `event` with no payload. Certified, and the
+                    // rule is not new: `lower_event_payload` already
+                    // says "a bare `event` with no payload defaults to
+                    // an unsigned scalar". v1 agrees — it emits the same
+                    // `void(uint64_t)` member the certified
+                    // `event<uint<8>>` produces, byte for byte. Answering
+                    // `false` here gave two spellings of one member
+                    // opposite verdicts.
+                    [] => true,
                     [crate::ast::TypeArg::Type(TypeExpr::Builtin { name, .. })] => matches!(
                         name,
                         crate::ast::BuiltinTy::UInt
@@ -1632,6 +1661,22 @@ fn lower_state_field(
                 },
                 _ => false,
             };
+            // Payload FIRST. A field that is both defaulted and
+            // uncertified is under both arms, and this one is graded a
+            // notch lower — checking the default first handed
+            // `event<string> default ev` the weaker
+            // `EmitsUncompilable` while v1 compiled it and flattened
+            // the payload.
+            if !payload_certified {
+                return Err(not_implemented(
+                    &format!("{who} `{tname}` event field `{fname}` with an uncertified payload"),
+                    "TB-IR lowers an event payload that is a single builtin scalar, or none \
+                     at all; for anything else v1 either flattens the payload to a 64-bit \
+                     integer without a word, or names a type it never declares"
+                        .to_string(),
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
             if f.default.is_some() {
                 return Err(not_implemented(
                     &format!("{who} `{tname}` event field `{fname}` with a default"),
@@ -1646,21 +1691,10 @@ fn lower_state_field(
                     V1Status::EmitsUncompilable,
                 ));
             }
-            if !payload_certified {
-                return Err(not_implemented(
-                    &format!("{who} `{tname}` event field `{fname}` with an uncertified payload"),
-                    "TB-IR lowers an event payload that is a single builtin scalar; for \
-                     anything else v1 either flattens the payload to a 64-bit integer \
-                     without a word, or names a type it never declares"
-                        .to_string(),
-                    V1Status::SilentlyMisLowers,
-                ));
-            }
             return Err(unsupported(
                 &format!("{who} `{tname}` directional event field `{fname}`"),
-                "event-driven transactors await the event slice; an `in event<T>` field \
-                 driving the bound bus needs an `on <ev>` handler, which is a follow-up \
-                 slice",
+                "event-driven transactors await the event slice; a directional `event<T>` \
+                 field needs an `on <ev>` handler to drive it, which is a follow-up slice",
             ));
         }
         // NOT "scalar": this is everything directional that is not an

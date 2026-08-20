@@ -9336,6 +9336,12 @@ end impl T
         "    ev : out event<uint<8>>",
         "    ev : out event<uint<128>>",
         "    ev : out event<bool>",
+        // A bare `event` is certified too. `lower_event_payload`
+        // already said so — "a bare `event` with no payload defaults to
+        // an unsigned scalar" — and v1 emits the SAME member it gives
+        // `event<uint<8>>`. Refusing it gave two spellings of one C++
+        // member opposite verdicts.
+        "    ev : out event",
     ] {
         let msg = assert_unsupported(&lower_src(&prog(ok)).unwrap_err());
         assert!(msg.contains("directional event field"), "`{ok}`: {msg}");
@@ -9352,6 +9358,20 @@ end impl T
     // not compile (5 g++ errors — v1 emits no C++ enum, so the name in
     // the subscriber signature is undeclared), and the rest are
     // silently FLATTENED to `void(uint64_t)` and compile.
+    // A field that is BOTH defaulted and uncertified is under two
+    // arms; the payload one is graded higher, so it must answer first.
+    // Checking the default first handed this the weaker
+    // `EmitsUncompilable` while v1 compiled it and flattened the
+    // payload to `void(uint64_t)`.
+    let both = "    ev2 : out event<string>\n    ev : out event<string> default ev2";
+    let err = lower_src(&prog(both)).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("uncertified payload"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&prog(both))).is_ok(),
+        "v1 emits it — which is why the weaker grade was wrong"
+    );
+
     for bad in [
         "    ev : out event<Color>",
         "    ev : out event<string>",
@@ -9526,6 +9546,34 @@ end impl T
     assert!(
         msg.contains("initiator-side bound-to transactor `AxilHelper` state field `v`"),
         "the initiator form names itself: {msg}"
+    );
+
+    // A DIRECTIONAL field on the initiator owner. There was none
+    // anywhere in the suite, so reinstating the pre-check that used to
+    // shadow the shared rule — the exact regression this series fixed —
+    // passed every test.
+    let msg = lower_with_stdlib_bus_src(
+        &initiator.replace("    v : Vec<uint<8>, 4>", "    p : in uint<8>"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        msg.contains(
+            "initiator-side bound-to transactor `AxilHelper` directional non-event field `p`"
+        ),
+        "the initiator owner reaches the shared directional rule: {msg}"
+    );
+
+    // …and one on the UNBOUND owner whose type is NAMED, which the
+    // named-type branches would otherwise swallow: `in TlmReadInitiator`
+    // lowered for one commit, tbir dropping the `in` itself.
+    let msg =
+        lower_src(&unbound.replace("    v : Vec<uint<8>, 4>", "    d2 : in TlmReadInitiator"))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        msg.contains("transactor `Poker` directional non-event field `d2`"),
+        "a directional module handle is still refused: {msg}"
     );
 
     // The bound-TARGET label, pinned on a row above that only checked

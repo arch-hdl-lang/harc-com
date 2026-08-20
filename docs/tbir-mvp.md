@@ -8351,8 +8351,11 @@ former `transaction` group lives in
      over a space the parser keeps extending.
 
      What can be certified at that site is a single positional BUILTIN
-     scalar payload with no `default`. That keeps `Unsupported`.
-     Everything else takes the arm's worst, `SilentlyMisLowers`.
+     scalar payload — or none at all — with no `default`. That keeps
+     `Unsupported`. An uncertified payload takes `SilentlyMisLowers`; a
+     `default` on an otherwise-certified payload takes
+     `EmitsUncompilable`, and the payload check has to answer FIRST,
+     since a field can be under both.
 
      `event<Beat>` is over-refused by this: v1 declares the record and
      emits `void(Beat)` correctly. It is refused because `record_ids`
@@ -8372,6 +8375,59 @@ former `transaction` group lives in
      Four rounds on five arms. The method that finally held was not a
      better enumeration — it was giving up on enumerating the bad cases
      and certifying the good ones instead.
+
+133. **Round five: what an allow-list fixed, and what it did not
+     (2026-08-20).**
+
+     The event allow-list from 132 held. A 40-row sweep over builtin ×
+     width × direction × owner × position found v1 correct on every
+     certified row — the one part of this series that is finished. What
+     did not hold was everything AROUND it, in the same three ways as
+     every previous round.
+
+     - **A regression.** Deleting 132's third pre-check let a
+       directional MODULE handle through: `dut : in TlmReadInitiator`
+       stopped being refused and lowered, with tbir dropping the `in`
+       marker itself — byte-identical output to the undirected
+       spelling. The delete removed a check that ran BEFORE the
+       named-type branches; those branches then answered first. A
+       directional field is dispatched to the shared rule explicitly
+       now.
+     - **The arm in FRONT of the fix was graded from a subset.** A
+       field that is both defaulted and uncertified is under two arms,
+       and the `default` one is graded a notch lower;
+       `event<string> default ev2` therefore claimed "v1 emits C++ that
+       does not compile" while v1 compiled it and flattened the payload.
+       The payload check answers first now. This is structurally the
+       same finding 130 made about the queue and record default arms —
+       third occurrence.
+     - **A rule the repo already stated, reconstructed wrong again.** A
+       bare `event` with no payload was refused as "uncertified", while
+       `lower_event_payload` says in as many words that it "defaults to
+       an unsigned scalar" and v1 emits the SAME member it gives
+       `event<uint<8>>`. Two spellings of one C++ member, opposite
+       verdicts. Fourth occurrence of this specific failure.
+
+     **Named and NOT fixed**, with the measurement recorded at the site:
+     `record_ids` holds regblock MIRRORS, so `b : DmaRegs` is accepted
+     as a value-record — tbir emits `DmaRegs b{};` and compiles, v1
+     emits `VDmaRegs* b = nullptr;` and g++ refuses. `queue<DmaRegs>`
+     is the same hole with both backends building different element
+     types. Gating it needs a regblock-name set that does not reach the
+     function. The event allow-list sidesteps that map rather than
+     trusting it; these two arms still trust it.
+
+     **Out of scope, also unfixed:** a FOURTH owner. A transactor
+     carrying an `on` handler routes through `lower_component_field`
+     (`components_impl.rs`), whose four directional arms still answer a
+     blanket `Unsupported` for landings where v1 drops the direction and
+     compiles — the defect this whole series was opened to remove,
+     three of them shipping an empty reason string.
+
+     The suite could not previously catch a reinstated pre-check: there
+     was no directional-field case on the initiator owner at all, so
+     re-adding the shadowing check passed every test. There is one on
+     each of the three owners now.
 
 ## Next steps
 
