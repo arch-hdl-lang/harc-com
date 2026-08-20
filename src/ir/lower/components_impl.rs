@@ -1439,10 +1439,12 @@ fn lower_field(
                 _ => None,
             }
             .filter(|n| *n != 0)
-            .ok_or_else(|| unsupported(
-                &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
-                "the length must be a nonzero decimal compile-time literal",
-            ))?;
+            .ok_or_else(|| {
+                unsupported(
+                    &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
+                    "the length must be a nonzero decimal compile-time literal",
+                )
+            })?;
             Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
         }
         // Scalar counter, or a nested sub-component (`source :
@@ -2174,13 +2176,15 @@ fn lower_method_body(
 }
 
 /// Resolve an env's `connect` block into `ConnectEdgeSchema`s. The env
-/// is `env_schema` (id `env_cid`); the test reaches it through the
+/// is `env_schema` (id `env_id`); the test reaches it through the
 /// test-field local. `components` is the program snapshot for resolving
-/// sink sub-component types. Paths are relative to the env field (the
-/// first segment is the env local; here we record the sub-component path
-/// from the env down, e.g. `["source"]`).
+/// sink component types. Paths are relative to the env field (the first
+/// segment is the env local; here we record the path from the env down,
+/// e.g. `["source"]`) — and the EMPTY path records the env's OWN port,
+/// which is why `env_id` is passed at all.
 pub(crate) fn resolve_connects(
     env: &ComponentDecl,
+    env_id: ComponentId,
     env_schema: &ComponentSchema,
     components: &[ComponentSchema],
 ) -> Result<Vec<ConnectEdgeSchema>, LowerError> {
@@ -2190,9 +2194,13 @@ pub(crate) fn resolve_connects(
             continue;
         };
         for e in &block.edges {
-            edges.push(resolve_one_connect(env, components, e, |path| {
-                resolve_sub_path(env_schema, components, path)
-            })?);
+            edges.push(resolve_one_connect(
+                env,
+                Some(env_id),
+                components,
+                e,
+                |path| resolve_sub_path(env_schema, components, path),
+            )?);
         }
     }
     Ok(edges)
@@ -2211,7 +2219,23 @@ pub(crate) fn resolve_testbench_connects(
             continue;
         };
         for e in &block.edges {
-            edges.push(resolve_one_connect(tb, components, e, |path| {
+            // `None`: a testbench is not itself a component in the
+            // table, so there is no id here for a single-segment
+            // endpoint to resolve against.
+            //
+            // That is a table artifact, NOT a v1 limitation, and saying
+            // "unmeasured" was doing the same work as saying
+            // "impossible". Measured: a testbench declaring
+            // `own_ev : out event<uint<8>>` with `own_ev -> direct.accept`
+            // makes v1 emit the vector into the testbench struct and
+            // wire it — `_tb.own_ev.push_back([&](auto _t) {
+            // TbSink_accept(_tb.direct, _t); });` — and it compiles.
+            // tbir never reaches this arm for it, refusing earlier on an
+            // unrelated pre-existing gap ("testbench field `own_ev` with
+            // a non-scalar, non-named type"), so `None` is currently
+            // unobservable rather than correct. Giving a testbench an id
+            // is the fix, and it belongs with that field gap, not here.
+            edges.push(resolve_one_connect(tb, None, components, e, |path| {
                 resolve_testbench_path(roots, components, path)
             })?);
         }
@@ -2219,8 +2243,27 @@ pub(crate) fn resolve_testbench_connects(
     Ok(edges)
 }
 
+/// How an endpoint reads back to the user. The path is relative to the
+/// owning scope, so an EMPTY one is the owner's own port — `own_ev`, not
+/// `.own_ev`, which is what naive `join(".")` produces once single-segment
+/// endpoints are allowed to reach these messages.
+///
+/// Public because the IR dump renders the same paths and had the same
+/// naive join. Adding this helper and then leaving one renderer to do it
+/// by hand is how `dump-ir` came to print `connect .own_ev -> sb.write_obs`
+/// — the exact string this exists to prevent, in the one place the first
+/// pass forgot to look.
+pub(crate) fn endpoint_label(path: &[String], leaf: &str) -> String {
+    if path.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{}.{leaf}", path.join("."))
+    }
+}
+
 fn resolve_one_connect<F>(
     owner: &ComponentDecl,
+    owner_id: Option<ComponentId>,
     components: &[ComponentSchema],
     edge: &ConnectEdge,
     resolve_path: F,
@@ -2253,19 +2296,46 @@ where
     })?;
     // The source path is `<subcomp>.<event>` (final segment is the event
     // port on the source sub-component).
-    if from.len() < 2 {
-        // NOT reclassified, and the reason is worth keeping: what v1
-        // does with a malformed `connect` edge depends on where the edge
-        // SITS, not on how it is malformed. In an INSTANTIATED env v1
-        // emits the path verbatim and the result usually does not
-        // compile — but a single-segment endpoint resolves against the
-        // owner's own hookable / `out event` and works
-        // (`E_take(_tb.top, _t)`), and an UNINSTANTIATED env emits no
-        // wiring at all, so every malformed edge in one is invisible and
-        // v1 simply succeeds. tbir resolves `connect` for every env in
-        // the merged file, so it sees edges v1 never reaches. One site,
-        // three outcomes — the `--codegen v1` suggestion stays, because
-        // it is true somewhere.
+    // A SINGLE-segment endpoint names the owner's own port rather than a
+    // sub-component's, and that is a v1 feature this arm used to refuse
+    // along with the malformed edges. The note that lived here said as
+    // much in passing — "a single-segment endpoint resolves against the
+    // owner's own hookable / `out event` and works" — and it is exact:
+    // v1 emits, for `own_ev -> sb.write_obs` on an env declaring
+    // `own_ev : out event<uint<8>>`,
+    //
+    //     env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });
+    //
+    // and for the sink direction `source.observed -> own_sink`,
+    //
+    //     env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });
+    //
+    // Both compile and both are genuinely WIRED, not dropped. So this is
+    // an implementable gap, not a malformation, and lumping the two
+    // under one verdict is what made "one site, three outcomes" true.
+    //
+    // Nothing downstream needed changing: `src_path`/`sink_path` are
+    // relative to the owning scope, so the EMPTY path already means "the
+    // owner", `resolve_component_path_mode` returns the owner untouched
+    // for it, and the emitter chains it onto the instance prefix to
+    // produce exactly v1's line.
+    //
+    // What stays rejected is an endpoint with no segments at all, which
+    // names nothing in any scope. The placement rule the old note
+    // records still governs THAT case and the other malformed shapes:
+    // in an instantiated env v1 emits the path verbatim and g++ refuses;
+    // in an uninstantiated one v1 emits no wiring and succeeds, so the
+    // same edge is invisible there. Measured across six malformations ×
+    // both placements — uniform, and the reason the `--codegen v1`
+    // suggestion stays: it is true somewhere.
+    // `from.is_empty()` is UNREACHABLE — `dotted_path` returns `Some`
+    // only with at least one segment — and is kept because the split
+    // below computes `from.len() - 1`, which underflows on an empty
+    // slice. It guards an arithmetic edge, not a user-facing case, which
+    // is why no test pins it (confirmed by mutation: deleting it fails
+    // nothing) and why deleting it would be trading a diagnostic for a
+    // panic.
+    if from.is_empty() || (from.len() < 2 && owner_id.is_none()) {
         return Err(unsupported(
             &format!(
                 "a `connect` source `{}` without an event field",
@@ -2278,7 +2348,10 @@ where
     let src_event = src_event[0].clone();
     // The sink path is `<subcomp>.<method>` (final segment is the
     // hookable method on the sink sub-component).
-    if to.len() < 2 {
+    // Same rule at the sink: `-> own_sink` names the owner's own
+    // hookable, which v1 wires (see the source note above).
+    // Same underflow guard as the source side above.
+    if to.is_empty() || (to.len() < 2 && owner_id.is_none()) {
         return Err(unsupported(
             &format!("a `connect` sink `{}` without a method", to.join(".")),
             "",
@@ -2288,7 +2361,10 @@ where
     let sink_name = sink_name[0].clone();
 
     // Resolve the source sub-component and verify it exposes `src_event`.
-    let src_cid = resolve_path(src_path)?;
+    let src_cid = match (src_path.is_empty(), owner_id) {
+        (true, Some(id)) => id,
+        _ => resolve_path(src_path)?,
+    };
     let src_comp = &components[src_cid.index()];
     let (src_payload, src_activation) = match src_comp.field(&src_event) {
         Some(ComponentFieldSchema {
@@ -2299,8 +2375,8 @@ where
         _ => {
             return Err(unsupported(
                 &format!(
-                    "a `connect` source `{}.{src_event}` that is not an `out event` port",
-                    src_path.join(".")
+                    "a `connect` source `{}` that is not an `out event` port",
+                    endpoint_label(src_path, &src_event)
                 ),
                 "",
             ));
@@ -2310,7 +2386,10 @@ where
     // Resolve the sink sub-component. The final segment is either a
     // hookable sink method (`sb.write_obs`) or an `in event<T>` field on
     // an event-driven transactor (`drv.req`); pick the matching sink shape.
-    let sink_cid = resolve_path(sink_path)?;
+    let sink_cid = match (sink_path.is_empty(), owner_id) {
+        (true, Some(id)) => id,
+        _ => resolve_path(sink_path)?,
+    };
     let sink_comp = &components[sink_cid.index()];
     // The SEMANTIC sink checks below. Measured on an INSTANTIATED env,
     // which is the only place v1 looks at the edge at all:
@@ -2361,8 +2440,8 @@ where
         if !sm.hookable {
             return Err(not_implemented(
                 &format!(
-                    "a `connect` sink method `{}.{sink_name}` that is not `hookable`",
-                    sink_path.join(".")
+                    "a `connect` sink method `{}` that is not `hookable`",
+                    endpoint_label(sink_path, &sink_name)
                 ),
                 "analysis sinks must be declared `hookable`; v1 emits a fan-out over the \
                  method name as if it were an event vector, which is not a member of the \
@@ -2384,8 +2463,8 @@ where
         if sm.has_ret {
             return Err(not_implemented(
                 &format!(
-                    "a `connect` sink method `{}.{sink_name}` that returns a value",
-                    sink_path.join(".")
+                    "a `connect` sink method `{}` that returns a value",
+                    endpoint_label(sink_path, &sink_name)
                 ),
                 "analysis sinks must not return a value; v1 refuses it too, with \"must \
                  return void\"",
@@ -2394,10 +2473,8 @@ where
         }
         if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
             return Err(connect_payload_mismatch(
-                &src_path.join("."),
-                &src_event,
-                &sink_path.join("."),
-                &sink_name,
+                &endpoint_label(src_path, &src_event),
+                &endpoint_label(sink_path, &sink_name),
                 both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
@@ -2413,10 +2490,8 @@ where
     {
         if *payload != src_payload {
             return Err(connect_payload_mismatch(
-                &src_path.join("."),
-                &src_event,
-                &sink_path.join("."),
-                &sink_name,
+                &endpoint_label(src_path, &src_event),
+                &endpoint_label(sink_path, &sink_name),
                 both_scalar_payloads(src_payload, *payload),
             ));
         }
@@ -2425,11 +2500,31 @@ where
             *activation,
         )
     } else {
+        // Owner-relative names land here too, on the SAME verdict as the
+        // sub-component ones. A first pass carved them out to
+        // `Unsupported`, reasoning that `EmitsUncompilable` "would be
+        // false half the time" because an uninstantiated env compiles.
+        // True — and true of every shape this arm already covered, which
+        // is why it justifies nothing. Measured across the family, all
+        // four are identical (instantiated; every one compiles when the
+        // env is not instantiated):
+        //
+        //   `-> source`      owner-rel, names a sub-component field  g++ refuses
+        //   `-> own_scalar`  owner-rel, names a scalar               g++ refuses
+        //   `-> own_fn`      owner-rel, non-`hookable` method        g++ refuses
+        //   `-> sb.count`    sub-component, names a scalar           g++ refuses
+        //
+        // The carve-out also split the family in the wrong place:
+        // `own_fn` is owner-relative and was never in it. Whether this
+        // arm should be `EmitsUncompilable` or fall under `connect`'s
+        // placement rule is a question about all four together, decided
+        // where the arm is, not one to answer differently for two of
+        // them.
         return Err(not_implemented(
             &format!(
-                "a `connect` sink `{}.{sink_name}` that is neither a `hookable` sink \
+                "a `connect` sink `{}` that is neither a `hookable` sink \
                  method nor an `event` field",
-                sink_path.join(".")
+                endpoint_label(sink_path, &sink_name)
             ),
             "v1 emits a fan-out over the name as if it were an event vector; on a scalar \
              field that does not compile",
@@ -2495,17 +2590,11 @@ fn resolve_testbench_path(
 ///
 /// `scalars` is the caller's answer to "are both sides scalars?", which
 /// is the exact discriminator rather than a proxy for it.
-fn connect_payload_mismatch(
-    src_path: &str,
-    src_event: &str,
-    sink_path: &str,
-    sink_name: &str,
-    scalars: bool,
-) -> LowerError {
-    let construct = format!(
-        "a `connect` payload mismatch from `{src_path}.{src_event}` to \
-         `{sink_path}.{sink_name}`"
-    );
+fn connect_payload_mismatch(src: &str, sink: &str, scalars: bool) -> LowerError {
+    // Both arguments are already full endpoint labels (`endpoint_label`),
+    // not path-plus-leaf: an owner-relative endpoint has an EMPTY path,
+    // and re-appending the leaf here would render it `.own_ev`.
+    let construct = format!("a `connect` payload mismatch from `{src}` to `{sink}`");
     if scalars {
         unsupported(
             &construct,
@@ -2899,6 +2988,34 @@ pub(crate) fn fold_field_default(
 
 use crate::ast::{CallArg, Expr as AstExpr};
 use crate::ir::{ComponentBase, Expr as IrExpr, Stmt as IrStmt};
+
+/// A resolved component field WRITE target. Same four parts as
+/// `ComponentRecordField`, carried through so the assignment site can
+/// decide what a whole-`Vec` leaf means instead of the resolver
+/// deciding for it.
+pub(crate) struct ComponentFieldTarget {
+    pub base: ComponentBase,
+    pub field: String,
+    pub leaf_vec: Option<(usize, IrType)>,
+    pub dotted: String,
+}
+
+/// A resolved component record-field access: the emission base, the
+/// validated C++ member suffix (`current.value`), the full dotted path
+/// as written, and — when the leaf field is a `Vec<T, N>` — its `(N, T)`
+/// shape. The shape is REPORTED, not judged: read and write disagree
+/// about whether a whole-`Vec` leaf is admissible, so each caller
+/// decides.
+pub(crate) struct ComponentRecordField {
+    pub base: ComponentBase,
+    pub field: String,
+    pub leaf_vec: Option<(usize, IrType)>,
+    /// The full dotted path as the user wrote it (`env.source.current.data`).
+    /// `field` is only the suffix after the emission base, which is what
+    /// codegen renders — naming that in a diagnostic told the user about
+    /// `current.data` when they had written the longer path.
+    pub dotted: String,
+}
 
 impl super::FuncBuilder<'_> {
     /// Normalize a component-access dotted path to the form the component
@@ -3457,10 +3574,10 @@ impl super::FuncBuilder<'_> {
     /// component member access stores the validated C++ member suffix as
     /// one string (`current.value`); emission already renders it after the
     /// resolved component base.
-    fn as_component_record_field(
+    pub(crate) fn as_component_record_field(
         &self,
         e: &AstExpr,
-    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+    ) -> Result<Option<ComponentRecordField>, LowerError> {
         let Some(path) = dotted_path(e) else {
             return Ok(None);
         };
@@ -3469,7 +3586,15 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
 
-        let validate = |record: RecordId, sub: &[String]| -> Result<(), LowerError> {
+        // Returns the leaf's `Vec` shape when the leaf IS one. The
+        // verdict on a whole-`Vec` leaf belongs to the caller, not here:
+        // this resolver serves both the read and the write path, and
+        // `==`/`!=` may read one (see `vec_read_ok`) while a write may
+        // not. Erroring here also hid the shape from the equality
+        // pairing check, which has to see it to permit anything.
+        let validate = |record: RecordId,
+                        sub: &[String]|
+         -> Result<Option<(usize, IrType)>, LowerError> {
             let mut rid = record;
             for (i, seg) in sub.iter().enumerate() {
                 let schema = &self.ctx.records[rid.index()];
@@ -3482,25 +3607,46 @@ impl super::FuncBuilder<'_> {
                 if i + 1 < sub.len() {
                     match field.ty {
                         IrType::Record(next) if field.vec_len.is_none() => rid = next,
-                        _ => {
-                            return Err(unsupported(
+                        // The same two mid-segment shapes the record-LOCAL
+                        // walk separates (`try_record_field_chain`), split
+                        // here the same way and worded the same way, so a
+                        // reader who has seen one diagnostic recognises the
+                        // other. Both measured on a component method: v1
+                        // emits `self.a.kids.p` / `self.a.n.p` and g++
+                        // refuses each ("'std::array<Kid, 4>' has no member
+                        // named 'p'"; "request for member 'p' in
+                        // '...', which is of non-class type 'uint64_t'"),
+                        // so the `--codegen v1` escape this used to promise
+                        // was not one.
+                        IrType::Record(_) if field.vec_len.is_some() => {
+                            return Err(not_implemented(
                                 &format!(
-                                    "field `{}.{seg}` is not a nested record; cannot access `.{}`",
+                                    "traversing the `Vec` record field `{}.{seg}` without an element index; cannot access `.{}`",
                                     schema.name,
                                     sub[i + 1]
                                 ),
-                                "only nested struct/transaction fields can be traversed further",
+                                format!("select one element first (`{seg}[i].{}`)", sub[i + 1]),
+                                V1Status::EmitsUncompilable,
+                            ));
+                        }
+                        _ => {
+                            return Err(not_implemented(
+                                &format!(
+                                    "field access `.{}` on `{}.{seg}`, which is not a nested record",
+                                    sub[i + 1],
+                                    schema.name
+                                ),
+                                "only nested struct/transaction fields can be traversed further"
+                                    .to_string(),
+                                V1Status::EmitsUncompilable,
                             ));
                         }
                     }
-                } else if field.vec_len.is_some() {
-                    return Err(unsupported(
-                        &format!("a whole-`Vec` component record field `{}`", path.join(".")),
-                        "indexed component-record `Vec` access is not lowered by TB-IR yet",
-                    ));
+                } else if let Some(n) = field.vec_len {
+                    return Ok(Some((n, field.ty.clone())));
                 }
             }
-            Ok(())
+            Ok(None)
         };
 
         // Method-body form: `current.value`, where `current` is a field
@@ -3511,8 +3657,13 @@ impl super::FuncBuilder<'_> {
                 if let Some(schema) = comp.field(&path[0]) {
                     if let ComponentFieldKind::Record { record } = schema.kind {
                         self.require_self_activation(schema.activation, "field", &path[0])?;
-                        validate(record, &path[1..])?;
-                        return Ok(Some((ComponentBase::SelfField, path.join("."))));
+                        let leaf_vec = validate(record, &path[1..])?;
+                        return Ok(Some(ComponentRecordField {
+                            base: ComponentBase::SelfField,
+                            field: path.join("."),
+                            leaf_vec,
+                            dotted: path.join("."),
+                        }));
                     }
                 }
             }
@@ -3548,12 +3699,14 @@ impl super::FuncBuilder<'_> {
                 "field",
                 &tail[recv_len],
             )?;
-            validate(record, sub)?;
+            let leaf_vec = validate(record, sub)?;
             base.extend_from_slice(&tail[..recv_len]);
-            return Ok(Some((
-                ComponentBase::Path(base),
-                tail[recv_len..].join("."),
-            )));
+            return Ok(Some(ComponentRecordField {
+                base: ComponentBase::Path(base),
+                field: tail[recv_len..].join("."),
+                leaf_vec,
+                dotted: path.join("."),
+            }));
         }
         Ok(None)
     }
@@ -3561,9 +3714,14 @@ impl super::FuncBuilder<'_> {
     pub(crate) fn as_component_field_target(
         &self,
         target: &AstExpr,
-    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
-        if let Some(record_field) = self.as_component_record_field(target)? {
-            return Ok(Some(record_field));
+    ) -> Result<Option<ComponentFieldTarget>, LowerError> {
+        if let Some(rf) = self.as_component_record_field(target)? {
+            return Ok(Some(ComponentFieldTarget {
+                base: rf.base,
+                field: rf.field,
+                leaf_vec: rf.leaf_vec,
+                dotted: rf.dotted,
+            }));
         }
         // Self-relative bare field (only inside a method body, and only
         // when the name is NOT a shadowing local).
@@ -3584,7 +3742,12 @@ impl super::FuncBuilder<'_> {
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
                         ) {
                             self.require_self_activation(field.activation, "field", &id.name)?;
-                            return Ok(Some((ComponentBase::SelfField, id.name.clone())));
+                            return Ok(Some(ComponentFieldTarget {
+                                base: ComponentBase::SelfField,
+                                field: id.name.clone(),
+                                leaf_vec: None,
+                                dotted: id.name.clone(),
+                            }));
                         }
                     }
                 }
@@ -3637,7 +3800,12 @@ impl super::FuncBuilder<'_> {
                             )?;
                             let mut base = base_head;
                             base.extend_from_slice(recv_tail);
-                            return Ok(Some((ComponentBase::Path(base), field)));
+                            return Ok(Some(ComponentFieldTarget {
+                                base: ComponentBase::Path(base),
+                                field: field.clone(),
+                                leaf_vec: None,
+                                dotted: path.join("."),
+                            }));
                         }
                         // A whole sub-component copy is resolved after field
                         // writes. Decline here so `checker.sb = sb` reaches
@@ -3668,8 +3836,29 @@ impl super::FuncBuilder<'_> {
         &self,
         e: &AstExpr,
     ) -> Result<Option<IrExpr>, LowerError> {
-        if let Some((base, field)) = self.as_component_record_field(e)? {
-            return Ok(Some(IrExpr::ComponentField { base, field }));
+        if let Some(rf) = self.as_component_record_field(e)? {
+            // A whole-`Vec` leaf read is admissible in exactly one
+            // landing — `==`/`!=` against another `Vec` of the same
+            // shape, which both backends emit and g++ accepts
+            // (`self.a.data == self.b.data`). See `vec_read_ok`; the
+            // pairing check is what sets it.
+            if rf.leaf_vec.is_some() && !self.vec_read_ok {
+                // Measured on the landings that still reach here:
+                // `let d = a.data` gives "cannot convert
+                // `std::array<…,4>` to `int64_t` in initialization" from
+                // v1's own output, and `${a.data}` an invalid
+                // `static_cast`. No backend compiles either, so there is
+                // nothing to send the user to.
+                return Err(not_implemented(
+                    &format!("a whole-`Vec` component record field `{}`", rf.dotted),
+                    format!("index the field element-wise (`{}[i]`)", rf.dotted),
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            return Ok(Some(IrExpr::ComponentField {
+                base: rf.base,
+                field: rf.field,
+            }));
         }
         if let ExprKind::Ident(id) = &*e.kind {
             if self.lookup(&id.name).is_none() {
@@ -3758,8 +3947,7 @@ impl super::FuncBuilder<'_> {
         if let Some(path) = dotted_path(e) {
             let path = self.strip_tb_prefix(&path);
             if path.len() >= 2 {
-                if let Some((head_cid, mut base, tail, head_mode)) =
-                    self.component_path_head(&path)
+                if let Some((head_cid, mut base, tail, head_mode)) = self.component_path_head(&path)
                 {
                     let (recv_tail, last) = tail.split_at(tail.len() - 1);
                     if !self.recv_is_scoreboard_sub(head_cid, recv_tail) {
@@ -3769,11 +3957,20 @@ impl super::FuncBuilder<'_> {
                         if let Some(schema) = self.ctx.components[cid.index()].field(&last[0]) {
                             if let ComponentFieldKind::FixedVec(vec) = &schema.kind {
                                 self.require_component_activation(
-                                    &path[0], head_cid, head_mode, recv_tail,
-                                    schema.activation, "field", &last[0],
+                                    &path[0],
+                                    head_cid,
+                                    head_mode,
+                                    recv_tail,
+                                    schema.activation,
+                                    "field",
+                                    &last[0],
                                 )?;
                                 base.extend_from_slice(recv_tail);
-                                return Ok(Some((ComponentBase::Path(base), last[0].clone(), vec.clone())));
+                                return Ok(Some((
+                                    ComponentBase::Path(base),
+                                    last[0].clone(),
+                                    vec.clone(),
+                                )));
                             }
                         }
                     }
@@ -4491,34 +4688,34 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         if args.len() != 1 {
-            return Err(unsupported(
+            // v1 raises its OWN error here — "`_tb.p.idle`: expected 1
+            // cycle-count arg, got 0" — so `--codegen v1` is not an
+            // escape hatch, it is the same refusal with a different
+            // message. Measured at 0 and 2 arguments.
+            return Err(not_implemented(
                 &format!("`{}(...)` with {} arguments", name.name, args.len()),
-                "idle predicates take exactly one cycle-count argument",
+                "idle predicates take exactly one cycle-count argument".to_string(),
+                V1Status::Rejects,
             ));
         }
-        let CallArg::Expr(n_expr) = &args[0] else {
-            // Stays `Unsupported`, unlike the general component-method
-            // arm above. The arity check three lines up has already
-            // established exactly one argument, so v1's name-dropping
-            // positional binding lands the value in the only slot there
-            // is and emits code identical to the positional form. No
-            // reordering hazard exists here.
-            // Deliberately NOT name-checked, unlike `record_read`, which
-            // was given a hand-written `["addr"]` so that an unknown
-            // name becomes `Invalid`. The difference is whether there
-            // is a name to check AGAINST: the compiler's own arity
-            // message here says "exactly one cycle-count argument" and
-            // the docs write `idle(N)`, where `N` is a value
-            // placeholder — no parameter name is stated anywhere.
-            // `record_read`'s `addr` came from the compiler's own
-            // diagnostic AND the docs. Inventing one here is the
-            // `record_write` mistake, so this stays as `bitbash` does.
-            return Err(unsupported(
-                &format!("a named argument to `{}`", name.name),
-                "v1 ignores the name and binds by position; with one parameter that is \
-                 the same thing, so it emits the predicate correctly",
-            ));
-        };
+        // A named argument binds by position, because there is only one
+        // position. This used to be refused, on a note that reasoned the
+        // case through correctly and then stopped short: the arity check
+        // three lines up has already established exactly one argument,
+        // so v1's name-dropping positional binding lands the value in
+        // the only slot there is and emits code identical to the
+        // positional form. That is a description of a feature working,
+        // not of a gap — measured, `p.idle(n = 2)` compiles under v1 and
+        // emits the same predicate as `p.idle(2)`.
+        //
+        // The name is NOT checked against anything, and that part of the
+        // old note stands: the compiler's own arity message says
+        // "exactly one cycle-count argument" and the docs write
+        // `idle(N)`, where `N` is a value placeholder. No parameter name
+        // is stated anywhere, so there is nothing to check against and
+        // inventing one would be the `record_write` mistake. v1 accepts
+        // any name here too.
+        let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
         Ok(Some(IrExpr::ComponentIdle {
             base: ComponentBase::Path(path),
@@ -4561,20 +4758,22 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         if args.len() != 1 {
-            return Err(unsupported(
+            // NOT the same as its `idle` sibling, measured rather than
+            // assumed from the shared shape: v1's
+            // `resolve_component_quiesced_predicate` returns `None` on a
+            // wrong argument count, so the call falls through to the
+            // generic method shape and emits `if (!(_tb.p.quiesced()))`
+            // — g++: "`struct Prod` has no member named `quiesced`".
+            // v1 emits, and what it emits does not build.
+            return Err(not_implemented(
                 &format!("`quiesced(...)` with {} arguments", args.len()),
-                "the quiesce predicate takes exactly one cycle-count argument",
+                "the quiesce predicate takes exactly one cycle-count argument".to_string(),
+                V1Status::EmitsUncompilable,
             ));
         }
-        let CallArg::Expr(n_expr) = &args[0] else {
-            // Same as the idle predicates: one argument, so v1's
-            // positional binding is correct and the name is decoration.
-            return Err(unsupported(
-                "a named argument to `quiesced`",
-                "v1 ignores the name and binds by position; with one parameter that is \
-                 the same thing, so it emits the predicate correctly",
-            ));
-        };
+        // Same as the idle predicates one screen up: one argument, so a
+        // name can only bind where the position already put it.
+        let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
 
         // Collect every leaf sub-component instance path under the receiver.

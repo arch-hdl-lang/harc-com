@@ -462,10 +462,7 @@ impl CosimOpts {
 /// isn't found in any source. Ports whose width can't be folded, or
 /// with unpacked (post-name) dimensions, are skipped — a TB referencing
 /// a skipped port fails C++ compilation with a missing-member error.
-pub fn cosim_ports_from_sv(
-    sv_sources: &[std::path::PathBuf],
-    top: &str,
-) -> Option<Vec<CosimPort>> {
+pub fn cosim_ports_from_sv(sv_sources: &[std::path::PathBuf], top: &str) -> Option<Vec<CosimPort>> {
     for path in sv_sources {
         let Ok(src) = std::fs::read_to_string(path) else {
             continue;
@@ -497,7 +494,10 @@ pub fn cosim_ports_from_sv(
 ///     failure mode this scanner must never have.
 fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
     let raw_lines: Vec<&str> = src.lines().collect();
-    let lines: Vec<String> = raw_lines.iter().map(|l| strip_sv_line_comments(l)).collect();
+    let lines: Vec<String> = raw_lines
+        .iter()
+        .map(|l| strip_sv_line_comments(l))
+        .collect();
     let start = lines.iter().position(|l| {
         let t = l.trim_start();
         if let Some(rest) = t.strip_prefix("module ") {
@@ -578,9 +578,8 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                     // carry the closing paren on the same line — retry
                     // with it stripped when the raw text doesn't
                     // evaluate.
-                    let v = eval_sv_const_expr(val, &params).or_else(|| {
-                        eval_sv_const_expr(val.trim_end_matches(')'), &params)
-                    });
+                    let v = eval_sv_const_expr(val, &params)
+                        .or_else(|| eval_sv_const_expr(val.trim_end_matches(')'), &params));
                     if let Some(v) = v {
                         params.insert(name.to_string(), v);
                     }
@@ -667,9 +666,7 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                     ("byte", Some(8)),
                 ] {
                     if let Some(r) = rest.strip_prefix(q) {
-                        if r.starts_with(|c: char| c.is_whitespace() || c == '[')
-                            || r.is_empty()
-                        {
+                        if r.starts_with(|c: char| c.is_whitespace() || c == '[') || r.is_empty() {
                             if let Some(w) = w {
                                 base_width = Some(base_width.map_or(w, |b| b.max(w)));
                             }
@@ -708,9 +705,7 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                             rest = after_tok;
                         }
                         None => {
-                            skipped.push(format!(
-                                "unresolved port type `{tok}`: `{t}`"
-                            ));
+                            skipped.push(format!("unresolved port type `{tok}`: `{t}`"));
                             continue;
                         }
                     }
@@ -744,10 +739,7 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
             // One or more comma-separated names, each with an optional
             // unpacked dimension (`input logic a, b, c` / `... x [N]`).
             for name_decl in split_sv_top_level_commas(cur) {
-                let nd = name_decl
-                    .trim()
-                    .trim_end_matches([';', ')'])
-                    .trim();
+                let nd = name_decl.trim().trim_end_matches([';', ')']).trim();
                 if nd.is_empty() {
                     continue;
                 }
@@ -755,8 +747,7 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
-                if name.is_empty() || !nd.starts_with(|c: char| c.is_alphabetic() || c == '_')
-                {
+                if name.is_empty() || !nd.starts_with(|c: char| c.is_alphabetic() || c == '_') {
                     skipped.push(format!("unparsed port declarator `{nd}` in: `{t}`"));
                     continue;
                 }
@@ -791,7 +782,9 @@ fn scan_sv_module_ports(src: &str, top: &str) -> Option<Vec<CosimPort>> {
                     }
                     unpacked_elems = Some(elems);
                 } else if !after_name.is_empty() {
-                    skipped.push(format!("unparsed port declarator tail `{after_name}`: `{t}`"));
+                    skipped.push(format!(
+                        "unparsed port declarator tail `{after_name}`: `{t}`"
+                    ));
                     continue;
                 }
                 out.push(CosimPort {
@@ -915,7 +908,12 @@ fn sv_const_range_width(
     let b = eval_sv_const_expr(b_s.trim(), params)?;
     // Order-agnostic: `[7:0]` and `[0:7]` are both 8 wide (ascending
     // ranges are the common style for unpacked dims).
-    Some((a - b).unsigned_abs().saturating_add(1).min(u32::MAX as u64) as u32)
+    Some(
+        (a - b)
+            .unsigned_abs()
+            .saturating_add(1)
+            .min(u32::MAX as u64) as u32,
+    )
 }
 
 /// Small recursive-descent evaluator for SV constant expressions in
@@ -10561,19 +10559,15 @@ impl Emitter {
                 let owner = self.resolve_value_field_type(target)?;
                 let owner_name = type_simple_name(Some(&owner))?;
                 if let Some(fields) = self.record_fields.get(owner_name) {
-                fields
-                    .iter()
+                    fields
+                        .iter()
                         .find(|f| f.name.name == name.name)
-                    .map(|f| f.ty.clone())
+                        .map(|f| f.ty.clone())
                 } else if let Some(comp) = self.components.get(owner_name) {
                     component_field_type(&comp.items, &name.name)
                 } else if let Some(transactor) = self.transactors.get(owner_name) {
                     component_field_type(
-                        &synth_component_from_transactor(
-                            transactor,
-                            /*include_active*/ true,
-                        )
-                        .items,
+                        &synth_component_from_transactor(transactor, /*include_active*/ true).items,
                         &name.name,
                     )
                 } else {
@@ -10599,19 +10593,16 @@ impl Emitter {
                     ..
                 }
             ),
-            ExprKind::Ident(id) => self
-                .let_widths
-                .get(&id.name)
-                .is_some_and(|lw| lw.signed),
+            ExprKind::Ident(id) => self.let_widths.get(&id.name).is_some_and(|lw| lw.signed),
             ExprKind::Field { .. } | ExprKind::Index { .. } => {
                 self.resolve_value_field_type(e).is_some_and(|ty| {
-                matches!(
-                    ty,
-                    TypeExpr::Builtin {
-                        name: BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Int,
-                        ..
-                    }
-                )
+                    matches!(
+                        ty,
+                        TypeExpr::Builtin {
+                            name: BuiltinTy::SInt | BuiltinTy::SIntCap | BuiltinTy::Int,
+                            ..
+                        }
+                    )
                 })
             }
             ExprKind::Int(_) => true,
@@ -12062,7 +12053,10 @@ impl Emitter {
                     " = nullptr".into()
                 } else if matches!(
                     &f.ty,
-                    TypeExpr::Builtin { name: BuiltinTy::Vec, .. }
+                    TypeExpr::Builtin {
+                        name: BuiltinTy::Vec,
+                        ..
+                    }
                 ) {
                     "{}".into()
                 } else {
@@ -12194,7 +12188,10 @@ impl Emitter {
                     format!(" = {}", format_simple_expr(d))
                 } else if matches!(
                     &f.ty,
-                    TypeExpr::Builtin { name: BuiltinTy::Vec, .. }
+                    TypeExpr::Builtin {
+                        name: BuiltinTy::Vec,
+                        ..
+                    }
                 ) {
                     "{}".into()
                 } else {
@@ -12420,9 +12417,7 @@ impl Emitter {
         );
         let rhs = if width > 128 {
             let words = width.div_ceil(32);
-            format!(
-                "harc_rt::harc_wide_trunc<{words}>(harc_rt::harc_read({raw_expr}), {width})"
-            )
+            format!("harc_rt::harc_wide_trunc<{words}>(harc_rt::harc_read({raw_expr}), {width})")
         } else if signed && width <= 64 {
             format!(
                 "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({raw_expr})), {width}, 64))"
@@ -12467,9 +12462,9 @@ impl Emitter {
                 Some(w) if w > 128 => {
                     format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
                 }
-                Some(w) => format!(
-                    "harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})"
-                ),
+                Some(w) => {
+                    format!("harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})")
+                }
                 None => value_expr.to_string(),
             };
             writeln!(self.out, "harc_rt::harc_assign({sig_expr}, {normalized});").ok();
@@ -15028,7 +15023,11 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();   // drop preference scope").ok();
         self.pad(depth + 2);
-        writeln!(self.out, "_s.pop();   // drop exhausted unique-history scope").ok();
+        writeln!(
+            self.out,
+            "_s.pop();   // drop exhausted unique-history scope"
+        )
+        .ok();
         for candidate in free_fields
             .iter()
             .filter(|f| unique_fields.contains(&f.name))
@@ -15073,8 +15072,7 @@ impl Emitter {
             self.pad(depth + 3);
             writeln!(self.out, "}}\n").ok();
             self.pad(depth + 2);
-            writeln!(self.out, "}}")
-                .ok();
+            writeln!(self.out, "}}").ok();
         }
         self.pad(depth + 2);
         writeln!(self.out, "if (!_harc_recycled_unique_history) {{").ok();
@@ -15095,8 +15093,7 @@ impl Emitter {
         self.pad(depth + 3);
         writeln!(self.out, "_r = _s.check();").ok();
         self.pad(depth + 2);
-        writeln!(self.out, "}}")
-            .ok();
+        writeln!(self.out, "}}").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
 
@@ -19761,9 +19758,7 @@ impl Emitter {
                 // UInt values cannot retain padding bits and SInt right
                 // shifts sign-fill from their declared sign bit.
                 if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
-                    if let Some(width) = self
-                        .infer_shift_width_best_effort(lhs)
-                        .filter(|w| *w > 64)
+                    if let Some(width) = self.infer_shift_width_best_effort(lhs).filter(|w| *w > 64)
                     {
                         let signed = self.infer_expr_signed_best_effort(lhs);
                         match (*op, width, signed) {
@@ -20526,6 +20521,39 @@ fn cpp_uint_for_width(w: Option<u32>) -> String {
     }
 }
 
+/// The EQUIVALENCE CLASS of a record `Vec<T, N>` element type: two
+/// element types share a class exactly when `record_field_c_type`
+/// renders them as the same C++ member type. Not the rendered spelling
+/// itself — a record element answers an opaque id token, because the
+/// record's C++ name is not reachable from an `IrType` alone.
+///
+/// Lives here, beside `cpp_uint_for_width` / `cpp_sint_for_width` /
+/// `scalar_leaf_c_type`, because it has to agree with them exactly and
+/// a copy in the lowerer would drift. Both backends render the member
+/// as `std::array<elem, N>`, so two whole-`Vec` fields have the same
+/// C++ type — the thing `operator==` and `operator=` actually require —
+/// iff their lengths match and this answers the same class for both.
+///
+/// The collapse is the point. Every unsigned scalar of 64 bits or fewer
+/// becomes `uint64_t`, so `Vec<uint<8>, 4>` and `Vec<uint<32>, 4>` ARE
+/// the same C++ member and compare/copy fine; only signedness at or
+/// below 64 bits, the 65..=128 and >128 buckets, `bool`, and the record
+/// element identity actually separate two members.
+///
+/// `None` for an `IrType` that is no record-`Vec` element (a sequence,
+/// a component, an event, …) — no such element exists today, and
+/// answering "same class" for two of them would be a guess.
+pub(crate) fn ir_vec_elem_class(t: &crate::ir::IrType) -> Option<String> {
+    use crate::ir::IrType;
+    match t {
+        IrType::UInt(w) => Some(cpp_uint_for_width(*w)),
+        IrType::SInt(w) => Some(cpp_sint_for_width(*w)),
+        IrType::Bool => Some("bool".into()),
+        IrType::Record(rid) => Some(format!("record#{}", rid.index())),
+        _ => None,
+    }
+}
+
 fn cpp_sint_for_width(w: Option<u32>) -> String {
     match w {
         // No native __int128 signed in C++ portably — but unsigned
@@ -21109,9 +21137,7 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
 /// consumer, so such a suite still pays this clone once per caller —
 /// `dut_probes`, lowering, and the randomize emitter. Desugaring once up
 /// front in `cmd_sim` would collapse all three to a borrow; see harc#546.
-pub(crate) fn desugar_impl_for_test_in_file(
-    file: &SourceFile,
-) -> std::borrow::Cow<'_, SourceFile> {
+pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::Cow<'_, SourceFile> {
     if !file
         .items
         .iter()

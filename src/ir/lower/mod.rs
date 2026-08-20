@@ -14,6 +14,7 @@
 mod addrmap;
 mod bus;
 mod components;
+pub(crate) use components::endpoint_label;
 mod control;
 mod covergroups;
 mod exprs;
@@ -2137,7 +2138,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let comp_snapshot = prog.components.clone();
     for (i, src) in comp_sources.iter().enumerate() {
         if let components::CompSource::Env(decl) | components::CompSource::Agent(decl) = src {
-            let connects = components::resolve_connects(decl, &comp_snapshot[i], &comp_snapshot)?;
+            let connects = components::resolve_connects(
+                decl,
+                ir::ComponentId(i as u32),
+                &comp_snapshot[i],
+                &comp_snapshot,
+            )?;
             prog.components[i].connects = connects;
         }
     }
@@ -4334,14 +4340,9 @@ fn lower_test(
                         path.join(".")
                     ))
                 })?;
-            ir::resolve_component_path_mode(
-                &prog.components,
-                binding.component,
-                binding.mode,
-                tail,
-            )
-            .map(|resolved| resolved.effective_mode)
-            .map_err(|err| LowerError::Invalid(format!("invalid testbench `connect`: {err}")))
+            ir::resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
+                .map(|resolved| resolved.effective_mode)
+                .map_err(|err| LowerError::Invalid(format!("invalid testbench `connect`: {err}")))
         };
         let source_mode = endpoint_mode(&edge.src_path)?;
         let sink_mode = endpoint_mode(&edge.sink_path)?;
@@ -6518,6 +6519,31 @@ pub(crate) struct FuncBuilder<'a> {
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
     pub(crate) in_fmt_args: bool,
+    /// True while lowering the two operands of an `==`/`!=`, which is
+    /// the one landing where a WHOLE-`Vec` record-field read works.
+    ///
+    /// An ALLOW-list, and deliberately so. The read itself lowers, the
+    /// verifier accepts it, and the emitter prints `r.data == s.data` —
+    /// byte-identical to v1, which compiles because `std::array` has
+    /// `operator==` (and because v1 generates `operator==` for a record
+    /// element type, so a `Vec<Kid, N>` compares too). But the same read
+    /// landing anywhere else emits C++ that g++ refuses: measured,
+    /// `let d = r.data` and `${r.data}` both do, under BOTH backends.
+    ///
+    /// Refusing at the read and permitting one landing means a landing
+    /// nobody enumerated keeps today's clean diagnostic. Permitting at
+    /// the read and refusing the known-bad landings would mean a missed
+    /// one silently emits uncompilable code instead — worse, and not
+    /// checkable by inspection.
+    ///
+    /// All THREE whole-`Vec` read lanes consult it, because all three
+    /// spell the same landing: a record LOCAL (`r.data`, `exprs.rs`), a
+    /// bound responder's record STATE field (`t.ba.data`, same file),
+    /// and a COMPONENT record field (`a.data` in an agent method,
+    /// `components_impl.rs`). Gating one of them left the other two
+    /// refusing `assert a.data == b.data` while v1 emitted
+    /// `self.a.data == self.b.data` and g++ accepted it.
+    pub(crate) vec_read_ok: bool,
     /// True while lowering a transactor method body. Methods keep v1's
     /// synchronous hookable semantics (waits emit as `tick()` loops),
     /// so the constructs whose sync emission is out of this slice —
@@ -6937,6 +6963,7 @@ impl<'a> FuncBuilder<'a> {
             helper_ret: None,
             in_pure_helper: false,
             in_fmt_args: false,
+            vec_read_ok: false,
             in_transactor_method: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),

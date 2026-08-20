@@ -879,12 +879,9 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                     _ => None,
                 })
         }
-        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
-            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
-            .and_then(|f| match &f.kind {
-                crate::ir::ComponentFieldKind::FixedVec(vec) => ir_type_width(&vec.elem),
-                _ => None,
-            }),
+        Expr::ComponentVecElement { base, field, .. } => component_vec_elem_type(cx, base, field)
+            .as_ref()
+            .and_then(ir_type_width),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1033,14 +1030,10 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     _ => false,
                 })
         }
-        Expr::ComponentVecElement { base, field, .. } => component_of_base(cx, base)
-            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
-            .is_some_and(|f| matches!(
-                &f.kind,
-                crate::ir::ComponentFieldKind::FixedVec(crate::ir::FixedVecSchema {
-                    elem: crate::ir::IrType::SInt(_), ..
-                })
-            )),
+        Expr::ComponentVecElement { base, field, .. } => matches!(
+            component_vec_elem_type(cx, base, field),
+            Some(crate::ir::IrType::SInt(_))
+        ),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1081,6 +1074,42 @@ fn record_path_is_sint<'a>(
     segs: impl Iterator<Item = &'a String>,
 ) -> bool {
     record_path_type(cx, ty, segs).is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
+}
+
+/// The ELEMENT type of the `Vec` a `ComponentVecElement` / -`Write`
+/// selects from, for either shape its `field` can take.
+///
+/// `field` is a member SUFFIX, not always one name. A component field
+/// declared `Vec<T, N>` gives the single name `own`; a `Vec<T, N>` LEAF
+/// inside a component RECORD field gives a dotted path (`a.data`). The
+/// arms here used to do `fields.iter().find(|f| f.name == *field)`,
+/// which can never match a dotted one — so every dotted element read
+/// answered "width unknown, not signed". That is not a missing
+/// optimisation: it decided `>>` between an arithmetic and a logical
+/// shift, and whether a >64-bit element was truncated to `uint64_t`
+/// before use. Both compile; both silently disagree with v1.
+fn component_vec_elem_type(
+    cx: &ECx<'_>,
+    base: &crate::ir::ComponentBase,
+    field: &str,
+) -> Option<crate::ir::IrType> {
+    let path: Vec<String> = field.split('.').map(str::to_string).collect();
+    let root = path.first()?;
+    let f = component_of_base(cx, base)?
+        .fields
+        .iter()
+        .find(|f| f.name == *root)?;
+    match &f.kind {
+        crate::ir::ComponentFieldKind::FixedVec(vec) if path.len() == 1 => Some(vec.elem.clone()),
+        crate::ir::ComponentFieldKind::Record { record } => {
+            // The leaf's own type. `record_path_type` reports a `Vec`
+            // field as its element type (`vec_len` rides beside `ty` in
+            // the schema), which is exactly what an element selection
+            // yields.
+            record_path_type(cx, crate::ir::IrType::Record(*record), path[1..].iter())
+        }
+        _ => None,
+    }
 }
 
 fn record_path_type<'a>(
@@ -1190,7 +1219,9 @@ fn component_of_base<'a>(
                         || c.on_handlers.iter().any(|h| h.function == cx.func.id)
                         || c.periodic_handlers.iter().any(|h| h.function == cx.func.id)
                         || c.cycle_handlers.iter().any(|h| h.function == cx.func.id)
-                        || c.watchdog.as_ref().is_some_and(|w| w.function == cx.func.id)
+                        || c.watchdog
+                            .as_ref()
+                            .is_some_and(|w| w.function == cx.func.id)
                 })?
             } else {
                 return None;

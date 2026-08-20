@@ -7681,6 +7681,509 @@ former `transaction` group lives in
      comment as a record of a conclusion rather than of a measurement
      that has an expiry date.
 
+120. **A feature and a set of mistakes sharing one verdict (2026-08-19).**
+
+     The `connect` endpoint arm refused every edge whose source or sink
+     was a single segment, and its note said why in a sentence that also
+     named the exception: *"a single-segment endpoint resolves against
+     the owner's own hookable / `out event` and works"*. That was
+     recorded as a reason the verdict had to stay vague — "one site,
+     three outcomes" — rather than as a feature to implement.
+
+     It is a feature, in both directions, and v1 genuinely WIRES it:
+
+     ```
+     own_ev -> sb.write_obs
+       → env.own_ev.push_back([&](auto _t) { AnalysisSb_write_obs(env.sb, _t); });
+
+     source.observed -> own_sink
+       → env.source.observed.push_back([&](auto _t) { AnalysisEnv_own_sink(env, _t); });
+     ```
+
+     Both compile. tbir now lowers both, and its wiring lines are
+     byte-identical to v1's — verified by diffing the emitted
+     `push_back` sets, not by reading them.
+
+     The EXECUTING layers needed no changing, which is most of the
+     point: `src_path`/`sink_path` are relative to the owning scope, so
+     the empty path already meant "the owner" —
+     `resolve_component_path_mode` returns the start component untouched
+     for it, and the emitter chains it onto the instance prefix. The gap
+     was one `len() < 2` guard rejecting a shape those layers already
+     handled.
+
+     "Nothing downstream needed changing" was the first draft of that
+     sentence, and it was false in the way this file keeps having to
+     record. Three of the four `ConnectEdgeSchema` doc comments said
+     "sub-component", which the change falsifies; and `display.rs`
+     rendered these paths with a naive `join(".")`, so `dump-ir` printed
+
+         connect .own_ev -> sb.write_obs (method) (c1)
+
+     — the exact leading dot `endpoint_label` had just been written to
+     prevent, in the one renderer the change did not look at. Adding a
+     helper does not fix the sites that never call it; `dump-ir` is also
+     the tool this sweep uses as its own verdict oracle, so the bug was
+     in front of it the whole time.
+
+     **Two things this did NOT license.** Splitting a feature out of a
+     mixed arm routes new shapes into the neighbouring arms, and those
+     were measured on different inputs:
+
+     - A single segment naming something that is neither a hookable nor
+       an event — a sub-component field, say — reaches the arm that
+       already covered the sub-component spelling, and takes its
+       `NotImplemented { EmitsUncompilable }`. A first pass carved it out
+       to `Unsupported`, reasoning that `EmitsUncompilable` "would be
+       false half the time" because an uninstantiated env compiles. True,
+       and true of every shape that arm already covered, so it justified
+       nothing — and the split fell in the wrong place besides, leaving
+       an owner-relative non-`hookable` method on the other side of it.
+       Measured across all four (instantiated; every one compiles
+       uninstantiated): `-> source`, `-> own_scalar`, `-> own_fn` and
+       `-> sb.count` all get the same g++ refusal. Whether that arm
+       should be `EmitsUncompilable` at all is a question about the
+       family, answered where the arm is.
+     - The testbench-owned `connect` resolver gets `None` for the owner
+       id, because a testbench is not itself a component in the table.
+       The first draft called that form "unmeasured", which was doing
+       the same work as calling it impossible. Measured: v1 implements
+       it — a testbench declaring `own_ev : out event<uint<8>>` with
+       `own_ev -> direct.accept` emits
+       `_tb.own_ev.push_back([&](auto _t) { TbSink_accept(_tb.direct, _t); });`
+       and compiles. tbir refuses earlier, on an unrelated pre-existing
+       gap ("testbench field `own_ev` with a non-scalar, non-named
+       type"), so `None` is unobservable rather than right. The fix is
+       to give a testbench an id, and it belongs with that field gap.
+
+     The placement rule the old note recorded still governs everything
+     else, and this round re-measured it across six malformations × two
+     placements × both backends: instantiated, v1 emits the path
+     verbatim and g++ refuses; uninstantiated, v1 emits no wiring and
+     succeeds. Uniform. That is why the `--codegen v1` suggestion stays
+     on the genuinely malformed edges — it is true somewhere — and it is
+     the same evidence, now separated from the feature it was tangled
+     with.
+
+121. **"No hazard here" is a reason not to warn, not a reason to refuse
+     (2026-08-19).**
+
+     `idle(n = 2)` and `quiesced(n = 2)` were `Unsupported`, under a note
+     that worked the case out correctly and then stopped one step short:
+     the arity check above has already established exactly one argument,
+     so v1's name-dropping positional binding "lands the value in the
+     only slot there is and emits code identical to the positional form
+     … it emits the predicate correctly". Every clause of that describes
+     something to implement.
+
+     The reasoning it came from was about a different question. The
+     general named-argument guard splits three ways — a name at its own
+     position (inert), a REORDERED name (a silent swap, and the hazard
+     the guard exists for), and a name matching no parameter. These
+     predicates take one argument, so no reordering is expressible, and
+     the note recorded that as "they keep `Unsupported`". Absence of the
+     hazard is a reason the verdict is not `SilentlyMisLowers`; it was
+     never a reason to refuse, and nothing anywhere argued for the
+     refusal itself.
+
+     Implemented, and pinned by the property that made it safe rather
+     than by a remembered string: the named and positional spellings
+     must emit the SAME program. They do — the whole emitted file is
+     byte-identical, under both backends, for both predicates.
+
+     The name is still checked against nothing, and that half of the old
+     note stands unchanged: no parameter name is stated anywhere for
+     these (the arity diagnostic says "exactly one cycle-count
+     argument"; the docs write `idle(N)`, a value placeholder), so there
+     is nothing to check against and inventing one would be the
+     `record_write` mistake. v1 accepts `nosuch = 4` here too, and emits
+     the same predicate.
+
+     **Two neighbours were left alone, deliberately.** The probe that
+     found this also re-opened `p.two(bogus = 1, 2)`, which is `Invalid`
+     while v1 compiles it and emits the correct positional call — the
+     shape of a false `Invalid`. It is not one: the note there had
+     already considered `SilentlyMisLowers` and refuted it in writing,
+     because v1 emits exactly the right code and claiming otherwise
+     would be a false explanation. `Invalid` rests on "no backend can
+     HONOUR it" rather than "no backend runs it", and re-deciding a
+     question already measured and written down is the mistake
+     divergence 120 was about.
+
+     The arity arms reject genuine errors — but this entry first added
+     "likewise the arity arms", certifying them as fine, and they were
+     not. Both carried `Unsupported`, promising a `--codegen v1` escape
+     hatch neither has, and they do not even share a verdict. Measured:
+
+     | call | v1 |
+     |---|---|
+     | `p.idle()`, `p.idle(1, 2)` | its own error, "expected 1 cycle-count arg, got N" — **rejects** |
+     | `p.quiesced()`, `p.quiesced(1, 2)` | falls through `resolve_component_quiesced_predicate` (`None` on a wrong count) to the generic method shape, emits `if (!(_tb.p.quiesced()))` — g++: no such member |
+
+     So `NotImplemented { Rejects }` and
+     `NotImplemented { EmitsUncompilable }` respectively. Blessing two
+     sites because they sat next to the one being fixed, and pinning
+     that with a test, is worse than leaving them unexamined: the test
+     made the wrong verdict load-bearing.
+
+122. **A refusal worth keeping, and the measurement that says so
+     (2026-08-19).**
+
+     Five sites refuse `pop()` in a nested expression — scoreboard,
+     testbench, component and target-state queues (two spellings) — each
+     with the same one-line reason, "bind it to its own `let` first —
+     `pop` mutates the queue". v1 compiles every nested form, which is
+     the profile of an implementable gap, and the previous two batches
+     had both turned out to be exactly that.
+
+     This one is not, and the difference is worth recording because the
+     surface looks identical. Lowering an expression-position call means
+     hoisting it into a statement ahead of the expression. For a MUTATING
+     call that is equivalent only when the surrounding expression
+     evaluates it unconditionally, exactly once — and C++ short-circuits:
+
+     | | |
+     |---|---|
+     | source | `assert (guard == 1 && sb.q.pop() == 7) \|\| sb.q.size() == 1` |
+     | v1 emits | `if (!((guard == 1 && _tb.sb.q.pop() == 7) \|\| _tb.sb.q.size() == 1))` |
+
+     With `guard == 0` the pop never runs and the queue keeps its
+     element. A hoisted lowering would pop first, empty the queue, and
+     fail an assert v1 passes — a silent behavioural divergence, the one
+     outcome worth refusing a program over.
+
+     Repeated evaluation is an obstacle at ONE of the two looping
+     constructs, and this entry first claimed it was neither.
+
+     `while` is fine: `lower_while` opens the header block before
+     lowering the condition, so a hoisted call lands IN the header and
+     the back-edge targets it. Measured on `while tick() < 3` over a
+     TESTBENCH METHOD — `b1` holds the inlined body
+     (`TbFieldWrite(_tb.n, (_tb.n + 1))`, `Assign(%__t0, _tb.n)`) and
+     `b5` jumps back to `b1`. The distinction matters: a pure file-scope
+     helper does not CFG-inline and is not a witness for this.
+
+     `wait until` is not fine. `lower_wait_until` lowers the predicate
+     into the block PRECEDING the terminator, so a hoisted call runs
+     exactly once — while v1 emits the predicate as a lambda,
+     `wait_until_timeout(_slot, [&]{ return _tb.sb.q.pop() == 7; }, …)`,
+     and re-runs it every cycle. That same function already says so
+     thirty lines up, about transactor edges: "hoisting would run it
+     exactly once, the wrong semantics".
+
+     So "it's in a loop" is the wrong objection at one construct and
+     exactly the right one at the other, and implementing this needs
+     BOTH: `&&`/`||` lowered to branches when a side-effecting call sits
+     under them, and a `wait until` predicate that re-evaluates rather
+     than hoists. `wait until sb.q.pop() == 7` contains no short-circuit
+     at all, so the first alone would never reach it — the scoped work
+     as first recorded was not just incomplete but insufficient for the
+     case that motivated it. Recorded as scoped work rather than
+     attempted.
+
+     The five copies of the reason are now one function carrying the
+     measurement, and a test pins v1's short-circuited output — so the
+     obvious "fix" fails a test that explains itself rather than
+     silently changing what a program means.
+
+123. **Three misdirections in the record-traversal loop (2026-08-19).**
+
+     Three arms of the record field-chain walk told the user to re-run
+     with `--codegen v1`, and v1 emits code g++ refuses. Measured, each
+     against controls that compile under BOTH backends
+     (`r.kids[1].p`, `r.inner.p`, `r.data[2]`, `s.kids = r.kids`):
+
+     | source | v1 |
+     |---|---|
+     | `r.data[0].p` — field on a scalar element | emits, g++ refuses |
+     | `r.kids.p` — traverse a `Vec` with no index | emits, g++ refuses |
+     | `r.n.p` — field on a scalar | emits, g++ refuses |
+
+     `NotImplemented { EmitsUncompilable }` now, matching `r.n[0]` — the
+     same family, one site over, which already carried that verdict.
+     Following the in-file precedent rather than inventing one.
+
+     One message also stopped being a sentence: "field `Rec.n` is not a
+     nested record; cannot access `.p`" reads as nonsense once spliced
+     into "HARC does not implement … yet", so it is a noun phrase now.
+
+     **The mutation round is the part worth recording.** The first three
+     mutants all reported CAUGHT, and all three were vacuous: deleting a
+     `V1Status` argument from `not_implemented` leaves a two-argument
+     call to a three-argument function, so the mutant fails to COMPILE,
+     and a harness that scores "tests not green" counts that as caught.
+     Rewritten to flip `EmitsUncompilable` → `Rejects` — which compiles
+     — two of the three survived. Only the `Vec`-traversal arm had a
+     test; the other two sites had none, and the vacuous run would have
+     shipped that.
+
+     A mutant that does not compile tests the type checker, not the
+     suite. The harness cannot tell the difference, so the check has to
+     be that the mutation is a legal program — which is the same
+     discipline as running a compiling control beside every failing
+     cell, applied to the tool instead of the fixture.
+
+124. **Whole-`Vec` equality, and why the permission is an allow-list
+     (2026-08-19).**
+
+     `assert r.data == s.data` was refused with every other whole-`Vec`
+     read, under a note that already said the comparison works:
+     "`assert r.data == r.data` emits `r.data == r.data`, which compiles
+     and works (`std::array` has `operator==`)". It does, for record
+     elements too — v1 generates `operator==` for the element struct, so
+     `Vec<Kid, N>` compares element-wise. One site, several outcomes, and
+     splitting them is the better answer than labelling the site with
+     whichever outcome is true somewhere.
+
+     The IR needed nothing: `IrType` has no `Vec` variant, but the read
+     lowers as an ordinary `RecordField` with `index: None`, the verifier
+     accepts it, and the emitter prints `r.data == s.data` — the same
+     text v1 emits. Confirmed by permitting the read globally as an
+     experiment and compiling the result.
+
+     **That experiment is also what settled the shape of the fix.** With
+     the read permitted everywhere, `let d = r.data` and `${r.data}` both
+     emit C++ that g++ refuses. So the permission is keyed on the LANDING
+     and defaults to off: a landing nobody enumerated keeps today's clean
+     diagnostic. The inverse — permit at the read, block the known-bad
+     landings — would mean a landing nobody enumerated silently emits
+     code that does not build, and there is no way to check by inspection
+     that the list is complete.
+
+     Two things the first draft got wrong, both caught by running rather
+     than reading:
+
+     - **It regressed mismatched operands.** Permitting the read on any
+       equality let `r.data == s.kids` (scalar elements against record
+       ones) and `r.data == s.n` (a `Vec` against a scalar) through,
+       where both backends emit a comparison g++ refuses. The read used
+       to catch those, so the permission had to carry the pairing check
+       itself — same length, same element type.
+     - **It broke regblock lowering.** The pairing helper calls
+       `try_record_field_chain` on every `==` operand, and propagated its
+       error with `?`. A regblock access like `regs.DMACR.RS` makes that
+       resolver fail, so a working program became a hard error before its
+       real lowering path ever saw it. Errors are swallowed now: "not a
+       matching pair" is the only answer this question can give.
+
+     The second one surfaced as five failing tests, three of them in
+     regblock corpora that have nothing to do with `Vec` — a reminder
+     that a helper called speculatively on every operand of a common
+     operator is not a local change.
+
+     Two tests that pinned the old refusal were rewritten rather than
+     deleted. One had justified it with "it only worked by luck"; the
+     site's own note said `std::array::operator==` is why it works, and
+     the measurement agrees with the note.
+
+125. **One landing, three lanes: what "gated" turned out to mean
+     (2026-08-20).**
+
+     Divergence 124 permitted a whole-`Vec` record-field read in the
+     `==`/`!=` landing and called the job done. It had gated ONE of the
+     three sites that refuse such a read. `grep vec_read_ok src/` showed
+     a single gate; the other two never saw the flag. Measured:
+     `assert a.data == b.data` inside an agent method, and
+     `assert ba.data == bb.data` inside a bound responder's thread, were
+     both still refused, while v1 emitted `self.a.data == self.b.data` /
+     `target.ba.data == target.bb.data` and g++ accepted each with zero
+     errors.
+
+     The three lanes spell the same landing and are three functions: a
+     record LOCAL (`try_record_field_chain`), a bound responder's record
+     STATE field (`as_transactor_state_record_field`), and a COMPONENT
+     record field (`as_component_record_field`). Nothing about the first
+     one said "there are two more"; the flag's own doc comment described
+     the landing, not its coverage. **A permission is not implemented
+     until every site that refuses the thing consults it** — and the way
+     to know is to grep for the flag and count the refusals, not to read
+     the one you edited.
+
+     The fix also had to change the shape of the component resolver.
+     `as_component_record_field` served BOTH the read and the write path
+     and erred on a `Vec` leaf itself, which hid the leaf's shape from
+     the pairing check that needs it. It now REPORTS the shape and each
+     caller judges: the write refuses unconditionally, the read consults
+     the flag. Reporting rather than judging is what let one resolver
+     serve two callers that disagree.
+
+     Verdicts corrected on measurement, all `Unsupported` →
+     `NotImplemented { EmitsUncompilable }`:
+
+     - the two remaining whole-`Vec` read refusals (`let d = a.data`
+       gives "cannot convert `std::array<…, 4>` to `int64_t`" from v1's
+       own output);
+     - the component walk's nested-record arm, split into the same two
+       arms the record-local walk already had ("traversing the `Vec`
+       record field … without an element index" vs "… which is not a
+       nested record"), with the same wording — copied, not
+       reconstructed.
+
+     One verdict was deliberately left alone and should not have been.
+     The component whole-`Vec` WRITE kept `Unsupported` on the reasoning
+     that `a.data = b.data` compiles under v1, so the escape hatch is
+     real — while the same arm also covers `a.data = 5`, which v1 emits
+     and g++ refuses. "Mixed, so keep the weaker claim" is not a rule
+     the repo has: `Unsupported` is the STRONGER claim, and divergence
+     126 splits the arm instead.
+
+     Two smaller things, same root:
+
+     - **A detail string printed its own placeholders.** The state-field
+       refusal's detail was a plain `&str` containing
+       "`{field}.{vec}[i]`" — no `format!`, so the braces reached the
+       user verbatim. The identical bug had just been fixed one site
+       over. A message written by copying a `format!`-shaped sentence
+       into a non-`format!` slot fails silently in both directions.
+     - **The pairing check answered on spelling, not on path.**
+       `(r.data) == s.data` was refused because `dotted_path` sees
+       through parentheses and two of the three resolvers do not. The
+       oracle peels parentheses first, so the answer is a property of
+       the path.
+
+     The regression guard for divergence 124's critical bug is now a
+     test rather than a note: a testbench `function` CFG-inlines into
+     its caller, so `assert r.kids[bump()].p == 0` emits `bump()`'s body
+     exactly once — the count that fails the moment the pairing check
+     starts lowering its operands again. Eleven mutants over the guards
+     in this round, all caught; the harness itself had to be fixed
+     first, because `cargo test` prints "error: test failed" to stderr
+     and a NOBUILD check keyed on `"error: "` scored every CAUGHT mutant
+     as unbuildable.
+
+126. **A pairing rule that asked the wrong question, and the three
+     writes behind it (2026-08-20).**
+
+     Divergence 125 paired whole-`Vec` equality operands on `IrType`
+     equality. That is not the question. Both backends declare a
+     `Vec<T, N>` record field as `std::array<elem, N>` and collapse
+     every unsigned scalar of 64 bits or fewer to `uint64_t`, so
+     `Vec<uint<8>, 4>` and `Vec<uint<32>, 4>` are the SAME C++ member
+     and compare element-wise fine. Pairing on `IrType` refused that
+     program — and because 125 had just flipped the read refusal to
+     `EmitsUncompilable`, it refused it while telling the user no
+     backend runs it. Measured: v1 emits `r.data == s.eight` with both
+     members `std::array<uint64_t, 4>`, g++ 0 errors.
+
+     **The rule was already written down, one file over.** The whole-
+     `Vec` WRITE arm in `stmts.rs` carried a comment spelling out the
+     `uint64_t` collapse in full, as the reason it kept `Unsupported`.
+     It was read during 124 and reconstructed anyway. The predicate now
+     lives in `cpp_tb::ir_vec_elem_class`, beside the
+     `cpp_uint_for_width` / `cpp_sint_for_width` / `scalar_leaf_c_type`
+     family it has to agree with, and BOTH the read pairing and the
+     write shape check call it. Two things follow from having one
+     predicate:
+
+     - `Vec<uint<32>, 4> = Vec<uint<16>, 4>` is a copy, not a refusal —
+       the gap the old comment described but did not close.
+     - With that landing gone the write arm is no longer mixed, and it
+       loses `Unsupported`: a length mismatch, a signedness split at or
+       below 64 bits, a record-vs-scalar element and a scalar RHS each
+       have v1 emitting an assignment g++ refuses (one error apiece,
+       measured on all four).
+
+     The same "one landing, three lanes" sweep 125 claimed then had to
+     be finished for real:
+
+     - the responder-state lane's mid-segment traversal arm still said
+       `Unsupported` (v1 emits `target.ba.kids.p` / `target.ba.n.p`,
+       g++ refuses each);
+     - the whole-`Vec` WRITE now lowers in all three lanes, through one
+       `whole_vec_copy_rhs` helper that turns the read permission on for
+       the RHS — the responder-state and component spellings each emit
+       what v1 emits and compile. (The record-local lane was left
+       resolving its own RHS with `try_record_field_chain`, which sees
+       record LOCALS only; divergence 127 finishes that.);
+     - component-record `Vec` ELEMENT access lowers, reusing the
+       `ComponentVecElement` / `ComponentVecElementWrite` nodes a fixed-
+       vector component FIELD already had. It was carrying two false
+       verdicts: `let z = a.data[0]` claimed `EmitsUncompilable` and
+       `a.data[0] = 1` claimed `SilentlyMisLowers`, the loudest verdict
+       in the enum, while v1 emitted `self.a.data[0]` and g++ accepted.
+
+     That last one closed a loop rather than a gap. The whole-`Vec`
+     diagnostics say "index the field element-wise (`X[i]`)", and in the
+     component lane `X[i]` did not lower — the suggestion sent the user
+     to a second refusal. There is a test whose whole purpose is to
+     forbid that; it only exercised the write arm, so the two read
+     details added in 125 walked straight past it. It now follows its
+     own advice and checks the suggested spelling lowers.
+
+     **And the suggestion has to be typeable.** `chain.dotted` is rooted
+     at the record TYPE, so "index the field element-wise
+     (`Bundle.data[i]`)" handed back something that does not parse. The
+     chain carries the user's own spelling now (`r.data[i]`) for
+     details, and keeps the record-rooted one for construct names, where
+     naming the field by its record is the point. The predecessor of
+     this bug was the same sentence in a plain `&str` slot printing
+     `{rec}.{field}` braces and all — one detail string, two ways to
+     hand the user a path they cannot use.
+
+127. **Two silent miscompiles behind one convenience (2026-08-20).**
+
+     Divergence 126 lowered component-record `Vec` element access by
+     reusing the `ComponentVecElement` / `ComponentVecElementWrite`
+     nodes a fixed-vector component FIELD already had. The node's
+     `field` is a member SUFFIX, and for the new lane it is DOTTED
+     (`a.data`). Every consumer resolved it with
+     `fields.iter().find(|f| f.name == *field)` — a lookup that can
+     never match a dotted name. Width came back unknown, signedness
+     `false`, type `None`.
+
+     None of that surfaced as a diagnostic. It decided:
+
+     - `>>` between an ARITHMETIC and a LOGICAL shift. With a
+       `Vec<sint<32>, 4>` element holding `-8`, v1 answers `-4` and tbir
+       answered `9223372036854775804`.
+     - whether a >64-bit element was truncated to `uint64_t` before use.
+       With a `Vec<uint<128>, 2>` element holding `1 << 100`, v1 answers
+       `1 << 99` and tbir answered `0`.
+     - whether the write guards could see a record element at all. The
+       record-local element write carries a matched PAIR of guards — a
+       scalar-leaf check and a record-leaf check — and the new lane
+       copied one of them, which was inert anyway because it routes
+       through the same broken type lookup. `a.kids[0] = 5` emitted
+       `self.a.kids[0] = 5;`, which g++ refuses, for a program that had
+       been cleanly refused before the lane existed.
+
+     Both files compiled. **A reused node is not a free implementation:
+     the reuse changed what its key field can contain, and every reader
+     of that field was part of the change.** The type walk lives in one
+     helper now (`component_vec_elem_type`), and `record_id_of_expr`
+     answers through `expr_type` so the two cannot disagree.
+
+     Two more false verdicts came out of the same "resolvers stop at
+     `[`" fact, in the opposite direction. An element selection INSIDE a
+     component-record or responder-state path (`ba.data[0]`,
+     `c.b.tbl[0].data`, `ba.kids[0].p`) resolves in neither lane, so it
+     fell past every one of them onto whichever generic arm caught the
+     leftovers: "index expressions" (`EmitsUncompilable`), "assignment
+     to a target that is neither a DUT port nor a local"
+     (`SilentlyMisLowers` — the loudest verdict in the enum), "field
+     access on a non-DUT value" (`EmitsUncompilable`). v1 compiles the
+     whole family, measured at 0 errors each. Those arms cover much
+     else, so the answer comes BEFORE them, as one precise `Unsupported`
+     — which is true, and names the gap instead of mislabelling it.
+
+     And the write pairing was still asking the wrong resolver.
+     `r.data = c.a.data` — a record local copied from a component record
+     field — was reported "non-matching RHS" under
+     `EmitsUncompilable`, because that arm resolved its RHS with
+     `try_record_field_chain`, which sees record locals only. v1 emits
+     `r.data = c.a.data;` and compiles. Every write lane now goes
+     through `whole_vec_copy_rhs`, which lowers the RHS ONCE and asks
+     the resulting IR for its shape rather than the AST — so an indexed
+     RHS (`r.tbl[0].data`) pairs too, instead of being refused for its
+     spelling. The read-side pairing still has to ask the AST, because
+     both operands are lowered again afterwards; the two positions get
+     different mechanisms for a reason, and the comments say which.
+
+     Smaller, same root: `spelled` was built from field names alone, so
+     `r.tbl[0].data` suggested `r.tbl.data[i]` — a DIFFERENT field,
+     refused by a different diagnostic. It carries the selection now
+     (`r.tbl[…].data[i]`), as a template rather than a paste.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

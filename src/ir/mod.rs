@@ -1398,14 +1398,23 @@ pub struct ConnectEdgeSchema {
     /// Dotted path from the owning scope to the source component. For an
     /// env it is relative to the bound env field; for a testbench it starts
     /// with a testbench-owned component field.
+    ///
+    /// EMPTY means the owner itself — `own_ev -> sb.write_obs`, where the
+    /// event is declared on the env rather than on a sub-component.
+    /// Renderers must not `join(".")` this blindly; use
+    /// `lower::endpoint_label`.
     pub src_path: Vec<String>,
-    /// `out event<T>` field on the source sub-component.
+    /// `out event<T>` field on the source component — a sub-component's,
+    /// or the owner's own when `src_path` is empty.
     pub src_event: String,
     /// Activation provenance of the source event endpoint.
     pub src_activation: Activation,
-    /// Dotted path to the sink sub-component (`["sb"]`).
+    /// Dotted path to the sink component (`["sb"]`). EMPTY means the
+    /// owner itself — `source.observed -> own_sink`. Same rendering
+    /// caveat as `src_path`.
     pub sink_path: Vec<String>,
-    /// Sink sub-component's component schema (to name `<Comp>_<method>`).
+    /// Sink component's schema (to name `<Comp>_<method>`) — a
+    /// sub-component's, or the owner's own when `sink_path` is empty.
     pub sink_component: ComponentId,
     /// What the edge feeds on the sink sub-component.
     pub sink: ConnectSink,

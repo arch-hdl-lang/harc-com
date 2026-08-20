@@ -15,9 +15,9 @@ use super::*;
 mod implementation;
 
 pub(crate) use implementation::{
-    dotted_path, fold_field_default, is_builtin_component_predicate, is_event_field,
-    lower_component_bodies, lower_component_schema, lower_event_payload, lower_queue_elem,
-    resolve_connects, resolve_testbench_connects, scoreboard_is_component,
+    dotted_path, endpoint_label, fold_field_default, is_builtin_component_predicate,
+    is_event_field, lower_component_bodies, lower_component_schema, lower_event_payload,
+    lower_queue_elem, resolve_connects, resolve_testbench_connects, scoreboard_is_component,
     transactor_has_mode_sensitive_analysis_surface, transactor_is_analysis_source,
     transactor_is_component, transactor_is_dut_poking_bfm, transactor_is_event_driven,
     transactor_is_function_library, transactor_is_passive_helper, transactor_is_reactive_monitor,
