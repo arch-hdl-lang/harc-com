@@ -11,7 +11,8 @@ use super::{
     LowerError, V1Status,
 };
 use crate::ast::{
-    CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl, UnaryOp,
+    BinaryOp, CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl,
+    UnaryOp,
 };
 use crate::ir::{
     CallTarget, CovBinBound, CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema,
@@ -281,16 +282,19 @@ fn hook_call_arg_names(group: &str, call: &AstExpr) -> Result<Vec<String>, Lower
 }
 
 /// Recognize a hook-param cover target: `<param>` (scalar), `<param>.<field>`
-/// (record field), or `<param>.<field>[const]` (a `Vec<T, N>` field element),
+/// (record field), or `<param>.<field>[index]` (a `Vec<T, N>` field element),
 /// where `<param>` is one of the covergroup hook trigger's argument names.
 /// Returns `Ok(None)` when the target is not rooted at a hook param so
 /// the caller falls through to DUT-port / literal lowering. A nested
-/// path (`t.a.b`) or a non-constant index is out of subset and errors.
+/// field path (`t.a.b`) remains out of subset; an index may itself be a
+/// supported per-sample cover expression.
 fn lower_hook_param_field(
     group: &str,
     point: &str,
     target: &AstExpr,
     hook_params: &[String],
+    helpers: &HelperRegistry<'_>,
+    extern_fns: &HashMap<String, &ExternFnDecl>,
     consts: &HashMap<String, ConstVal>,
 ) -> Result<Option<Expr>, LowerError> {
     if hook_params.is_empty() {
@@ -315,14 +319,19 @@ fn lower_hook_param_field(
         index: i,
     } = &*cur.kind
     {
-        // Covergroup schemas lower before any runtime scope, so a Vec
-        // lane index can only be a constant literal here (same rule as
-        // DUT-port lanes). Represent it as a constant `Expr::Literal`.
-        let v = cover_const_u64(group, point, ConstRole::LaneIndex, i, consts, hook_params)?;
-        index = Some(Box::new(Expr::Literal {
-            value: v,
-            ty: IrType::Unknown,
-        }));
+        let lowered =
+            match cover_const_u64(group, point, ConstRole::LaneIndex, i, consts, hook_params) {
+                Ok(Some(value)) => Expr::Literal {
+                    value,
+                    ty: IrType::Unknown,
+                },
+                Ok(None) => {
+                    lower_point_target(group, point, i, hook_params, helpers, extern_fns, consts)?
+                }
+                Err(err) => return Err(err),
+            };
+        reject_wide_cover_composition(group, point, "runtime lane selector", &[&lowered])?;
+        index = Some(Box::new(lowered));
         cur = t;
     }
     // Peel parens, then require exactly `<ident>.<field>`.
@@ -351,10 +360,105 @@ fn lower_hook_param_field(
     }))
 }
 
-/// A cover-point target is a pure DUT-bound scalar expression. Keep this
+fn cover_ir_width(expr: &Expr) -> Option<u32> {
+    let type_width = |ty: &IrType| match ty {
+        IrType::UInt(width) | IrType::SInt(width) => *width,
+        IrType::Bool => Some(1),
+        _ => None,
+    };
+    match expr {
+        Expr::Literal { ty, .. } => type_width(ty),
+        Expr::WideLiteral(words) => words
+            .len()
+            .checked_mul(32)
+            .and_then(|width| u32::try_from(width).ok()),
+        Expr::Port(port) => port.width.or(Some(64)),
+        Expr::Unary(_, inner) => cover_ir_width(inner),
+        Expr::Binary(_, lhs, rhs) => match (cover_ir_width(lhs), cover_ir_width(rhs)) {
+            (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+            _ => None,
+        },
+        Expr::Ternary(_, then_expr, else_expr) => {
+            match (cover_ir_width(then_expr), cover_ir_width(else_expr)) {
+                (Some(then_width), Some(else_width)) => Some(then_width.max(else_width)),
+                _ => None,
+            }
+        }
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        Expr::BitSliceDyn { .. } => Some(64),
+        Expr::WidthCast { width, .. } => Some(*width),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            type_width(ret)
+        }
+        _ => None,
+    }
+}
+
+fn reject_wide_cover_composition(
+    group: &str,
+    point: &str,
+    construct: &str,
+    operands: &[&Expr],
+) -> Result<(), LowerError> {
+    if operands
+        .iter()
+        .any(|expr| cover_ir_width(expr).is_some_and(|width| width > 64))
+    {
+        return Err(unsupported(
+            &format!("covergroup `{group}` point `{point}` {construct} over a wide value"),
+            "direct wide values and slices lower, but composed wide unary/binary/ternary \
+             expressions still need type-directed operand coercion",
+        ));
+    }
+    Ok(())
+}
+
+fn cover_wrap_operand_width(expr: &AstExpr) -> Option<u32> {
+    match &*expr.kind {
+        ExprKind::Paren(inner) => cover_wrap_operand_width(inner),
+        ExprKind::Cast { ty, .. } => cast_literal_width(ty),
+        ExprKind::BitSlice { hi, lo, .. } => {
+            let hi = literal_width(hi)?;
+            let lo = literal_width(lo)?;
+            (hi >= lo).then_some(hi - lo + 1)
+        }
+        ExprKind::Call { callee, args } => {
+            let ExprKind::Field { name, .. } = &*callee.kind else {
+                return None;
+            };
+            if !matches!(name.name.as_str(), "trunc" | "zext" | "sext" | "resize") {
+                return None;
+            }
+            let [crate::ast::CallArg::Expr(width)] = args.as_slice() else {
+                return None;
+            };
+            literal_width(width)
+        }
+        ExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+            ) =>
+        {
+            Some(cover_wrap_operand_width(lhs)?.max(cover_wrap_operand_width(rhs)?))
+        }
+        ExprKind::Int(lit) => super::exprs::parse_int_literal(lit).map(|value| {
+            if value == 0 {
+                1
+            } else {
+                64 - value.leading_zeros()
+            }
+        }),
+        ExprKind::Bool(_) => Some(1),
+        _ => None,
+    }
+}
+
+/// A cover-point target is a pure sampled scalar expression. Keep this
 /// subset deliberately smaller than general expression lowering because
-/// covergroup schemas lower before test/run scopes exist: no locals,
-/// helper calls, regblock reads, or transactor edges.
+/// covergroup schemas lower before test/run scopes exist: no run locals,
+/// regblock reads, or transactor edges. Pure file-scope helpers and hook
+/// parameters are available because they do not depend on a run scope.
 ///
 /// Also serves bin range BOUNDS and bin VALUES, so a rejection here
 /// reaches four landings. Out-of-subset expressions are classified by
@@ -391,7 +495,15 @@ fn lower_point_target(
     // later), so carry the param name + field; codegen renders it as the
     // closure arg `param.field` (mirrors v1 emitting `t.burst` over the
     // by-value closure param).
-    if let Some(hp) = lower_hook_param_field(group, point, target, hook_params, consts)? {
+    if let Some(hp) = lower_hook_param_field(
+        group,
+        point,
+        target,
+        hook_params,
+        helpers,
+        extern_fns,
+        consts,
+    )? {
         return Ok(hp);
     }
 
@@ -401,22 +513,46 @@ fn lower_point_target(
         e: &AstExpr,
         consts: &HashMap<String, ConstVal>,
         hook_params: &[String],
+        helpers: &HelperRegistry<'_>,
+        extern_fns: &HashMap<String, &ExternFnDecl>,
     ) -> Result<Option<PortRef>, LowerError> {
         let mut cur = e;
         let mut lane = None;
         if let ExprKind::Index { target, index } = &*cur.kind {
-            // Covergroup schemas lower before any test/run scope exists,
-            // so a lane index has no runtime locals to reference: only a
-            // constant is in subset (`cover_const_u64` rejects anything
-            // else). Kept as `LaneIndex::Const`.
-            lane = Some(crate::ir::LaneIndex::Const(cover_const_u64(
-                group,
-                point,
-                ConstRole::LaneIndex,
-                index,
-                consts,
-                hook_params,
-            )?));
+            // A constant stays compact in the port handle. A per-sample
+            // DUT/hook expression reuses the existing runtime lane-index
+            // variant, exactly like a general expression-position port.
+            lane = Some(
+                match cover_const_u64(
+                    group,
+                    point,
+                    ConstRole::LaneIndex,
+                    index,
+                    consts,
+                    hook_params,
+                ) {
+                    Ok(Some(value)) => crate::ir::LaneIndex::Const(value),
+                    Ok(None) => {
+                        let index = lower_point_target(
+                            group,
+                            point,
+                            index,
+                            hook_params,
+                            helpers,
+                            extern_fns,
+                            consts,
+                        )?;
+                        reject_wide_cover_composition(
+                            group,
+                            point,
+                            "runtime lane selector",
+                            &[&index],
+                        )?;
+                        crate::ir::LaneIndex::Var(Box::new(index))
+                    }
+                    Err(err) => return Err(err),
+                },
+            );
             cur = target;
         }
         let mut segments: Vec<String> = Vec::new();
@@ -444,7 +580,15 @@ fn lower_point_target(
         }
     }
 
-    if let Some(port) = lower_port(group, point, target, consts, hook_params)? {
+    if let Some(port) = lower_port(
+        group,
+        point,
+        target,
+        consts,
+        hook_params,
+        helpers,
+        extern_fns,
+    )? {
         return Ok(Expr::Port(port));
     }
 
@@ -453,12 +597,16 @@ fn lower_point_target(
         match &*cur.kind {
             ExprKind::Paren(inner) => cur = inner,
             ExprKind::Int(s) => {
-                let value =
-                    super::exprs::parse_int_literal(s).ok_or_else(|| unsupported_target(cur))?;
-                return Ok(Expr::Literal {
-                    value,
-                    ty: IrType::Unknown,
-                });
+                let (value, ty) = if let Some(value) = super::exprs::parse_int_literal(s) {
+                    (value, IrType::Unknown)
+                } else if let Some((width, value)) =
+                    super::exprs::parse_sized_int_literal_with_width(s)
+                {
+                    (value, IrType::UInt(Some(width)))
+                } else {
+                    return Err(unsupported_target(cur));
+                };
+                return Ok(Expr::Literal { value, ty });
             }
             // A file-scope `const` / enum variant sampled directly.
             // Degenerate — the coverpoint reads the same value forever —
@@ -490,6 +638,7 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
+                reject_wide_cover_composition(group, point, "unary expression", &[&inner])?;
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -498,6 +647,39 @@ fn lower_point_target(
                 return Ok(Expr::Unary(op, Box::new(inner)));
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(
+                    op,
+                    BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+                ) {
+                    let symbol = match op {
+                        BinaryOp::AddWrap => "+%",
+                        BinaryOp::SubWrap => "-%",
+                        BinaryOp::MulWrap => "*%",
+                        _ => unreachable!(),
+                    };
+                    let lhs_width = cover_wrap_operand_width(lhs);
+                    let rhs_width = cover_wrap_operand_width(rhs);
+                    if let (Some(lhs_width), Some(rhs_width)) = (lhs_width, rhs_width) {
+                        let width = lhs_width.max(rhs_width);
+                        if width <= 64 {
+                            return Err(unsupported(
+                                &format!(
+                                    "covergroup `{group}` point `{point}` wrapping operator \
+                                     `{symbol}` at width {width}"
+                                ),
+                                "v1 preserves the operand widths and applies the wrapping mask; \
+                                 the TB-IR coverpoint path does not carry that mask yet",
+                            ));
+                        }
+                    }
+                    return Err(not_implemented(
+                        &format!(
+                            "covergroup `{group}` point `{point}` wrapping operator `{symbol}`"
+                        ),
+                        "v1 rejects this form because it cannot establish a supported wrapping width",
+                        V1Status::Rejects,
+                    ));
+                }
                 let op = super::exprs::lower_bin_op(*op)?;
                 let lhs = lower_point_target(
                     group,
@@ -517,6 +699,7 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
+                reject_wide_cover_composition(group, point, "binary expression", &[&lhs, &rhs])?;
                 return Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)));
             }
             ExprKind::Ternary {
@@ -551,6 +734,12 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
+                reject_wide_cover_composition(
+                    group,
+                    point,
+                    "ternary expression",
+                    &[&cond, &then_branch, &else_branch],
+                )?;
                 return Ok(Expr::Ternary(
                     Box::new(cond),
                     Box::new(then_branch),
@@ -558,15 +747,6 @@ fn lower_point_target(
                 ));
             }
             ExprKind::BitSlice { target, hi, lo } => {
-                let hi =
-                    cover_const_u32(group, point, ConstRole::SliceBound, hi, consts, hook_params)?;
-                let lo =
-                    cover_const_u32(group, point, ConstRole::SliceBound, lo, consts, hook_params)?;
-                if hi < lo {
-                    return Err(LowerError::Invalid(format!(
-                        "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
-                    )));
-                }
                 let target = lower_point_target(
                     group,
                     point,
@@ -576,11 +756,68 @@ fn lower_point_target(
                     extern_fns,
                     consts,
                 )?;
-                return Ok(Expr::BitSlice {
-                    target: Box::new(target),
-                    hi,
-                    lo,
-                });
+                let bound = |e: &AstExpr| match cover_const_u32(
+                    group,
+                    point,
+                    ConstRole::SliceBound,
+                    e,
+                    consts,
+                    hook_params,
+                ) {
+                    Ok(Some(value)) => Ok(Ok(value)),
+                    Ok(None) => {
+                        let expr = lower_point_target(
+                            group,
+                            point,
+                            e,
+                            hook_params,
+                            helpers,
+                            extern_fns,
+                            consts,
+                        )?;
+                        reject_wide_cover_composition(
+                            group,
+                            point,
+                            "runtime bit-slice selector",
+                            &[&expr],
+                        )?;
+                        Ok(Err(expr))
+                    }
+                    Err(err) => Err(err),
+                };
+                let hi = bound(hi)?;
+                let lo = bound(lo)?;
+                return match (hi, lo) {
+                    (Ok(hi), Ok(lo)) => {
+                        if hi < lo {
+                            return Err(LowerError::Invalid(format!(
+                                "covergroup `{group}` point `{point}` has invalid bit slice [{hi}:{lo}]"
+                            )));
+                        }
+                        Ok(Expr::BitSlice {
+                            target: Box::new(target),
+                            hi,
+                            lo,
+                        })
+                    }
+                    (hi, lo) => Ok(Expr::BitSliceDyn {
+                        target: Box::new(target),
+                        hi: Box::new(match hi {
+                            Ok(value) => Expr::Literal {
+                                value: value.into(),
+                                ty: IrType::Unknown,
+                            },
+                            Err(expr) => expr,
+                        }),
+                        lo: Box::new(match lo {
+                            Ok(value) => Expr::Literal {
+                                value: value.into(),
+                                ty: IrType::Unknown,
+                            },
+                            Err(expr) => expr,
+                        }),
+                    }),
+                };
             }
             ExprKind::Cast { expr, ty } => {
                 let width = cover_cast_width(group, point, ty, consts, hook_params)?
@@ -817,10 +1054,10 @@ fn classify_out_of_subset_target(
         //
         // The previous version documented this split in a comment and
         // still returned one classification for both.
-        ExprKind::Int(lit) if lit.contains('\'') => unsupported(
+        ExprKind::Int(lit) if lit.contains('\'') => not_implemented(
             &format!("{what} sampling the sized literal `{lit}`"),
-            "TB-IR does not lower sized literals in a coverpoint yet; v1 lowers a bare one \
-             correctly here",
+            "the sized literal's value is wider than the 64-bit cover sample; v1 narrows it",
+            V1Status::SilentlyMisLowers,
         ),
         ExprKind::Int(lit) => not_implemented(
             &format!("{what} sampling the over-wide integer literal `{lit}`"),
@@ -1123,7 +1360,22 @@ fn cover_const_u64(
     e: &AstExpr,
     consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
-) -> Result<u64, LowerError> {
+) -> Result<Option<u64>, LowerError> {
+    // Sized literals are values in lane/slice positions: v1 normalizes
+    // their radix spelling and uses the numeric value. Width-method and
+    // type-cast widths are different — v1 requires a plain integer token
+    // there — so keep those roles on their existing rejection path.
+    let mut bare = e;
+    while let ExprKind::Paren(inner) = &*bare.kind {
+        bare = inner;
+    }
+    if matches!(role, ConstRole::LaneIndex | ConstRole::SliceBound) {
+        if let ExprKind::Int(lit) = &*bare.kind {
+            if let Some(value) = super::exprs::parse_sized_int_literal(lit) {
+                return Ok(Some(value));
+            }
+        }
+    }
     // A HOOK PARAMETER beats a file-scope `const` of the same name,
     // and this is where that rule was missing. `mentions_hook_param`
     // guarded the bin path only, so with `hookable run_for(cmd, k)` and
@@ -1138,22 +1390,18 @@ fn cover_const_u64(
     // one the fold newly reaches, so leaving this to the bin path would
     // have widened the hole while documenting the guard.
     //
-    // TB-IR's cover model needs a static bound, so a hook-parameter one
-    // cannot be folded at all — it refuses, and says which name it is
-    // deferring to.
+    // A per-call lane/slice bound is dynamic rather than erroneous. Width
+    // roles remain static and keep their measured v1 classifications.
     if let Some(name) = first_hook_param(e, hook_params) {
         let what = format!(
             "covergroup `{group}` point `{point}` {} `{name}`",
             role.name()
         );
+        if role.v1_on_unfoldable().is_none() {
+            return Ok(None);
+        }
         return Err(match role.v1_on_unfoldable() {
-            None => unsupported(
-                &what,
-                format!(
-                    "`{name}` is a hook parameter, so the bound is only known per call; the \
-                     TB-IR cover model needs a static one, and v1 emits the argument"
-                ),
-            ),
+            None => unreachable!(),
             Some(V1Status::Rejects) => not_implemented(
                 &what,
                 format!(
@@ -1213,7 +1461,14 @@ fn cover_const_u64(
                 status,
             ),
         }),
-        Ok(v) => Ok(v.bits),
+        Ok(v) => Ok(Some(v.bits)),
+        Err(ConstFoldErr::Unsupported(_))
+            if matches!(role, ConstRole::LaneIndex | ConstRole::SliceBound)
+                && first_unresolved_name(e, consts).is_none()
+                && first_unfoldable_int_literal(e).is_none() =>
+        {
+            Ok(None)
+        }
         Err(err) => Err(cover_const_refusal(group, point, role, e, consts, err)),
     }
 }
@@ -1231,10 +1486,8 @@ fn cover_const_u64(
 ///     with a warning ("integer constant is too large for its type")
 ///     and truncates, so the coverpoint silently samples a bound
 ///     nobody wrote.
-///   * anything else — a runtime expression like `[dut.en:0]`, which
-///     v1 emits as a genuinely dynamic bound that compiles and runs.
-///     TB-IR's cover model needs a static width, so this is a real
-///     subset gap with a working escape hatch.
+///   * anything else — a runtime lane/slice bound is represented directly;
+///     width roles keep v1's own reject/silent-fallback classification.
 fn cover_const_refusal(
     group: &str,
     point: &str,
@@ -1279,10 +1532,24 @@ fn cover_const_refusal(
     }
     if let Some(lit) = first_unfoldable_int_literal(e) {
         if lit.contains('\'') {
-            return unsupported(
-                &format!("{what} written as the sized literal `{lit}`"),
-                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
-            );
+            return match role {
+                ConstRole::LaneIndex | ConstRole::SliceBound => not_implemented(
+                    &format!("{what} written as the sized literal `{lit}`"),
+                    "the literal does not fit the TB-IR bound domain; v1 narrows it into a \
+                     C++ index/bound",
+                    V1Status::SilentlyMisLowers,
+                ),
+                ConstRole::WidthArg => not_implemented(
+                    &format!("{what} written as the sized literal `{lit}`"),
+                    "v1 requires a plain integer width token and rejects a sized one too",
+                    V1Status::Rejects,
+                ),
+                ConstRole::CastWidth => not_implemented(
+                    &format!("{what} written as the sized literal `{lit}`"),
+                    "v1 does not resolve sized cast widths and emits its 64-bit fallback",
+                    V1Status::SilentlyMisLowers,
+                ),
+            };
         }
         return not_implemented(
             &format!("{what} written as the over-wide literal `{lit}`"),
@@ -1294,11 +1561,23 @@ fn cover_const_refusal(
     }
     match err {
         ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("{what}: {detail}")),
-        ConstFoldErr::Unsupported(_) => unsupported(
-            &format!("{what} that is not a compile-time constant"),
-            "the TB-IR cover model needs a static bound; v1 emits the expression as a \
-             RUNTIME bound, which compiles and samples a width that varies per cycle",
-        ),
+        ConstFoldErr::Unsupported(_) => match role {
+            ConstRole::LaneIndex | ConstRole::SliceBound => not_implemented(
+                &format!("{what} that cannot be represented as a runtime scalar"),
+                "the expression is outside the coverpoint sampler subset",
+                V1Status::SilentlyMisLowers,
+            ),
+            ConstRole::WidthArg => not_implemented(
+                &format!("{what} that is not a plain integer literal"),
+                "v1 rejects non-literal width-method arguments too",
+                V1Status::Rejects,
+            ),
+            ConstRole::CastWidth => not_implemented(
+                &format!("{what} that is not a plain integer literal"),
+                "v1 drops the written cast width and emits its 64-bit fallback",
+                V1Status::SilentlyMisLowers,
+            ),
+        },
     }
 }
 
@@ -1378,14 +1657,17 @@ fn cover_const_u32(
     e: &AstExpr,
     consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
-) -> Result<u32, LowerError> {
-    let v = cover_const_u64(group, point, role, e, consts, hook_params)?;
-    u32::try_from(v).map_err(|_| {
-        LowerError::Invalid(format!(
-            "covergroup `{group}` point `{point}` {} {v} does not fit in u32",
-            role.name()
-        ))
-    })
+) -> Result<Option<u32>, LowerError> {
+    cover_const_u64(group, point, role, e, consts, hook_params)?
+        .map(|v| {
+            u32::try_from(v).map_err(|_| {
+                LowerError::Invalid(format!(
+                    "covergroup `{group}` point `{point}` {} {v} does not fit in u32",
+                    role.name()
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn cover_width_arg(
@@ -1397,7 +1679,8 @@ fn cover_width_arg(
     consts: &HashMap<String, ConstVal>,
     hook_params: &[String],
 ) -> Result<u32, LowerError> {
-    let width = cover_const_u32(group, point, ConstRole::WidthArg, e, consts, hook_params)?;
+    let width = cover_const_u32(group, point, ConstRole::WidthArg, e, consts, hook_params)?
+        .expect("width roles never lower as dynamic bounds");
     // The spec says LITERAL — "Width `N` must be a positive constant
     // integer literal in `1..=1024`" — and v1 enforces it with
     // `eval_const_width`, refusing anything else with "requires a
@@ -1428,62 +1711,6 @@ fn cover_width_arg(
         return Err(LowerError::Invalid(format!(
             "covergroup `{group}` point `{point}` {why}"
         )));
-    }
-    if width > 64 {
-        // NOT clamped, and an earlier version of this arm clamped it —
-        // "a coverpoint samples 64 bits, so widening past it is the
-        // identity". That holds only when the widened value is sampled
-        // DIRECTLY. Slice it first and v1 keeps a real 128-bit
-        // intermediate while a clamped TB-IR throws the width away and
-        // shifts a `uint64_t` past its own width:
-        //
-        //   cover dut.count_out[3:0].sext<128>()[70:65]
-        //     v1   : harc_bits(harc_sext_u128(..., 4, 128), 70, 65)
-        //            -> 63 at count_out = 15
-        //     TB-IR: (((uint64_t)(nibble sign-extended to 64)) >> 65) & 0x3F
-        //            -> 0, and g++ only warns
-        //
-        // Both build, neither says anything, and the numbers differ for
-        // every value whose low nibble has bit 3 set. So the honest
-        // answer is the one the arm gave before: refuse, and point at
-        // the backend that gets it right.
-        // Split at 128 exactly as `cover_cast_width` does, and for the
-        // same measured reason — which this arm did not do, so a
-        // `>128` CAST underneath a `>64` width method lost the accurate
-        // verdict: `(dut.count_out as uint<300>).trunc<200>()` came out
-        // `Unsupported` while v1 gives "no matching function for call
-        // to `harc_rt::HarcWide<10>::HarcWide(__int128 unsigned)`".
-        //
-        // That is the very leak `CastWidthPolicy` was introduced to
-        // close, reappearing one arm over: `Report` suppresses the
-        // cast's own refusal, so this arm has to carry it.
-        // v1 builds all of these — `_harc_u128`, the `harc_*_u128`
-        // helpers, and `HarcWide<N>` above 128 — and keeps the extra
-        // bits, which is why the suggestion is honest.
-        //
-        // There used to be an `EmitsUncompilable` split at 128 here,
-        // on the strength of g++ rejecting `HarcWide<10>::HarcWide(
-        // __int128 unsigned)`. That rejection is an artifact of the
-        // flag I probed with: `HarcWide`'s converting constructor is
-        // gated on `std::is_integral_v<T>`, which libstdc++ reports
-        // FALSE for `__int128` under `-std=c++20` and TRUE under
-        // `-std=gnu++20` — and `src/main.rs` builds the emitted
-        // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`. Under the
-        // real flags every one of those programs compiles.
-        //
-        // `tests/wide_cast_cpp.rs` already carried a comment saying
-        // exactly this ("Match the real build: `run_verilator`
-        // (`src/main.rs`) sets `CFG_CXXFLAGS_STD=-std=gnu++20`"), so
-        // this is the same failure as `resize`: a fact written down in
-        // the repo, re-derived wrongly from a local experiment. Four
-        // rounds of machinery — the 128 split, `CastWidthPolicy`'s
-        // second reason to exist, the `src_width > 128` arm — were
-        // built on one mis-set compiler flag.
-        return Err(unsupported(
-            &format!("covergroup `{group}` point `{point}` `.{method}<{width}>()`"),
-            "the TB-IR covergroup expression model is 64-bit; v1 carries a `_harc_u128` \
-             intermediate and keeps the extra bits",
-        ));
     }
     Ok(width)
 }
@@ -1534,14 +1761,10 @@ fn cover_cast_width(
             args,
             ..
         } => match args.first() {
-            Some(crate::ast::TypeArg::Expr(e)) => Some(cover_const_u32(
-                group,
-                point,
-                ConstRole::CastWidth,
-                e,
-                consts,
-                hook_params,
-            )?),
+            Some(crate::ast::TypeArg::Expr(e)) => Some(
+                cover_const_u32(group, point, ConstRole::CastWidth, e, consts, hook_params)?
+                    .expect("cast-width roles never lower as dynamic bounds"),
+            ),
             Some(_) => None,
             None => Some(64),
         },
@@ -1552,20 +1775,6 @@ fn cover_cast_width(
             return Err(LowerError::Invalid(format!(
                 "covergroup `{group}` point `{point}` cast width must be greater than zero"
             )));
-        }
-        if width > 64 {
-            // No split at 128. v1 emits `(_harc_u128)(v)` up to 128 and
-            // `(HarcWide<N>)(v)` above it, and BOTH compile under the
-            // `-std=gnu++20` the product builds with — see the note in
-            // `cover_width_arg`. The `EmitsUncompilable` arm that used
-            // to live here was measured with `-std=c++20`, where
-            // `HarcWide`'s `is_integral_v` gate rejects `__int128`.
-            return Err(unsupported(
-                &format!("covergroup `{group}` point `{point}` cast to {width} bits"),
-                "the TB-IR covergroup expression model is 64-bit; v1 widens through \
-                 `_harc_u128` (or `harc_rt::HarcWide<N>` above 128) and keeps the extra \
-                 bits",
-            ));
         }
     }
     Ok(width)
@@ -1640,13 +1849,19 @@ fn cover_infer_expr_width(
             }
             Ok(None)
         }
-        ExprKind::Int(s) => Ok(super::exprs::parse_int_literal(s).map(|v| {
-            if v == 0 {
-                1
+        ExprKind::Int(s) => Ok(
+            if let Some((width, _)) = super::exprs::parse_sized_int_literal_with_width(s) {
+                Some(width)
             } else {
-                64 - v.leading_zeros()
-            }
-        })),
+                super::exprs::parse_int_literal(s).map(|v| {
+                    if v == 0 {
+                        1
+                    } else {
+                        64 - v.leading_zeros()
+                    }
+                })
+            },
+        ),
         _ => Ok(None),
     }
 }
@@ -1875,10 +2090,9 @@ fn bin_bound_fallback(
     }
     if let Some(lit) = first_unfoldable_int_literal(e) {
         if lit.contains('\'') {
-            return Err(unsupported(
-                &format!("covergroup `{group}` bin `{bin}` spec `{lit}`"),
-                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
-            ));
+            let expr = lower_point_target(group, bin, e, hook_params, helpers, extern_fns, consts)
+                .map_err(|err| relabel_point_as_bin(err, bin))?;
+            return Ok(CovBinBound::Runtime(expr));
         }
         return Err(not_implemented(
             &format!("covergroup `{group}` bin `{bin}` spec `{lit}`"),
@@ -1903,19 +2117,22 @@ fn bin_bound_fallback(
 /// is reached first because `fold_const` is not consulted for a shape
 /// that is already a literal.
 fn parse_bound(group: &str, bin: &str, s: &str) -> Result<u64, LowerError> {
-    super::exprs::parse_int_literal(s).ok_or_else(|| {
-        if s.contains('\'') {
-            return unsupported(
+    super::exprs::parse_int_literal(s)
+        .or_else(|| super::exprs::parse_sized_int_literal(s))
+        .ok_or_else(|| {
+            if s.contains('\'') {
+                return not_implemented(
                 &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),
-                "TB-IR does not lower sized literals yet; v1 folds a bare one correctly here",
+                "the sized literal's value is wider than the 64-bit cover sample; v1 narrows it",
+                V1Status::SilentlyMisLowers,
             );
-        }
-        not_implemented(
-            &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),
-            "v1 emits the literal verbatim into `_v == <lit>` and g++ takes it with a \
+            }
+            not_implemented(
+                &format!("covergroup `{group}` bin `{bin}` spec `{s}`"),
+                "v1 emits the literal verbatim into `_v == <lit>` and g++ takes it with a \
              warning — \"integer constant is too large for its type\" — so the bin compares \
              against a truncated value with no error",
-            V1Status::SilentlyMisLowers,
-        )
-    })
+                V1Status::SilentlyMisLowers,
+            )
+        })
 }

@@ -31,6 +31,26 @@ covergroup ExprCov @(posedge dut.clk)
             two = {2}
             three = {3}
         end bins
+    cp_sized_value : cover 32'h7
+        bins
+            seven = {4'd7}
+        end bins
+    cp_sized_slice : cover dut.count_out[4'd3:4'd0]
+        bins
+            max = {4'd15}
+        end bins
+    cp_runtime_slice : cover dut.count_out[dut.en + 2:0]
+        bins
+            zero = {0}
+        end bins
+    cp_wide_sign : cover dut.count_out[3:0].sext<128>()[70:65]
+        bins
+            filled = {63}
+        end bins
+    cp_wide_cast : cover (dut.count_out as uint<200>)[70:65]
+        bins
+            zero = {0}
+        end bins
     cross cp_low_nibble, cp_activity
 end covergroup ExprCov
 
@@ -72,6 +92,11 @@ impl CovExprTargetsTest for CovExprTargetsTb
         assert cov.cp_low_pair.one > 0 else fail("low-pair one bin hole")
         assert cov.cp_low_pair.two > 0 else fail("low-pair two bin hole")
         assert cov.cp_low_pair.three > 0 else fail("low-pair three bin hole")
+        assert cov.cp_sized_value.seven > 0 else fail("sized literal/bin hole")
+        assert cov.cp_sized_slice.max > 0 else fail("sized slice bound hole")
+        assert cov.cp_runtime_slice.zero > 0 else fail("runtime slice bound hole")
+        assert cov.cp_wide_sign.filled > 0 else fail("128-bit cover intermediate hole")
+        assert cov.cp_wide_cast.zero > 0 else fail("wide cover intermediate hole")
         log(info, "coverage assertions passed")
     end check
 end impl CovExprTargetsTest

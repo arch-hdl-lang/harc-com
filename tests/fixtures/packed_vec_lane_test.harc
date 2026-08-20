@@ -18,9 +18,13 @@
 //                samples both shapes so sampler codegen is covered too.
 
 covergroup PackedVecLaneCov @(posedge dut.clk)
-    cp_packed_id0 : cover dut.lane_id_out[0]
+    cp_packed_id0 : cover dut.lane_id_out[2'd0]
         bins
             id4 = {4}
+        end bins
+    cp_packed_dynamic : cover dut.lane_id_out[dut.lane_valid_out[0]]
+        bins
+            id10 = {10}
         end bins
     cp_unpacked0 : cover dut.pass_uvec_out[0]
         bins
@@ -99,6 +103,8 @@ impl PackedVecLaneTest for PackedVecLaneTb
         cov.report()
         assert cov.cp_packed_id0.id4 > 0
             else fail("packed lane coverpoint did not sample lane_id_out[0] == 4")
+        assert cov.cp_packed_dynamic.id10 > 0
+            else fail("runtime lane coverpoint did not sample lane_id_out[1] == 10")
         assert cov.cp_unpacked0.u42 > 0
             else fail("unpacked array coverpoint did not sample pass_uvec_out[0] == 0x42")
     end check

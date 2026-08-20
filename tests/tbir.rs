@@ -22275,7 +22275,7 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
 
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert!(lanes.contains(LANE), "lane fixture shape changed");
     let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
 
@@ -22330,8 +22330,9 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
 
     // Two more shapes, two more verdicts, from the same helper.
     let runtime = slice("dut.count_out[dut.en:0]");
-    let msg = assert_unsupported(&lower_src(&runtime).unwrap_err());
-    assert!(msg.contains("not a compile-time constant"), "{msg}");
+    let prog = lower_src(&runtime).expect("a runtime slice bound lowers");
+    verify::verify_program(&prog).expect("a runtime slice bound verifies");
+    assert!(emit_cpp_src(&runtime).contains("harc_rt::harc_bits"));
     let v1 = cpp_tb::emit(&merged_src(&runtime)).expect("v1 emits a dynamic bound");
     assert!(
         v1.contains("(uint32_t)(harc_rt::harc_read(dut->en))"),
@@ -22346,8 +22347,8 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     assert!(msg.contains("over-wide literal"), "{msg}");
 
     let sized = slice("dut.count_out[4'd3:0]");
-    let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
-    assert!(msg.contains("sized literal"), "{msg}");
+    let prog = lower_src(&sized).expect("a sized slice bound lowers");
+    verify::verify_program(&prog).expect("a sized slice bound verifies");
 
     // NESTED, both kinds. The walk that finds a name or a literal
     // inside `[K + N:0]` is what makes any of the above work on a
@@ -22378,12 +22379,28 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
         );
         assert!(msg.contains("over-wide literal"), "`{t}`: {msg}");
     }
-    // …and the reason that one keeps the suggestion: v1 folds it.
+    // …and the reason lowering it is exact: v1 folds it to the same bound.
     let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
     assert!(
         v1.contains("(uint32_t)(3)"),
         "v1 folds `4'd3` to 3, so `--codegen v1` really is a way out: {v1}"
     );
+
+    // Sized tokens are values, not legal width arguments. v1 rejects a
+    // width method and silently drops a cast width, so neither is a
+    // remaining escape hatch.
+    let sized_method = slice("dut.count_out[3:0].zext<8'd8>()");
+    assert_not_implemented(
+        &lower_src(&sized_method).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    cpp_tb::emit(&merged_src(&sized_method)).expect_err("v1 rejects a sized method width");
+    let sized_cast = slice("(dut.count_out as uint<8'd8>)");
+    assert_not_implemented(
+        &lower_src(&sized_cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    cpp_tb::emit(&merged_src(&sized_cast)).expect("v1 silently falls back to a 64-bit cast");
 }
 
 /// A coverpoint bound is a constant EXPRESSION, not just a literal or a
@@ -22417,7 +22434,7 @@ fn a_constant_expression_coverpoint_bound_folds() {
     }
     // The lane-index role folds through the same helper.
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert_eq!(
         emit_cpp_src(&lanes.replacen(LANE, "cover dut.lane_id_out[2 - 2]", 1)),
         emit_cpp_src(&lanes),
@@ -22901,8 +22918,8 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
     cpp_tb::emit(&merged_src(&eq_trunc)).expect_err("v1 refuses a no-op trunc");
     emit_cpp_src(&slice("dut.count_out[7:0].zext<8>()"));
 
-    // Wide receivers and wide widths alike keep the suggestion: v1
-    // builds all of them under `-std=gnu++20`, which is what
+    // Wide receivers and wide widths alike now lower: v1 builds all of
+    // them under `-std=gnu++20`, which is what
     // `src/main.rs` passes to the emitted testbench. An
     // `EmitsUncompilable` split at 128 used to live here and in
     // `cover_cast_width`, measured with `-std=c++20`, where
@@ -22916,7 +22933,10 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
         // cast" when there is no cast at all.
         "dut.count_out[200:0].trunc<65>()",
     ] {
-        assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        let src = slice(t);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{t}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{t}` verifies: {e:?}"));
+        emit_cpp_src(&src);
         cpp_tb::emit(&merged_src(&slice(t))).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
     }
 
@@ -22933,14 +22953,15 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
         emit_cpp_src(&src);
         cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
     }
-    // A folded bound with a width ABOVE 64 is still refused, but for
-    // the 64-bit model rather than for direction — `Unsupported`, not
-    // the `Invalid` the folding inference used to produce.
+    // A folded bound with a width above 64 is still not a direction
+    // error; the wide expression model now lowers it.
     let folded_wide = format!(
         "const HI = 100\n\n{}",
         slice("dut.count_out[HI:0].zext<70>()")
     );
-    assert_unsupported(&lower_src(&folded_wide).unwrap_err());
+    let prog = lower_src(&folded_wide).expect("a folded wide receiver lowers");
+    verify::verify_program(&prog).expect("a folded wide receiver verifies");
+    emit_cpp_src(&folded_wide);
     cpp_tb::emit(&merged_src(&folded_wide)).expect("v1 builds it");
     // …while the literal spelling of the same program stays `Invalid`
     // under both backends.
@@ -22960,7 +22981,7 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
 ///
 /// | coverpoint | v1 | verdict |
 /// |---|---|---|
-/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | `Unsupported` |
+/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | lowered |
 /// | `cmd.ticks.trunc<k>()` | refuses: "requires a constant integer width" | `Rejects` |
 /// | `cmd.ticks.zext<k>()` | same refusal | `Rejects` |
 /// | `(cmd.ticks as uint<k>)` | `(uint64_t)(cmd.ticks)` — width dropped | `SilentlyMisLowers` |
@@ -22994,21 +23015,22 @@ fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
         )
     };
 
-    // The role v1 gets right keeps the suggestion…
+    // The dynamic role v1 gets right lowers through `BitSliceDyn`…
     let slice = point("cmd.ticks[k:0]");
-    let msg = assert_unsupported(&lower_src(&slice).unwrap_err());
-    assert!(msg.contains("bit-slice bound `k`"), "{msg}");
+    let prog = lower_src(&slice).expect("a hook-parameter slice bound lowers");
+    verify::verify_program(&prog).expect("a hook-parameter slice bound verifies");
+    assert!(emit_cpp_src(&slice).contains("(uint32_t)(k)"));
     let v1 = cpp_tb::emit(&merged_src(&slice)).expect("v1 emits the per-call bound");
     assert!(
         v1.contains("harc_bits(cmd.ticks, (uint32_t)(k)"),
         "v1 emits the hook ARGUMENT as the bound: {v1}"
     );
-    // …and it is a real hazard, not a hypothetical: an unrelated const
-    // of the same name must not capture it.
-    let msg = assert_unsupported(&lower_src(&format!("const k = 7\n\n{slice}")).unwrap_err());
+    // …and an unrelated const of the same name must not capture it.
+    let shadowed = format!("const k = 7\n\n{slice}");
+    let cpp = emit_cpp_src(&shadowed);
     assert!(
-        msg.contains("is a hook parameter"),
-        "a file-scope `const k` must not fold the bound to [7:0]: {msg}"
+        cpp.contains("(uint32_t)(k)") && !cpp.contains("(uint32_t)(7)"),
+        "a file-scope `const k` must not fold the hook argument to [7:0]: {cpp}"
     );
 
     // The two roles v1 refuses…
@@ -23049,7 +23071,7 @@ fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
 #[test]
 fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert!(lanes.contains(LANE), "fixture shape changed");
     let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
 
@@ -23110,8 +23132,8 @@ fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
     );
 }
 
-/// A width above 64 bits is REFUSED, not clamped — and an earlier
-/// version of this test asserted the clamp, on the argument that "a
+/// A width above 64 bits keeps its real intermediate width — an earlier
+/// version clamped it, on the argument that "a
 /// coverpoint samples 64 bits, so widening past it is the identity".
 ///
 /// That holds only when the widened value is sampled DIRECTLY. Slice
@@ -23130,43 +23152,39 @@ fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
 /// turned an accurate `--codegen v1` suggestion into a silently wrong
 /// sample, which is the one outcome this sweep exists to prevent.
 ///
-/// The refusals split where v1 stops working:
-///
-/// | construct | v1 | verdict |
-/// |---|---|---|
-/// | `.sext<128>()`, `as uint<128>` | `_harc_u128`, compiles | `Unsupported` |
-/// | `as uint<200>` | `HarcWide<7>`, g++ rejects the ctor | `EmitsUncompilable` |
 #[test]
-fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
+fn a_coverpoint_width_above_64_keeps_the_extra_bits() {
     let cov = fixture("cov_expr_targets_test.harc");
     const CP: &str = "cover dut.count_out[3:0]\n";
     let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
 
-    // The identity claim, falsified: v1's sliced form reads bits the
-    // 64-bit model does not have.
+    // The identity claim, falsified: the sliced form reads bits that a
+    // clamped 64-bit intermediate would not have.
     let sliced = slice("dut.count_out[3:0].sext<128>()[70:65]");
-    let msg = assert_unsupported(&lower_src(&sliced).unwrap_err());
-    assert!(msg.contains("`.sext<128>()`"), "{msg}");
+    let prog = lower_src(&sliced).expect("a sliced 128-bit intermediate lowers");
+    verify::verify_program(&prog).expect("a sliced 128-bit intermediate verifies");
+    assert!(emit_cpp_src(&sliced).contains("harc_sext_u128"));
     let v1 = cpp_tb::emit(&merged_src(&sliced)).expect("v1 emits the 128-bit slice");
     assert!(
         v1.contains("harc_sext_u128") && v1.contains("(uint32_t)(70), (uint32_t)(65)"),
         "v1 slices bits 70:65 of a real 128-bit value: {v1}"
     );
 
-    // Every widening form refuses, and each names itself.
-    for (t, want) in [
-        ("dut.count_out[3:0].sext<128>()", "`.sext<128>()`"),
-        ("dut.count_out[3:0].zext<128>()", "`.zext<128>()`"),
-        ("dut.count_out[3:0].resize<128>()", "`.resize<128>()`"),
-        ("(dut.count_out as uint<128>)", "cast to 128 bits"),
-        ("(dut.count_out as sint<128>)", "cast to 128 bits"),
-        ("(dut.count_out as uint<65>)", "cast to 65 bits"),
+    // Every widening form lowers and verifies.
+    for t in [
+        "dut.count_out[3:0].sext<128>()",
+        "dut.count_out[3:0].zext<128>()",
+        "dut.count_out[3:0].resize<128>()",
+        "(dut.count_out as uint<128>)",
+        "(dut.count_out as sint<128>)",
+        "(dut.count_out as uint<65>)",
     ] {
-        let msg = assert_unsupported(&lower_src(&slice(t)).unwrap_err());
-        assert!(msg.contains(want), "`{t}`: {msg}");
-        // …and the claim behind the suggestion: v1 builds it.
-        cpp_tb::emit(&merged_src(&slice(t)))
-            .unwrap_or_else(|e| panic!("`{t}`: v1 must emit it for the suggestion to hold: {e}"));
+        let src = slice(t);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{t}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{t}` verifies: {e:?}"));
+        emit_cpp_src(&src);
+        cpp_tb::emit(&merged_src(&src))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 parity oracle must emit it: {e}"));
     }
 
     // `trunc` is the exception: it NARROWS, so whether v1 accepts it
@@ -23199,8 +23217,9 @@ fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
     // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`.
     // `tests/wide_cast_cpp.rs` already said so in a comment.
     let wide = slice("(dut.count_out as uint<200>)");
-    let msg = assert_unsupported(&lower_src(&wide).unwrap_err());
-    assert!(msg.contains("cast to 200 bits"), "{msg}");
+    let prog = lower_src(&wide).expect("a 200-bit coverpoint cast lowers");
+    verify::verify_program(&prog).expect("a 200-bit coverpoint cast verifies");
+    assert!(emit_cpp_src(&wide).contains("harc_wide_"));
     let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it");
     assert!(v1.contains("HarcWide<7>"), "{v1}");
 
@@ -23903,17 +23922,18 @@ fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
 ///
 /// | spec | v1 emits | verdict |
 /// |---|---|---|
-/// | `4'd0` | folds to `_v == 0` — correct | `Unsupported`: v1 really is a way out |
+/// | `4'd0` | folds to `_v == 0` — correct | lowered |
 /// | `99999999999999999999999` | verbatim; g++ warns and truncates | `SilentlyMisLowers` |
 #[test]
 fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     let spec = |b: &str| fixture.replace("en0 = {0}", &format!("en0 = {{{b}}}"));
 
-    let msg = assert_unsupported(&lower_src(&spec("4'd0")).unwrap_err());
-    assert!(msg.contains("sized literal"), "{msg}");
-    // …and the claim behind that suggestion: v1 folds it to the same
-    // comparison the plain literal produces.
+    let sized = spec("4'd0");
+    let prog = lower_src(&sized).expect("a sized exact bin lowers");
+    verify::verify_program(&prog).expect("a sized exact bin verifies");
+    assert_eq!(emit_cpp_src(&sized), emit_cpp_src(&spec("0")));
+    // v1 folds it to the same comparison the plain literal produces.
     assert_eq!(
         cpp_tb::emit(&merged_src(&spec("4'd0"))).expect("v1 emits"),
         cpp_tb::emit(&merged_src(&spec("0"))).expect("v1 emits"),
@@ -23934,7 +23954,16 @@ fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     // Both landings — a member and a range end — share one
     // implementation, so both are checked.
     let range = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [4'd1 .. 7]");
-    assert!(assert_unsupported(&lower_src(&range).unwrap_err()).contains("sized literal"));
+    let prog = lower_src(&range).expect("a sized range end lowers");
+    verify::verify_program(&prog).expect("a sized range end verifies");
+
+    let compound = spec("4'd1 + 1");
+    let prog = lower_src(&compound).expect("a sized literal inside a bin expression lowers");
+    verify::verify_program(&prog).expect("a sized literal inside a bin expression verifies");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&compound)).expect("v1 emits compound sized bin"),
+        cpp_tb::emit(&merged_src(&spec("1 + 1"))).expect("v1 emits plain compound bin")
+    );
 }
 
 /// A bin spec is a constant EXPRESSION, not just a literal or a name.
@@ -24328,32 +24357,104 @@ fn parentheses_do_not_hide_the_failing_node_from_the_classifier() {
     );
 }
 
-/// A Verilog-sized literal in a coverpoint target keeps pointing at v1,
-/// which lowers a bare one correctly — the same split the addrmap and
-/// regblock address folds carry.
+/// Coverpoint values use expression capabilities the general TB-IR path
+/// already owns: validated sized literals, runtime slice/lane indices and
+/// wide intermediates.  Keep a positive v1 control for every spelling so
+/// this stays a retirement-gap test rather than an inferred enhancement.
 #[test]
-fn a_sized_literal_coverpoint_target_still_points_at_v1() {
-    let fixture = fixture("cov_runtime_bound_test.harc");
-    let src = fixture.replace("cp_en : cover dut.en", "cp_en : cover 32'h7");
+fn v1_working_coverpoint_value_forms_lower_and_verify() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    const TARGET: &str = "cp_en : cover dut.en";
+    let target = |expr: &str| base.replace(TARGET, &format!("cp_en : cover {expr}"));
 
-    let err = lower_src(&src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("sampling the sized literal"), "{msg}");
+    for (what, expr, tbir_needle, v1_needle) in [
+        (
+            "sized literal",
+            "32'h7",
+            "uint64_t _v = (uint64_t)(7)",
+            "(uint64_t)(0x7)",
+        ),
+        (
+            "sized slice bounds",
+            "dut.count_out[4'd3:4'd0]",
+            "harc_bits",
+            "(uint32_t)(3), (uint32_t)(0)",
+        ),
+        (
+            "runtime slice bounds",
+            "dut.count_out[dut.en + 2:0]",
+            "harc_rt::harc_bits",
+            "(uint32_t)(harc_rt::harc_read(dut->en) + 2)",
+        ),
+        (
+            "128-bit intermediate",
+            "dut.count_out[3:0].sext<128>()[70:65]",
+            "harc_sext_u128",
+            "harc_sext_u128",
+        ),
+        (
+            "wide intermediate",
+            "(dut.count_out as uint<200>)[70:65]",
+            "harc_wide_trunc<7>",
+            "harc_bits",
+        ),
+    ] {
+        let src = target(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        let tbir = emit_cpp_src(&src);
+        assert!(
+            tbir.contains(tbir_needle),
+            "{what}: missing `{tbir_needle}`:\n{tbir}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+        assert!(
+            v1.contains(v1_needle),
+            "{what}: missing v1 `{v1_needle}`:\n{v1}"
+        );
+    }
 
-    // v1's evidence: it lowers the sized literal to the right value.
-    assert!(
-        cpp_tb::emit(&merged_src(&src))
-            .expect("v1 emits a sized literal")
-            .contains("(uint64_t)(0x7)"),
-        "v1 lowers a bare sized literal correctly, which is why this points at it"
-    );
+    for (what, from, to) in [
+        ("sized exact bin", "en0 = {0}", "en0 = {4'd0}"),
+        (
+            "sized range bounds",
+            "const_hi = [8 .. 15]",
+            "const_hi = [8'd8 .. 8'd15]",
+        ),
+    ] {
+        let src = base.replace(from, to);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+    }
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    for (what, expr, needle) in [
+        (
+            "sized lane index",
+            "dut.lane_id_out[2'd0]",
+            "lane_id_out[0]",
+        ),
+        (
+            "runtime lane index",
+            "dut.lane_id_out[dut.lane_valid_out[0]]",
+            "lane_id_out[dut->lane_valid_out[0]]",
+        ),
+    ] {
+        let src = lanes.replace("cover dut.lane_id_out[2'd0]", &format!("cover {expr}"));
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        let tbir = emit_cpp_src(&src);
+        assert!(tbir.contains(needle), "{what}: missing `{needle}`: {tbir}");
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+    }
 
     // An OVER-WIDE literal shares the same `ExprKind::Int` arm and gets
     // the opposite classification: v1 emits a `_harc_u128` composite
     // that narrows, so the coverpoint would sample a truncated value.
     // Pointing there would be the misdirection this sweep exists to
     // remove.
-    let wide = fixture.replace("cp_en : cover dut.en", "cp_en : cover 0x10000000000000000");
+    let wide = base.replace("cp_en : cover dut.en", "cp_en : cover 0x10000000000000000");
     let msg = assert_not_implemented(
         &lower_src(&wide).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
@@ -24364,6 +24465,245 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
             .expect("v1 emits an over-wide literal")
             .contains("_harc_u128"),
         "v1 emits the narrowing composite"
+    );
+
+    let wide_sized = base.replace(
+        "cp_en : cover dut.en",
+        "cp_en : cover 128'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    );
+    assert_not_implemented(
+        &lower_src(&wide_sized).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+
+    // Retain the DECLARED width, not only the numeric value. A later
+    // signed extension needs to know that 4'hF has a four-bit sign bit.
+    let signed_sized = target("(4'hF).sext<8>()");
+    let prog = lower_src(&signed_sized).expect("a sized literal receiver lowers");
+    let ir::Expr::WidthCast {
+        src_width: Some(4),
+        inner,
+        ..
+    } = &prog.covgroups[0].points[1].target
+    else {
+        panic!("sized receiver width was not retained: {prog}")
+    };
+    assert!(matches!(
+        &**inner,
+        ir::Expr::Literal {
+            ty: ir::IrType::UInt(Some(4)),
+            ..
+        }
+    ));
+    emit_cpp_src(&signed_sized);
+}
+
+#[test]
+fn coverpoint_width_sensitive_compositions_stay_gated() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    let source =
+        |expr: &str| base.replace("cp_en : cover dut.en", &format!("cp_en : cover {expr}"));
+
+    // The cover-specific lowerer has no wrapping-width carrier yet. In
+    // particular, erasing 4'd15 to an untyped 15 would turn +% into +
+    // and sample 16 instead of 0. v1 rejects this spelling too.
+    let wrapping = source("4'd15 +% 1");
+    let msg = assert_not_implemented(&lower_src(&wrapping).unwrap_err(), lower::V1Status::Rejects);
+    assert!(msg.contains("wrapping operator `+%`"), "{msg}");
+    cpp_tb::emit(&merged_src(&wrapping)).expect_err("v1 cannot infer the sized wrap width");
+
+    let cast_wrapping = source("(4'd1 as uint<8>) +% 1");
+    let msg = assert_unsupported(&lower_src(&cast_wrapping).unwrap_err());
+    assert!(msg.contains("at width 8"), "{msg}");
+    cpp_tb::emit(&merged_src(&cast_wrapping))
+        .expect("v1 uses the enclosing cast to establish an 8-bit wrap width");
+
+    // Direct wide values and a final narrow slice are supported. Feeding
+    // a wide value into C++'s untyped operators is not: HarcWide has two
+    // scalar conversions and these shapes would be ambiguous or truncate.
+    for expr in [
+        "(dut.en as uint<200>) + 1",
+        "-(dut.en as uint<200>)",
+        "dut.en ? (dut.en as uint<200>) : 0",
+        "(dut.en as uint<200>) + (dut.en as uint<128>)",
+    ] {
+        let msg = assert_unsupported(&lower_src(&source(expr)).unwrap_err());
+        assert!(msg.contains("wide value"), "`{expr}`: {msg}");
+    }
+
+    let wide_selector = source("dut.count_out[(dut.en as uint<200>):0]");
+    let msg = assert_unsupported(&lower_src(&wide_selector).unwrap_err());
+    assert!(msg.contains("runtime bit-slice selector"), "{msg}");
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    let wide_lane = lanes.replace(
+        "cover dut.lane_id_out[2'd0]",
+        "cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<200>)]",
+    );
+    let msg = assert_unsupported(&lower_src(&wide_lane).unwrap_err());
+    assert!(msg.contains("runtime lane selector"), "{msg}");
+
+    // A raw DUT port's actual packed width arrives with the SV emit
+    // options, after schema lowering. Pin the late guard too.
+    let raw = source("dut.en + 1");
+    let merged = merged_src(&raw);
+    let prog = lower::lower_program(&merged).expect("widthless raw port lowers");
+    verify::verify_program(&prog).expect("widthless raw port verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths.insert("en".to_string(), 1024);
+    let err = tbir::emit(&prog, &merged, &opts)
+        .expect_err("known-wide raw DUT port composition must fail before C++");
+    assert!(err.to_string().contains("wider than 64 bits"), "{err}");
+
+    // Aggregate source paths use the same underscore flattening as emitted
+    // DUT member access (`dut.send.rsp_data` → `send_rsp_data`).
+    let aggregate = source("dut.send.rsp_data + 1");
+    let merged = merged_src(&aggregate);
+    let prog = lower::lower_program(&merged).expect("aggregate raw port lowers");
+    verify::verify_program(&prog).expect("aggregate raw port verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths
+        .insert("send_rsp_data".to_string(), 1024);
+    let err = tbir::emit(&prog, &merged, &opts)
+        .expect_err("known-wide aggregate DUT port composition must fail before C++");
+    assert!(err.to_string().contains("wider than 64 bits"), "{err}");
+
+    // Packed-vector metadata is keyed by the flattened physical member too.
+    // A qualified source path must still use logical lane extraction rather
+    // than indexing Verilator's packed storage representation directly.
+    let aggregate_lane = source("dut.send.rsp_data[0]");
+    let merged = merged_src(&aggregate_lane);
+    let prog = lower::lower_program(&merged).expect("aggregate lane lowers");
+    verify::verify_program(&prog).expect("aggregate lane verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.vec_lane_widths.insert("send_rsp_data".to_string(), 32);
+    let cpp = tbir::emit(&prog, &merged, &opts).expect("aggregate packed lane emits");
+    assert!(
+        cpp.contains("harc_vec_lane_read<32>(dut->send_rsp_data"),
+        "{cpp}"
+    );
+}
+
+#[test]
+fn clocked_covergroups_apply_helper_types_and_verifier_metadata() {
+    let source = |arg: &str| {
+        format!(
+            r#"
+function id8(x: uint<8>) -> uint<8>
+    return x
+end function id8
+
+covergroup TypedCov @(posedge dut.clk)
+    cp : cover id8({arg})
+        bins
+            zero = {{0}}
+        end bins
+end covergroup TypedCov
+
+testbench Tb
+    dut : Top
+    cov : TypedCov
+end testbench Tb
+
+impl TypedCoverTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl TypedCoverTest
+"#
+        )
+    };
+
+    let msg = assert_invalid(
+        &lower_src(&source("dut.en as uint<200>"))
+            .expect_err("a wide argument must not truncate into uint<8>"),
+    );
+    assert!(msg.contains("argument 1 expects uint<8>"), "{msg}");
+
+    let literal = source("1");
+    let prog = lower_src(&literal).expect("unsized helper argument lowers");
+    verify::verify_program(&prog).expect("unsized helper argument verifies as a scalar wildcard");
+
+    let valid = source("dut.en");
+    let mut bad_arity = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(_, args) = &mut bad_arity.covgroups[0].points[0].target else {
+        panic!("expected helper call")
+    };
+    args.clear();
+    let errs = verify::verify_program(&bad_arity).expect_err("helper arity corruption must fail");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("arity mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_return = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(ir::CallTarget::Helper { ret, .. }, _) =
+        &mut bad_return.covgroups[0].points[0].target
+    else {
+        panic!("expected helper call")
+    };
+    *ret = ir::IrType::UInt(Some(16));
+    let errs = verify::verify_program(&bad_return).expect_err("helper return corruption must fail");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("return metadata mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+}
+
+#[test]
+fn coverpoint_value_expression_corruption_is_rejected_before_codegen() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    let source =
+        |expr: &str| base.replace("cp_en : cover dut.en", &format!("cp_en : cover {expr}"));
+
+    let mut wrong_kind =
+        lower_src(&source("dut.count_out[dut.en:0]")).expect("dynamic slice lowers");
+    wrong_kind.covgroups[0].points[1].target = ir::Expr::Local(ir::LocalId(u32::MAX));
+    let errs = verify::verify_program(&wrong_kind)
+        .expect_err("a function local is not valid in a covergroup schema");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("outside the cover subset")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_width = lower_src(&source("(dut.count_out as uint<200>)[70:65]"))
+        .expect("wide cover expression lowers");
+    let ir::Expr::BitSlice { target, .. } = &mut bad_width.covgroups[0].points[1].target else {
+        panic!("expected outer constant slice")
+    };
+    let ir::Expr::WidthCast { width, .. } = &mut **target else {
+        panic!("expected wide cast below the slice")
+    };
+    *width = 0;
+    let errs = verify::verify_program(&bad_width)
+        .expect_err("a zero-width coverpoint cast must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("invalid destination 0")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    let mut bad_lane = lower_src(&lanes.replace(
+        "cover dut.lane_id_out[2'd0]",
+        "cover dut.lane_id_out[dut.lane_valid_out[0]]",
+    ))
+    .expect("runtime lane index lowers");
+    let ir::Expr::Port(port) = &mut bad_lane.covgroups[0].points[0].target else {
+        panic!("expected port-backed coverpoint")
+    };
+    port.lane = Some(ir::LaneIndex::Var(Box::new(ir::Expr::Local(ir::LocalId(
+        u32::MAX,
+    )))));
+    let errs = verify::verify_program(&bad_lane)
+        .expect_err("a local hidden in a runtime lane index must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("outside the cover subset")),
+        "unexpected verifier errors: {errs:?}"
     );
 }
 

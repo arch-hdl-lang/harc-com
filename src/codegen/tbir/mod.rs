@@ -2440,6 +2440,7 @@ fn emit_test(
                     schema,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
+                    &opts.dut_port_widths,
                 )?;
             }
             ir::CovTrigger::Hook {
@@ -2525,6 +2526,7 @@ fn emit_test(
                     *side,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
+                    &opts.dut_port_widths,
                 )?;
             }
         }

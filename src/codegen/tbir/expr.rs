@@ -614,7 +614,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
 /// General-position wide-literal rendering, mirroring v1's
 /// `c_value_literal`: ≤ 128 bits → `_harc_u128` shifted-OR composite;
 /// above → `harc_rt::HarcWide<N>` brace-init.
-fn wide_literal_cpp(words: &[u32]) -> String {
+pub(super) fn wide_literal_cpp(words: &[u32]) -> String {
     if words.len() <= 4 {
         let mut padded = [0u32; 4];
         padded[..words.len()].copy_from_slice(words);

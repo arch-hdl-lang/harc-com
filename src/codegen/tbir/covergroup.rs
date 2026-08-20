@@ -143,30 +143,89 @@ fn cross_bin_labels(cross: &DeclaredCross<'_>) -> Vec<(usize, String)> {
 /// `emit_bin_membership` semantics: `Eq` is `_v == x`, `Range` is the
 /// inclusive `_v >= lo && _v <= hi` (open bounds drop their side; a
 /// fully open range is `true`), members `||`-joined.
-fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, EmitError> {
+struct CoverWidths<'a> {
+    lanes: &'a HashMap<String, u32>,
+    ports: &'a HashMap<String, u32>,
+}
+
+fn cover_type_width(ty: &IrType) -> Option<u32> {
+    match ty {
+        IrType::UInt(width) | IrType::SInt(width) => *width,
+        IrType::Bool => Some(1),
+        _ => None,
+    }
+}
+
+fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
+    match e {
+        Expr::Literal { ty, .. } => cover_type_width(ty),
+        Expr::WideLiteral(words) => words
+            .len()
+            .checked_mul(32)
+            .and_then(|width| u32::try_from(width).ok()),
+        Expr::Port(port) => match &port.lane {
+            Some(_) => cover_lane_width(widths.lanes, port),
+            None => port
+                .width
+                .or_else(|| widths.ports.get(&port.port_path.join("_")).copied()),
+        },
+        Expr::Unary(_, inner) => cover_expr_width(inner, widths),
+        Expr::Binary(_, lhs, rhs) => {
+            match (cover_expr_width(lhs, widths), cover_expr_width(rhs, widths)) {
+                (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+                _ => None,
+            }
+        }
+        Expr::Ternary(_, then_expr, else_expr) => match (
+            cover_expr_width(then_expr, widths),
+            cover_expr_width(else_expr, widths),
+        ) {
+            (Some(then_width), Some(else_width)) => Some(then_width.max(else_width)),
+            _ => None,
+        },
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        Expr::BitSliceDyn { .. } => Some(64),
+        Expr::WidthCast { width, .. } => Some(*width),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            cover_type_width(ret)
+        }
+        _ => None,
+    }
+}
+
+fn reject_wide_cpp_operand(
+    what: &str,
+    operands: &[&Expr],
+    widths: &CoverWidths<'_>,
+) -> Result<(), EmitError> {
+    if operands
+        .iter()
+        .any(|operand| cover_expr_width(operand, widths).is_some_and(|width| width > 64))
+    {
+        return Err(EmitError(format!(
+            "tbir: covergroup {what} uses a DUT value wider than 64 bits without type-directed operand coercion"
+        )));
+    }
+    Ok(())
+}
+
+fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitError> {
     Ok(match e {
         Expr::Literal { value, .. } => format!("{value}"),
+        Expr::WideLiteral(words) => super::expr::wide_literal_cpp(words),
         Expr::Port(p) => {
             let sig = cover_port_signal(p);
             match &p.lane {
                 None => format!("harc_rt::harc_read({sig})"),
                 Some(lane) => {
-                    // Covergroup lane indices are constant-only (the
-                    // schema lowers before any runtime scope; see
-                    // `lower_covergroups`), so a `Var` index never
-                    // reaches here. Render a constant directly; surface a
-                    // precise codegen error if a runtime index ever does.
                     let idx = match lane {
                         crate::ir::LaneIndex::Const(c) => c.to_string(),
-                        crate::ir::LaneIndex::Var(_) => {
-                            return Err(EmitError(
-                                "tbir: covergroup point with a runtime lane \
-                                 index — only constant lanes are in subset"
-                                    .to_string(),
-                            ))
+                        crate::ir::LaneIndex::Var(index) => {
+                            reject_wide_cpp_operand("runtime lane selector", &[index], widths)?;
+                            cover_expr_cpp(index, widths)?
                         }
                     };
-                    match cover_lane_width(lanes, p) {
+                    match cover_lane_width(widths.lanes, p) {
                         Some(w) => {
                             format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))")
                         }
@@ -176,36 +235,50 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
             }
         }
         Expr::Binary(op, a, b) => {
-            let a = cover_expr_cpp(a, lanes)?;
-            let b = cover_expr_cpp(b, lanes)?;
+            reject_wide_cpp_operand("binary expression", &[a, b], widths)?;
+            let a = cover_expr_cpp(a, widths)?;
+            let b = cover_expr_cpp(b, widths)?;
             format!("({a} {} {b})", cover_bin_op_cpp(*op))
         }
         Expr::Unary(op, a) => {
-            let a = cover_expr_cpp(a, lanes)?;
+            reject_wide_cpp_operand("unary expression", &[a], widths)?;
+            let a = cover_expr_cpp(a, widths)?;
             format!("{}({a})", cover_un_op_cpp(*op))
         }
         Expr::Ternary(c, t, f) => {
-            let c = cover_expr_cpp(c, lanes)?;
-            let t = cover_expr_cpp(t, lanes)?;
-            let f = cover_expr_cpp(f, lanes)?;
+            reject_wide_cpp_operand("ternary expression", &[c, t, f], widths)?;
+            let c = cover_expr_cpp(c, widths)?;
+            let t = cover_expr_cpp(t, widths)?;
+            let f = cover_expr_cpp(f, widths)?;
             format!("({c} ? {t} : {f})")
         }
         Expr::BitSlice { target, hi, lo } => {
-            let t = cover_expr_cpp(target, lanes)?;
+            let t = cover_expr_cpp(target, widths)?;
             let width = hi - lo + 1;
-            let mask = if width >= 64 {
-                u64::MAX
+            if width <= 64 {
+                format!("harc_rt::harc_bits(({t}), {hi}, {lo})")
+            } else if width <= 128 {
+                format!(
+                    "static_cast<_harc_u128>(harc_rt::harc_wide_extract_bits<4>(({t}), {lo}, {width}))"
+                )
             } else {
-                (1u64 << width) - 1
-            };
-            format!("(((uint64_t)({t}) >> {lo}) & 0x{mask:X}ULL)")
+                let words = width.div_ceil(32);
+                format!("harc_rt::harc_wide_extract_bits<{words}>(({t}), {lo}, {width})")
+            }
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            reject_wide_cpp_operand("runtime bit-slice selector", &[hi, lo], widths)?;
+            let target = cover_expr_cpp(target, widths)?;
+            let hi = cover_expr_cpp(hi, widths)?;
+            let lo = cover_expr_cpp(lo, widths)?;
+            format!("harc_rt::harc_bits(({target}), (uint32_t)({hi}), (uint32_t)({lo}))")
         }
         Expr::WidthCast {
             kind,
             width,
             src_width,
             inner,
-        } => cover_width_cast_cpp(*kind, *width, *src_width, inner, lanes)?,
+        } => cover_width_cast_cpp(*kind, *width, *src_width, inner, widths)?,
         // Hook-param cover target (`cover t.burst` / `cover t.data[i]`):
         // `param` is the hook-sampler closure's by-value argument, so the
         // sample reads `param.field` directly — same shape as v1 emitting
@@ -217,13 +290,15 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
             index,
         } => match index {
             Some(idx) => {
-                let i = cover_expr_cpp(idx, lanes)?;
+                reject_wide_cpp_operand("hook-field lane selector", &[idx], widths)?;
+                let i = cover_expr_cpp(idx, widths)?;
                 format!("{param}.{field}[{i}]")
             }
             None => format!("{param}.{field}"),
         },
         Expr::CovHookArg { param } => param.clone(),
         Expr::Call(target, args) => {
+            reject_wide_cpp_operand("call argument", &args.iter().collect::<Vec<_>>(), widths)?;
             let name = match target {
                 CallTarget::Helper { name, .. } => super::expr::helper_cpp_name(name),
                 CallTarget::ExternFn { name, .. } => name.clone(),
@@ -235,7 +310,7 @@ fn cover_expr_cpp(e: &Expr, lanes: &HashMap<String, u32>) -> Result<String, Emit
             };
             let mut rendered = Vec::with_capacity(args.len());
             for arg in args {
-                rendered.push(cover_expr_cpp(arg, lanes)?);
+                rendered.push(cover_expr_cpp(arg, widths)?);
             }
             format!("{name}({})", rendered.join(", "))
         }
@@ -252,10 +327,7 @@ fn cover_port_signal(p: &PortRef) -> String {
 }
 
 fn cover_lane_width(lanes: &HashMap<String, u32>, p: &PortRef) -> Option<u32> {
-    match p.port_path.as_slice() {
-        [name] => lanes.get(name).copied(),
-        _ => None,
-    }
+    lanes.get(&p.port_path.join("_")).copied()
 }
 
 fn cover_bin_op_cpp(op: BinOp) -> &'static str {
@@ -294,33 +366,66 @@ fn cover_width_cast_cpp(
     width: u32,
     src_width: Option<u32>,
     inner: &Expr,
-    lanes: &HashMap<String, u32>,
+    widths: &CoverWidths<'_>,
 ) -> Result<String, EmitError> {
-    let e = cover_expr_cpp(inner, lanes)?;
+    let e = cover_expr_cpp(inner, widths)?;
+    if let Some(words) = super::wide_scalar_words(width) {
+        return Ok(match kind {
+            WidthCastKind::Trunc => {
+                format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})")
+            }
+            WidthCastKind::Zext => match src_width {
+                Some(sw) => format!("harc_rt::harc_wide_zext<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_zext<{words}>({e})"),
+            },
+            WidthCastKind::Sext => match src_width {
+                Some(sw) if sw < width => {
+                    format!("harc_rt::harc_wide_sext<{words}>({e}, {sw}, {width})")
+                }
+                Some(sw) => format!("harc_rt::harc_wide_trunc<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_zext<{words}>({e})"),
+            },
+            WidthCastKind::Resize => match src_width {
+                Some(sw) if width < sw => {
+                    format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})")
+                }
+                Some(sw) => format!("harc_rt::harc_wide_zext<{words}>({e}, {sw})"),
+                None => format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})"),
+            },
+        });
+    }
+    let c_unsigned = if width > 64 { "_harc_u128" } else { "uint64_t" };
     let mask = |w: u32| (1u64 << w) - 1;
     let trunc_shape = |e: &str| {
-        if width == 64 {
+        if width > 64 {
+            format!("harc_rt::harc_trunc_u128((_harc_u128)({e}), {width})")
+        } else if width == 64 {
             format!("((uint64_t)({e}))")
         } else {
-            format!("((uint64_t)((({e}) & 0x{:X}ULL)))", mask(width))
+            format!("((uint64_t)(((uint64_t)({e}) & 0x{:X}ULL)))", mask(width))
         }
     };
-    let plain_cast = |e: &str| format!("((uint64_t)({e}))");
+    let plain_cast = |e: &str| format!("(({c_unsigned})({e}))");
     Ok(match kind {
         WidthCastKind::Trunc => trunc_shape(&e),
         WidthCastKind::Zext => plain_cast(&e),
         WidthCastKind::Sext => match src_width {
             Some(sw) if sw < width => {
-                let shift = 64 - sw;
-                if width == 64 {
-                    format!("((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                if width > 64 {
+                    format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {
-                    format!(
-                        "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) & 0x{:X}ULL)",
-                        mask(width)
-                    )
+                    let shift = 64 - sw;
+                    if width == 64 {
+                        format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
+                    } else {
+                        format!(
+                            "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) & 0x{:X}ULL)",
+                            mask(width)
+                        )
+                    }
                 }
             }
+            _ if width <= 64 => format!("((int64_t)((uint64_t)({e})))"),
             _ => plain_cast(&e),
         },
         WidthCastKind::Resize => match src_width {
@@ -331,10 +436,7 @@ fn cover_width_cast_cpp(
     })
 }
 
-fn bin_membership(
-    values: &[CovBinValue],
-    lanes: &HashMap<String, u32>,
-) -> Result<String, EmitError> {
+fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<String, EmitError> {
     if values.is_empty() {
         return Ok("(false)".to_string());
     }
@@ -361,7 +463,7 @@ fn bin_membership(
     let bound = |b: &CovBinBound| -> Result<String, EmitError> {
         match b {
             CovBinBound::Const(x) => Ok(x.to_string()),
-            CovBinBound::Runtime(e) => cover_expr_cpp(e, lanes),
+            CovBinBound::Runtime(e) => cover_expr_cpp(e, widths),
         }
     };
     let mut parts = Vec::with_capacity(values.len());
@@ -577,9 +679,10 @@ pub(super) fn sampler_registration(
     schema: &CovgroupSchema,
     instance: &str,
     lanes: &HashMap<String, u32>,
+    ports: &HashMap<String, u32>,
 ) -> Result<(), EmitError> {
     writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
-    sample_body(out, schema, instance, lanes, 2)?;
+    sample_body(out, schema, instance, &CoverWidths { lanes, ports }, 2)?;
     writeln!(out, "{INDENT}}});").ok();
     Ok(())
 }
@@ -593,7 +696,7 @@ fn sample_body(
     out: &mut String,
     schema: &CovgroupSchema,
     instance: &str,
-    lanes: &HashMap<String, u32>,
+    widths: &CoverWidths<'_>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let crosses = auto_cross_pairs(schema);
@@ -615,10 +718,10 @@ fn sample_body(
     }
     for p in &schema.points {
         writeln!(out, "{pad2}{{").ok();
-        let target = cover_expr_cpp(&p.target, lanes)?;
+        let target = cover_expr_cpp(&p.target, widths)?;
         writeln!(out, "{pad3}uint64_t _v = (uint64_t)({});", target).ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {
-            let membership = bin_membership(&b.values, lanes)?;
+            let membership = bin_membership(&b.values, widths)?;
             if !any_cross {
                 writeln!(
                     out,
@@ -764,6 +867,7 @@ pub(super) fn hook_sampler_registration(
     side: crate::ast::HookSide,
     instance: &str,
     lanes: &HashMap<String, u32>,
+    ports: &HashMap<String, u32>,
 ) -> Result<(), EmitError> {
     let side_str = match side {
         crate::ast::HookSide::Pre => "pre",
@@ -785,7 +889,7 @@ pub(super) fn hook_sampler_registration(
         arg_decls.join(", ")
     )
     .ok();
-    sample_body(out, schema, instance, lanes, 2)?;
+    sample_body(out, schema, instance, &CoverWidths { lanes, ports }, 2)?;
     writeln!(out, "{INDENT}}});").ok();
     Ok(())
 }
