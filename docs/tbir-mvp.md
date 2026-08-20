@@ -8222,6 +8222,65 @@ former `transaction` group lives in
      identically. Every case in the test now runs its own no-`apply`
      control first.
 
+130. **Probing an arm is not measuring it (2026-08-20).**
+
+     Five refusals in the transactor state-field lowering were probed
+     one landing each and labelled from that one probe. Two came out
+     wrong, and both were wrong in the direction that matters: an
+     `Unsupported` pointing users at a backend that silently changes
+     what their program means.
+
+     The guards admit more than the probes covered:
+
+     | guard | probed | also admits |
+     |---|---|---|
+     | `f.direction.is_some()` | `out event<T>` — v1 emits a real subscriber vector | a directional SCALAR — v1 emits `uint64_t p;`, the direction DROPPED, and it compiles |
+     | `tb_scalar_field_ir_type(..) == None` | `Vec<uint<8>, 4>` — v1 emits a usable `std::array` | `stream`/`buffer` — v1 emits a bare `uint64_t`, which compiles and is not a stream; and enums, which do not compile at all |
+
+     Both arms take `SilentlyMisLowers` now, because an arm's verdict is
+     the worst thing v1 does anywhere under it and both extra landings
+     are that.
+
+     **The directional split already existed in this file.**
+     `lower_unbound_item` separates the event half from the scalar half
+     of the identical `f.direction.is_some()` test, with the scalar half
+     already labelled `SilentlyMisLowers` and the reason written out. It
+     was copied this time instead of re-derived. That is the third
+     occasion in this sweep where the rule was already stated somewhere
+     in the repo and got reconstructed from one example instead.
+
+     Two more things the one-probe method hid:
+
+     - **The two `default` arms are mixed.** `default 0` gives
+       `HarcQueue<uint64_t> q = 0;` and g++ refuses it, but
+       `format_simple_expr` pastes a bare `Ident` verbatim, so
+       `default q0` naming another queue field compiles. The label
+       (`EmitsUncompilable`, the worst) is unchanged; the comment
+       claiming "there is no `--codegen v1` to send anyone to" was
+       false and is gone.
+     - **`lower_state_field` has four callers**, and every message said
+       "bound-to transactor" — including on the unbound DUT-poking form,
+       which is bound to nothing, and on the two initiator-side paths,
+       whose sibling arms in the same functions say "initiator-side
+       bound-to transactor". A `StateFieldOwner` label now travels with
+       the call.
+
+     And the generic-applied justification was false twice over. A
+     record declaration CAN take generic parameters — `parse_transaction`
+     calls `parse_optional_generic_params`; only `struct` cannot — and
+     "the file compiles" does not hold for the regblock-mirror landing,
+     where v1 emits `VDmaRegs* b = nullptr;` and g++ refuses. The label
+     survives (`SilentlyMisLowers` outranks `EmitsUncompilable`), but a
+     wrong measurement recorded as a reason not to re-measure is worse
+     than no comment at all.
+
+     Method, stated so the next batch inherits it: **work out what the
+     GUARD admits before labelling the arm.** One probe measures one
+     landing. A control — the same program with the field removed —
+     goes with every row; the control caught an invalid `enum` in the
+     probe skeleton that had every row, including itself, reporting "v1
+     rejects".
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

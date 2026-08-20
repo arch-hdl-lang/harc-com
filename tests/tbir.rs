@@ -9264,6 +9264,193 @@ end impl T
     }
 }
 
+/// The transactor state-field arms, one row per LANDING the guard
+/// admits — not one probe per arm.
+///
+/// The first attempt at these probed one landing each and labelled the
+/// whole arm from it. Two verdicts came out wrong that way: the
+/// directional guard is `f.direction.is_some()`, which admits a
+/// directional SCALAR as well as the `out event` that was probed; and
+/// the non-scalar guard is the catch-all of `tb_scalar_field_ir_type`,
+/// which admits `stream`/`buffer` as well as the `Vec` that was probed.
+/// Both of those extra landings have v1 emitting a member that COMPILES
+/// and means something else — the worst verdict in the enum — under an
+/// arm that was telling users to go there.
+///
+/// Each row below is measured against a control (the same program with
+/// the field removed), which lowers under tbir and compiles under v1.
+#[test]
+fn the_transactor_state_field_arms_are_labelled_per_landing() {
+    let prog = |field: &str| {
+        format!(
+            r#"
+struct Beat
+    p : uint<8>
+end struct Beat
+
+enum Color {{ RED, GREEN }}
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    n : uint<32> default 0
+{field}
+    thread bus.read(addr: uint<8>)
+        n = n + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+
+    // The control. Every row below differs from it by one field, so a
+    // verdict is attributable to that field and nothing else — an
+    // earlier probe round reported "v1 rejects" for a reason that was
+    // really a missing mode annotation, and a control would have caught
+    // it immediately.
+    let control_src = prog("    b : Beat");
+    lower_src(&control_src).expect("the control lowers");
+    let control_v1 = cpp_tb::emit(&merged_src(&control_src)).expect("v1 emits the control");
+
+    // ── the directional guard admits two shapes ───────────────────
+    // An EVENT field: v1 emits the subscriber vector and it works, so
+    // `--codegen v1` is a real way out.
+    let msg = assert_unsupported(&lower_src(&prog("    ev : out event<uint<8>>")).unwrap_err());
+    assert!(msg.contains("directional event field"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    ev : out event<uint<8>>")))
+            .expect("v1 emits")
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "v1 gives an event field a real subscriber vector"
+    );
+
+    // A directional SCALAR: v1 emits `uint64_t p;` — the direction
+    // DROPPED — and the file compiles. Pointing there hands the user a
+    // program that means something else.
+    let err = lower_src(&prog("    p : in uint<8>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("directional scalar field"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    p : in uint<8>")))
+            .expect("v1 emits")
+            .contains("uint64_t p;"),
+        "v1 drops the direction and emits a plain scalar member"
+    );
+
+    // ── the non-scalar guard admits five, and `stream` sets the label ─
+    for (field, needle) in [
+        ("    v : Vec<uint<8>, 4>", "std::array<uint64_t, 4> v{};"),
+        // The row that sets the verdict: a stream becomes a bare
+        // integer. It compiles, and it is not a stream.
+        ("    s : stream<uint<8>>", "uint64_t s;"),
+    ] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("non-scalar type"), "`{field}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(field)))
+                .expect("v1 emits")
+                .contains(needle),
+            "`{field}`: v1 emits `{needle}`"
+        );
+    }
+    // …and an enum under the SAME arm is the uncompilable end of it,
+    // which is why the arm cannot claim `Unsupported` either.
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    m : Color")))
+            .expect("v1 emits")
+            .contains("Color m;"),
+        "v1 emits a C++ enum name it never declares"
+    );
+
+    // ── the two default arms are mixed, and `EmitsUncompilable` wins ─
+    for field in ["    q : queue<uint<8>> default 0", "    b : Beat default 0"] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("with a default"), "`{field}`: {msg}");
+    }
+    // The landing that keeps those arms from being uniform: a bare
+    // `Ident` default is pasted verbatim by `format_simple_expr` and
+    // compiles under v1. Refused all the same — the arm takes its
+    // WORST outcome — but the source must not claim there is no v1.
+    assert!(
+        cpp_tb::emit(&merged_src(&prog(
+            "    q0 : queue<uint<8>>\n    q : queue<uint<8>> default q0"
+        )))
+        .expect("v1 emits")
+        .contains("q = q0;"),
+        "v1 pastes a bare identifier default verbatim"
+    );
+
+    // ── the message names the construct the user actually wrote ─────
+    // `lower_state_field` serves four callers. Every message used to
+    // say "bound-to transactor", including on the UNBOUND DUT-poking
+    // form, which is bound to nothing. A mutation that ignores the
+    // owner label survives every assertion above, so it gets its own.
+    let unbound = r#"
+transactor Poker
+    dut : TlmReadInitiator
+    n : uint<32> default 0
+    v : Vec<uint<8>, 4>
+
+    when active
+        hookable poke()
+            n = n + 1
+        end poke
+    end when
+end transactor Poker
+
+testbench Tb
+    dut : TlmReadInitiator
+    px  : Poker active
+end testbench Tb
+
+impl T for Tb
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    let msg = lower_src(unbound).unwrap_err().to_string();
+    assert!(
+        msg.contains("transactor `Poker` state field `v`"),
+        "the unbound form names itself: {msg}"
+    );
+    assert!(
+        !msg.contains("bound-to transactor `Poker`"),
+        "…and does not claim to be bound to anything: {msg}"
+    );
+
+    // ── generic application: dropped without a word ──────────────────
+    let err = lower_src(&prog("    b : Beat<uint<8>>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("generic-applied type"), "{msg}");
+    // The claim IS a whole-output equality — "the program that runs is
+    // the one `b : Beat` would have given" — so it is asserted as one.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&prog("    b : Beat<uint<8>>"))).expect("v1 emits"),
+        control_v1,
+        "v1's output is byte-identical to the control: the argument list vanishes"
+    );
+}
+
 /// The two record-traversal arms that had no cell of their own.
 ///
 /// `indexing the non-`Vec` record field` had its verdict flipped to
