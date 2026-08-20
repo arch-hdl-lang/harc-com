@@ -2827,6 +2827,163 @@ end impl QueueOwnerTest
     assert!(cpp.contains("_tb.pending.pop()"), "{cpp}");
 }
 
+/// A direct testbench queue is typed by its declared scalar element, not by
+/// the historical 64-bit queue carrier. This fixture crosses every pop
+/// landing (typed/inferred/assigned/discarded) and the generated storage.
+#[test]
+fn wide_queue_testbench_ir_display_and_emission_preserve_scalar_type() {
+    let src = fixture("testbench_wide_queue_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide testbench queue lowers");
+    verify::verify_program(&prog).expect("wide testbench queue verifies");
+
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("queue wide_values:uint<256>"),
+        "dump-ir must retain the declared queue element width: {dump}"
+    );
+    assert!(
+        dump.contains("inferred_wide : uint<256>") && dump.contains("signed_value : sint<8>"),
+        "inferred pops must use the queue's exact scalar type: {dump}"
+    );
+
+    let run = prog.function(prog.tests[0].run);
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. } if run.local(*dest).name.starts_with("__t") => {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded queue pop");
+    assert_eq!(
+        discarded.ty,
+        ir::IrType::UInt(Some(256)),
+        "a discarded pop still needs width-correct storage"
+    );
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide testbench queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide queue storage must reuse the scalar local C++ mapping: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8> inferred_wide")
+            && cpp.contains("harc_rt::HarcWide<8> __t"),
+        "inferred and discarded wide pops must not truncate: {cpp}"
+    );
+}
+
+/// Signedness is part of a scalar queue's element type even when the pop has
+/// no annotation to seed the destination local.
+#[test]
+fn wide_queue_inferred_signed_pop_keeps_declared_signedness() {
+    let src = r#"
+testbench SignedQueueTb
+    dut : Top
+    values : queue<sint<8>>
+end testbench SignedQueueTb
+
+impl SignedQueueTest for SignedQueueTb
+    run
+        let value = values.pop()
+    end run
+end impl SignedQueueTest
+"#;
+    let prog = lower_src(src).expect("signed scalar queue lowers");
+    verify::verify_program(&prog).expect("signed scalar queue verifies");
+    let run = prog.function(prog.tests[0].run);
+    let value = run
+        .locals
+        .iter()
+        .find(|local| local.name == "value")
+        .expect("pop destination local exists");
+    assert_eq!(value.ty, ir::IrType::SInt(Some(8)));
+}
+
+/// A discarded pop is still a value-producing queue operation internally;
+/// its unread destination must therefore retain a width above 128 bits.
+#[test]
+fn wide_queue_discarded_pop_uses_exact_element_type() {
+    let src = r#"
+testbench DiscardQueueTb
+    dut : Top
+    values : queue<uint<256>>
+end testbench DiscardQueueTb
+
+impl DiscardQueueTest for DiscardQueueTb
+    run
+        values.pop()
+    end run
+end impl DiscardQueueTest
+"#;
+    let prog = lower_src(src).expect("discarded wide queue pop lowers");
+    verify::verify_program(&prog).expect("discarded wide queue pop verifies");
+    let run = prog.function(prog.tests[0].run);
+    let dest = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. } => Some(*dest),
+            _ => None,
+        })
+        .expect("discarded pop lowers to TbQueuePop");
+    assert_eq!(run.local(dest).ty, ir::IrType::UInt(Some(256)));
+}
+
+/// The verifier uses the full queue element type in assignment direction:
+/// pushes cannot exceed the element width and pops cannot narrow it.
+#[test]
+fn wide_queue_verifier_rejects_lossy_scalar_transfers() {
+    let mut push_prog =
+        lower_src(&fixture("testbench_wide_queue_test.harc")).expect("fixture lowers");
+    let run = push_prog.tests[0].run.index();
+    let push = push_prog.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePush { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("fixture has a queue push");
+    *push = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&push_prog).is_err(),
+        "a 512-bit value cannot enter a 256-bit queue"
+    );
+
+    let mut pop_prog =
+        lower_src(&fixture("testbench_wide_queue_test.harc")).expect("fixture lowers");
+    let run = pop_prog.tests[0].run.index();
+    let dest = pop_prog.functions[run]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. }
+                if pop_prog.functions[run].local(*dest).name == "typed_wide" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has a typed wide pop");
+    pop_prog.functions[run].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&pop_prog).is_err(),
+        "a 256-bit queue value cannot enter a 128-bit local"
+    );
+}
+
 /// A queue pop defines its destination for every successor block, just like
 /// scoreboard/component queue pops. This source puts the read after a branch
 /// so the verifier must propagate the definition through its dataflow `gens`.
@@ -15181,7 +15338,9 @@ fn target_nonscalar_queue_state_lowers() {
     assert!(matches!(
         &x.state_fields[1].kind,
         ir::StateFieldKind::Queue {
-            elem: ir::QueueElem::Scalar { signed: false }
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(8))
+            }
         }
     ));
     // The responder body's state-queue push/pop are instance-filled to

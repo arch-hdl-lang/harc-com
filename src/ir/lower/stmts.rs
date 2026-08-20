@@ -825,19 +825,7 @@ impl FuncBuilder<'_> {
                     let elem = self.tb_queue_elem(&field)?;
                     self.check_pop_let_type(l, &elem, &format!("testbench queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                self.set_local_type(id, ty);
-                            }
-                        }
-                    }
+                    self.type_tb_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::TbQueuePop { field, dest: id });
                     return Ok(());
                 }
@@ -1580,6 +1568,28 @@ impl FuncBuilder<'_> {
         )))
     }
 
+    /// Type a direct testbench queue-pop destination from the queue element
+    /// unless the source `let` supplied a scalar annotation. Record handling
+    /// is unchanged; scalar inference preserves the field's exact width and
+    /// signedness.
+    fn type_tb_queue_pop_local(
+        &mut self,
+        dest: crate::ir::LocalId,
+        elem: &crate::ir::QueueElem,
+        declared: Option<&TypeExpr>,
+    ) {
+        let ty = match elem {
+            crate::ir::QueueElem::Scalar { ty } => declared
+                .and_then(typed_let_ir_type)
+                .unwrap_or_else(|| ty.clone()),
+            crate::ir::QueueElem::Record(rid) => IrType::Record(*rid),
+        };
+        if let IrType::UInt(Some(width)) | IrType::SInt(Some(width)) = &ty {
+            self.let_widths.insert(dest, *width);
+        }
+        self.set_local_type(dest, ty);
+    }
+
     /// Reject a narrowing scalar assignment at lowering, where it can
     /// carry a source-level fix.
     ///
@@ -2240,6 +2250,34 @@ impl FuncBuilder<'_> {
         }
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
+                // `v = pending.pop()` on a direct testbench scalar queue.
+                // Unlike a generic expression, `pop()` is a mutating queue
+                // operation and therefore lowers directly to a statement
+                // whose destination is the already-declared local.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((field, method)) = self.as_tb_queue_call(callee) {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("testbench queue `{field}`"),
+                                args,
+                            )?;
+                            let elem = self.tb_queue_elem(&field)?;
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and testbench queue \
+                                         `{field}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::TbQueuePop { field, dest: local });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 // NOTE: `x = bus.m(...)` (bus call into an existing
                 // local) is deliberately NOT lowered — v1 supports bus
                 // calls only in `let`-RHS and statement position, and
@@ -3116,7 +3154,7 @@ impl FuncBuilder<'_> {
         let schema = &self.ctx.scoreboards[sb.index()];
         match schema.field(field) {
             Some(f) => match &f.kind {
-                crate::ir::ScoreboardFieldKind::Queue { elem } => Ok(*elem),
+                crate::ir::ScoreboardFieldKind::Queue { elem } => Ok(elem.clone()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
                     schema.name
@@ -4394,15 +4432,11 @@ impl FuncBuilder<'_> {
     /// lands in a temp nothing reads. v1 emits the same call and drops
     /// the return value.
     ///
-    /// Typed from the queue's element so a record-element pop declares a
-    /// struct slot rather than a scalar one; a scalar element leaves the
-    /// temp at the default u64, exactly as a `let` with no annotation
-    /// does on the bound path.
+    /// Typed from the queue's exact element so both record and scalar pops
+    /// declare the same storage they would have used in a bound `let`.
     fn discard_slot(&mut self, elem: crate::ir::QueueElem) -> crate::ir::LocalId {
         let dest = self.fresh_temp();
-        if let crate::ir::QueueElem::Record(rid) = elem {
-            self.set_local_type(dest, IrType::Record(rid));
-        }
+        self.set_local_type(dest, elem.ir_type());
         dest
     }
 

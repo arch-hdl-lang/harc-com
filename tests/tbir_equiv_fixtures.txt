@@ -167,6 +167,7 @@ tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitia
 analysis_sink_connect_test | Top | top_counter.sv | - | pass
 testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectTest
 testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectFreshTest
+testbench_wide_queue_test | Top | top_counter.sv | - | pass | - | - | WideQueueTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorFreshTest
 analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - | - | AnalysisSourceModeTest

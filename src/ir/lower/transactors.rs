@@ -1600,7 +1600,7 @@ fn lower_state_field(
         ));
     }
     // A `queue<T>` state field → the shared queue-element machinery
-    // (scalar ≤ 64 bits or a value-record), reused verbatim from the
+    // (an exact scalar type up to 64 bits or a value-record), reused verbatim from the
     // scoreboard/component queue seam so all three lower `queue<Record>`
     // through the identical `harc_rt::HarcQueue<Rec>` shape.
     if let TypeExpr::Builtin {
@@ -1617,7 +1617,8 @@ fn lower_state_field(
                 "a `queue<T>` state field starts empty; drop the `default`",
             ));
         }
-        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
+        let elem =
+            super::components::lower_bounded_queue_elem(tname, fname, args.first(), record_ids)?;
         return Ok(StateFieldSchema {
             name: fname.clone(),
             kind: StateFieldKind::Queue { elem },

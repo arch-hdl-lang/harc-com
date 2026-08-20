@@ -1789,7 +1789,7 @@ impl Checker<'_> {
                     if let (Some(elem), Some(actual)) =
                         (self.tb_queue_elem(field), expr_type(self.func, value))
                     {
-                        if !queue_elem_matches_type(elem, &actual) {
+                        if !queue_elem_accepts_type(elem, &actual) {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
                                     "fn{} b{} pushes {:?} into testbench queue `{field}` with element {:?}",
@@ -1806,7 +1806,7 @@ impl Checker<'_> {
                         self.tb_queue_elem(field),
                         self.func.locals.get(dest.index()),
                     ) {
-                        if !queue_elem_matches_type(elem, &local.ty) {
+                        if !queue_elem_fits_dest(elem, &local.ty) {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
                                     "fn{} b{} pops testbench queue `{field}` with element {:?} into local %{} declared {:?}",
@@ -3058,17 +3058,18 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
     }
 }
 
-/// Queue elements erase scalar widths but retain signedness and record
-/// identity. `Unknown` is the inferred type of an unannotated scalar pop,
-/// which is emitted as the queue's runtime scalar representation.
-fn queue_elem_matches_type(elem: &QueueElem, ty: &IrType) -> bool {
-    match (elem, ty) {
-        (_, IrType::Unknown) => true,
-        (QueueElem::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (QueueElem::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
-        (QueueElem::Record(expected), IrType::Record(actual)) => expected == actual,
-        _ => false,
-    }
+/// Whether `actual` can enter the queue's element slot. Unknown expressions
+/// remain conservatively accepted; known scalars obey the ordinary assignment
+/// direction, including width and signedness.
+fn queue_elem_accepts_type(elem: &QueueElem, actual: &IrType) -> bool {
+    matches!(actual, IrType::Unknown) || assign_compatible(&elem.ir_type(), actual)
+}
+
+/// Whether a value popped from `elem` can enter `dest`. This is the reverse
+/// assignment direction from a push: a wider destination is valid, while a
+/// narrower destination would lose queue data.
+fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
+    matches!(dest, IrType::Unknown) || assign_compatible(dest, &elem.ir_type())
 }
 
 fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {

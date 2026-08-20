@@ -307,9 +307,10 @@ fn scoreboard_field_kind(
         ..
     } = t
     {
-        // Scalar ≤ 64 bits or a value-record element — resolved through the
+        // Exact scalar up to 64 bits or value-record element — resolved through the
         // shared component-path helper (don't fork the record-queue seam).
-        let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
+        let elem =
+            super::components::lower_bounded_queue_elem(sb, fname, args.first(), record_ids)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
     let ty = scalar_ir_type(t).ok_or_else(|| {

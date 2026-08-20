@@ -28,9 +28,8 @@ impl Display for TbProgram {
                         write!(f, " field {}:{}={}", sf.name, type_str(&sf.ty), sf.default)?;
                     }
                     TbStateFieldSchema::Queue(qf) => {
-                        let elem = match qf.elem {
-                            QueueElem::Scalar { signed: true } => "sint".to_string(),
-                            QueueElem::Scalar { signed: false } => "uint".to_string(),
+                        let elem = match &qf.elem {
+                            QueueElem::Scalar { ty } => type_str(ty),
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         write!(f, " queue {}:{elem}", qf.name)?;
@@ -184,8 +183,7 @@ impl Display for TbProgram {
                     }
                     crate::ir::StateFieldKind::Queue { elem } => {
                         let e = match elem {
-                            crate::ir::QueueElem::Scalar { signed: true } => "sint".to_string(),
-                            crate::ir::QueueElem::Scalar { signed: false } => "uint".to_string(),
+                            crate::ir::QueueElem::Scalar { ty } => type_str(ty),
                             crate::ir::QueueElem::Record(r) => format!("rec{}", r.index()),
                         };
                         writeln!(f, "    state {} : queue<{}>", sf.name, e)?;
@@ -262,8 +260,7 @@ impl Display for TbProgram {
                     ComponentFieldKind::Queue { elem } => {
                         use crate::ir::QueueElem;
                         let inner = match elem {
-                            QueueElem::Scalar { signed: true } => "sint".to_string(),
-                            QueueElem::Scalar { signed: false } => "uint".to_string(),
+                            QueueElem::Scalar { ty } => type_str(ty),
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         format!("queue<{inner}>")

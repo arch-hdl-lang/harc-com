@@ -651,8 +651,9 @@ impl RecordSchema {
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields and `queue<T>` fields where `T` is a scalar ≤ 64 bits
-/// lower; the test body manipulates them through `Stmt::ScoreboardOp`
+/// Scalar fields and `queue<T>` fields where `T` is a scalar up to 64
+/// bits or a value-record lower; the test body manipulates them through
+/// `Stmt::ScoreboardOp`
 /// (scalar read/write, queue push/pop/size/empty). Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
 /// state and therefore need per-instance materialization — are NOT
@@ -678,23 +679,35 @@ pub enum ScoreboardFieldKind {
     /// `default` is the declared initializer literal (0 fallback, v1).
     Scalar { ty: IrType, default: u64 },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is a scalar ≤ 64 bits or a value-record.
+    /// FIFO whose element is an exact scalar type up to 64 bits or a value-record.
     Queue { elem: QueueElem },
 }
 
-/// The element type of a `queue<T>` field, mirroring `EventPayload`:
-/// a scalar ≤ 64 bits, or a value-record carried by struct. Shared by
-/// scoreboard and composite-component queue fields so both lower a
-/// `queue<Record>` element through one shape (`harc_rt::HarcQueue<Rec>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The element type of a `queue<T>` field: an exact scalar IR type, or a
+/// value-record carried by struct. Shared by testbenches, scoreboards,
+/// composite components, and transactor state so every queue owner uses one
+/// storage descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
-    /// `queue<uint<32>>` / `queue<sint<…>>` / `queue<bool>` — a scalar
-    /// ≤ 64 bits. `signed` selects the C element type (`int64_t` vs
-    /// `uint64_t`) and printf width.
-    Scalar { signed: bool },
+    /// `queue<uint<256>>` / `queue<sint<8>>` / `queue<bool>` — the exact
+    /// scalar type drives inferred pop locals and the width-aware C++ storage
+    /// mapping (`uint64_t`, `_harc_u128`, or `HarcWide<N>`).
+    Scalar { ty: IrType },
     /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
     /// `TbProgram::records`; the C++ element type is the record struct.
     Record(RecordId),
+}
+
+impl QueueElem {
+    /// The queue's full IR element type, shared by lowering and verification
+    /// so inferred/discarded pop destinations cannot lose scalar width or
+    /// signedness.
+    pub fn ir_type(&self) -> IrType {
+        match self {
+            Self::Scalar { ty } => ty.clone(),
+            Self::Record(record) => IrType::Record(*record),
+        }
+    }
 }
 
 impl ScoreboardSchema {
@@ -1732,7 +1745,7 @@ pub enum StateFieldKind {
     /// `default` is the declared initializer literal (0 fallback).
     Scalar { ty: IrType, default: u64 },
     /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
-    /// whose element is a scalar ≤ 64 bits or a value-record. Manipulated
+    /// whose element is an exact scalar type up to 64 bits or a value-record. Manipulated
     /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
     /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
     Queue { elem: QueueElem },

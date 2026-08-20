@@ -3,8 +3,8 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 OwnedStateConnectTb { dut: Top } queue pending:uint queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept component source=c0 passive component direct=c1 component nested=c2
-  testbench tb1 OwnedStateConnectTb { dut: Top } queue pending:uint queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept component source=c0 passive component direct=c1 component nested=c2
+  testbench tb0 OwnedStateConnectTb { dut: Top } queue pending:uint<32> queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept component source=c0 passive component direct=c1 component nested=c2
+  testbench tb1 OwnedStateConnectTb { dut: Top } queue pending:uint<32> queue records:PendingItem connect source.observed->direct.accept connect source.observed->nested.sink.accept component source=c0 passive component direct=c1 component nested=c2
   test OwnedStateConnectFreshTest tb=tb0 run=fn2 check=-
   test OwnedStateConnectTest tb=tb1 run=fn3 check=fn4
   record r0 PendingItem
@@ -75,7 +75,7 @@ fn fn3 run_OwnedStateConnectTest [kind=Run, owner=tb1]
 
 fn fn4 check_OwnedStateConnectTest [kind=Check, owner=tb1]
   locals:
-    %0 got : unknown
+    %0 got : uint<32>
     %1 record : record(r0)
   entry = b0
 
