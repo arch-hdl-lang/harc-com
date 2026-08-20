@@ -1,0 +1,110 @@
+// Direct transactor heartbeat predicates (spec §7.8). Unlike analysis
+// transactors represented as composite components, PulseDrv lowers through
+// the dedicated DUT-poking transactor schema. It has no user state fields,
+// so TB-IR must materialize its heartbeat stamps on demand when a predicate
+// names the instance.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor PulseDrv
+    dut : Top
+
+    when active
+        hookable pulse()
+            // Raw DUT writes are deliberately not heartbeat activity.
+            dut.en = 1
+            wait 1 cycle
+            dut.en = 0
+        end pulse
+    end when
+end transactor PulseDrv
+
+// Existing state storage must use the same generated remap when its source
+// field collides with this method slot; the predicate and method receiver
+// both have to agree on that storage object.
+transactor StatefulPulseDrv
+    dut  : Top
+    seen : uint<32> default 0
+
+    when active
+        hookable pulse()
+            seen = seen + 1
+        end pulse
+    end when
+end transactor StatefulPulseDrv
+
+agent HeartbeatEmptyAgent
+    marker : uint<1> default 0
+
+    hookable ping()
+        marker = 1
+    end ping
+end agent HeartbeatEmptyAgent
+
+testbench TransactorHeartbeatTb
+    dut            : Top
+    // Deliberately collides with the generated PulseDrv_pulse method slot.
+    PulseDrv_pulse : PulseDrv active
+    pas            : PulseDrv passive
+    // Deliberately collides with the generated pre-hook vector, a distinct
+    // namespace from the callable slot covered by PulseDrv_pulse above.
+    StatefulPulseDrv_pulse_pre : StatefulPulseDrv active
+    // Deliberately occupies the generated namespace that the index-zero
+    // stateless heartbeat storage would otherwise claim.
+    __harc_transactor_state_tb0_f0 : StatefulPulseDrv passive
+    // Deliberately collides with the component callable emitted for the
+    // test-scope HeartbeatEmptyAgent instance below.
+    HeartbeatEmptyAgent_ping : StatefulPulseDrv passive
+    stateful_pre_hits : uint<32> default 0
+end testbench TransactorHeartbeatTb
+
+impl TransactorHeartbeatPredicatesTest for TransactorHeartbeatTb
+    clock clk = SysDomain
+
+    // Deliberately occupies the generated namespace for the second
+    // stateless heartbeat actor as a same-scope component local.
+    let __harc_transactor_state_tb0_f1 : HeartbeatEmptyAgent
+
+    on StatefulPulseDrv_pulse_pre.pulse pre
+        stateful_pre_hits = stateful_pre_hits + 1
+    end on
+
+    run
+        PulseDrv_pulse.dut = dut
+        StatefulPulseDrv_pulse_pre.dut = dut
+
+        // At bootstrap cycle 0 both stamps are 0, so a two-cycle idle
+        // threshold is false. Cover expression, let-binding, named-arg,
+        // and discarded-statement positions.
+        assert !PulseDrv_pulse.idle(2) else fail("active idle true at cycle 0")
+        let named = PulseDrv_pulse.idle_in(any_name = 2)
+        assert !named else fail("named idle_in true at cycle 0")
+        PulseDrv_pulse.idle_out(2)
+        assert !pas.quiesced(2) else fail("passive quiesced true at cycle 0")
+        assert !StatefulPulseDrv_pulse_pre.idle(2) else fail("stateful idle true at cycle 0")
+
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+
+        assert PulseDrv_pulse.idle(2) else fail("active idle false after two cycles")
+        assert PulseDrv_pulse.idle_in(2) else fail("active idle_in false after two cycles")
+        assert PulseDrv_pulse.idle_out(2) else fail("active idle_out false after two cycles")
+        assert PulseDrv_pulse.quiesced(2) else fail("active quiesced false after two cycles")
+        assert pas.idle(2) else fail("passive idle false after two cycles")
+        assert StatefulPulseDrv_pulse_pre.quiesced(2) else fail("stateful quiesced false after two cycles")
+
+        // The active method remains callable even though heartbeat use
+        // caused a stamp object to be emitted for this otherwise-stateless
+        // transactor. Its raw pin writes do not bump either stamp.
+        PulseDrv_pulse.pulse()
+        assert PulseDrv_pulse.idle(2) else fail("raw DUT writes unexpectedly bumped heartbeat")
+        StatefulPulseDrv_pulse_pre.pulse()
+        assert stateful_pre_hits == 1 else fail("stateful pre hook did not fire")
+        assert StatefulPulseDrv_pulse_pre.seen == 1 else fail("stateful method used wrong storage")
+        assert StatefulPulseDrv_pulse_pre.idle(2) else fail("state update unexpectedly bumped heartbeat")
+        log(info, "PASS: direct transactor heartbeat predicates")
+    end run
+end impl TransactorHeartbeatPredicatesTest

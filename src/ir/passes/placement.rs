@@ -516,7 +516,9 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(e, accesses, transactor);
         }
         Expr::WidthCast { inner, .. } => visit_expr(inner, accesses, transactor),
-        Expr::ComponentIdle { n, .. } => visit_expr(n, accesses, transactor),
+        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
+            visit_expr(n, accesses, transactor)
+        }
         Expr::SeqIndex { index, .. } => visit_expr(index, accesses, transactor),
         Expr::Call(target, args) => {
             if matches!(target, CallTarget::TransactorMethod { .. }) {

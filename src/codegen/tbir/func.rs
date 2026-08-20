@@ -1048,14 +1048,22 @@ fn emit_stmt(
             // Resolve the instance field to its transactor type via the
             // owner testbench — the lambda is named `<Type>_<method>`,
             // mirroring v1's hookable lambda naming.
-            let xschema = func
+            let (xschema, state_storage) = func
                 .owner
                 .and_then(|o| prog.testbenches.get(o.index()))
                 .and_then(|tb| {
                     tb.transactor_fields
                         .iter()
                         .find(|(f, _)| f == bus_field)
-                        .map(|(_, xid)| prog.transactor(*xid))
+                        .map(|(_, xid)| {
+                            let storage = tb
+                                .unbound_state_actors
+                                .iter()
+                                .find(|actor| actor.field == *bus_field)
+                                .map(|actor| actor.storage.clone())
+                                .unwrap_or_else(|| bus_field.clone());
+                            (prog.transactor(*xid), storage)
+                        })
                 })
                 .ok_or_else(|| {
                     EmitError(format!(
@@ -1071,7 +1079,7 @@ fn emit_stmt(
             // state struct by reference as the leading arg, so `a.go()` and
             // `b.go()` mutate their own state through one shared body.
             if uses_state_receiver(xschema) {
-                rendered.push(bus_field.clone());
+                rendered.push(state_storage);
             }
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
@@ -2363,10 +2371,9 @@ pub(super) fn declare_method_slot(
 /// suspension terminators emit v1's sync shapes (`for (...) tick();`,
 /// `while (!(pred)) tick();`) and `Return` is a real `return`.
 ///
-/// The remaining intentionally omitted v1 machinery is the transactor
-/// instance struct and per-instance heartbeat stamps (`idle()` predicates
-/// are still outside the TBIR subset). Method-hook vectors and their fan-out
-/// loops are emitted below.
+/// Direct transactor instance storage and heartbeat predicates are emitted
+/// by the surrounding test scaffold; this routine owns the method lambda and
+/// its method-hook fan-out loops.
 pub(super) fn emit_method(
     out: &mut String,
     prog: &TbProgram,

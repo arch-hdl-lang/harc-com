@@ -327,7 +327,9 @@ fn check_temporal_slots(e: &Expr, n_slots: usize, what: &str, errs: &mut Vec<Ver
             check_temporal_slots(f, n_slots, what, errs);
         }
         Expr::WidthCast { inner, .. } => check_temporal_slots(inner, n_slots, what, errs),
-        Expr::ComponentIdle { n, .. } => check_temporal_slots(n, n_slots, what, errs),
+        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
+            check_temporal_slots(n, n_slots, what, errs)
+        }
         Expr::SeqIndex { index, .. } => check_temporal_slots(index, n_slots, what, errs),
         Expr::Call(_, args) => {
             for a in args {
@@ -627,6 +629,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     }
     for (ti, tb) in prog.testbenches.iter().enumerate() {
         let mut component_binding_names = std::collections::HashSet::new();
+        let mut transactor_binding_names = std::collections::HashSet::new();
         let state_scalars: Vec<_> = tb
             .state_fields
             .iter()
@@ -663,6 +666,11 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
         for (field, xid) in &tb.transactor_fields {
+            if !transactor_binding_names.insert(field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!("tb{ti} declares transactor field `{field}` more than once"),
+                });
+            }
             if xid.index() >= prog.transactors.len() {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
@@ -670,6 +678,91 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         xid.0
                     ),
                 });
+            }
+        }
+        let mut actor_names = std::collections::HashSet::new();
+        let mut actor_storage_names = std::collections::HashSet::new();
+        for actor in &tb.unbound_state_actors {
+            if !actor_names.insert(&actor.field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares transactor stamp storage `{}` more than once",
+                        actor.field
+                    ),
+                });
+            }
+            if actor.storage.is_empty() || !actor_storage_names.insert(&actor.storage) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} transactor field `{}` has empty or duplicate C++ stamp storage `{}`",
+                        actor.field, actor.storage
+                    ),
+                });
+            }
+            match tb
+                .transactor_fields
+                .iter()
+                .find_map(|(name, bound)| (name == &actor.field).then_some(*bound))
+            {
+                Some(bound) if bound == actor.transactor => {}
+                Some(bound) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} transactor stamp storage `{}` binds x{} but the field binds x{}",
+                        actor.field, actor.transactor.0, bound.0
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} transactor stamp storage `{}` has no matching transactor field",
+                        actor.field
+                    ),
+                }),
+            }
+            if actor.transactor.index() >= prog.transactors.len() {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} transactor stamp storage `{}` references missing x{}",
+                        actor.field, actor.transactor.0
+                    ),
+                });
+            }
+        }
+        let mut target_names = std::collections::HashSet::new();
+        for actor in &tb.target_tlm_actors {
+            if transactor_binding_names.contains(&actor.instance)
+                || !target_names.insert(&actor.instance)
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares target transactor instance `{}` more than once",
+                        actor.instance
+                    ),
+                });
+            }
+            let Some(schema) = prog.transactors.get(actor.transactor.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} target transactor `{}` references missing x{}",
+                        actor.instance, actor.transactor.0
+                    ),
+                });
+                continue;
+            };
+            let binding = tb.bus_bindings.iter().find(|b| b.field == actor.bus_field);
+            match binding {
+                Some(binding) if schema.bound_bus.as_deref() == Some(binding.bus.as_str()) => {}
+                Some(binding) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} target transactor `{}` uses bus `{}` but x{} binds to {:?}",
+                        actor.instance, binding.bus, actor.transactor.0, schema.bound_bus
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} target transactor `{}` references missing bus binding `{}`",
+                        actor.instance, actor.bus_field
+                    ),
+                }),
             }
         }
         for binding in &tb.component_fields {
@@ -704,6 +797,44 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     what: format!("tb{ti} has invalid connect metadata: {detail}"),
                 });
             }
+        }
+        // Testbench cycle-service predicates are standalone expressions,
+        // not part of the handler body's CFG. Walk them explicitly with
+        // the handler function's owner/type context so every expression
+        // invariant (including transactor heartbeat field/schema/storage)
+        // is checked before codegen renders the registration closure.
+        for (si, service) in tb.cycle_services.iter().enumerate() {
+            let Some(func) = prog.functions.get(service.function.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} cycle service {si} references missing fn{}",
+                        service.function.0
+                    ),
+                });
+                continue;
+            };
+            if func.kind != FunctionKind::TestHook
+                || func.owner != Some(TestbenchId(ti as u32))
+                || !func.params.is_empty()
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} cycle service {si} body fn{} is {:?}, owner {:?}, with {} param(s)",
+                        func.id.0,
+                        func.kind,
+                        func.owner,
+                        func.params.len()
+                    ),
+                });
+            }
+            let mut checker = Checker {
+                prog,
+                func,
+                fid: func.id,
+                bid: func.entry,
+                errs: &mut errs,
+            };
+            checker.check_expr(&service.trigger, true, "testbench cycle-service trigger");
         }
     }
     for (i, func) in prog.functions.iter().enumerate() {
@@ -1892,6 +2023,93 @@ impl Checker<'_> {
         }
     }
 
+    /// A direct transactor heartbeat expression carries both the source
+    /// field name and schema id. Verify both halves against the owning
+    /// testbench so an IR-mutating pass cannot invent a field, mismatch its
+    /// schema, or leave codegen indexing a dangling transactor id.
+    fn check_transactor_idle(&mut self, field: &str, transactor: TransactorId, storage: &str) {
+        let Some(owner) = self.func.owner else {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat `{field}` has no owning testbench",
+                    self.fid.0, self.bid.0
+                ),
+            });
+            return;
+        };
+        let Some(tb) = self.prog.testbenches.get(owner.index()) else {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat owner tb{} does not resolve",
+                    self.fid.0, self.bid.0, owner.0
+                ),
+            });
+            return;
+        };
+        let bound = tb
+            .transactor_fields
+            .iter()
+            .find_map(|(name, id)| (name == field).then_some(*id))
+            .or_else(|| {
+                tb.target_tlm_actors
+                    .iter()
+                    .find(|actor| actor.instance == field)
+                    .map(|actor| actor.transactor)
+            });
+        match bound {
+            None => self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat field `{field}` is not bound on testbench `{}`",
+                    self.fid.0, self.bid.0, tb.name
+                ),
+            }),
+            Some(actual) if actual != transactor => {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} transactor heartbeat field `{field}` binds x{} but expression names x{}",
+                        self.fid.0, self.bid.0, actual.0, transactor.0
+                    ),
+                })
+            }
+            Some(_) => {}
+        }
+        if self.prog.transactors.get(transactor.index()).is_none() {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat references missing x{}",
+                    self.fid.0, self.bid.0, transactor.0
+                ),
+            });
+        }
+        let direct_storage = tb
+            .unbound_state_actors
+            .iter()
+            .find(|actor| actor.field == field && actor.transactor == transactor)
+            .map(|actor| actor.storage.as_str());
+        let target_storage = tb
+            .target_tlm_actors
+            .iter()
+            .find(|actor| actor.instance == field && actor.transactor == transactor)
+            .map(|actor| actor.instance.as_str());
+        match direct_storage.or(target_storage) {
+            Some(expected) if expected == storage => {}
+            Some(expected) => self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat field `{field}` names stamp storage `{storage}` but schema requires `{expected}`",
+                    self.fid.0, self.bid.0
+                ),
+            }),
+            None => {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} transactor heartbeat field `{field}` has no matching stamp storage",
+                    self.fid.0, self.bid.0
+                ),
+            });
+            }
+        }
+    }
+
     /// `local` must be record-typed and its schema must declare `field`.
     /// `mid_positions` lists the segments (positions in `[field] ++ path`)
     /// that carry a `Vec<Record, N>` element selection.
@@ -2175,6 +2393,16 @@ impl Checker<'_> {
             // Idle predicate: the base/kind are resolved at lowering; only
             // the threshold sub-expression carries verifiable structure.
             Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
+            Expr::TransactorIdle {
+                field,
+                transactor,
+                storage,
+                n,
+                ..
+            } => {
+                self.check_transactor_idle(field, *transactor, storage);
+                self.check_expr(n, ports_ok, context);
+            }
             Expr::ScoreboardQuery {
                 sb,
                 field,
@@ -2868,7 +3096,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(e, f);
         }
         Expr::WidthCast { inner, .. } => for_each_local(inner, f),
-        Expr::ComponentIdle { n, .. } => for_each_local(n, f),
+        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => for_each_local(n, f),
         Expr::CovBin { .. } => {}
         Expr::CovHookParam { index, .. } => {
             if let Some(i) = index {

@@ -34,7 +34,7 @@ family of rejections over a one-site exception. Current implementation order:
   queue-owner spellings.
 - [x] Method-hook paths: statement-position registration, nested component
   receivers, and non-transactor component receivers.
-- [ ] Heartbeat predicates on transactor receivers.
+- [x] Heartbeat predicates on transactor receivers.
 - [ ] Bound-transactor `thread` items routed through the component path.
 - [ ] Coverpoint target/value gaps with working v1 behavior (sized literals,
   supported width forms, and other explicitly probed cases).
@@ -46,8 +46,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 167 remaining constructor call sites (168 textual matches including
-the `unsupported` helper definition) as an inventory, not 167 separate tasks.
+Treat the 166 remaining constructor call sites (167 textual matches including
+the `unsupported` helper definition) as an inventory, not 166 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -66,9 +66,45 @@ shared IR primitive, and equivalence fixture. Then:
    (diagnostic cleanup). A falling raw count alone can hide no user-visible
    progress.
 
-Heartbeat predicates on transactor receivers are the recommended next family:
-the remaining positive-v1 tests converge on receiver resolution plus existing
-activity-stamp state, making it the next promising shared seam.
+Bound-transactor `thread` items routed through the component path are the
+recommended next family. The remaining positive-v1 controls converge on one
+classification/routing seam, after which the existing target-thread IR and
+actor emission should carry the behavior.
+
+## Review-derived semantic gates
+
+The method-hook batch exposed defects that lowering-only tests could not see.
+For each new family, explicitly mark every applicable gate below as covered or
+not applicable before requesting review:
+
+1. **Source order and registration time.** Exercise a source action before and
+   after registration/declaration; do not collect a construct into an unordered
+   side table and replay it at phase entry unless the language says it is
+   elaboration-time.
+2. **Natural completion versus explicit return.** If behavior fires at function
+   exit, separately test fall-through and every explicit-return path. Keep
+   natural-return metadata verified as distinct, in-range `Return` blocks.
+3. **Phase and capture lifetime.** A closure registered in `run` may fire in
+   `check`; captured locals must outlive both phases or the source must be
+   rejected precisely. Test mutation through the capture, not only reads.
+4. **Declaration order and ABI.** Emit handler/callback bodies only after every
+   callable they may reference is declared. Cover signed scalars, records,
+   sequences, and component values so closure-vector and method signatures
+   cannot drift.
+5. **Owner/type isolation.** Include two tests or two same-typed instances and
+   prove subscriptions/state do not leak across test owners while intentional
+   type-scoped fan-out still reaches siblings.
+6. **Generated-name hygiene.** Mutate or author source names that resemble the
+   generated identifiers. Generated storage must use a collision-proof name
+   and an explicit source-to-storage remap.
+7. **Verifier corruption probes.** For every new id/path/side-table relation,
+   mutate the lowered IR to an out-of-range, mismatched, duplicate, and
+   wrong-kind value where applicable; each corruption must fail verification
+   before codegen.
+8. **Runtime boundary proof.** A family is not complete at `lower_src` or emitted
+   C++ shape. Its self-checking fixture must compile and run under both emitters,
+   trace-diff clean, and survive the full equivalence registry at the family
+   boundary.
 
 ## Per-gap implementation loop
 
@@ -93,9 +129,9 @@ activity-stamp state, making it the next promising shared seam.
    - the complete Rust test suite.
 
 8. Recount `unsupported(...)` sites and record which family disappeared.
-   The completed event, queue-query, and method-hook slices reduce the call-site
-   count from 174 to 167. Nested bus expressions were also reclassified because
-   v1 rejects them too.
+   The completed event, queue-query, method-hook, and transactor-heartbeat
+   slices reduce the call-site count from 174 to 166. Nested bus expressions
+   were also reclassified because v1 rejects them too.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

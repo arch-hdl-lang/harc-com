@@ -862,7 +862,7 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
-        ComponentIdle { n, .. } => expr_has_probe(n),
+        ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
         ComponentVecElement { index, .. } => expr_has_probe(index),
         _ => false,
     }
@@ -1250,7 +1250,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         WidthCast { inner, .. } => for_each_port_in_expr(inner, f),
         SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
+        ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
         ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
         _ => {}
     }
@@ -2549,19 +2549,21 @@ fn emit_test(
     // (passed in as `self_state`) and the run/check coroutine reads them.
     //
     // State-receiver ABI (#494 P1b): one SHARED `_<Type>_state` struct type
-    // per transactor type, then one instance VARIABLE per instance. The
+    // per transactor type, then one storage VARIABLE per instance. A
+    // demand-created stateless heartbeat object uses the schema's generated
+    // storage symbol rather than its potentially-colliding source field. The
     // type-shared method lambda takes the receiver by reference, so any
     // number of active instances of one type coexist with independent
     // state (`Drv_go(a)` and `Drv_go(b)` mutate `a`/`b` separately).
     let mut emitted_state_ty = HashSet::new();
-    for (_, xid) in &tb.unbound_state_actors {
-        if !emitted_state_ty.insert(*xid) {
+    for actor in &tb.unbound_state_actors {
+        if !emitted_state_ty.insert(actor.transactor) {
             continue;
         }
-        runtime::unbound_state_struct_decl(out, prog.transactor(*xid), &prog.records);
+        runtime::unbound_state_struct_decl(out, prog.transactor(actor.transactor), &prog.records);
     }
-    for (instance, xid) in &tb.unbound_state_actors {
-        runtime::unbound_state_var(out, prog.transactor(*xid), instance);
+    for actor in &tb.unbound_state_actors {
+        runtime::unbound_state_var(out, prog.transactor(actor.transactor), &actor.storage);
     }
     let mut emitted_xactors = HashSet::new();
     for (_, xid) in &tb.transactor_fields {

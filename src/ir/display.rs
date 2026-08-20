@@ -1200,6 +1200,14 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             };
             format!("{}.{m}({})", comp_base_str(base), expr_str(func, n))
         }
+        Expr::TransactorIdle { field, kind, n, .. } => {
+            let m = match kind {
+                crate::ir::IdleKind::In => "idle_in",
+                crate::ir::IdleKind::Out => "idle_out",
+                crate::ir::IdleKind::Both => "idle",
+            };
+            format!("{field}.{m}({})", expr_str(func, n))
+        }
         Expr::Binary(op, a, b) => format!(
             "({} {} {})",
             expr_str(func, a),
