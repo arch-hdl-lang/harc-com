@@ -746,12 +746,15 @@ fn lower_bound_target_transactor(
             // checking that the name resolves — `apply Whatever`,
             // naming nothing, emits clean. That is the `connect` arm's
             // situation one step above, and it takes the same verdict.
-            ComponentItem::Lifecycle(..) => {
-                return Err(LowerError::Invalid(format!(
-                    "lifecycle blocks are not accepted on transactor `{tname}`; the parser \
-                     refuses them outside `test`/`impl`/`testbench`"
-                )));
-            }
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
             ComponentItem::Apply(_) => {
                 return Err(not_implemented(
                     &format!("bound-to transactor `{tname}` `apply` items"),
@@ -1204,12 +1207,15 @@ fn lower_bound_initiator_transactor(
             // half is unreachable (the parser refuses a lifecycle block
             // outside `test`/`impl`/`testbench`), and v1 drops `apply`
             // silently.
-            ComponentItem::Lifecycle(..) => {
-                return Err(LowerError::Invalid(format!(
-                    "lifecycle blocks are not accepted on transactor `{tname}`; the parser \
-                     refuses them outside `test`/`impl`/`testbench`"
-                )));
-            }
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
             ComponentItem::Apply(_) => {
                 return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` `apply` items"),
@@ -1311,12 +1317,15 @@ fn lower_bound_initiator_transactor(
             // half is unreachable (the parser refuses a lifecycle block
             // outside `test`/`impl`/`testbench`), and v1 drops `apply`
             // silently.
-            ComponentItem::Lifecycle(..) => {
-                return Err(LowerError::Invalid(format!(
-                    "lifecycle blocks are not accepted on transactor `{tname}`; the parser \
-                     refuses them outside `test`/`impl`/`testbench`"
-                )));
-            }
+            // `unreachable!`, matching the sibling arm this file
+            // already had for the same impossible state — not a
+            // user-facing `Invalid`, which would be a diagnostic
+            // nothing can ever print.
+            ComponentItem::Lifecycle(..) => unreachable!(
+                "the parser refuses a lifecycle block inside a transactor: \
+                 \"lifecycle blocks are currently supported only inside `test`/`impl` and \
+                 `testbench`\""
+            ),
             ComponentItem::Apply(_) => {
                 return Err(not_implemented(
                     &format!("initiator-side bound-to transactor `{tname}` `apply` items"),

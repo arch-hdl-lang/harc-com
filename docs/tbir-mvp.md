@@ -8198,9 +8198,14 @@ former `transaction` group lives in
      `testbench` ("lifecycle blocks are currently supported only inside
      `test`/`impl` and `testbench`"), so neither backend sees one on a
      transactor — measured, both print that same parser error byte for
-     byte. The arm was offering `--codegen v1` for a program that does
-     not parse anywhere. It is `Invalid` now, in its own arm, naming the
-     gate.
+     byte, and `TransactorDecl` is constructed at exactly one place with
+     no desugaring pass that could build the item another way. The arm
+     was offering `--codegen v1` for a program that does not parse
+     anywhere. It is `unreachable!` now — which is what the sibling arm
+     20 lines up in the same file already said about the same
+     impossible state. The first version returned a user-facing
+     `Invalid` instead: one fact, two treatments, and a diagnostic
+     nothing can ever print.
 
      `apply` does reach it, and v1 does not implement it: `cpp_tb` has
      `ComponentItem::Apply(_) => {}`, so v1 emits the file with no trace
