@@ -1373,6 +1373,54 @@ fn resolve_testbench_component_path(
     Ok(cid)
 }
 
+fn resolve_component_queue_elem(
+    prog: &TbProgram,
+    func: &TbFunction,
+    base: &ComponentBase,
+    queue: &str,
+) -> Result<QueueElem, String> {
+    let component = match base {
+        ComponentBase::SelfField => match func.kind {
+            FunctionKind::ComponentMethod { component } => component,
+            _ => {
+                return Err(format!(
+                    "self-relative component queue `{queue}` appears outside a component method"
+                ));
+            }
+        },
+        ComponentBase::Path(path) => {
+            let owner = func
+                .owner
+                .ok_or_else(|| "component queue path has no owning testbench".to_string())?;
+            let tb = prog
+                .testbenches
+                .get(owner.index())
+                .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
+            resolve_testbench_component_path(prog, tb, path)?
+        }
+        ComponentBase::Local(local) => {
+            return Err(format!(
+                "component queue `{queue}` uses unsupported local base %{}",
+                local.0
+            ));
+        }
+    };
+    let schema = prog
+        .components
+        .get(component.index())
+        .ok_or_else(|| format!("references missing component c{}", component.0))?;
+    match schema.field(queue) {
+        Some(ComponentFieldSchema {
+            kind: ComponentFieldKind::Queue { elem },
+            ..
+        }) => Ok(elem.clone()),
+        _ => Err(format!(
+            "component c{} has no queue field `{queue}`",
+            component.0
+        )),
+    }
+}
+
 fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
@@ -2165,6 +2213,19 @@ impl Checker<'_> {
                         crate::ir::ScoreboardOp::QueuePush { queue, value } => {
                             self.check_scoreboard_queue(*sb, queue);
                             self.check_expr(value, false, "ScoreboardOp push value");
+                            if let (Some(elem), Some(actual)) = (
+                                self.scoreboard_queue_elem(*sb, queue),
+                                expr_type(self.func, value),
+                            ) {
+                                if !queue_elem_accepts_type(&elem, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pushes {:?} into scoreboard queue `{queue}` with element {:?}",
+                                            self.fid.0, self.bid.0, actual, elem
+                                        ),
+                                    });
+                                }
+                            }
                         }
                         crate::ir::ScoreboardOp::QueuePop { queue, dest } => {
                             self.check_scoreboard_queue(*sb, queue);
@@ -2173,21 +2234,11 @@ impl Checker<'_> {
                                 self.scoreboard_queue_elem(*sb, queue),
                                 self.func.locals.get(dest.index()),
                             ) {
-                                let compatible = match (elem, &local.ty) {
-                                    (QueueElem::Record(expected), IrType::Record(actual)) => {
-                                        expected == actual
-                                    }
-                                    (QueueElem::Scalar { .. }, IrType::Record(_))
-                                    | (QueueElem::Record(_), _) => false,
-                                    // Preserve existing scalar assignment conversions,
-                                    // including signed-to-unsigned and the reverse.
-                                    (QueueElem::Scalar { .. }, _) => true,
-                                };
-                                if !compatible {
+                                if !queue_elem_fits_dest(&elem, &local.ty) {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
-                                            "fn{} b{} pops scoreboard sb{} queue `{queue}` with element {:?} into local %{} declared {:?}",
-                                            self.fid.0, self.bid.0, sb.0, elem, dest.0, local.ty
+                                            "fn{} b{} pops scoreboard queue `{queue}` with element {:?} into local %{} declared {:?}",
+                                            self.fid.0, self.bid.0, elem, dest.0, local.ty
                                         ),
                                     });
                                 }
@@ -2227,13 +2278,53 @@ impl Checker<'_> {
                     // no-inline-port rule like any host-state assignment.
                     self.check_expr(value, false, "SeqPush value");
                 }
-                Stmt::ComponentQueuePush { value, .. } => {
+                Stmt::ComponentQueuePush { base, queue, value } => {
                     // Component-queue host state — the pushed value follows
                     // the no-inline-port rule like any Assign value.
                     self.check_expr(value, false, "ComponentQueuePush value");
+                    match resolve_component_queue_elem(self.prog, self.func, base, queue) {
+                        Ok(elem) => {
+                            if let Some(actual) = expr_type(self.func, value) {
+                                if !queue_elem_accepts_type(&elem, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pushes {:?} into component queue `{queue}` with element {:?}",
+                                            self.fid.0, self.bid.0, actual, elem
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Err(detail) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} has invalid component queue push: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                    }
                 }
-                Stmt::ComponentQueuePop { dest, .. } => {
+                Stmt::ComponentQueuePop { base, queue, dest } => {
                     self.check_local(*dest);
+                    match resolve_component_queue_elem(self.prog, self.func, base, queue) {
+                        Ok(elem) => {
+                            if let Some(local) = self.func.locals.get(dest.index()) {
+                                if !queue_elem_fits_dest(&elem, &local.ty) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pops component queue `{queue}` with element {:?} into local %{} declared {:?}",
+                                            self.fid.0, self.bid.0, elem, dest.0, local.ty
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Err(detail) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} has invalid component queue pop: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                    }
                 }
                 // Whole sub-component value copy — receiver/source resolved
                 // at lowering against the component schema; nothing to
@@ -2436,17 +2527,13 @@ impl Checker<'_> {
         }
     }
 
-    fn scoreboard_queue_elem(
-        &self,
-        sb: crate::ir::ScoreboardId,
-        queue: &str,
-    ) -> Option<&QueueElem> {
+    fn scoreboard_queue_elem(&self, sb: crate::ir::ScoreboardId, queue: &str) -> Option<QueueElem> {
         self.prog
             .scoreboards
             .get(sb.index())
             .and_then(|schema| schema.field(queue))
             .and_then(|field| match &field.kind {
-                crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem),
+                crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem.clone()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. } => None,
             })
     }
@@ -2537,7 +2624,6 @@ impl Checker<'_> {
             }
         }
     }
-
     /// `local` must be record-typed and its schema must declare `field`.
     /// `mid_positions` lists the segments (positions in `[field] ++ path`)
     /// that carry a `Vec<Record, N>` element selection.

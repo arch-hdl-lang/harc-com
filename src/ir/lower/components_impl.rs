@@ -1389,12 +1389,12 @@ fn lower_field(
                     "",
                 ));
             }
-            // The element is an exact scalar type up to 64 bits or a value-record
+            // The element is an exact scalar type or a value-record
             // (`errors : queue<CheckerError>`). A record element lowers to a
             // `harc_rt::HarcQueue<Rec>` and is manipulated through the
-            // component-queue ops; anything else (enum / Vec / >64-bit /
+            // component-queue ops; anything else (enum / Vec /
             // unknown named type) is rejected precisely.
-            let elem = lower_bounded_queue_elem(comp, fname, args.first(), record_ids)?;
+            let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
             Ok(ComponentFieldKind::Queue { elem })
         }
         TypeExpr::Builtin {

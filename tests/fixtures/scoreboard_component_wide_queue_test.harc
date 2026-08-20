@@ -1,0 +1,67 @@
+// Scoreboard and composite-component scalar queues retain exact widths and
+// signedness across inferred, assigned, and discarded pops.
+
+scoreboard WideDataScoreboard
+    wide_values   : queue<uint<256>>
+    signed_values : queue<sint<8>>
+end scoreboard WideDataScoreboard
+
+agent WideQueueComponent
+    wide_values   : queue<uint<256>>
+    signed_values : queue<sint<8>>
+end agent WideQueueComponent
+
+testbench WideOwnerQueueTb
+    dut  : Top
+    sb   : WideDataScoreboard
+    comp : WideQueueComponent
+end testbench WideOwnerQueueTb
+
+impl ScoreboardComponentWideQueueTest for WideOwnerQueueTb
+    run
+        let one : uint<256> = 1
+
+        sb.wide_values.push(one << 200)
+        sb.wide_values.push(one << 201)
+        sb.wide_values.push(one << 202)
+        let sb_inferred = sb.wide_values.pop()
+        let sb_assigned : uint<256> = 0
+        sb_assigned = sb.wide_values.pop()
+        sb.wide_values.pop()
+
+        assert (sb_inferred >> 200) == 1
+            else fail("scoreboard inferred pop lost bit 200")
+        assert (sb_assigned >> 201) == 1
+            else fail("scoreboard assigned pop lost bit 201")
+        assert sb.wide_values.empty()
+            else fail("scoreboard discarded pop did not drain the queue")
+
+        let negative : sint<8> = (0 - 1) as sint<8>
+        sb.signed_values.push(negative)
+        let sb_signed = sb.signed_values.pop()
+        assert sb_signed < 0
+            else fail("scoreboard inferred pop lost signedness")
+
+        comp.wide_values.push(one << 210)
+        comp.wide_values.push(one << 211)
+        comp.wide_values.push(one << 212)
+        let comp_inferred = comp.wide_values.pop()
+        let comp_assigned : uint<256> = 0
+        comp_assigned = comp.wide_values.pop()
+        comp.wide_values.pop()
+
+        assert (comp_inferred >> 210) == 1
+            else fail("component inferred pop lost bit 210")
+        assert (comp_assigned >> 211) == 1
+            else fail("component assigned pop lost bit 211")
+        assert comp.wide_values.empty()
+            else fail("component discarded pop did not drain the queue")
+
+        comp.signed_values.push(negative)
+        let comp_signed = comp.signed_values.pop()
+        assert comp_signed < 0
+            else fail("component inferred pop lost signedness")
+
+        log(info, "PASS: scoreboard/component wide scalar queues preserve exact types")
+    end run
+end impl ScoreboardComponentWideQueueTest

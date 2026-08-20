@@ -289,7 +289,7 @@ pub(crate) fn lower_scoreboard(
 
 /// Classify a scoreboard field type. Scalar fields mirror v1's
 /// `scoreboard_field_c_type` → `txn_field_c_type` choices; `queue<T>`
-/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar ≤ 64 bits or a
+/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar or a
 /// value-record (transaction/struct), mirroring v1's `HarcQueue<Struct>`.
 /// The record-element resolution reuses the composite-component path's
 /// `lower_queue_elem` so both queue seams agree on the `QueueElem` shape.
@@ -307,10 +307,9 @@ fn scoreboard_field_kind(
         ..
     } = t
     {
-        // Exact scalar up to 64 bits or value-record element — resolved through the
-        // shared component-path helper (don't fork the record-queue seam).
-        let elem =
-            super::components::lower_bounded_queue_elem(sb, fname, args.first(), record_ids)?;
+        // Exact scalar or value-record element — resolved through the shared
+        // component-path helper (don't fork the record-queue seam).
+        let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
     let ty = scalar_ir_type(t).ok_or_else(|| {
