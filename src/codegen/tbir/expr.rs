@@ -148,23 +148,28 @@ pub(super) fn lane_width(cx: &ECx<'_>, p: &PortRef) -> Option<u32> {
     }
 }
 
-/// Resolve the C++ receiver for a transactor-state access. A non-empty
-/// `instance` is a fully-bound test-scope read (`a.calls`) and renders as
-/// itself. An EMPTY instance is a type-shared method-body placeholder
-/// (#494 P1b) and renders against the per-call state receiver
-/// (`self_state`); reaching an empty instance with no receiver in scope
-/// means a lowering/pass bug left a placeholder unbound.
-pub(super) fn resolve_state_instance<'a>(
-    cx: &ECx<'a>,
-    instance: &'a str,
-) -> Result<&'a str, EmitError> {
+/// Resolve the C++ receiver for a transactor-state access. A non-empty source
+/// instance (`a.calls`) maps through the owning testbench's explicit storage
+/// table when collision hygiene renamed its object. An EMPTY instance is a
+/// type-shared method-body placeholder (#494 P1b) and renders against the
+/// per-call state receiver (`self_state`); reaching an empty instance with no
+/// receiver in scope means a lowering/pass bug left a placeholder unbound.
+pub(super) fn resolve_state_instance(cx: &ECx<'_>, instance: &str) -> Result<String, EmitError> {
     if !instance.is_empty() {
-        return Ok(instance);
+        if let Some(storage) = owner_tb(cx).and_then(|tb| {
+            tb.unbound_state_actors
+                .iter()
+                .find(|actor| actor.field == instance)
+                .map(|actor| actor.storage.clone())
+        }) {
+            return Ok(storage);
+        }
+        return Ok(instance.to_string());
     }
-    cx.state_receiver.ok_or_else(|| {
+    cx.state_receiver.map(str::to_string).ok_or_else(|| {
         EmitError(format!(
             "tbir: empty-instance transactor-state access in {} with no state receiver \
-             in scope (unfilled placeholder — lowering/pass bug)",
+                 in scope (unfilled placeholder — lowering/pass bug)",
             cx.func.name
         ))
     })
@@ -519,6 +524,25 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 crate::ir::IdleKind::Both => format!(
                     "((((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n})) \
                      && (((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n})))"
+                ),
+            }
+        }
+        Expr::TransactorIdle {
+            storage, kind, n, ..
+        } => {
+            let n = expr_cpp(cx, n)?;
+            match kind {
+                crate::ir::IdleKind::In => {
+                    format!(
+                        "(((uint64_t)cycle_count - {storage}._last_in_cycle) >= (uint64_t)({n}))"
+                    )
+                }
+                crate::ir::IdleKind::Out => format!(
+                    "(((uint64_t)cycle_count - {storage}._last_out_cycle) >= (uint64_t)({n}))"
+                ),
+                crate::ir::IdleKind::Both => format!(
+                    "((((uint64_t)cycle_count - {storage}._last_in_cycle) >= (uint64_t)({n})) \
+                     && (((uint64_t)cycle_count - {storage}._last_out_cycle) >= (uint64_t)({n})))"
                 ),
             }
         }
@@ -1171,8 +1195,8 @@ fn state_transactor<'a>(cx: &ECx<'a>, instance: &str) -> Option<&'a crate::ir::T
         .or_else(|| {
             tb.unbound_state_actors
                 .iter()
-                .find(|(n, _)| n == instance)
-                .map(|(_, t)| *t)
+                .find(|actor| actor.field == *instance)
+                .map(|actor| actor.transactor)
         })?;
     prog.transactors.get(tid.index())
 }

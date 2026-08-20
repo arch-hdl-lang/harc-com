@@ -1535,16 +1535,14 @@ pub struct TestbenchSchema {
     /// locals (v1's `AnalysisEnv env;`), so `connect` push_backs and
     /// method calls work against the run function's `env`.
     pub component_fields: Vec<ComponentFieldBinding>,
-    /// Unbound DUT-poking transactor instances that carry persistent
-    /// scalar state fields (`drv : SeqXactor active` where `SeqXactor`
-    /// has a `last_read : uint<32>` field), in declaration order. Each
-    /// names an entry in `transactor_fields`; emission generates a
-    /// per-instance state struct (mirroring the bound-to target form's
-    /// `target_state_struct_inst`) that the method lambdas and the
-    /// run/check coroutine share by `[&]` capture. Stateless unbound
-    /// transactors (no state fields) are absent here — their methods are
-    /// pure DUT-poking lambdas with no per-instance struct.
-    pub unbound_state_actors: Vec<(String, TransactorId)>,
+    /// Unbound DUT-poking transactor instances that need persistent
+    /// storage, in declaration order: either they declare state fields or
+    /// an idle/quiesced predicate needs their heartbeat stamps. Each names
+    /// an entry in `transactor_fields`; emission generates a per-instance
+    /// state struct that method lambdas and run/check share by capture.
+    /// Otherwise-stateless instances absent from heartbeat expressions do
+    /// not appear here.
+    pub unbound_state_actors: Vec<UnboundStateActorSchema>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
@@ -1645,6 +1643,17 @@ pub struct TargetTlmActorSchema {
     /// The bound-to transactor type providing the responder bodies and
     /// state fields (`TbProgram::transactors[transactor]`).
     pub transactor: TransactorId,
+}
+
+/// Per-instance storage for an unbound DUT-poking or initiator transactor.
+/// `field` is the source-level receiver used for resolution; `storage` is
+/// the C++ identifier emitted for the state object. They are deliberately
+/// distinct so a source field cannot collide with a generated method slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundStateActorSchema {
+    pub field: String,
+    pub transactor: TransactorId,
+    pub storage: String,
 }
 
 /// One `let regs : R = bind <helper>` register-block binding. The
@@ -2672,6 +2681,23 @@ pub enum Expr {
         kind: IdleKind,
         n: Box<Expr>,
     },
+    /// A heartbeat-idle predicate on a direct transactor instance:
+    /// `drv.idle_in(N)`, `drv.idle_out(N)`, `drv.idle(N)`, or
+    /// `drv.quiesced(N)` (the latter is equivalent to `idle(N)` for a
+    /// transactor, which has no nested component leaves in this schema).
+    /// `field` and `transactor` are carried together so verification can
+    /// prove the owning testbench still binds that field to that schema
+    /// after an IR-mutating pass. The threshold reads the same activity
+    /// stamps already emitted on every transactor state struct.
+    TransactorIdle {
+        field: String,
+        transactor: TransactorId,
+        /// Verified C++ state-object symbol. This differs from `field` for
+        /// demand-created storage on otherwise-stateless transactors.
+        storage: String,
+        kind: IdleKind,
+        n: Box<Expr>,
+    },
     /// The global simulation cycle counter (`cycle_count`). A bare
     /// `cycle_count` ident resolves here (it is a framework-provided
     /// value, not a user local). Both backends emit the in-scope
@@ -2801,7 +2827,7 @@ pub enum Expr {
     },
 }
 
-/// Which heartbeat stamp(s) an `Expr::ComponentIdle` predicate reads.
+/// Which heartbeat stamp(s) a component/transactor idle predicate reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleKind {
     /// `idle_in(N)` — N cycles since last input activity.

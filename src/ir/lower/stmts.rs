@@ -650,6 +650,20 @@ impl FuncBuilder<'_> {
                         return Ok(());
                     }
                 }
+                // A direct transactor heartbeat predicate is a pure value,
+                // not a method edge. In statement position v1 still
+                // evaluates its threshold expression and discards the
+                // boolean, so retain it in an unread temp rather than
+                // dropping the statement or routing it through
+                // `Stmt::TransactorCall`.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some(idle) = self.as_transactor_idle(callee, args)? {
+                        let discard = self.fresh_temp();
+                        self.set_local_type(discard, crate::ir::IrType::Bool);
+                        self.push(Stmt::Assign(discard, idle));
+                        return Ok(());
+                    }
+                }
                 // Statement-position transactor method call:
                 // `xact.write1(2, 17, true)` — call for effect, result
                 // (if any) discarded, mirroring v1.

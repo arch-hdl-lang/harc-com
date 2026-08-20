@@ -287,16 +287,17 @@ pub(super) fn unbound_state_struct_decl(
     writeln!(out, "{INDENT}}};").ok();
 }
 
-/// Emit one instance variable of the shared per-TYPE state struct
-/// (`_<Type>_state <instance>;`). Multiple instances of one type each get
-/// their own variable with independent default-initialized state.
+/// Emit one storage variable of the shared per-TYPE state struct. `storage`
+/// may be a generated symbol distinct from the source instance name; this
+/// prevents a demand-created heartbeat object from colliding with a method
+/// lambda such as `<Type>_<method>`.
 pub(super) fn unbound_state_var(
     out: &mut String,
     schema: &crate::ir::TransactorSchema,
-    instance: &str,
+    storage: &str,
 ) {
     let ty = unbound_state_struct_ty(schema);
-    writeln!(out, "{INDENT}{ty} {instance};").ok();
+    writeln!(out, "{INDENT}{ty} {storage};").ok();
 }
 
 /// The shared field layout of a per-instance transactor-state struct:

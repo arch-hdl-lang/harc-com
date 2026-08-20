@@ -418,8 +418,11 @@ pub(crate) fn lower_transactor(
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         // Method bodies see no scoreboards either — scoreboards are
         // test-scope testbench fields, structurally invisible here.
         scoreboard_fields: HashMap::new(),
@@ -816,8 +819,11 @@ fn lower_bound_target_transactor(
         // applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
@@ -1374,8 +1380,11 @@ fn lower_bound_initiator_transactor(
         // remaps are applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),

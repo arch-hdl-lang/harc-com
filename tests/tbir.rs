@@ -15718,7 +15718,11 @@ end impl EvTest
     assert_eq!(xs.state_fields[0].name, "count");
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
-        vec![("ev".to_string(), ir::TransactorId(0))],
+        vec![ir::UnboundStateActorSchema {
+            field: "ev".to_string(),
+            transactor: ir::TransactorId(0),
+            storage: "ev".to_string(),
+        }],
         "stateful instance recorded for per-instance materialization",
     );
 
@@ -15734,8 +15738,16 @@ end impl EvTest
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
         vec![
-            ("ev".to_string(), ir::TransactorId(0)),
-            ("ev2".to_string(), ir::TransactorId(0)),
+            ir::UnboundStateActorSchema {
+                field: "ev".to_string(),
+                transactor: ir::TransactorId(0),
+                storage: "ev".to_string(),
+            },
+            ir::UnboundStateActorSchema {
+                field: "ev2".to_string(),
+                transactor: ir::TransactorId(0),
+                storage: "ev2".to_string(),
+            },
         ],
         "both active stateful instances recorded for per-instance materialization",
     );
@@ -17049,7 +17061,11 @@ fn bound_initiator_transactor_with_state_lowers() {
     // state materialization (the same table the unbound form uses).
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
-        vec![("helper".to_string(), ir::TransactorId(0))],
+        vec![ir::UnboundStateActorSchema {
+            field: "helper".to_string(),
+            transactor: ir::TransactorId(0),
+            storage: "helper".to_string(),
+        }],
         "stateful bound-initiator instance recorded for materialization",
     );
 
@@ -22409,17 +22425,13 @@ fn a_constant_expression_coverpoint_bound_folds() {
     );
 }
 
-/// The built-in predicates on a TRANSACTOR receiver. v1 resolves them
-/// there as well as on a component — `resolve_component_idle_predicate`
-/// walks `self.transactors` through `synth_component_from_transactor`,
-/// and both backends stamp `_last_in_cycle`/`_last_out_cycle` on
-/// transactor state structs — so a flat `Invalid` was calling twelve
-/// working programs (4 names x assert / bare statement / `let`) errors.
-///
-/// The carve-out that fixed it shipped with no test: `&& false` on it
-/// left the whole suite green.
+/// The built-in predicates on a direct TRANSACTOR receiver. This is one
+/// typed IR seam but twelve positive-v1 source positions (four names x
+/// assert / bare statement / `let`). A stateless transactor is important:
+/// TB-IR must materialize its activity-stamp object on demand instead of
+/// emitting a predicate against an undeclared C++ receiver.
 #[test]
-fn a_built_in_predicate_on_a_transactor_is_a_gap_not_an_error() {
+fn a_built_in_predicate_on_a_transactor_lowers_and_verifies() {
     let src = |stmt: &str| {
         format!(
             r#"domain SysDomain
@@ -22457,27 +22469,102 @@ end impl TT"#
             format!("let v = d.{name}(2)"),
         ] {
             let s = src(&stmt);
-            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-            assert!(
-                msg.contains(&format!("`d.{name}` on a transactor")),
-                "`{stmt}`: {msg}"
-            );
-            // The half that makes the suggestion honest: v1 emits the
-            // heartbeat against the transactor's own stamps.
+            let prog = lower_src(&s).unwrap_or_else(|e| panic!("`{stmt}` lowers: {e:?}"));
+            verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{stmt}` verifies: {e:?}"));
+            let tbir = emit_cpp_src(&s);
+            let storage =
+                &prog.testbenches[prog.tests[0].testbench.index()].unbound_state_actors[0].storage;
+            // Both emitters read the transactor's own stamps. TB-IR uses
+            // collision-proof generated storage; v1 retains `_tb.d`.
             let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
-            // `idle_out` reads only the out stamp; the other three read
-            // the in stamp (`idle` and `quiesced` read both).
             let stamp = if name == "idle_out" {
-                "_tb.d._last_out_cycle"
+                "_last_out_cycle"
             } else {
-                "_tb.d._last_in_cycle"
+                "_last_in_cycle"
             };
             assert!(
-                v1.contains(stamp),
-                "`{stmt}`: v1 resolves the predicate on the transactor (`{stamp}`)"
+                tbir.contains(&format!("{storage}.{stamp}")),
+                "`{stmt}`: TB-IR resolves the predicate on `{storage}.{stamp}`: {tbir}"
+            );
+            assert!(
+                v1.contains(&format!("_tb.d.{stamp}")),
+                "`{stmt}`: v1 resolves the predicate on `_tb.d.{stamp}`"
             );
         }
     }
+
+    // One argument binds by position, including a name v1 ignores.
+    lower_src(&src("let v = d.idle_in(any_name = 2)"))
+        .expect("a named threshold lowers by position");
+
+    // A test-scope `let d : Drv active` uses the bare receiver spelling
+    // rather than the impl-for `_tb.d` spelling.
+    let bare = src("assert d.idle(2) else fail(\"bare\")")
+        .replace(
+            "testbench Tb\n    dut : Top\n    d   : Drv active\nend testbench Tb\n\nimpl TT for Tb",
+            "test TT\n    let dut : Top\n    let d : Drv active",
+        )
+        .replace("end impl TT", "end test TT");
+    let prog = lower_src(&bare).expect("bare transactor heartbeat lowers");
+    verify::verify_program(&prog).expect("bare transactor heartbeat verifies");
+    let storage =
+        &prog.testbenches[prog.tests[0].testbench.index()].unbound_state_actors[0].storage;
+    assert!(
+        emit_cpp_src(&bare).contains(&format!("{storage}._last_in_cycle")),
+        "bare receiver must map to generated storage `{storage}`"
+    );
+
+    // Bound target-side TLM responders live in a separate binding table,
+    // but v1 exposes the same four predicates on their existing state
+    // object. Exercise every name through that receiver namespace.
+    let target_fixture = fixture("tlm_target_thread_test.harc");
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let target_src = target_fixture.replace("target.idle(2)", &format!("target.{name}(2)"));
+        let prog = lower_src(&target_src)
+            .unwrap_or_else(|e| panic!("target responder `{name}` lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("target responder `{name}` verifies: {e:?}"));
+        let stamp = if name == "idle_out" {
+            "_last_out_cycle"
+        } else {
+            "_last_in_cycle"
+        };
+        assert!(
+            emit_cpp_src(&target_src).contains(&format!("target.{stamp}")),
+            "target responder `{name}` must use its existing stamp object"
+        );
+    }
+
+    // A source method declaration wins over the built-in spelling. This
+    // guards the resolver order: `idle` is a default, not a reserved word.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let declared = src(&format!("assert d.{name}(2) == 7 else fail(\"override\")")).replacen(
+            "hookable go()\n            wait 1 cycle\n        end go",
+            &format!(
+                "hookable {name}(n: uint<8>) -> uint<32>\n            return 7\n        end {name}"
+            ),
+            1,
+        );
+        let cpp = emit_cpp_src(&declared);
+        assert!(
+            cpp.contains(&format!("Drv_{name}(2)")),
+            "declared `{name}` method must win over heartbeat lowering: {cpp}"
+        );
+    }
+
+    // Wrong arity is not a retirement gap: v1 rejects idle predicates
+    // itself and emits uncompilable C++ for quiesced.
+    let msg = assert_not_implemented(
+        &lower_src(&src("assert d.idle() else fail(\"arity\")")).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("exactly one cycle-count"), "{msg}");
+    let msg = assert_not_implemented(
+        &lower_src(&src("assert d.quiesced() else fail(\"arity\")")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("exactly one cycle-count"), "{msg}");
+
     // …and a name nothing implements is still the program error the
     // surrounding arm was written for.
     let s = src("assert d.nosuch(2) else fail(\"o\")");
@@ -22487,6 +22574,168 @@ end impl TT"#
     assert!(
         v1.contains("_tb.d.nosuch(2)"),
         "v1 emits a call `Drv` has no member for: {v1}"
+    );
+}
+
+#[test]
+fn transactor_heartbeat_storage_and_references_are_verified() {
+    fn first_idle(prog: &mut ir::TbProgram) -> &mut ir::Expr {
+        for func in &mut prog.functions {
+            for block in &mut func.blocks {
+                for stmt in &mut block.stmts {
+                    let ir::Stmt::AssertCheck { cond, .. } = stmt else {
+                        continue;
+                    };
+                    let ir::Expr::Unary(_, inner) = cond else {
+                        continue;
+                    };
+                    if matches!(&**inner, ir::Expr::TransactorIdle { .. }) {
+                        return inner;
+                    }
+                }
+            }
+        }
+        panic!("fixture has no negated transactor heartbeat assertion")
+    }
+
+    let src = fixture("transactor_heartbeat_predicates_test.harc");
+    let prog = lower_src(&src).expect("transactor heartbeat fixture lowers");
+    verify::verify_program(&prog).expect("transactor heartbeat fixture verifies");
+
+    // Both otherwise-stateless instances need stamp storage, and the late
+    // discovery is rebuilt in testbench declaration order.
+    let tb = &prog.testbenches[prog.tests[0].testbench.index()];
+    let actors: Vec<&str> = tb
+        .unbound_state_actors
+        .iter()
+        .map(|actor| actor.field.as_str())
+        .collect();
+    assert_eq!(
+        actors,
+        vec![
+            "PulseDrv_pulse",
+            "pas",
+            "StatefulPulseDrv_pulse_pre",
+            "__harc_transactor_state_tb0_f0",
+            "HeartbeatEmptyAgent_ping",
+        ]
+    );
+    assert_eq!(
+        tb.unbound_state_actors[0].storage, "__harc_transactor_state_tb0_f0_1",
+        "generated stateless storage must be fresh against source fields"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[1].storage, "__harc_transactor_state_tb0_f1_1",
+        "generated stateless storage must be fresh against test-scope component locals"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[2].storage, "__harc_transactor_state_tb0_f2",
+        "an already-stateful field colliding with a hook vector must use the same explicit remap"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[3].storage, "__harc_transactor_state_tb0_f0",
+        "an ordinary stateful actor retains its source-name storage ABI"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[4].storage, "__harc_transactor_state_tb0_f4",
+        "stateful storage must be remapped away from component callable slots"
+    );
+
+    let mut missing_field = prog.clone();
+    let ir::Expr::TransactorIdle { field, .. } = first_idle(&mut missing_field) else {
+        unreachable!()
+    };
+    *field = "missing".to_string();
+    let errs = verify::verify_program(&missing_field)
+        .expect_err("a heartbeat field absent from the owning testbench must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("heartbeat field `missing`")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut dangling_schema = prog.clone();
+    let ir::Expr::TransactorIdle { transactor, .. } = first_idle(&mut dangling_schema) else {
+        unreachable!()
+    };
+    *transactor = ir::TransactorId(u32::MAX);
+    let errs = verify::verify_program(&dangling_schema)
+        .expect_err("a dangling heartbeat transactor id must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("references missing x")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut missing_storage = prog.clone();
+    missing_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors
+        .retain(|actor| actor.field != "PulseDrv_pulse");
+    let errs = verify::verify_program(&missing_storage)
+        .expect_err("a heartbeat expression without its stamp storage must fail verification");
+    assert!(
+        errs.iter().any(|e| e
+            .to_string()
+            .contains("heartbeat field `PulseDrv_pulse` has no matching stamp storage")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut duplicate_storage = prog.clone();
+    let duplicate = duplicate_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors[0]
+        .clone();
+    duplicate_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors
+        .push(duplicate);
+    let errs = verify::verify_program(&duplicate_storage)
+        .expect_err("duplicate heartbeat stamp storage must fail verification");
+    assert!(
+        errs.iter().any(|e| e
+            .to_string()
+            .contains("stamp storage `PulseDrv_pulse` more than once")),
+        "unexpected verifier errors: {errs:?}"
+    );
+}
+
+#[test]
+fn transactor_heartbeat_cycle_service_is_verified() {
+    let src = r#"transactor CycDrv
+    dut : Top
+end transactor CycDrv
+
+testbench CycTb
+    dut : Top
+    d : CycDrv passive
+    hit : uint<32> default 0
+    on d.idle(2) == true
+        hit = hit + 1
+    end on
+end testbench CycTb
+
+impl CycTest for CycTb
+    run
+        wait 3 cycles
+    end run
+end impl CycTest"#;
+    let prog = lower_src(src).expect("heartbeat cycle-service trigger lowers");
+    verify::verify_program(&prog).expect("heartbeat cycle-service trigger verifies");
+    assert_eq!(prog.testbenches[0].cycle_services.len(), 1);
+    assert_eq!(prog.testbenches[0].unbound_state_actors.len(), 1);
+
+    let mut corrupt = prog.clone();
+    let ir::Expr::Binary(_, left, _) = &mut corrupt.testbenches[0].cycle_services[0].trigger else {
+        panic!("cycle-service trigger is not the expected comparison")
+    };
+    let ir::Expr::TransactorIdle { storage, .. } = &mut **left else {
+        panic!("cycle-service trigger is not a transactor heartbeat")
+    };
+    *storage = "missing_storage".to_string();
+    let errs = verify::verify_program(&corrupt)
+        .expect_err("a corrupted standalone cycle-service heartbeat must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("schema requires")),
+        "unexpected verifier errors: {errs:?}"
     );
 }
 

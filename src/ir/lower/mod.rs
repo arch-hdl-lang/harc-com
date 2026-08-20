@@ -41,6 +41,7 @@ use crate::ir::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum LowerError {
@@ -1898,8 +1899,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
@@ -1965,8 +1969,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: consts.clone(),
@@ -2169,8 +2176,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         // A transactor body that pokes its own sub-scoreboard (`sb.writes =
         // ...` inside a cycle-trigger / on-handler) validates the scalar
@@ -4626,6 +4636,78 @@ fn lower_test(
         addrmap_bindings_map.insert(binding.clone(), actx);
     }
 
+    // Pre-assign storage for every direct transactor. Stateful instances
+    // preserve the established source-name ABI unless that name would
+    // collide with an emitted callable/hook-vector slot. Stateless
+    // instances reserve their demand-created heartbeat name up front so
+    // the allocator can make every generated name fresh against source
+    // fields and against every other allocated storage symbol.
+    let future_tb_index = prog.testbenches.len();
+    let method_slot_names: HashSet<String> = transactor_fields
+        .iter()
+        .flat_map(|(_, xid)| {
+            let schema = &prog.transactors[xid.index()];
+            schema.methods.iter().flat_map(|method| {
+                let base = format!("{}_{}", schema.name, method.name);
+                [base.clone(), format!("{base}_pre"), format!("{base}_post")]
+            })
+        })
+        .collect();
+    let component_slot_names: HashSet<String> = prog
+        .components
+        .iter()
+        .flat_map(|schema| {
+            schema.methods.iter().flat_map(|method| {
+                let base = format!("{}_{}", schema.name, method.name);
+                [base.clone(), format!("{base}_pre"), format!("{base}_post")]
+            })
+        })
+        .collect();
+    let mut occupied_storage_names = method_slot_names.clone();
+    occupied_storage_names.extend(component_slot_names.iter().cloned());
+    occupied_storage_names.extend(transactor_fields.iter().map(|(field, _)| field.clone()));
+    occupied_storage_names.extend(cov_fields.iter().map(|(field, _)| field.clone()));
+    occupied_storage_names.extend(scoreboard_fields.iter().map(|(field, _)| field.clone()));
+    occupied_storage_names.extend(scalar_fields.iter().map(|field| field.name.clone()));
+    occupied_storage_names.extend(queue_fields.iter().map(|field| field.name.clone()));
+    occupied_storage_names.extend(record_fields.iter().map(|(field, _)| field.clone()));
+    occupied_storage_names.extend(
+        component_field_bindings
+            .iter()
+            .map(|binding| binding.field.clone()),
+    );
+    occupied_storage_names.extend(bus_bindings.iter().map(|binding| binding.field.clone()));
+    occupied_storage_names.extend(
+        target_tlm_binds
+            .iter()
+            .map(|(instance, _, _)| instance.clone()),
+    );
+    occupied_storage_names.extend(regblock_binds.iter().map(|(binding, _, _)| binding.clone()));
+    occupied_storage_names.extend(addrmap_binds.iter().map(|(binding, _, _)| binding.clone()));
+    occupied_storage_names.extend(test_let_names.iter().cloned());
+
+    let mut transactor_storage_names: HashMap<String, String> = HashMap::new();
+    for (index, (field, xid)) in transactor_fields.iter().enumerate() {
+        let schema = &prog.transactors[xid.index()];
+        let storage = if !schema.state_fields.is_empty()
+            && !method_slot_names.contains(field)
+            && !component_slot_names.contains(field)
+        {
+            field.clone()
+        } else {
+            let base = format!("__harc_transactor_state_tb{future_tb_index}_f{index}");
+            let mut candidate = base.clone();
+            let mut suffix = 1usize;
+            while occupied_storage_names.contains(&candidate) {
+                candidate = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            occupied_storage_names.insert(candidate.clone());
+            candidate
+        };
+        transactor_storage_names.insert(field.clone(), storage);
+    }
+
     // Resolve bound-to target-TLM responder binds: the bound bus binding
     // must exist in this test, its bus type must match the transactor's
     // `bound to` bus, and the instance name must be unique. Build the
@@ -4722,7 +4804,7 @@ fn lower_test(
     // Bound-to TARGET responders (`target_tlm_actors`, handled above) and
     // bound-to INITIATOR BFMs keep their own name-fill path — see the
     // fill loop below, gated on `bound_bus`.
-    let mut unbound_state_actors: Vec<(String, ir::TransactorId)> = Vec::new();
+    let mut unbound_state_actors: Vec<ir::UnboundStateActorSchema> = Vec::new();
     for (field, xid) in &transactor_fields {
         let xschema = &prog.transactors[xid.index()];
         // Bound-to TARGET instances are handled above (they appear in
@@ -4765,8 +4847,10 @@ fn lower_test(
         if is_bound && !is_passive {
             let method_fns: Vec<usize> =
                 xschema.methods.iter().map(|m| m.function.index()).collect();
+            let storage = &transactor_storage_names[field];
             for fidx in method_fns {
-                if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], field)
+                if let Err(prev) =
+                    fill_transactor_state_instance(&mut prog.functions[fidx], storage)
                 {
                     return Err(unsupported(
                         &format!(
@@ -4778,7 +4862,14 @@ fn lower_test(
                 }
             }
         }
-        unbound_state_actors.push((field.clone(), *xid));
+        unbound_state_actors.push(ir::UnboundStateActorSchema {
+            field: field.clone(),
+            transactor: *xid,
+            // Existing stateful actors normally retain their source-name ABI;
+            // the precomputed map remaps only a generated-slot collision.
+            // Demand-created stateless heartbeat storage is generated below.
+            storage: transactor_storage_names[field].clone(),
+        });
     }
 
     // ── Closure-hook cluster: `on <obj>.<method> pre/post` method hooks ──
@@ -5006,7 +5097,7 @@ fn lower_test(
         passive_transactor_fields: passive_transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
-        target_tlm_actors,
+        target_tlm_actors: target_tlm_actors.clone(),
         component_fields: component_field_bindings,
         unbound_state_actors,
         synthetic,
@@ -5146,6 +5237,24 @@ fn lower_test(
         }
     }
 
+    let heartbeat_transactor_fields: Rc<RefCell<HashSet<String>>> = Default::default();
+    let existing_transactor_storage: HashMap<String, String> = prog.testbenches[tb_id.index()]
+        .unbound_state_actors
+        .iter()
+        .map(|actor| (actor.field.clone(), actor.storage.clone()))
+        .collect();
+    let heartbeat_transactor_storage: HashMap<String, String> = transactor_fields
+        .iter()
+        .map(|(field, _)| {
+            (
+                field.clone(),
+                existing_transactor_storage
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| transactor_storage_names[field].clone()),
+            )
+        })
+        .collect();
     let ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: if synthetic {
@@ -5166,8 +5275,14 @@ fn lower_test(
             .map(|b| (b.field.clone(), b.remap.clone()))
             .collect(),
         transactor_fields: transactor_fields.iter().cloned().collect(),
+        target_transactor_fields: target_tlm_actors
+            .iter()
+            .map(|actor| (actor.instance.clone(), actor.transactor))
+            .collect(),
         passive_transactor_fields: passive_transactor_fields.clone(),
         transactors: prog.transactors.clone(),
+        heartbeat_transactor_fields: Rc::clone(&heartbeat_transactor_fields),
+        heartbeat_transactor_storage: heartbeat_transactor_storage.clone(),
         scoreboard_fields: scoreboard_fields.iter().cloned().collect(),
         scoreboards: prog.scoreboards.clone(),
         consts: consts.clone(),
@@ -5407,6 +5522,37 @@ fn lower_test(
             });
         }
         prog.testbenches[tb_id.index()].cycle_services = cycle_services;
+    }
+
+    // A stateless direct transactor normally needs no per-instance C++
+    // object, but an idle/quiesced predicate reads its auto-injected
+    // activity stamps. Materialize storage only for fields that actually
+    // lowered such a predicate. Rebuild in declaration order rather than
+    // appending the late discoveries: declaration order is observable when
+    // generated names collide and was a source-order lesson from the prior
+    // method-hook batch.
+    {
+        let requested = heartbeat_transactor_fields.borrow();
+        let already_stateful: HashMap<String, ir::UnboundStateActorSchema> = prog.testbenches
+            [tb_id.index()]
+        .unbound_state_actors
+        .iter()
+        .map(|actor| (actor.field.clone(), actor.clone()))
+        .collect();
+        prog.testbenches[tb_id.index()].unbound_state_actors = transactor_fields
+            .iter()
+            .filter_map(|(field, xid)| {
+                already_stateful.get(field).cloned().or_else(|| {
+                    requested
+                        .contains(field)
+                        .then(|| ir::UnboundStateActorSchema {
+                            field: field.clone(),
+                            transactor: *xid,
+                            storage: heartbeat_transactor_storage[field].clone(),
+                        })
+                })
+            })
+            .collect();
     }
 
     prog.tests.push(TestSchema {
@@ -6072,6 +6218,10 @@ pub(crate) struct LowerCtx {
     /// testbench-schema construction). Empty for synthetic testbenches,
     /// helper contexts, and transactor method bodies.
     pub transactor_fields: HashMap<String, ir::TransactorId>,
+    /// Bound-to target responder instances (`target` → transactor id).
+    /// These live outside `transactor_fields` but expose the same built-in
+    /// heartbeat predicates through their already-materialized state object.
+    pub target_transactor_fields: HashMap<String, ir::TransactorId>,
     /// The subset of `transactor_fields` declared `passive`. A call to an
     /// active-only method (`when active`) on a passive instance is
     /// rejected at the call site (a passive instance has no such method),
@@ -6080,6 +6230,18 @@ pub(crate) struct LowerCtx {
     /// Snapshot of the program's transactor schemas, for method
     /// validation at call sites.
     pub transactors: Vec<TransactorSchema>,
+    /// Direct transactor instance fields whose heartbeat predicates were
+    /// actually lowered in this test. All out-of-line bodies share this
+    /// set through `Rc`, so a predicate in run/check, a closure hook, or a
+    /// testbench service requests the same per-instance stamp storage.
+    /// Back-patched into `TestbenchSchema::unbound_state_actors` after all
+    /// bodies have lowered; keeping it demand-driven avoids adding unused
+    /// state structs to every stateless transactor fixture.
+    pub heartbeat_transactor_fields: Rc<RefCell<HashSet<String>>>,
+    /// Collision-proof C++ state-object name for a direct transactor field.
+    /// The mapping is carried into `Expr::TransactorIdle`; target responders
+    /// retain their existing per-instance object name.
+    pub heartbeat_transactor_storage: HashMap<String, String>,
     /// Scoreboard-typed testbench fields (`sb` → scoreboard id), for
     /// `sb.<field>` / `sb.<queue>.push(...)` resolution. Empty for
     /// synthetic testbenches (no `_tb` to hold the instance), helper
@@ -7457,7 +7619,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 fill_expr(f, instance);
             }
             ir::Expr::WidthCast { inner, .. } => fill_expr(inner, instance),
-            ir::Expr::ComponentIdle { n, .. } => fill_expr(n, instance),
+            ir::Expr::ComponentIdle { n, .. } | ir::Expr::TransactorIdle { n, .. } => {
+                fill_expr(n, instance)
+            }
             ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
             ir::Expr::RecordField {
                 mid_indices, index, ..
@@ -7706,7 +7870,8 @@ fn fill_visit_expr(
         Expr::Unary(_, a)
         | Expr::BitSlice { target: a, .. }
         | Expr::WidthCast { inner: a, .. }
-        | Expr::ComponentIdle { n: a, .. } => {
+        | Expr::ComponentIdle { n: a, .. }
+        | Expr::TransactorIdle { n: a, .. } => {
             fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict)
         }
         Expr::BitSliceDyn { target, hi, lo } => {

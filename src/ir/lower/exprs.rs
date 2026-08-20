@@ -962,6 +962,12 @@ impl FuncBuilder<'_> {
                         if let Some(q) = self.as_component_quiesced(callee, args)? {
                             return Ok(q);
                         }
+                        // Direct transactor heartbeat predicates use the
+                        // transactor field/schema namespace rather than a
+                        // composite `ComponentBase`.
+                        if let Some(idle) = self.as_transactor_idle(callee, args)? {
+                            return Ok(idle);
+                        }
                         // Testbench-owned queue value-queries. `pop()`
                         // mutates and is accepted only as a standalone let
                         // RHS by the statement lowering path.
@@ -1986,6 +1992,22 @@ impl FuncBuilder<'_> {
                     n: Box::new(n),
                 }
             }
+            Expr::TransactorIdle {
+                field,
+                transactor,
+                storage,
+                kind,
+                n,
+            } => {
+                let n = self.hoist_ports_with_hint(*n, None);
+                Expr::TransactorIdle {
+                    field,
+                    transactor,
+                    storage,
+                    kind,
+                    n: Box::new(n),
+                }
+            }
             Expr::SeqIndex { seq, index } => {
                 let index = self.hoist_ports_with_hint(*index, None);
                 Expr::SeqIndex {
@@ -2258,6 +2280,22 @@ impl FuncBuilder<'_> {
                 let n = self.hoist_transactor_calls(*n);
                 Expr::ComponentIdle {
                     base,
+                    kind,
+                    n: Box::new(n),
+                }
+            }
+            Expr::TransactorIdle {
+                field,
+                transactor,
+                storage,
+                kind,
+                n,
+            } => {
+                let n = self.hoist_transactor_calls(*n);
+                Expr::TransactorIdle {
+                    field,
+                    transactor,
+                    storage,
                     kind,
                     n: Box::new(n),
                 }
@@ -2610,6 +2648,106 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// Lower a built-in heartbeat predicate on a direct transactor field.
+    /// A user-declared method with the same name wins, matching v1 and the
+    /// component predicate path. Both testbench fields (`_tb.d`) and bare
+    /// test-scope instances (`d`) resolve through `transactor_fields`.
+    pub(crate) fn as_transactor_idle(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &*callee.kind
+        else {
+            return Ok(None);
+        };
+        let kind = match method.name.as_str() {
+            "idle" | "quiesced" => crate::ir::IdleKind::Both,
+            "idle_in" => crate::ir::IdleKind::In,
+            "idle_out" => crate::ir::IdleKind::Out,
+            _ => return Ok(None),
+        };
+        let field = match &*target.kind {
+            ExprKind::Field {
+                target: root_expr,
+                name: field,
+            } => {
+                let ExprKind::Ident(root) = &*root_expr.kind else {
+                    return Ok(None);
+                };
+                if Some(root.name.as_str()) != self.ctx.tb_field.as_deref() {
+                    return Ok(None);
+                }
+                field.name.clone()
+            }
+            ExprKind::Ident(id)
+                if self.lookup(&id.name).is_none()
+                    && (self.ctx.bare_transactor_fields.contains(&id.name)
+                        || self.ctx.transactor_fields.contains_key(&id.name)
+                        || self.ctx.target_transactor_fields.contains_key(&id.name)) =>
+            {
+                id.name.clone()
+            }
+            _ => return Ok(None),
+        };
+        let Some(transactor) = self
+            .ctx
+            .transactor_fields
+            .get(&field)
+            .or_else(|| self.ctx.target_transactor_fields.get(&field))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let schema = &self.ctx.transactors[transactor.index()];
+        if schema.method(&method.name).is_some() {
+            return Ok(None);
+        }
+        if args.len() != 1 {
+            let (detail, v1) = if method.name == "quiesced" {
+                (
+                    "the quiesce predicate takes exactly one cycle-count argument",
+                    V1Status::EmitsUncompilable,
+                )
+            } else {
+                (
+                    "idle predicates take exactly one cycle-count argument",
+                    V1Status::Rejects,
+                )
+            };
+            return Err(not_implemented(
+                &format!("`{}(...)` with {} arguments", method.name, args.len()),
+                detail.to_string(),
+                v1,
+            ));
+        }
+        // The sole argument binds by position. v1 ignores an optional
+        // source name here, as it does for component predicates.
+        let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
+        let n = self.lower_expr_no_ports(n_expr)?;
+        let storage = if self.ctx.transactor_fields.contains_key(&field) {
+            self.ctx
+                .heartbeat_transactor_fields
+                .borrow_mut()
+                .insert(field.clone());
+            self.ctx.heartbeat_transactor_storage[&field].clone()
+        } else {
+            // Bound target responders already have a per-instance state
+            // object whose body includes the heartbeat stamps.
+            field.clone()
+        };
+        Ok(Some(Expr::TransactorIdle {
+            field,
+            transactor,
+            storage,
+            kind,
+            n: Box::new(n),
+        }))
+    }
+
     /// `Some((tb_field, transactor, method))` when `callee` is a
     /// method access on a transactor-typed testbench field:
     /// `_tb.xact.write1` (the impl-for desugaring already rewrote
@@ -2659,45 +2797,16 @@ impl FuncBuilder<'_> {
         };
         let schema = &self.ctx.transactors[xid.index()];
         if schema.method(&method.name).is_none() {
-            // Same carve-out as the component-shaped siblings in
-            // `as_component_method_call`, and it was missing here — so
-            // twelve landings (4 predicate names x assert / bare
-            // statement / `let`) called a working program invalid.
-            //
-            // v1 resolves the built-in predicates on a TRANSACTOR
-            // receiver too: `resolve_component_idle_predicate` walks
-            // `self.transactors` via `synth_component_from_transactor`,
-            // and the heartbeat stamps are emitted on transactor state
-            // structs by both backends. Measured on `transactor Drv`
-            // with a `when active` hookable, testbench field `d : Drv
-            // active`:
-            //
-            //   assert d.idle(2)  -> `if (!(((cycle_count -
-            //                       _tb.d._last_in_cycle) >= 2) && ...)`
-            //   d.idle(2)         -> the same expression, discarded
-            //   let v = d.idle(2) -> `auto v = ...`
-            //
-            // All three compile (whole emitted testbench, g++
-            // `-fsyntax-only`, exit 0), for all four names. `d.nosuch(2)`
-            // does not — "'struct Drv' has no member named 'nosuch'" —
-            // so the surrounding `Invalid` is right for everything else.
-            //
-            // TB-IR cannot lower it yet because `Expr::ComponentIdle`
-            // takes a `ComponentBase`, which names a component instance
-            // and has no transactor-field spelling. The stamps ARE
-            // emitted on TB-IR's transactor state structs
-            // (`emit_state_struct_body`), so closing this is a matter of
-            // giving the predicate a transactor receiver, not of adding
-            // runtime state.
-            if super::components::is_builtin_component_predicate(&method.name) {
-                return Err(unsupported(
-                    &format!(
-                        "the built-in predicate `{}.{}` on a transactor",
-                        field_name, method.name
-                    ),
-                    "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` on a COMPONENT \
-                     receiver; v1 resolves them on a transactor as well",
-                ));
+            // Built-in heartbeat predicates are pure expressions, not
+            // transactor method edges. Returning `None` lets statement,
+            // let, and assignment callers fall through to ordinary
+            // expression lowering (`as_transactor_idle`) instead of
+            // claiming the call here and rejecting a missing method.
+            if matches!(
+                method.name.as_str(),
+                "idle" | "idle_in" | "idle_out" | "quiesced"
+            ) {
+                return Ok(None);
             }
             return Err(LowerError::Invalid(format!(
                 "transactor `{}` has no method `{}`",
@@ -3681,7 +3790,9 @@ pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
                 || expr_has_transactor_edge(f)
         }
         Expr::WidthCast { inner, .. } => expr_has_transactor_edge(inner),
-        Expr::ComponentIdle { n, .. } => expr_has_transactor_edge(n),
+        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
+            expr_has_transactor_edge(n)
+        }
         Expr::SeqIndex { index, .. } => expr_has_transactor_edge(index),
         Expr::BitSlice { target, .. } => expr_has_transactor_edge(target),
         Expr::BitSliceDyn { target, hi, lo } => {
