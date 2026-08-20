@@ -3148,6 +3148,9 @@ pub(super) fn emit_target_actor(
     let pad2 = INDENT.repeat(depth + 2);
 
     for tm in &schema.target_methods {
+        if !actor.active && matches!(tm.activation, crate::ir::Activation::ActiveOnly) {
+            continue;
+        }
         let method = &tm.name;
         let func = prog.function(tm.function);
         let names = cpp_local_names(func);

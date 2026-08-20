@@ -44,7 +44,7 @@ use crate::ast::{
     TypeArg, TypeExpr,
 };
 use crate::ir::{
-    self, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
+    self, Activation, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
     TargetTlmMethodSchema, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
     TransactorSchema, TypedParam,
 };
@@ -574,6 +574,11 @@ fn lower_bound_target_transactor(
     side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
+    let component_hosted = t
+        .items
+        .iter()
+        .chain(t.when_active.iter().flatten())
+        .any(|item| matches!(item, ComponentItem::OnHandler(handler) if !handler.periodic));
     // Resolve the bound bus.
     let bus_name = match t.bound_to.as_ref() {
         Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
@@ -604,11 +609,40 @@ fn lower_bound_target_transactor(
     // target threads; reject the out-of-subset shapes precisely.
     let mut state_fields: Vec<StateFieldSchema> = Vec::new();
     let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
-    let mut threads_ast: Vec<&TargetTlmThread> = Vec::new();
-    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
-    for ci in all_items {
+    let mut threads_ast: Vec<(&TargetTlmThread, Activation)> = Vec::new();
+    let all_items = t.items.iter().map(|item| (item, Activation::Always)).chain(
+        t.when_active
+            .iter()
+            .flatten()
+            .map(|item| (item, Activation::ActiveOnly)),
+    );
+    for (ci, activation) in all_items {
         match ci {
             ComponentItem::Field(f) => {
+                // A mixed responder/handler declaration has two IR views.
+                // Component IR owns event ports, DUT handles, fixed vectors,
+                // and nested components; responder IR needs only the state
+                // kinds its target-thread expression lowering can address.
+                // The component pass still validates every skipped field.
+                let target_state_field = f.direction.is_none()
+                    && (matches!(
+                        f.ty,
+                        TypeExpr::Builtin {
+                            name: crate::ast::BuiltinTy::Queue,
+                            ..
+                        }
+                    ) || super::tb_scalar_field_ir_type(&f.ty).is_some()
+                        || matches!(
+                            &f.ty,
+                            TypeExpr::Named { name, .. }
+                                if name
+                                    .segments
+                                    .last()
+                                    .is_some_and(|name| record_ctx.record_ids.contains_key(&name.name))
+                        ));
+                if component_hosted && !target_state_field {
+                    continue;
+                }
                 let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
@@ -621,7 +655,7 @@ fn lower_bound_target_transactor(
                 }
                 state_fields.push(sf);
             }
-            ComponentItem::TargetTlmThread(th) => threads_ast.push(th),
+            ComponentItem::TargetTlmThread(th) => threads_ast.push((th, activation)),
             ComponentItem::Hookable(h) => {
                 return Err(unsupported(
                     &format!(
@@ -632,6 +666,11 @@ fn lower_bound_target_transactor(
                      hookable bodies — is a follow-up slice; only target-side `thread \
                      bus.<m>(...)` responders are lowered",
                 ));
+            }
+            ComponentItem::OnHandler(h) if !h.periodic => {
+                // The component IR view lowers and schedules non-periodic
+                // handlers. This target view keeps only responder metadata so
+                // its actor can share the component-hosted instance.
             }
             ComponentItem::OnHandler(_) => {
                 // Reachable ONLY for a PERIODIC handler. `transactor_is_
@@ -857,7 +896,7 @@ fn lower_bound_target_transactor(
     };
 
     let mut funcs = Vec::new();
-    for th in threads_ast {
+    for (th, activation) in threads_ast {
         // `thread bus.<method>(...)`: the method path is `bus.<method>`.
         let segs: Vec<&str> = th.method.segments.iter().map(|s| s.name.as_str()).collect();
         if segs.len() != 2 || segs[0] != "bus" {
@@ -1007,6 +1046,7 @@ fn lower_bound_target_transactor(
         schema.target_methods.push(TargetTlmMethodSchema {
             name: mname.to_string(),
             function: fid,
+            activation,
             args: method.args.iter().map(|(n, _)| n.name.clone()).collect(),
             has_ret,
             ooo_tags,

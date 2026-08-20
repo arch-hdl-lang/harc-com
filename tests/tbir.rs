@@ -24872,59 +24872,143 @@ fn a_thread_in_a_component_is_silently_dropped_by_v1() {
     );
 }
 
-/// The same arm also catches a `thread` on a transactor that IS
-/// bus-bound: `transactor_is_component` routes one down the component
-/// path when it additionally has a non-periodic `on` handler.
-///
-/// There the construct works — `emit_bound_tlm_target_actors` emits the
-/// target actor regardless of the `on` handler — so v1 is a genuine
-/// escape hatch and the arm keeps `Unsupported`. The first version of
-/// the split reclassified the whole arm from a probe that only ever put
-/// a `thread` on an env.
+/// A bus-bound transactor may combine event/cycle handlers with a target
+/// responder thread. The declaration intentionally has two IR views:
+/// component IR owns the handlers, component-only fields, and state object,
+/// while the existing target transactor IR owns the responder body. The target
+/// actor records the component host explicitly so codegen shares one instance
+/// instead of declaring a second state object.
 #[test]
-fn a_thread_on_a_bound_transactor_still_points_at_v1() {
-    let bound = fixture("tlm_target_thread_test.harc");
-    emit_cpp_src(&bound);
+fn bound_transactor_thread_and_monitor_share_component_host() {
+    let prog = lower_src(&fixture("tlm_target_thread_monitor_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
 
-    // Add a non-periodic `on` handler, which is what routes this
-    // transactor down the component path.
-    // `bus.read` is a tlm_method, so the `on` handler needs a real
-    // handshake channel — the bus is given one here. No fixture in the
-    // corpus has this shape (bound transactor + `on` + `thread`), which
-    // is why it went unprobed the first time.
-    let via_component = bound
-        .replacen(
-            "    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
-            r#"    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
-    handshake_channel obs: receive kind: valid_ready
-        data: UInt<8>;
-    end handshake_channel obs"#,
-            1,
-        )
-        .replacen(
-            "transactor TlmMemTarget bound to TlmMemBus",
-            "transactor TlmMemTarget bound to TlmMemBus\n    sink : uint<8> default 0",
-            1,
-        )
-        .replacen(
-            "    thread bus.read(addr: uint<8>)",
-            "    on bus.obs.handshake(v)\n        sink = v\n    end on\n\n    thread bus.read(addr: uint<8>)",
-            1,
-        );
-    let err = lower_src(&via_component).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("bound transactor"), "{msg}");
+    assert_eq!(prog.transactors.len(), 1, "target responder IR view");
+    assert_eq!(prog.components.len(), 1, "monitor component IR view");
+    assert_eq!(prog.transactors[0].target_methods.len(), 1);
+    assert_eq!(
+        prog.transactors[0].target_methods[0].activation,
+        ir::Activation::ActiveOnly
+    );
+    assert_eq!(prog.components[0].cycle_handlers.len(), 1);
+    assert_eq!(prog.components[0].on_handlers.len(), 1);
+    assert!(prog.components[0]
+        .fields
+        .iter()
+        .any(|field| matches!(field.kind, ir::ComponentFieldKind::Event { .. })));
+    assert!(prog.transactors[0]
+        .state_fields
+        .iter()
+        .all(|field| field.name != "in_ev"));
 
-    // v1's evidence: the target actor is still emitted, so pointing the
-    // user at v1 is accurate rather than a dead end.
-    let v1 = cpp_tb::emit(&merged_src(&via_component)).expect("v1 emits");
+    let actor = &prog.testbenches[0].target_tlm_actors[0];
+    assert_eq!(actor.instance, "target");
+    assert_eq!(actor.host_component, Some(ir::ComponentId(0)));
+    assert!(actor.active);
+    assert!(prog.testbenches[0]
+        .component_fields
+        .iter()
+        .any(|f| f.field == "target" && f.component == ir::ComponentId(0)));
+
+    let cpp = emit_fixture_cpp("tlm_target_thread_monitor_test.harc");
+    assert!(cpp.contains("TlmMemTarget target;"));
     assert!(
-        v1.matches("harc_rt::ThreadSlot").count()
-            > cpp_tb::emit(&merged_src(&bound))
-                .expect("v1 emits")
-                .matches("harc_rt::ThreadSlot")
-                .count(),
-        "the `on` handler adds slots and the thread's actor survives"
+        !cpp.contains("_TlmMemTarget_target_state"),
+        "a component-hosted target actor must not declare duplicate state"
+    );
+
+    let passive_src = fixture("tlm_target_thread_monitor_test.harc").replacen(
+        "TlmMemTarget active = bind mem",
+        "TlmMemTarget passive = bind mem",
+        1,
+    );
+    let passive = lower_src(&passive_src).expect("passive monitor lowers");
+    verify::verify_program(&passive).expect("passive monitor verifies");
+    assert!(!passive.testbenches[0].target_tlm_actors[0].active);
+    let passive_tbir = emit_cpp_src(&passive_src);
+    let passive_v1 = cpp_tb::emit(&merged_src(&passive_src)).expect("v1 emits passive control");
+    assert!(
+        !passive_tbir.contains("_target_read_target_slot")
+            && !passive_v1.contains("_target_read_target_slot"),
+        "neither backend may schedule a `when active` responder for a passive binding"
+    );
+}
+
+/// The mixed target/component seam is an explicit IR relation, not a
+/// codegen naming convention. Missing, out-of-range, duplicate, and
+/// state-incompatible host metadata must all fail verification.
+#[test]
+fn bound_transactor_thread_component_host_corruption_is_rejected() {
+    let fresh =
+        || lower_src(&fixture("tlm_target_thread_monitor_test.harc")).expect("fixture lowers");
+
+    let mut missing = fresh();
+    missing.testbenches[0].target_tlm_actors[0].host_component = None;
+    assert!(
+        format!("{:?}", verify::verify_program(&missing).unwrap_err())
+            .contains("stores no host component")
+    );
+
+    let mut out_of_range = fresh();
+    out_of_range.testbenches[0].target_tlm_actors[0].host_component = Some(ir::ComponentId(99));
+    assert!(
+        format!("{:?}", verify::verify_program(&out_of_range).unwrap_err())
+            .contains("references missing host c99")
+    );
+
+    let mut duplicate = fresh();
+    let actor = duplicate.testbenches[0].target_tlm_actors[0].clone();
+    duplicate.testbenches[0].target_tlm_actors.push(actor);
+    assert!(
+        format!("{:?}", verify::verify_program(&duplicate).unwrap_err()).contains("more than once")
+    );
+
+    let mut wrong_kind = fresh();
+    wrong_kind.components[0].fields[0].kind = ir::ComponentFieldKind::Queue {
+        elem: ir::QueueElem::Scalar { signed: false },
+    };
+    assert!(
+        format!("{:?}", verify::verify_program(&wrong_kind).unwrap_err())
+            .contains("is not state-compatible")
+    );
+
+    let mut wrong_host_kind = fresh();
+    wrong_host_kind.components[0].kind = ir::ComponentKindTag::Agent;
+    assert!(format!(
+        "{:?}",
+        verify::verify_program(&wrong_host_kind).unwrap_err()
+    )
+    .contains("is not state-compatible"));
+
+    let mut duplicate_state = fresh();
+    let state = duplicate_state.transactors[0].state_fields[0].clone();
+    duplicate_state.transactors[0].state_fields[1] = state;
+    assert!(format!(
+        "{:?}",
+        verify::verify_program(&duplicate_state).unwrap_err()
+    )
+    .contains("is not state-compatible"));
+
+    let mut wrong_mode = fresh();
+    wrong_mode.testbenches[0].target_tlm_actors[0].active = false;
+    assert!(
+        format!("{:?}", verify::verify_program(&wrong_mode).unwrap_err()).contains("active=false")
+    );
+
+    let passive_src = fixture("tlm_target_thread_monitor_test.harc").replacen(
+        "TlmMemTarget active = bind mem",
+        "TlmMemTarget passive = bind mem",
+        1,
+    );
+    let mut missing_mode = lower_src(&passive_src).expect("passive control lowers");
+    missing_mode.testbenches[0]
+        .component_fields
+        .iter_mut()
+        .find(|field| field.field == "target")
+        .expect("target component binding")
+        .mode = None;
+    assert!(
+        format!("{:?}", verify::verify_program(&missing_mode).unwrap_err()).contains("mode None")
     );
 }
 
@@ -28398,59 +28482,42 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     // positive rows above with only the TRIGGER changed, so what moves
     // it is the gate and nothing else.
     let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
-    // `lowers` says which branch the row is expected to take. Without
-    // it a row could silently switch branches — if the target row's
-    // `thread`-through-the-component-path arm were later implemented it
-    // would start lowering, take the `Ok` branch, and quietly stop
-    // asserting anything about where it went.
-    for (what, lowers, src) in [
+    // Every row routes the non-periodic handler to component IR. The target
+    // row additionally retains its responder in transactor IR and joins both
+    // views at the bound instance; the two initiator rows need only the
+    // component view.
+    for (what, target, src) in [
         (
             "target",
-            false,
+            true,
             base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
         ),
-        ("initiator items", true, active(initiator(non_periodic))),
+        ("initiator items", false, active(initiator(non_periodic))),
         (
             "initiator when active",
-            true,
+            false,
             active(initiator(&format!(
                 "    when active\n{non_periodic}    end when\n"
             ))),
         ),
     ] {
-        let got = lower_src(&src);
-        assert_eq!(
-            got.is_ok(),
-            lowers,
-            "{what}: expected lowers={lowers}, got the other branch"
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what}: must lower: {e}"));
+        let c = prog
+            .components
+            .iter()
+            .find(|c| c.name == "TlmMemTarget")
+            .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
+        assert!(
+            !c.cycle_handlers.is_empty(),
+            "{what}: the composite table must carry the trigger"
         );
-        match got {
-            // The two initiator rows go further than "not here": the
-            // composite table LOWERS them, and the trigger lands as a
-            // cycle handler on the component. That is the positive
-            // witness for where they went.
-            Ok(prog) => {
-                let c = prog
-                    .components
-                    .iter()
-                    .find(|c| c.name == "TlmMemTarget")
-                    .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
-                assert!(
-                    !c.cycle_handlers.is_empty(),
-                    "{what}: the composite table must carry the trigger"
-                );
-            }
-            // The target row still has its `thread`, which the
-            // composite path does not lower — but it fails THERE, and
-            // says so.
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("reached through the component path"),
-                    "{what}: a non-periodic `on` must route to the composite table: {msg}"
-                );
-                assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
-            }
+        if target {
+            assert_eq!(prog.transactors[0].target_methods.len(), 1);
+            assert_eq!(prog.testbenches[0].target_tlm_actors.len(), 1);
+            assert_eq!(
+                prog.testbenches[0].target_tlm_actors[0].host_component,
+                Some(ir::ComponentId(0))
+            );
         }
     }
 }
