@@ -497,6 +497,7 @@ impl FuncBuilder<'_> {
                 if let Some(local) = self.lookup(&id.name) {
                     return Ok(Expr::Local(local));
                 }
+                self.reject_inactive_target_state_root(e)?;
                 // Whole transaction/struct-typed testbench field read
                 // (`cur`) from an inlined testbench method. Ordinary
                 // lookup is intentionally fenced at inline-helper
@@ -616,6 +617,7 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::Field { target, name } => {
+                self.reject_inactive_target_state_root(target)?;
                 if let Some(port) = self.as_port_ref(e)? {
                     return Ok(Expr::Port(port));
                 }
@@ -992,6 +994,7 @@ impl FuncBuilder<'_> {
                         // value-queries: `pending.size()` / `.empty()`
                         // (bare field name inside a responder body).
                         // (`.pop()` mutates → statement-only; rejected here.)
+                        self.reject_inactive_target_state_root(target)?;
                         if let Some(q) = self.lower_state_queue_query(callee, args)? {
                             return Ok(q);
                         }

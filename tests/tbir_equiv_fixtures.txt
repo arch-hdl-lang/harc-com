@@ -107,6 +107,7 @@ cov_cross_bins_test | Top | top_counter.sv | top_counter.arch | pass
 cov_runtime_bound_test | Top | top_counter.sv | top_counter.arch | pass
 cov_runtime_bin_value_test | Top | top_counter.sv | top_counter.arch | pass
 cov_expr_targets_test | Top | top_counter.sv | top_counter.arch | pass
+wide_cover_helper_test | WideCoverHelperTop | wide_cover_helper.sv | - | pass
 covergroup_hook_trigger_test | Top | top_counter.sv | - | pass
 covergroup_hook_param_test | Top | top_counter.sv | - | pass
 wait_any_of_test | Top | top_counter.sv | top_counter.arch | pass
@@ -157,6 +158,7 @@ struct_basic_test | Top | top_counter.sv | - | pass
 struct_nested_test | Top | top_counter.sv | - | pass
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_monitor_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+tlm_target_always_mixed_passive_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - | pass
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass

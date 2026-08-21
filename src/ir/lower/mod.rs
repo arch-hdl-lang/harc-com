@@ -3547,6 +3547,12 @@ fn lower_test(
                     .cycle_handlers
                     .iter()
                     .any(|ch| matches!(ch.activation, ir::Activation::Always));
+                let has_always_target = prog.transactors.iter().any(|x| {
+                    x.name == simple
+                        && x.target_methods
+                            .iter()
+                            .any(|m| matches!(m.activation, ir::Activation::Always))
+                });
                 // Mode rules:
                 //   * `active`  — the `on <ev>` driver (under `when active`)
                 //     fires on `emit <inst>.<ev>`. Always permitted.
@@ -3563,7 +3569,7 @@ fn lower_test(
                         mode: Some(TransactorMode::Passive),
                         ..
                     }) => {
-                        if !has_monitor {
+                        if !has_monitor && !has_always_target {
                             return Err(unsupported(
                                 &format!(
                                     "passive bound-to event-driven transactor instance `let {} : \
@@ -3571,8 +3577,9 @@ fn lower_test(
                                     l.name.name
                                 ),
                                 "a `passive` instance only runs always-on cycle/handshake \
-                                 observers; this transactor declares none, so a passive instance \
-                                 is inert — annotate it `active`",
+                                 observers and always-present target responders; this transactor \
+                                 declares neither, so a passive instance is inert — annotate it \
+                                 `active`",
                             ));
                         }
                         false
@@ -6712,6 +6719,12 @@ pub(crate) struct FuncBuilder<'a> {
     /// Empty in every non-responder context, so the resolution path is
     /// inert.
     pub(crate) target_state_fields: HashMap<String, crate::ir::StateFieldKind>,
+    /// State fields declared under `when active` and therefore absent from
+    /// an always-present target responder.  Keeping this set separate from
+    /// `target_state_fields` lets name resolution distinguish invalid
+    /// activation leakage from an ordinary unresolved name, including queue
+    /// method calls whose generic fallback diagnostic omits the receiver.
+    pub(crate) inactive_target_state_fields: HashSet<String>,
     /// True while lowering a Check-kind function — used for the
     /// precise test-scope-let rejection (see `LowerCtx::
     /// test_scope_lets`).
@@ -7096,6 +7109,7 @@ impl<'a> FuncBuilder<'a> {
             self_transactor_method_active_only: false,
             current_body_name: None,
             target_state_fields: HashMap::new(),
+            inactive_target_state_fields: HashSet::new(),
             in_check: false,
             in_test_body: false,
             let_widths: HashMap::new(),
@@ -7108,6 +7122,41 @@ impl<'a> FuncBuilder<'a> {
             pending_tlm_forks: Vec::new(),
             next_tlm_fork_tag: HashMap::new(),
         }
+    }
+
+    /// Reject an AST access rooted at state that does not exist in this
+    /// responder's activation view. Locals shadow state fields, matching the
+    /// ordinary target-state resolution order.
+    pub(crate) fn reject_inactive_target_state_root(
+        &self,
+        expr: &crate::ast::Expr,
+    ) -> Result<(), LowerError> {
+        let root = match &*expr.kind {
+            ExprKind::Ident(id) => Some(id),
+            ExprKind::Field { target, .. }
+            | ExprKind::Index { target, .. }
+            | ExprKind::BitSlice { target, .. } => {
+                return self.reject_inactive_target_state_root(target);
+            }
+            ExprKind::Paren(inner) => return self.reject_inactive_target_state_root(inner),
+            _ => None,
+        };
+        let Some(root) = root else {
+            return Ok(());
+        };
+        if self.lookup(&root.name).is_some()
+            || !self.inactive_target_state_fields.contains(&root.name)
+        {
+            return Ok(());
+        }
+        let body = self
+            .current_body_name
+            .as_deref()
+            .unwrap_or("always-present target thread");
+        Err(LowerError::Invalid(format!(
+            "{body} references active-only state field `{}`",
+            root.name
+        )))
     }
 
     /// Mark the `RecordSeq` accumulator of the tseq body being lowered, so

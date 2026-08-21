@@ -298,10 +298,23 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
         },
         Expr::CovHookArg { param } => param.clone(),
         Expr::Call(target, args) => {
-            reject_wide_cpp_operand("call argument", &args.iter().collect::<Vec<_>>(), widths)?;
             let name = match target {
+                // A pure helper's declared parameter types are retained and
+                // checked during lowering/verification.  They provide the
+                // exact C++ carrier context for wide values (`HarcWide<N>`),
+                // so rejecting the argument here would discard information
+                // the call already has.
                 CallTarget::Helper { name, .. } => super::expr::helper_cpp_name(name),
-                CallTarget::ExternFn { name, .. } => name.clone(),
+                CallTarget::ExternFn { name, .. } => {
+                    // FFI arguments do not yet carry parameter metadata in
+                    // CallTarget, so retain the conservative wide gate.
+                    reject_wide_cpp_operand(
+                        "call argument",
+                        &args.iter().collect::<Vec<_>>(),
+                        widths,
+                    )?;
+                    name.clone()
+                }
                 other => {
                     return Err(EmitError(format!(
                         "tbir: covergroup target call is outside the sampler subset: {other:?}"

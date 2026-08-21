@@ -1,0 +1,35 @@
+// A matching wide helper parameter is a type-directed C++ context for the
+// coverpoint's wide DUT value. The sampler must pass HarcWide through rather
+// than reject or truncate it.
+
+function classify_wide(x: uint<200>) -> uint<8>
+    if x == 0
+        return 0
+    end if
+    return 1
+end function classify_wide
+
+covergroup WideHelperCov @(posedge dut.clk)
+    cp_wide : cover classify_wide(dut.wide)
+        bins
+            zero = {0}
+            nonzero = {1}
+        end bins
+end covergroup WideHelperCov
+
+testbench WideCoverHelperTb
+    dut : WideCoverHelperTop
+    cov : WideHelperCov
+end testbench WideCoverHelperTb
+
+impl WideCoverHelperTest for WideCoverHelperTb
+    run
+        wait 2 cycles
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_wide.nonzero > 0
+            else fail("wide helper coverpoint was not sampled")
+    end check
+end impl WideCoverHelperTest

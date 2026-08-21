@@ -24652,6 +24652,32 @@ end impl TypedCoverTest
     );
 }
 
+/// A wide helper parameter supplies the exact type-directed carrier that the
+/// cover sampler needs. This is distinct from (and adjacent to) the rejected
+/// wide-to-narrow call above.
+#[test]
+fn clocked_covergroup_passes_matching_wide_helper_argument() {
+    let src = fixture("wide_cover_helper_test.harc");
+    let prog = lower_src(&src).expect("matching wide helper call lowers");
+    verify::verify_program(&prog).expect("matching wide helper call verifies");
+
+    let merged = merged_src(&src);
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths.insert("wide".to_string(), 200);
+    let tbir = tbir::emit(&prog, &merged, &opts).expect("tbir emits matching wide helper call");
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits matching wide helper call");
+    for cpp in [&tbir, &v1] {
+        assert!(
+            cpp.contains("HarcWide<7>"),
+            "wide carrier is retained:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("classify_wide(harc_rt::harc_read(dut->wide))"),
+            "wide DUT value reaches the typed helper:\n{cpp}"
+        );
+    }
+}
+
 #[test]
 fn coverpoint_value_expression_corruption_is_rejected_before_codegen() {
     let base = fixture("cov_runtime_bound_test.harc");
@@ -25272,6 +25298,111 @@ fn bound_transactor_thread_and_monitor_share_component_host() {
             && !passive_v1.contains("_target_read_target_slot"),
         "neither backend may schedule a `when active` responder for a passive binding"
     );
+}
+
+/// A target responder in the always-present half is itself useful passive
+/// behavior. The mixed component gate must not require an unrelated cycle
+/// monitor before it discovers and binds that responder.
+#[test]
+fn passive_mixed_target_with_always_responder_is_not_inert() {
+    let src = fixture("tlm_target_always_mixed_passive_test.harc");
+    let prog = lower_src(&src).expect("passive mixed target lowers");
+    verify::verify_program(&prog).expect("passive mixed target verifies");
+
+    let method = &prog.transactors[0].target_methods[0];
+    assert_eq!(method.activation, ir::Activation::Always);
+    let actor = &prog.testbenches[0].target_tlm_actors[0];
+    assert!(!actor.active);
+    assert!(actor.host_component.is_some());
+
+    for cpp in [
+        emit_fixture_cpp("tlm_target_always_mixed_passive_test.harc"),
+        cpp_tb::emit(&merged_src(&src)).expect("v1 emits passive always responder"),
+    ] {
+        assert!(
+            cpp.contains("_target_read_target_slot"),
+            "the always responder must remain scheduled for a passive instance:\n{cpp}"
+        );
+    }
+}
+
+/// An always target body cannot see storage declared inside `when active`.
+/// Passive elaboration removes those fields, so every access kind must be an
+/// invalid-source diagnostic rather than a generic "try v1" subset error.
+#[test]
+fn always_target_rejects_active_only_state_references() {
+    let base = r#"
+struct Beat
+    addr : uint<8>
+end struct Beat
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    handshake_channel observed_req: receive kind: valid_ready
+        addr: uint<8>
+    end handshake_channel observed_req
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    observed : uint<8> default 0
+    on bus.observed_req.handshake(req)
+        observed = req.addr
+    end on
+    thread bus.read(addr: uint<8>)
+        __TARGET_BODY__
+    end thread
+    when active
+        active_only : uint<32> default 256
+        pending : queue<uint<8>>
+        last : Beat
+        in_ev : in event<uint<8>>
+        on in_ev(v)
+            active_only = active_only + v
+        end on
+    end when
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+
+    for (body, field) in [
+        (
+            "active_only = active_only + 1\n        return active_only + addr",
+            "active_only",
+        ),
+        ("pending.push(addr)\n        return addr", "pending"),
+        ("return pending.size()", "pending"),
+        ("last.addr = addr\n        return last.addr", "last"),
+    ] {
+        let src = base.replace("__TARGET_BODY__", body);
+        let msg = assert_invalid(
+            &lower_src(&src).expect_err("always target must not see active-only state"),
+        );
+        assert!(
+            msg.contains("always-present target thread")
+                && msg.contains(&format!("active-only state field `{field}`")),
+            "{msg}"
+        );
+    }
+
+    // A responder-local declaration still shadows a same-named active-only
+    // field. The structural check follows normal name resolution rather than
+    // banning an identifier spelling globally.
+    let shadow = base.replace(
+        "__TARGET_BODY__",
+        "let pending : uint<32> = addr\n        return pending",
+    );
+    lower_src(&shadow).expect("local shadows inactive target state");
 }
 
 /// The mixed target/component seam is an explicit IR relation, not a
