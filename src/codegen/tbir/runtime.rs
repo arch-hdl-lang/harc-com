@@ -348,7 +348,7 @@ fn emit_state_struct_body(
 /// (carried by value, matching v1's `HarcQueue<Rec>`).
 fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
     match elem {
-        crate::ir::QueueElem::Scalar { ty } => super::local_scalar_cty(ty),
+        crate::ir::QueueElem::Scalar { ty } => super::field_scalar_cty(ty),
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }
 }

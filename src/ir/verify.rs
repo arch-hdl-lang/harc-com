@@ -570,6 +570,22 @@ fn check_cover_expr(
     }
 }
 
+fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<VerifyError>) {
+    let QueueElem::Scalar { ty } = elem else {
+        return;
+    };
+    let valid = matches!(ty, IrType::Bool)
+        || matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 0);
+    if !valid {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!(
+                "{what} has invalid scalar element type {ty:?}; expected bool or a resolved, \
+                 nonzero UInt/SInt"
+            ),
+        });
+    }
+}
+
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
     for t in &prog.tests {
@@ -754,6 +770,13 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for field in &component.fields {
+            if let ComponentFieldKind::Queue { elem } = &field.kind {
+                verify_queue_elem_schema(
+                    elem,
+                    format!("component c{ci} field `{}`", field.name),
+                    &mut errs,
+                );
+            }
             if let ComponentFieldKind::FixedVec(vec) = &field.kind {
                 let valid_elem = matches!(
                     &vec.elem,
@@ -793,6 +816,17 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         field.name, child.0
                     ),
                 }),
+            }
+        }
+    }
+    for (si, scoreboard) in prog.scoreboards.iter().enumerate() {
+        for field in &scoreboard.fields {
+            if let ScoreboardFieldKind::Queue { elem } = &field.kind {
+                verify_queue_elem_schema(
+                    elem,
+                    format!("scoreboard sb{si} field `{}`", field.name),
+                    &mut errs,
+                );
             }
         }
     }
@@ -866,6 +900,15 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // testbench transactor field resolves. Emission indexes both
     // tables directly off these links.
     for (xi, x) in prog.transactors.iter().enumerate() {
+        for field in &x.state_fields {
+            if let StateFieldKind::Queue { elem } = &field.kind {
+                verify_queue_elem_schema(
+                    elem,
+                    format!("transactor x{xi} state field `{}`", field.name),
+                    &mut errs,
+                );
+            }
+        }
         for (name, function) in x
             .methods
             .iter()
@@ -927,7 +970,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         for field in &tb.state_fields {
             let name = match field {
                 TbStateFieldSchema::Scalar(field) => &field.name,
-                TbStateFieldSchema::Queue(field) => &field.name,
+                TbStateFieldSchema::Queue(field) => {
+                    verify_queue_elem_schema(
+                        &field.elem,
+                        format!("tb{ti} queue field `{}`", field.name),
+                        &mut errs,
+                    );
+                    &field.name
+                }
             };
             if !state_names.insert(name) {
                 errs.push(VerifyError::BadProgramRef {
@@ -1424,8 +1474,8 @@ fn resolve_transactor_state_queue_elem(
             .or_else(|| {
                 tb.unbound_state_actors
                     .iter()
-                    .find(|(name, _)| name == instance)
-                    .map(|(_, transactor)| *transactor)
+                    .find(|actor| actor.field == instance)
+                    .map(|actor| actor.transactor)
             })
             .ok_or_else(|| {
                 format!(

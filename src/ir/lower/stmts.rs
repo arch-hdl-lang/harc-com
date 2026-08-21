@@ -1907,7 +1907,47 @@ impl FuncBuilder<'_> {
             crate::ir::QueueElem::Record(rid) => Some(*rid),
             crate::ir::QueueElem::Scalar { .. } => None,
         };
-        self.check_slot_type(value, want, what)
+        self.check_slot_type(value, want, what)?;
+
+        let crate::ir::QueueElem::Scalar { ty: expected } = elem else {
+            return Ok(());
+        };
+        let Some(actual) = self.expr_type(value) else {
+            return Ok(());
+        };
+        if queue_scalar_assignment_compatible(expected, &actual) {
+            return Ok(());
+        }
+
+        let scalar_shape = |ty: &IrType| match ty {
+            IrType::UInt(Some(width)) => Some((*width, false)),
+            IrType::SInt(Some(width)) => Some((*width, true)),
+            _ => None,
+        };
+        if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+            (scalar_shape(expected), scalar_shape(&actual))
+        {
+            if dest_signed != src_signed {
+                return Err(LowerError::Invalid(format!(
+                    "{what} holds an {} {dest_width}-bit value, but the pushed value is {} \
+                     {src_width}-bit. Signedness must match — relabel the value explicitly with \
+                     `as {}<{src_width}>`.",
+                    if dest_signed { "signed" } else { "unsigned" },
+                    if src_signed { "signed" } else { "unsigned" },
+                    if dest_signed { "sint" } else { "uint" },
+                )));
+            }
+            if src_width > dest_width {
+                return Err(LowerError::Invalid(format!(
+                    "the value pushed into {what} is {src_width}-bit, but the queue holds \
+                     {dest_width}-bit values, so the push narrows. Truncate the value explicitly \
+                     before pushing it or widen the queue element type."
+                )));
+            }
+        }
+        Err(LowerError::Invalid(format!(
+            "{what} holds {expected:?}, but the pushed value is {actual:?}"
+        )))
     }
 
     /// The verdict for a whole-record assignment whose RHS did not type
@@ -5254,6 +5294,25 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
         // so it is intentionally absent here.)
         BuiltinTy::Time => Some(IrType::UInt(Some(64))),
         _ => None,
+    }
+}
+
+fn queue_scalar_assignment_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
+    if expected == actual {
+        return true;
+    }
+    let widthless = |ty: &IrType| matches!(ty, IrType::UInt(None) | IrType::SInt(None));
+    if widthless(expected) || widthless(actual) {
+        return true;
+    }
+    match (expected, actual) {
+        (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
+        | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
+        (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
+        _ => false,
     }
 }
 

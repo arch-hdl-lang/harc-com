@@ -7,8 +7,9 @@ bus TlmMemBus
 end bus TlmMemBus
 
 transactor WideQueueResponder bound to TlmMemBus
-    wide_values : queue<uint<256>>
-    odd_values  : queue<uint<65>>
+    wide_values   : queue<uint<256>>
+    odd_values    : queue<uint<65>>
+    signed_values : queue<sint<8>>
 
     thread bus.read(addr: uint<8>)
         wait 1 cycle
@@ -35,6 +36,19 @@ transactor WideQueueResponder bound to TlmMemBus
             else fail("responder assigned pop lost bit 202")
         assert wide_values.empty()
             else fail("responder discarded pop did not drain the queue")
+
+        let negative_one : sint<8> = (0 - 1) as sint<8>
+        let negative_two : sint<8> = (0 - 2) as sint<8>
+        signed_values.push(negative_one)
+        signed_values.push(negative_two)
+        let signed_first : sint<8> = signed_values.pop()
+        let signed_second = signed_values.pop()
+        assert signed_first == negative_one
+            else fail("target signed queue changed its first value")
+        assert signed_second == negative_two
+            else fail("target signed queue lost FIFO order")
+        assert signed_values.empty()
+            else fail("target signed queue did not drain")
 
         let odd_one : uint<65> = 1
         odd_values.push((odd_one << 64) + addr)

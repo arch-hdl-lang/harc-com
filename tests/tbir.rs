@@ -2878,6 +2878,32 @@ fn wide_queue_testbench_ir_display_and_emission_preserve_scalar_type() {
     );
 }
 
+/// A boolean queue is boolean host state, not an integer carrier. The queue
+/// element mapper is shared by every direct owner, so this direct-testbench
+/// boundary catches accidental reuse of the scalar-local widening policy.
+#[test]
+fn scalar_queue_bool_uses_bool_cpp_storage() {
+    let src = r#"
+testbench BoolQueueTb
+    dut   : Top
+    flags : queue<bool>
+end testbench BoolQueueTb
+
+impl BoolQueueTest for BoolQueueTb
+    run
+        flags.push(true)
+        let flag = flags.pop()
+        assert flag
+    end run
+end impl BoolQueueTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<bool> flags;"),
+        "queue<bool> must emit boolean storage: {cpp}"
+    );
+}
+
 /// Signedness is part of a scalar queue's element type even when the pop has
 /// no annotation to seed the destination local.
 #[test]
@@ -3132,6 +3158,160 @@ end impl QueueDiagTest
     );
 }
 
+/// A scalar value entering a queue is an ordinary directional assignment.
+/// Width loss and signedness changes are source errors, not malformed IR for
+/// the verifier to report through the compiler-bug channel.
+#[test]
+fn scalar_queue_push_type_changes_are_source_diagnostics() {
+    let program = |queue_ty: &str, value_ty: &str| {
+        format!(
+            r#"
+testbench QueuePushDiagTb
+    dut    : Top
+    values : queue<{queue_ty}>
+end testbench QueuePushDiagTb
+
+impl QueuePushDiagTest for QueuePushDiagTb
+    run
+        let value : {value_ty} = 1
+        values.push(value)
+    end run
+end impl QueuePushDiagTest
+"#
+        )
+    };
+
+    let narrowing = assert_invalid(
+        &lower_src(&program("uint<64>", "uint<65>"))
+            .expect_err("a 65-bit value must not narrow into a 64-bit queue"),
+    );
+    assert!(
+        narrowing.contains("testbench queue `values`")
+            && narrowing.contains("65-bit")
+            && narrowing.contains("64-bit")
+            && narrowing.contains("narrows"),
+        "narrowing diagnostic must name the queue and both widths: {narrowing}"
+    );
+
+    let signedness = assert_invalid(
+        &lower_src(&program("uint<129>", "sint<129>"))
+            .expect_err("a signed value must not enter an unsigned queue implicitly"),
+    );
+    assert!(
+        signedness.contains("testbench queue `values`")
+            && signedness.contains("signed 129-bit")
+            && signedness.contains("unsigned 129-bit")
+            && signedness.contains("Signedness must match"),
+        "signedness diagnostic must name the queue and both types: {signedness}"
+    );
+}
+
+/// `QueueElem::Scalar` is an internal schema contract, not a general-purpose
+/// wrapper around arbitrary `IrType`s. The verifier protects every owner table
+/// because later display/emission code assumes a resolved, nonzero scalar.
+#[test]
+fn queue_elem_scalar_schema_requires_resolved_nonzero_integer_or_bool() {
+    let src = r#"
+testbench QueueSchemaTb
+    dut    : Top
+    values : queue<uint<8>>
+end testbench QueueSchemaTb
+
+impl QueueSchemaTest for QueueSchemaTb
+    run
+        wait 1 cycle
+    end run
+end impl QueueSchemaTest
+"#;
+    let prog = lower_src(src).expect("valid queue schema lowers");
+    for ty in [
+        ir::IrType::Unknown,
+        ir::IrType::UInt(None),
+        ir::IrType::SInt(None),
+        ir::IrType::UInt(Some(0)),
+        ir::IrType::SInt(Some(0)),
+        ir::IrType::Record(ir::RecordId(0)),
+    ] {
+        let mut broken = prog.clone();
+        let elem = ir::QueueElem::Scalar { ty: ty.clone() };
+        let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0]
+        else {
+            panic!("fixture state field is a queue");
+        };
+        field.elem = elem.clone();
+        broken.testbenches[0].queue_fields[0].elem = elem;
+        let rendered = verify::verify_program(&broken)
+            .expect_err("invalid scalar queue schema is rejected")
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("tb0 queue field `values` has invalid scalar element type")
+                && rendered.contains(&format!("{ty:?}")),
+            "invalid schema must identify the owner, field, and type: {rendered}"
+        );
+    }
+
+    let owner_prog = lower_src(&fixture("scoreboard_component_wide_queue_test.harc"))
+        .expect("owner fixture lowers");
+    let mut broken = owner_prog.clone();
+    let ir::ScoreboardFieldKind::Queue { elem } = &mut broken.scoreboards[0].fields[0].kind else {
+        panic!("fixture scoreboard field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid scoreboard queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `wide_values` has invalid scalar element type"),
+        "scoreboard queue schema is audited: {rendered}"
+    );
+
+    let mut broken = owner_prog;
+    let ir::ComponentFieldKind::Queue { elem } = &mut broken.components[0].fields[0].kind else {
+        panic!("fixture component field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid component queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("component c0 field `wide_values` has invalid scalar element type"),
+        "component queue schema is audited: {rendered}"
+    );
+
+    let mut broken =
+        lower_src(&fixture("target_wide_queue_state_test.harc")).expect("target fixture lowers");
+    let ir::StateFieldKind::Queue { elem } = &mut broken.transactors[0].state_fields[0].kind else {
+        panic!("fixture target-state field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid target-state queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered
+            .contains("transactor x0 state field `wide_values` has invalid scalar element type"),
+        "target-state queue schema is audited: {rendered}"
+    );
+}
+
 /// A data-only scoreboard queue uses the same exact scalar descriptor as a
 /// direct testbench queue. This pins inferred, assigned, and discarded pop
 /// destinations plus verifier assignment direction at the owner-specific IR
@@ -3160,6 +3340,7 @@ fn scoreboard_queue_wide_scalar_behavior_is_exact() {
     let run = prog.function(prog.tests[0].run);
     for (name, ty) in [
         ("sb_inferred", ir::IrType::UInt(Some(256))),
+        ("sb_typed", ir::IrType::UInt(Some(256))),
         ("sb_assigned", ir::IrType::UInt(Some(256))),
         ("sb_signed", ir::IrType::SInt(Some(8))),
     ] {
@@ -3248,39 +3429,8 @@ fn scoreboard_queue_wide_scalar_behavior_is_exact() {
 /// scoreboard owner, including assignment into an existing local.
 #[test]
 fn component_queue_wide_scalar_behavior_is_exact() {
-    let src = r#"
-agent WideQueueComponent
-    wide_values   : queue<uint<256>>
-    signed_values : queue<sint<8>>
-end agent WideQueueComponent
-
-testbench WideComponentQueueTb
-    dut  : Top
-    comp : WideQueueComponent
-end testbench WideComponentQueueTb
-
-impl WideComponentQueueTest for WideComponentQueueTb
-    run
-        let one : uint<256> = 1
-        comp.wide_values.push(one << 210)
-        comp.wide_values.push(one << 211)
-        comp.wide_values.push(one << 212)
-        let comp_inferred = comp.wide_values.pop()
-        let comp_assigned : uint<256> = 0
-        comp_assigned = comp.wide_values.pop()
-        comp.wide_values.pop()
-        assert (comp_inferred >> 210) == 1
-        assert (comp_assigned >> 211) == 1
-        assert comp.wide_values.empty()
-
-        let negative : sint<8> = (0 - 1) as sint<8>
-        comp.signed_values.push(negative)
-        let comp_signed = comp.signed_values.pop()
-        assert comp_signed < 0
-    end run
-end impl WideComponentQueueTest
-"#;
-    let merged = merged_src(src);
+    let src = fixture("scoreboard_component_wide_queue_test.harc");
+    let merged = merged_src(&src);
     let prog = lower::lower_program(&merged).expect("wide component queue lowers");
     verify::verify_program(&prog).expect("wide component queue verifies");
 
@@ -3301,6 +3451,7 @@ end impl WideComponentQueueTest
     let run = prog.function(prog.tests[0].run);
     for (name, ty) in [
         ("comp_inferred", ir::IrType::UInt(Some(256))),
+        ("comp_typed", ir::IrType::UInt(Some(256))),
         ("comp_assigned", ir::IrType::UInt(Some(256))),
         ("comp_signed", ir::IrType::SInt(Some(8))),
     ] {
@@ -5427,15 +5578,22 @@ end impl T"#
         verify::verify_program(&wrong_queue).is_err(),
         "a record destination redirected to a scalar queue must not verify"
     );
-    // Scalar queue assignment keeps the existing C++ conversion rule;
-    // record identity is the new invariant, not scalar signedness.
+    // Scalar queue assignment keeps the queue's exact signedness contract;
+    // record identity remains the separate invariant for record elements.
     let scalar_convert = prog(
         "sint<8>",
         "        let x : uint<8>\n        x = sb.q.pop()",
         "",
     );
-    let scalar_prog = lower_src(&scalar_convert).expect("scalar queue conversion lowers");
-    verify::verify_program(&scalar_prog).expect("scalar queue conversion still verifies");
+    let scalar_err = lower_src(&scalar_convert)
+        .expect_err("scalar queue signedness conversion must be rejected");
+    let scalar_msg = assert_invalid(&scalar_err);
+    assert!(
+        scalar_msg.contains("scoreboard queue `q`")
+            && scalar_msg.contains("SInt(Some(8))")
+            && scalar_msg.contains("UInt(Some(8))"),
+        "signedness diagnostic must identify the scoreboard queue and both types: {scalar_msg}"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&pop_ok))
             .expect("v1 emits")
@@ -15820,6 +15978,7 @@ fn target_nonscalar_queue_wide_scalar_behavior_is_exact() {
     for (field, ty) in [
         ("wide_values", ir::IrType::UInt(Some(256))),
         ("odd_values", ir::IrType::UInt(Some(65))),
+        ("signed_values", ir::IrType::SInt(Some(8))),
     ] {
         assert!(matches!(
             transactor
@@ -15838,6 +15997,8 @@ fn target_nonscalar_queue_wide_scalar_behavior_is_exact() {
         ("bare_inferred", ir::IrType::UInt(Some(256))),
         ("bare_typed", ir::IrType::UInt(Some(256))),
         ("bare_assigned", ir::IrType::UInt(Some(256))),
+        ("signed_first", ir::IrType::SInt(Some(8))),
+        ("signed_second", ir::IrType::SInt(Some(8))),
     ] {
         assert_eq!(
             responder
@@ -26457,7 +26618,9 @@ fn bound_transactor_thread_component_host_corruption_is_rejected() {
 
     let mut wrong_kind = fresh();
     wrong_kind.components[0].fields[0].kind = ir::ComponentFieldKind::Queue {
-        elem: ir::QueueElem::Scalar { signed: false },
+        elem: ir::QueueElem::Scalar {
+            ty: ir::IrType::UInt(Some(32)),
+        },
     };
     assert!(
         format!("{:?}", verify::verify_program(&wrong_kind).unwrap_err())
