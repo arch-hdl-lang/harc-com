@@ -1,5 +1,5 @@
 // Scoreboard and composite-component scalar queues retain exact widths and
-// signedness across inferred, assigned, and discarded pops.
+// signedness across typed, inferred, assigned, and discarded pops.
 
 scoreboard WideDataScoreboard
     wide_values   : queue<uint<256>>
@@ -24,15 +24,19 @@ impl ScoreboardComponentWideQueueTest for WideOwnerQueueTb
         sb.wide_values.push(one << 200)
         sb.wide_values.push(one << 201)
         sb.wide_values.push(one << 202)
+        sb.wide_values.push(one << 203)
         let sb_inferred = sb.wide_values.pop()
+        let sb_typed : uint<256> = sb.wide_values.pop()
         let sb_assigned : uint<256> = 0
         sb_assigned = sb.wide_values.pop()
         sb.wide_values.pop()
 
         assert (sb_inferred >> 200) == 1
             else fail("scoreboard inferred pop lost bit 200")
-        assert (sb_assigned >> 201) == 1
-            else fail("scoreboard assigned pop lost bit 201")
+        assert (sb_typed >> 201) == 1
+            else fail("scoreboard typed pop lost bit 201")
+        assert (sb_assigned >> 202) == 1
+            else fail("scoreboard assigned pop lost bit 202")
         assert sb.wide_values.empty()
             else fail("scoreboard discarded pop did not drain the queue")
 
@@ -45,15 +49,19 @@ impl ScoreboardComponentWideQueueTest for WideOwnerQueueTb
         comp.wide_values.push(one << 210)
         comp.wide_values.push(one << 211)
         comp.wide_values.push(one << 212)
+        comp.wide_values.push(one << 213)
         let comp_inferred = comp.wide_values.pop()
+        let comp_typed : uint<256> = comp.wide_values.pop()
         let comp_assigned : uint<256> = 0
         comp_assigned = comp.wide_values.pop()
         comp.wide_values.pop()
 
         assert (comp_inferred >> 210) == 1
             else fail("component inferred pop lost bit 210")
-        assert (comp_assigned >> 211) == 1
-            else fail("component assigned pop lost bit 211")
+        assert (comp_typed >> 211) == 1
+            else fail("component typed pop lost bit 211")
+        assert (comp_assigned >> 212) == 1
+            else fail("component assigned pop lost bit 212")
         assert comp.wide_values.empty()
             else fail("component discarded pop did not drain the queue")
 
