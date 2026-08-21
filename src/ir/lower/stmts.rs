@@ -2116,11 +2116,31 @@ impl FuncBuilder<'_> {
         if self.lower_component_dut_bind(target, value)? {
             return Ok(());
         }
-        if let Some((_, field, _)) = self.as_component_vec_field(target)? {
-            return Err(unsupported(
-                &format!("whole-vector write to component field `{field}`"),
-                "write one element with `<field>[index]`; whole-vector assignment is not lowered yet",
-            ));
+        if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
+            let shape =
+                crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem).map(|elem| (vec.len, elem));
+            let rhs = match shape {
+                Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
+                None => None,
+            };
+            let Some(rhs) = rhs else {
+                let dotted = super::components::dotted_path(target)
+                    .map(|path| path.join("."))
+                    .unwrap_or_else(|| field.clone());
+                return Err(not_implemented(
+                    &format!(
+                        "a whole-vector write to component field `{dotted}` with a non-matching RHS"
+                    ),
+                    format!("assign the field element-wise (`{dotted}[i] = ...`)"),
+                    V1Status::EmitsUncompilable,
+                ));
+            };
+            self.push(Stmt::ComponentFieldWrite {
+                base,
+                field,
+                value: rhs,
+            });
+            return Ok(());
         }
         // Composite-component scalar/record-leaf field write — self-relative
         // inside a method body (`count = ...`) or a dotted path from a

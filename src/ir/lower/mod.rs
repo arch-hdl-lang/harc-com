@@ -6672,6 +6672,10 @@ pub(crate) struct FuncBuilder<'a> {
     /// refusing `assert a.data == b.data` while v1 emitted
     /// `self.a.data == self.b.data` and g++ accepted it.
     pub(crate) vec_read_ok: bool,
+    /// Exact AST node whose whole-`Vec` read is authorized while
+    /// `vec_read_ok` is set. The landing permission must not leak into a
+    /// nested index/call expression within that node.
+    pub(crate) vec_read_span: Option<crate::lexer::Span>,
     /// True while lowering a transactor method body. Methods keep v1's
     /// synchronous hookable semantics (waits emit as `tick()` loops),
     /// so the constructs whose sync emission is out of this slice —
@@ -7103,6 +7107,7 @@ impl<'a> FuncBuilder<'a> {
             in_pure_helper: false,
             in_fmt_args: false,
             vec_read_ok: false,
+            vec_read_span: None,
             in_transactor_method: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),

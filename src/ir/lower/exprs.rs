@@ -57,10 +57,18 @@ pub(crate) struct TransactorStateRecordChain {
 }
 
 impl super::FuncBuilder<'_> {
+    /// Whether `e` is the exact whole-vector operand/RHS currently granted
+    /// access. Parentheses are transparent, but nested expressions have a
+    /// different span and therefore cannot inherit the permission.
+    pub(crate) fn whole_vec_read_allowed(&self, e: &crate::ast::Expr) -> bool {
+        self.vec_read_ok && self.vec_read_span == Some(unparen_expr(e).span)
+    }
+
     /// The `(len, element type)` of a whole-`Vec` record-field read, in
-    /// whichever of the three lanes that spells one — a record LOCAL
+    /// whichever lane spells one — a record LOCAL
     /// (`r.data`), a bound responder's record STATE field (`t.ba.data`),
-    /// or a COMPONENT record field (`a.data` in an agent method). The
+    /// a COMPONENT record field (`a.data` in an agent method), or a direct
+    /// COMPONENT fixed-vector field (`table.words`). The
     /// lanes are tried in the order `lower_expr`'s `Field` arm resolves
     /// them, so the shape reported is the one that would be lowered.
     ///
@@ -99,6 +107,8 @@ impl super::FuncBuilder<'_> {
         }
         let (len, ty) = if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
             (c.leaf_vec_len?, c.leaf_ty)
+        } else if let Ok(Some((_, _, vec))) = self.as_component_vec_field(e) {
+            (vec.len, vec.elem)
         } else if let Ok(Some(rf)) = self.as_component_record_field(e) {
             rf.leaf_vec?
         } else if let Ok(Some(l)) = self.try_record_field_chain(e) {
@@ -145,9 +155,12 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         let saved = self.vec_read_ok;
+        let saved_span = self.vec_read_span;
         self.vec_read_ok = true;
+        self.vec_read_span = Some(unparen_expr(value).span);
         let e = self.lower_expr_no_ports(value);
         self.vec_read_ok = saved;
+        self.vec_read_span = saved_span;
         let e = e?;
         // The shape comes from the LOWERED expression, not the AST.
         // The read-side pairing has to ask the AST (both operands are
@@ -266,12 +279,19 @@ impl super::FuncBuilder<'_> {
                 let cid = self.component_base_id(base)?;
                 let mut segs = field.split('.');
                 let root = segs.next()?;
-                let crate::ir::ComponentFieldKind::Record { record } =
-                    self.ctx.components.get(cid.index())?.field(root)?.kind
-                else {
+                let root_kind = &self.ctx.components.get(cid.index())?.field(root)?.kind;
+                if let crate::ir::ComponentFieldKind::FixedVec(vec) = root_kind {
+                    return (segs.next().is_none())
+                        .then(|| {
+                            crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem)
+                                .map(|elem| (vec.len, elem))
+                        })
+                        .flatten();
+                }
+                let crate::ir::ComponentFieldKind::Record { record } = root_kind else {
                     return None;
                 };
-                let mut cur = record;
+                let mut cur = *record;
                 let mut leaf = None;
                 for seg in segs {
                     let fld = self.ctx.records.get(cur.index())?.field(seg)?;
@@ -580,12 +600,6 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
-                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
-                    return Err(unsupported(
-                        &format!("whole-vector read of component field `{field}`"),
-                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
-                    ));
-                }
                 // Whole composite-component value read — a self sub-component
                 // field passed by value as a method arg (`sb.observe(addr,
                 // model)`). Locals shadow (checked above).
@@ -649,7 +663,7 @@ impl FuncBuilder<'_> {
                     // gets through, and only because both backends emit
                     // `target.ba.data == target.bb.data`, which g++
                     // accepts. See `vec_read_ok`.
-                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                    if chain.leaf_vec_len.is_some() && !self.whole_vec_read_allowed(e) {
                         let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                         return Err(not_implemented(
                             &format!("a whole-`Vec` read of record state field `{dotted}`"),
@@ -713,12 +727,6 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
-                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
-                    return Err(unsupported(
-                        &format!("whole-vector read of component field `{field}`"),
-                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
-                    ));
-                }
                 // `r.field` read on a `recv()`-captured payload local
                 // (`let r = bus.<ch>.recv(); ... r.data`). Each payload
                 // signal was captured into its own local at recv time;
@@ -765,7 +773,7 @@ impl FuncBuilder<'_> {
                     // `Index` arm handles it. A whole nested-RECORD leaf
                     // read (`let d = s.inner`) is unrelated and always
                     // allowed: it yields the nested struct value.
-                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                    if chain.leaf_vec_len.is_some() && !self.whole_vec_read_allowed(e) {
                         // What v1 does with the read depends on where it
                         // LANDS, and the equality landing is now
                         // implemented rather than refused with the rest:
@@ -865,9 +873,12 @@ impl FuncBuilder<'_> {
                 let eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
                     && self.same_whole_vec_shape(lhs, rhs);
                 let saved = self.vec_read_ok;
+                let saved_span = self.vec_read_span;
                 self.vec_read_ok = eq;
+                self.vec_read_span = eq.then(|| unparen_expr(lhs).span);
                 let l = self.lower_expr(lhs);
                 let r = if l.is_ok() {
+                    self.vec_read_span = eq.then(|| unparen_expr(rhs).span);
                     self.lower_expr(rhs)
                 } else {
                     Ok(Expr::Literal {
@@ -876,6 +887,7 @@ impl FuncBuilder<'_> {
                     })
                 };
                 self.vec_read_ok = saved;
+                self.vec_read_span = saved_span;
                 let (l, r) = (l?, r?);
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
                 // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
@@ -3480,6 +3492,13 @@ impl FuncBuilder<'_> {
             _ => None,
         }
     }
+}
+
+fn unparen_expr(mut e: &crate::ast::Expr) -> &crate::ast::Expr {
+    while let ExprKind::Paren(inner) = &*e.kind {
+        e = inner;
+    }
+    e
 }
 
 /// Width-method name → `WidthCastKind`.

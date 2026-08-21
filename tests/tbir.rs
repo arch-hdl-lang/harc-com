@@ -31635,12 +31635,18 @@ end impl T"#;
 fn component_fixed_vec_elements_lower_emit_and_remain_per_instance() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>
+    shadow : Vec<uint<64>, 4>
     flags : Vec<bool, 4>
 
     hookable store(index: uint<32>, value: uint<64>)
         words[index] = value
         flags[index] = true
     end store
+
+    hookable snapshot()
+        shadow = words
+        assert shadow == words else fail("snapshot mismatch")
+    end snapshot
 end scoreboard Table
 
 testbench Tb
@@ -31653,9 +31659,13 @@ impl T for Tb
     run
         a.store(2, 0x1234)
         b.store(2, 0x5678)
+        a.snapshot()
         assert a.flags[2] else fail("a flag")
         assert a.words[2] == 0x1234 else fail("a value")
         assert b.words[2] == 0x5678 else fail("b value")
+        assert a.words != b.words else fail("vectors unexpectedly equal")
+        a.words = b.words
+        assert a.words == b.words else fail("whole-vector copy failed")
         wait 1 cycle
     end run
 end impl T"#;
@@ -31672,6 +31682,10 @@ end impl T"#;
     assert!(cpp.contains("std::array<uint64_t, 4> words{};"), "{cpp}");
     assert!(cpp.contains("std::array<bool, 4> flags{};"), "{cpp}");
     assert!(cpp.contains("self.words[index] = value;"), "{cpp}");
+    assert!(cpp.contains("self.shadow = self.words;"), "{cpp}");
+    assert!(cpp.contains("self.shadow == self.words"), "{cpp}");
+    assert!(cpp.contains("a.words = b.words;"), "{cpp}");
+    assert!(cpp.contains("a.words == b.words"), "{cpp}");
     assert!(cpp.contains("a.words[2]"), "{cpp}");
     assert!(cpp.contains("b.words[2]"), "{cpp}");
 }
@@ -31711,6 +31725,322 @@ end impl T"#;
     assert!(
         msg.contains("default value on fixed-vector field `Table.words`"),
         "{msg}"
+    );
+}
+
+#[test]
+fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
+    let src = r#"scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        a.words = b.words
+        assert a.words == b.words else fail("copy")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("same-shape component vectors lower");
+    verify::verify_program(&prog).expect("whole-vector component IR verifies");
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the same array operations");
+    let tbir = emit_cpp_src(src);
+    for (v1_rendered, tbir_rendered) in [
+        ("_tb.a.words = _tb.b.words;", "a.words = b.words;"),
+        ("_tb.a.words == _tb.b.words", "a.words == b.words"),
+    ] {
+        assert!(v1.contains(v1_rendered), "v1 emits `{v1_rendered}`:\n{v1}");
+        assert!(
+            tbir.contains(tbir_rendered),
+            "tbir emits `{tbir_rendered}`:\n{tbir}"
+        );
+    }
+
+    for bad in [
+        "a.words = b.flags",
+        "assert a.words == b.flags else fail(\"bad\")",
+    ] {
+        let bad_src = src.replacen("a.words = b.words", bad, 1);
+        let err = lower_src(&bad_src).expect_err("mismatched whole vectors are not C++ values");
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("whole-vector"), "`{bad}`: {msg}");
+    }
+    let naked = src.replacen("a.words = b.words", "let x = b.words", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&naked).expect_err("a whole array cannot initialize a scalar local"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("whole-vector component field"), "{msg}");
+
+    let index_leak = r#"transaction Row
+    data : Vec<uint<64>, 4>
+end transaction Row
+transaction Bank
+    tbl : Vec<Row, 2>
+end transaction Bank
+scoreboard Table
+    words : Vec<uint<64>, 4>
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+testbench Tb
+    dut : Top
+    a : Table
+end testbench Tb
+impl T for Tb
+    run
+        let bank : Bank
+        a.words = bank.tbl[a.words].data
+        wait 1 cycle
+    end run
+end impl T"#;
+    let msg = assert_not_implemented(
+        &lower_src(index_leak)
+            .expect_err("whole-vector permission must not leak into an index expression"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("whole-vector component field `a.words`"),
+        "{msg}"
+    );
+
+    fn corrupt<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::ComponentBase, &mut String, &mut ir::Expr),
+    {
+        let (base, field, value) = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ComponentFieldWrite { base, field, value } => Some((base, field, value)),
+                _ => None,
+            })
+            .expect("fixture contains a whole-vector write");
+        mutate(base, field, value);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted component-vector metadata must not verify"
+        );
+    }
+
+    corrupt(prog.clone(), |_, field, _| *field = "missing".to_string());
+    corrupt(prog.clone(), |base, _, _| {
+        *base = ir::ComponentBase::Local(ir::LocalId(0))
+    });
+    corrupt(prog.clone(), |_, _, value| match value {
+        ir::Expr::ComponentField { field, .. } => *field = "flags".to_string(),
+        other => panic!("whole-vector RHS is not a component field: {other:?}"),
+    });
+    corrupt(prog.clone(), |_, _, value| {
+        *value = ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(None),
+        }
+    });
+    corrupt(prog.clone(), |_, field, _| *field = "flags".to_string());
+
+    fn corrupt_equality<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::BinOp, &mut ir::Expr, &mut ir::Expr),
+    {
+        let cond = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .expect("fixture contains a vector equality");
+        let ir::Expr::Binary(op, lhs, rhs) = cond else {
+            panic!("vector equality did not lower to Binary: {cond:?}")
+        };
+        mutate(op, lhs, rhs);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted whole-vector equality must not verify"
+        );
+    }
+    corrupt_equality(prog.clone(), |op, _, _| *op = ir::BinOp::Add);
+    corrupt_equality(prog, |_, _, rhs| match rhs {
+        ir::Expr::ComponentField { field, .. } => *field = "flags".to_string(),
+        other => panic!("whole-vector equality RHS is not a component field: {other:?}"),
+    });
+}
+
+#[test]
+fn component_fixed_vec_side_table_predicates_are_verified() {
+    let src = r#"property words_equal
+    a.words == b.words
+end property words_equal
+
+scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        assert property words_equal
+        cover a.words == b.words
+        on a.words == b.words
+            log(info, "equal")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("whole-vector side-table predicates lower");
+    verify::verify_program(&prog).expect("whole-vector side-table predicates verify");
+    assert_eq!(prog.property_checks.len(), 1);
+    assert_eq!(prog.cover_checks.len(), 1);
+    assert_eq!(prog.cycle_handlers.len(), 1);
+
+    fn set_add(expr: &mut ir::Expr) {
+        let ir::Expr::Binary(op, _, _) = expr else {
+            panic!("whole-vector predicate is not binary: {expr:?}")
+        };
+        *op = ir::BinOp::Add;
+    }
+
+    let mut bad_property = prog.clone();
+    match &mut bad_property.property_checks[0].shape {
+        ir::PropertyShape::Invariant(expr) => set_add(expr),
+        other => panic!("whole-vector property is not invariant: {other:?}"),
+    }
+    assert!(
+        verify::verify_program(&bad_property).is_err(),
+        "corrupted property side-table predicate must not verify"
+    );
+
+    let mut bad_cover = prog.clone();
+    set_add(&mut bad_cover.cover_checks[0].cond);
+    assert!(
+        verify::verify_program(&bad_cover).is_err(),
+        "corrupted cover side-table predicate must not verify"
+    );
+
+    let mut bad_handler = prog.clone();
+    let ir::CycleHandlerKind::Trigger { trigger, .. } = &mut bad_handler.cycle_handlers[0].kind
+    else {
+        panic!("whole-vector cycle handler is not trigger-based")
+    };
+    let ir::Expr::Binary(_, _, rhs) = trigger else {
+        panic!("whole-vector cycle trigger is not binary: {trigger:?}")
+    };
+    let ir::Expr::ComponentField { field, .. } = &mut **rhs else {
+        panic!("whole-vector cycle trigger RHS is not a component field: {rhs:?}")
+    };
+    *field = "flags".to_string();
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "cross-lane cycle-handler predicate must not verify"
+    );
+}
+
+#[test]
+fn side_table_local_reads_obey_registration_point_dominance() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let x = 3
+        assert past(x) == 3 else fail("x=${x}")
+        cover x == 3
+        on x == 3
+            log(info, "x")
+        end on
+        let y = 4
+        wait 1 cycle
+    end run
+end test T"#;
+
+    let prog = lower_src(src).expect("local-capturing side tables lower");
+    verify::verify_program(&prog).expect("defined local captures verify");
+    let run = prog.tests[0].run;
+    let y = prog
+        .function(run)
+        .locals
+        .iter()
+        .position(|l| l.name == "y")
+        .map(|index| ir::LocalId(index as u32))
+        .unwrap();
+
+    let assert_use_before_def = |bad: ir::TbProgram, site: &str| {
+        let errs = verify::verify_program(&bad).expect_err(site);
+        assert!(
+            errs.iter().any(|err| matches!(
+                err,
+                verify::VerifyError::LocalUseBeforeDef { local, .. } if *local == y
+            )),
+            "{site}: {errs:?}"
+        );
+    };
+
+    let mut bad_root = prog.clone();
+    let ir::PropertyShape::Invariant(root) = &mut bad_root.property_checks[0].shape else {
+        panic!("temporal equality did not lower as an invariant")
+    };
+    *root = ir::Expr::Local(y);
+    assert_use_before_def(bad_root, "later local in property root must not verify");
+
+    let mut bad_temporal = prog.clone();
+    bad_temporal.property_checks[0].temporals[0].inner = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_temporal,
+        "later local in temporal operand must not verify",
+    );
+
+    let mut bad_message = prog.clone();
+    bad_message.property_checks[0]
+        .message
+        .as_mut()
+        .expect("fixture has a property message")
+        .args[0]
+        .expr = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_message,
+        "later local in property message must not verify",
+    );
+
+    let mut bad_cover = prog.clone();
+    bad_cover.cover_checks[0].cond = ir::Expr::Local(y);
+    assert_use_before_def(bad_cover, "later local in cover root must not verify");
+
+    let mut bad_handler = prog;
+    let ir::CycleHandlerKind::Trigger { trigger, .. } = &mut bad_handler.cycle_handlers[0].kind
+    else {
+        panic!("fixture cycle handler is not trigger-based")
+    };
+    *trigger = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_handler,
+        "later local in cycle-handler root must not verify",
     );
 }
 

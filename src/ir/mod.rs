@@ -2210,7 +2210,8 @@ pub enum Stmt {
         /// `path` against the run-scope env local. See `ScoreboardQuery`.
         nested_path: Option<Vec<String>>,
     },
-    /// Write a composite-component scalar field. `base` selects the
+    /// Write a composite-component scalar/record field, or a whole fixed
+    /// vector in the same-shape copy position. `base` selects the
     /// access form: `SelfField` (`count = count + 1` inside a method body
     /// → `self.count = ...`) or `Path` (`env.sb.errors = ...` from the
     /// test). The value is port-hoisted like `Assign`.
@@ -2647,10 +2648,12 @@ pub enum Expr {
         /// nested form (the board lives inside the env, not on `_tb`).
         nested_path: Option<Vec<String>>,
     },
-    /// Read a composite-component scalar field. `base` is `SelfField`
+    /// Read a composite-component scalar/record field, or a whole fixed
+    /// vector in a same-shape equality/copy position. `base` is `SelfField`
     /// (`count` inside a method → `self.count`) or `Path` (`env.sb.count`
-    /// from the test → `env.sb.count`). Host state — allowed wherever a
-    /// `Local` is. Queue/event fields are never read this way (queues use
+    /// from the test → `env.sb.count`). Host state; whole vectors are limited
+    /// to the explicitly shape-checked positions. Queue/event fields are
+    /// never read this way (queues use
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
     ComponentField {

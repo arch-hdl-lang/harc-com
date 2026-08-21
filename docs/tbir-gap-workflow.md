@@ -45,6 +45,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Record-value destination gaps with positive v1 controls: fitting sized
   field defaults, record queue pops into existing locals, and whole-record
   testbench-field copies.
+- [x] Whole fixed-vector component state in the C++-valid value positions:
+  same-shape equality/inequality and whole-array copies, with direct and
+  self-relative component spellings.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -53,8 +56,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 155 remaining constructor call sites (156 textual matches including
-the `unsupported` helper definition) as an inventory, not 155 separate tasks.
+Treat the 152 remaining constructor call sites (153 textual matches including
+the `unsupported` helper definition) as an inventory, not 152 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -63,7 +66,8 @@ shared IR primitive, and equivalence fixture. Then:
    cases from the retirement-blocker queue while retaining their diagnostics.
 2. Cluster the remaining rows by shared IR primitive and implement a whole
    family at once. Method hooks, transactor predicates, bound threads,
-   coverpoint values, and record/state/helper handling are the current seams.
+   coverpoint values and the remaining record/state/helper handling are the
+   current seams.
 3. Use one self-checking trace fixture per family, with small unit probes for
    each surface spelling and malformed neighbor.
 4. Run targeted lowering/verifier tests per edit, simulations per family, and
@@ -148,11 +152,11 @@ not applicable before requesting review:
 
 8. Recount `unsupported(...)` sites and record which family disappeared.
    The completed event, queue-query, method-hook, transactor-heartbeat, and
-   bound-thread, direct coverpoint-value, composed-wide-cover, and record-value
-   destination slices reduce the count from 174 to 156 textual matches (155
-   constructors plus the helper definition). Nested bus expressions and sized
-   cover widths were also reclassified because v1 rejects or silently mis-lowers
-   them.
+   bound-thread, direct coverpoint-value, composed-wide-cover, record-value
+   destination, and whole component fixed-vector slices reduce the count from
+   174 to 153 textual matches (152 constructors plus the helper definition).
+   Nested bus expressions and sized cover widths were also reclassified because
+   v1 rejects or silently mis-lowers them.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
