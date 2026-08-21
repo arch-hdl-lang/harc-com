@@ -23,9 +23,9 @@ domain SysDomain
 end domain SysDomain
 
 transaction CountCmd
-    ticks  : uint<8>  default 2  with [range(1, 9)]
+    ticks  : uint<8>  default 8'd2  with [range(1, 9)]
     flag   : bool     default true
-    !tag   : uint<16> default 7
+    !tag   : uint<16> default 16'h0007
     expect : uint<32>
 
     keep ticks in [1..16]

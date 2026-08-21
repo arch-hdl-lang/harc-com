@@ -2169,6 +2169,29 @@ impl Checker<'_> {
                         crate::ir::ScoreboardOp::QueuePop { queue, dest } => {
                             self.check_scoreboard_queue(*sb, queue);
                             self.check_local(*dest);
+                            if let (Some(elem), Some(local)) = (
+                                self.scoreboard_queue_elem(*sb, queue),
+                                self.func.locals.get(dest.index()),
+                            ) {
+                                let compatible = match (elem, &local.ty) {
+                                    (QueueElem::Record(expected), IrType::Record(actual)) => {
+                                        expected == actual
+                                    }
+                                    (QueueElem::Scalar { .. }, IrType::Record(_))
+                                    | (QueueElem::Record(_), _) => false,
+                                    // Preserve existing scalar assignment conversions,
+                                    // including signed-to-unsigned and the reverse.
+                                    (QueueElem::Scalar { .. }, _) => true,
+                                };
+                                if !compatible {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} pops scoreboard sb{} queue `{queue}` with element {:?} into local %{} declared {:?}",
+                                            self.fid.0, self.bid.0, sb.0, elem, dest.0, local.ty
+                                        ),
+                                    });
+                                }
+                            }
                         }
                         crate::ir::ScoreboardOp::ScalarWrite { scalar, value } => {
                             self.check_scoreboard_scalar(*sb, scalar);
@@ -2411,6 +2434,21 @@ impl Checker<'_> {
                 detail: format!("scoreboard sb{} has no queue field `{queue}`", sb.0),
             });
         }
+    }
+
+    fn scoreboard_queue_elem(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        queue: &str,
+    ) -> Option<&QueueElem> {
+        self.prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|schema| schema.field(queue))
+            .and_then(|field| match &field.kind {
+                crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem),
+                crate::ir::ScoreboardFieldKind::Scalar { .. } => None,
+            })
     }
 
     /// A direct transactor heartbeat expression carries both the source
