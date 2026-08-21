@@ -13,6 +13,8 @@
 //      sb.samples.pop()` (let-RHS, popped local typed as the record so its
 //      fields resolve), `sb.samples.size()` / `.empty()` (value queries).
 //   3. Struct field access on a popped record (`s.run_idx`, `s.count`).
+//   4. Assignment-position record pop into an existing local and a
+//      whole-record testbench-field copy (`_tb.last = want`).
 //
 // Uses only the v1-supported surface, so the same file passes under
 // `--codegen v1` and `--codegen tbir`; the equivalence harness trace-diffs
@@ -36,6 +38,7 @@ end scoreboard SampleSb
 testbench ScoreboardDataQueueStructTb
     dut : Top
     sb  : SampleSb
+    last : Sample
 end testbench ScoreboardDataQueueStructTb
 
 impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
@@ -73,13 +76,17 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
             dut.en = 0
             wait 1 cycle                   // let the last count settle
 
-            let want : Sample = sb.samples.pop()
+            let want : Sample
+            want = sb.samples.pop()
+            _tb.last = want
             sb.reads = sb.reads + 1
             let got = dut.count_out
             assert want.run_idx == i
                 else fail("run[${i}]: popped run_idx=${want.run_idx}, expected ${i}")
             assert got == want.count
                 else fail("run[${i}]: count_out=${got}, expected ${want.count}")
+            assert last.run_idx == want.run_idx && last.count == want.count
+                else fail("run[${i}]: shared record copy mismatch")
             log(info, "run[${i}] count_out=${got} matched sample count=${want.count}")
         end for
 

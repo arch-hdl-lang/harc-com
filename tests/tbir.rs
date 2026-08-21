@@ -4750,13 +4750,13 @@ end test BadFieldTest
 /// The five record-assignment arms, split on whether the program is
 /// well typed — and the sixth spelling, which had no arm at all.
 ///
-/// Each of these rejected a whole family under one `Unsupported`, so
+/// Each of these once rejected a whole family under one `Unsupported`, so
 /// each promised `--codegen v1` for programs v1 cannot compile. Only
-/// one of the families contains a well-typed program:
+/// one family contains a well-typed program, and that row now lowers:
 ///
 /// | assignment | v1 emits | |
 /// |---|---|---|
-/// | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | a real escape hatch |
+/// | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | lowers |
 /// | `b = sb.q.pop()`, `q : queue<uint<8>>` | the same line — "operand types are 'Beat' and 'long unsigned int'" | `Invalid` |
 /// | `b = drv.get()` | `b = Drv_get(_tb.drv);` — "'Beat' and 'uint64_t'" | `Invalid` |
 /// | `b = o` / `b = 5` | "'Beat' and 'Other'" / "'Beat' and 'int'" | `Invalid` |
@@ -4789,6 +4789,7 @@ end transaction Other
 
 scoreboard Sb
     q : queue<{elem}>
+    scalar_q : queue<uint<8>>
 end scoreboard Sb
 
 transactor Drv
@@ -4827,11 +4828,60 @@ end impl T"#
     lower_src(&run("        let b : Beat\n        drv.rec = b")).expect("same-typed copy lowers");
     lower_src(&run("        drv.st = 5")).expect("a scalar state field takes a scalar");
 
-    // The one well-typed member of the pop family — v1 compiles it, so
-    // the suggestion is honest.
+    // The one well-typed member of the pop family lowers as the same
+    // struct assignment v1 emits.
     let pop_ok = run("        let b : Beat\n        b = sb.q.pop()");
-    let msg = assert_unsupported(&lower_src(&pop_ok).unwrap_err());
-    assert!(msg.contains("scoreboard `pop()` result"), "{msg}");
+    let lowered = lower_src(&pop_ok).expect("record pop into an existing local lowers");
+    verify::verify_program(&lowered).expect("record pop assignment verifies");
+    let tbir_cpp = tbir::emit(&lowered, &merged_src(&pop_ok), &cpp_tb::EmitOpts::default())
+        .expect("tbir emits the record pop assignment");
+    assert!(tbir_cpp.contains("b = _tb.sb.q.pop();"), "{tbir_cpp}");
+    let mut corrupted = lowered.clone();
+    let run_idx = corrupted.tests[0].run.index();
+    let pop_dest = corrupted.functions[run_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { dest, .. },
+                ..
+            } => Some(*dest),
+            _ => None,
+        })
+        .expect("record queue pop has a destination");
+    corrupted.functions[run_idx].locals[pop_dest.index()].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&corrupted).is_err(),
+        "a scoreboard record pop into a scalar destination must not verify"
+    );
+    let mut wrong_queue = lowered.clone();
+    let pop_queue = wrong_queue.functions[run_idx]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, .. },
+                ..
+            } => Some(queue),
+            _ => None,
+        })
+        .expect("record queue pop has a queue reference");
+    *pop_queue = "scalar_q".to_string();
+    assert!(
+        verify::verify_program(&wrong_queue).is_err(),
+        "a record destination redirected to a scalar queue must not verify"
+    );
+    // Scalar queue assignment keeps the existing C++ conversion rule;
+    // record identity is the new invariant, not scalar signedness.
+    let scalar_convert = prog(
+        "sint<8>",
+        "        let x : uint<8>\n        x = sb.q.pop()",
+        "",
+    );
+    let scalar_prog = lower_src(&scalar_convert).expect("scalar queue conversion lowers");
+    verify::verify_program(&scalar_prog).expect("scalar queue conversion still verifies");
     assert!(
         cpp_tb::emit(&merged_src(&pop_ok))
             .expect("v1 emits")
@@ -5903,13 +5953,14 @@ end impl T"#
         )
     };
 
-    // A same-typed RHS: v1 emits the struct copy and g++ ACCEPTS it, so
-    // the suggestion is honest. It had been `SilentlyMisLowers` —
-    // "`--codegen v1` accepts it but silently emits something else" —
-    // which withheld a hatch that works.
+    // A same-typed RHS lowers as a shared-record assignment. TBIR's
+    // synthetic local names the one test-scope record cell.
     let ok = prog("        let b : Beat\n        tbrec = b");
-    let msg = assert_unsupported(&lower_src(&ok).unwrap_err());
-    assert!(msg.contains("testbench record field"), "{msg}");
+    let lowered = lower_src(&ok).expect("whole testbench record copy lowers");
+    verify::verify_program(&lowered).expect("whole testbench record copy verifies");
+    let tbir_cpp = tbir::emit(&lowered, &merged_src(&ok), &cpp_tb::EmitOpts::default())
+        .expect("tbir emits the shared record copy");
+    assert!(tbir_cpp.contains("tbrec = b;"), "{tbir_cpp}");
     assert!(
         cpp_tb::emit(&merged_src(&ok))
             .expect("v1 emits")
@@ -10263,15 +10314,15 @@ end test T"#
 /// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
 /// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
 /// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
-/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | lowers |
 /// | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits and truncates | `SilentlyMisLowers` |
 ///
 /// The literal rows do not split on the apostrophe — the width prefix
 /// is not the value. `4'd3` folds to `3` and `128'hFF…` folds to a
 /// `_harc_u128` composite that the 64-bit member truncates, and an
 /// unsized decimal past `u64` does the same thing with a different
-/// diagnostic. The guard normalizes through `cpp_tb`'s own folder and
-/// asks whether the result fits.
+/// diagnostic. TBIR accepts the fitting value and keeps the over-wide
+/// cases classified as silent v1 truncations.
 ///
 /// Compiled with `-std=gnu++20`, the standard `src/main.rs` passes.
 #[test]
@@ -10314,19 +10365,31 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         assert!(v1.contains(needle), "v1 emits `{needle}`: {v1}");
     }
 
-    // A literal whose VALUE fits the 64-bit member folds correctly,
-    // whatever its spelling — a real escape hatch.
-    for (lit, folded) in [
-        ("4'd3", "uint64_t a = 3;"),
-        ("8'hFF", "uint64_t a = 0xFF;"),
-        ("4'b1010", "uint64_t a = 0b1010;"),
+    // A sized literal whose VALUE fits the 64-bit member now lowers to
+    // the same record default as v1, whatever its spelling.
+    for (lit, value, v1_folded) in [
+        ("4'd3", 3, "uint64_t a = 3;"),
+        ("8'hFF", 255, "uint64_t a = 0xFF;"),
+        ("4'b1010", 10, "uint64_t a = 0b1010;"),
     ] {
         let src = prog(&format!(
             "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
         ));
-        assert_unsupported(&lower_src(&src).unwrap_err());
+        let lowered = lower_src(&src).expect("fitting sized record default lowers");
+        verify::verify_program(&lowered).expect("sized record default verifies");
+        assert_eq!(lowered.records[0].fields[0].default, Some(value));
+        let tbir = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("tbir emits fitting sized record default");
+        let tbir_folded = format!("uint64_t a = {value};");
+        assert!(
+            tbir.contains(&tbir_folded),
+            "`{lit}` folds to `{tbir_folded}`: {tbir}"
+        );
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
-        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+        assert!(
+            v1.contains(v1_folded),
+            "`{lit}` folds to `{v1_folded}`: {v1}"
+        );
     }
     // One that does not fit truncates into the member with only a
     // warning — and a SIZED literal is on this side of the line too,

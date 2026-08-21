@@ -2285,15 +2285,6 @@ impl FuncBuilder<'_> {
                                 self.ctx.records[rid.index()].name
                             )));
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "assignment of a scoreboard `pop()` result to transaction \
-                                 local `{}`",
-                                id.name
-                            ),
-                            "pop into a fresh `let` instead; v1 emits the same struct copy \
-                             and it compiles",
-                        ));
                     }
                     self.push(Stmt::ScoreboardOp {
                         sb,
@@ -2791,13 +2782,11 @@ impl FuncBuilder<'_> {
                      individually (`<field>.<sub> = ...`)",
                 ));
             }
-            // The copy itself is not lowered yet — but the suggestion
-            // is honest now, because v1 does compile this one.
-            return Err(unsupported(
-                "a whole-record write of a testbench record field",
-                "v1 emits the struct copy `_tb.<field> = <rhs>;` and it compiles; assign \
-                 the record's fields individually to stay in the TB-IR subset",
-            ));
+            let local = self
+                .record_target_local(target)
+                .expect("tb_record_field_target resolved a declared synthetic record local");
+            self.push(Stmt::Assign(local, e));
+            return Ok(());
         }
         // Two measured shapes, and they are not the same failure.
         //

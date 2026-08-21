@@ -42,7 +42,10 @@ family of rejections over a one-site exception. Current implementation order:
   (wide unary/binary/ternary operands are coerced through the 1024-bit scalar
   model; known-width `+%`/`-%`/`*%` cover expressions retain their 1–64-bit
   mask; wider wraps remain excluded because v1 rejects them).
-- [ ] Record/state/helper gaps whose tests contain a positive v1 control.
+- [x] Record-value destination gaps with positive v1 controls: fitting sized
+  field defaults, record queue pops into existing locals, and whole-record
+  testbench-field copies.
+- [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
@@ -50,8 +53,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 158 remaining constructor call sites (159 textual matches including
-the `unsupported` helper definition) as an inventory, not 158 separate tasks.
+Treat the 155 remaining constructor call sites (156 textual matches including
+the `unsupported` helper definition) as an inventory, not 155 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -81,10 +84,10 @@ fixture runs under both emitters and trace-diffs wide add, bit-not, ternary, and
 wrapped-nibble samples. Wrapping above 64 bits remains a measured v1 rejection,
 not a retirement blocker.
 
-The recommended next family is record/state/helper gaps with a positive v1
-control. Cluster those sites by the missing shared IR value shape rather than
-by source spelling, and keep verifier type metadata in the same patch as each
-new lowering path.
+The recommended next family is the remaining state/helper gaps with a positive
+v1 control. Cluster those sites by the missing shared IR value shape rather
+than by source spelling, and keep verifier type metadata in the same patch as
+each new lowering path.
 
 ## Review-derived semantic gates
 
@@ -145,9 +148,11 @@ not applicable before requesting review:
 
 8. Recount `unsupported(...)` sites and record which family disappeared.
    The completed event, queue-query, method-hook, transactor-heartbeat, and
-   bound-thread, and direct coverpoint-value slices reduce the call-site count
-   from 174 to 159. Nested bus expressions and sized cover widths were also
-   reclassified because v1 rejects or silently mis-lowers them.
+   bound-thread, direct coverpoint-value, composed-wide-cover, and record-value
+   destination slices reduce the count from 174 to 156 textual matches (155
+   constructors plus the helper definition). Nested bus expressions and sized
+   cover widths were also reclassified because v1 rejects or silently mis-lowers
+   them.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
