@@ -609,6 +609,7 @@ fn lower_bound_target_transactor(
     // target threads; reject the out-of-subset shapes precisely.
     let mut state_fields: Vec<StateFieldSchema> = Vec::new();
     let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
+    let mut state_activations: HashMap<String, Activation> = HashMap::new();
     let mut threads_ast: Vec<(&TargetTlmThread, Activation)> = Vec::new();
     let all_items = t.items.iter().map(|item| (item, Activation::Always)).chain(
         t.when_active
@@ -653,6 +654,7 @@ fn lower_bound_target_transactor(
                         sf.name
                     )));
                 }
+                state_activations.insert(sf.name.clone(), activation);
                 state_fields.push(sf);
             }
             ComponentItem::TargetTlmThread(th) => threads_ast.push((th, activation)),
@@ -1003,7 +1005,29 @@ fn lower_bound_target_transactor(
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&body_ctx, helper_registry, side_tables);
-        b.target_state_fields = state_names.clone();
+        b.current_body_name = Some(format!(
+            "transactor `{tname}` {} target thread `bus.{mname}`",
+            if matches!(activation, Activation::Always) {
+                "always-present"
+            } else {
+                "active-only"
+            }
+        ));
+        b.target_state_fields = state_names
+            .iter()
+            .filter(|(name, _)| {
+                matches!(activation, Activation::ActiveOnly)
+                    || matches!(state_activations[*name], Activation::Always)
+            })
+            .map(|(name, kind)| (name.clone(), kind.clone()))
+            .collect();
+        if matches!(activation, Activation::Always) {
+            b.inactive_target_state_fields = state_activations
+                .iter()
+                .filter(|(_, activation)| matches!(activation, Activation::ActiveOnly))
+                .map(|(name, _)| name.clone())
+                .collect();
+        }
         let mut params = Vec::with_capacity(th.params.len());
         for p in &th.params {
             let ty = helpers::ir_type_of(p.ty.as_ref());

@@ -503,6 +503,9 @@ impl FuncBuilder<'_> {
                 // state-field op: `pending.push(x)` / `pending.pop()`
                 // (bare field name), mirroring the component form.
                 if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let ExprKind::Field { target, .. } = &*callee.kind {
+                        self.reject_inactive_target_state_root(target)?;
+                    }
                     if let Some((field, method)) = self.as_state_queue_call(callee) {
                         if method == "push" {
                             let [CallArg::Expr(arg)] = args.as_slice() else {
@@ -1945,6 +1948,7 @@ impl FuncBuilder<'_> {
         target: &crate::ast::Expr,
         value: &crate::ast::Expr,
     ) -> Result<(), LowerError> {
+        self.reject_inactive_target_state_root(target)?;
         if let Some(port) = self.as_port_ref(target)? {
             // Writing a read-only `probe` is a hard error: only a
             // `probe force` declaration opts into the SV procedural-force
