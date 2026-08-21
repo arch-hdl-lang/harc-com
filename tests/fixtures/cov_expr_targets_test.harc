@@ -51,6 +51,23 @@ covergroup ExprCov @(posedge dut.clk)
         bins
             zero = {0}
         end bins
+    cp_wide_add : cover (dut.count_out as uint<200>) + (1 as uint<200>)
+        bins
+            sixteen = {16}
+        end bins
+    cp_wide_not : cover (~(dut.count_out as uint<200>))[3:0]
+        bins
+            zero = {0}
+        end bins
+    cp_wide_ternary : cover dut.en ? (dut.count_out as uint<200>) : (0 as uint<200>)
+        bins
+            zero = {0}
+            seven = {7}
+        end bins
+    cp_wrapping_nibble : cover (dut.count_out[3:0] as uint<4>) +% (1 as uint<4>)
+        bins
+            wrapped = {0}
+        end bins
     cross cp_low_nibble, cp_activity
 end covergroup ExprCov
 
@@ -97,6 +114,11 @@ impl CovExprTargetsTest for CovExprTargetsTb
         assert cov.cp_runtime_slice.zero > 0 else fail("runtime slice bound hole")
         assert cov.cp_wide_sign.filled > 0 else fail("128-bit cover intermediate hole")
         assert cov.cp_wide_cast.zero > 0 else fail("wide cover intermediate hole")
+        assert cov.cp_wide_add.sixteen > 0 else fail("wide cover add hole")
+        assert cov.cp_wide_not.zero > 0 else fail("wide cover unary hole")
+        assert cov.cp_wide_ternary.zero > 0 else fail("wide cover ternary zero hole")
+        assert cov.cp_wide_ternary.seven > 0 else fail("wide cover ternary data hole")
+        assert cov.cp_wrapping_nibble.wrapped > 0 else fail("cover wrapping arithmetic hole")
         log(info, "coverage assertions passed")
     end check
 end impl CovExprTargetsTest

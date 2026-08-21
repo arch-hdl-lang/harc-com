@@ -108,6 +108,7 @@ cov_runtime_bound_test | Top | top_counter.sv | top_counter.arch | pass
 cov_runtime_bin_value_test | Top | top_counter.sv | top_counter.arch | pass
 cov_expr_targets_test | Top | top_counter.sv | top_counter.arch | pass
 wide_cover_helper_test | WideCoverHelperTop | wide_cover_helper.sv | - | pass
+cov_wide_port_expr_test | WideCoverExprTop | wide_cover_expr.sv | - | pass
 covergroup_hook_trigger_test | Top | top_counter.sv | - | pass
 covergroup_hook_param_test | Top | top_counter.sv | - | pass
 wait_any_of_test | Top | top_counter.sv | top_counter.arch | pass

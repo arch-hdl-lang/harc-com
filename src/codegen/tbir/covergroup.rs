@@ -146,11 +146,15 @@ fn cross_bin_labels(cross: &DeclaredCross<'_>) -> Vec<(usize, String)> {
 struct CoverWidths<'a> {
     lanes: &'a HashMap<String, u32>,
     ports: &'a HashMap<String, u32>,
+    /// Late-resolved hook argument and record-field types, keyed as `arg`
+    /// and `arg.field`. Clock-triggered covergroups pass an empty map.
+    hook_types: &'a HashMap<String, IrType>,
 }
 
 fn cover_type_width(ty: &IrType) -> Option<u32> {
     match ty {
-        IrType::UInt(width) | IrType::SInt(width) => *width,
+        // Widthless scalar types use the compiler's 64-bit host ABI.
+        IrType::UInt(width) | IrType::SInt(width) => Some(width.unwrap_or(64)),
         IrType::Bool => Some(1),
         _ => None,
     }
@@ -167,15 +171,35 @@ fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
             Some(_) => cover_lane_width(widths.lanes, port),
             None => port
                 .width
-                .or_else(|| widths.ports.get(&port.port_path.join("_")).copied()),
+                .or_else(|| widths.ports.get(&port.port_path.join("_")).copied())
+                .filter(|width| *width != u32::MAX),
         },
+        Expr::CovHookArg { param } => widths.hook_types.get(param).and_then(cover_type_width),
+        Expr::CovHookParam { param, field, .. } => widths
+            .hook_types
+            .get(&format!("{param}.{field}"))
+            .and_then(cover_type_width),
+        Expr::Unary(UnOp::Not, _) => Some(1),
         Expr::Unary(_, inner) => cover_expr_width(inner, widths),
-        Expr::Binary(_, lhs, rhs) => {
-            match (cover_expr_width(lhs, widths), cover_expr_width(rhs, widths)) {
+        Expr::Binary(op, lhs, rhs) => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => Some(1),
+            // v1 evaluates narrow shifts in its 64-bit host carrier. Keep
+            // that effective width in the expression metadata as well as in
+            // emission so a later wide composition does not mask the shifted
+            // value back to the LHS's declared width.
+            BinOp::Shl | BinOp::Shr => cover_expr_width(lhs, widths).map(|width| width.max(64)),
+            _ => match (cover_expr_width(lhs, widths), cover_expr_width(rhs, widths)) {
                 (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
-                _ => None,
-            }
-        }
+                (width, None) | (None, width) => width,
+            },
+        },
         Expr::Ternary(_, then_expr, else_expr) => match (
             cover_expr_width(then_expr, widths),
             cover_expr_width(else_expr, widths),
@@ -193,6 +217,91 @@ fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
     }
 }
 
+fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
+    match e {
+        Expr::Literal { ty, .. } => matches!(ty, IrType::SInt(_)),
+        Expr::Unary(UnOp::Not, _) => false,
+        Expr::Unary(_, inner) => cover_expr_signed(inner, widths),
+        Expr::Binary(op, lhs, rhs) => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => false,
+            BinOp::Shl | BinOp::Shr => cover_expr_signed(lhs, widths),
+            _ => cover_expr_signed(lhs, widths) && cover_expr_signed(rhs, widths),
+        },
+        Expr::Ternary(_, then_expr, else_expr) => {
+            cover_expr_signed(then_expr, widths) && cover_expr_signed(else_expr, widths)
+        }
+        Expr::WidthCast { kind, .. } => matches!(kind, WidthCastKind::Sext),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            matches!(ret, IrType::SInt(_))
+        }
+        Expr::CovHookArg { param } => widths
+            .hook_types
+            .get(param)
+            .is_some_and(|ty| matches!(ty, IrType::SInt(_))),
+        Expr::CovHookParam { param, field, .. } => widths
+            .hook_types
+            .get(&format!("{param}.{field}"))
+            .is_some_and(|ty| matches!(ty, IrType::SInt(_))),
+        _ => false,
+    }
+}
+
+fn has_unresolved_arch_width(e: &Expr, widths: &CoverWidths<'_>) -> bool {
+    match e {
+        Expr::Port(port) if port.lane.is_none() && port.width.is_none() => widths
+            .ports
+            .get(&port.port_path.join("_"))
+            .is_some_and(|width| *width == u32::MAX),
+        Expr::Unary(_, inner) => has_unresolved_arch_width(inner, widths),
+        // Truncation, direction-agnostic resize (including `as uint<N>`),
+        // and a fixed slice establish a concrete low-bit result without
+        // needing the source's parameter-dependent packed width. Other casts
+        // (especially sign extension) still need that width.
+        Expr::WidthCast {
+            kind: WidthCastKind::Trunc | WidthCastKind::Resize,
+            ..
+        }
+        | Expr::BitSlice { .. } => false,
+        // `as sint<N>` is represented as Sext with equal source/target
+        // widths to preserve signedness without filling. A real `.sext<N>()`
+        // over an unresolved port has no source width and must recurse.
+        Expr::WidthCast {
+            kind: WidthCastKind::Sext,
+            width,
+            src_width: Some(src_width),
+            ..
+        } if width == src_width => false,
+        Expr::WidthCast { inner, .. } => has_unresolved_arch_width(inner, widths),
+        Expr::Binary(_, lhs, rhs) => {
+            has_unresolved_arch_width(lhs, widths) || has_unresolved_arch_width(rhs, widths)
+        }
+        Expr::Ternary(cond, then_expr, else_expr) => {
+            has_unresolved_arch_width(cond, widths)
+                || has_unresolved_arch_width(then_expr, widths)
+                || has_unresolved_arch_width(else_expr, widths)
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            has_unresolved_arch_width(target, widths)
+                || has_unresolved_arch_width(hi, widths)
+                || has_unresolved_arch_width(lo, widths)
+        }
+        Expr::CovHookParam {
+            index: Some(index), ..
+        } => has_unresolved_arch_width(index, widths),
+        Expr::Call(_, args) => args
+            .iter()
+            .any(|arg| has_unresolved_arch_width(arg, widths)),
+        _ => false,
+    }
+}
+
 fn reject_wide_cpp_operand(
     what: &str,
     operands: &[&Expr],
@@ -207,6 +316,241 @@ fn reject_wide_cpp_operand(
         )));
     }
     Ok(())
+}
+
+fn cover_coerce_cpp(rendered: String, src_width: Option<u32>, width: u32, signed: bool) -> String {
+    if let Some(words) = super::wide_scalar_words(width) {
+        if signed {
+            if let Some(src_width) = src_width {
+                return format!(
+                    "harc_rt::harc_wide_sext<{words}>({rendered}, {src_width}, {width})"
+                );
+            }
+        }
+        return match src_width {
+            Some(src_width) => {
+                format!("harc_rt::harc_wide_zext<{words}>({rendered}, {src_width})")
+            }
+            None => format!("harc_rt::harc_wide_zext<{words}>({rendered})"),
+        };
+    }
+    if width > 64 {
+        if signed {
+            if let Some(src_width) = src_width {
+                return format!(
+                    "harc_rt::harc_sext_u128((_harc_u128)({rendered}), {src_width}, {width})"
+                );
+            }
+        }
+        format!("((_harc_u128)({rendered}))")
+    } else {
+        format!("((uint64_t)({rendered}))")
+    }
+}
+
+fn cover_bool_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitError> {
+    let width = cover_expr_width(e, widths);
+    let rendered = cover_expr_cpp(e, widths)?;
+    Ok(match width {
+        Some(width) if width > 128 => {
+            let value =
+                cover_coerce_cpp(rendered, Some(width), width, cover_expr_signed(e, widths));
+            format!("(!harc_rt::harc_wide_is_zero({value}))")
+        }
+        Some(width) if width > 64 => format!("(((_harc_u128)({rendered})) != 0)"),
+        _ => format!("(({rendered}) != 0)"),
+    })
+}
+
+fn cover_common_width(lhs: Option<u32>, rhs: Option<u32>) -> Option<u32> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+        (width, None) | (None, width) => width,
+    }
+}
+
+fn cover_binary_cpp(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    widths: &CoverWidths<'_>,
+) -> Result<String, EmitError> {
+    if has_unresolved_arch_width(lhs, widths) || has_unresolved_arch_width(rhs, widths) {
+        return Err(EmitError(
+            "tbir: covergroup composed expression uses a parameter-dependent ARCH DUT port width; use an elaborated interface with a concrete packed width"
+                .to_string(),
+        ));
+    }
+    if matches!(op, BinOp::And | BinOp::Or) {
+        let lhs = cover_bool_cpp(lhs, widths)?;
+        let rhs = cover_bool_cpp(rhs, widths)?;
+        return Ok(format!("({lhs} {} {rhs})", cover_bin_op_cpp(op)));
+    }
+
+    let lhs_width = cover_expr_width(lhs, widths);
+    let rhs_width = cover_expr_width(rhs, widths);
+    let lhs_signed = cover_expr_signed(lhs, widths);
+    let rhs_signed = cover_expr_signed(rhs, widths);
+    let common_signed = lhs_signed && rhs_signed;
+    let lhs_cpp = cover_expr_cpp(lhs, widths)?;
+    let rhs_cpp = cover_expr_cpp(rhs, widths)?;
+
+    if matches!(op, BinOp::Shl | BinOp::Shr) {
+        // Clamp a full-width RHS to the operation's carrier width. Merely
+        // casting a wide count to uint64_t would turn (1 << 100) into zero
+        // and incorrectly perform an unshifted operation. v1 evaluates
+        // <=64-bit cover shifts in its uint64_t/int64_t host carrier (so a
+        // one-bit `en << 1` produces 2); wider values keep their HARC width.
+        let lhs_width = lhs_width.unwrap_or(64);
+        let shift_width = lhs_width.max(64);
+        let shift_count = match rhs_width {
+            Some(width) if width > 128 => {
+                format!("harc_rt::harc_wide_shift_count(({rhs_cpp}), {shift_width})")
+            }
+            Some(width) if width > 64 => {
+                format!("harc_rt::harc_u128_shift_count((_harc_u128)({rhs_cpp}), {shift_width})")
+            }
+            _ => format!("harc_rt::harc_u64_shift_count((uint64_t)({rhs_cpp}), {shift_width})"),
+        };
+        return Ok(match lhs_width {
+            width if width > 128 => {
+                let lhs = cover_coerce_cpp(lhs_cpp, Some(width), width, lhs_signed);
+                let shifted = format!("(({lhs}) {} ({shift_count}))", cover_bin_op_cpp(op));
+                if matches!(op, BinOp::Shr) && lhs_signed {
+                    format!("harc_rt::harc_wide_ashr(({lhs}), {shift_count}, {width})")
+                } else {
+                    format!("harc_rt::harc_wide_mask_bits({shifted}, {width})")
+                }
+            }
+            width if width > 64 => {
+                let helper = if matches!(op, BinOp::Shl) {
+                    "harc_shl_u128"
+                } else if lhs_signed {
+                    "harc_ashr_u128"
+                } else {
+                    "harc_shr_u128"
+                };
+                format!("harc_rt::{helper}((_harc_u128)({lhs_cpp}), {shift_count}, {width})")
+            }
+            _ => {
+                let helper = if matches!(op, BinOp::Shl) {
+                    "harc_shl_u128"
+                } else if lhs_signed {
+                    "harc_ashr_u128"
+                } else {
+                    "harc_shr_u128"
+                };
+                format!("((uint64_t)harc_rt::{helper}((_harc_u128)({lhs_cpp}), {shift_count}, 64))")
+            }
+        });
+    }
+
+    let common_width = cover_common_width(lhs_width, rhs_width);
+    let (lhs_cpp, rhs_cpp) = match common_width {
+        Some(width) if width > 64 => (
+            cover_coerce_cpp(lhs_cpp, lhs_width, width, common_signed),
+            cover_coerce_cpp(rhs_cpp, rhs_width, width, common_signed),
+        ),
+        _ => (lhs_cpp, rhs_cpp),
+    };
+    if common_signed {
+        if let Some(width) = common_width.filter(|width| *width > 64) {
+            let less = |lhs: &str, rhs: &str| {
+                if width > 128 {
+                    format!("harc_rt::harc_wide_slt({lhs}, {rhs}, {width})")
+                } else {
+                    format!("harc_rt::harc_slt_u128({lhs}, {rhs}, {width})")
+                }
+            };
+            return Ok(match op {
+                BinOp::Lt => less(&lhs_cpp, &rhs_cpp),
+                BinOp::Le => format!("(!{})", less(&rhs_cpp, &lhs_cpp)),
+                BinOp::Gt => less(&rhs_cpp, &lhs_cpp),
+                BinOp::Ge => format!("(!{})", less(&lhs_cpp, &rhs_cpp)),
+                BinOp::Div if width > 128 => {
+                    format!("harc_rt::harc_wide_sdiv({lhs_cpp}, {rhs_cpp}, {width})")
+                }
+                BinOp::Mod if width > 128 => {
+                    format!("harc_rt::harc_wide_smod({lhs_cpp}, {rhs_cpp}, {width})")
+                }
+                BinOp::Div => format!("harc_rt::harc_sdiv_u128({lhs_cpp}, {rhs_cpp}, {width})"),
+                BinOp::Mod => format!("harc_rt::harc_smod_u128({lhs_cpp}, {rhs_cpp}, {width})"),
+                _ => format!("({lhs_cpp} {} {rhs_cpp})", cover_bin_op_cpp(op)),
+            });
+        }
+    }
+    Ok(format!("({lhs_cpp} {} {rhs_cpp})", cover_bin_op_cpp(op)))
+}
+
+fn cover_unary_cpp(op: UnOp, inner: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitError> {
+    if !matches!(op, UnOp::Not) && has_unresolved_arch_width(inner, widths) {
+        return Err(EmitError(
+            "tbir: covergroup unary expression uses a parameter-dependent ARCH DUT port width; use an elaborated interface with a concrete packed width"
+                .to_string(),
+        ));
+    }
+    if matches!(op, UnOp::Not) {
+        return Ok(format!("!({})", cover_bool_cpp(inner, widths)?));
+    }
+    let width = cover_expr_width(inner, widths);
+    let rendered = cover_expr_cpp(inner, widths)?;
+    Ok(match (op, width) {
+        (UnOp::Neg, Some(width)) if width > 128 => {
+            let words = width.div_ceil(32);
+            let value = cover_coerce_cpp(
+                rendered,
+                Some(width),
+                width,
+                cover_expr_signed(inner, widths),
+            );
+            format!(
+                "harc_rt::harc_wide_mask_bits((harc_rt::HarcWide<{words}>{{}} - {value}), {width})"
+            )
+        }
+        (UnOp::Neg, Some(width)) if width > 64 => {
+            format!("harc_rt::harc_trunc_u128(-((_harc_u128)({rendered})), {width})")
+        }
+        (UnOp::BitNot, Some(width)) if width > 128 => {
+            let value = cover_coerce_cpp(
+                rendered,
+                Some(width),
+                width,
+                cover_expr_signed(inner, widths),
+            );
+            format!("harc_rt::harc_wide_mask_bits(~({value}), {width})")
+        }
+        (UnOp::BitNot, Some(width)) if width > 64 => {
+            format!("harc_rt::harc_trunc_u128(~((_harc_u128)({rendered})), {width})")
+        }
+        _ => format!("{}({rendered})", cover_un_op_cpp(op)),
+    })
+}
+
+fn cover_ternary_cpp(
+    cond: &Expr,
+    then_expr: &Expr,
+    else_expr: &Expr,
+    widths: &CoverWidths<'_>,
+) -> Result<String, EmitError> {
+    if has_unresolved_arch_width(then_expr, widths) || has_unresolved_arch_width(else_expr, widths)
+    {
+        return Err(EmitError(
+            "tbir: covergroup ternary branches use a parameter-dependent ARCH DUT port width; use an elaborated interface with a concrete packed width"
+                .to_string(),
+        ));
+    }
+    let cond = cover_bool_cpp(cond, widths)?;
+    let then_width = cover_expr_width(then_expr, widths);
+    let else_width = cover_expr_width(else_expr, widths);
+    let signed = cover_expr_signed(then_expr, widths) && cover_expr_signed(else_expr, widths);
+    let width = cover_common_width(then_width, else_width);
+    let mut then_cpp = cover_expr_cpp(then_expr, widths)?;
+    let mut else_cpp = cover_expr_cpp(else_expr, widths)?;
+    if let Some(width) = width.filter(|width| *width > 64) {
+        then_cpp = cover_coerce_cpp(then_cpp, then_width, width, signed);
+        else_cpp = cover_coerce_cpp(else_cpp, else_width, width, signed);
+    }
+    Ok(format!("({cond} ? {then_cpp} : {else_cpp})"))
 }
 
 fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitError> {
@@ -234,24 +578,9 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
                 }
             }
         }
-        Expr::Binary(op, a, b) => {
-            reject_wide_cpp_operand("binary expression", &[a, b], widths)?;
-            let a = cover_expr_cpp(a, widths)?;
-            let b = cover_expr_cpp(b, widths)?;
-            format!("({a} {} {b})", cover_bin_op_cpp(*op))
-        }
-        Expr::Unary(op, a) => {
-            reject_wide_cpp_operand("unary expression", &[a], widths)?;
-            let a = cover_expr_cpp(a, widths)?;
-            format!("{}({a})", cover_un_op_cpp(*op))
-        }
-        Expr::Ternary(c, t, f) => {
-            reject_wide_cpp_operand("ternary expression", &[c, t, f], widths)?;
-            let c = cover_expr_cpp(c, widths)?;
-            let t = cover_expr_cpp(t, widths)?;
-            let f = cover_expr_cpp(f, widths)?;
-            format!("({c} ? {t} : {f})")
-        }
+        Expr::Binary(op, a, b) => cover_binary_cpp(*op, a, b, widths)?,
+        Expr::Unary(op, a) => cover_unary_cpp(*op, a, widths)?,
+        Expr::Ternary(c, t, f) => cover_ternary_cpp(c, t, f, widths)?,
         Expr::BitSlice { target, hi, lo } => {
             let t = cover_expr_cpp(target, widths)?;
             let width = hi - lo + 1;
@@ -298,6 +627,15 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
         },
         Expr::CovHookArg { param } => param.clone(),
         Expr::Call(target, args) => {
+            if args
+                .iter()
+                .any(|arg| has_unresolved_arch_width(arg, widths))
+            {
+                return Err(EmitError(
+                    "tbir: covergroup call argument uses a parameter-dependent ARCH DUT port width; use an elaborated interface with a concrete packed width"
+                        .to_string(),
+                ));
+            }
             let name = match target {
                 // A pure helper's declared parameter types are retained and
                 // checked during lowering/verification.  They provide the
@@ -695,7 +1033,18 @@ pub(super) fn sampler_registration(
     ports: &HashMap<String, u32>,
 ) -> Result<(), EmitError> {
     writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
-    sample_body(out, schema, instance, &CoverWidths { lanes, ports }, 2)?;
+    let hook_types = HashMap::new();
+    sample_body(
+        out,
+        schema,
+        instance,
+        &CoverWidths {
+            lanes,
+            ports,
+            hook_types: &hook_types,
+        },
+        2,
+    )?;
     writeln!(out, "{INDENT}}});").ok();
     Ok(())
 }
@@ -902,7 +1251,26 @@ pub(super) fn hook_sampler_registration(
         arg_decls.join(", ")
     )
     .ok();
-    sample_body(out, schema, instance, &CoverWidths { lanes, ports }, 2)?;
+    let mut hook_types = HashMap::new();
+    for param in func.params.iter().take(n_params) {
+        hook_types.insert(param.name.clone(), param.ty.clone());
+        if let IrType::Record(record) = &param.ty {
+            for field in &prog.records[record.index()].fields {
+                hook_types.insert(format!("{}.{}", param.name, field.name), field.ty.clone());
+            }
+        }
+    }
+    sample_body(
+        out,
+        schema,
+        instance,
+        &CoverWidths {
+            lanes,
+            ports,
+            hook_types: &hook_types,
+        },
+        2,
+    )?;
     writeln!(out, "{INDENT}}});").ok();
     Ok(())
 }

@@ -355,13 +355,21 @@ fn cover_expr_type_hint(expr: &Expr) -> Option<IrType> {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Port(port) => Some(IrType::UInt(port.width)),
+        Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
         Expr::Unary(_, inner) => cover_expr_type_hint(inner),
-        Expr::Binary(_, _, _) => Some(IrType::UInt(Some(64))),
-        Expr::Ternary(_, then_expr, else_expr) => {
-            let then_ty = cover_expr_type_hint(then_expr)?;
-            let else_ty = cover_expr_type_hint(else_expr)?;
-            (then_ty == else_ty).then_some(then_ty)
-        }
+        Expr::Binary(op, lhs, rhs) => match op {
+            crate::ir::BinOp::Eq
+            | crate::ir::BinOp::Ne
+            | crate::ir::BinOp::Lt
+            | crate::ir::BinOp::Le
+            | crate::ir::BinOp::Gt
+            | crate::ir::BinOp::Ge
+            | crate::ir::BinOp::And
+            | crate::ir::BinOp::Or => Some(IrType::Bool),
+            crate::ir::BinOp::Shl | crate::ir::BinOp::Shr => cover_expr_type_hint(lhs),
+            _ => cover_common_type_hint(lhs, rhs),
+        },
+        Expr::Ternary(_, then_expr, else_expr) => cover_common_type_hint(then_expr, else_expr),
         Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
         Expr::BitSliceDyn { .. } => Some(IrType::UInt(None)),
         Expr::WidthCast { kind, width, .. } => Some(match kind {
@@ -373,6 +381,20 @@ fn cover_expr_type_hint(expr: &Expr) -> Option<IrType> {
         }
         _ => None,
     }
+}
+
+fn cover_common_type_hint(lhs: &Expr, rhs: &Expr) -> Option<IrType> {
+    let lhs = cover_expr_type_hint(lhs)?;
+    let rhs = cover_expr_type_hint(rhs)?;
+    Some(match (lhs, rhs) {
+        (IrType::SInt(Some(lhs)), IrType::SInt(Some(rhs))) => IrType::SInt(Some(lhs.max(rhs))),
+        (IrType::UInt(Some(lhs)), IrType::UInt(Some(rhs))) => IrType::UInt(Some(lhs.max(rhs))),
+        (IrType::SInt(Some(lhs)), IrType::UInt(Some(rhs)))
+        | (IrType::UInt(Some(lhs)), IrType::SInt(Some(rhs))) => IrType::UInt(Some(lhs.max(rhs))),
+        (IrType::SInt(_), IrType::SInt(_)) => IrType::SInt(None),
+        (IrType::Bool, IrType::Bool) => IrType::Bool,
+        _ => IrType::UInt(None),
+    })
 }
 
 fn cover_scalar_type(ty: &IrType) -> bool {

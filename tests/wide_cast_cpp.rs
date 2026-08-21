@@ -185,6 +185,32 @@ int main() {{
         uint64_t low8 = {mask};
         ok += (w200 == 0x3FF) && (low8 == 0xFF);
     }}
+    {{  // Signed wide comparison + arithmetic shift used by cover expressions
+        auto neg200 = harc_rt::harc_wide_sext<7>(0xF, 4, 200);
+        auto pos200 = harc_rt::harc_wide_sext<7>(0x1, 4, 200);
+        auto shifted = harc_rt::harc_wide_ashr(neg200, 1, 200);
+        auto shifted_by_wide_source = harc_rt::harc_wide_mask_bits(
+            (pos200 << harc_rt::harc_wide_shift_count(pos200, 200)), 200);
+        harc_rt::HarcWide<7> high_count;
+        harc_rt::harc_wide_set_bit(high_count, 100);
+        auto neg_fifteen = harc_rt::harc_wide_sext<7>(0xF1, 8, 200);
+        auto pos_two = harc_rt::harc_wide_sext<7>(0x2, 8, 200);
+        auto neg_seven = harc_rt::harc_wide_sext<7>(0xF9, 8, 200);
+        auto neg_one = harc_rt::harc_wide_sext<7>(0xFF, 8, 200);
+        const _harc_u128 neg65 = harc_rt::harc_sext_u128(0xF, 4, 65);
+        ok += harc_rt::harc_wide_slt(neg200, pos200, 200)
+            && harc_rt::harc_wide_get_bit(shifted, 199)
+            && (shifted_by_wide_source == 2)
+            && (harc_rt::harc_wide_shift_count(high_count, 200) == 200)
+            && (harc_rt::harc_u128_shift_count((_harc_u128{{1}} << 100), 65) == 65)
+            && (harc_rt::harc_wide_sdiv(neg_fifteen, pos_two, 200) == neg_seven)
+            && (harc_rt::harc_wide_smod(neg_fifteen, pos_two, 200) == neg_one)
+            && (harc_rt::harc_sdiv_u128(harc_rt::harc_sext_u128(0xF1, 8, 65), 2, 65)
+                == harc_rt::harc_sext_u128(0xF9, 8, 65))
+            && (harc_rt::harc_smod_u128(harc_rt::harc_sext_u128(0xF1, 8, 65), 2, 65)
+                == harc_rt::harc_sext_u128(0xFF, 8, 65))
+            && harc_rt::harc_slt_u128(neg65, 1, 65);
+    }}
     printf("%d\n", ok);
     return 0;
 }}
@@ -222,7 +248,7 @@ int main() {{
     assert!(run.status.success(), "probe exited non-zero");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout).trim(),
-        "2",
+        "3",
         "wide-cast shapes compiled but computed the wrong values",
     );
     let _ = std::fs::remove_dir_all(&dir);

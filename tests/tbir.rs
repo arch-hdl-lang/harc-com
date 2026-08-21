@@ -24499,37 +24499,134 @@ fn v1_working_coverpoint_value_forms_lower_and_verify() {
 }
 
 #[test]
-fn coverpoint_width_sensitive_compositions_stay_gated() {
+fn coverpoint_compositions_preserve_wide_and_wrapping_widths() {
     let base = fixture("cov_runtime_bound_test.harc");
     let source =
         |expr: &str| base.replace("cp_en : cover dut.en", &format!("cp_en : cover {expr}"));
 
-    // The cover-specific lowerer has no wrapping-width carrier yet. In
-    // particular, erasing 4'd15 to an untyped 15 would turn +% into +
-    // and sample 16 instead of 0. v1 rejects this spelling too.
+    let activity_cpp = emit_fixture_cpp("cov_expr_targets_test.harc");
+    assert!(
+        activity_cpp.contains("harc_u64_shift_count((uint64_t)(1), 64), 64)"),
+        "narrow cover shifts must preserve v1's 64-bit host-carrier semantics: {activity_cpp}"
+    );
+    let wide_cpp = emit_fixture_cpp("cov_wide_port_expr_test.harc");
+    assert!(
+        wide_cpp.contains("harc_wide_zext<7>") && wide_cpp.contains(", 64)"),
+        "nested narrow shifts must retain their effective carrier width when widened: {wide_cpp}"
+    );
+
+    // A sized literal by itself still has no wrapping width in v1's
+    // cover-expression path, so the migration classifier remains pinned.
     let wrapping = source("4'd15 +% 1");
     let msg = assert_not_implemented(&lower_src(&wrapping).unwrap_err(), lower::V1Status::Rejects);
     assert!(msg.contains("wrapping operator `+%`"), "{msg}");
     cpp_tb::emit(&merged_src(&wrapping)).expect_err("v1 cannot infer the sized wrap width");
 
+    // A cast supplies the missing width. TB-IR retains it as an explicit
+    // truncation around the ordinary arithmetic node, exactly as the
+    // general expression path does for wrapping operators.
     let cast_wrapping = source("(4'd1 as uint<8>) +% 1");
-    let msg = assert_unsupported(&lower_src(&cast_wrapping).unwrap_err());
-    assert!(msg.contains("at width 8"), "{msg}");
+    let prog = lower_src(&cast_wrapping).expect("known-width cover wrap lowers");
+    let ir::Expr::WidthCast {
+        kind: ir::WidthCastKind::Trunc,
+        width: 8,
+        inner,
+        ..
+    } = &prog.covgroups[0].points[1].target
+    else {
+        panic!("cover wrap lost its width: {prog}")
+    };
+    assert!(matches!(&**inner, ir::Expr::Binary(ir::BinOp::Add, _, _)));
+    let cpp = emit_cpp_src(&cast_wrapping);
+    assert!(cpp.contains("& 0xFFULL"), "{cpp}");
     cpp_tb::emit(&merged_src(&cast_wrapping))
         .expect("v1 uses the enclosing cast to establish an 8-bit wrap width");
 
-    // Direct wide values and a final narrow slice are supported. Feeding
-    // a wide value into C++'s untyped operators is not: HarcWide has two
-    // scalar conversions and these shapes would be ambiguous or truncate.
+    let wide_wrap = source("(dut.en as uint<200>) +% (1 as uint<200>)");
+    let msg = assert_not_implemented(
+        &lower_src(&wide_wrap).expect_err("v1 rejects wide wrapping arithmetic"),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("at width 200"), "{msg}");
+
+    // Wide operands are coerced to a common carrier before applying C++
+    // operators. The sample still observes only the low 64 bits, but every
+    // nested intermediate retains its declared width until that boundary.
     for expr in [
         "(dut.en as uint<200>) + 1",
         "-(dut.en as uint<200>)",
         "dut.en ? (dut.en as uint<200>) : 0",
         "(dut.en as uint<200>) + (dut.en as uint<128>)",
     ] {
-        let msg = assert_unsupported(&lower_src(&source(expr)).unwrap_err());
-        assert!(msg.contains("wide value"), "`{expr}`: {msg}");
+        let src = source(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{expr}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}` verifies: {e:?}"));
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains("HarcWide<7>") || cpp.contains("harc_wide_zext<7>"),
+            "`{expr}`: {cpp}"
+        );
     }
+    for (expr, helper) in [
+        ("(dut.en as sint<200>) < (1 as sint<200>)", "harc_wide_slt"),
+        ("dut.count_out[3:0].sext<200>() >> 1", "harc_wide_ashr"),
+        ("!(dut.en as uint<200>)", "harc_wide_is_zero"),
+        ("(dut.en as uint<200>) << 130", "harc_wide_mask_bits"),
+        ("(dut.en as sint<200>) / (1 as sint<200>)", "harc_wide_sdiv"),
+        ("(dut.en as sint<200>) % (1 as sint<200>)", "harc_wide_smod"),
+        ("(dut.en as sint<65>) / (1 as sint<65>)", "harc_sdiv_u128"),
+        ("(dut.en as sint<65>) % (1 as sint<65>)", "harc_smod_u128"),
+    ] {
+        let src = source(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{expr}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}` verifies: {e:?}"));
+        let cpp = emit_cpp_src(&src);
+        assert!(cpp.contains(helper), "`{expr}`: {cpp}");
+    }
+    let mixed_signed = source("(dut.en as sint<65>) < (1 as sint<128>)");
+    let cpp = emit_cpp_src(&mixed_signed);
+    assert!(cpp.contains("harc_slt_u128"), "{cpp}");
+    assert!(
+        cpp.contains("harc_sext_u128") && cpp.contains(", 65, 128)"),
+        "{cpp}"
+    );
+
+    // A wide RHS is still a scalar C++ shift count. Without the explicit
+    // conversion this emitted `HarcWide<N>` as the count and failed in the
+    // host compiler despite lowering and verification succeeding.
+    let wide_shift_count = source("(dut.en as uint<200>) << (dut.en as uint<200>)");
+    let cpp = emit_cpp_src(&wide_shift_count);
+    assert!(cpp.contains("harc_wide_shift_count"), "{cpp}");
+
+    // Mixed signed/unsigned operands use the unsigned common type in the
+    // verifier, hook metadata pass, and emitter alike.
+    let mixed_sign = source("(dut.en as sint<200>) < (1 as uint<300>)");
+    let prog = lower_src(&mixed_sign).expect("mixed-sign cover expression lowers");
+    verify::verify_program(&prog).expect("mixed-sign cover expression verifies");
+    let cpp = emit_cpp_src(&mixed_sign);
+    assert!(cpp.contains("harc_wide_zext<10>"), "{cpp}");
+    assert!(!cpp.contains("harc_wide_slt"), "{cpp}");
+
+    // Logical not produces a one-bit unsigned boolean even when its operand
+    // is signed. Treating it as signed sign-extended true (1) into all ones.
+    let nested_not = source("!(dut.en as sint<200>) + (dut.en as sint<200>)");
+    let cpp = emit_cpp_src(&nested_not);
+    assert!(cpp.contains("harc_wide_zext<7>(!"), "{cpp}");
+    assert!(!cpp.contains("harc_wide_sext<7>(!"), "{cpp}");
+
+    // A widthless `sint` helper still has the 64-bit host ABI and must be
+    // sign-extended when composed with a declared wide signed value.
+    let widthless_helper = format!(
+        "function neg_one() -> sint\n    return -1\nend function\n\n{}",
+        source("neg_one() + (dut.en as sint<200>)")
+    );
+    let prog = lower_src(&widthless_helper).expect("widthless signed helper composition lowers");
+    verify::verify_program(&prog).expect("widthless signed helper composition verifies");
+    let cpp = emit_cpp_src(&widthless_helper);
+    assert!(
+        cpp.contains("harc_wide_sext<7>(harc_helper_neg_one(), 64, 200)"),
+        "{cpp}"
+    );
 
     let wide_selector = source("dut.count_out[(dut.en as uint<200>):0]");
     let msg = assert_unsupported(&lower_src(&wide_selector).unwrap_err());
@@ -24551,9 +24648,48 @@ fn coverpoint_width_sensitive_compositions_stay_gated() {
     verify::verify_program(&prog).expect("widthless raw port verifies structurally");
     let mut opts = cpp_tb::EmitOpts::default();
     opts.dut_port_widths.insert("en".to_string(), 1024);
+    let cpp = tbir::emit(&prog, &merged, &opts)
+        .expect("known-wide raw DUT port composition uses the late width metadata");
+    assert!(cpp.contains("harc_wide_zext<32>"), "{cpp}");
+
+    opts.dut_port_widths.insert("en".to_string(), u32::MAX);
     let err = tbir::emit(&prog, &merged, &opts)
-        .expect_err("known-wide raw DUT port composition must fail before C++");
-    assert!(err.to_string().contains("wider than 64 bits"), "{err}");
+        .expect_err("an unresolved native ARCH width must not allocate an enormous carrier");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
+    // Direct low-64-bit sampling and an explicitly narrowed sample do not
+    // need the unresolved source width to choose an intermediate carrier.
+    for expr in ["dut.en", "dut.en.trunc<8>()"] {
+        let direct = format!(
+            r#"
+covergroup DirectCov @(posedge dut.clk)
+    cp : cover {expr}
+        bins
+            zero = {{0}}
+        end bins
+end covergroup DirectCov
+
+testbench DirectTb
+    dut : Top
+    cov : DirectCov
+end testbench DirectTb
+
+impl DirectTest for DirectTb
+    run
+        wait 1 cycle
+    end run
+end impl DirectTest
+"#
+        );
+        let merged = merged_src(&direct);
+        let prog = lower::lower_program(&merged).unwrap_or_else(|e| panic!("`{expr}`: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}`: {e:?}"));
+        tbir::emit(&prog, &merged, &opts)
+            .unwrap_or_else(|e| panic!("safe unresolved-width sample `{expr}` rejected: {e:?}"));
+    }
 
     // Aggregate source paths use the same underscore flattening as emitted
     // DUT member access (`dut.send.rsp_data` → `send_rsp_data`).
@@ -24564,9 +24700,9 @@ fn coverpoint_width_sensitive_compositions_stay_gated() {
     let mut opts = cpp_tb::EmitOpts::default();
     opts.dut_port_widths
         .insert("send_rsp_data".to_string(), 1024);
-    let err = tbir::emit(&prog, &merged, &opts)
-        .expect_err("known-wide aggregate DUT port composition must fail before C++");
-    assert!(err.to_string().contains("wider than 64 bits"), "{err}");
+    let cpp = tbir::emit(&prog, &merged, &opts)
+        .expect("known-wide aggregate DUT port composition uses the late width metadata");
+    assert!(cpp.contains("harc_wide_zext<32>"), "{cpp}");
 
     // Packed-vector metadata is keyed by the flattened physical member too.
     // A qualified source path must still use logical lane extraction rather
@@ -24581,6 +24717,30 @@ fn coverpoint_width_sensitive_compositions_stay_gated() {
     assert!(
         cpp.contains("harc_vec_lane_read<32>(dut->send_rsp_data"),
         "{cpp}"
+    );
+}
+
+#[test]
+fn coverpoint_hook_fields_carry_late_width_and_signedness_into_codegen() {
+    let src = fixture("covergroup_hook_param_test.harc")
+        .replace(
+            "    expect : uint<32> default 0",
+            "    expect : uint<32> default 0\n    wide_a : uint<200> default 0\n    wide_b : uint<300> default 0\n    signed_a : sint<200> default 0\n    signed_b : sint<300> default 0",
+        )
+        .replace(
+            "    cross cp_ticks, cp_expect",
+            "    cp_wide : cover cmd.wide_a + cmd.wide_b\n    cp_signed : cover cmd.signed_a < cmd.signed_b\n    cross cp_ticks, cp_expect",
+        );
+    let prog = lower_src(&src).expect("wide hook-field expressions lower");
+    verify::verify_program(&prog).expect("wide hook-field expressions verify");
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("harc_wide_zext<10>(cmd.wide_a, 200)"),
+        "differently sized hook fields must share a 300-bit carrier: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_wide_slt") && cpp.contains("cmd.signed_a"),
+        "signed hook fields must use signed comparison semantics: {cpp}"
     );
 }
 
@@ -24624,6 +24784,62 @@ end impl TypedCoverTest
     let prog = lower_src(&literal).expect("unsized helper argument lowers");
     verify::verify_program(&prog).expect("unsized helper argument verifies as a scalar wildcard");
 
+    // A parameter-dependent native ARCH port remains unsafe as a raw helper
+    // argument, but explicit low-bit narrowing establishes the helper's
+    // concrete uint<8> carrier without knowing the source's full width.
+    let mut unresolved_opts = cpp_tb::EmitOpts::default();
+    unresolved_opts
+        .dut_port_widths
+        .insert("en".to_string(), u32::MAX);
+    for arg in [
+        "dut.en.trunc<8>()",
+        "dut.en.resize<8>()",
+        "dut.en as uint<8>",
+        "dut.en[7:0]",
+    ] {
+        let narrowed = source(arg);
+        let merged = merged_src(&narrowed);
+        let prog = lower::lower_program(&merged)
+            .unwrap_or_else(|e| panic!("narrowed helper argument `{arg}` lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("narrowed helper argument `{arg}` verifies: {e:?}"));
+        tbir::emit(&prog, &merged, &unresolved_opts)
+            .unwrap_or_else(|e| panic!("safe narrowed helper argument `{arg}` rejected: {e:?}"));
+    }
+    let signed_helper = |arg: &str| {
+        source(arg).replace(
+            "function id8(x: uint<8>) -> uint<8>",
+            "function id8(x: sint<8>) -> sint<8>",
+        )
+    };
+    let signed_relabel = signed_helper("dut.en as sint<8>");
+    let merged = merged_src(&signed_relabel);
+    let prog = lower::lower_program(&merged).expect("signed relabel helper argument lowers");
+    verify::verify_program(&prog).expect("signed relabel helper argument verifies");
+    tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect("signed fixed-width relabel must bound an unresolved source");
+
+    let true_sext = signed_helper("dut.en.sext<8>()");
+    let merged = merged_src(&true_sext);
+    let prog = lower::lower_program(&merged).expect("true sext helper argument lowers");
+    verify::verify_program(&prog).expect("true sext helper argument verifies");
+    let err = tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect_err("true sext still needs the unresolved source width");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
+    let raw = source("dut.en");
+    let merged = merged_src(&raw);
+    let prog = lower::lower_program(&merged).expect("raw unresolved helper argument lowers");
+    let err = tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect_err("raw unresolved helper argument must stay rejected");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
     let valid = source("dut.en");
     let mut bad_arity = lower_src(&valid).expect("valid helper target lowers");
     let ir::Expr::Call(_, args) = &mut bad_arity.covgroups[0].points[0].target else {
@@ -24648,6 +24864,32 @@ end impl TypedCoverTest
     assert!(
         errs.iter()
             .any(|err| err.to_string().contains("return metadata mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_ternary = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(_, args) = &mut bad_ternary.covgroups[0].points[0].target else {
+        panic!("expected helper call")
+    };
+    args[0] = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(16)),
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+    );
+    let errs = verify::verify_program(&bad_ternary)
+        .expect_err("mixed-width ternary must retain its promoted uint<16> metadata");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("argument 1 type mismatch")),
         "unexpected verifier errors: {errs:?}"
     );
 }
