@@ -3412,6 +3412,118 @@ end impl QueueBoundaryTest
     }
 }
 
+/// The scalar-queue element width has a ceiling: the same 1024-bit limit
+/// (`MAX_WIDTH_METHOD_BITS`) the width-method / width-cast paths already
+/// enforce. `queue<uint<1024>>` sits exactly on the ceiling and must be
+/// ACCEPTED; `queue<uint<1025>>` and a far-over `queue<uint<2000>>` lower
+/// cleanly (nothing before verify caps the declared width) but the verifier
+/// must REJECT them with a ceiling diagnostic that names the offending width
+/// and the limit. Without the verify-side ceiling check these produce a valid
+/// but out-of-spec HarcWide carrier end-to-end; this test is that fix's guard.
+#[test]
+fn scalar_queue_element_width_ceiling_is_enforced() {
+    let program = |width: u32| {
+        format!(
+            r#"
+testbench QueueCeilingTb
+    dut    : Top
+    values : queue<uint<{width}>>
+end testbench QueueCeilingTb
+
+impl QueueCeilingTest for QueueCeilingTb
+    run
+        values.pop()
+    end run
+end impl QueueCeilingTest
+"#
+        )
+    };
+
+    // On the ceiling: accepted through lowering AND verify.
+    let at_limit = lower_src(&program(1024)).expect("queue<uint<1024>> lowers");
+    verify::verify_program(&at_limit).expect("queue<uint<1024>> is on the ceiling and verifies");
+
+    // Over the ceiling: lowers, but verify rejects with a width/limit message.
+    for over in [1025u32, 2000] {
+        let prog = lower_src(&program(over))
+            .unwrap_or_else(|e| panic!("queue<uint<{over}>> should still lower: {e:?}"));
+        let errs = verify::verify_program(&prog)
+            .expect_err(&format!("queue<uint<{over}>> must be rejected by verify"));
+        let joined = errs
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains(&over.to_string()) && joined.contains("1024"),
+            "queue<uint<{over}>> rejection must name the offending width and the 1024-bit \
+             ceiling: {joined}"
+        );
+    }
+
+    // Signed elements share the same ceiling.
+    let signed = lower_src(
+        r#"
+testbench QueueCeilingSignedTb
+    dut    : Top
+    values : queue<sint<2000>>
+end testbench QueueCeilingSignedTb
+
+impl QueueCeilingSignedTest for QueueCeilingSignedTb
+    run
+        values.pop()
+    end run
+end impl QueueCeilingSignedTest
+"#,
+    )
+    .expect("queue<sint<2000>> lowers");
+    assert!(
+        verify::verify_program(&signed).is_err(),
+        "queue<sint<2000>> must also be rejected by verify"
+    );
+}
+
+/// Boundary accepts: the last native carrier (`uint<64>`), the exact
+/// `_harc_u128` fit (`uint<128>`), and the documented ceiling (`uint<1024>`)
+/// all lower, verify, and map to the expected C++ storage carrier. The
+/// ceiling case anchors that `scalar_queue_element_width_ceiling_is_enforced`
+/// rejects only ABOVE 1024, not at it.
+#[test]
+fn scalar_queue_element_width_boundary_accepts() {
+    let src = r#"
+testbench QueueAcceptTb
+    dut   : Top
+    u64   : queue<uint<64>>
+    u128  : queue<uint<128>>
+    u1024 : queue<uint<1024>>
+end testbench QueueAcceptTb
+
+impl QueueAcceptTest for QueueAcceptTb
+    run
+        let got_u64   = u64.pop()
+        let got_u128  = u128.pop()
+        let got_u1024 = u1024.pop()
+    end run
+end impl QueueAcceptTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("boundary-accept queues lower");
+    verify::verify_program(&prog).expect("boundary-accept queues verify");
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("boundary-accept queues emit");
+    for declaration in [
+        "harc_rt::HarcQueue<uint64_t> u64;",
+        "harc_rt::HarcQueue<_harc_u128> u128;",
+        "harc_rt::HarcQueue<harc_rt::HarcWide<32>> u1024;",
+    ] {
+        assert!(
+            cpp.contains(declaration),
+            "expected boundary storage `{declaration}` in:\n{cpp}"
+        );
+    }
+}
+
 /// Direct scalar queues deliberately widen only the scalar element
 /// subset. Aggregate elements other than value records stay explicit
 /// refusals instead of being flattened into scalar storage — each on
