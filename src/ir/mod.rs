@@ -2093,6 +2093,8 @@ pub enum Stmt {
         instance: String,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
+        index: Option<Expr>,
         value: Expr,
     },
     /// `pending.push(x)` inside a target-responder body (or
@@ -2251,6 +2253,7 @@ pub enum Stmt {
     ComponentVecElementWrite {
         base: ComponentBase,
         field: String,
+        index_pos: usize,
         index: Expr,
         value: Expr,
     },
@@ -2645,6 +2648,8 @@ pub enum Expr {
         instance: String,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
+        index: Option<Box<Expr>>,
     },
     /// A value-producing read on a bound-to target transactor's
     /// persistent `queue<T>` state field: `pending.size()` /
@@ -2691,6 +2696,7 @@ pub enum Expr {
     ComponentVecElement {
         base: ComponentBase,
         field: String,
+        index_pos: usize,
         index: Box<Expr>,
     },
     /// A whole composite-component value, passed by value as a method

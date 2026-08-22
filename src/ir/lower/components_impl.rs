@@ -4255,7 +4255,7 @@ impl super::FuncBuilder<'_> {
     /// returned rather than re-derived from the base segments because
     /// those start with the literal `"self"` in the second shape, which
     /// names no binding.
-    fn component_path_head<'a>(
+    pub(crate) fn component_path_head<'a>(
         &self,
         path: &'a [String],
     ) -> Option<(

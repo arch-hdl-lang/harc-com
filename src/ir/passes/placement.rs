@@ -331,11 +331,25 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::TransactorStateWrite { value, .. }
-            | Stmt::TransactorStateRecordFieldWrite { value, .. }
             | Stmt::TransactorStateQueuePush { value, .. } => {
                 // Host state on a transactor-instance struct — no pin
                 // access of its own; the value may carry inline reads.
                 host_service_only = false;
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
+            Stmt::TransactorStateRecordFieldWrite {
+                mid_indices,
+                index,
+                value,
+                ..
+            } => {
+                host_service_only = false;
+                for (_, idx) in mid_indices {
+                    visit_expr(idx, &mut accesses, &mut transactor);
+                }
+                if let Some(idx) = index {
+                    visit_expr(idx, &mut accesses, &mut transactor);
+                }
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::TransactorStateQueuePop { .. } | Stmt::TbQueuePop { .. } => {
@@ -559,7 +573,6 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
-        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentField { .. }
@@ -569,6 +582,16 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
         | Expr::CovBin { .. }
         | Expr::CovHookParam { .. }
         | Expr::CovHookArg { .. } => {}
+        Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                visit_expr(idx, accesses, transactor);
+            }
+            if let Some(idx) = index {
+                visit_expr(idx, accesses, transactor);
+            }
+        }
         Expr::ComponentVecElement { index, .. } => visit_expr(index, accesses, transactor),
     }
 }

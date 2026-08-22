@@ -1889,11 +1889,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
     let mut record_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
     for (name, body) in &record_bodies {
-        let keeps = crate::codegen::cpp_tb::collect_record_keeps(
-            body,
-            &record_bodies,
-            &record_fields,
-        );
+        let keeps =
+            crate::codegen::cpp_tb::collect_record_keeps(body, &record_bodies, &record_fields);
         if !keeps.is_empty() {
             record_keeps.insert(name.clone(), keeps);
         }
@@ -7574,11 +7571,24 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
     fn in_expr(e: &ir::Expr) -> Option<String> {
         match e {
             ir::Expr::TransactorState { instance, .. }
-            | ir::Expr::TransactorStateRecordField { instance, .. }
             | ir::Expr::TransactorStateQueueQuery { instance, .. }
                 if !instance.is_empty() =>
             {
                 Some(instance.clone())
+            }
+            ir::Expr::TransactorStateRecordField {
+                instance,
+                mid_indices,
+                index,
+                ..
+            } => {
+                if !instance.is_empty() {
+                    return Some(instance.clone());
+                }
+                mid_indices
+                    .iter()
+                    .find_map(|(_, idx)| in_expr(idx))
+                    .or_else(|| index.as_deref().and_then(in_expr))
             }
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
@@ -7600,13 +7610,28 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::TransactorStateWrite {
                     instance, value, ..
                 }
-                | ir::Stmt::TransactorStateRecordFieldWrite {
-                    instance, value, ..
-                } => {
+                => {
                     if !instance.is_empty() {
                         Some(instance.clone())
                     } else {
                         in_expr(value)
+                    }
+                }
+                ir::Stmt::TransactorStateRecordFieldWrite {
+                    instance,
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    if !instance.is_empty() {
+                        Some(instance.clone())
+                    } else {
+                        mid_indices
+                            .iter()
+                            .find_map(|(_, idx)| in_expr(idx))
+                            .or_else(|| index.as_ref().and_then(in_expr))
+                            .or_else(|| in_expr(value))
                     }
                 }
                 ir::Stmt::TransactorStateQueuePush {
@@ -7691,13 +7716,30 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
     fn fill_expr(e: &mut ir::Expr, instance: &str) {
         match e {
             ir::Expr::TransactorState { instance: i, .. }
-            | ir::Expr::TransactorStateRecordField { instance: i, .. }
             | ir::Expr::TransactorStateQueueQuery { instance: i, .. } => {
                 debug_assert!(
                     i.is_empty() || i == instance,
                     "target-state instance already filled with a different name"
                 );
                 *i = instance.to_string();
+            }
+            ir::Expr::TransactorStateRecordField {
+                instance: i,
+                mid_indices,
+                index,
+                ..
+            } => {
+                debug_assert!(
+                    i.is_empty() || i == instance,
+                    "target-state instance already filled with a different name"
+                );
+                *i = instance.to_string();
+                for (_, idx) in mid_indices {
+                    fill_expr(idx, instance);
+                }
+                if let Some(idx) = index {
+                    fill_expr(idx, instance);
+                }
             }
             ir::Expr::Binary(_, a, b) => {
                 fill_expr(a, instance);
@@ -7796,9 +7838,6 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::TransactorStateWrite {
                     instance: i, value, ..
                 }
-                | ir::Stmt::TransactorStateRecordFieldWrite {
-                    instance: i, value, ..
-                }
                 | ir::Stmt::TransactorStateQueuePush {
                     instance: i, value, ..
                 } => {
@@ -7807,6 +7846,26 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                         "target-state-write instance already filled with a different name"
                     );
                     *i = instance.to_string();
+                    fill_expr(value, instance);
+                }
+                ir::Stmt::TransactorStateRecordFieldWrite {
+                    instance: i,
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    debug_assert!(
+                        i.is_empty() || i == instance,
+                        "target-state-write instance already filled with a different name"
+                    );
+                    *i = instance.to_string();
+                    for (_, idx) in mid_indices {
+                        fill_expr(idx, instance);
+                    }
+                    if let Some(idx) = index {
+                        fill_expr(idx, instance);
+                    }
                     fill_expr(value, instance);
                 }
                 ir::Stmt::TransactorStateQueuePop { instance: i, .. } => {
@@ -7999,6 +8058,16 @@ fn fill_visit_expr(
                 fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
             }
         }
+        Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+            if let Some(idx) = index {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+        }
         Expr::CovHookParam {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
@@ -8016,7 +8085,6 @@ fn fill_visit_expr(
         | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
-        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ComponentValue { .. }
@@ -8089,9 +8157,22 @@ fn fill_initiator_bus_prefix(
                     | Stmt::TbFieldWrite { value: e, .. }
                     | Stmt::TbQueuePush { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
-                    | Stmt::TransactorStateRecordFieldWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
+                    }
+                    Stmt::TransactorStateRecordFieldWrite {
+                        mid_indices,
+                        index,
+                        value,
+                        ..
+                    } => {
+                        for (_, idx) in mid_indices {
+                            visit_expr(idx, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                        if let Some(idx) = index {
+                            visit_expr(idx, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                        visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::ComponentVecElementWrite { index, value, .. } => {
                         visit_expr(index, placeholder, binding, remap, rewrite, &mut conflict);

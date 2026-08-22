@@ -872,6 +872,12 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Call(_, args) => args.iter().any(expr_has_probe),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
         ComponentVecElement { index, .. } => expr_has_probe(index),
+        TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
+                || index.as_deref().is_some_and(expr_has_probe)
+        }
         _ => false,
     }
 }
@@ -891,10 +897,19 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | TbFieldWrite { value: e, .. }
         | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
-        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
+        TransactorStateRecordFieldWrite {
+            mid_indices,
+            index,
+            value,
+            ..
+        } => {
+            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
+                || index.as_ref().is_some_and(expr_has_probe)
+                || expr_has_probe(value)
+        }
         ComponentVecElementWrite { index, value, .. } => {
             expr_has_probe(index) || expr_has_probe(value)
         }
@@ -1153,10 +1168,23 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | TbFieldWrite { value: e, .. }
         | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
-        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        TransactorStateRecordFieldWrite {
+            mid_indices,
+            index,
+            value,
+            ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_port_in_expr(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+            for_each_port_in_expr(value, f);
+        }
         ComponentVecElementWrite { index, value, .. } => {
             for_each_port_in_expr(index, f);
             for_each_port_in_expr(value, f);
@@ -1260,6 +1288,16 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
         ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
+        TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_port_in_expr(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+        }
         _ => {}
     }
 }

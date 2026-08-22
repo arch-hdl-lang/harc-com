@@ -2076,7 +2076,13 @@ impl FuncBuilder<'_> {
         // `responder.last.addr = ...` (test). Checked before the whole-
         // record `as_transactor_state` write lane, which only fires when
         // there is no further subfield.
-        if let Some(chain) = self.as_transactor_state_record_field(target)? {
+        if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+            chain.mid_indices = chain
+                .mid_indices
+                .into_iter()
+                .map(|(position, index)| (position, self.hoist_ports(index)))
+                .collect();
+            chain.leaf_index = chain.leaf_index.map(|index| self.hoist_ports(index));
             if let Some(len) = chain.leaf_vec_len {
                 let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                 // A matching-shape copy lowers, as it does in the other
@@ -2113,6 +2119,8 @@ impl FuncBuilder<'_> {
                     instance: chain.instance,
                     field: chain.field,
                     path: chain.path,
+                    mid_indices: chain.mid_indices,
+                    index: chain.leaf_index,
                     value: rhs,
                 });
                 return Ok(());
@@ -2126,6 +2134,8 @@ impl FuncBuilder<'_> {
                 instance: chain.instance,
                 field: chain.field,
                 path: chain.path,
+                mid_indices: chain.mid_indices,
+                index: chain.leaf_index,
                 value: e,
             });
             return Ok(());
@@ -2215,6 +2225,33 @@ impl FuncBuilder<'_> {
         // test-scope component local (`env.src.current.value = ...`). Record
         // leaves must be claimed before whole-sub-component assignment:
         // otherwise that resolver mistakes `current` for a `Sub` receiver.
+        if let Some(chain) = self.as_indexed_component_record_field(target)? {
+            let index = self.hoist_ports(chain.index);
+            let value = self.lower_expr_no_ports(value)?;
+            if let IrType::Record(record) = chain.leaf_ty {
+                if self.record_id_of_expr(&value) != Some(record) {
+                    return Err(self.record_assign_mismatch(
+                        &value,
+                        record,
+                        format!("indexed component record field `{}`", chain.field),
+                        "assign a value of the selected field's record type",
+                    ));
+                }
+            } else {
+                self.reject_record_into_scalar(
+                    &value,
+                    &format!("indexed component record field `{}`", chain.field),
+                )?;
+            }
+            self.push(Stmt::ComponentVecElementWrite {
+                base: chain.base,
+                field: chain.field,
+                index_pos: chain.index_pos,
+                index,
+                value,
+            });
+            return Ok(());
+        }
         if let Some(tgt) = self.as_component_field_target(target)? {
             let (base, field) = (tgt.base, tgt.field);
             // A whole-`Vec` component record field takes a whole-`Vec`
@@ -2729,6 +2766,40 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
+            if let Some(mut chain) = self.as_transactor_state_record_field(it)? {
+                if let Some(len) = chain.leaf_vec_len {
+                    chain.mid_indices = chain
+                        .mid_indices
+                        .into_iter()
+                        .map(|(position, index)| (position, self.hoist_ports(index)))
+                        .collect();
+                    let idx = self.lower_expr_no_ports(index)?;
+                    super::exprs::check_literal_vec_index_bounds(
+                        &format!("{}.{}", chain.field, chain.path.join(".")),
+                        &idx,
+                        len,
+                    )?;
+                    let value = self.lower_expr_no_ports(value)?;
+                    self.reject_record_into_scalar(
+                        &value,
+                        &format!(
+                            "element of responder record state `{}.{}`",
+                            chain.field,
+                            chain.path.join(".")
+                        ),
+                    )?;
+                    chain.leaf_index = Some(idx);
+                    self.push(Stmt::TransactorStateRecordFieldWrite {
+                        instance: chain.instance,
+                        field: chain.field,
+                        path: chain.path,
+                        mid_indices: chain.mid_indices,
+                        index: chain.leaf_index,
+                        value,
+                    });
+                    return Ok(());
+                }
+            }
             if let Some((base, field, vec)) = self.as_component_vec_field(it)? {
                 let index = self.lower_expr_no_ports(index)?;
                 super::exprs::check_literal_component_vec_index_bounds(
@@ -2742,6 +2813,7 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::ComponentVecElementWrite {
                     base,
                     field,
+                    index_pos: 0,
                     index,
                     value,
                 });
@@ -2787,9 +2859,11 @@ impl FuncBuilder<'_> {
                         &value,
                         &format!("element of component `Vec` field `{}`", rf.dotted),
                     )?;
+                    let index_pos = rf.field.split('.').count() - 1;
                     self.push(Stmt::ComponentVecElementWrite {
                         base: rf.base,
                         field: rf.field,
+                        index_pos,
                         index,
                         value,
                     });
