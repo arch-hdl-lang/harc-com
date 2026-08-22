@@ -614,6 +614,9 @@ impl super::FuncBuilder<'_> {
                 let rcall =
                     self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
                 let got = self.fresh_temp();
+                if let Some(ty) = self.transactor_call_ret_ty(&rcall) {
+                    self.set_local_type(got, ty);
+                }
                 self.push(Stmt::TransactorCall {
                     dest: Some(got),
                     call: rcall,
@@ -690,6 +693,9 @@ impl super::FuncBuilder<'_> {
         if reg.access.reads_from_bus() {
             let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)])?;
             let id = self.declare(dest_name);
+            if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                self.set_local_type(id, ty);
+            }
             self.push(Stmt::TransactorCall {
                 dest: Some(id),
                 call,

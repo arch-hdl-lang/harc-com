@@ -524,6 +524,12 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(hi, accesses, transactor);
             visit_expr(lo, accesses, transactor);
         }
+        Expr::PortSnapshotLane { port, index, .. } => {
+            if !accesses.contains(&port.access) {
+                accesses.push(port.access);
+            }
+            visit_expr(index, accesses, transactor);
+        }
         Expr::Ternary(c, t, e) => {
             visit_expr(c, accesses, transactor);
             visit_expr(t, accesses, transactor);

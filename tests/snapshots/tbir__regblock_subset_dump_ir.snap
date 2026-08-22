@@ -38,7 +38,7 @@ fn fn1 RegHelper_read [kind=TransactorBody(x0)]
     addr : uint<8>
   locals:
     %0 addr : uint<8>
-    %1 __ret : unknown
+    %1 __ret : uint<32>
   ret = %__ret
   entry = b0
 
@@ -50,8 +50,8 @@ fn fn1 RegHelper_read [kind=TransactorBody(x0)]
 fn fn2 run_RegblockSubsetTest [kind=Run, owner=tb0]
   locals:
     %0 regs : record(r0)
-    %1 src : unknown
-    %2 st : unknown
+    %1 src : uint<32>
+    %2 st : uint<32>
     %3 cmd : unknown
   entry = b0
 

@@ -581,6 +581,7 @@ fn type_str(t: &IrType) -> String {
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
         IrType::Seq(t) => format!("seq({})", type_str(t)),
         IrType::Component(c) => format!("component(c{})", c.0),
+        IrType::PortSnapshot => "port-snapshot".to_string(),
         IrType::Unknown => "unknown".to_string(),
     }
 }
@@ -1256,6 +1257,16 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             expr_str(func, target),
             expr_str(func, hi),
             expr_str(func, lo)
+        ),
+        Expr::PortSnapshotLane {
+            snapshot,
+            port,
+            index,
+        } => format!(
+            "{}:{}[{}]",
+            local_str(func, *snapshot),
+            port_str(Some(func), port),
+            expr_str(func, index)
         ),
         Expr::WidthCast {
             kind,

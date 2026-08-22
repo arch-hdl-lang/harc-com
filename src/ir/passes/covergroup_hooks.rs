@@ -563,6 +563,7 @@ fn type_name(prog: &TbProgram, ty: &IrType) -> String {
         IrType::RecordSeq(r) => format!("TSeq<{}>", prog.records[r.index()].name),
         IrType::Seq(elem) => format!("TSeq<{}>", type_name(prog, elem)),
         IrType::Component(c) => format!("component `{}`", prog.components[c.index()].name),
+        IrType::PortSnapshot => "port snapshot".to_string(),
         IrType::Unknown => "unknown".to_string(),
     }
 }

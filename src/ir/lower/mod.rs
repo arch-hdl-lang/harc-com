@@ -6783,13 +6783,20 @@ pub(crate) struct FuncBuilder<'a> {
     /// for the bound-instance path, and it was dropped in both places
     /// for the same reason.
     /// Sibling methods callable by bare name inside a transactor body:
-    /// `(param_names, param_tys, has_ret, active_only)`. The types are
+    /// `(param_names, param_tys, ret_ty, active_only)`. The types are
     /// carried for the same reason `TransactorMethodSchema::param_tys`
     /// is — a call site lowers under a snapshot, with no functions
     /// table, so without them it had nothing to type-check an argument
     /// against.
-    pub(crate) self_transactor_methods:
-        HashMap<String, (Vec<String>, Vec<crate::ir::IrType>, bool, bool)>,
+    pub(crate) self_transactor_methods: HashMap<
+        String,
+        (
+            Vec<String>,
+            Vec<crate::ir::IrType>,
+            Option<crate::ir::IrType>,
+            bool,
+        ),
+    >,
     /// True while lowering a transactor method declared under
     /// `when active`. Used to reject an always-on method that would
     /// backdoor-call an active-only sibling.
@@ -7821,6 +7828,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 fill_expr(hi, instance);
                 fill_expr(lo, instance);
             }
+            ir::Expr::PortSnapshotLane { index, .. } => fill_expr(index, instance),
             ir::Expr::Ternary(c, t, f) => {
                 fill_expr(c, instance);
                 fill_expr(t, instance);
@@ -8103,6 +8111,10 @@ fn fill_visit_expr(
             fill_visit_expr(target, placeholder, binding, remap, rewrite, conflict);
             fill_visit_expr(hi, placeholder, binding, remap, rewrite, conflict);
             fill_visit_expr(lo, placeholder, binding, remap, rewrite, conflict);
+        }
+        Expr::PortSnapshotLane { port, index, .. } => {
+            fill_visit_port(port, placeholder, binding, remap, rewrite, conflict);
+            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict);
         }
         Expr::Ternary(c, t, f) => {
             fill_visit_expr(c, placeholder, binding, remap, rewrite, conflict);

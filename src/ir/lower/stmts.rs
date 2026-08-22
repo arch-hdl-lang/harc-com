@@ -1215,6 +1215,9 @@ impl FuncBuilder<'_> {
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let Some(call) = self.lower_transactor_call(callee, args, true)? {
                 let id = self.declare(&l.name.name);
+                if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                    self.set_local_type(id, ty);
+                }
                 self.push(Stmt::TransactorCall {
                     dest: Some(id),
                     call,
@@ -3695,10 +3698,9 @@ impl FuncBuilder<'_> {
             return Ok(None);
         };
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("transactor method call `{tb_field}.{method}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(lazy_message_call_error(&format!(
+                "transactor method call `{tb_field}.{method}(...)`"
+            )));
         }
         // Detach the schema borrow from `self` (the arg loop below
         // lowers through `&mut self`).
@@ -3776,6 +3778,25 @@ impl FuncBuilder<'_> {
         )))
     }
 
+    pub(crate) fn transactor_call_ret_ty(&self, call: &Expr) -> Option<IrType> {
+        let Expr::Call(target, _) = call else {
+            return None;
+        };
+        match target {
+            crate::ir::CallTarget::TransactorMethod { bus_field, method } => {
+                let xid = self.ctx.transactor_fields.get(bus_field)?;
+                self.ctx.transactors[xid.index()]
+                    .method(method)?
+                    .ret_ty
+                    .clone()
+            }
+            crate::ir::CallTarget::TransactorSelfMethod { method, .. } => {
+                self.self_transactor_methods.get(method)?.2.clone()
+            }
+            _ => None,
+        }
+    }
+
     /// Lower a bare sibling method call inside a DUT-poking transactor
     /// method body: `idle()` / `readv()`. This is distinct from
     /// `xact.idle()` at testbench scope: no testbench field is involved,
@@ -3792,17 +3813,16 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some((param_names, param_tys, has_ret, callee_active_only)) =
+        let Some((param_names, param_tys, ret_ty, callee_active_only)) =
             self.self_transactor_methods.get(name).cloned()
         else {
             return Ok(None);
         };
         let n_params = param_names.len();
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("transactor sibling method call `{name}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(lazy_message_call_error(&format!(
+                "transactor sibling method call `{name}(...)`"
+            )));
         }
         if args.len() != n_params {
             return Err(LowerError::Invalid(format!(
@@ -3810,7 +3830,7 @@ impl FuncBuilder<'_> {
                 args.len()
             )));
         }
-        if need_ret && !has_ret {
+        if need_ret && ret_ty.is_none() {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{transactor}.{name}` returns no value"
             )));
@@ -4919,9 +4939,7 @@ impl FuncBuilder<'_> {
             Some(e) => self.else_fail_literal(e)?,
             None => "assumption failed".to_string(),
         };
-        let on_fail = self.lower_fmt(&msg)?;
-        self.push(Stmt::AssumeCheck { cond, on_fail });
-        Ok(())
+        self.lower_immediate_check(cond, &msg, true)
     }
 
     /// A destination for a queue `pop` whose value is discarded
@@ -4979,9 +4997,67 @@ impl FuncBuilder<'_> {
             Some(e) => self.else_fail_literal(e)?,
             None => "assertion failed".to_string(),
         };
-        let on_fail = self.lower_fmt(&msg)?;
-        self.push(Stmt::AssertCheck { cond, on_fail });
-        Ok(())
+        self.lower_immediate_check(cond, &msg, false)
+    }
+
+    /// Lower an immediate assert/assume while preserving lazy diagnostic
+    /// evaluation. Most messages remain a compact inline check. When a
+    /// capture needs a statement-level call edge (an impure helper,
+    /// testbench/transactor method, or suspending TLM call), split the CFG:
+    /// branch on the condition first, then hoist the capture calls *inside*
+    /// the failure arm before emitting an unconditional diagnostic check.
+    /// This matches v1's call-at-the-log-site behavior without running the
+    /// call on the successful path.
+    fn lower_immediate_check(
+        &mut self,
+        cond: Expr,
+        msg: &str,
+        assume: bool,
+    ) -> Result<(), LowerError> {
+        match self.lower_fmt(msg) {
+            Ok(on_fail) => {
+                if assume {
+                    self.push(Stmt::AssumeCheck { cond, on_fail });
+                } else {
+                    self.push(Stmt::AssertCheck { cond, on_fail });
+                }
+                Ok(())
+            }
+            Err(LowerError::Unsupported { .. }) => {
+                // A CFG Branch cannot carry raw DUT reads: unlike the inline
+                // AssertCheck emitter, control-flow terminators require every
+                // port value to be sampled into a local first. The read still
+                // occurs exactly once at the original assert/assume site.
+                let cond = self.hoist_ports(cond);
+                let success = self.new_block();
+                let failure = self.new_block();
+                self.terminate(Terminator::Branch(cond, success, failure));
+
+                self.start_block(failure);
+                let on_fail = self.lower_fmt_hoisting(msg)?;
+                let failed = Expr::Literal {
+                    value: 0,
+                    ty: IrType::Bool,
+                };
+                if assume {
+                    self.push(Stmt::AssumeCheck {
+                        cond: failed,
+                        on_fail,
+                    });
+                } else {
+                    self.push(Stmt::AssertCheck {
+                        cond: failed,
+                        on_fail,
+                    });
+                }
+                if !self.is_terminated() {
+                    self.terminate(Terminator::Jump(success));
+                }
+                self.start_block(success);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn lower_fail_msg(&mut self, msg: &crate::ast::Expr) -> Result<FmtArgs, LowerError> {
@@ -5239,25 +5315,28 @@ impl FuncBuilder<'_> {
     /// reusing v1's `process_interp` so format tokens (and therefore
     /// runtime log/trace text) are byte-identical across backends.
     ///
-    /// Used by conditionally-evaluated messages (an assert's `else
-    /// fail(...)`, a timeout header) — CFG-inlined calls stay rejected
-    /// there, because eagerly hoisting them ahead of the check would run
-    /// the inlined body even when the message is never emitted.
+    /// Used by conditionally-evaluated messages when the caller has no
+    /// failure-side CFG seam. CFG-inlined calls stay rejected here because
+    /// eagerly hoisting them ahead of the check would run the inlined body
+    /// even when the message is never emitted. Immediate checks and timeout
+    /// headers retry with `lower_fmt_hoisting` only after entering their
+    /// failure/timeout block.
     pub(crate) fn lower_fmt(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
         self.lower_fmt_impl(msg, false)
     }
 
-    /// `lower_fmt` for UNCONDITIONALLY-evaluated messages (`log(...)`, a
-    /// bare `fail(...)`): every interpolation is evaluated exactly once at
-    /// the statement, so a CFG-inlined call can be hoisted ahead of it
-    /// with identical observable order/count.
+    /// `lower_fmt` for messages that are unconditional in the current CFG
+    /// block (`log(...)`, a bare `fail(...)`, or a check's failure block):
+    /// every interpolation is evaluated exactly once at the statement, so
+    /// a CFG-inlined call can be hoisted ahead of it with identical
+    /// observable order/count.
     pub(crate) fn lower_fmt_hoisting(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
         self.lower_fmt_impl(msg, true)
     }
 
     fn lower_fmt_impl(&mut self, msg: &str, hoist: bool) -> Result<FmtArgs, LowerError> {
         let (fmt, caps) = crate::codegen::cpp_tb::process_interp(msg);
-        let mut args = Vec::with_capacity(caps.len());
+        let mut parsed_caps = Vec::with_capacity(caps.len());
         for c in caps {
             // `Invalid`, not `Unsupported`. A capture that does not parse is
             // a static error in the program, not a gap in this backend —
@@ -5267,43 +5346,84 @@ impl FuncBuilder<'_> {
             // input (harc#593). The parser now rejects such a capture up
             // front, so this should be unreachable; it stays as a
             // fail-closed backstop rather than a claim about v1.
-            let mut parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
+            let parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
                 LowerError::Invalid(format!(
                     "`${{{}}}` is not an expression; an interpolation holds one \
                      complete expression, optionally followed by `:` and a format spec",
                     c.expr
                 ))
             })?;
+            parsed_caps.push((parsed, c.wide_hex, c.expr));
+        }
+
+        // If any capture needs statement-level lowering, snapshot every
+        // completed capture before moving to the next one. Leaving an earlier
+        // scalar read embedded in FmtArgs while a later capture mutates state
+        // would reverse their observable evaluation order at emission time.
+        let ordered = hoist
+            && parsed_caps.iter().try_fold(false, |found, (e, _, _)| {
+                Ok::<_, LowerError>(found || self.fmt_expr_has_hoistable_call(e)?)
+            })?;
+        let mut args = Vec::with_capacity(parsed_caps.len());
+        for (mut parsed, wide_hex, capture) in parsed_caps {
             // A message interpolation lowers lazily (the captured expr is
             // re-evaluated at the log/failure site), so a CFG-inlined call
             // — an impure helper or a testbench method — cannot live inside
-            // it. For an UNCONDITIONALLY-evaluated message, v1 evaluates
-            // each `${...}` exactly once, in place, at the message point;
+            // it. For a message unconditional in its current block, v1
+            // evaluates each `${...}` exactly once, in place, at the message point;
             // mirror that by eagerly HOISTING every such call into a fresh
             // temp before the statement, then referencing the temp in the
             // format arg. Hoisting preserves the evaluation-count-of-one
             // and the left-to-right capture order, so the runtime trace is
             // identical to v1's inline form.
             //
-            // Bus/TLM calls suspend mid-message and are structurally
-            // unhoistable (their `wait`s would land between hoist and log);
-            // those keep the reject in `lower_expr`/`try_lower_bus_call`.
+            // Suspending bus/TLM and transactor calls take the same ordered
+            // statement-position path inside this already-selected block.
             if hoist {
                 self.hoist_fmt_calls(&mut parsed)?;
             }
 
-            // Ports are allowed in format args, but DUT/sync-touching
-            // helper calls are not — messages evaluate lazily at the
-            // log/failure site, and an inlined CFG cannot.
+            // Ports are allowed in format args. Any call that still reaches
+            // this message context lives under a lazy subexpression and must
+            // retain the existing rejection rather than becoming eager.
             let was = self.in_fmt_args;
             self.in_fmt_args = true;
             let lowered = self.lower_expr(&parsed);
             self.in_fmt_args = was;
-            let expr = lowered?;
-            args.push(FmtArg {
-                expr,
-                wide_hex: c.wide_hex,
-            });
+            let mut expr = lowered?;
+            if self.record_id_of_expr(&expr).is_some() {
+                return Err(not_implemented(
+                    &format!("aggregate interpolation capture `${{{capture}}}`"),
+                    "printf-style message captures must produce a scalar value; select a scalar field or lane",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            if self.bool_expr_has_invalid_record_operand(&expr) {
+                return Err(LowerError::Invalid(format!(
+                    "interpolation capture `${{{capture}}}` applies a scalar operator to an incompatible record value"
+                )));
+            }
+            let ty = self.scalar_assignment_type(&expr);
+            if ty.as_ref().is_some_and(|ty| !fmt_arg_type_is_scalar(ty)) {
+                return Err(not_implemented(
+                    &format!("aggregate interpolation capture `${{{capture}}}`"),
+                    "printf-style message captures must produce a scalar value; select a scalar field or lane",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            if ordered {
+                expr = self.hoist_fmt_ports(expr);
+                let name = self.fresh_msg_tmp_name();
+                let tmp = self.declare(&name);
+                self.set_local_type(
+                    tmp,
+                    ty.filter(|ty| *ty != IrType::Unknown)
+                        .unwrap_or(IrType::PortSnapshot),
+                );
+                self.push(Stmt::Assign(tmp, expr));
+                expr = Expr::Local(tmp);
+            }
+            args.push(FmtArg { expr, wide_hex });
         }
         Ok(FmtArgs { fmt, args })
     }
@@ -5321,6 +5441,9 @@ impl FuncBuilder<'_> {
     /// so they are left in place (only their sub-expressions are visited,
     /// in case an impure call is nested as an argument).
     fn hoist_fmt_calls(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        if self.fmt_outer_call_needs_hoist(e)? {
+            self.reject_lazy_fmt_call_arguments(e)?;
+        }
         // A suspending bus/TLM (or transactor) method call inside an
         // unconditionally-evaluated message: hoist it through the
         // statement-position lowering (which drives the protocol and lands
@@ -5351,27 +5474,203 @@ impl FuncBuilder<'_> {
             *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
             return Ok(());
         }
+        // An indexed lane's target is structural input to the existing
+        // `dut.<port>[i]` / record-Vec recognizers, so replacing that target
+        // with a synthetic temp would destroy the supported source shape.
+        // Traverse both sides target-first; the selector call is resolved to
+        // a temp, then the completed lane value is snapshotted by the capture
+        // materialization in `lower_fmt_impl`.
+        if let ExprKind::Index { target, index } = &mut *e.kind {
+            if self.fmt_expr_has_hoistable_call(index)? {
+                if let Some(port) = self.as_port_ref(target)? {
+                    // Sample the packed target before the selector emits any
+                    // statements. Lowering the final lane as a dynamic
+                    // one-bit slice of that snapshot preserves target-first
+                    // source order even when the selector writes the DUT.
+                    let sample_name = self.fresh_msg_tmp_name();
+                    let sample = self.declare(&sample_name);
+                    self.set_local_type(sample, IrType::PortSnapshot);
+                    self.push(Stmt::DutRead(sample, port.clone()));
+                    self.hoist_fmt_calls(index)?;
+                    let was = self.in_fmt_args;
+                    self.in_fmt_args = true;
+                    let lowered_index = self.lower_expr(index);
+                    self.in_fmt_args = was;
+                    let lowered_index = self.hoist_ports(lowered_index?);
+                    let index_name = self.fresh_msg_tmp_name();
+                    let index_tmp = self.declare(&index_name);
+                    let index_ty = self.expr_type(&lowered_index).unwrap_or(IrType::UInt(None));
+                    self.set_local_type(index_tmp, index_ty);
+                    self.push(Stmt::Assign(index_tmp, lowered_index));
+                    let lane = Expr::PortSnapshotLane {
+                        snapshot: sample,
+                        port,
+                        index: Box::new(Expr::Local(index_tmp)),
+                    };
+                    let span = e.span;
+                    let name = self.fresh_msg_tmp_name();
+                    let tmp = self.declare(&name);
+                    self.set_local_type(tmp, IrType::UInt(None));
+                    self.push(Stmt::Assign(tmp, lane));
+                    *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
+                    return Ok(());
+                }
+            }
+            self.hoist_fmt_calls(target)?;
+            self.hoist_fmt_calls(index)?;
+            return Ok(());
+        }
         // Not a hoisted call itself — descend into children in source
         // (left-to-right) order to catch impure calls nested inside pure
         // calls, operators, casts, etc.
-        for child in fmt_expr_children_mut(e) {
-            self.hoist_fmt_calls(child)?;
+        let mut children = fmt_expr_children_mut(e);
+        let needs_hoist = children
+            .iter()
+            .map(|child| self.fmt_expr_has_hoistable_call(child))
+            .collect::<Result<Vec<_>, _>>()?;
+        for i in 0..children.len() {
+            self.hoist_fmt_calls(children[i])?;
+            if needs_hoist[i + 1..].iter().any(|needed| *needed) {
+                self.materialize_fmt_ast_expr(children[i])?;
+            }
         }
+        Ok(())
+    }
+
+    /// Whether the always-evaluated portion of `e` contains a call that the
+    /// message lowering will turn into statements. Lazy RHS/ternary branches
+    /// deliberately stay excluded, matching `fmt_expr_children_mut`.
+    fn fmt_expr_has_hoistable_call(&self, e: &AstExpr) -> Result<bool, LowerError> {
+        if let ExprKind::Call { callee, .. } = &*e.kind {
+            let is_bus_tlm = matches!(&*callee.kind, ExprKind::Field { target, .. }
+                if matches!(&*target.kind, ExprKind::Ident(id)
+                    if self.ctx.bus_bindings.contains_key(&id.name)));
+            if self.fmt_call_needs_hoist(e)
+                || is_bus_tlm
+                || self.as_transactor_call(callee)?.is_some()
+                || self.fmt_self_transactor_method(callee).is_some()
+            {
+                return Ok(true);
+            }
+        }
+        for child in fmt_expr_children(e) {
+            if self.fmt_expr_has_hoistable_call(child)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn fmt_outer_call_needs_hoist(&self, e: &AstExpr) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return Ok(false);
+        };
+        let is_bus_tlm = matches!(&*callee.kind, ExprKind::Field { target, .. }
+            if matches!(&*target.kind, ExprKind::Ident(id)
+                if self.ctx.bus_bindings.contains_key(&id.name)));
+        Ok(self.fmt_call_needs_hoist(e)
+            || is_bus_tlm
+            || self.as_transactor_call(callee)?.is_some()
+            || self.fmt_self_transactor_method(callee).is_some())
+    }
+
+    fn reject_lazy_fmt_call_arguments(&self, e: &AstExpr) -> Result<(), LowerError> {
+        let ExprKind::Call { args, .. } = &*e.kind else {
+            return Ok(());
+        };
+        for arg in args {
+            let (CallArg::Expr(value) | CallArg::Named { value, .. }) = arg;
+            if self.fmt_expr_has_conditional_hoistable_call(value, false)? {
+                return Err(lazy_message_call_error(
+                    "statement-producing call in a conditionally evaluated call argument",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn fmt_expr_has_conditional_hoistable_call(
+        &self,
+        e: &AstExpr,
+        conditional: bool,
+    ) -> Result<bool, LowerError> {
+        if conditional && self.fmt_outer_call_needs_hoist(e)? {
+            return Ok(true);
+        }
+        match &*e.kind {
+            ExprKind::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    crate::ast::BinaryOp::AndAnd
+                        | crate::ast::BinaryOp::OrOr
+                        | crate::ast::BinaryOp::AndKw
+                        | crate::ast::BinaryOp::OrKw
+                ) =>
+            {
+                Ok(
+                    self.fmt_expr_has_conditional_hoistable_call(lhs, conditional)?
+                        || self.fmt_expr_has_conditional_hoistable_call(rhs, true)?,
+                )
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => Ok(
+                self.fmt_expr_has_conditional_hoistable_call(cond, conditional)?
+                    || self.fmt_expr_has_conditional_hoistable_call(then_branch, true)?
+                    || self.fmt_expr_has_conditional_hoistable_call(else_branch, true)?,
+            ),
+            _ => {
+                for child in fmt_expr_children(e) {
+                    if self.fmt_expr_has_conditional_hoistable_call(child, conditional)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Snapshot one always-evaluated child before a later sibling emits an
+    /// impure/suspending call. Lower in message context so a call hidden in a
+    /// lazy subexpression remains rejected instead of becoming eager.
+    fn materialize_fmt_ast_expr(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        let original = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
+        let span = original.span;
+        let was = self.in_fmt_args;
+        self.in_fmt_args = true;
+        let lowered = self.lower_expr(&original);
+        self.in_fmt_args = was;
+        let lowered = self.hoist_fmt_ports(lowered?);
+        // Width metadata may be absent for a raw DUT read; the ordinary
+        // scalar local ABI is the same conservative fallback used by the
+        // existing call-result hoist. A known aggregate retains its exact
+        // type so record equality/field selection remains well-typed.
+        let ty = self
+            .expr_type(&lowered)
+            .filter(|ty| *ty != IrType::Unknown)
+            .unwrap_or(IrType::PortSnapshot);
+        let name = self.fresh_msg_tmp_name();
+        let tmp = self.declare(&name);
+        self.set_local_type(tmp, ty);
+        self.push(Stmt::Assign(tmp, lowered));
+        *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
         Ok(())
     }
 
     /// If `e` is a SUSPENDING call — a bus/TLM `tlm_method` call
     /// (`mem.read(a)`) or a transactor method call (`xact.read(a)`) — hoist
-    /// it out of an unconditionally-evaluated message: lower it through its
-    /// statement-position path (which drives the protocol / method body,
+    /// it out of a message unconditional in its current CFG block: lower it
+    /// through its statement-position path (which drives the protocol / method body,
     /// including the wait/suspend) into a fresh `__msg_tmpN` local, and
     /// replace the call node with `Ident(__msg_tmpN)` so the later fmt-arg
     /// lowering just reads the resolved value. Returns `Ok(true)` when the
     /// node was such a call and was hoisted; `Ok(false)` otherwise (the
     /// caller falls through to the impure-helper hoist / child recursion).
     ///
-    /// Only reached from `hoist_fmt_calls`, which runs exclusively for
-    /// UNCONDITIONALLY-evaluated messages and only descends into
+    /// Only reached from `hoist_fmt_calls`, which runs exclusively where the
+    /// message is unconditional in its current block and only descends into
     /// always-evaluated operands (`fmt_expr_children_mut` skips
     /// short-circuit `&&`/`||` RHS and ternary branches), so hoisting here
     /// never changes the source-level evaluation count/order — a suspending
@@ -5390,7 +5689,8 @@ impl FuncBuilder<'_> {
             if matches!(&*target.kind, ExprKind::Ident(id)
                 if self.ctx.bus_bindings.contains_key(&id.name)));
         let is_transactor = self.as_transactor_call(callee)?.is_some();
-        if !is_bus_tlm && !is_transactor {
+        let self_method = self.fmt_self_transactor_method(callee);
+        if !is_bus_tlm && !is_transactor && self_method.is_none() {
             return Ok(false);
         }
         let span = e.span;
@@ -5405,7 +5705,7 @@ impl FuncBuilder<'_> {
                 lowered,
                 "bus tlm_method call failed to lower after classification"
             );
-        } else {
+        } else if is_transactor {
             // Transactor method call edge with a result destination — the
             // same lowering as `let name = xact.method(...)`.
             let ExprKind::Call { callee, args } = &*e.kind else {
@@ -5415,13 +5715,40 @@ impl FuncBuilder<'_> {
                 .lower_transactor_call(callee, args, true)?
                 .expect("transactor call failed to lower after classification");
             let id = self.declare(&name);
+            if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                self.set_local_type(id, ty);
+            }
             self.push(Stmt::TransactorCall {
+                dest: Some(id),
+                call,
+            });
+        } else {
+            let ExprKind::Call { args, .. } = &*e.kind else {
+                unreachable!("classified as a sibling transactor call above");
+            };
+            let method = self_method.expect("sibling method classification");
+            let call = self
+                .lower_transactor_self_call(&method, args, true)?
+                .expect("sibling transactor call failed to lower after classification");
+            let id = self.declare(&name);
+            if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                self.set_local_type(id, ty);
+            }
+            self.push(Stmt::TransactorSelfCall {
                 dest: Some(id),
                 call,
             });
         }
         *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
         Ok(true)
+    }
+
+    fn fmt_self_transactor_method(&self, callee: &AstExpr) -> Option<String> {
+        let ExprKind::Ident(method) = &*callee.kind else {
+            return None;
+        };
+        (self.in_transactor_method && self.self_transactor_methods.contains_key(&method.name))
+            .then(|| method.name.clone())
     }
 
     /// A `__msg_tmpN` source name guaranteed unique against every local
@@ -5472,7 +5799,8 @@ fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
         ExprKind::Paren(inner)
         | ExprKind::Unary { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. } => vec![inner],
-        ExprKind::Field { target, .. } | ExprKind::Index { target, .. } => vec![target],
+        ExprKind::Field { target, .. } => vec![target],
+        ExprKind::Index { target, index } => vec![target, index],
         // Short-circuiting logical operators evaluate the RHS only
         // conditionally (v1 emits `&&`/`||`, which C++ short-circuits), so
         // a call in the RHS must NOT be hoisted unconditionally — descend
@@ -5498,8 +5826,8 @@ fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
         // A pure call: descend into its arguments so an impure call nested
         // as an argument still hoists. (An impure call is caught by
         // `fmt_call_needs_hoist` before we ever recurse into it.)
-        ExprKind::Call { callee, args } => {
-            let mut v = vec![callee];
+        ExprKind::Call { args, .. } => {
+            let mut v = Vec::with_capacity(args.len());
             for a in args {
                 let (CallArg::Expr(inner) | CallArg::Named { value: inner, .. }) = a;
                 v.push(inner);
@@ -5510,6 +5838,50 @@ fn fmt_expr_children_mut(e: &mut AstExpr) -> Vec<&mut AstExpr> {
         // message position.
         _ => Vec::new(),
     }
+}
+
+/// Immutable twin of `fmt_expr_children_mut`, used to preflight whether a
+/// later always-evaluated child will emit statements before we start mutating
+/// the AST/CFG.
+fn fmt_expr_children(e: &AstExpr) -> Vec<&AstExpr> {
+    match &*e.kind {
+        ExprKind::Paren(inner)
+        | ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. } => vec![inner],
+        ExprKind::Field { target, .. } => vec![target],
+        ExprKind::Index { target, index } => vec![target, index],
+        ExprKind::Binary { op, lhs, rhs } => {
+            use crate::ast::BinaryOp as B;
+            if matches!(op, B::AndAnd | B::OrOr | B::AndKw | B::OrKw) {
+                vec![lhs]
+            } else {
+                vec![lhs, rhs]
+            }
+        }
+        ExprKind::BitSlice { target, hi, lo } => vec![target, hi, lo],
+        ExprKind::Ternary { cond, .. } => vec![cond],
+        ExprKind::Call { args, .. } => args
+            .iter()
+            .map(|a| match a {
+                CallArg::Expr(inner) | CallArg::Named { value: inner, .. } => inner,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn fmt_arg_type_is_scalar(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown | IrType::PortSnapshot
+    )
+}
+
+fn lazy_message_call_error(what: &str) -> LowerError {
+    unsupported(
+        &format!("{what} inside a message"),
+        "the call is conditionally evaluated; bind the lazy expression to a `let` before formatting it",
+    )
 }
 
 /// The `callee` of a `let ... = <callee>(...)` initializer when the RHS is

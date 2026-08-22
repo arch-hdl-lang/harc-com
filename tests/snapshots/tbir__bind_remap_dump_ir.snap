@@ -56,7 +56,7 @@ fn fn1 AxilHelper_read [kind=TransactorBody(x0)]
     addr : uint<8>
   locals:
     %0 addr : uint<8>
-    %1 __ret : unknown
+    %1 __ret : uint<32>
     %2 __t0 : unknown
     %3 __t1 : unknown
     %4 r : unknown
@@ -98,7 +98,7 @@ fn fn1 AxilHelper_read [kind=TransactorBody(x0)]
 
 fn fn2 run_BindRemapTest [kind=Run, owner=tb0]
   locals:
-    %0 v : unknown
+    %0 v : uint<32>
   entry = b0
 
   b0:

@@ -2284,7 +2284,13 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn hoist_ports(&mut self, e: Expr) -> Expr {
-        self.hoist_ports_with_hint(e, None)
+        self.hoist_ports_with_hint(e, None, false)
+    }
+
+    /// Ordered interpolation materialization needs an exact host carrier for
+    /// a port whose source width is only known later from `--sv` metadata.
+    pub(crate) fn hoist_fmt_ports(&mut self, e: Expr) -> Expr {
+        self.hoist_ports_with_hint(e, None, true)
     }
 
     /// Lower an expression with a width hint so a bare DUT-port read in
@@ -2297,15 +2303,22 @@ impl FuncBuilder<'_> {
         hint: Option<IrType>,
     ) -> Result<Expr, LowerError> {
         let ir = self.lower_expr(e)?;
-        Ok(self.hoist_ports_with_hint(ir, hint))
+        Ok(self.hoist_ports_with_hint(ir, hint, false))
     }
 
-    fn hoist_ports_with_hint(&mut self, e: Expr, hint: Option<IrType>) -> Expr {
+    fn hoist_ports_with_hint(
+        &mut self,
+        e: Expr,
+        hint: Option<IrType>,
+        exact_untyped_ports: bool,
+    ) -> Expr {
         match e {
             Expr::Port(p) => {
                 let t = self.fresh_temp();
                 if let Some(ty) = port_temp_type(&p, hint.as_ref()) {
                     self.set_local_type(t, ty);
+                } else if exact_untyped_ports {
+                    self.set_local_type(t, IrType::PortSnapshot);
                 }
                 self.push(Stmt::DutRead(t, p));
                 Expr::Local(t)
@@ -2322,22 +2335,22 @@ impl FuncBuilder<'_> {
                 } else {
                     None
                 };
-                let a = self.hoist_ports_with_hint(*a, a_hint);
-                let b = self.hoist_ports_with_hint(*b, b_hint);
+                let a = self.hoist_ports_with_hint(*a, a_hint, exact_untyped_ports);
+                let b = self.hoist_ports_with_hint(*b, b_hint, exact_untyped_ports);
                 Expr::Binary(op, Box::new(a), Box::new(b))
             }
             Expr::Unary(op, a) => {
-                let a = self.hoist_ports_with_hint(*a, None);
+                let a = self.hoist_ports_with_hint(*a, None, exact_untyped_ports);
                 Expr::Unary(op, Box::new(a))
             }
             Expr::Ternary(c, t, e) => {
-                let c = self.hoist_ports_with_hint(*c, None);
-                let t = self.hoist_ports_with_hint(*t, None);
-                let e = self.hoist_ports_with_hint(*e, None);
+                let c = self.hoist_ports_with_hint(*c, None, exact_untyped_ports);
+                let t = self.hoist_ports_with_hint(*t, None, exact_untyped_ports);
+                let e = self.hoist_ports_with_hint(*e, None, exact_untyped_ports);
                 Expr::Ternary(Box::new(c), Box::new(t), Box::new(e))
             }
             Expr::BitSlice { target, hi, lo } => {
-                let target = self.hoist_ports_with_hint(*target, None);
+                let target = self.hoist_ports_with_hint(*target, None, exact_untyped_ports);
                 Expr::BitSlice {
                     target: Box::new(target),
                     hi,
@@ -2345,22 +2358,31 @@ impl FuncBuilder<'_> {
                 }
             }
             Expr::BitSliceDyn { target, hi, lo } => {
-                let target = self.hoist_ports_with_hint(*target, None);
-                let hi = self.hoist_ports_with_hint(*hi, None);
-                let lo = self.hoist_ports_with_hint(*lo, None);
+                let target = self.hoist_ports_with_hint(*target, None, exact_untyped_ports);
+                let hi = self.hoist_ports_with_hint(*hi, None, exact_untyped_ports);
+                let lo = self.hoist_ports_with_hint(*lo, None, exact_untyped_ports);
                 Expr::BitSliceDyn {
                     target: Box::new(target),
                     hi: Box::new(hi),
                     lo: Box::new(lo),
                 }
             }
+            Expr::PortSnapshotLane {
+                snapshot,
+                port,
+                index,
+            } => Expr::PortSnapshotLane {
+                snapshot,
+                port,
+                index: Box::new(self.hoist_ports_with_hint(*index, None, exact_untyped_ports)),
+            },
             Expr::WidthCast {
                 kind,
                 width,
                 src_width,
                 inner,
             } => {
-                let inner = self.hoist_ports_with_hint(*inner, None);
+                let inner = self.hoist_ports_with_hint(*inner, None, exact_untyped_ports);
                 Expr::WidthCast {
                     kind,
                     width,
@@ -2371,7 +2393,7 @@ impl FuncBuilder<'_> {
             Expr::Call(t, args) => {
                 let args = args
                     .into_iter()
-                    .map(|a| self.hoist_ports_with_hint(a, None))
+                    .map(|a| self.hoist_ports_with_hint(a, None, exact_untyped_ports))
                     .collect();
                 // A value-bearing transactor-method call in expression
                 // position: pull the call edge into its own
@@ -2385,7 +2407,7 @@ impl FuncBuilder<'_> {
                 self.hoist_transactor_edge(Expr::Call(t, args))
             }
             Expr::ComponentIdle { base, kind, n } => {
-                let n = self.hoist_ports_with_hint(*n, None);
+                let n = self.hoist_ports_with_hint(*n, None, exact_untyped_ports);
                 Expr::ComponentIdle {
                     base,
                     kind,
@@ -2399,7 +2421,7 @@ impl FuncBuilder<'_> {
                 kind,
                 n,
             } => {
-                let n = self.hoist_ports_with_hint(*n, None);
+                let n = self.hoist_ports_with_hint(*n, None, exact_untyped_ports);
                 Expr::TransactorIdle {
                     field,
                     transactor,
@@ -2409,14 +2431,14 @@ impl FuncBuilder<'_> {
                 }
             }
             Expr::SeqIndex { seq, index } => {
-                let index = self.hoist_ports_with_hint(*index, None);
+                let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
                 Expr::SeqIndex {
                     seq,
                     index: Box::new(index),
                 }
             }
             Expr::ComponentVecElement { base, field, index_pos, index } => {
-                let index = self.hoist_ports_with_hint(*index, None);
+                let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
                 Expr::ComponentVecElement { base, field, index_pos, index: Box::new(index) }
             }
             Expr::TransactorStateRecordField {
@@ -2428,9 +2450,9 @@ impl FuncBuilder<'_> {
             } if index.is_some() || !mid_indices.is_empty() => {
                 let mid_indices = mid_indices
                     .into_iter()
-                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None)))
+                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None, exact_untyped_ports)))
                     .collect();
-                let index = index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None)));
+                let index = index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None, exact_untyped_ports)));
                 Expr::TransactorStateRecordField {
                     instance,
                     field,
@@ -2452,10 +2474,10 @@ impl FuncBuilder<'_> {
             } if index.is_some() || !mid_indices.is_empty() => {
                 let mid_indices = mid_indices
                     .into_iter()
-                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None)))
+                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None, exact_untyped_ports)))
                     .collect();
                 let index =
-                    index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None)));
+                    index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None, exact_untyped_ports)));
                 Expr::RecordField {
                     local,
                     field,
@@ -2465,7 +2487,7 @@ impl FuncBuilder<'_> {
                 }
             }
             Expr::CovHookParam { param, field, index: Some(index) } => {
-                let index = self.hoist_ports_with_hint(*index, None);
+                let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
                 Expr::CovHookParam { param, field, index: Some(Box::new(index)) }
             }
             other @ (Expr::Literal { .. }
@@ -2544,6 +2566,37 @@ impl FuncBuilder<'_> {
                 | crate::ir::CallTarget::ExternFn { ret, .. },
                 _,
             ) => Some(ret.clone()),
+            Expr::TbField(field) => self.ctx.tb_scalar_fields.get(field).cloned(),
+            Expr::ComponentField { base, field } => self.component_field_value_type(base, field),
+            Expr::TransactorState { instance, field } => {
+                let kind = if instance.is_empty() {
+                    self.target_state_fields.get(field)
+                } else {
+                    self.ctx.target_state.get(instance)?.get(field)
+                };
+                match kind? {
+                    crate::ir::StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                    crate::ir::StateFieldKind::Record { record } => Some(IrType::Record(*record)),
+                    crate::ir::StateFieldKind::Queue { .. } => None,
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                let kind = if instance.is_empty() {
+                    self.target_state_fields.get(field)
+                } else {
+                    self.ctx.target_state.get(instance)?.get(field)
+                };
+                let crate::ir::StateFieldKind::Record { record } = kind? else {
+                    return None;
+                };
+                self.record_path_value_type(*record, path, mid_indices, index.is_some())
+            }
             Expr::ScoreboardQuery { sb, query, .. } => match query {
                 crate::ir::ScoreboardQuery::Scalar { scalar } => self
                     .ctx
@@ -2624,6 +2677,67 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// Exact scalar/record value type of a component field expression.
+    /// Whole fixed vectors deliberately return `None`: they are arrays, not
+    /// scalar format/temporary values. Dotted record paths retain the leaf's
+    /// declared width and record identity.
+    pub(crate) fn component_field_value_type(
+        &self,
+        base: &crate::ir::ComponentBase,
+        field: &str,
+    ) -> Option<IrType> {
+        let cid = self.component_base_id(base)?;
+        let mut segs = field.split('.');
+        let root = self.ctx.components.get(cid.index())?.field(segs.next()?)?;
+        let mut record = match &root.kind {
+            crate::ir::ComponentFieldKind::Scalar { ty, .. } => {
+                return segs.next().is_none().then(|| ty.clone())
+            }
+            crate::ir::ComponentFieldKind::Record { record } => *record,
+            _ => return None,
+        };
+        let rest: Vec<&str> = segs.collect();
+        if rest.is_empty() {
+            return Some(IrType::Record(record));
+        }
+        for (i, seg) in rest.iter().enumerate() {
+            let member = self.ctx.records.get(record.index())?.field(seg)?;
+            if i + 1 == rest.len() {
+                return member.vec_len.is_none().then(|| member.ty.clone());
+            }
+            match member.ty {
+                IrType::Record(next) if member.vec_len.is_none() => record = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn record_path_value_type(
+        &self,
+        mut record: RecordId,
+        path: &[String],
+        mid_indices: &[(usize, Expr)],
+        leaf_indexed: bool,
+    ) -> Option<IrType> {
+        for (i, seg) in path.iter().enumerate() {
+            let member = self.ctx.records.get(record.index())?.field(seg)?;
+            let indexed = mid_indices.iter().any(|(pos, _)| *pos == i)
+                || (i + 1 == path.len() && leaf_indexed);
+            if i + 1 == path.len() {
+                return match (member.vec_len, indexed) {
+                    (None, false) | (Some(_), true) => Some(member.ty.clone()),
+                    _ => None,
+                };
+            }
+            match member.ty {
+                IrType::Record(next) if member.vec_len.is_none() == !indexed => record = next,
+                _ => return None,
+            }
+        }
+        Some(IrType::Record(record))
+    }
+
     /// Conservative scalar result type for assignment compatibility. Unlike
     /// ordinary expression typing, an `&` literal mask provides a real upper
     /// bound, and shifts retain that bounded LHS width. This admits
@@ -2686,6 +2800,9 @@ impl FuncBuilder<'_> {
         match &e {
             Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _) => {
                 let temp = self.fresh_temp();
+                if let Some(ty) = self.transactor_call_ret_ty(&e) {
+                    self.set_local_type(temp, ty);
+                }
                 self.push(Stmt::TransactorCall {
                     dest: Some(temp),
                     call: e,
@@ -2694,6 +2811,9 @@ impl FuncBuilder<'_> {
             }
             Expr::Call(crate::ir::CallTarget::TransactorSelfMethod { .. }, _) => {
                 let temp = self.fresh_temp();
+                if let Some(ty) = self.transactor_call_ret_ty(&e) {
+                    self.set_local_type(temp, ty);
+                }
                 self.push(Stmt::TransactorSelfCall {
                     dest: Some(temp),
                     call: e,

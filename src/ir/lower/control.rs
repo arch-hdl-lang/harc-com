@@ -671,11 +671,12 @@ impl FuncBuilder<'_> {
         let budget = self.fresh_temp();
         self.push(Stmt::Assign(budget, cycles_ir));
 
-        // Header line — the user's `fail("…")` message, or v1's
-        // default "<label> timed out after N cycles".
-        let header = match &to.message {
+        // Keep the user's header source until the timeout block exists.
+        // A statement-level interpolation call must run only after the wait
+        // has actually timed out, never while registering the wait.
+        let header_msg = match &to.message {
             Some(m) => match &*m.kind {
-                ExprKind::String(s) => self.lower_fmt(s)?,
+                ExprKind::String(s) => Some(s.clone()),
                 _ => {
                     // v1 DISCARDS the message and substitutes its own
                     // generic one: `sim_log_line("FAIL", "wait until
@@ -691,20 +692,7 @@ impl FuncBuilder<'_> {
                     ));
                 }
             },
-            None => {
-                let label = match ir_mode {
-                    WaitMode::Single => "wait until",
-                    WaitMode::AllOf => "wait until all of",
-                    WaitMode::AnyOf => "wait until any of",
-                };
-                FmtArgs {
-                    fmt: format!("{label} timed out after %lld cycles"),
-                    args: vec![FmtArg {
-                        expr: Expr::Local(budget),
-                        wide_hex: None,
-                    }],
-                }
-            }
+            None => None,
         };
 
         let on_fire = self.new_block();
@@ -721,6 +709,23 @@ impl FuncBuilder<'_> {
         // success path (a timed-out wait fails the test via the error
         // count but does not abort the run — v1 semantics).
         self.start_block(on_timeout);
+        let header = match header_msg {
+            Some(msg) => self.lower_fmt_hoisting(&msg)?,
+            None => {
+                let label = match ir_mode {
+                    WaitMode::Single => "wait until",
+                    WaitMode::AllOf => "wait until all of",
+                    WaitMode::AnyOf => "wait until any of",
+                };
+                FmtArgs {
+                    fmt: format!("{label} timed out after %lld cycles"),
+                    args: vec![FmtArg {
+                        expr: Expr::Local(budget),
+                        wide_hex: None,
+                    }],
+                }
+            }
+        };
         self.push(Stmt::FailDiag {
             guard: None,
             args: header,
