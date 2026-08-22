@@ -1,0 +1,72 @@
+// Queue empty-pop guard — end-to-end exercise of the FATAL report.
+//
+// `harc_rt::HarcQueue<T>::pop()` used to call `std::deque::front()`
+// with no emptiness check (#644), so popping an empty scoreboard queue
+// was undefined behaviour: the testbench read garbage, or crashed
+// somewhere unrelated to the mistake that caused it. The scoreboard /
+// component-queue seam is the exposed one — the direct-actor thread pop
+// waits on `!queue.empty()` first, but `sb.expected.pop()` calls the
+// helper straight through.
+//
+// The failure is reported through the sim's own FATAL path — the
+// reporter that `run_<Test>()` installs on the queue helper bumps
+// `ctx.errors` and sets `_fatal`, exactly like `log(fatal, ...)`. So
+// the run records the failure and unwinds normally instead of aborting,
+// which is why the emitted log and trace survive and why this fixture
+// can sit in the v1-vs-TB-IR equivalence registry: both codegens must
+// report it identically. `_fatal` is a loop-exit condition, so the run
+// stops at the next scheduler tick rather than at the pop itself; the
+// statements after the pop still execute, with the poisoned value.
+//
+// Pass criterion: the run reports
+//   "FATAL] pop() on an empty queue"
+// and never reports "ALL TESTS PASSED". Like
+// `regblock_record_recursion_test`, this fixture is therefore NOT
+// runnable via the standard run_fixtures.sh sentinel check — see
+// tests/run_negative_fixtures.sh.
+//
+// `tests/queue_pop_guard_cpp.rs` pins the helper's own two paths at the
+// C++ level — reporter installed, and the abort backstop for a caller
+// with no sim context — so a regression fails in `cargo test` too, not
+// only in the Verilator fixture job.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard EmptyPopSb
+    expected : queue<uint<32>>
+end scoreboard EmptyPopSb
+
+testbench QueueEmptyPopTb
+    dut : Top
+    sb  : EmptyPopSb
+end testbench QueueEmptyPopTb
+
+impl QueueEmptyPopTest for QueueEmptyPopTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "queue empty-pop: draining the queue, then popping once more")
+
+        // A normal round-trip first, so a guard that fired on a
+        // NON-empty queue would fail here rather than looking like the
+        // report under test.
+        sb.expected.push(7)
+        let first = sb.expected.pop()
+        assert first == 7
+            else fail("push/pop round-trip returned ${first}, expected 7")
+        assert sb.expected.empty()
+            else fail("queue not drained: ${sb.expected.size()} value(s) left")
+
+        // Nothing left to return: the runtime must report FATAL here.
+        let boom = sb.expected.pop()
+
+        // Reached, because `_fatal` stops the run at the next tick
+        // rather than at the pop. The value handed back must be the
+        // deterministic zero, not whatever `front()` used to read off
+        // the end of the deque.
+        assert boom == 0
+            else fail("empty pop returned ${boom}, expected a zero-filled value")
+    end run
+end impl QueueEmptyPopTest

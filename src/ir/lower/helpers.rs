@@ -139,7 +139,7 @@ pub(crate) fn lower_pure_helper<'a>(
     side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
-    b.in_pure_helper = true;
+    b.scalar_helper_abi = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
         let ty = ir_type_of_with_records(p.ty.as_ref(), &ctx.record_ids);
@@ -151,11 +151,17 @@ pub(crate) fn lower_pure_helper<'a>(
         });
     }
     if decl.return_ty.is_some() {
+        let ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &ctx.record_ids);
+        if matches!(ret_ty, IrType::Record(_)) {
+            return Err(not_implemented(
+                &format!("record return from pure helper `{}`", decl.name.name),
+                "v1 types a named return as a Verilated module pointer and then returns a \
+                 record value, so its generated C++ does not compile",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let ret = b.declare("__ret");
-        b.set_local_type(
-            ret,
-            ir_type_of_with_records(decl.return_ty.as_ref(), &ctx.record_ids),
-        );
+        b.set_local_type(ret, ret_ty);
         b.helper_ret = Some(ret);
     }
     b.lower_block_stmts(&decl.body)?;
@@ -210,6 +216,17 @@ impl FuncBuilder<'_> {
             let mut lowered = Vec::with_capacity(arg_exprs.len());
             for (p, e) in decl.params.iter().zip(arg_exprs) {
                 let v = self.lower_expr(e)?;
+                if self.record_id_of_expr(&v).is_some() {
+                    return Err(not_implemented(
+                        &format!(
+                            "record argument passed to scalar-ABI parameter `{}` of pure helper `{name}`",
+                            p.name.name
+                        ),
+                        "pure-helper parameters use the scalar C++ ABI; v1 also emits a \
+                         non-record parameter and fails to compile the record argument",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
                 lowered.push(v);
             }
@@ -632,6 +649,18 @@ impl FuncBuilder<'_> {
         if let Some(ret) = self.helper_ret {
             if let Some(e) = value {
                 let ir = self.lower_expr_no_ports(e)?;
+                if self.scalar_helper_abi {
+                    if self.record_id_of_expr(&ir).is_some() {
+                        return Err(not_implemented(
+                            "record value returned from a scalar-valued pure helper",
+                            "pure helpers use the scalar C++ return ABI; v1 also emits the \
+                             scalar return type and fails to compile the record return value",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    let expected = self.local_type(ret).clone();
+                    self.check_slot_ir(&ir, &expected, "pure-helper return")?;
+                }
                 self.push(Stmt::Assign(ret, ir));
             }
             self.terminate(Terminator::Return);
@@ -786,7 +815,9 @@ fn scan_decl(d: &FunctionDecl) -> Scan {
         impure: false,
         callees: Vec::new(),
     };
-    // A param of module (Named) type is a DUT handle.
+    // A param of module (Named) type is a DUT handle. Record-typed params
+    // intentionally remain on the inlined path too: v1 cannot distinguish
+    // those names and emits them as Verilated module pointers.
     if d.params
         .iter()
         .any(|p| matches!(p.ty, Some(TypeExpr::Named { .. })))

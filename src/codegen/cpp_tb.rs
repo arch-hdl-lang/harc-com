@@ -3174,6 +3174,30 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         writeln!(e.out, "{INDENT}}};").ok();
         writeln!(e.out, "").ok();
 
+        // Route an empty-queue pop through the sim's own FATAL path
+        // instead of the runtime header's abort backstop: the run
+        // records the failure, unwinds normally, and still writes its
+        // log and trace. `_fatal` is a loop-exit condition, so the run
+        // stops at the next scheduler tick — same semantics as
+        // `log(fatal, ...)`. The TB-IR prologue
+        // (`codegen/tbir/runtime.rs`) emits this verbatim too; the text
+        // must stay identical or the v1-vs-TB-IR trace-diff diverges on
+        // the FATAL line.
+        writeln!(
+            e.out,
+            "{INDENT}harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {{"
+        )
+        .ok();
+        writeln!(
+            e.out,
+            "{INDENT}{INDENT}sim_log_line(\"FATAL\", \"pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed\");"
+        )
+        .ok();
+        writeln!(e.out, "{INDENT}{INDENT}ctx.errors++;").ok();
+        writeln!(e.out, "{INDENT}{INDENT}_fatal = true;").ok();
+        writeln!(e.out, "{INDENT}}});").ok();
+        writeln!(e.out, "").ok();
+
         if log_seed {
             writeln!(
                 e.out,
@@ -20129,6 +20153,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         }
         Item::Test(t) => t.items.iter().any(|ti| match ti {
             TestItem::Stmt(s) => stmt(s, &solver_bearing),
+            TestItem::Phase(_, body) => block(body, &solver_bearing),
             TestItem::Scope(sc) => {
                 sc.setup
                     .as_ref()
@@ -23354,7 +23379,10 @@ fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
     out
 }
 
-fn collect_record_keeps(
+/// Collect a record's direct keeps plus recursively-prefixed keeps from
+/// nested record fields. Shared with TB-IR lowering so both emitters build
+/// identical call-site constraint expressions.
+pub(crate) fn collect_record_keeps(
     items: &[TxnBodyItem],
     record_bodies: &std::collections::HashMap<String, Vec<TxnBodyItem>>,
     record_fields: &std::collections::HashMap<String, Vec<Field>>,

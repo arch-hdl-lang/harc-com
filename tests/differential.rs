@@ -436,13 +436,23 @@ fn the_shared_scalar_width_gate_across_its_call_sites() {
     // `HarcWide<N>`, and `sint<128>` is the signed half — the emitter
     // seam picks a different C++ type for each, so a fix that only
     // reaches one of them shows up here.
-    let widths = &[
-        "uint<64>",
-        "uint<65>",
-        "uint<128>",
-        "sint<128>",
-        "uint<1024>",
-    ];
+    // UNSIGNED only, deliberately. A signed field past 64 bits is
+    // refused at every one of these sites — `field_scalar_width_ok` —
+    // because `_harc_u128` and `HarcWide<N>` are both unsigned, so `<`
+    // and `/` on one answer by magnitude in either backend. An earlier
+    // version of this branch widened signed fields too and had
+    // `sint<128>` here; the cap came from `main`'s scoreboard rule and
+    // was adopted at the merge, for a hazard this branch had itself
+    // recorded two divergences earlier without acting on it. The cap
+    // itself is asserted in `tests/tbir.rs`, which can name the width
+    // it stops at; these rows only ask that the widths BELOW it lower
+    // at every site.
+    //
+    // A narrow signed row does not belong here either: these templates
+    // write a plain `2` into the field, and invariant 15 requires the
+    // assigned value's signedness to match, so a `sint<64>` row would
+    // measure that rule rather than the width one.
+    let widths = &["uint<64>", "uint<65>", "uint<128>", "uint<1024>"];
 
     // Call site 1 + 2: a testbench field. Declaration and default are
     // separate call sites in the same lowering pass.

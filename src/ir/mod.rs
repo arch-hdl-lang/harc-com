@@ -644,17 +644,19 @@ impl RecordSchema {
 }
 
 /// One `scoreboard` declaration, lowered to its structural shape: a
-/// host-state record of scalar counters and typed FIFO queues, in
+/// host-state record of scalar counters, value-records, and typed FIFO queues, in
 /// declaration order. Both backends emit this as a C++ struct (v1's
 /// `emit_scoreboard` shape is the behavior reference): scalar fields as
 /// `uint64_t`/`int64_t`/`bool` members with their declared defaults,
+/// value-record fields as default-constructed record members, and
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields and `queue<T>` fields where `T` is `bool`, an explicitly
-/// sized `uint`/`sint` in the language range 1..=1024, or a value-record
-/// lower; the test body manipulates them through `Stmt::ScoreboardOp`
-/// (scalar read/write, queue push/pop/size/empty). Scoreboard
+/// Scalar fields, whole value-record fields, and `queue<T>` fields where `T`
+/// is `bool`, an explicitly sized `uint`/`sint` in the language range
+/// 1..=1024, or a value-record lower; the test body manipulates them through
+/// `Stmt::ScoreboardOp` (scalar/record read/write, queue push/pop/size/empty).
+/// Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
 /// state and therefore need per-instance materialization — are NOT
 /// lowered in this subset and are rejected at the call site with a
@@ -672,16 +674,32 @@ pub struct ScoreboardFieldSchema {
     pub kind: ScoreboardFieldKind,
 }
 
-/// A scoreboard field is either a scalar counter or a typed FIFO queue.
+/// A scoreboard field is a scalar counter, a whole value-record, or a typed
+/// FIFO queue.
 #[derive(Debug, Clone)]
 pub enum ScoreboardFieldKind {
     /// `writes : uint<32> default 0` — a scalar host counter. The
     /// `default` is the declared initializer literal (0 fallback, v1).
-    Scalar { ty: IrType, default: u64 },
+    Scalar {
+        ty: IrType,
+        default: ScoreboardScalarDefault,
+    },
+    /// `last : CheckerState` — a value-record held directly in the
+    /// scoreboard struct. Whole-record reads/writes use the existing
+    /// scoreboard query/op seam; the record is default-constructed.
+    Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is an exact scalar type through the 1024-bit
     /// language ceiling or a value-record.
     Queue { elem: QueueElem },
+}
+
+/// Width-preserving initializer for persistent scoreboard scalar state.
+#[derive(Debug, Clone)]
+pub enum ScoreboardScalarDefault {
+    Narrow(u64),
+    /// LSB-first 32-bit words, matching `Expr::WideLiteral`.
+    Wide(Vec<u32>),
 }
 
 /// The element type of a `queue<T>` field: an exact scalar IR type, or a
@@ -2082,6 +2100,8 @@ pub enum Stmt {
         instance: String,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
+        index: Option<Expr>,
         value: Expr,
     },
     /// `pending.push(x)` inside a target-responder body (or
@@ -2227,7 +2247,8 @@ pub enum Stmt {
         /// `path` against the run-scope env local. See `ScoreboardQuery`.
         nested_path: Option<Vec<String>>,
     },
-    /// Write a composite-component scalar field. `base` selects the
+    /// Write a composite-component scalar/record field, or a whole fixed
+    /// vector in the same-shape copy position. `base` selects the
     /// access form: `SelfField` (`count = count + 1` inside a method body
     /// → `self.count = ...`) or `Path` (`env.sb.errors = ...` from the
     /// test). The value is port-hoisted like `Assign`.
@@ -2239,6 +2260,7 @@ pub enum Stmt {
     ComponentVecElementWrite {
         base: ComponentBase,
         field: String,
+        index_pos: usize,
         index: Expr,
         value: Expr,
     },
@@ -2412,7 +2434,9 @@ pub enum ScoreboardOp {
     /// destination; for a discarded `sb.q.pop()` that is an unread temp,
     /// so the store is dead but the pop is not (see `Stmt::TbQueuePop`).
     QueuePop { queue: String, dest: LocalId },
-    /// `sb.<scalar> = value` — write a scalar counter field.
+    /// `sb.<value> = value` — write a scalar counter or whole-record field.
+    /// The historical variant name remains to avoid duplicating the common
+    /// scoreboard receiver/path machinery.
     ScalarWrite { scalar: String, value: Expr },
 }
 
@@ -2633,6 +2657,8 @@ pub enum Expr {
         instance: String,
         field: String,
         path: Vec<String>,
+        mid_indices: Vec<(usize, Expr)>,
+        index: Option<Box<Expr>>,
     },
     /// A value-producing read on a bound-to target transactor's
     /// persistent `queue<T>` state field: `pending.size()` /
@@ -2660,14 +2686,17 @@ pub enum Expr {
         /// `_tb.<field>`. `Some(path)` → a data-only scoreboard held as
         /// an ENV sub-component (`top.sb`), accessed by the full dotted
         /// `path` (e.g. `["top","sb"]`) against the run-scope env local.
-        /// Validation skips the testbench-field binding check for the
-        /// nested form (the board lives inside the env, not on `_tb`).
+        /// Verification replays the component path and requires its terminal
+        /// leaf to reference the carried scoreboard id (the board lives
+        /// inside the env, not on `_tb`).
         nested_path: Option<Vec<String>>,
     },
-    /// Read a composite-component scalar field. `base` is `SelfField`
+    /// Read a composite-component scalar/record field, or a whole fixed
+    /// vector in a same-shape equality/copy position. `base` is `SelfField`
     /// (`count` inside a method → `self.count`) or `Path` (`env.sb.count`
-    /// from the test → `env.sb.count`). Host state — allowed wherever a
-    /// `Local` is. Queue/event fields are never read this way (queues use
+    /// from the test → `env.sb.count`). Host state; whole vectors are limited
+    /// to the explicitly shape-checked positions. Queue/event fields are
+    /// never read this way (queues use
     /// scoreboard-style ops which are out of subset for components in v0;
     /// events are written via `connect`/`emit` only).
     ComponentField {
@@ -2677,6 +2706,7 @@ pub enum Expr {
     ComponentVecElement {
         base: ComponentBase,
         field: String,
+        index_pos: usize,
         index: Box<Expr>,
     },
     /// A whole composite-component value, passed by value as a method
@@ -2877,7 +2907,7 @@ pub enum WidthCastKind {
 /// A value-producing scoreboard read (see `Expr::ScoreboardQuery`).
 #[derive(Debug, Clone)]
 pub enum ScoreboardQuery {
-    /// `sb.<scalar>` — read a scalar counter field.
+    /// `sb.<value>` — read a scalar counter or whole-record field.
     Scalar { scalar: String },
     /// `sb.<queue>.size()` — element count (lowers to `uint64_t`).
     QueueSize { queue: String },

@@ -11,6 +11,76 @@ use crate::ir::{
     BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind,
 };
 
+fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs),
+        (lhs, rhs) => return lhs.or(rhs),
+    };
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    if matches!(lhs, IrType::Unknown) {
+        return Some(rhs);
+    }
+    if matches!(rhs, IrType::Unknown) {
+        return Some(lhs);
+    }
+    let scalar = |ty: &IrType| match ty {
+        IrType::UInt(width) => Some((*width, false)),
+        IrType::SInt(width) => Some((*width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        _ => None,
+    };
+    let (Some((lw, ls)), Some((rw, rs))) = (scalar(&lhs), scalar(&rhs)) else {
+        return Some(lhs);
+    };
+    // Widthless integers use a 64-bit host ABI. Identical widthless types
+    // returned above retain their source-level `None`; once composed with a
+    // different scalar, their concrete contribution is 64 bits.
+    let width = Some(lw.unwrap_or(64).max(rw.unwrap_or(64)));
+    Some(if ls && rs {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
+fn narrowest_scalar_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let scalar = |ty: IrType| match ty {
+        IrType::UInt(width) => Some((width, false)),
+        IrType::SInt(width) => Some((width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        IrType::Unknown => None,
+        _ => None,
+    };
+    let (lhs, rhs) = (lhs.and_then(&scalar), rhs.and_then(scalar));
+    let (width, signed) = match (lhs, rhs) {
+        (Some((lw, ls)), Some((rw, rs))) => {
+            let (lhs_width, rhs_width) = (lw.unwrap_or(64), rw.unwrap_or(64));
+            let selected = if lhs_width < rhs_width && !ls {
+                lhs_width
+            } else if rhs_width < lhs_width && !rs {
+                rhs_width
+            } else {
+                lhs_width.max(rhs_width)
+            };
+            let width = if lw.is_none() && rw.is_none() {
+                None
+            } else {
+                Some(selected)
+            };
+            (width, ls && rs)
+        }
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => return None,
+    };
+    Some(if signed {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
 /// Resolution of a (possibly nested) record field-access chain
 /// `ident.f1.f2...fn` rooted at a record-typed local. `field` is the
 /// first-level field (`f1`) on the local's record; `path` is the further
@@ -48,6 +118,8 @@ pub(crate) struct TransactorStateRecordChain {
     pub instance: String,
     pub field: String,
     pub path: Vec<String>,
+    pub mid_indices: Vec<(usize, Expr)>,
+    pub leaf_index: Option<Expr>,
     /// `Some(N)` when the leaf is a `Vec<T, N>` field. Only the
     /// `==`/`!=` landing reads one; see `vec_read_ok`.
     pub leaf_vec_len: Option<usize>,
@@ -56,11 +128,207 @@ pub(crate) struct TransactorStateRecordChain {
     pub leaf_ty: IrType,
 }
 
+pub(crate) struct IndexedComponentRecordChain {
+    pub base: crate::ir::ComponentBase,
+    pub field: String,
+    pub index_pos: usize,
+    pub index: Expr,
+    pub leaf_ty: IrType,
+}
+
+/// Flatten a record-shaped path into its root, declaration-order field
+/// segments, and the index attached to each segment. The index position is
+/// relative to `segs` (not including the root).
+fn indexed_path_parts<'a>(
+    e: &'a AstExpr,
+) -> Option<(
+    &'a crate::ast::Ident,
+    Vec<String>,
+    Vec<(usize, &'a AstExpr)>,
+)> {
+    let mut segs = Vec::new();
+    let mut raw_indices = Vec::new();
+    let mut pending_index = None;
+    let mut cur = e;
+    let root = loop {
+        match &*cur.kind {
+            ExprKind::Field { target, name } => {
+                if let Some(idx) = pending_index.take() {
+                    raw_indices.push((segs.len(), idx));
+                }
+                segs.push(name.name.clone());
+                cur = target;
+            }
+            ExprKind::Index { target, index } => {
+                if pending_index.is_some() || segs.is_empty() {
+                    return None;
+                }
+                pending_index = Some(index);
+                cur = target;
+            }
+            ExprKind::Ident(root) if pending_index.is_none() => break root,
+            _ => return None,
+        }
+    };
+    if segs.is_empty() {
+        return None;
+    }
+    let total = segs.len();
+    segs.reverse();
+    let mut indices = Vec::with_capacity(raw_indices.len());
+    for (raw_pos, idx) in raw_indices.into_iter().rev() {
+        indices.push((total - 1 - raw_pos, idx));
+    }
+    Some((root, segs, indices))
+}
+
 impl super::FuncBuilder<'_> {
+    pub(crate) fn as_indexed_component_record_field(
+        &mut self,
+        e: &AstExpr,
+    ) -> Result<Option<IndexedComponentRecordChain>, LowerError> {
+        let Some((root, segs, raw_indices)) = indexed_path_parts(e) else {
+            return Ok(None);
+        };
+        if raw_indices.len() != 1 || self.lookup(&root.name).is_some() {
+            return Ok(None);
+        }
+        let mut full: Vec<String> = std::iter::once(root.name.clone()).chain(segs).collect();
+        let mut indexed_full_pos = raw_indices[0].0 + 1;
+        if self.ctx.tb_field.as_deref() == Some(root.name.as_str()) {
+            full.remove(0);
+            indexed_full_pos = indexed_full_pos.saturating_sub(1);
+        }
+
+        let resolve_record_path = |this: &Self,
+                                   record: RecordId,
+                                   suffix: &[String],
+                                   index_pos: usize|
+         -> Result<(IrType, usize), LowerError> {
+            let mut rid = record;
+            let mut selected_len = None;
+            for (pos, seg) in suffix.iter().enumerate() {
+                let schema = &this.ctx.records[rid.index()];
+                let fld = schema.field(seg).ok_or_else(|| {
+                    LowerError::Invalid(format!("record `{}` has no field `{seg}`", schema.name))
+                })?;
+                let indexed = pos == index_pos;
+                if indexed {
+                    selected_len = Some(fld.vec_len.ok_or_else(|| {
+                        not_implemented(
+                            &format!(
+                                "indexing the non-`Vec` record field `{}.{seg}`",
+                                schema.name
+                            ),
+                            "only `Vec<T, N>` record fields are indexable",
+                            V1Status::EmitsUncompilable,
+                        )
+                    })?);
+                }
+                if pos + 1 == suffix.len() {
+                    let len = selected_len.ok_or_else(|| {
+                        LowerError::Invalid("indexed component path has no selection".into())
+                    })?;
+                    return Ok((fld.ty.clone(), len));
+                }
+                match fld.ty {
+                    IrType::Record(next) if fld.vec_len.is_none() && !indexed => rid = next,
+                    IrType::Record(next) if fld.vec_len.is_some() && indexed => rid = next,
+                    IrType::Record(_) if fld.vec_len.is_some() => {
+                        return Err(not_implemented(
+                            &format!(
+                                "traversing the `Vec` record field `{}.{seg}` without an element index",
+                                schema.name
+                            ),
+                            format!("select one element first (`{seg}[i]`)"),
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    _ => {
+                        return Err(not_implemented(
+                            &format!(
+                                "field access on `{}.{seg}`, which is not a nested record",
+                                schema.name
+                            ),
+                            "only nested struct/transaction fields can be traversed further",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
+            }
+            Err(LowerError::Invalid(
+                "indexed component record path has no field".into(),
+            ))
+        };
+
+        if let Some(cid) = self.self_component {
+            if let Some(schema) = self.ctx.components[cid.index()].field(&full[0]) {
+                if let crate::ir::ComponentFieldKind::Record { record } = schema.kind {
+                    let suffix = &full[1..];
+                    if indexed_full_pos >= 1 && indexed_full_pos < full.len() {
+                        let index_pos = indexed_full_pos;
+                        let (leaf_ty, len) =
+                            resolve_record_path(self, record, suffix, index_pos - 1)?;
+                        let index = self.lower_expr(raw_indices[0].1)?;
+                        check_literal_vec_index_bounds(&full.join("."), &index, len)?;
+                        return Ok(Some(IndexedComponentRecordChain {
+                            base: crate::ir::ComponentBase::SelfField,
+                            field: full.join("."),
+                            index_pos,
+                            index,
+                            leaf_ty,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let Some((head_cid, mut base, tail, _)) = self.component_path_head(&full) else {
+            return Ok(None);
+        };
+        for recv_len in 0..tail.len() {
+            let Ok(cid) = self.resolve_component_recv(head_cid, &tail[..recv_len]) else {
+                break;
+            };
+            let Some(schema) = self.ctx.components[cid.index()].field(&tail[recv_len]) else {
+                continue;
+            };
+            let crate::ir::ComponentFieldKind::Record { record } = schema.kind else {
+                continue;
+            };
+            let suffix = &tail[recv_len + 1..];
+            let suffix_start = full.len() - tail.len() + recv_len;
+            if indexed_full_pos <= suffix_start || indexed_full_pos >= full.len() {
+                continue;
+            }
+            let index_pos = indexed_full_pos - suffix_start;
+            let (leaf_ty, len) = resolve_record_path(self, record, suffix, index_pos - 1)?;
+            base.extend_from_slice(&tail[..recv_len]);
+            let index = self.lower_expr(raw_indices[0].1)?;
+            check_literal_vec_index_bounds(&full.join("."), &index, len)?;
+            return Ok(Some(IndexedComponentRecordChain {
+                base: crate::ir::ComponentBase::Path(base),
+                field: tail[recv_len..].join("."),
+                index_pos,
+                index,
+                leaf_ty,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Whether `e` is the exact whole-vector operand/RHS currently granted
+    /// access. Parentheses are transparent, but nested expressions have a
+    /// different span and therefore cannot inherit the permission.
+    pub(crate) fn whole_vec_read_allowed(&self, e: &crate::ast::Expr) -> bool {
+        self.vec_read_ok && self.vec_read_span == Some(unparen_expr(e).span)
+    }
+
     /// The `(len, element type)` of a whole-`Vec` record-field read, in
-    /// whichever of the three lanes that spells one — a record LOCAL
+    /// whichever lane spells one — a record LOCAL
     /// (`r.data`), a bound responder's record STATE field (`t.ba.data`),
-    /// or a COMPONENT record field (`a.data` in an agent method). The
+    /// a COMPONENT record field (`a.data` in an agent method), or a direct
+    /// COMPONENT fixed-vector field (`table.words`). The
     /// lanes are tried in the order `lower_expr`'s `Field` arm resolves
     /// them, so the shape reported is the one that would be lowered.
     ///
@@ -99,6 +367,8 @@ impl super::FuncBuilder<'_> {
         }
         let (len, ty) = if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
             (c.leaf_vec_len?, c.leaf_ty)
+        } else if let Ok(Some((_, _, vec))) = self.as_component_vec_field(e) {
+            (vec.len, vec.elem)
         } else if let Ok(Some(rf)) = self.as_component_record_field(e) {
             rf.leaf_vec?
         } else if let Ok(Some(l)) = self.try_record_field_chain(e) {
@@ -145,9 +415,12 @@ impl super::FuncBuilder<'_> {
             return Ok(None);
         }
         let saved = self.vec_read_ok;
+        let saved_span = self.vec_read_span;
         self.vec_read_ok = true;
+        self.vec_read_span = Some(unparen_expr(value).span);
         let e = self.lower_expr_no_ports(value);
         self.vec_read_ok = saved;
+        self.vec_read_span = saved_span;
         let e = e?;
         // The shape comes from the LOWERED expression, not the AST.
         // The read-side pairing has to ask the AST (both operands are
@@ -266,12 +539,19 @@ impl super::FuncBuilder<'_> {
                 let cid = self.component_base_id(base)?;
                 let mut segs = field.split('.');
                 let root = segs.next()?;
-                let crate::ir::ComponentFieldKind::Record { record } =
-                    self.ctx.components.get(cid.index())?.field(root)?.kind
-                else {
+                let root_kind = &self.ctx.components.get(cid.index())?.field(root)?.kind;
+                if let crate::ir::ComponentFieldKind::FixedVec(vec) = root_kind {
+                    return (segs.next().is_none())
+                        .then(|| {
+                            crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem)
+                                .map(|elem| (vec.len, elem))
+                        })
+                        .flatten();
+                }
+                let crate::ir::ComponentFieldKind::Record { record } = root_kind else {
                     return None;
                 };
-                let mut cur = record;
+                let mut cur = *record;
                 let mut leaf = None;
                 for seg in segs {
                     let fld = self.ctx.records.get(cur.index())?.field(seg)?;
@@ -287,7 +567,12 @@ impl super::FuncBuilder<'_> {
                 instance,
                 field,
                 path,
+                mid_indices,
+                index,
             } => {
+                if index.is_some() || !mid_indices.is_empty() {
+                    return None;
+                }
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
                 } else {
@@ -580,12 +865,6 @@ impl FuncBuilder<'_> {
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
                 }
-                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
-                    return Err(unsupported(
-                        &format!("whole-vector read of component field `{field}`"),
-                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
-                    ));
-                }
                 // Whole composite-component value read — a self sub-component
                 // field passed by value as a method arg (`sb.observe(addr,
                 // model)`). Locals shadow (checked above).
@@ -649,7 +928,7 @@ impl FuncBuilder<'_> {
                     // gets through, and only because both backends emit
                     // `target.ba.data == target.bb.data`, which g++
                     // accepts. See `vec_read_ok`.
-                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                    if chain.leaf_vec_len.is_some() && !self.whole_vec_read_allowed(e) {
                         let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                         return Err(not_implemented(
                             &format!("a whole-`Vec` read of record state field `{dotted}`"),
@@ -664,6 +943,8 @@ impl FuncBuilder<'_> {
                         instance: chain.instance,
                         field: chain.field,
                         path: chain.path,
+                        mid_indices: chain.mid_indices,
+                        index: chain.leaf_index.map(Box::new),
                     });
                 }
                 // Test-scope read of a bound-to target responder's
@@ -708,16 +989,18 @@ impl FuncBuilder<'_> {
                 }
                 self.reject_out_of_subset_regblock_access(e, "read")?;
                 self.reject_out_of_subset_addrmap_access(e, "read")?;
+                if let Some(chain) = self.as_indexed_component_record_field(e)? {
+                    return Ok(Expr::ComponentVecElement {
+                        base: chain.base,
+                        field: chain.field,
+                        index_pos: chain.index_pos,
+                        index: Box::new(chain.index),
+                    });
+                }
                 // Composite-component scalar field read via a test-scope
                 // path (`env.sb.count`).
                 if let Some(ce) = self.as_component_field_read(e)? {
                     return Ok(ce);
-                }
-                if let Some((_, field, _)) = self.as_component_vec_field(e)? {
-                    return Err(unsupported(
-                        &format!("whole-vector read of component field `{field}`"),
-                        "read one element with `<field>[index]`; whole-vector values are not lowered yet",
-                    ));
                 }
                 // `r.field` read on a `recv()`-captured payload local
                 // (`let r = bus.<ch>.recv(); ... r.data`). Each payload
@@ -765,7 +1048,7 @@ impl FuncBuilder<'_> {
                     // `Index` arm handles it. A whole nested-RECORD leaf
                     // read (`let d = s.inner`) is unrelated and always
                     // allowed: it yields the nested struct value.
-                    if chain.leaf_vec_len.is_some() && !self.vec_read_ok {
+                    if chain.leaf_vec_len.is_some() && !self.whole_vec_read_allowed(e) {
                         // What v1 does with the read depends on where it
                         // LANDS, and the equality landing is now
                         // implemented rather than refused with the rest:
@@ -865,9 +1148,12 @@ impl FuncBuilder<'_> {
                 let eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
                     && self.same_whole_vec_shape(lhs, rhs);
                 let saved = self.vec_read_ok;
+                let saved_span = self.vec_read_span;
                 self.vec_read_ok = eq;
+                self.vec_read_span = eq.then(|| unparen_expr(lhs).span);
                 let l = self.lower_expr(lhs);
                 let r = if l.is_ok() {
+                    self.vec_read_span = eq.then(|| unparen_expr(rhs).span);
                     self.lower_expr(rhs)
                 } else {
                     Ok(Expr::Literal {
@@ -876,6 +1162,7 @@ impl FuncBuilder<'_> {
                     })
                 };
                 self.vec_read_ok = saved;
+                self.vec_read_span = saved_span;
                 let (l, r) = (l?, r?);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
@@ -905,6 +1192,7 @@ impl FuncBuilder<'_> {
                 // DUT port read is side-effect-free and untraced, so
                 // the difference is unobservable.)
                 let c = self.lower_expr(cond)?;
+                self.validate_truth_expr(&c, "ternary condition")?;
                 let t = self.lower_expr(then_branch)?;
                 let e = self.lower_expr(else_branch)?;
                 Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
@@ -1126,12 +1414,31 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::Index { target, index } => {
+                if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+                    if let Some(len) = chain.leaf_vec_len {
+                        let idx = self.lower_expr(index)?;
+                        check_literal_vec_index_bounds(
+                            &format!("{}.{}", chain.field, chain.path.join(".")),
+                            &idx,
+                            len,
+                        )?;
+                        chain.leaf_index = Some(idx);
+                        return Ok(Expr::TransactorStateRecordField {
+                            instance: chain.instance,
+                            field: chain.field,
+                            path: chain.path,
+                            mid_indices: chain.mid_indices,
+                            index: chain.leaf_index.map(Box::new),
+                        });
+                    }
+                }
                 if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
                     let index = self.lower_expr(index)?;
                     check_literal_component_vec_index_bounds(&base, &field, &index, vec.len)?;
                     return Ok(Expr::ComponentVecElement {
                         base,
                         field,
+                        index_pos: 0,
                         index: Box::new(index),
                     });
                 }
@@ -1151,9 +1458,11 @@ impl FuncBuilder<'_> {
                         check_literal_component_vec_index_bounds(
                             &rf.base, &rf.dotted, &index, len,
                         )?;
+                        let index_pos = rf.field.split('.').count() - 1;
                         return Ok(Expr::ComponentVecElement {
                             base: rf.base,
                             field: rf.field,
+                            index_pos,
                             index: Box::new(index),
                         });
                     }
@@ -1674,6 +1983,19 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
+            Expr::ScoreboardQuery {
+                sb,
+                query: crate::ir::ScoreboardQuery::Scalar { scalar },
+                ..
+            } => self
+                .ctx
+                .scoreboards
+                .get(sb.index())?
+                .field(scalar)
+                .and_then(|field| match field.kind {
+                    crate::ir::ScoreboardFieldKind::Record { record } => Some(record),
+                    _ => None,
+                }),
             // One element of a component-record `Vec<Record, N>` leaf
             // (`a.kids[i]`) is a whole record value, exactly as
             // `tbl.entries[i]` is on a record local. Answered through
@@ -1705,6 +2027,8 @@ impl FuncBuilder<'_> {
                 instance,
                 field,
                 path,
+                mid_indices,
+                index,
             } => {
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
@@ -1718,8 +2042,16 @@ impl FuncBuilder<'_> {
                 let last = path.len().checked_sub(1)?;
                 for (i, seg) in path.iter().enumerate() {
                     let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    let indexed =
+                        mid_indices.iter().any(|(p, _)| *p == i) || (i == last && index.is_some());
                     match fld.ty {
-                        IrType::Record(r) if fld.vec_len.is_none() => {
+                        IrType::Record(r) if fld.vec_len.is_none() && !indexed => {
+                            if i == last {
+                                return Some(r);
+                            }
+                            cur = r;
+                        }
+                        IrType::Record(r) if fld.vec_len.is_some() && indexed => {
                             if i == last {
                                 return Some(r);
                             }
@@ -1749,6 +2081,69 @@ impl FuncBuilder<'_> {
             Expr::ComponentField { base, field } => self.component_field_record(base, field),
             _ => None,
         }
+    }
+
+    /// Boolean-producing operators hide their operand type from `expr_type`.
+    /// Same-record equality/inequality is supported by the generated record
+    /// operators; every other record operand in a scalar boolean expression is
+    /// invalid and must be diagnosed before TB-IR verification.
+    pub(crate) fn bool_expr_has_invalid_record_operand(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Unary(_, inner) => {
+                self.record_id_of_expr(inner).is_some()
+                    || self.bool_expr_has_invalid_record_operand(inner)
+            }
+            Expr::Binary(op, lhs, rhs) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+                match (self.record_id_of_expr(lhs), self.record_id_of_expr(rhs)) {
+                    (Some(lhs), Some(rhs)) => lhs != rhs,
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => {
+                        self.bool_expr_has_invalid_record_operand(lhs)
+                            || self.bool_expr_has_invalid_record_operand(rhs)
+                    }
+                }
+            }
+            Expr::Binary(_, lhs, rhs) => {
+                self.record_id_of_expr(lhs).is_some()
+                    || self.record_id_of_expr(rhs).is_some()
+                    || self.bool_expr_has_invalid_record_operand(lhs)
+                    || self.bool_expr_has_invalid_record_operand(rhs)
+            }
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                self.record_id_of_expr(cond).is_some()
+                    || self.record_id_of_expr(then_expr).is_some()
+                    || self.record_id_of_expr(else_expr).is_some()
+                    || self.bool_expr_has_invalid_record_operand(cond)
+                    || self.bool_expr_has_invalid_record_operand(then_expr)
+                    || self.bool_expr_has_invalid_record_operand(else_expr)
+            }
+            Expr::WidthCast { inner, .. } | Expr::BitSlice { target: inner, .. } => {
+                self.record_id_of_expr(inner).is_some()
+                    || self.bool_expr_has_invalid_record_operand(inner)
+            }
+            Expr::BitSliceDyn { target, hi, lo } => [target.as_ref(), hi.as_ref(), lo.as_ref()]
+                .iter()
+                .any(|inner| {
+                    self.record_id_of_expr(inner).is_some()
+                        || self.bool_expr_has_invalid_record_operand(inner)
+                }),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn validate_truth_expr(&self, e: &Expr, context: &str) -> Result<(), LowerError> {
+        if let Some(record) = self.record_id_of_expr(e) {
+            let name = &self.ctx.records[record.index()].name;
+            return Err(LowerError::Invalid(format!(
+                "{context} must be a scalar value, not record `{name}`"
+            )));
+        }
+        if self.bool_expr_has_invalid_record_operand(e) {
+            return Err(LowerError::Invalid(format!(
+                "{context} applies a scalar operator to a record value"
+            )));
+        }
+        Ok(())
     }
 
     /// The record type of a component field access, or `None` if the
@@ -2019,9 +2414,29 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            Expr::ComponentVecElement { base, field, index } => {
+            Expr::ComponentVecElement { base, field, index_pos, index } => {
                 let index = self.hoist_ports_with_hint(*index, None);
-                Expr::ComponentVecElement { base, field, index: Box::new(index) }
+                Expr::ComponentVecElement { base, field, index_pos, index: Box::new(index) }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } if index.is_some() || !mid_indices.is_empty() => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None)))
+                    .collect();
+                let index = index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None)));
+                Expr::TransactorStateRecordField {
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
+                }
             }
             // An indexed `Vec`-field read carries index sub-exprs (the
             // leaf `[i]` and any mid-chain `entries[i].…` selections),
@@ -2107,10 +2522,12 @@ impl FuncBuilder<'_> {
                 | BinOp::Ge
                 | BinOp::And
                 | BinOp::Or => Some(IrType::Bool),
-                _ => self.expr_type(a).or_else(|| self.expr_type(b)),
+                BinOp::Shl | BinOp::Shr => self.expr_type(a),
+                _ => common_expr_type(self.expr_type(a), self.expr_type(b)),
             },
+            Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
             Expr::Unary(_, inner) => self.expr_type(inner),
-            Expr::Ternary(_, t, e) => self.expr_type(t).or_else(|| self.expr_type(e)),
+            Expr::Ternary(_, t, e) => common_expr_type(self.expr_type(t), self.expr_type(e)),
             Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
             // Runtime bounds: the width is not known here. The helper
             // returns `uint64_t`, so the value is unsigned of unknown
@@ -2126,6 +2543,22 @@ impl FuncBuilder<'_> {
                 | crate::ir::CallTarget::ExternFn { ret, .. },
                 _,
             ) => Some(ret.clone()),
+            Expr::ScoreboardQuery { sb, query, .. } => match query {
+                crate::ir::ScoreboardQuery::Scalar { scalar } => self
+                    .ctx
+                    .scoreboards
+                    .get(sb.index())?
+                    .field(scalar)
+                    .and_then(|field| match &field.kind {
+                        crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                        crate::ir::ScoreboardFieldKind::Record { record } => {
+                            Some(IrType::Record(*record))
+                        }
+                        _ => None,
+                    }),
+                crate::ir::ScoreboardQuery::QueueSize { .. } => Some(IrType::UInt(None)),
+                crate::ir::ScoreboardQuery::QueueEmpty { .. } => Some(IrType::Bool),
+            },
             // A record-field chain types as its leaf: the leaf field's own
             // scalar/record type, or the element type when the leaf `Vec`
             // is indexed. A whole (unindexed) `Vec` leaf is an array — it
@@ -2187,6 +2620,56 @@ impl FuncBuilder<'_> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Conservative scalar result type for assignment compatibility. Unlike
+    /// ordinary expression typing, an `&` literal mask provides a real upper
+    /// bound, and shifts retain that bounded LHS width. This admits
+    /// `(wide & 0xFF) >> 4` into uint<8> without exempting unrelated binary
+    /// expressions such as `wide + 1` from narrowing checks.
+    pub(crate) fn scalar_assignment_type(&self, e: &Expr) -> Option<IrType> {
+        match e {
+            Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
+                let bounded = |e: &Expr| {
+                    if let Expr::Literal { value, ty } = e {
+                        if matches!(ty, IrType::Unknown) {
+                            return Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1))));
+                        }
+                    }
+                    self.scalar_assignment_type(e)
+                };
+                narrowest_scalar_type(bounded(lhs), bounded(rhs))
+            }
+            Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => self.scalar_assignment_type(lhs),
+            Expr::Binary(
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or,
+                _,
+                _,
+            ) => Some(IrType::Bool),
+            Expr::Binary(_, lhs, rhs) => common_expr_type(
+                self.scalar_assignment_type(lhs),
+                self.scalar_assignment_type(rhs),
+            ),
+            Expr::Ternary(_, then_expr, else_expr) => common_expr_type(
+                self.scalar_assignment_type(then_expr),
+                self.scalar_assignment_type(else_expr),
+            ),
+            Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+            Expr::Unary(_, inner) => self.scalar_assignment_type(inner),
+            // Not `expr_type`: it answers `None` for every host-state
+            // read — a testbench/scoreboard/component field, a
+            // transactor state field — and those are exactly the leaves
+            // a declared WIDE field made reachable. See
+            // `host_state_scalar_type`.
+            _ => self.host_state_scalar_type(e),
         }
     }
 
@@ -2311,12 +2794,38 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            Expr::ComponentVecElement { base, field, index } => {
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                index,
+            } => {
                 let index = self.hoist_transactor_calls(*index);
                 Expr::ComponentVecElement {
                     base,
                     field,
+                    index_pos,
                     index: Box::new(index),
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_transactor_calls(idx)))
+                    .collect();
+                let index = index.map(|idx| Box::new(self.hoist_transactor_calls(*idx)));
+                Expr::TransactorStateRecordField {
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
                 }
             }
             Expr::Call(t, args) => {
@@ -3134,26 +3643,12 @@ impl FuncBuilder<'_> {
     /// The returned `path` is length ≥ 1 (a whole-record access, path
     /// empty, is handled by the scalar `TransactorState` lane).
     pub(crate) fn as_transactor_state_record_field(
-        &self,
+        &mut self,
         e: &AstExpr,
     ) -> Result<Option<TransactorStateRecordChain>, LowerError> {
-        let ExprKind::Field { .. } = &*e.kind else {
+        let Some((root, segs, raw_indices)) = indexed_path_parts(e) else {
             return Ok(None);
         };
-        // Flatten `a.b.c…` → root ident + segments (declaration order).
-        let mut segs: Vec<String> = Vec::new();
-        let mut cur = e;
-        let root = loop {
-            match &*cur.kind {
-                ExprKind::Field { target, name } => {
-                    segs.push(name.name.clone());
-                    cur = target;
-                }
-                ExprKind::Ident(root) => break root,
-                _ => return Ok(None),
-            }
-        };
-        segs.reverse();
         // A local shadows a same-named state field / instance (the
         // established convention throughout this lowerer). Fall through
         // to the record-local field-chain lane in that case.
@@ -3164,30 +3659,36 @@ impl FuncBuilder<'_> {
         // Bare responder-body form: root IS the record state field, so
         // the instance is a placeholder. Otherwise root/`_tb`-prefix
         // names the bound test-scope instance and its state field.
-        let (instance, state_field, sub) = if self.target_state_fields.contains_key(&root.name) {
-            // `last.addr` — root is the state field, segs are the subfields.
-            (String::new(), root.name.clone(), segs)
-        } else {
-            // Test-scope: `responder.last.addr` (instance=root) or
-            // `_tb.xact.last.addr` (instance=segs[0]).
-            let (instance, rest_start) = if Some(root.name.as_str()) == self.ctx.tb_field.as_deref()
-            {
-                match segs.first() {
-                    Some(mid) => (mid.clone(), 1usize),
-                    None => return Ok(None),
-                }
+        let (instance, state_field, sub, sub_start) =
+            if self.target_state_fields.contains_key(&root.name) {
+                // `last.addr` — root is the state field, segs are the subfields.
+                (String::new(), root.name.clone(), segs, 0usize)
             } else {
-                (root.name.clone(), 0usize)
+                // Test-scope: `responder.last.addr` (instance=root) or
+                // `_tb.xact.last.addr` (instance=segs[0]).
+                let (instance, rest_start) =
+                    if Some(root.name.as_str()) == self.ctx.tb_field.as_deref() {
+                        match segs.first() {
+                            Some(mid) => (mid.clone(), 1usize),
+                            None => return Ok(None),
+                        }
+                    } else {
+                        (root.name.clone(), 0usize)
+                    };
+                if !self.ctx.target_state.contains_key(&instance) {
+                    return Ok(None);
+                }
+                let rest = &segs[rest_start..];
+                let Some(state_field) = rest.first() else {
+                    return Ok(None);
+                };
+                (
+                    instance,
+                    state_field.clone(),
+                    rest[1..].to_vec(),
+                    rest_start + 1,
+                )
             };
-            if !self.ctx.target_state.contains_key(&instance) {
-                return Ok(None);
-            }
-            let rest = &segs[rest_start..];
-            let Some(state_field) = rest.first() else {
-                return Ok(None);
-            };
-            (instance, state_field.clone(), rest[1..].to_vec())
-        };
         // The named state field must exist and be a whole-record field.
         let kind = if instance.is_empty() {
             self.target_state_fields.get(&state_field)
@@ -3200,6 +3701,7 @@ impl FuncBuilder<'_> {
         let Some(crate::ir::StateFieldKind::Record { record }) = kind else {
             return Ok(None);
         };
+        let record = *record;
         // A bare whole-record access (no subfield) is the scalar
         // `TransactorState` lane's job, not this one.
         if sub.is_empty() {
@@ -3207,7 +3709,14 @@ impl FuncBuilder<'_> {
         }
         // Type-check the subfield chain against the record schema,
         // descending through nested records to the leaf.
-        let mut cur_rid = *record;
+        if raw_indices.iter().any(|(p, _)| *p < sub_start) {
+            return Ok(None);
+        }
+        let mut indices = Vec::with_capacity(raw_indices.len());
+        for (pos, idx) in raw_indices {
+            indices.push((pos - sub_start, self.lower_expr(idx)?));
+        }
+        let mut cur_rid = record;
         let last = sub.len() - 1;
         let mut leaf_vec_len = None;
         let mut leaf_ty = IrType::Unknown;
@@ -3219,13 +3728,20 @@ impl FuncBuilder<'_> {
                     schema.name
                 )));
             };
+            let indexed = indices.iter().any(|(p, _)| *p == i);
             if i == last {
                 leaf_vec_len = fld.vec_len;
                 leaf_ty = fld.ty.clone();
                 break;
             }
             match fld.ty {
-                IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_none() && !indexed => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_some() && indexed => {
+                    if let Some((_, idx)) = indices.iter().find(|(p, _)| *p == i) {
+                        check_literal_vec_index_bounds(seg, idx, fld.vec_len.unwrap_or(0))?;
+                    }
+                    cur_rid = next;
+                }
                 // The THIRD lane's copy of the mid-segment split. The
                 // record-LOCAL walk (`try_record_field_chain`) and the
                 // COMPONENT walk (`as_component_record_field`) already
@@ -3265,6 +3781,11 @@ impl FuncBuilder<'_> {
             instance,
             field: state_field,
             path: sub,
+            mid_indices: indices.iter().filter(|(p, _)| *p < last).cloned().collect(),
+            leaf_index: indices
+                .into_iter()
+                .find(|(p, _)| *p == last)
+                .map(|(_, idx)| idx),
             leaf_vec_len,
             leaf_ty,
         }))
@@ -3377,7 +3898,7 @@ impl FuncBuilder<'_> {
     /// its size are one decision, and a guard that disagreed with the
     /// emitter about either would fire on the wrong expressions.
     pub(super) fn wide_scalar_words(&self, e: &Expr) -> Option<u32> {
-        match self.scalar_type_of(e) {
+        match self.scalar_assignment_type(e) {
             Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w)))
                 if w > Self::BUILTIN_SCALAR_BITS =>
             {
@@ -3387,52 +3908,21 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// The scalar type of an expression, including the HOST-STATE reads
-    /// `expr_type` answers `None` for: a testbench field, a scoreboard
-    /// field, a component field (whose member name may be a DOTTED
-    /// record path), a transactor state field and its record leaves.
+    /// The scalar type of a HOST-STATE read — a testbench field, a
+    /// scoreboard field, a component field (whose member name may be a
+    /// DOTTED record path), a transactor state field or one of its
+    /// record leaves.
     ///
-    /// `expr_type` is asked FIRST and its answer is final. It states
-    /// rules this must not restate — notably that a comparison or a
-    /// logical operator yields `Bool` whatever its operands are. An
-    /// earlier version recursed through `Expr::Binary` on its own and
-    /// dropped that rule, so `(a == 1) and (b == 1)` on two wide fields
-    /// of different widths was refused as "the operator `&&` between
-    /// scalars of 5 and 8 words" — a program v1 builds, under a label
-    /// saying v1 cannot.
-    pub(super) fn scalar_type_of(&self, e: &Expr) -> Option<IrType> {
-        let answered = self.expr_type(e);
-        // `Bool` is conclusive: `expr_type` returns it for every
-        // comparison and logical operator regardless of the operands,
-        // which is the rule this function must not restate.
-        if matches!(answered, Some(IrType::Bool)) {
-            return answered;
-        }
-        // For the arithmetic operators `expr_type` DEFERS to its
-        // operands (`self.expr_type(a).or_else(|| self.expr_type(b))`),
-        // so on `a + 1` with a host-state `a` it answers with the
-        // LITERAL's type — narrower than the expression really is. Take
-        // the wider of the two answers rather than the first one.
-        let mine = match e {
-            Expr::Unary(_, inner) => self.scalar_type_of(inner),
-            Expr::Binary(_, a, b) => {
-                let (x, y) = (self.scalar_type_of(a), self.scalar_type_of(b));
-                match (scalar_bits(x.as_ref()), scalar_bits(y.as_ref())) {
-                    (Some(bx), Some(by)) if by > bx => y,
-                    (Some(_), _) => x,
-                    _ => y.or(x),
-                }
-            }
-            Expr::Ternary(_, t, f) => self.scalar_type_of(t).or_else(|| self.scalar_type_of(f)),
-            _ => None,
-        };
-        if mine.is_some() || answered.is_some() {
-            return match (scalar_bits(mine.as_ref()), scalar_bits(answered.as_ref())) {
-                (Some(bm), Some(ba)) if ba > bm => answered,
-                (Some(_), _) => mine,
-                _ => answered.or(mine),
-            };
-        }
+    /// `expr_type` answers `None` for every one of them, which is why
+    /// this exists; `scalar_assignment_type` calls it as its
+    /// fallthrough instead of `expr_type`, so the two halves compose:
+    /// that function knows the EXPRESSION shapes (bitand narrowing,
+    /// shifts, and that a comparison or logical operator yields `Bool`
+    /// whatever its operands are), and this one knows the LEAVES it
+    /// bottoms out on. Written separately and merged; an earlier
+    /// version of this file recursed through `Expr::Binary` here too
+    /// and dropped the `Bool` rule in the copy.
+    pub(super) fn host_state_scalar_type(&self, e: &Expr) -> Option<IrType> {
         let wide = |ty: Option<&IrType>| -> Option<IrType> { ty.cloned() };
         match e {
             Expr::TbField(name) => wide(self.ctx.tb_scalar_fields.get(name)),
@@ -3469,13 +3959,24 @@ impl FuncBuilder<'_> {
                 instance,
                 field,
                 path,
+                index,
+                ..
             } => {
                 let Some(crate::ir::StateFieldKind::Record { record }) =
                     self.state_field_kind(instance, field)
                 else {
                     return None;
                 };
-                wide(self.record_leaf_type(*record, path).as_ref())
+                // `index` came from `main`'s indexed record-state
+                // support. An INDEXED `Vec` leaf reads as one ELEMENT,
+                // so its type is the element type; an unindexed one is
+                // a `std::array` and has no scalar type at all. Same
+                // `(vec_len, index.is_some())` pairing `expr_type`'s
+                // record walk makes.
+                wide(
+                    self.record_leaf_type(*record, path, index.is_some())
+                        .as_ref(),
+                )
             }
             Expr::ComponentField { base, field } => {
                 let cid = self.component_base_id(base)?;
@@ -3495,14 +3996,14 @@ impl FuncBuilder<'_> {
                 match (&f.kind, rest.is_empty()) {
                     (crate::ir::ComponentFieldKind::Scalar { ty, .. }, true) => wide(Some(ty)),
                     (crate::ir::ComponentFieldKind::Record { record }, false) => {
-                        self.record_leaf_type(*record, &rest)
+                        self.record_leaf_type(*record, &rest, false)
                     }
                     _ => None,
                 }
             }
-            // Unary/Binary/Ternary were handled above, where their
-            // answer is merged with `expr_type`'s.
-            _ => None,
+            // Expression shapes belong to `scalar_assignment_type`,
+            // which calls this only after it has decomposed them.
+            _ => self.expr_type(e),
         }
     }
 
@@ -3676,7 +4177,12 @@ impl FuncBuilder<'_> {
     /// The declared type of a record leaf reached by `path` from
     /// `record`. `None` when any step is not a record or the leaf does
     /// not exist.
-    fn record_leaf_type(&self, record: crate::ir::RecordId, path: &[String]) -> Option<IrType> {
+    fn record_leaf_type(
+        &self,
+        record: crate::ir::RecordId,
+        path: &[String],
+        indexed: bool,
+    ) -> Option<IrType> {
         let mut cur = record;
         for (i, seg) in path.iter().enumerate() {
             let fld = self.ctx.records.get(cur.index())?.field(seg)?;
@@ -3685,9 +4191,13 @@ impl FuncBuilder<'_> {
                 // scalar of the element type — the same distinction
                 // `expr_type`'s record walk makes with
                 // `match (fld.vec_len, index.is_some())`. Answering the
-                // element type here would call a whole `Vec` field a
-                // wide scalar.
-                return fld.vec_len.is_none().then(|| fld.ty.clone());
+                // element type there would call a whole `Vec` field a
+                // wide scalar; answering `None` for an INDEXED one
+                // would miss a wide element.
+                return match (fld.vec_len, indexed) {
+                    (Some(_), true) | (None, false) => Some(fld.ty.clone()),
+                    _ => None,
+                };
             }
             match fld.ty {
                 IrType::Record(r) => cur = r,
@@ -3829,6 +4339,13 @@ impl FuncBuilder<'_> {
             _ => None,
         }
     }
+}
+
+fn unparen_expr(mut e: &crate::ast::Expr) -> &crate::ast::Expr {
+    while let ExprKind::Paren(inner) = &*e.kind {
+        e = inner;
+    }
+    e
 }
 
 /// Width-method name → `WidthCastKind`.
@@ -4099,7 +4616,7 @@ fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {
     }
 }
 
-fn wide_literal_bits(words: &[u32]) -> u32 {
+pub(crate) fn wide_literal_bits(words: &[u32]) -> u32 {
     let Some((idx, word)) = words.iter().enumerate().rev().find(|(_, w)| **w != 0) else {
         return 1;
     };
@@ -4108,15 +4625,6 @@ fn wide_literal_bits(words: &[u32]) -> u32 {
 
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
 /// separators). Verilog-style sized literals are not lowered.
-/// Declared bit-width of a scalar IR type, or `None` when it has none.
-fn scalar_bits(ty: Option<&IrType>) -> Option<u32> {
-    match ty? {
-        IrType::UInt(w) | IrType::SInt(w) => *w,
-        IrType::Bool => Some(1),
-        _ => None,
-    }
-}
-
 pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     parse_int_literal_checked(s).ok()
 }

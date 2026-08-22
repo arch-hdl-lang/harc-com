@@ -34,6 +34,15 @@ struct Beat
     data : uint<32>
 end struct Beat
 
+struct StateKid
+    value : uint<8>
+end struct StateKid
+
+struct StateBundle
+    data : Vec<uint<8>, 4>
+    kids : Vec<StateKid, 4>
+end struct StateBundle
+
 bus TlmMemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
 end bus TlmMemBus
@@ -41,17 +50,23 @@ end bus TlmMemBus
 transactor MemoryResponder bound to TlmMemBus
     // Persistent WHOLE-RECORD state (not a queue, not a scalar).
     last : Beat
+    bundle : StateBundle
 
     thread bus.read(addr: uint<8>)
         wait 1 cycle
+        let slot : uint<8> = addr & 3
         // Write the whole-record state field's subfields for this request.
         last.addr = addr
         last.data = 256 + addr
+        bundle.data[slot] = addr
+        bundle.kids[slot].value = addr + 1
         // Read subfields back inside the responder body.
         assert last.addr == addr
             else fail("responder: last.addr=${last.addr}, expected ${addr}")
         assert last.data == 256 + addr
             else fail("responder: last.data=${last.data}, expected ${256 + addr}")
+        assert bundle.data[slot] == addr else fail("responder indexed scalar state mismatch")
+        assert bundle.kids[slot].value == addr + 1 else fail("responder indexed record state mismatch")
         // Return the whole-record subfield.
         return last.data
     end thread
@@ -82,6 +97,8 @@ impl TargetRecordStateTest for TargetRecordStateTb
             else fail("responder.last.addr=${responder.last.addr}, expected 0x05")
         assert responder.last.data == 261
             else fail("responder.last.data=${responder.last.data}, expected 261")
+        assert responder.bundle.data[1] == 5 else fail("test indexed scalar state mismatch")
+        assert responder.bundle.kids[1].value == 6 else fail("test indexed record state mismatch")
 
         log(info, "PASS: whole-record target-transactor state round-tripped")
     end run

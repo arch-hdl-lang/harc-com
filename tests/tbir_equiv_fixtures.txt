@@ -70,6 +70,8 @@ top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass
+pure_helper_record_value_test | Top | top_counter.sv | top_counter.arch | pass
+struct_keep_randomize_test | Top | top_counter.sv | top_counter.arch | pass
 call_return_type_test | Top | top_counter.sv | - | pass | - | call_return_type_ref.cpp
 signed_host_state_test | Top | top_counter.sv | top_counter.arch | pass
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
@@ -181,6 +183,8 @@ agent_on_handler_test | Top | top_counter.sv | - | pass
 component_event_subscription_test | Top | top_counter.sv | - | pass
 method_hook_family_test | Top | top_counter.sv | top_counter.arch | pass
 component_method_randomize_test | Top | top_counter.sv | - | pass
+component_struct_keep_randomize_test | Top | top_counter.sv | - | pass
+phase_struct_keep_randomize_test | Top | top_counter.sv | - | pass
 regblock_access_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_basic_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_bitbash_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
@@ -237,6 +241,7 @@ bind_remap_test | axil_amba | axil_amba.sv | - | pass
 axilite_hooks_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | - | fail
+queue_empty_pop_test | Top | top_counter.sv | - | fail
 aes_cipher_top_test | AesCipherTop | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv | - | pass
 dma_engine_test | DmaEngine | dma_engine.sv | - | pass
 scoreboard_typed_queue_test | ScoreboardTypedQueue | scoreboard_typed_queue.sv | - | pass
@@ -249,6 +254,7 @@ wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
+scoreboard_record_state_test | Top | top_counter.sv | top_counter.arch | pass
 
 # Added by the harc#551 coverage audit. These ran under run_fixtures.sh
 # (default backend only) and were never trace-diffed across the two

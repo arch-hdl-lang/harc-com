@@ -1865,31 +1865,47 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    // Transaction-level `keep` clauses as AST exprs, by transaction
+    // Record-level `keep` clauses as AST exprs, by transaction/struct
     // name. Spec §4: these are part of every `randomize(t)` of that
     // type, merged ahead of any call-site `with {...}` body (v1's
-    // `txn_keeps` merge in `StmtKind::Randomize`).
-    let mut txn_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
+    // record-keep merge in `StmtKind::Randomize`).
+    let mut record_bodies: HashMap<String, Vec<crate::ast::TxnBodyItem>> = HashMap::new();
+    let mut record_fields: HashMap<String, Vec<crate::ast::Field>> = HashMap::new();
     for it in &file.items {
-        if let Item::Transaction(t) = it {
-            let keeps: Vec<crate::ast::Expr> = t
-                .body
-                .iter()
-                .filter_map(|item| match item {
-                    crate::ast::TxnBodyItem::Keep(k) => Some(k.expr.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !keeps.is_empty() {
-                txn_keeps.insert(t.name.name.clone(), keeps);
+        match it {
+            Item::Transaction(t) => {
+                record_bodies.insert(t.name.name.clone(), t.body.clone());
+                record_fields.insert(
+                    t.name.name.clone(),
+                    t.body
+                        .iter()
+                        .filter_map(|item| match item {
+                            crate::ast::TxnBodyItem::Field(field) => Some(field.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                );
             }
+            Item::Struct(s) => {
+                record_bodies.insert(s.name.name.clone(), s.body.clone());
+                record_fields.insert(s.name.name.clone(), s.fields.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut record_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
+    for (name, body) in &record_bodies {
+        let keeps =
+            crate::codegen::cpp_tb::collect_record_keeps(body, &record_bodies, &record_fields);
+        if !keeps.is_empty() {
+            record_keeps.insert(name.clone(), keeps);
         }
     }
 
     // Eagerly lower pure helpers (declaration order) so call sites can
     // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
-    // Records are visible (for precise rejection messages), but pure
-    // helpers cannot hold record locals — see `lower_let`.
+    // Records are visible so scalar-valued pure helpers can hold host-side
+    // record locals in their file-scope C++ bodies.
     let helper_ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: None,
@@ -1935,9 +1951,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        // Pure helpers cannot hold record locals, so `randomize` can
-        // never fire in one — these maps stay inert here.
-        txn_keeps: HashMap::new(),
+        // Pure helpers cannot randomize records (that statement is outside
+        // the pure scan subset), but declaration lowerers reuse this context
+        // when constructing method contexts that can host `randomize`.
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
@@ -2006,7 +2023,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        txn_keeps: txn_keeps.clone(),
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         // tseq generator bodies never access the DUT.
@@ -2222,9 +2239,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
         // Component method bodies are not cataloged in the constraint-IR
-        // problem table; a `randomize` inside one lowers with no
-        // problem-id (v1's nullptr-descriptor fallback).
-        txn_keeps: HashMap::new(),
+        // problem table; a `randomize` inside one still merges declared
+        // keeps, but lowers with no problem-id (v1's nullptr-descriptor
+        // fallback).
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         // Component methods cannot call a tseq generator (test-scope only).
         tseqs: HashMap::new(),
@@ -2349,7 +2367,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &properties,
             &extern_fns,
             &helper_registry,
-            &txn_keeps,
+            &record_keeps,
             &randomize_problem_ids,
             &tseq_records,
             &side_tables,
@@ -3153,7 +3171,7 @@ fn lower_test(
     properties: &HashMap<String, crate::ast::Expr>,
     extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
-    txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
+    record_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
     tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
@@ -5394,7 +5412,7 @@ fn lower_test(
         components: prog.components.clone(),
         component_fields: component_field_map,
         component_modes: component_field_modes,
-        txn_keeps: txn_keeps.clone(),
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         probes: probes.clone(),
@@ -6121,37 +6139,11 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
     }
 }
 
-/// The largest declared field width lowered as a scalar member.
-///
-/// 1024 bits is the language-level vector target `harc_thread_rt.h`
-/// states for `HarcWide<N>` (N <= 32). Locals and queue elements have
-/// NO ceiling — `wide_scalar_words` is
-/// `(width > 128).then(|| width.div_ceil(32))`,
-/// unbounded, and `queue<uint<4096>>` really does emit
-/// `HarcQueue<HarcWide<128>>`. An earlier draft of this comment
-/// claimed 1024 was "the same ceiling the value model already used",
-/// which would have been the reason for the number and is not true.
-/// The number is the stated language limit; the value model is simply
-/// more permissive than the language is.
-///
-/// A FIELD is not a local, but the storage seam is shared:
-/// `field_scalar_cty` renders 65..128 as v1's `_harc_u128` and wider
-/// as `harc_rt::HarcWide<N>`.
-///
-/// This was very nearly capped at 128 instead. Above that, a field is
-/// declared `HarcWide<N>`, and `w = w + 1` on one was rejected by g++
-/// in BOTH backends — "ambiguous overload for `operator+`", because
-/// `HarcWide` converts to `uint64_t` and to `_harc_u128` equally well.
-/// That is a missing runtime overload, not a width the language cannot
-/// express: the mixed HarcWide/integer operators now live next to the
-/// `operator==` that already stated the same rule. Capping here would
-/// have written a language limit around a header omission.
-pub(super) const MAX_SCALAR_FIELD_WIDTH: u32 = 1024;
-
 /// Scalar IR type of a testbench member field (`expected : uint<32>`),
 /// or `None` when the type is outside the scalar subset. Mirrors v1's
 /// `component_field_c_type` → `txn_field_c_type` C-type choice, up to
-/// `MAX_SCALAR_FIELD_WIDTH`.
+/// `MAX_WIDTH_METHOD_BITS`. Signed widths are NOT capped here — the
+/// declared-FIELD rule that does that is `scalar_field_ir_type`.
 pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
@@ -6164,15 +6156,19 @@ pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
         Some(_) => return None,
         None => None,
     };
-    if width.is_some_and(|w| w == 0 || w > MAX_SCALAR_FIELD_WIDTH) {
+    if width == Some(0) {
         return None;
     }
-    match name {
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
-        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
-        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
-        _ => None,
-    }
+    let ty = match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => IrType::UInt(width),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => IrType::SInt(width),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
+        _ => return None,
+    };
+    // The width policy is `components::field_scalar_width_ok`, shared
+    // with the other field-type decoder. The two may differ about which
+    // SPELLINGS they admit; they must not differ about width.
+    components::field_scalar_width_ok(&ty).then_some(ty)
 }
 
 /// Simple (last-segment) name of a `Named` type expression, if any.
@@ -6490,12 +6486,12 @@ pub(crate) struct LowerCtx {
     /// Declared root mode for a component instance. Structural roots use this
     /// only as inherited context for nested transactor fields.
     pub component_modes: HashMap<String, Option<ir::ComponentInstanceMode>>,
-    /// Per-transaction `keep` constraint clauses as AST expressions, by
-    /// transaction name. Merged ahead of a `randomize(t)` call-site
+    /// Per-record `keep` constraint clauses as AST expressions, by
+    /// transaction/struct name. Merged ahead of a `randomize(t)` call-site
     /// `with {...}` body (v1's spec-§4 merge) when building the
     /// `ConstraintSite`. Empty for keep-free transactions and for
     /// contexts that cannot host a `randomize` (pure helpers).
-    pub txn_keeps: HashMap<String, Vec<crate::ast::Expr>>,
+    pub record_keeps: HashMap<String, Vec<crate::ast::Expr>>,
     /// Randomize-target span → typed constraint-problem id. The handle
     /// (`ConstraintProblemId.0`) the constraint-IR layer assigned to the
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
@@ -6729,10 +6725,9 @@ pub(crate) struct FuncBuilder<'a> {
     tb_record_locals: HashMap<String, LocalId>,
     /// Return slot when lowering a standalone pure-helper body.
     pub(crate) helper_ret: Option<LocalId>,
-    /// True while lowering a standalone pure-helper body — record
-    /// locals are rejected there (pure helpers emit as file-scope
-    /// uint64-only C++ functions in the tbir backend).
-    pub(crate) in_pure_helper: bool,
+    /// True only for an out-of-line file helper, whose generated C++ ABI is
+    /// scalar even when source type metadata is otherwise unknown.
+    pub(crate) scalar_helper_abi: bool,
     /// True while lowering `${...}` captures of a log/fail message —
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
@@ -6762,6 +6757,10 @@ pub(crate) struct FuncBuilder<'a> {
     /// refusing `assert a.data == b.data` while v1 emitted
     /// `self.a.data == self.b.data` and g++ accepted it.
     pub(crate) vec_read_ok: bool,
+    /// Exact AST node whose whole-`Vec` read is authorized while
+    /// `vec_read_ok` is set. The landing permission must not leak into a
+    /// nested index/call expression within that node.
+    pub(crate) vec_read_span: Option<crate::lexer::Span>,
     /// True while lowering a transactor method body. Methods keep v1's
     /// synchronous hookable semantics (waits emit as `tick()` loops),
     /// so the constructs whose sync emission is out of this slice —
@@ -7052,6 +7051,7 @@ fn lower_tb_cycle_service_body<'a>(
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     let trigger = b.lower_expr(&trigger_expr)?;
+    b.validate_truth_expr(&trigger, "testbench cycle-handler trigger")?;
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -7190,9 +7190,10 @@ impl<'a> FuncBuilder<'a> {
             inline_frames: Vec::new(),
             tb_record_locals: HashMap::new(),
             helper_ret: None,
-            in_pure_helper: false,
+            scalar_helper_abi: false,
             in_fmt_args: false,
             vec_read_ok: false,
+            vec_read_span: None,
             in_transactor_method: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),
@@ -7639,11 +7640,24 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
     fn in_expr(e: &ir::Expr) -> Option<String> {
         match e {
             ir::Expr::TransactorState { instance, .. }
-            | ir::Expr::TransactorStateRecordField { instance, .. }
             | ir::Expr::TransactorStateQueueQuery { instance, .. }
                 if !instance.is_empty() =>
             {
                 Some(instance.clone())
+            }
+            ir::Expr::TransactorStateRecordField {
+                instance,
+                mid_indices,
+                index,
+                ..
+            } => {
+                if !instance.is_empty() {
+                    return Some(instance.clone());
+                }
+                mid_indices
+                    .iter()
+                    .find_map(|(_, idx)| in_expr(idx))
+                    .or_else(|| index.as_deref().and_then(in_expr))
             }
             ir::Expr::Binary(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
             ir::Expr::Unary(_, a) | ir::Expr::WidthCast { inner: a, .. } => in_expr(a),
@@ -7665,13 +7679,28 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::TransactorStateWrite {
                     instance, value, ..
                 }
-                | ir::Stmt::TransactorStateRecordFieldWrite {
-                    instance, value, ..
-                } => {
+                => {
                     if !instance.is_empty() {
                         Some(instance.clone())
                     } else {
                         in_expr(value)
+                    }
+                }
+                ir::Stmt::TransactorStateRecordFieldWrite {
+                    instance,
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    if !instance.is_empty() {
+                        Some(instance.clone())
+                    } else {
+                        mid_indices
+                            .iter()
+                            .find_map(|(_, idx)| in_expr(idx))
+                            .or_else(|| index.as_ref().and_then(in_expr))
+                            .or_else(|| in_expr(value))
                     }
                 }
                 ir::Stmt::TransactorStateQueuePush {
@@ -7756,13 +7785,30 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
     fn fill_expr(e: &mut ir::Expr, instance: &str) {
         match e {
             ir::Expr::TransactorState { instance: i, .. }
-            | ir::Expr::TransactorStateRecordField { instance: i, .. }
             | ir::Expr::TransactorStateQueueQuery { instance: i, .. } => {
                 debug_assert!(
                     i.is_empty() || i == instance,
                     "target-state instance already filled with a different name"
                 );
                 *i = instance.to_string();
+            }
+            ir::Expr::TransactorStateRecordField {
+                instance: i,
+                mid_indices,
+                index,
+                ..
+            } => {
+                debug_assert!(
+                    i.is_empty() || i == instance,
+                    "target-state instance already filled with a different name"
+                );
+                *i = instance.to_string();
+                for (_, idx) in mid_indices {
+                    fill_expr(idx, instance);
+                }
+                if let Some(idx) = index {
+                    fill_expr(idx, instance);
+                }
             }
             ir::Expr::Binary(_, a, b) => {
                 fill_expr(a, instance);
@@ -7861,9 +7907,6 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::TransactorStateWrite {
                     instance: i, value, ..
                 }
-                | ir::Stmt::TransactorStateRecordFieldWrite {
-                    instance: i, value, ..
-                }
                 | ir::Stmt::TransactorStateQueuePush {
                     instance: i, value, ..
                 } => {
@@ -7872,6 +7915,26 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                         "target-state-write instance already filled with a different name"
                     );
                     *i = instance.to_string();
+                    fill_expr(value, instance);
+                }
+                ir::Stmt::TransactorStateRecordFieldWrite {
+                    instance: i,
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    debug_assert!(
+                        i.is_empty() || i == instance,
+                        "target-state-write instance already filled with a different name"
+                    );
+                    *i = instance.to_string();
+                    for (_, idx) in mid_indices {
+                        fill_expr(idx, instance);
+                    }
+                    if let Some(idx) = index {
+                        fill_expr(idx, instance);
+                    }
                     fill_expr(value, instance);
                 }
                 ir::Stmt::TransactorStateQueuePop { instance: i, .. } => {
@@ -8064,6 +8127,16 @@ fn fill_visit_expr(
                 fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
             }
         }
+        Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+            if let Some(idx) = index {
+                fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict);
+            }
+        }
         Expr::CovHookParam {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
@@ -8081,7 +8154,6 @@ fn fill_visit_expr(
         | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
-        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ComponentValue { .. }
@@ -8154,9 +8226,22 @@ fn fill_initiator_bus_prefix(
                     | Stmt::TbFieldWrite { value: e, .. }
                     | Stmt::TbQueuePush { value: e, .. }
                     | Stmt::TransactorStateWrite { value: e, .. }
-                    | Stmt::TransactorStateRecordFieldWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
+                    }
+                    Stmt::TransactorStateRecordFieldWrite {
+                        mid_indices,
+                        index,
+                        value,
+                        ..
+                    } => {
+                        for (_, idx) in mid_indices {
+                            visit_expr(idx, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                        if let Some(idx) = index {
+                            visit_expr(idx, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                        visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::ComponentVecElementWrite { index, value, .. } => {
                         visit_expr(index, placeholder, binding, remap, rewrite, &mut conflict);

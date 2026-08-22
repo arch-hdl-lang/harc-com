@@ -1877,6 +1877,7 @@ fn lower_cycle_body(
     // checker's test-scope `dut` pointer; field reads resolve self-
     // relatively and re-root at the instance path at emission.
     let trigger = b.lower_expr(&h.event)?;
+    b.validate_truth_expr(&trigger, "component cycle-handler trigger")?;
     b.lower_block_stmts(&h.body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -3065,16 +3066,49 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
         .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
 }
 
-/// The scalar subset of a DECLARED component/scoreboard field, capped at
-/// `MAX_SCALAR_FIELD_WIDTH`. Both emitters render the member through
-/// `field_scalar_cty`, which knows `_harc_u128` and `HarcWide<N>`, so
-/// the 64-bit cap `scalar_ir_type` still applies to payloads and vector
+/// The scalar subset of a DECLARED component/scoreboard/testbench
+/// field. Both emitters render the member through `field_scalar_cty`,
+/// which knows `_harc_u128` and `HarcWide<N>`, so the 64-bit cap
+/// `scalar_ir_type` still applies to event payloads and fixed-vector
 /// elements never belonged here.
+///
+/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`, the language's stated
+/// vector target, which `lib.rs` has held all along — this branch added
+/// a `MAX_SCALAR_FIELD_WIDTH` beside it with a doc comment re-deriving
+/// the number 1024 that the constant it duplicated already fixed.
+///
+/// SIGNED stops at 64. Past that a scalar lives in `_harc_u128` or
+/// `HarcWide<N>`, and BOTH are unsigned: `<` and `/` on either answer
+/// by magnitude, in v1 as well as here. That is `main`'s scoreboard
+/// rule, capped for exactly that reason while this branch was widening
+/// every declared field to 1024 without it. The narrower position is
+/// the right one, and one decoder is the place for it — `main` had
+/// re-introduced a second copy in `scoreboards.rs` to hold it.
 pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
-    decoded_scalar_ir_type(t).filter(|ty| {
-        !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w))
-            if *w > super::MAX_SCALAR_FIELD_WIDTH)
-    })
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// The width policy for a declared scalar FIELD, at every site that has
+/// one.
+///
+/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`; SIGNED stops at 64.
+///
+/// There are two field-type decoders — this file's, which also accepts
+/// `BuiltinTy::Int`, and `tb_scalar_field_ir_type` in `mod.rs` — and
+/// they are allowed to differ about which SPELLINGS they admit. They
+/// are not allowed to differ about WIDTH: a `sint<128>` refused on a
+/// scoreboard and lowered on a testbench field is one language with two
+/// rules. Landing the cap in only one of them is exactly what happened
+/// at the merge that introduced it.
+pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
+    match ty {
+        IrType::UInt(Some(w)) => *w <= crate::MAX_WIDTH_METHOD_BITS,
+        // Past 64 a scalar lives in `_harc_u128` or `HarcWide<N>`, and
+        // BOTH are unsigned: `<` and `/` on one answer by magnitude, in
+        // v1 as well as here.
+        IrType::SInt(Some(w)) => *w <= 64,
+        _ => true,
+    }
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {
@@ -4038,7 +4072,7 @@ impl super::FuncBuilder<'_> {
             // shape, which both backends emit and g++ accepts
             // (`self.a.data == self.b.data`). See `vec_read_ok`; the
             // pairing check is what sets it.
-            if rf.leaf_vec.is_some() && !self.vec_read_ok {
+            if rf.leaf_vec.is_some() && !self.whole_vec_read_allowed(e) {
                 // Measured on the landings that still reach here:
                 // `let d = a.data` gives "cannot convert
                 // `std::array<…,4>` to `int64_t` in initialization" from
@@ -4064,12 +4098,21 @@ impl super::FuncBuilder<'_> {
                         if matches!(
                             field.kind,
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
-                        ) {
+                        ) || (self.whole_vec_read_allowed(e)
+                            && matches!(field.kind, ComponentFieldKind::FixedVec(_)))
+                        {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some(IrExpr::ComponentField {
                                 base: ComponentBase::SelfField,
                                 field: id.name.clone(),
                             }));
+                        }
+                        if matches!(field.kind, ComponentFieldKind::FixedVec(_)) {
+                            return Err(not_implemented(
+                                &format!("a whole-vector component field `{}`", id.name),
+                                format!("index the field element-wise (`{}[i]`)", id.name),
+                                V1Status::EmitsUncompilable,
+                            ));
                         }
                     }
                 }
@@ -4095,7 +4138,9 @@ impl super::FuncBuilder<'_> {
                         if matches!(
                             schema.kind,
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
-                        ) {
+                        ) || (self.whole_vec_read_allowed(e)
+                            && matches!(schema.kind, ComponentFieldKind::FixedVec(_)))
+                        {
                             self.require_component_activation(
                                 &path[0],
                                 head_cid,
@@ -4111,6 +4156,13 @@ impl super::FuncBuilder<'_> {
                                 base: ComponentBase::Path(base),
                                 field,
                             }));
+                        }
+                        if matches!(schema.kind, ComponentFieldKind::FixedVec(_)) {
+                            return Err(not_implemented(
+                                &format!("a whole-vector component field `{}`", path.join(".")),
+                                format!("index the field element-wise (`{}[i]`)", path.join(".")),
+                                V1Status::EmitsUncompilable,
+                            ));
                         }
                     }
                 }
@@ -4433,7 +4485,7 @@ impl super::FuncBuilder<'_> {
     /// returned rather than re-derived from the base segments because
     /// those start with the literal `"self"` in the second shape, which
     /// names no binding.
-    fn component_path_head<'a>(
+    pub(crate) fn component_path_head<'a>(
         &self,
         path: &'a [String],
     ) -> Option<(
@@ -4695,26 +4747,17 @@ impl super::FuncBuilder<'_> {
                         )));
                     }
                     let lowered = self.lower_component_call_args(args, None)?;
-                    // Shape must agree: the channel renders as
-                    // `std::function<void(uint64_t)>` or
-                    // `std::function<void(<Record>)>`, and passing one
-                    // where the other is expected is a hard C++ error.
-                    // Signedness is left alone — both backends widen a
-                    // scalar payload to a 64-bit slot, so `sint` into an
-                    // `event<uint<8>>` is the same benign conversion v1
-                    // performs.
-                    // `record_id_of_expr`, not `expr_type`: the latter
-                    // has no arm for a record-valued component field,
-                    // transactor-state field or ternary, and this match
-                    // waved `Unknown` straight through — so exactly the
-                    // shapes divergence 108 taught the compiler to type
-                    // were the ones this check could not see.
-                    let got = self.record_id_of_expr(&lowered[0]);
-                    let shape_ok = match payload {
-                        EventPayload::Record(want) => got == Some(want),
-                        EventPayload::Scalar { .. } => got.is_none(),
-                    };
-                    if !shape_ok {
+                    if self
+                        .check_slot_type(
+                            &lowered[0],
+                            match payload {
+                                EventPayload::Record(r) => Some(r),
+                                EventPayload::Scalar { .. } => None,
+                            },
+                            &format!("event `{}`", segs[0]),
+                        )
+                        .is_err()
+                    {
                         let want = match payload {
                             EventPayload::Scalar { signed: true } => "sint".to_string(),
                             EventPayload::Scalar { signed: false } => "uint".to_string(),

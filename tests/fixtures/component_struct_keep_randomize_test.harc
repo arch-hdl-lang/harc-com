@@ -1,0 +1,49 @@
+// A kept struct randomized only inside a component method. Component sites
+// are intentionally absent from the typed runtime problem table, so this
+// fixture catches a missing `harc_z3_rt.h` include as a C++ compile failure.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct ComponentKeepValue
+    value : uint<16>
+    keep value > 1000
+    keep value < 2000
+end struct ComponentKeepValue
+
+agent ComponentKeepRandomizer
+    trigger : event<uint<8>>
+    seen    : uint<32> default 0
+    last    : uint<16> default 0
+
+    on trigger(tag)
+        let item : ComponentKeepValue
+        randomize(item)
+        seen = seen + 1
+        last = item.value
+    end on
+end agent ComponentKeepRandomizer
+
+test ComponentStructKeepRandomizeTest
+    let dut : Top
+    let rz  : ComponentKeepRandomizer
+
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        emit rz.trigger(1)
+        wait 2 cycles
+
+        assert rz.seen == 1 else fail("component keep handler count ${rz.seen}")
+        assert rz.last > 1000 else fail("component keep lower bound ${rz.last}")
+        assert rz.last < 2000 else fail("component keep upper bound ${rz.last}")
+        log(info, "component struct keep randomized ${rz.last}")
+    end run
+end test ComponentStructKeepRandomizeTest

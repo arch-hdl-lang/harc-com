@@ -1615,10 +1615,15 @@ end test T"#,
     // From-source: 2 (one for log(error), one for log(fatal)).
     // Plus existing `errors++;` from assert/fail paths: 0 here (no
     // asserts in the fixture).
+    // Plus 1 from the prologue's `HarcQueueFatalScope` reporter, which
+    // routes an empty-queue pop through the same FATAL path (#644). It
+    // is scaffolding, not a lowering of any statement in the fixture —
+    // the point of this count is still that info/warn/debug lower to no
+    // bump at all, and a regression there moves the total either way.
     assert_eq!(
-        errors_inc_count, 2,
-        "expected exactly 2 `errors++;` lines (one for ERROR, one for FATAL); \
-         got {} in:\n{}",
+        errors_inc_count, 3,
+        "expected exactly 3 `errors++;` lines (ERROR, FATAL, and the queue-pop \
+         reporter in the prologue); got {} in:\n{}",
         errors_inc_count, cpp
     );
 

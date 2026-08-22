@@ -1,13 +1,13 @@
 //! `scoreboard` declaration lowering → `ScoreboardSchema`.
 //!
 //! A scoreboard in the v0 subset is a *data-only* host-state record: a
-//! testbench field holding scalar counters and typed FIFO queues. v1's
+//! testbench field holding scalar counters, value-records, and typed FIFO queues. v1's
 //! `emit_scoreboard` is the behavior reference — it emits a C++ struct
 //! whose scalar fields are `uint64_t`/`int64_t`/`bool` members (with
 //! their declared defaults) and whose `queue<T>` fields are
 //! `harc_rt::HarcQueue<T>` members. The test body manipulates them
-//! through `Stmt::ScoreboardOp` (push/pop/scalar-write) and
-//! `Expr::ScoreboardQuery` (size/empty/scalar-read).
+//! through `Stmt::ScoreboardOp` (push/pop/value-write) and
+//! `Expr::ScoreboardQuery` (size/empty/value-read).
 //!
 //! Out-of-scope shapes are explicit rejections, never silent drops.
 //! `Unsupported` (v1 runs the program):
@@ -17,7 +17,7 @@
 //!     scoreboard does not lower to a struct missing its methods);
 //!   - queue element types other than exact scalars through the 1024-bit
 //!     language ceiling or value-records (enum/Vec/list/event/nested);
-//!   - non-scalar / >64-bit scalar fields.
+//!   - non-scalar fields and signed scalar fields above 64 bits.
 //!
 //! `NotImplemented { v1: SilentlyMisLowers }` (v1 is not a way out):
 //!   - component `parameters`, which v1 drops entirely;
@@ -27,7 +27,7 @@
 use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, TypeExpr};
 use crate::codegen::cpp_tb::RecordLeafFate;
-use crate::ir::{RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
+use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
 
 pub(crate) fn lower_scoreboard(
@@ -104,6 +104,14 @@ pub(crate) fn lower_scoreboard(
         match item {
             ComponentItem::Field(f) => {
                 let fname = &f.name.name;
+                if matches!(fname.as_str(), "_last_in_cycle" | "_last_out_cycle") {
+                    return Err(not_implemented(
+                        &format!("scoreboard field `{sb}.{fname}`"),
+                        "v1 emits this user field beside a generated scoreboard heartbeat field \
+                         with the same name, so the generated C++ has duplicate members",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 if f.direction.is_some() {
                     // v1 emits `uint64_t p;` — no direction, and no
                     // initializer either, so the field reads
@@ -140,7 +148,7 @@ pub(crate) fn lower_scoreboard(
                 )?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
-                        let default = scalar_default(&f.default, sb, fname, &f.ty, consts)?;
+                        let default = scalar_default(&f.default, sb, fname, &f.ty, &ty, consts)?;
                         ScoreboardFieldKind::Scalar { ty, default }
                     }
                     other => {
@@ -149,12 +157,20 @@ pub(crate) fn lower_scoreboard(
                             // and g++ rejects it: "could not convert '0'
                             // from 'int' to 'harc_rt::HarcQueue<long
                             // unsigned int>'" (`-std=gnu++20`).
-                            return Err(not_implemented(
-                                &format!("a default on scoreboard queue field `{sb}.{fname}`"),
-                                "queues default-construct empty; v1 emits \
-                                 `HarcQueue<T> q = 0;`, which has no such constructor",
-                                V1Status::EmitsUncompilable,
-                            ));
+                            return Err(match other {
+                                ScoreboardFieldKind::Record { .. } => not_implemented(
+                                    &format!("a default on scoreboard record field `{sb}.{fname}`"),
+                                    "record fields use their type-derived default initialization; \
+                                     v1 emits `Record field = 0`, which has no such conversion",
+                                    V1Status::EmitsUncompilable,
+                                ),
+                                _ => not_implemented(
+                                    &format!("a default on scoreboard queue field `{sb}.{fname}`"),
+                                    "queues default-construct empty; v1 emits \
+                                     `HarcQueue<T> q = 0;`, which has no such constructor",
+                                    V1Status::EmitsUncompilable,
+                                ),
+                            });
                         }
                         other
                     }
@@ -286,7 +302,7 @@ pub(crate) fn lower_scoreboard(
             _ => {
                 return Err(unsupported(
                     &format!("an unsupported item in scoreboard `{sb}`"),
-                    "only scalar/queue fields are lowered",
+                    "only scalar, record, and queue fields are lowered",
                 ));
             }
         }
@@ -324,6 +340,14 @@ fn scoreboard_field_kind(
             super::components::lower_queue_elem(sb, fname, args.first(), record_ids, enum_names)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
+    if let TypeExpr::Named { name, .. } = t {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if declared_records.contains(simple) {
+            return Ok(ScoreboardFieldKind::Record {
+                record: record_ids[simple],
+            });
+        }
+    }
     let ty = super::components::scalar_field_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same
         // predicate rather than a second copy of it: what does v1 do
@@ -346,7 +370,8 @@ fn scoreboard_field_kind(
         // uses. Measured: `list<Vec<uint<8>, 2>>` gives
         // `std::vector<std::array<uint64_t, 2>> l;` and compiles, while
         // the same leaf in a transaction does not.
-        const SUBSET: &str = "only scalar uint/sint/bits/bool fields up to 1024 bits and \
+        const SUBSET: &str = "only unsigned scalar fields through 1024 bits, signed scalar \
+                              fields up to 64 bits, bool fields, and \
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
@@ -363,7 +388,10 @@ fn scoreboard_field_kind(
         }
         unsupported(&what, SUBSET)
     })?;
-    Ok(ScoreboardFieldKind::Scalar { ty, default: 0 })
+    Ok(ScoreboardFieldKind::Scalar {
+        ty,
+        default: crate::ir::ScoreboardScalarDefault::Narrow(0),
+    })
 }
 
 /// A scoreboard field's `default` — same rule as the component form
@@ -375,13 +403,74 @@ fn scalar_default(
     sb: &str,
     fname: &str,
     ty: &crate::ast::TypeExpr,
+    ir_ty: &IrType,
     consts: &HashMap<String, super::ConstVal>,
-) -> Result<u64, LowerError> {
-    let Some(d) = default else { return Ok(0) };
+) -> Result<crate::ir::ScoreboardScalarDefault, LowerError> {
+    let Some(d) = default else {
+        return Ok(crate::ir::ScoreboardScalarDefault::Narrow(0));
+    };
+    if matches!(ir_ty, IrType::UInt(_)) {
+        if let crate::ast::ExprKind::Int(lit) = &*d.kind {
+            if let Some(words) = scoreboard_wide_hex_words(lit) {
+                let value_bits = super::exprs::wide_literal_bits(&words);
+                let fits = matches!(ir_ty, IrType::UInt(Some(width)) if value_bits <= *width);
+                if !fits {
+                    return Err(LowerError::Invalid(format!(
+                        "the default on scoreboard field `{sb}.{fname}`: unsigned literal needs \
+                     {value_bits} bits but the field is declared {ir_ty:?}"
+                    )));
+                }
+                if value_bits <= 64 {
+                    let lo = words.first().copied().unwrap_or(0) as u64;
+                    let hi = words.get(1).copied().unwrap_or(0) as u64;
+                    return Ok(crate::ir::ScoreboardScalarDefault::Narrow(lo | (hi << 32)));
+                }
+                return Ok(crate::ir::ScoreboardScalarDefault::Wide(words));
+            }
+        }
+    }
     super::components::fold_field_default(
         d,
         Some(ty),
         consts,
         &format!("scoreboard field `{sb}.{fname}`"),
     )
+    .map(crate::ir::ScoreboardScalarDefault::Narrow)
+}
+
+/// Scoreboard defaults are persistent values, so unlike the general sized-
+/// literal expression gap they retain fitting wide hexadecimal initializers.
+/// Accept both `0x...` and `N'h...` and trim leading zero words. Unsized hex
+/// already handled by the shared `u64` folder stays on that path unless its
+/// spelling is wider than 16 digits; sized hex is retained even when its value
+/// fits in `u64`, because the shared folder intentionally does not parse it.
+fn scoreboard_wide_hex_words(lit: &str) -> Option<Vec<u32>> {
+    let normalized = lit.replace('_', "");
+    let sized = normalized.find('\'');
+    let hex = if let Some(tick) = sized {
+        let tail = &normalized[tick + 1..];
+        let (kind, digits) = tail.split_at(tail.chars().next()?.len_utf8());
+        matches!(kind, "h" | "H").then_some(digits)?
+    } else {
+        normalized
+            .strip_prefix("0x")
+            .or_else(|| normalized.strip_prefix("0X"))?
+    };
+    if hex.chars().any(|c| !c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if sized.is_none() && hex.len() <= 16 {
+        return None;
+    }
+    let mut words = Vec::with_capacity(hex.len().div_ceil(8));
+    let mut remaining = hex.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(8);
+        words.push(u32::from_str_radix(&hex[start..remaining], 16).ok()?);
+        remaining = start;
+    }
+    while words.len() > 1 && words.last() == Some(&0) {
+        words.pop();
+    }
+    Some(words)
 }

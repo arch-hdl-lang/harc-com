@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 /// (`EmitOpts::vec_lane_widths`) that routes `dut.<port>[i]` lane
 /// accesses through `harc_rt::harc_vec_lane_*<W>` (v1's
 /// `dut_packed_lane` split).
+#[derive(Clone, Copy)]
 pub(super) struct ECx<'a> {
     pub func: &'a TbFunction,
     pub names: &'a [String],
@@ -51,6 +52,9 @@ pub(super) struct ECx<'a> {
     /// per-instance struct the caller passed by reference; `None`
     /// everywhere else (an empty instance is then a lowering/pass bug).
     pub state_receiver: Option<&'a str>,
+    /// Widths of the current concurrent check's temporal latch slots.
+    /// Empty outside property/cover emission.
+    pub temporal_widths: &'a [Option<u32>],
 }
 
 /// C++ symbol for a lowered pure-helper function. Prefixed so a HARC
@@ -250,6 +254,30 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // across checks the way v1's span-tagged names guard against.
         Expr::TemporalSlot { slot, kind } => match kind {
             crate::ir::TemporalFn::Past => format!("_harc_ps{slot}"),
+            crate::ir::TemporalFn::Rose
+                if cx
+                    .temporal_widths
+                    .get(*slot as usize)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|width| width > 128) =>
+            {
+                format!(
+                    "(harc_rt::harc_wide_is_zero(_harc_ps{slot}) && !harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
+                )
+            }
+            crate::ir::TemporalFn::Fell
+                if cx
+                    .temporal_widths
+                    .get(*slot as usize)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|width| width > 128) =>
+            {
+                format!(
+                    "(!harc_rt::harc_wide_is_zero(_harc_ps{slot}) && harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
+                )
+            }
             crate::ir::TemporalFn::Rose => format!("(!_harc_ps{slot} && _harc_cur{slot})"),
             crate::ir::TemporalFn::Fell => format!("(_harc_ps{slot} && !_harc_cur{slot})"),
             crate::ir::TemporalFn::Stable => format!("(_harc_ps{slot} == _harc_cur{slot})"),
@@ -280,11 +308,19 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             instance,
             field,
             path,
-        } => format!(
-            "{}.{field}.{}",
-            resolve_state_instance(cx, instance)?,
-            path.join(".")
-        ),
+            mid_indices,
+            index,
+        } => {
+            let recv = format!("{}.{field}", resolve_state_instance(cx, instance)?);
+            record_access_cpp(
+                cx,
+                &recv,
+                &path[0],
+                &path[1..],
+                mid_indices,
+                index.as_deref(),
+            )?
+        }
         // Bound-to target transactor `queue<T>` state field size/empty
         // read — a `harc_rt::HarcQueue<T>` member of the per-instance
         // struct. Mirrors the scoreboard/component queue-query shapes.
@@ -355,40 +391,98 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
             }
             let a_signed = expr_is_signed(cx, a);
-            let a_width = expr_shift_width(cx, a);
-            let a = expr_cpp(cx, a)?;
-            let b = expr_cpp(cx, b)?;
+            let a_width = shift_lhs_width(cx, a);
+            let mut a_cpp = expr_cpp(cx, a)?;
+            let mut b_cpp = expr_cpp(cx, b)?;
+
+            // `HarcWide<N>` deliberately converts to both native scalar
+            // carriers for reads, which makes a mixed expression such as
+            // `wide + 1` or `wide & 0xFF` ambiguous to C++. For unsigned
+            // arithmetic/bitwise operators, promote both operands to the
+            // widest word carrier before spelling the operator. This also
+            // widens differently-sized HarcWide operands to one ABI.
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+            ) {
+                (a_cpp, b_cpp) = coerce_unsigned_wide_pair(cx, a, b, a_cpp, b_cpp);
+            }
+            let shift_count = shift_count_cpp(cx, b, &b_cpp, a_width.unwrap_or(64));
+            let wide_shift_count = expr_static_width(cx, b).is_some_and(|width| width > 64);
             match op {
+                BinOp::And => format!(
+                    "({} && {})",
+                    truthy_cpp(cx, a, a_cpp),
+                    truthy_cpp(cx, b, b_cpp)
+                ),
+                BinOp::Or => format!(
+                    "({} || {})",
+                    truthy_cpp(cx, a, a_cpp),
+                    truthy_cpp(cx, b, b_cpp)
+                ),
                 BinOp::Shl if a_width.is_some_and(|w| w > 128) => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_wide_mask_bits((({a}) << ({b})), {width})")
+                    format!("harc_rt::harc_wide_mask_bits((({a_cpp}) << ({shift_count})), {width})")
                 }
                 BinOp::Shl if a_width.is_some_and(|w| w > 64) => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_shl_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                    format!("harc_rt::harc_shl_u128((_harc_u128)({a_cpp}), (uint64_t)({shift_count}), {width})")
                 }
-                BinOp::Shl => format!("(((uint64_t)({a})) << {b})"),
+                BinOp::Shl if wide_shift_count => {
+                    let width = a_width.unwrap_or(64);
+                    format!(
+                        "((uint64_t)harc_rt::harc_shl_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
+                    )
+                }
+                BinOp::Shl => format!("(((uint64_t)({a_cpp})) << {shift_count})"),
                 BinOp::Shr if a_width.is_some_and(|w| w > 128) && a_signed => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_wide_ashr(({a}), (uint64_t)({b}), {width})")
+                    format!("harc_rt::harc_wide_ashr(({a_cpp}), {shift_count}, {width})")
                 }
                 BinOp::Shr if a_width.is_some_and(|w| w > 128) => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_wide_mask_bits((({a}) >> ({b})), {width})")
+                    format!("harc_rt::harc_wide_mask_bits((({a_cpp}) >> ({shift_count})), {width})")
                 }
                 BinOp::Shr if a_width.is_some_and(|w| w > 64) && a_signed => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_ashr_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                    format!(
+                        "harc_rt::harc_ashr_u128((_harc_u128)({a_cpp}), (uint64_t)({shift_count}), {width})"
+                    )
                 }
                 BinOp::Shr if a_width.is_some_and(|w| w > 64) => {
                     let width = a_width.unwrap();
-                    format!("harc_rt::harc_shr_u128((_harc_u128)({a}), (uint64_t)({b}), {width})")
+                    format!("harc_rt::harc_shr_u128((_harc_u128)({a_cpp}), (uint64_t)({shift_count}), {width})")
+                }
+                BinOp::Shr if a_signed && wide_shift_count => {
+                    let width = a_width.unwrap_or(64);
+                    format!(
+                        "((int64_t)harc_rt::harc_ashr_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
+                    )
+                }
+                BinOp::Shr if wide_shift_count => {
+                    let width = a_width.unwrap_or(64);
+                    format!(
+                        "((uint64_t)harc_rt::harc_shr_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
+                    )
                 }
                 BinOp::Shr if a_signed => {
-                    format!("(((int64_t)({a})) >> {b})")
+                    format!("(((int64_t)({a_cpp})) >> {shift_count})")
                 }
-                BinOp::Shr => format!("(((uint64_t)({a})) >> {b})"),
-                _ => format!("({a} {} {b})", bin_op_cpp(*op)),
+                BinOp::Shr => format!("(((uint64_t)({a_cpp})) >> {shift_count})"),
+                _ => format!("({a_cpp} {} {b_cpp})", bin_op_cpp(*op)),
             }
         }
         Expr::Unary(op, a) => {
@@ -396,16 +490,24 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let a = expr_cpp(cx, a)?;
             match op {
                 UnOp::BitNot => bit_not_cpp(&a, width),
+                UnOp::Neg if width.is_some_and(|w| w > 128) => {
+                    let width = width.unwrap();
+                    format!("harc_rt::harc_wide_negate({a}, {width})")
+                }
+                UnOp::Not if width.is_some_and(|w| w > 128) => {
+                    format!("harc_rt::harc_wide_is_zero({a})")
+                }
                 _ => format!("{}({a})", un_op_cpp(*op)),
             }
         }
         Expr::Ternary(c, t, e2) => {
             // v1 wraps the whole conditional in parens so it cannot
             // bind into a surrounding higher-precedence operator.
-            let c = expr_cpp(cx, c)?;
-            let t = expr_cpp(cx, t)?;
-            let e2 = expr_cpp(cx, e2)?;
-            format!("({c} ? {t} : {e2})")
+            let c = truthy_cpp(cx, c, expr_cpp(cx, c)?);
+            let t_cpp = expr_cpp(cx, t)?;
+            let e2_cpp = expr_cpp(cx, e2)?;
+            let (t_cpp, e2_cpp) = coerce_unsigned_wide_pair(cx, t, e2, t_cpp, e2_cpp);
+            format!("({c} ? {t_cpp} : {e2_cpp})")
         }
         Expr::BitSlice { target, hi, lo } => {
             let t = match &**target {
@@ -483,9 +585,18 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
         }
-        Expr::ComponentVecElement { base, field, index } => {
+        Expr::ComponentVecElement {
+            base,
+            field,
+            index_pos,
+            index,
+        } => {
             let index = expr_cpp(cx, index)?;
-            format!("{}.{field}[{index}]", comp_base_cpp_subst_cx(cx, base))
+            format!(
+                "{}.{}",
+                comp_base_cpp_subst_cx(cx, base),
+                indexed_member_cpp(field, *index_pos, &index)
+            )
         }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
@@ -513,7 +624,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.
         Expr::ComponentIdle { base, kind, n } => {
             let recv = comp_base_cpp_subst(base, cx.self_subst);
-            let n = expr_cpp(cx, n)?;
+            let n = bounded_count_expr_cpp(cx, n, u64::MAX)?;
             match kind {
                 crate::ir::IdleKind::In => {
                     format!("(((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n}))")
@@ -530,7 +641,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::TransactorIdle {
             storage, kind, n, ..
         } => {
-            let n = expr_cpp(cx, n)?;
+            let n = bounded_count_expr_cpp(cx, n, u64::MAX)?;
             match kind {
                 crate::ir::IdleKind::In => {
                     format!(
@@ -828,6 +939,185 @@ fn bin_op_cpp(op: BinOp) -> &'static str {
     }
 }
 
+fn wide_operand_cpp(
+    value: String,
+    source_width: Option<u32>,
+    source_signed: bool,
+    target_width: u32,
+) -> String {
+    let words = target_width.div_ceil(32);
+    match source_width {
+        Some(width) if width == target_width => value,
+        Some(width) if source_signed => {
+            format!("harc_rt::harc_wide_sext<{words}>({value}, {width}, {target_width})")
+        }
+        Some(width) => format!("harc_rt::harc_wide_zext<{words}>({value}, {width})"),
+        None if source_signed => {
+            format!("harc_rt::harc_wide_sext<{words}>({value}, 64, {target_width})")
+        }
+        None => format!("harc_rt::harc_wide_zext<{words}>({value})"),
+    }
+}
+
+fn coerce_unsigned_wide_pair(
+    cx: &ECx<'_>,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_cpp: String,
+    rhs_cpp: String,
+) -> (String, String) {
+    let lhs_width = expr_binary_operand_width(cx, lhs);
+    let rhs_width = expr_binary_operand_width(cx, rhs);
+    let Some(target_width) = lhs_width.max(rhs_width).filter(|width| *width > 128) else {
+        return (lhs_cpp, rhs_cpp);
+    };
+    let lhs_signed = expr_is_signed(cx, lhs);
+    let rhs_signed = expr_is_signed(cx, rhs);
+    let target_is_unsigned = lhs_width.is_some_and(|w| w == target_width && !lhs_signed)
+        || rhs_width.is_some_and(|w| w == target_width && !rhs_signed);
+    if !target_is_unsigned {
+        return (lhs_cpp, rhs_cpp);
+    }
+
+    let needs_signed_extension = |expr: &Expr, signed: bool| {
+        signed
+            && !matches!(
+                expr,
+                Expr::Literal {
+                    ty: crate::ir::IrType::Unknown,
+                    ..
+                }
+            )
+    };
+    (
+        wide_operand_cpp(
+            lhs_cpp,
+            lhs_width,
+            needs_signed_extension(lhs, lhs_signed),
+            target_width,
+        ),
+        wide_operand_cpp(
+            rhs_cpp,
+            rhs_width,
+            needs_signed_extension(rhs, rhs_signed),
+            target_width,
+        ),
+    )
+}
+
+fn truthy_cpp(cx: &ECx<'_>, expr: &Expr, rendered: String) -> String {
+    if expr_static_width(cx, expr).is_some_and(|width| width > 128) {
+        format!("!harc_rt::harc_wide_is_zero({rendered})")
+    } else {
+        rendered
+    }
+}
+
+pub(super) fn truthy_expr_cpp(cx: &ECx<'_>, expr: &Expr) -> Result<String, EmitError> {
+    Ok(truthy_cpp(cx, expr, expr_cpp(cx, expr)?))
+}
+
+/// Render an unsigned scalar for a host timing/count API. Wide carriers
+/// are narrowed explicitly and saturate at the consumer's maximum instead
+/// of relying on ambiguous C++ conversion operators or wrapping casts.
+pub(super) fn bounded_count_expr_cpp(
+    cx: &ECx<'_>,
+    expr: &Expr,
+    limit: u64,
+) -> Result<String, EmitError> {
+    let rendered = expr_cpp(cx, expr)?;
+    Ok(match expr_static_width(cx, expr) {
+        Some(width) if width > 128 => {
+            format!("harc_rt::harc_wide_shift_count({rendered}, {limit}ULL)")
+        }
+        Some(width) if width > 64 => {
+            format!("harc_rt::harc_u128_shift_count((_harc_u128)({rendered}), {limit}ULL)")
+        }
+        _ => rendered,
+    })
+}
+
+/// Render a value into an explicitly declared scalar destination. This is
+/// primarily needed for >128-bit unsigned storage: C++ construction from a
+/// negative scalar zero-fills upper words, while HARC assignment uses the
+/// destination width and therefore requires sign extension modulo 2^N.
+pub(super) fn scalar_assignment_expr_cpp(
+    cx: &ECx<'_>,
+    value: &Expr,
+    destination: &crate::ir::IrType,
+) -> Result<String, EmitError> {
+    let rendered = expr_cpp(cx, value)?;
+    let crate::ir::IrType::UInt(Some(target_width)) = destination else {
+        return Ok(rendered);
+    };
+    if *target_width <= 128 {
+        return Ok(rendered);
+    }
+    let source_signed = match value {
+        // Widthless positive literals are contextual unsigned values for an
+        // unsigned destination. `expr_is_signed` classifies them as signed
+        // for C++ arithmetic promotion, which is a different question.
+        Expr::Literal {
+            ty: crate::ir::IrType::Unknown,
+            ..
+        }
+        | Expr::Unary(UnOp::Not, _) => false,
+        _ => expr_is_signed(cx, value),
+    };
+    let coerced = wide_operand_cpp(
+        rendered,
+        expr_binary_operand_width(cx, value),
+        source_signed,
+        *target_width,
+    );
+    Ok(format!(
+        "harc_rt::harc_wide_mask_bits({coerced}, {target_width})"
+    ))
+}
+
+fn expr_binary_operand_width(cx: &ECx<'_>, value: &Expr) -> Option<u32> {
+    if let Expr::Literal { value, ty } = value {
+        return match ty {
+            crate::ir::IrType::Unknown => Some((64 - value.leading_zeros()).max(1)),
+            crate::ir::IrType::Bool => Some(1),
+            crate::ir::IrType::UInt(Some(width)) | crate::ir::IrType::SInt(Some(width)) => {
+                Some(*width)
+            }
+            crate::ir::IrType::UInt(None) | crate::ir::IrType::SInt(None) => Some(64),
+            _ => None,
+        };
+    }
+    expr_static_width(cx, value).max(expr_shift_width(cx, value))
+}
+
+fn shift_lhs_width(cx: &ECx<'_>, lhs: &Expr) -> Option<u32> {
+    if let Expr::Literal { ty, .. } = lhs {
+        // A widthless literal uses the scalar runtime carrier.  Its value's
+        // significant-bit width is useful for arithmetic promotion, but not
+        // for shift saturation: `1 << 3` must not clamp at one bit.
+        return match ty {
+            crate::ir::IrType::UInt(Some(width)) | crate::ir::IrType::SInt(Some(width)) => {
+                Some(*width)
+            }
+            crate::ir::IrType::Bool => Some(1),
+            _ => Some(64),
+        };
+    }
+    expr_shift_width(cx, lhs)
+}
+
+fn shift_count_cpp(cx: &ECx<'_>, rhs: &Expr, rendered: &str, limit: u32) -> String {
+    match expr_static_width(cx, rhs) {
+        Some(width) if width > 128 => {
+            format!("harc_rt::harc_wide_shift_count({rendered}, {limit})")
+        }
+        Some(width) if width > 64 => {
+            format!("harc_rt::harc_u128_shift_count((_harc_u128)({rendered}), {limit})")
+        }
+        _ => rendered.to_string(),
+    }
+}
+
 fn un_op_cpp(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
@@ -848,9 +1138,10 @@ fn bit_not_cpp(e: &str, width: Option<u32>) -> String {
     }
 }
 
-fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     match e {
         Expr::Literal { ty, .. } => ir_type_width(ty),
+        Expr::WideLiteral(words) => words.len().checked_mul(32).map(|width| width as u32),
         Expr::Local(id) => cx
             .func
             .locals
@@ -880,6 +1171,7 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             instance,
             field,
             path,
+            ..
         } => state_transactor(cx, instance)
             .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
             .and_then(|f| match f.kind {
@@ -918,6 +1210,11 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                 crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => ir_type_width(ty),
                 _ => None,
             }),
+        Expr::TemporalSlot {
+            slot,
+            kind: crate::ir::TemporalFn::Past,
+        } => cx.temporal_widths.get(*slot as usize).copied().flatten(),
+        Expr::TemporalSlot { .. } => Some(1),
         Expr::Binary(op, a, b) => match op {
             BinOp::Eq
             | BinOp::Ne
@@ -927,10 +1224,12 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             | BinOp::Ge
             | BinOp::And
             | BinOp::Or => Some(1),
-            _ => expr_static_width(cx, a).or_else(|| expr_static_width(cx, b)),
+            BinOp::Shl | BinOp::Shr => shift_lhs_width(cx, a),
+            _ => expr_static_width(cx, a).max(expr_static_width(cx, b)),
         },
+        Expr::Unary(UnOp::Not, _) => Some(1),
         Expr::Unary(_, inner) => expr_static_width(cx, inner),
-        Expr::Ternary(_, t, f) => expr_static_width(cx, t).or_else(|| expr_static_width(cx, f)),
+        Expr::Ternary(_, t, f) => expr_static_width(cx, t).max(expr_static_width(cx, f)),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
         Expr::WidthCast { width, .. } => Some(*width),
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
@@ -952,15 +1251,31 @@ fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
 fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     match e {
         Expr::WideLiteral(words) => words.len().checked_mul(32).map(|w| w as u32),
+        Expr::Binary(
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        ) => Some(1),
         Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
             let bound = |e: &Expr| -> Option<u32> {
-                if let Expr::Literal { value, .. } = e {
-                    return Some((64 - value.leading_zeros()).max(1));
+                if let Expr::Literal { value, ty } = e {
+                    if matches!(ty, crate::ir::IrType::Unknown) {
+                        return Some((64 - value.leading_zeros()).max(1));
+                    }
                 }
                 expr_shift_width(cx, e)
             };
             match (bound(lhs), bound(rhs)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), Some(b)) if a < b && !expr_is_signed(cx, lhs) => Some(a),
+                (Some(a), Some(b)) if b < a && !expr_is_signed(cx, rhs) => Some(b),
+                (Some(a), Some(b)) => Some(a.max(b)),
                 (w, None) | (None, w) => w,
             }
         }
@@ -968,6 +1283,7 @@ fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_shift_width(cx, then_expr).max(expr_shift_width(cx, else_expr))
         }
+        Expr::Unary(UnOp::Not, _) => Some(1),
         Expr::Unary(_, inner) => expr_shift_width(cx, inner),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
         _ => expr_static_width(cx, e),
@@ -1030,6 +1346,7 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             instance,
             field,
             path,
+            ..
         } => state_transactor(cx, instance)
             .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
             .is_some_and(|f| match f.kind {
@@ -1075,6 +1392,7 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     }
                 )
             }),
+        Expr::Unary(UnOp::Not, _) => false,
         Expr::Unary(_, inner) => expr_is_signed(cx, inner),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
@@ -1379,4 +1697,19 @@ pub(super) fn record_access_cpp(
         s.push(']');
     }
     Ok(s)
+}
+
+pub(super) fn indexed_member_cpp(field: &str, index_pos: usize, index: &str) -> String {
+    field
+        .split('.')
+        .enumerate()
+        .map(|(pos, seg)| {
+            if pos == index_pos {
+                format!("{seg}[{index}]")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }

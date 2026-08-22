@@ -9,16 +9,22 @@ tb-ir program
 
 fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
   locals:
-    %0 total : unknown
-    %1 i : unknown
-    %2 bump : unknown
-    %3 _anon : unknown
-    %4 want : uint<32>
-    %5 got : unknown
+    %0 one : uint<256>
+    %1 total : unknown
+    %2 i : unknown
+    %3 bump : unknown
+    %4 _anon : unknown
+    %5 want : uint<32>
+    %6 got : unknown
   entry = b0
 
   b0:
     Log(info, "scoreboard basic: queue + counters on counter DUT")
+    Assign(%one, 1)
+    ScoreboardOp(sb0.sb, wide = (%one << 200))
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.wide)[207:193] == 128), on_fail: "wide scoreboard state lost its high bit" }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.seeded) == 0x000000010000000000000000), on_fail: "wide scoreboard default lost its high bit" }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.sized) == 0x000000010000000000000000), on_fail: "sized wide scoreboard default lost its high bit" }
     DutWrite(dut.rst, 1)
     DutWrite(dut.en, 0)
     -> WaitCycles(3, b1)
@@ -82,5 +88,8 @@ fn fn1 check_ScoreboardBasicTest [kind=Check, owner=tb0]
     AssertCheck { cond: (ScoreboardQuery(sb0.sb.expected.size()) == 0), on_fail: "scoreboard left %lld expected value(s)", ScoreboardQuery(sb0.sb.expected.size()) }
     AssertCheck { cond: (ScoreboardQuery(sb0.sb.writes) == ScoreboardQuery(sb0.sb.reads)), on_fail: "counter drift: writes=%lld reads=%lld", ScoreboardQuery(sb0.sb.writes), ScoreboardQuery(sb0.sb.reads) }
     AssertCheck { cond: (ScoreboardQuery(sb0.sb.writes) == 3), on_fail: "expected 3 writes, got %lld", ScoreboardQuery(sb0.sb.writes) }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.wide)[207:193] == 128), on_fail: "wide scoreboard state did not persist into check" }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.seeded) == 0x000000010000000000000000), on_fail: "wide scoreboard default did not persist into check" }
+    AssertCheck { cond: (ScoreboardQuery(sb0.sb.sized) == 0x000000010000000000000000), on_fail: "sized wide scoreboard default did not persist into check" }
     Log(info, "PASS: scoreboard drained, %lld reads matched %lld writes", ScoreboardQuery(sb0.sb.reads), ScoreboardQuery(sb0.sb.writes))
     -> Return

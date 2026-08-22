@@ -983,15 +983,6 @@ impl FuncBuilder<'_> {
         if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
             if let Some(&rid) = self.ctx.record_ids.get(simple) {
-                if self.in_pure_helper {
-                    return Err(unsupported(
-                        &format!(
-                            "transaction-typed local `let {}` in a pure helper function",
-                            l.name.name
-                        ),
-                        "pure helpers emit as scalar-only file-scope functions",
-                    ));
-                }
                 // `let r : ReadResponse = model.predict_read(addr)` — a
                 // record-typed local bound from a component-method call that
                 // returns that record. The dest local is record-typed and
@@ -1373,6 +1364,12 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         let e = self.lower_expr_no_ports(value)?;
+        if self.record_id_of_expr(&e).is_none() && self.bool_expr_has_invalid_record_operand(&e) {
+            return Err(LowerError::Invalid(format!(
+                "`let {}` is initialised from an invalid record composition",
+                l.name.name
+            )));
+        }
         // Record-valued RHS with no `: T` annotation — the bare copy form
         // `let t2 = t1`. v1's untyped fallback would mis-declare it as
         // `int64_t t2 = t1;` (broken for a struct); typing the dest as the
@@ -1617,38 +1614,6 @@ impl FuncBuilder<'_> {
         e: &Expr,
         name: &str,
     ) -> Result<(), LowerError> {
-        // Only the expression shapes invariant 15's own `expr_type`
-        // resolves — exactly the set that would otherwise reach the
-        // internal-error channel, so this adds no rejection the verifier
-        // was not already making. A binary/ternary RHS is deliberately
-        // excluded: lowering's `expr_type` over-approximates one as its
-        // left operand's declared width, which would reject a provably
-        // narrowed value such as `(wide & 0xFF) >> 4`. Pure-helper and
-        // extern calls are included because their CallTarget carries the
-        // exact declared return type.
-        // …plus any shape `scalar_type_of` resolves as WIDE. Those are
-        // host-state reads, which `expr_type` declines and which this
-        // set therefore never admitted; harmless while a field could
-        // not exceed 64 bits, but once it could, `let c : uint<160> =
-        // b` for a `uint<256>` field `b` lowered into `HarcWide<5> =
-        // HarcWide<8>`, which has no `operator=`. Restricted to wide
-        // sources so the narrowing rule for every existing shape is
-        // exactly what it was.
-        if !matches!(
-            e,
-            Expr::Literal { .. }
-                | Expr::WideLiteral(_)
-                | Expr::Local(_)
-                | Expr::BitSlice { .. }
-                | Expr::WidthCast { .. }
-                | Expr::Call(
-                    crate::ir::CallTarget::Helper { .. } | crate::ir::CallTarget::ExternFn { .. },
-                    _,
-                )
-        ) && self.wide_scalar_words(e).is_none()
-        {
-            return Ok(());
-        }
         // Signedness, not just width: invariant 15's `assign_compatible`
         // also requires the two to agree, so `let s : sint<8> = a +% b`
         // (a wrap's residue is unsigned per spec §2.4) reached the
@@ -1658,16 +1623,13 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(w)) => (*w, true),
             _ => return Ok(()),
         };
-        // `scalar_type_of`, not `expr_type`: the latter answers `None`
-        // for every host-state read, so `a = b` between two declared
-        // FIELDS skipped this check entirely. Harmless while a field
-        // could not exceed 64 bits and both sides were `uint64_t`
-        // anyway; once fields could be wide it let `a : uint<160> =
-        // b : uint<256>` lower into `HarcWide<5> = HarcWide<8>`, which
-        // has no `operator=`. The `let` spelling was worse still — v1
-        // gave a clean narrowing diagnostic there and tbir emitted C++
-        // nobody could build.
-        let (aw, a_signed) = match self.scalar_type_of(e) {
+        // `scalar_assignment_type` bottoms out on
+        // `host_state_scalar_type`, so this now sees a FIELD source
+        // too. `expr_type` answered `None` for those, and while a field
+        // could not exceed 64 bits both sides were `uint64_t` anyway;
+        // once they could, `a : uint<160> = b : uint<256>` lowered into
+        // `HarcWide<5> = HarcWide<8>`, which has no `operator=`.
+        let (aw, a_signed) = match self.scalar_assignment_type(e) {
             Some(IrType::UInt(Some(w))) => (w, false),
             Some(IrType::SInt(Some(w))) => (w, true),
             _ => return Ok(()),
@@ -1778,6 +1740,9 @@ impl FuncBuilder<'_> {
                 "{what} is a scalar and the value assigned to it is a `{}`",
                 self.ctx.records[rid.index()].name
             ))),
+            None if self.bool_expr_has_invalid_record_operand(e) => Err(LowerError::Invalid(
+                format!("{what} is scalar but its value contains an invalid record composition"),
+            )),
             None => Ok(()),
         }
     }
@@ -1897,7 +1862,7 @@ impl FuncBuilder<'_> {
         // ternary "operands to `?:` have different types `Beat` and
         // `Other`", from v1 and tbir alike. No backend runs it.
         if self.record_id_of_expr(value).is_none()
-            && matches!(self.expr_type(value), Some(IrType::Record(_)))
+            && self.bool_expr_has_invalid_record_operand(value)
         {
             return Err(LowerError::Invalid(format!(
                 "{what} was given a record-valued operand in a position that does not \
@@ -1984,7 +1949,14 @@ impl FuncBuilder<'_> {
         let crate::ir::QueueElem::Scalar { ty: expected } = elem else {
             return Ok(());
         };
-        let Some(actual) = self.expr_type(value) else {
+        let actual = match value {
+            crate::ir::Expr::Literal {
+                value,
+                ty: IrType::Unknown,
+            } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+            _ => self.scalar_assignment_type(value),
+        };
+        let Some(actual) = actual else {
             return Ok(());
         };
         if queue_scalar_assignment_compatible(expected, &actual) {
@@ -2019,6 +1991,56 @@ impl FuncBuilder<'_> {
         }
         Err(LowerError::Invalid(format!(
             "{what} holds {expected:?}, but the pushed value is {actual:?}"
+        )))
+    }
+
+    fn check_scoreboard_scalar_write(
+        &self,
+        value: &crate::ir::Expr,
+        expected: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let actual = match value {
+            crate::ir::Expr::Literal {
+                value,
+                ty: IrType::Unknown,
+            } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+            _ => self.scalar_assignment_type(value),
+        };
+        let Some(actual) = actual else {
+            return Ok(());
+        };
+        if queue_scalar_assignment_compatible(expected, &actual) {
+            return Ok(());
+        }
+        let scalar_shape = |ty: &IrType| match ty {
+            IrType::UInt(Some(width)) => Some((*width, false)),
+            IrType::SInt(Some(width)) => Some((*width, true)),
+            _ => None,
+        };
+        if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+            (scalar_shape(expected), scalar_shape(&actual))
+        {
+            if dest_signed != src_signed {
+                return Err(LowerError::Invalid(format!(
+                    "{what} is {} {dest_width}-bit state, but the assigned value is {} \
+                     {src_width}-bit. Signedness must match — relabel the value explicitly with \
+                     `as {}<{src_width}>`.",
+                    if dest_signed { "signed" } else { "unsigned" },
+                    if src_signed { "signed" } else { "unsigned" },
+                    if dest_signed { "sint" } else { "uint" },
+                )));
+            }
+            if src_width > dest_width {
+                return Err(LowerError::Invalid(format!(
+                    "assignment of a {src_width}-bit value to {what}, declared {dest_width} \
+                     bits, narrows. Widths must not shrink implicitly — truncate the value \
+                     explicitly or widen the scoreboard field."
+                )));
+            }
+        }
+        Err(LowerError::Invalid(format!(
+            "{what} is declared {expected:?}, but the assigned value is {actual:?}"
         )))
     }
 
@@ -2128,7 +2150,13 @@ impl FuncBuilder<'_> {
         // `responder.last.addr = ...` (test). Checked before the whole-
         // record `as_transactor_state` write lane, which only fires when
         // there is no further subfield.
-        if let Some(chain) = self.as_transactor_state_record_field(target)? {
+        if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+            chain.mid_indices = chain
+                .mid_indices
+                .into_iter()
+                .map(|(position, index)| (position, self.hoist_ports(index)))
+                .collect();
+            chain.leaf_index = chain.leaf_index.map(|index| self.hoist_ports(index));
             if let Some(len) = chain.leaf_vec_len {
                 let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                 // A matching-shape copy lowers, as it does in the other
@@ -2165,6 +2193,8 @@ impl FuncBuilder<'_> {
                     instance: chain.instance,
                     field: chain.field,
                     path: chain.path,
+                    mid_indices: chain.mid_indices,
+                    index: chain.leaf_index,
                     value: rhs,
                 });
                 return Ok(());
@@ -2178,6 +2208,8 @@ impl FuncBuilder<'_> {
                 instance: chain.instance,
                 field: chain.field,
                 path: chain.path,
+                mid_indices: chain.mid_indices,
+                index: chain.leaf_index,
                 value: e,
             });
             return Ok(());
@@ -2236,17 +2268,64 @@ impl FuncBuilder<'_> {
         if self.lower_component_dut_bind(target, value)? {
             return Ok(());
         }
-        if let Some((_, field, _)) = self.as_component_vec_field(target)? {
-            return Err(unsupported(
-                &format!("whole-vector write to component field `{field}`"),
-                "write one element with `<field>[index]`; whole-vector assignment is not lowered yet",
-            ));
+        if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
+            let shape =
+                crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem).map(|elem| (vec.len, elem));
+            let rhs = match shape {
+                Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
+                None => None,
+            };
+            let Some(rhs) = rhs else {
+                let dotted = super::components::dotted_path(target)
+                    .map(|path| path.join("."))
+                    .unwrap_or_else(|| field.clone());
+                return Err(not_implemented(
+                    &format!(
+                        "a whole-vector write to component field `{dotted}` with a non-matching RHS"
+                    ),
+                    format!("assign the field element-wise (`{dotted}[i] = ...`)"),
+                    V1Status::EmitsUncompilable,
+                ));
+            };
+            self.push(Stmt::ComponentFieldWrite {
+                base,
+                field,
+                value: rhs,
+            });
+            return Ok(());
         }
         // Composite-component scalar/record-leaf field write — self-relative
         // inside a method body (`count = ...`) or a dotted path from a
         // test-scope component local (`env.src.current.value = ...`). Record
         // leaves must be claimed before whole-sub-component assignment:
         // otherwise that resolver mistakes `current` for a `Sub` receiver.
+        if let Some(chain) = self.as_indexed_component_record_field(target)? {
+            let index = self.hoist_ports(chain.index);
+            let value = self.lower_expr_no_ports(value)?;
+            if let IrType::Record(record) = chain.leaf_ty {
+                if self.record_id_of_expr(&value) != Some(record) {
+                    return Err(self.record_assign_mismatch(
+                        &value,
+                        record,
+                        format!("indexed component record field `{}`", chain.field),
+                        "assign a value of the selected field's record type",
+                    ));
+                }
+            } else {
+                self.reject_record_into_scalar(
+                    &value,
+                    &format!("indexed component record field `{}`", chain.field),
+                )?;
+            }
+            self.push(Stmt::ComponentVecElementWrite {
+                base: chain.base,
+                field: chain.field,
+                index_pos: chain.index_pos,
+                index,
+                value,
+            });
+            return Ok(());
+        }
         if let Some(tgt) = self.as_component_field_target(target)? {
             let (base, field) = (tgt.base, tgt.field);
             // A whole-`Vec` component record field takes a whole-`Vec`
@@ -2321,13 +2400,36 @@ impl FuncBuilder<'_> {
         if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
-        // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
-        // (classic) / `_tb.sb.writes = ...` (impl-form, post-desugar).
+        // Scoreboard scalar/whole-record write: `sb.writes = sb.writes + 1`
+        // or `sb.last = item` (classic), plus `_tb.sb...` after impl desugar.
         if let ExprKind::Field { target: ft, name } = &*target.kind {
             if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
                 let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                 let e = self.lower_expr_no_ports(value)?;
-                self.reject_record_into_scalar(&e, &format!("scoreboard field `{}`", name.name))?;
+                let expected = self.scoreboard_scalar_type(sb, &name.name)?;
+                match expected {
+                    IrType::Record(record) => {
+                        if self.record_id_of_expr(&e) != Some(record) {
+                            return Err(self.record_assign_mismatch(
+                                &e,
+                                record,
+                                format!("scoreboard record field `{}`", name.name),
+                                "assign a value of the same record type",
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.reject_record_into_scalar(
+                            &e,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                        self.check_scoreboard_scalar_write(
+                            &e,
+                            &expected,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                    }
+                }
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -2755,6 +2857,40 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
+            if let Some(mut chain) = self.as_transactor_state_record_field(it)? {
+                if let Some(len) = chain.leaf_vec_len {
+                    chain.mid_indices = chain
+                        .mid_indices
+                        .into_iter()
+                        .map(|(position, index)| (position, self.hoist_ports(index)))
+                        .collect();
+                    let idx = self.lower_expr_no_ports(index)?;
+                    super::exprs::check_literal_vec_index_bounds(
+                        &format!("{}.{}", chain.field, chain.path.join(".")),
+                        &idx,
+                        len,
+                    )?;
+                    let value = self.lower_expr_no_ports(value)?;
+                    self.reject_record_into_scalar(
+                        &value,
+                        &format!(
+                            "element of responder record state `{}.{}`",
+                            chain.field,
+                            chain.path.join(".")
+                        ),
+                    )?;
+                    chain.leaf_index = Some(idx);
+                    self.push(Stmt::TransactorStateRecordFieldWrite {
+                        instance: chain.instance,
+                        field: chain.field,
+                        path: chain.path,
+                        mid_indices: chain.mid_indices,
+                        index: chain.leaf_index,
+                        value,
+                    });
+                    return Ok(());
+                }
+            }
             if let Some((base, field, vec)) = self.as_component_vec_field(it)? {
                 let index = self.lower_expr_no_ports(index)?;
                 super::exprs::check_literal_component_vec_index_bounds(
@@ -2768,6 +2904,7 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::ComponentVecElementWrite {
                     base,
                     field,
+                    index_pos: 0,
                     index,
                     value,
                 });
@@ -2813,9 +2950,11 @@ impl FuncBuilder<'_> {
                         &value,
                         &format!("element of component `Vec` field `{}`", rf.dotted),
                     )?;
+                    let index_pos = rf.field.split('.').count() - 1;
                     self.push(Stmt::ComponentVecElementWrite {
                         base: rf.base,
                         field: rf.field,
+                        index_pos,
                         index,
                         value,
                     });
@@ -3347,7 +3486,8 @@ impl FuncBuilder<'_> {
         let schema = &self.ctx.scoreboards[sb.index()];
         match schema.field(field) {
             Some(f) => match &f.kind {
-                crate::ir::ScoreboardFieldKind::Scalar { .. } => Ok(field.to_string()),
+                crate::ir::ScoreboardFieldKind::Scalar { .. }
+                | crate::ir::ScoreboardFieldKind::Record { .. } => Ok(field.to_string()),
                 crate::ir::ScoreboardFieldKind::Queue { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a queue, not a scalar — assign via \
                      `push`/`pop`",
@@ -3356,6 +3496,28 @@ impl FuncBuilder<'_> {
             },
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
+    }
+
+    fn scoreboard_scalar_type(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<IrType, LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(crate::ir::ScoreboardFieldSchema {
+                kind: crate::ir::ScoreboardFieldKind::Scalar { ty, .. },
+                ..
+            }) => Ok(ty.clone()),
+            Some(crate::ir::ScoreboardFieldSchema {
+                kind: crate::ir::ScoreboardFieldKind::Record { record },
+                ..
+            }) => Ok(IrType::Record(*record)),
+            _ => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no scalar field `{field}`",
                 schema.name
             ))),
         }
@@ -3379,6 +3541,10 @@ impl FuncBuilder<'_> {
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
                     schema.name
                 ))),
+                crate::ir::ScoreboardFieldKind::Record { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a record, not a queue",
+                    schema.name
+                ))),
             },
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
@@ -3400,6 +3566,10 @@ impl FuncBuilder<'_> {
                 crate::ir::ScoreboardFieldKind::Queue { .. } => Ok(()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
+                    schema.name
+                ))),
+                crate::ir::ScoreboardFieldKind::Record { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a record, not a queue",
                     schema.name
                 ))),
             },
@@ -3706,11 +3876,11 @@ impl FuncBuilder<'_> {
         };
         let record = self.ctx.records[record_id.index()].name.clone();
 
-        // Spec §4: transaction-level `keep`s are part of every
+        // Spec §4: transaction/struct-level `keep`s are part of every
         // `randomize(t)` of that type. Merge them ahead of the call-site
         // `with {...}` body, exactly as v1's `StmtKind::Randomize` arm.
         let mut constraints: Vec<crate::ast::Expr> = Vec::new();
-        if let Some(keeps) = self.ctx.txn_keeps.get(&record) {
+        if let Some(keeps) = self.ctx.record_keeps.get(&record) {
             constraints.extend(keeps.iter().cloned());
         }
         constraints.extend(with_body.iter().cloned());
@@ -4314,6 +4484,7 @@ impl FuncBuilder<'_> {
             let trigger = self.with_check_body(&[], "an `on <bool-expr>` trigger", |b| {
                 b.lower_expr(&h.event)
             })?;
+            self.validate_truth_expr(&trigger, "cycle-handler trigger")?;
             CycleHandlerKind::Trigger {
                 trigger,
                 edge: crate::ir::CycleEdge::from_ast(h.edge),
@@ -4483,6 +4654,7 @@ impl FuncBuilder<'_> {
         let mut out = Vec::with_capacity(temporals.len());
         for t in temporals {
             let inner = self.with_check_body(&[], construct, |b| b.lower_expr(&t.inner))?;
+            self.validate_truth_expr(&inner, "temporal operand")?;
             out.push(crate::ir::TemporalSlot { inner });
         }
         Ok(out)
@@ -4519,15 +4691,20 @@ impl FuncBuilder<'_> {
                 let (ante, cons) = self.with_check_body(&temporals, construct, |b| {
                     Ok((b.lower_expr(lhs)?, b.lower_expr(rhs)?))
                 })?;
+                self.validate_truth_expr(&ante, "property antecedent")?;
+                self.validate_truth_expr(&cons, "property consequent")?;
                 if next {
                     PropertyShape::ImpliesNext { ante, cons }
                 } else {
                     PropertyShape::Implies { ante, cons }
                 }
             }
-            _ => PropertyShape::Invariant(
-                self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?,
-            ),
+            _ => {
+                let invariant =
+                    self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+                self.validate_truth_expr(&invariant, "property condition")?;
+                PropertyShape::Invariant(invariant)
+            }
         };
 
         // `assert <temporal> else fail("...")` — the clause names what
@@ -4601,6 +4778,7 @@ impl FuncBuilder<'_> {
         let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
         let slots = self.lower_temporal_slots(&temporals, construct)?;
         let cond = self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+        self.validate_truth_expr(&cond, "cover condition")?;
 
         let id = {
             let mut tables = self.side_tables.borrow_mut();
@@ -4636,6 +4814,7 @@ impl FuncBuilder<'_> {
         // transactor call edge hoists ahead of the check.
         let cond = self.lower_expr(expr)?;
         let cond = self.hoist_transactor_calls(cond);
+        self.validate_truth_expr(&cond, "assume condition")?;
         let msg = match v.else_fail.as_ref() {
             Some(e) => self.else_fail_literal(e)?,
             None => "assumption failed".to_string(),
@@ -4695,6 +4874,7 @@ impl FuncBuilder<'_> {
         // advance simulated time). `(helper.read(0) & 1) == 1`.
         let cond = self.lower_expr(expr)?; // ports allowed in assert conditions
         let cond = self.hoist_transactor_calls(cond);
+        self.validate_truth_expr(&cond, "assert condition")?;
         let msg = match v.else_fail.as_ref() {
             Some(e) => self.else_fail_literal(e)?,
             None => "assertion failed".to_string(),

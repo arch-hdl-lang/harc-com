@@ -121,6 +121,7 @@ struct SuiteScaffold {
     // program table, so today every shard is emitted with identical bytes,
     // including shards whose own tests use no probe and no `randomize`.
     has_probes: bool,
+    uses_constraint_solver: bool,
     problem_table_cpp: String,
     randomize_snippets: Vec<String>,
 }
@@ -171,6 +172,11 @@ impl SuiteScaffold {
         // body depth (run/check fn = depth 2 → block stmts at depth 5).
         let randomize_snippets =
             crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
+        // The runtime metadata table intentionally excludes component-scope
+        // sites. Include detection must follow the source/codegen decision,
+        // not table non-emptiness, or a component-only kept struct emits Z3
+        // calls without the runtime header.
+        let uses_constraint_solver = crate::codegen::cpp_tb::uses_constraint_solver(file);
 
         // Probe reads/forces dereference `dut->rootp->...`, which needs the
         // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
@@ -188,6 +194,7 @@ impl SuiteScaffold {
         Ok(SuiteScaffold {
             dut_type,
             has_probes,
+            uses_constraint_solver,
             problem_table_cpp,
             randomize_snippets,
         })
@@ -243,6 +250,7 @@ fn emit_selected_tests(
         dut_type,
         &test_names,
         &scaffold.problem_table_cpp,
+        scaffold.uses_constraint_solver,
         scaffold.has_probes,
         opts.cosim.as_ref(),
     );
@@ -335,7 +343,7 @@ fn emit_selected_tests(
         covergroup::covgroup_struct(&mut out, cg);
     }
     for h in &helpers {
-        func::emit_helper_function(&mut out, h)?;
+        func::emit_helper_function(&mut out, prog, h)?;
         writeln!(out).ok();
     }
 
@@ -864,6 +872,12 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Call(_, args) => args.iter().any(expr_has_probe),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
         ComponentVecElement { index, .. } => expr_has_probe(index),
+        TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
+                || index.as_deref().is_some_and(expr_has_probe)
+        }
         _ => false,
     }
 }
@@ -883,10 +897,19 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | TbFieldWrite { value: e, .. }
         | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
-        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
+        TransactorStateRecordFieldWrite {
+            mid_indices,
+            index,
+            value,
+            ..
+        } => {
+            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
+                || index.as_ref().is_some_and(expr_has_probe)
+                || expr_has_probe(value)
+        }
         ComponentVecElementWrite { index, value, .. } => {
             expr_has_probe(index) || expr_has_probe(value)
         }
@@ -1145,10 +1168,23 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | TbFieldWrite { value: e, .. }
         | TbQueuePush { value: e, .. }
         | TransactorStateWrite { value: e, .. }
-        | TransactorStateRecordFieldWrite { value: e, .. }
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        TransactorStateRecordFieldWrite {
+            mid_indices,
+            index,
+            value,
+            ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_port_in_expr(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+            for_each_port_in_expr(value, f);
+        }
         ComponentVecElementWrite { index, value, .. } => {
             for_each_port_in_expr(index, f);
             for_each_port_in_expr(value, f);
@@ -1252,6 +1288,16 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
         ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
+        TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_port_in_expr(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_port_in_expr(idx, f);
+            }
+        }
         _ => {}
     }
 }
@@ -2011,7 +2057,7 @@ fn emit_lifecycle_checkers(
             continue;
         }
         let lambda = func::periodic_handler_lambda_name(comp, ph);
-        let period = func::clause_expr_cpp(prog, ph.function, inst_path, &ph.period)?;
+        let period = func::clause_count_cpp(prog, ph.function, inst_path, &ph.period)?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
         let svc = ph.phase.service_vec();
         writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
@@ -2045,7 +2091,7 @@ fn emit_lifecycle_checkers(
             continue;
         }
         let lambda = func::cycle_handler_lambda_name(comp, ch);
-        let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
+        let trigger = func::clause_predicate_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
         if ch.monitor_channel.is_some() {
             // Bound-bus handshake monitor (v1's `emit_bound_monitor_actors`).
@@ -2120,11 +2166,11 @@ fn emit_lifecycle_checkers(
         } else {
             let lambda = func::watchdog_lambda_name(comp, w);
             let period = match &w.period {
-                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
                 None => WATCHDOG_DEFAULT_PERIOD.to_string(),
             };
             let max_idle = match &w.max_idle {
-                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
                 None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
             };
             let tag = format!("_wdog_{inst_tag}_{}", w.function.0);

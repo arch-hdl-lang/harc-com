@@ -64,6 +64,9 @@ struct CountSb {
     harc_rt::HarcQueue<uint64_t> expected;
     uint64_t writes = 0;
     uint64_t reads = 0;
+    harc_rt::HarcWide<8> wide = 0;
+    _harc_u128 seeded = (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL);
+    _harc_u128 sized = (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL);
     uint64_t _last_in_cycle = 0;
     uint64_t _last_out_cycle = 0;
 };
@@ -184,6 +187,18 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
         HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);
     };
 
+    // Route an empty-queue pop through the sim's own FATAL path instead
+    // of the runtime header's abort backstop: the run records the
+    // failure, unwinds normally, and still writes its log and trace.
+    // `_fatal` is a loop-exit condition, so the run stops at the next
+    // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
+    // verbatim by both codegens so the two traces stay diffable.
+    harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
+        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        ctx.errors++;
+        _fatal = true;
+    });
+
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
     harc_rt::ThreadScheduler sched;
@@ -193,6 +208,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
     auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_ScoreboardBasicTest (TB-IR loop-switch)
+            harc_rt::HarcWide<8> one = 0; (void)one;
             uint64_t total = 0; (void)total;
             uint64_t i = 0; (void)i;
             uint64_t bump = 0; (void)bump;
@@ -205,6 +221,20 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                 switch (__bb) {
                 case 0: {
                     sim_log_line("INFO", "scoreboard basic: queue + counters on counter DUT");
+                    one = 1;
+                    _tb.sb.wide = harc_rt::harc_wide_mask_bits(harc_rt::harc_wide_mask_bits(((one) << (200)), 256), 256);
+                    if (!((harc_rt::harc_bits((_tb.sb.wide), 207, 193) == 128))) {
+                        sim_log_line("FAIL", "wide scoreboard state lost its high bit");
+                        ctx.errors++;
+                    }
+                    if (!((_tb.sb.seeded == (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)))) {
+                        sim_log_line("FAIL", "wide scoreboard default lost its high bit");
+                        ctx.errors++;
+                    }
+                    if (!((_tb.sb.sized == (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)))) {
+                        sim_log_line("FAIL", "sized wide scoreboard default lost its high bit");
+                        ctx.errors++;
+                    }
                     harc_rt::harc_assign(dut->rst, 1);
                     harc_rt::harc_assign(dut->en, 0);
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(3));
@@ -305,6 +335,18 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     }
                     if (!((_tb.sb.writes == 3))) {
                         sim_log_line("FAIL", "expected 3 writes, got %lld", harc_rt::harc_printf_ll(_tb.sb.writes));
+                        ctx.errors++;
+                    }
+                    if (!((harc_rt::harc_bits((_tb.sb.wide), 207, 193) == 128))) {
+                        sim_log_line("FAIL", "wide scoreboard state did not persist into check");
+                        ctx.errors++;
+                    }
+                    if (!((_tb.sb.seeded == (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)))) {
+                        sim_log_line("FAIL", "wide scoreboard default did not persist into check");
+                        ctx.errors++;
+                    }
+                    if (!((_tb.sb.sized == (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)))) {
+                        sim_log_line("FAIL", "sized wide scoreboard default did not persist into check");
                         ctx.errors++;
                     }
                     sim_log_line("INFO", "PASS: scoreboard drained, %lld reads matched %lld writes", harc_rt::harc_printf_ll(_tb.sb.reads), harc_rt::harc_printf_ll(_tb.sb.writes));

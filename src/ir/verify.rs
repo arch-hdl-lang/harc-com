@@ -586,6 +586,53 @@ fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<Verif
     }
 }
 
+fn verify_scoreboard_scalar_schema(
+    ty: &IrType,
+    default: &crate::ir::ScoreboardScalarDefault,
+    what: String,
+    errs: &mut Vec<VerifyError>,
+) {
+    let valid = match ty {
+        IrType::Bool | IrType::UInt(None) | IrType::SInt(None) => true,
+        IrType::UInt(Some(width)) => (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width),
+        IrType::SInt(Some(width)) => (1..=64).contains(width),
+        _ => false,
+    };
+    if !valid {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!(
+                "{what} has invalid scalar type {ty:?}; expected bool, unsigned width 1..={}, \
+                 or signed width 1..=64",
+                crate::MAX_WIDTH_METHOD_BITS
+            ),
+        });
+    }
+    let default_valid = match default {
+        crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
+            IrType::Bool => *value <= 1,
+            IrType::UInt(Some(width)) if *width < 64 => *value < (1u64 << width),
+            IrType::UInt(_) => true,
+            IrType::SInt(Some(width)) if (1..64).contains(width) => {
+                let signed = *value as i64;
+                let limit = 1i64 << (*width - 1);
+                (-limit..limit).contains(&signed)
+            }
+            IrType::SInt(Some(64)) | IrType::SInt(None) => true,
+            _ => false,
+        },
+        crate::ir::ScoreboardScalarDefault::Wide(words) => {
+            !words.is_empty()
+                && words.last().is_some_and(|word| *word != 0)
+                && matches!(ty, IrType::UInt(Some(width)) if wide_literal_bits(words) > 64 && wide_literal_bits(words) <= *width)
+        }
+    };
+    if !default_valid {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!("{what} has invalid scalar default {default:?} for {ty:?}"),
+        });
+    }
+}
+
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
     for t in &prog.tests {
@@ -760,6 +807,20 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         if let Some(handler) = &component.watchdog {
             check_component_function("watchdog", handler.function);
         }
+        drop(check_component_function);
+        for handler in &component.cycle_handlers {
+            if let Some(func) = prog.functions.get(handler.function.index()) {
+                let mut checker = Checker {
+                    prog,
+                    func,
+                    fid: func.id,
+                    bid: func.entry,
+                    errs: &mut errs,
+                    temporal_slots_ok: false,
+                };
+                checker.check_truth_expr(&handler.trigger, true, "component cycle-handler trigger");
+            }
+        }
         if component.has_active_surface() && !matches!(component.kind, ComponentKindTag::Transactor)
         {
             errs.push(VerifyError::BadProgramRef {
@@ -821,12 +882,36 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     }
     for (si, scoreboard) in prog.scoreboards.iter().enumerate() {
         for field in &scoreboard.fields {
-            if let ScoreboardFieldKind::Queue { elem } = &field.kind {
-                verify_queue_elem_schema(
+            if matches!(field.name.as_str(), "_last_in_cycle" | "_last_out_cycle") {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "scoreboard sb{si} field `{}` collides with a generated heartbeat member",
+                        field.name
+                    ),
+                });
+            }
+            match &field.kind {
+                ScoreboardFieldKind::Queue { elem } => verify_queue_elem_schema(
                     elem,
                     format!("scoreboard sb{si} field `{}`", field.name),
                     &mut errs,
-                );
+                ),
+                ScoreboardFieldKind::Scalar { ty, default } => verify_scoreboard_scalar_schema(
+                    ty,
+                    default,
+                    format!("scoreboard sb{si} field `{}`", field.name),
+                    &mut errs,
+                ),
+                ScoreboardFieldKind::Record { record } => {
+                    if prog.records.get(record.index()).is_none() {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "scoreboard sb{si} field `{}` references missing record r{}",
+                                field.name, record.0
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1222,8 +1307,9 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 fid: func.id,
                 bid: func.entry,
                 errs: &mut errs,
+                temporal_slots_ok: false,
             };
-            checker.check_expr(&service.trigger, true, "testbench cycle-service trigger");
+            checker.check_truth_expr(&service.trigger, true, "testbench cycle-service trigger");
         }
     }
     for (i, func) in prog.functions.iter().enumerate() {
@@ -1568,6 +1654,15 @@ fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     }
 }
 
+fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool {
+    match (payload, ty) {
+        (_, IrType::Unknown) => true,
+        (EventPayload::Scalar { .. }, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => true,
+        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
+    }
+}
+
 fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
@@ -1779,6 +1874,63 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         return Err(errs); // nothing else is meaningful
     }
 
+    // Pure helpers emit as file-scope C++ functions whose params and return
+    // use the scalar helper ABI. Internal record locals are permitted, but a
+    // pass must not drift a parameter's mirrored local type or route a record
+    // through the signature/return slot: codegen deliberately maps only the
+    // ABI boundary through `local_scalar_cty`.
+    if func.kind == FunctionKind::Helper {
+        if func.params.len() > func.locals.len() {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} helper `{}` has {} params but only {} locals",
+                    fid.0,
+                    func.name,
+                    func.params.len(),
+                    func.locals.len()
+                ),
+            });
+        }
+        for (index, param) in func.params.iter().enumerate() {
+            match func.locals.get(index) {
+                Some(local) if local.ty != param.ty => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} helper `{}` param {} metadata {:?} does not match mirrored local {:?}",
+                        fid.0, func.name, index, param.ty, local.ty
+                    ),
+                }),
+                Some(local) if !cover_scalar_type(&local.ty) => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} helper `{}` param {} must use the scalar helper ABI, got {:?}",
+                            fid.0, func.name, index, local.ty
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let Some(ret) = func.ret {
+            match func.locals.get(ret.index()) {
+                Some(local) if !cover_scalar_type(&local.ty) => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} helper `{}` return %{} must use the scalar helper ABI, got {:?}",
+                            fid.0, func.name, ret.0, local.ty
+                        ),
+                    });
+                }
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} helper `{}` return %{} does not resolve",
+                        fid.0, func.name, ret.0
+                    ),
+                }),
+                _ => {}
+            }
+        }
+    }
+
     // Invariant 6 — successors resolve (checked before reachability so
     // the walk below can't index out of bounds).
     for (bi, b) in func.blocks.iter().enumerate() {
@@ -1855,13 +2007,14 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
             fid,
             bid,
             errs: &mut errs,
+            temporal_slots_ok: false,
         };
         ck.check_block(b);
     }
 
     // Invariant 4 — forward dataflow: a local must be defined on every
     // path from entry before its first read. Params count as defined.
-    check_def_before_use(func, fid, &reachable, &mut errs);
+    check_def_before_use(prog, func, fid, &reachable, &mut errs);
 
     if errs.is_empty() {
         Ok(())
@@ -1876,9 +2029,870 @@ struct Checker<'a> {
     fid: FunctionId,
     bid: BlockId,
     errs: &'a mut Vec<VerifyError>,
+    /// Concurrent property/cover roots are stored outside the CFG but
+    /// execute in the registering function's context. Their temporal
+    /// slots are valid only while explicitly walking those side tables.
+    temporal_slots_ok: bool,
 }
 
 impl Checker<'_> {
+    fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
+        self.check_expr(expr, ports_ok, context);
+        let ty = self.aggregate_assignment_expr_type(expr);
+        if matches!(ty, Some(IrType::Record(_))) || self.contains_invalid_record_composition(expr) {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {context} is not a scalar truth value",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+    }
+
+    fn check_scalar_value_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
+        self.check_expr(expr, ports_ok, context);
+        if matches!(
+            self.aggregate_assignment_expr_type(expr),
+            Some(IrType::Record(_))
+        ) || self.contains_invalid_record_composition(expr)
+        {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {context} is not a scalar value",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+    }
+
+    fn check_event_payload_value(
+        &mut self,
+        payload: EventPayload,
+        expr: &Expr,
+        context: &'static str,
+    ) {
+        self.check_expr(expr, false, context);
+        let actual = self
+            .aggregate_assignment_expr_type(expr)
+            .unwrap_or(IrType::Unknown);
+        if !event_payload_accepts_value_type(payload, &actual) {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {context} has type {actual:?}, incompatible with payload {payload:?}",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+    }
+
+    fn check_property_schema(&mut self, id: PropertyCheckId, schema: &PropertyCheckSchema) {
+        let saved = self.temporal_slots_ok;
+        self.temporal_slots_ok = true;
+        match &schema.shape {
+            PropertyShape::Implies { ante, cons } | PropertyShape::ImpliesNext { ante, cons } => {
+                self.check_truth_expr(ante, true, "property-check antecedent");
+                self.check_truth_expr(cons, true, "property-check consequent");
+            }
+            PropertyShape::Invariant(expr) => {
+                self.check_truth_expr(expr, true, "property-check invariant");
+            }
+        }
+        self.temporal_slots_ok = saved;
+        for (slot, temporal) in schema.temporals.iter().enumerate() {
+            self.check_scalar_value_expr(&temporal.inner, true, "property-check temporal operand");
+            check_temporal_slots(
+                &temporal.inner,
+                0,
+                &format!("property check p{} latch operand {slot}", id.0),
+                self.errs,
+            );
+        }
+        if let Some(message) = &schema.message {
+            self.check_fmt_args(message);
+        }
+    }
+
+    fn check_cover_schema(&mut self, id: CoverCheckId, schema: &CoverCheckSchema) {
+        let saved = self.temporal_slots_ok;
+        self.temporal_slots_ok = true;
+        self.check_truth_expr(&schema.cond, true, "cover-check condition");
+        self.temporal_slots_ok = saved;
+        for (slot, temporal) in schema.temporals.iter().enumerate() {
+            self.check_scalar_value_expr(&temporal.inner, true, "cover-check temporal operand");
+            check_temporal_slots(
+                &temporal.inner,
+                0,
+                &format!("cover check c{} latch operand {slot}", id.0),
+                self.errs,
+            );
+        }
+    }
+
+    /// Resolve the component selected by an emitted field-access base.
+    /// Lowering stores paths rather than a redundant component id on
+    /// `ComponentField`, so the verifier must replay the path walk before
+    /// codegen is allowed to trust the member name.
+    fn component_base_id(&self, base: &ComponentBase) -> Result<ComponentId, String> {
+        match base {
+            ComponentBase::SelfField => match self.func.kind {
+                FunctionKind::ComponentMethod { component } => self
+                    .prog
+                    .components
+                    .get(component.index())
+                    .map(|_| component)
+                    .ok_or_else(|| format!("self component c{} does not resolve", component.0)),
+                _ => Err("self-relative component field outside a component method".to_string()),
+            },
+            ComponentBase::Path(path) => {
+                let (root, tail) = path
+                    .split_first()
+                    .ok_or_else(|| "empty component field path".to_string())?;
+                // Match lowering's namespace order: a real testbench
+                // component field named `self` wins over the synthetic
+                // method-relative root of the same spelling.
+                let owner_tb = self
+                    .func
+                    .owner
+                    .and_then(|owner| self.prog.testbenches.get(owner.index()));
+                if let Some(tb) = owner_tb.filter(|tb| {
+                    tb.component_fields
+                        .iter()
+                        .any(|binding| binding.field == *root)
+                }) {
+                    resolve_testbench_component_path(self.prog, tb, path)
+                } else if root == "self" {
+                    let FunctionKind::ComponentMethod { component } = self.func.kind else {
+                        return Err(
+                            "self-rooted component path outside a component method".to_string()
+                        );
+                    };
+                    let mut cid = component;
+                    for segment in tail {
+                        let schema = self
+                            .prog
+                            .components
+                            .get(cid.index())
+                            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+                        cid = match schema.field(segment) {
+                            Some(ComponentFieldSchema {
+                                kind: ComponentFieldKind::Sub { component, .. },
+                                ..
+                            }) => *component,
+                            _ => {
+                                return Err(format!(
+                                    "self path segment `{segment}` is not a sub-component"
+                                ))
+                            }
+                        };
+                    }
+                    self.prog
+                        .components
+                        .get(cid.index())
+                        .map(|_| cid)
+                        .ok_or_else(|| format!("component c{} does not resolve", cid.0))
+                } else {
+                    let owner = self
+                        .func
+                        .owner
+                        .ok_or_else(|| "component path has no owning testbench".to_string())?;
+                    let tb = self
+                        .prog
+                        .testbenches
+                        .get(owner.index())
+                        .ok_or_else(|| format!("owner tb{} does not resolve", owner.0))?;
+                    resolve_testbench_component_path(self.prog, tb, path)
+                }
+            }
+            ComponentBase::Local(local) => Err(format!(
+                "component field uses local base %{}; only method calls may use local component values",
+                local.0
+            )),
+        }
+    }
+
+    fn component_emit_payload(
+        &self,
+        base: &ComponentBase,
+        event: &str,
+    ) -> Result<EventPayload, String> {
+        let component = self.component_base_id(base)?;
+        let schema = self
+            .prog
+            .components
+            .get(component.index())
+            .ok_or_else(|| format!("references missing component c{}", component.0))?;
+        let field = schema
+            .field(event)
+            .ok_or_else(|| format!("component `{}` has no field `{event}`", schema.name))?;
+        let ComponentFieldKind::Event { payload } = &field.kind else {
+            return Err(format!("component `{}.{event}` is not an event field", schema.name));
+        };
+        let payload = *payload;
+        match base {
+            ComponentBase::Path(_) => {
+                verify_component_event_ref(self.prog, self.func, base, component, event, payload)?;
+            }
+            ComponentBase::SelfField => {
+                let active_context = schema
+                    .methods
+                    .iter()
+                    .any(|m| m.function == self.fid && matches!(m.activation, Activation::ActiveOnly))
+                    || schema.on_handlers.iter().any(|h| {
+                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                    })
+                    || schema.periodic_handlers.iter().any(|h| {
+                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                    })
+                    || schema.cycle_handlers.iter().any(|h| {
+                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                    })
+                    || schema.watchdog.as_ref().is_some_and(|w| {
+                        w.function == self.fid && matches!(w.activation, Activation::ActiveOnly)
+                    });
+                if matches!(field.activation, Activation::ActiveOnly) && !active_context {
+                    return Err(format!(
+                        "always-on component body cannot emit active-only event `{event}`"
+                    ));
+                }
+            }
+            ComponentBase::Local(_) => {
+                return Err("component event emission cannot use a local component base".into());
+            }
+        }
+        Ok(payload)
+    }
+
+    /// Validate a component member suffix and return its whole fixed-vector
+    /// C++ shape when the suffix names one. `None` is a valid scalar or
+    /// whole-record field. Queue/event/sub-component members have dedicated
+    /// IR nodes and are invalid here.
+    fn component_field_vec_shape(
+        &self,
+        base: &ComponentBase,
+        field: &str,
+    ) -> Result<Option<(usize, String)>, String> {
+        let cid = self.component_base_id(base)?;
+        let component = self
+            .prog
+            .components
+            .get(cid.index())
+            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+        let mut segments = field.split('.');
+        let root = segments
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .ok_or_else(|| "empty component field name".to_string())?;
+        let root = component
+            .field(root)
+            .ok_or_else(|| format!("component `{}` has no field `{root}`", component.name))?;
+        match &root.kind {
+            ComponentFieldKind::Scalar { .. } => {
+                if segments.next().is_some() {
+                    Err(format!("scalar component field `{field}` has a subfield"))
+                } else {
+                    Ok(None)
+                }
+            }
+            ComponentFieldKind::FixedVec(vec) => {
+                if segments.next().is_some() {
+                    return Err(format!(
+                        "fixed-vector component field `{field}` has a subfield"
+                    ));
+                }
+                crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem)
+                    .map(|elem| Some((vec.len, elem)))
+                    .ok_or_else(|| {
+                        format!(
+                            "fixed-vector component field `{field}` has an invalid element type"
+                        )
+                    })
+            }
+            ComponentFieldKind::Record { record } => {
+                let mut rid = *record;
+                let rest: Vec<&str> = segments.collect();
+                if rest.is_empty() {
+                    return Ok(None);
+                }
+                for (index, segment) in rest.iter().enumerate() {
+                    let schema = self
+                        .prog
+                        .records
+                        .get(rid.index())
+                        .ok_or_else(|| format!("record r{} does not resolve", rid.0))?;
+                    let member = schema.field(segment).ok_or_else(|| {
+                        format!("record `{}` has no field `{segment}`", schema.name)
+                    })?;
+                    let last = index + 1 == rest.len();
+                    if last {
+                        return match member.vec_len {
+                            Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&member.ty)
+                                .map(|elem| Some((len, elem)))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "record vector field `{field}` has an invalid element type"
+                                    )
+                                }),
+                            None => Ok(None),
+                        };
+                    }
+                    match member.ty {
+                        IrType::Record(next) if member.vec_len.is_none() => rid = next,
+                        _ => {
+                            return Err(format!(
+                                "component record path `{field}` traverses non-record `{segment}`"
+                            ))
+                        }
+                    }
+                }
+                unreachable!("non-empty record suffix returned from the loop")
+            }
+            ComponentFieldKind::Queue { .. }
+            | ComponentFieldKind::Event { .. }
+            | ComponentFieldKind::Sub { .. }
+            | ComponentFieldKind::ScoreboardSub { .. }
+            | ComponentFieldKind::Dut { .. } => Err(format!(
+                "component member `{field}` is not a scalar, record, or fixed-vector field"
+            )),
+        }
+    }
+
+    fn component_indexed_field_type(
+        &self,
+        base: &ComponentBase,
+        field: &str,
+        index_pos: usize,
+    ) -> Result<(IrType, usize), String> {
+        let cid = self.component_base_id(base)?;
+        let component = self
+            .prog
+            .components
+            .get(cid.index())
+            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+        let segments: Vec<&str> = field.split('.').collect();
+        let root = component
+            .field(segments.first().copied().unwrap_or_default())
+            .ok_or_else(|| {
+                format!(
+                    "component `{}` has no field `{}`",
+                    component.name,
+                    segments.first().copied().unwrap_or_default()
+                )
+            })?;
+        match &root.kind {
+            ComponentFieldKind::FixedVec(vec) if segments.len() == 1 && index_pos == 0 => {
+                Ok((vec.elem.clone(), vec.len))
+            }
+            ComponentFieldKind::Record { record } if index_pos > 0 => {
+                let mut rid = *record;
+                let mut selected_len = None;
+                for (offset, segment) in segments[1..].iter().enumerate() {
+                    let pos = offset + 1;
+                    let schema = self
+                        .prog
+                        .records
+                        .get(rid.index())
+                        .ok_or_else(|| format!("record r{} does not resolve", rid.0))?;
+                    let member = schema.field(segment).ok_or_else(|| {
+                        format!("record `{}` has no field `{segment}`", schema.name)
+                    })?;
+                    let indexed = pos == index_pos;
+                    if indexed {
+                        selected_len = Some(member.vec_len.ok_or_else(|| {
+                            format!(
+                                "indexed component field `{field}` selects non-vector `{segment}`"
+                            )
+                        })?);
+                    }
+                    if offset + 1 == segments.len() - 1 {
+                        let len = selected_len.ok_or_else(|| {
+                            format!(
+                                "indexed component field `{field}` has no selection at position {index_pos}"
+                            )
+                        })?;
+                        return Ok((member.ty.clone(), len));
+                    }
+                    match member.ty {
+                        IrType::Record(next) if member.vec_len.is_none() && !indexed => rid = next,
+                        IrType::Record(next) if member.vec_len.is_some() && indexed => rid = next,
+                        _ => {
+                            return Err(format!(
+                            "indexed component path `{field}` has invalid selection at `{segment}`"
+                        ))
+                        }
+                    }
+                }
+                Err(format!(
+                    "indexed component path `{field}` has no record leaf"
+                ))
+            }
+            _ => Err(format!(
+                "indexed component field `{field}` does not select a fixed vector"
+            )),
+        }
+    }
+
+    fn record_path_vec_shape(
+        &self,
+        mut record: RecordId,
+        segments: &[&str],
+        mid_indices: &[usize],
+    ) -> Result<Option<(usize, String)>, String> {
+        if segments.is_empty() {
+            return Ok(None);
+        }
+        for (position, segment) in segments.iter().enumerate() {
+            let schema = self
+                .prog
+                .records
+                .get(record.index())
+                .ok_or_else(|| format!("record r{} does not resolve", record.0))?;
+            let member = schema
+                .field(segment)
+                .ok_or_else(|| format!("record `{}` has no field `{segment}`", schema.name))?;
+            let last = position + 1 == segments.len();
+            if last {
+                return match member.vec_len {
+                    Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&member.ty)
+                        .map(|elem| Some((len, elem)))
+                        .ok_or_else(|| {
+                            format!("record vector field `{segment}` has an invalid element type")
+                        }),
+                    None => Ok(None),
+                };
+            }
+            let indexed = mid_indices.contains(&position);
+            match member.ty {
+                IrType::Record(next) if member.vec_len.is_none() == !indexed => record = next,
+                _ => {
+                    return Err(format!(
+                        "record path traverses non-record or unindexed vector field `{segment}`"
+                    ))
+                }
+            }
+        }
+        unreachable!("non-empty record path returned from the loop")
+    }
+
+    fn record_field_vec_shape(
+        &self,
+        local: LocalId,
+        field: &str,
+        path: &[String],
+        mid_indices: &[(usize, Expr)],
+        leaf_indexed: bool,
+    ) -> Result<Option<(usize, String)>, String> {
+        if leaf_indexed {
+            return Ok(None);
+        }
+        let record = match self.func.locals.get(local.index()).map(|local| &local.ty) {
+            Some(IrType::Record(record)) => *record,
+            _ => return Err(format!("local %{} is not record-typed", local.0)),
+        };
+        let segments: Vec<&str> = std::iter::once(field)
+            .chain(path.iter().map(String::as_str))
+            .collect();
+        let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        self.record_path_vec_shape(record, &segments, &positions)
+    }
+
+    fn transactor_state_field(
+        &self,
+        instance: &str,
+        field: &str,
+    ) -> Result<&StateFieldSchema, String> {
+        let body_transactor = match self.func.kind {
+            FunctionKind::TransactorBody { transactor } => Some(transactor),
+            _ => None,
+        };
+        let transactor = if let Some(transactor) =
+            body_transactor.filter(|_| instance.is_empty() || self.func.owner.is_none())
+        {
+            // Target responder bodies are schema functions shared by every
+            // binding, so they have no owning testbench even after binding
+            // fills the emission placeholder with an instance name.
+            transactor
+        } else if instance.is_empty() {
+            return Err(
+                "placeholder transactor-state instance outside a transactor body".to_string(),
+            );
+        } else {
+            let owner = self
+                .func
+                .owner
+                .ok_or_else(|| "transactor-state access has no owning testbench".to_string())?;
+            let tb = self
+                .prog
+                .testbenches
+                .get(owner.index())
+                .ok_or_else(|| format!("owner tb{} does not resolve", owner.0))?;
+            tb.target_tlm_actors
+                .iter()
+                .find(|actor| actor.instance == instance)
+                .map(|actor| actor.transactor)
+                .or_else(|| {
+                    tb.unbound_state_actors
+                        .iter()
+                        .find(|actor| actor.field == instance)
+                        .map(|actor| actor.transactor)
+                })
+                .ok_or_else(|| format!("transactor state instance `{instance}` does not resolve"))?
+        };
+        let schema = self
+            .prog
+            .transactors
+            .get(transactor.index())
+            .ok_or_else(|| format!("transactor x{} does not resolve", transactor.0))?;
+        schema
+            .state_fields
+            .iter()
+            .find(|state| state.name == field)
+            .ok_or_else(|| format!("transactor `{}` has no state field `{field}`", schema.name))
+    }
+
+    fn transactor_state_record(&self, instance: &str, field: &str) -> Result<RecordId, String> {
+        match &self.transactor_state_field(instance, field)?.kind {
+            StateFieldKind::Record { record } => Ok(*record),
+            _ => Err(format!(
+                "transactor state field `{instance}.{field}` is not record-typed"
+            )),
+        }
+    }
+
+    fn record_path_leaf_type(
+        &self,
+        mut record: RecordId,
+        segments: &[&str],
+        mid_positions: &[usize],
+    ) -> Option<IrType> {
+        for (position, segment) in segments.iter().enumerate() {
+            let member = self.prog.records.get(record.index())?.field(segment)?;
+            if position + 1 == segments.len() {
+                return Some(member.ty.clone());
+            }
+            let indexed = mid_positions.contains(&position);
+            match member.ty {
+                IrType::Record(next) if member.vec_len.is_none() == !indexed => record = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn component_field_type(&self, base: &ComponentBase, field: &str) -> Option<IrType> {
+        let component = self
+            .prog
+            .components
+            .get(self.component_base_id(base).ok()?.index())?;
+        let segments: Vec<&str> = field.split('.').collect();
+        let root = component.field(*segments.first()?)?;
+        if segments.len() == 1 {
+            return match &root.kind {
+                ComponentFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                ComponentFieldKind::FixedVec(vec) => Some(vec.elem.clone()),
+                ComponentFieldKind::Record { record } => Some(IrType::Record(*record)),
+                _ => None,
+            };
+        }
+        let ComponentFieldKind::Record { record } = root.kind else {
+            return None;
+        };
+        self.record_path_leaf_type(record, &segments[1..], &[])
+    }
+
+    /// Type record-bearing RHS forms that the general scalar expression
+    /// classifier intentionally does not understand. Aggregate destinations
+    /// must enforce record identity even after another pass rewrites a valid
+    /// local RHS into a component/state/record-field expression.
+    fn aggregate_assignment_expr_type(&self, value: &Expr) -> Option<IrType> {
+        match value {
+            Expr::Ternary(_, then_expr, else_expr) => {
+                let then_ty = self.aggregate_assignment_expr_type(then_expr);
+                let else_ty = self.aggregate_assignment_expr_type(else_expr);
+                match (then_ty, else_ty) {
+                    (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) if lhs == rhs => {
+                        Some(IrType::Record(lhs))
+                    }
+                    // A record mixed with another record identity, a scalar,
+                    // or an unclassifiable arm is never a sound record value.
+                    (Some(IrType::Record(_)), _) | (_, Some(IrType::Record(_))) => {
+                        Some(IrType::Unknown)
+                    }
+                    (lhs, rhs) => common_scalar_expr_type(lhs, rhs).or(Some(IrType::Unknown)),
+                }
+            }
+            Expr::ComponentField { base, field } => self
+                .component_field_type(base, field)
+                .or(Some(IrType::Unknown)),
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                ..
+            } => self
+                .component_indexed_field_type(base, field, *index_pos)
+                .ok()
+                .map(|(ty, _)| ty)
+                .or(Some(IrType::Unknown)),
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                ..
+            } => {
+                let Some(IrType::Record(record)) = self
+                    .func
+                    .locals
+                    .get(local.index())
+                    .map(|local| local.ty.clone())
+                else {
+                    return Some(IrType::Unknown);
+                };
+                let segments: Vec<&str> = std::iter::once(field.as_str())
+                    .chain(path.iter().map(String::as_str))
+                    .collect();
+                let positions: Vec<usize> = mid_indices.iter().map(|(pos, _)| *pos).collect();
+                self.record_path_leaf_type(record, &segments, &positions)
+                    .or(Some(IrType::Unknown))
+            }
+            Expr::TransactorState { instance, field } => {
+                let Ok(state) = self.transactor_state_field(instance, field) else {
+                    return Some(IrType::Unknown);
+                };
+                match &state.kind {
+                    StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                    StateFieldKind::Record { record } => Some(IrType::Record(*record)),
+                    StateFieldKind::Queue { .. } => Some(IrType::Unknown),
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                ..
+            } => {
+                let Ok(record) = self.transactor_state_record(instance, field) else {
+                    return Some(IrType::Unknown);
+                };
+                let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                let positions: Vec<usize> = mid_indices.iter().map(|(pos, _)| *pos).collect();
+                self.record_path_leaf_type(record, &segments, &positions)
+                    .or(Some(IrType::Unknown))
+            }
+            _ => assignment_expr_type(self.prog, self.func, value).or(Some(IrType::Unknown)),
+        }
+    }
+
+    /// Reject record values consumed by scalar operators, plus aggregate
+    /// ternaries whose arms cannot denote one record type. The general scalar
+    /// classifier intentionally returns `Unknown` for several of these forms;
+    /// aggregate destinations must not interpret that as a wildcard.
+    fn contains_invalid_record_composition(&self, value: &Expr) -> bool {
+        if let Expr::Ternary(cond, then_expr, else_expr) = value {
+            if matches!(
+                self.aggregate_assignment_expr_type(cond),
+                Some(IrType::Record(_))
+            ) {
+                return true;
+            }
+            let then_ty = self.aggregate_assignment_expr_type(then_expr);
+            let else_ty = self.aggregate_assignment_expr_type(else_expr);
+            if (matches!(then_ty, Some(IrType::Record(_)))
+                || matches!(else_ty, Some(IrType::Record(_))))
+                && !matches!(
+                    (then_ty, else_ty),
+                    (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) if lhs == rhs
+                )
+            {
+                return true;
+            }
+        }
+        match value {
+            Expr::Binary(op, lhs, rhs) => {
+                let lhs_ty = self.aggregate_assignment_expr_type(lhs);
+                let rhs_ty = self.aggregate_assignment_expr_type(rhs);
+                let invalid_operands = if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    match (lhs_ty, rhs_ty) {
+                        (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) => lhs != rhs,
+                        (Some(IrType::Record(_)), _) | (_, Some(IrType::Record(_))) => true,
+                        _ => false,
+                    }
+                } else {
+                    matches!(lhs_ty, Some(IrType::Record(_)))
+                        || matches!(rhs_ty, Some(IrType::Record(_)))
+                };
+                invalid_operands
+                    || self.contains_invalid_record_composition(lhs)
+                    || self.contains_invalid_record_composition(rhs)
+            }
+            Expr::Unary(_, inner) | Expr::BitSlice { target: inner, .. } => {
+                matches!(
+                    self.aggregate_assignment_expr_type(inner),
+                    Some(IrType::Record(_))
+                ) || self.contains_invalid_record_composition(inner)
+            }
+            Expr::BitSliceDyn { target, hi, lo } => [target.as_ref(), hi.as_ref(), lo.as_ref()]
+                .iter()
+                .any(|inner| {
+                    matches!(
+                        self.aggregate_assignment_expr_type(inner),
+                        Some(IrType::Record(_))
+                    ) || self.contains_invalid_record_composition(inner)
+                }),
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                self.contains_invalid_record_composition(cond)
+                    || self.contains_invalid_record_composition(then_expr)
+                    || self.contains_invalid_record_composition(else_expr)
+            }
+            Expr::WidthCast { inner, .. }
+            | Expr::ComponentIdle { n: inner, .. }
+            | Expr::TransactorIdle { n: inner, .. }
+            | Expr::SeqIndex { index: inner, .. } => {
+                matches!(
+                    self.aggregate_assignment_expr_type(inner),
+                    Some(IrType::Record(_))
+                ) || self.contains_invalid_record_composition(inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn transactor_state_field_vec_shape(
+        &self,
+        instance: &str,
+        field: &str,
+        path: &[String],
+        mid_indices: &[(usize, Expr)],
+        index: Option<&Expr>,
+    ) -> Result<Option<(usize, String)>, String> {
+        if path.is_empty() {
+            return Err(format!(
+                "transactor state record field `{instance}.{field}` has an empty path"
+            ));
+        }
+        let record = self.transactor_state_record(instance, field)?;
+        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        if mid_indices.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || mid_indices
+                .iter()
+                .any(|(position, _)| *position + 1 >= segments.len())
+        {
+            return Err(format!(
+                "transactor state path `{instance}.{field}` has malformed index positions"
+            ));
+        }
+        let mut rid = record;
+        for (position, segment) in segments.iter().enumerate() {
+            let schema = self
+                .prog
+                .records
+                .get(rid.index())
+                .ok_or_else(|| format!("record r{} does not resolve", rid.0))?;
+            let member = schema
+                .field(segment)
+                .ok_or_else(|| format!("record `{}` has no field `{segment}`", schema.name))?;
+            let idx = mid_indices
+                .iter()
+                .find(|(p, _)| *p == position)
+                .map(|(_, e)| e)
+                .or_else(|| (position + 1 == segments.len()).then_some(index).flatten());
+            if let Some(idx) = idx {
+                let len = member
+                    .vec_len
+                    .ok_or_else(|| format!("indexed state path selects non-vector `{segment}`"))?;
+                if matches!(idx, Expr::Literal { value, .. } if *value as usize >= len) {
+                    return Err(format!(
+                        "indexed state path selects `{segment}` out of bounds for length {len}"
+                    ));
+                }
+            }
+            if position + 1 < segments.len() {
+                let indexed = idx.is_some();
+                match member.ty {
+                    IrType::Record(next) if member.vec_len.is_none() && !indexed => rid = next,
+                    IrType::Record(next) if member.vec_len.is_some() && indexed => rid = next,
+                    _ => return Err(format!("indexed state path cannot traverse `{segment}`")),
+                }
+            }
+        }
+        let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        let shape = self.record_path_vec_shape(record, &segments, &positions)?;
+        if index.is_some() {
+            shape.ok_or_else(|| format!("indexed state path leaf is not a vector"))?;
+            Ok(None)
+        } else {
+            Ok(shape)
+        }
+    }
+
+    fn expr_whole_vec_shape(&self, expr: &Expr) -> Result<Option<(usize, String)>, String> {
+        match expr {
+            Expr::ComponentField { base, field } => self.component_field_vec_shape(base, field),
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => self.record_field_vec_shape(*local, field, path, mid_indices, index.is_some()),
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => self.transactor_state_field_vec_shape(
+                instance,
+                field,
+                path,
+                mid_indices,
+                index.as_deref(),
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    fn report_bad_whole_vec_use(&mut self, detail: String) {
+        self.errs.push(VerifyError::BadProgramRef {
+            what: format!(
+                "fn{} b{} whole-vector use: {detail}",
+                self.fid.0, self.bid.0
+            ),
+        });
+    }
+
+    fn check_whole_vec_write_value(
+        &mut self,
+        dst_shape: Result<Option<(usize, String)>, String>,
+        value: &Expr,
+        context: &'static str,
+    ) {
+        let rhs_shape = self.expr_whole_vec_shape(value);
+        match (dst_shape, rhs_shape) {
+            (Ok(Some(dst)), Ok(Some(rhs))) if dst == rhs => {
+                self.check_expr_inner(value, false, context, true);
+            }
+            (Ok(None), Ok(None)) => self.check_expr(value, false, context),
+            (Ok(dst), Ok(rhs)) => {
+                self.report_bad_whole_vec_use(format!(
+                    "write has incompatible destination and value shapes {dst:?} and {rhs:?}"
+                ));
+                self.check_expr_inner(value, false, context, rhs.is_some());
+            }
+            (Err(detail), _) | (_, Err(detail)) => {
+                self.report_bad_whole_vec_use(detail);
+                self.check_expr(value, false, context);
+            }
+        }
+    }
+
+    fn report_bad_component_field(&mut self, detail: String) {
+        self.errs.push(VerifyError::BadProgramRef {
+            what: format!("fn{} b{} component field: {detail}", self.fid.0, self.bid.0),
+        });
+    }
+
     fn check_block(&mut self, b: &BasicBlock) {
         for s in &b.stmts {
             match s {
@@ -1898,7 +2912,7 @@ impl Checker<'_> {
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
                         let expected = &self.func.local(*l).ty;
-                        if let Some(actual) = expr_type(self.func, e) {
+                        if let Some(actual) = expr_type(self.prog, self.func, e) {
                             if *expected != IrType::Unknown
                                 && actual != IrType::Unknown
                                 && !assign_compatible(expected, &actual)
@@ -1911,6 +2925,33 @@ impl Checker<'_> {
                                     actual,
                                 });
                             }
+                        }
+                        // The general expression classifier deliberately
+                        // leaves aggregate ternaries untyped. For a record
+                        // destination, replay both arms so a rewriting pass
+                        // cannot hide a different record identity behind arm
+                        // order while preserving all historically accepted
+                        // non-ternary aggregate assignment forms.
+                        let aggregate_actual = self.aggregate_assignment_expr_type(e);
+                        let aggregate_incompatible = self.contains_invalid_record_composition(e)
+                            || match expected {
+                                IrType::Record(_) => aggregate_actual.as_ref().is_some_and(|actual| {
+                                    *actual != IrType::Unknown
+                                        && !aggregate_assignment_compatible(expected, actual)
+                                }),
+                                IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => {
+                                    matches!(&aggregate_actual, Some(IrType::Record(_)))
+                                }
+                                _ => false,
+                            };
+                        if aggregate_incompatible {
+                            self.errs.push(VerifyError::TypeMismatch {
+                                func: self.fid,
+                                block: self.bid,
+                                local: *l,
+                                expected: expected.clone(),
+                                actual: aggregate_actual.unwrap_or(IrType::Unknown),
+                            });
                         }
                     }
                 }
@@ -1952,7 +2993,14 @@ impl Checker<'_> {
                     if let Some(idx) = index {
                         self.check_expr(idx, false, "RecordFieldWrite index");
                     }
-                    self.check_expr(value, false, "RecordFieldWrite value");
+                    let dst_shape = self.record_field_vec_shape(
+                        *local,
+                        field,
+                        path,
+                        mid_indices,
+                        index.is_some(),
+                    );
+                    self.check_whole_vec_write_value(dst_shape, value, "RecordFieldWrite value");
                 }
                 Stmt::RecordWriteCb {
                     local,
@@ -1971,9 +3019,10 @@ impl Checker<'_> {
                 Stmt::TbQueuePush { field, value } => {
                     self.check_tb_queue(field);
                     self.check_expr(value, false, "TbQueuePush value");
-                    if let (Some(elem), Some(actual)) =
-                        (self.tb_queue_elem(field), expr_type(self.func, value))
-                    {
+                    if let (Some(elem), Some(actual)) = (
+                        self.tb_queue_elem(field),
+                        expr_type(self.prog, self.func, value),
+                    ) {
                         if !queue_elem_accepts_type(elem, &actual) {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
@@ -2007,8 +3056,32 @@ impl Checker<'_> {
                     // just hold the value to the no-inline-port rule.
                     self.check_expr(value, false, "TransactorStateWrite value");
                 }
-                Stmt::TransactorStateRecordFieldWrite { value, .. } => {
-                    self.check_expr(value, false, "TransactorStateRecordFieldWrite value");
+                Stmt::TransactorStateRecordFieldWrite {
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
+                    value,
+                } => {
+                    for (_, idx) in mid_indices {
+                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite mid index");
+                    }
+                    if let Some(idx) = index {
+                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite index");
+                    }
+                    let dst_shape = self.transactor_state_field_vec_shape(
+                        instance,
+                        field,
+                        path,
+                        mid_indices,
+                        index.as_ref(),
+                    );
+                    self.check_whole_vec_write_value(
+                        dst_shape,
+                        value,
+                        "TransactorStateRecordFieldWrite value",
+                    );
                 }
                 Stmt::TransactorStateQueuePush {
                     instance,
@@ -2018,14 +3091,10 @@ impl Checker<'_> {
                     // Target-state queue host state — the pushed value
                     // follows the no-inline-port rule like any Assign value.
                     self.check_expr(value, false, "TransactorStateQueuePush value");
-                    match resolve_transactor_state_queue_elem(
-                        self.prog,
-                        self.func,
-                        instance,
-                        field,
-                    ) {
+                    match resolve_transactor_state_queue_elem(self.prog, self.func, instance, field)
+                    {
                         Ok(elem) => {
-                            if let Some(actual) = expr_type(self.func, value) {
+                            if let Some(actual) = expr_type(self.prog, self.func, value) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
@@ -2046,12 +3115,8 @@ impl Checker<'_> {
                     dest,
                 } => {
                     self.check_local(*dest);
-                    match resolve_transactor_state_queue_elem(
-                        self.prog,
-                        self.func,
-                        instance,
-                        field,
-                    ) {
+                    match resolve_transactor_state_queue_elem(self.prog, self.func, instance, field)
+                    {
                         Ok(elem) => {
                             if let Some(local) = self.func.locals.get(dest.index()) {
                                 if !queue_elem_fits_dest(&elem, &local.ty) {
@@ -2060,11 +3125,7 @@ impl Checker<'_> {
                                             "fn{} b{} pops target-state queue \
                                              `{instance}.{field}` with element {:?} into local \
                                              %{} declared {:?}",
-                                            self.fid.0,
-                                            self.bid.0,
-                                            elem,
-                                            dest.0,
-                                            local.ty
+                                            self.fid.0, self.bid.0, elem, dest.0, local.ty
                                         ),
                                     });
                                 }
@@ -2075,33 +3136,26 @@ impl Checker<'_> {
                 }
                 Stmt::Log { args, .. } => self.check_fmt_args(args),
                 Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
-                    self.check_expr(cond, true, "AssertCheck cond");
+                    self.check_truth_expr(cond, true, "AssertCheck cond");
                     self.check_fmt_args(on_fail);
                 }
                 Stmt::CovReport(inst) => self.check_covgroup(inst.covgroup),
-                // Registration statements carry only a table index; the
-                // bodies themselves are verified once per schema by
-                // `check_concurrent_checks` (they are not part of any
-                // function's local scope, so walking them here would
-                // report every reference as an undefined local).
-                Stmt::PropertyCheck(p) => {
-                    if p.index() >= self.prog.property_checks.len() {
-                        self.errs.push(VerifyError::BadConcurrentCheck {
-                            func: self.fid,
-                            block: self.bid,
-                            detail: format!("references missing property check p{}", p.0),
-                        });
-                    }
-                }
-                Stmt::CoverCheck(c) => {
-                    if c.index() >= self.prog.cover_checks.len() {
-                        self.errs.push(VerifyError::BadConcurrentCheck {
-                            func: self.fid,
-                            block: self.bid,
-                            detail: format!("references missing cover check c{}", c.0),
-                        });
-                    }
-                }
+                Stmt::PropertyCheck(p) => match self.prog.property_checks.get(p.index()).cloned() {
+                    Some(schema) => self.check_property_schema(*p, &schema),
+                    None => self.errs.push(VerifyError::BadConcurrentCheck {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!("references missing property check p{}", p.0),
+                    }),
+                },
+                Stmt::CoverCheck(c) => match self.prog.cover_checks.get(c.index()).cloned() {
+                    Some(schema) => self.check_cover_schema(*c, &schema),
+                    None => self.errs.push(VerifyError::BadConcurrentCheck {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!("references missing cover check c{}", c.0),
+                    }),
+                },
                 // The handler body is its own function (verified in its
                 // own right); here the id must resolve to a one-parameter
                 // `TestHook` whose parameter matches the event payload. Both
@@ -2147,12 +3201,7 @@ impl Checker<'_> {
                             payload,
                         } => {
                             if let Err(detail) = verify_component_event_ref(
-                                self.prog,
-                                self.func,
-                                base,
-                                *component,
-                                event,
-                                *payload,
+                                self.prog, self.func, base, *component, event, *payload,
                             ) {
                                 self.errs.push(VerifyError::BadConcurrentCheck {
                                     func: self.fid,
@@ -2323,7 +3372,8 @@ impl Checker<'_> {
                 }
                 Stmt::EventEmit { event, args } => {
                     self.check_local(*event);
-                    if self.event_payload(*event).is_none() {
+                    let payload = self.event_payload(*event);
+                    if payload.is_none() {
                         self.errs.push(VerifyError::BadConcurrentCheck {
                             func: self.fid,
                             block: self.bid,
@@ -2340,42 +3390,49 @@ impl Checker<'_> {
                             ),
                         });
                     }
-                    for a in args {
-                        self.check_expr(a, false, "EventEmit arg");
+                    if let ([arg], Some(payload)) = (args.as_slice(), payload) {
+                        self.check_event_payload_value(payload, arg, "EventEmit arg");
+                    } else {
+                        for a in args {
+                            self.check_expr(a, false, "EventEmit arg");
+                        }
                     }
                 }
-                Stmt::CycleHandler(h) => {
-                    match self.prog.cycle_handlers.get(h.index()) {
-                        None => self.errs.push(VerifyError::BadConcurrentCheck {
-                            func: self.fid,
-                            block: self.bid,
-                            detail: format!("references missing cycle handler h{}", h.0),
-                        }),
-                        Some(schema) => match self.prog.functions.get(schema.function.index()) {
-                            Some(f)
-                                if f.kind == FunctionKind::TestHook && f.params.is_empty() => {}
-                            Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
-                                func: self.fid,
-                                block: self.bid,
-                                detail: format!(
-                                    "cycle handler h{} body fn{} is {:?} with {} param(s),                                      not a zero-parameter TestHook",
-                                    h.0,
-                                    f.id.0,
-                                    f.kind,
-                                    f.params.len()
-                                ),
-                            }),
-                            None => self.errs.push(VerifyError::BadConcurrentCheck {
-                                func: self.fid,
-                                block: self.bid,
-                                detail: format!(
-                                    "cycle handler h{} references missing fn{}",
-                                    h.0, schema.function.0
-                                ),
-                            }),
-                        },
+                Stmt::CycleHandler(h) => match self.prog.cycle_handlers.get(h.index()) {
+                    None => self.errs.push(VerifyError::BadConcurrentCheck {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!("references missing cycle handler h{}", h.0),
+                    }),
+                    Some(schema) => {
+                        if let CycleHandlerKind::Trigger { trigger, .. } = &schema.kind {
+                            self.check_truth_expr(trigger, true, "cycle-handler trigger");
+                        }
+                        match self.prog.functions.get(schema.function.index()) {
+                                Some(f)
+                                    if f.kind == FunctionKind::TestHook && f.params.is_empty() => {}
+                                Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "cycle handler h{} body fn{} is {:?} with {} param(s),                                      not a zero-parameter TestHook",
+                                        h.0,
+                                        f.id.0,
+                                        f.kind,
+                                        f.params.len()
+                                    ),
+                                }),
+                                None => self.errs.push(VerifyError::BadConcurrentCheck {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "cycle handler h{} references missing fn{}",
+                                        h.0, schema.function.0
+                                    ),
+                                }),
+                            }
                     }
-                }
+                },
                 Stmt::TransactorCall { dest, call } => {
                     if let Some(d) = dest {
                         self.check_local(*d);
@@ -2390,7 +3447,7 @@ impl Checker<'_> {
                 }
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
-                        self.check_expr(g, true, "FailDiag guard");
+                        self.check_truth_expr(g, true, "FailDiag guard");
                     }
                     self.check_fmt_args(args);
                 }
@@ -2400,16 +3457,18 @@ impl Checker<'_> {
                     op,
                     nested_path,
                 } => {
-                    self.check_scoreboard(*sb, field, nested_path.is_some());
+                    self.check_scoreboard(*sb, field, nested_path.as_deref());
                     match op {
                         crate::ir::ScoreboardOp::QueuePush { queue, value } => {
                             self.check_scoreboard_queue(*sb, queue);
                             self.check_expr(value, false, "ScoreboardOp push value");
                             if let (Some(elem), Some(actual)) = (
                                 self.scoreboard_queue_elem(*sb, queue),
-                                expr_type(self.func, value),
+                                self.aggregate_assignment_expr_type(value),
                             ) {
-                                if !queue_elem_accepts_type(&elem, &actual) {
+                                if self.contains_invalid_record_composition(value)
+                                    || !queue_elem_accepts_type(&elem, &actual)
+                                {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
                                             "fn{} b{} pushes {:?} into scoreboard queue `{queue}` with element {:?}",
@@ -2439,21 +3498,106 @@ impl Checker<'_> {
                         crate::ir::ScoreboardOp::ScalarWrite { scalar, value } => {
                             self.check_scoreboard_scalar(*sb, scalar);
                             self.check_expr(value, false, "ScoreboardOp scalar value");
+                            if let (Some(expected), Some(actual)) = (
+                                self.scoreboard_scalar_type(*sb, scalar),
+                                self.aggregate_assignment_expr_type(value),
+                            ) {
+                                if self.contains_invalid_record_composition(value)
+                                    || !aggregate_assignment_compatible(&expected, &actual)
+                                {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} writes {:?} into scoreboard scalar \
+                                             `{scalar}` declared {:?}",
+                                            self.fid.0, self.bid.0, actual, expected
+                                        ),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
-                Stmt::ComponentFieldWrite { value, .. } => {
+                Stmt::ComponentFieldWrite { base, field, value } => {
                     // Component host state — the value follows the
                     // no-inline-port rule like any Assign value.
-                    self.check_expr(value, false, "ComponentFieldWrite value");
+                    let dst_shape = self.component_field_vec_shape(base, field);
+                    self.check_whole_vec_write_value(dst_shape, value, "ComponentFieldWrite value");
                 }
-                Stmt::ComponentVecElementWrite { index, value, .. } => {
+                Stmt::ComponentVecElementWrite {
+                    base,
+                    field,
+                    index_pos,
+                    index,
+                    value,
+                } => {
                     self.check_expr(index, false, "ComponentVecElementWrite index");
                     self.check_expr(value, false, "ComponentVecElementWrite value");
+                    match self.component_indexed_field_type(base, field, *index_pos) {
+                        Ok((expected, len)) => {
+                            if matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
+                            {
+                                self.report_bad_component_field(format!(
+                                    "indexed component field `{field}` is out of bounds for length {len}"
+                                ));
+                            }
+                            let actual = match value {
+                                Expr::Literal {
+                                    ty: IrType::Unknown,
+                                    ..
+                                } => Some(IrType::Unknown),
+                                _ => self.aggregate_assignment_expr_type(value),
+                            };
+                            if let Some(actual) = actual {
+                                let compatible = match (&expected, &actual) {
+                                    (IrType::Record(expected), IrType::Record(actual)) => {
+                                        expected == actual
+                                    }
+                                    (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
+                                    // Scalar element coercions are already an established
+                                    // lowering contract (including positive literals into
+                                    // signed slots). This verifier guard is the aggregate
+                                    // boundary: record-vs-scalar and record identity.
+                                    _ => true,
+                                };
+                                if !compatible {
+                                    self.report_bad_component_field(format!(
+                                        "indexed component field `{field}` of type {expected:?} is written from incompatible type {actual:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(detail) => self.report_bad_component_field(detail),
+                    }
                 }
-                Stmt::ComponentEmit { args, .. } => {
-                    for a in args {
-                        self.check_expr(a, false, "ComponentEmit arg");
+                Stmt::ComponentEmit { base, event, args } => {
+                    let payload = match self.component_emit_payload(base, event) {
+                        Ok(payload) => Some(payload),
+                        Err(detail) => {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentEmit target `{event}`: {detail}",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                            None
+                        }
+                    };
+                    if args.len() != 1 {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentEmit carries {} argument(s)",
+                                self.fid.0,
+                                self.bid.0,
+                                args.len()
+                            ),
+                        });
+                    }
+                    if let ([arg], Some(payload)) = (args.as_slice(), payload) {
+                        self.check_event_payload_value(payload, arg, "ComponentEmit arg");
+                    } else {
+                        for a in args {
+                            self.check_expr(a, false, "ComponentEmit arg");
+                        }
                     }
                 }
                 Stmt::ComponentCall { args, dest, .. } => {
@@ -2476,7 +3620,7 @@ impl Checker<'_> {
                     self.check_expr(value, false, "ComponentQueuePush value");
                     match resolve_component_queue_elem(self.prog, self.func, base, queue) {
                         Ok(elem) => {
-                            if let Some(actual) = expr_type(self.func, value) {
+                            if let Some(actual) = expr_type(self.prog, self.func, value) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
@@ -2543,18 +3687,18 @@ impl Checker<'_> {
             }
         }
         match &b.terminator {
-            Terminator::Branch(c, _, _) => self.check_expr(c, false, "Branch cond"),
+            Terminator::Branch(c, _, _) => self.check_truth_expr(c, false, "Branch cond"),
             Terminator::WaitCycles(e, _, _) => self.check_expr(e, false, "WaitCycles count"),
             Terminator::WaitCyclesSync(e, _) => self.check_expr(e, false, "WaitCycles count"),
             Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
-                    self.check_expr(&p.expr, true, "WaitUntil pred");
+                    self.check_truth_expr(&p.expr, true, "WaitUntil pred");
                 }
             }
             Terminator::WaitUntilTimeout { preds, cycles, .. } => {
                 for p in preds {
-                    self.check_expr(&p.expr, true, "WaitUntilTimeout pred");
+                    self.check_truth_expr(&p.expr, true, "WaitUntilTimeout pred");
                 }
                 self.check_expr(cycles, false, "WaitUntilTimeout cycles");
             }
@@ -2582,6 +3726,29 @@ impl Checker<'_> {
                         block: self.bid,
                         detail: format!("c{} out of range", constraints.0),
                     });
+                } else if let Some(local) = self.func.locals.get(target.index()) {
+                    if let IrType::Record(record) = local.ty {
+                        let site = &self.prog.constraint_sites[constraints.index()];
+                        match self.prog.records.get(record.index()) {
+                            Some(schema) if schema.name == site.record => {}
+                            Some(schema) => self.errs.push(VerifyError::DanglingConstraintRef {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "c{} is for record `{}` but target local `{}` has record `{}`",
+                                    constraints.0, site.record, local.name, schema.name
+                                ),
+                            }),
+                            None => self.errs.push(VerifyError::DanglingConstraintRef {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "target local `{}` references missing record r{}",
+                                    local.name, record.0
+                                ),
+                            }),
+                        }
+                    }
                 }
             }
             Terminator::Fatal(args) => self.check_fmt_args(args),
@@ -2650,7 +3817,12 @@ impl Checker<'_> {
 
     /// The scoreboard id must resolve and `field` must be a
     /// scoreboard-typed field of the owning testbench bound to it.
-    fn check_scoreboard(&mut self, sb: crate::ir::ScoreboardId, field: &str, nested: bool) {
+    fn check_scoreboard(
+        &mut self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+        nested_path: Option<&[String]>,
+    ) {
         if sb.index() >= self.prog.scoreboards.len() {
             self.errs.push(VerifyError::BadScoreboard {
                 func: self.fid,
@@ -2659,11 +3831,14 @@ impl Checker<'_> {
             });
             return;
         }
-        // An env-nested data scoreboard (`top.sb`) is a sub-component of
-        // the env local, not a testbench field — the binding check below
-        // only applies to the `_tb.<field>` form. The sb id already
-        // resolved above; that is sufficient for the nested form.
-        if nested {
+        if let Some(path) = nested_path {
+            if let Err(detail) = self.check_nested_scoreboard_path(sb, field, path) {
+                self.errs.push(VerifyError::BadScoreboard {
+                    func: self.fid,
+                    block: self.bid,
+                    detail,
+                });
+            }
             return;
         }
         let bound = self
@@ -2687,20 +3862,123 @@ impl Checker<'_> {
         }
     }
 
+    /// Replay lowering's env/self component walk for a nested data-only
+    /// scoreboard. Codegen renders this path verbatim, so every segment and
+    /// the terminal scoreboard identity must remain tied to the schema after
+    /// any IR rewrite.
+    fn check_nested_scoreboard_path(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+        path: &[String],
+    ) -> Result<(), String> {
+        let (root, tail) = path
+            .split_first()
+            .ok_or_else(|| "nested scoreboard has an empty path".to_string())?;
+        if tail.is_empty() || path.last().is_none_or(|leaf| leaf != field) {
+            return Err(format!(
+                "nested scoreboard path `{}` does not terminate at field `{field}`",
+                path.join(".")
+            ));
+        }
+        // Match lowering's namespace order: a real testbench component field
+        // named `self` wins over the synthetic component-method root.
+        let owner_component = self
+            .func
+            .owner
+            .and_then(|owner| self.prog.testbenches.get(owner.index()))
+            .and_then(|owner| {
+                owner
+                    .component_fields
+                    .iter()
+                    .find(|binding| binding.field == *root)
+                    .map(|binding| binding.component)
+            });
+        let mut component = if let Some(component) = owner_component {
+            component
+        } else if root == "self" {
+            match self.func.kind {
+                FunctionKind::ComponentMethod { component } => component,
+                _ => {
+                    return Err(
+                        "self-rooted nested scoreboard outside a component method".to_string()
+                    )
+                }
+            }
+        } else {
+            return Err(format!("root `{root}` is not a testbench component field"));
+        };
+        for (position, segment) in tail.iter().enumerate() {
+            let schema = self
+                .prog
+                .components
+                .get(component.index())
+                .ok_or_else(|| format!("component c{} does not resolve", component.0))?;
+            let terminal = position + 1 == tail.len();
+            match schema.field(segment).map(|member| &member.kind) {
+                Some(ComponentFieldKind::Sub {
+                    component: next, ..
+                }) if !terminal => component = *next,
+                Some(ComponentFieldKind::ScoreboardSub { scoreboard }) if terminal => {
+                    if *scoreboard == sb {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "nested scoreboard path `{}` resolves to sb{}, not sb{}",
+                        path.join("."),
+                        scoreboard.0,
+                        sb.0
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "nested scoreboard path `{}` has invalid segment `{segment}`",
+                        path.join(".")
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "nested scoreboard path `{}` has no scoreboard leaf",
+            path.join(".")
+        ))
+    }
+
     fn check_scoreboard_scalar(&mut self, sb: crate::ir::ScoreboardId, scalar: &str) {
         let ok = self
             .prog
             .scoreboards
             .get(sb.index())
             .and_then(|s| s.field(scalar))
-            .is_some_and(|f| matches!(f.kind, crate::ir::ScoreboardFieldKind::Scalar { .. }));
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::ScoreboardFieldKind::Scalar { .. }
+                        | crate::ir::ScoreboardFieldKind::Record { .. }
+                )
+            });
         if !ok {
             self.errs.push(VerifyError::BadScoreboard {
                 func: self.fid,
                 block: self.bid,
-                detail: format!("scoreboard sb{} has no scalar field `{scalar}`", sb.0),
+                detail: format!(
+                    "scoreboard sb{} has no scalar/record field `{scalar}`",
+                    sb.0
+                ),
             });
         }
+    }
+
+    fn scoreboard_scalar_type(&self, sb: crate::ir::ScoreboardId, scalar: &str) -> Option<IrType> {
+        self.prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(scalar))
+            .and_then(|f| match &f.kind {
+                crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                crate::ir::ScoreboardFieldKind::Record { record } => Some(IrType::Record(*record)),
+                _ => None,
+            })
     }
 
     fn check_scoreboard_queue(&mut self, sb: crate::ir::ScoreboardId, queue: &str) {
@@ -2726,7 +4004,8 @@ impl Checker<'_> {
             .and_then(|schema| schema.field(queue))
             .and_then(|field| match &field.kind {
                 crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem.clone()),
-                crate::ir::ScoreboardFieldKind::Scalar { .. } => None,
+                crate::ir::ScoreboardFieldKind::Scalar { .. }
+                | crate::ir::ScoreboardFieldKind::Record { .. } => None,
             })
     }
 
@@ -2949,6 +4228,24 @@ impl Checker<'_> {
     }
 
     fn check_expr(&mut self, e: &Expr, ports_ok: bool, context: &'static str) {
+        if self.contains_invalid_record_composition(e) {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {context} contains an invalid record composition",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+        self.check_expr_inner(e, ports_ok, context, false);
+    }
+
+    fn check_expr_inner(
+        &mut self,
+        e: &Expr,
+        ports_ok: bool,
+        context: &'static str,
+        whole_vec_ok: bool,
+    ) {
         match e {
             Expr::Literal { .. } | Expr::WideLiteral(_) => {}
             // The global cycle counter — a framework value, no
@@ -2962,14 +4259,16 @@ impl Checker<'_> {
             // body, which is verified by `check_concurrent_checks`
             // rather than walked as part of a function body.
             Expr::TemporalSlot { slot, .. } => {
-                self.errs.push(VerifyError::BadConcurrentCheck {
-                    func: self.fid,
-                    block: self.bid,
-                    detail: format!(
-                        "temporal slot {slot} referenced in {context}, outside a \
-                         concurrent property/cover body"
-                    ),
-                });
+                if !self.temporal_slots_ok {
+                    self.errs.push(VerifyError::BadConcurrentCheck {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!(
+                            "temporal slot {slot} referenced in {context}, outside a \
+                             concurrent property/cover body"
+                        ),
+                    });
+                }
             }
             Expr::TbQueueQuery { field, query } => {
                 self.check_tb_queue(field);
@@ -2988,8 +4287,44 @@ impl Checker<'_> {
             // Transactor-instance state — host state, resolved at
             // lowering against the bound instance; nothing to verify
             // structurally here (no local/port dependency).
-            Expr::TransactorState { .. } => {}
-            Expr::TransactorStateRecordField { .. } => {}
+            Expr::TransactorState { instance, field } => {
+                if let Err(detail) = self.transactor_state_field(instance, field) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} transactor-state read `{instance}.{field}`: {detail}",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                for (_, idx) in mid_indices {
+                    self.check_expr(idx, ports_ok, context);
+                }
+                if let Some(idx) = index {
+                    self.check_expr(idx, ports_ok, context);
+                }
+                match self.transactor_state_field_vec_shape(
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index.as_deref(),
+                ) {
+                Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
+                    "transactor-state vector `{instance}.{field}.{}` with shape {shape:?} appears outside matching equality/copy",
+                    path.join(".")
+                )),
+                Ok(_) => {}
+                Err(detail) => self.report_bad_whole_vec_use(detail),
+                }
+            }
             Expr::TransactorStateQueueQuery { .. } => {}
             Expr::Port(_) => {
                 if !ports_ok {
@@ -3000,9 +4335,33 @@ impl Checker<'_> {
                     });
                 }
             }
-            Expr::Binary(_, a, b) => {
-                self.check_expr(a, ports_ok, context);
-                self.check_expr(b, ports_ok, context);
+            Expr::Binary(op, a, b) => {
+                let lhs_shape = self.expr_whole_vec_shape(a);
+                let rhs_shape = self.expr_whole_vec_shape(b);
+                match (lhs_shape, rhs_shape) {
+                    (Ok(Some(lhs)), Ok(Some(rhs)))
+                        if matches!(op, BinOp::Eq | BinOp::Ne) && lhs == rhs =>
+                    {
+                        self.check_expr_inner(a, ports_ok, context, true);
+                        self.check_expr_inner(b, ports_ok, context, true);
+                    }
+                    (Ok(None), Ok(None)) => {
+                        self.check_expr(a, ports_ok, context);
+                        self.check_expr(b, ports_ok, context);
+                    }
+                    (Ok(lhs), Ok(rhs)) => {
+                        self.report_bad_whole_vec_use(format!(
+                            "binary operator {op:?} has incompatible whole-vector operands {lhs:?} and {rhs:?}"
+                        ));
+                        self.check_expr_inner(a, ports_ok, context, lhs.is_some());
+                        self.check_expr_inner(b, ports_ok, context, rhs.is_some());
+                    }
+                    (Err(detail), _) | (_, Err(detail)) => {
+                        self.report_bad_whole_vec_use(detail);
+                        self.check_expr(a, ports_ok, context);
+                        self.check_expr(b, ports_ok, context);
+                    }
+                }
             }
             Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
             Expr::BitSlice { target, .. } => self.check_expr(target, ports_ok, context),
@@ -3059,6 +4418,24 @@ impl Checker<'_> {
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
+                match self.record_field_vec_shape(
+                    *local,
+                    field,
+                    path,
+                    mid_indices,
+                    index.is_some(),
+                ) {
+                    Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
+                        "record vector `%{}.{}` with shape {shape:?} appears outside matching equality/copy",
+                        local.0,
+                        std::iter::once(field.as_str())
+                            .chain(path.iter().map(String::as_str))
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    )),
+                    Ok(_) => {}
+                    Err(detail) => self.report_bad_whole_vec_use(detail),
+                }
             }
             // Register-level frontdoor read in expression position. The
             // mirror is a record local; the register name must be one of
@@ -3079,11 +4456,32 @@ impl Checker<'_> {
                 }
             }
             Expr::CovHookArg { .. } => {}
-            // Component host state — resolved at lowering against the
-            // component schema; no local/port dependency to verify here.
-            Expr::ComponentField { .. } => {}
-            Expr::ComponentVecElement { index, .. } => {
+            Expr::ComponentField { base, field } => {
+                match self.component_field_vec_shape(base, field) {
+                    Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
+                        "component vector `{field}` with shape {shape:?} appears outside matching equality/copy"
+                    )),
+                    Ok(_) => {}
+                    Err(detail) => self.report_bad_component_field(detail),
+                }
+            }
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                index,
+            } => {
                 self.check_expr(index, ports_ok, context);
+                match self.component_indexed_field_type(base, field, *index_pos) {
+                    Ok((_, len)) if matches!(index.as_ref(), Expr::Literal { value, .. } if *value as usize >= len) =>
+                    {
+                        self.report_bad_component_field(format!(
+                            "indexed component field `{field}` is out of bounds for length {len}"
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(detail) => self.report_bad_component_field(detail),
+                }
             }
             // A by-value component passed as a method arg. A `Local` base
             // is a method-param local (verify it is defined); a
@@ -3115,7 +4513,7 @@ impl Checker<'_> {
                 query,
                 nested_path,
             } => {
-                self.check_scoreboard(*sb, field, nested_path.is_some());
+                self.check_scoreboard(*sb, field, nested_path.as_deref());
                 match query {
                     crate::ir::ScoreboardQuery::Scalar { scalar } => {
                         self.check_scoreboard_scalar(*sb, scalar)
@@ -3315,7 +4713,116 @@ impl Checker<'_> {
 
 /// Best-effort expression typing for invariant 15. Returns `None` when
 /// the expression's type cannot be locally determined.
-fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
+fn common_scalar_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs),
+        (lhs, rhs) => return lhs.or(rhs),
+    };
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    if matches!(lhs, IrType::Unknown) {
+        return Some(rhs);
+    }
+    if matches!(rhs, IrType::Unknown) {
+        return Some(lhs);
+    }
+    let scalar = |ty: &IrType| match ty {
+        IrType::UInt(width) => Some((*width, false)),
+        IrType::SInt(width) => Some((*width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        _ => None,
+    };
+    let (Some((lw, ls)), Some((rw, rs))) = (scalar(&lhs), scalar(&rhs)) else {
+        return Some(lhs);
+    };
+    let width = Some(lw.unwrap_or(64).max(rw.unwrap_or(64)));
+    Some(if ls && rs {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
+fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
+    match e {
+        Expr::Literal {
+            value,
+            ty: IrType::Unknown,
+        } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+        Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
+            let bounded = |e: &Expr| {
+                if let Expr::Literal { value, ty } = e {
+                    if matches!(ty, IrType::Unknown) {
+                        return Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1))));
+                    }
+                }
+                assignment_expr_type(prog, func, e)
+            };
+            let (lhs, rhs) = (bounded(lhs), bounded(rhs));
+            let shape = |ty: IrType| match ty {
+                IrType::UInt(width) => Some((width, false)),
+                IrType::SInt(width) => Some((width, true)),
+                IrType::Bool => Some((Some(1), false)),
+                _ => None,
+            };
+            match (lhs.and_then(&shape), rhs.and_then(shape)) {
+                (Some((lhs_width, ls)), Some((rhs_width, rs))) => {
+                    let (lhs_abi, rhs_abi) = (lhs_width.unwrap_or(64), rhs_width.unwrap_or(64));
+                    let selected = if lhs_abi < rhs_abi && !ls {
+                        lhs_abi
+                    } else if rhs_abi < lhs_abi && !rs {
+                        rhs_abi
+                    } else {
+                        lhs_abi.max(rhs_abi)
+                    };
+                    let width = if lhs_width.is_none() && rhs_width.is_none() {
+                        None
+                    } else {
+                        Some(selected)
+                    };
+                    Some(if ls && rs {
+                        IrType::SInt(width)
+                    } else {
+                        IrType::UInt(width)
+                    })
+                }
+                (Some((width, signed)), None) | (None, Some((width, signed))) => Some(if signed {
+                    IrType::SInt(width)
+                } else {
+                    IrType::UInt(width)
+                }),
+                _ => None,
+            }
+        }
+        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => assignment_expr_type(prog, func, lhs),
+        Expr::Binary(
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        ) => Some(IrType::Bool),
+        Expr::Binary(_, lhs, rhs) => common_scalar_expr_type(
+            assignment_expr_type(prog, func, lhs),
+            assignment_expr_type(prog, func, rhs),
+        ),
+        Expr::Ternary(_, then_expr, else_expr) => common_scalar_expr_type(
+            assignment_expr_type(prog, func, then_expr),
+            assignment_expr_type(prog, func, else_expr),
+        ),
+        Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+        Expr::Unary(_, inner) => assignment_expr_type(prog, func, inner),
+        _ => expr_type(prog, func, e),
+    }
+}
+
+fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
     match e {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
@@ -3332,6 +4839,27 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             Some(ret.clone())
         }
+        Expr::ScoreboardQuery {
+            sb,
+            query: ScoreboardQuery::Scalar { scalar },
+            ..
+        } => prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|schema| schema.field(scalar))
+            .and_then(|field| match &field.kind {
+                ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                ScoreboardFieldKind::Record { record } => Some(IrType::Record(*record)),
+                _ => None,
+            }),
+        Expr::ScoreboardQuery {
+            query: ScoreboardQuery::QueueSize { .. },
+            ..
+        } => Some(IrType::UInt(None)),
+        Expr::ScoreboardQuery {
+            query: ScoreboardQuery::QueueEmpty { .. },
+            ..
+        } => Some(IrType::Bool),
         _ => None,
     }
 }
@@ -3351,6 +4879,13 @@ fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
 }
 
 fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
+    // Ordinary integer literals carry `Unknown` until a destination gives
+    // them a width. Treat that as the same conservative wildcard used by
+    // queue transfers; source lowering has already rejected literals that do
+    // not fit their destination.
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
     if expected == actual {
         return true;
     }
@@ -3369,6 +4904,14 @@ fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
         | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
         (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
         _ => false,
+    }
+}
+
+fn aggregate_assignment_compatible(expected: &IrType, actual: &IrType) -> bool {
+    match (expected, actual) {
+        (IrType::Record(expected), IrType::Record(actual)) => expected == actual,
+        (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
+        _ => assign_compatible(expected, actual),
     }
 }
 
@@ -3426,6 +4969,7 @@ fn bit_and_assign(dst: &mut [u64], src: &[u64]) {
 /// local sets. `defined_in[b]` = intersection of predecessors' outs;
 /// a read inside the block must be covered by the running defined set.
 fn check_def_before_use(
+    prog: &TbProgram,
     func: &TbFunction,
     fid: FunctionId,
     reachable: &[bool],
@@ -3575,7 +5119,18 @@ fn check_def_before_use(
                 }
                 Stmt::TbQueuePop { dest, .. } => bit_set(&mut defined, dest.index()),
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
-                Stmt::TransactorStateRecordFieldWrite { value, .. } => {
+                Stmt::TransactorStateRecordFieldWrite {
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    for (_, idx) in mid_indices {
+                        check_e(idx, &defined, errs);
+                    }
+                    if let Some(idx) = index {
+                        check_e(idx, &defined, errs);
+                    }
                     check_e(value, &defined, errs)
                 }
                 Stmt::TransactorStateQueuePush { value, .. } => check_e(value, &defined, errs),
@@ -3608,9 +5163,47 @@ fn check_def_before_use(
                     }
                 }
                 Stmt::CovReport(_) => {}
-                // Concurrent-check bodies reference DUT ports and host
-                // state, never function locals — nothing to def-check.
-                Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {}
+                // Concurrent-check schemas live outside the CFG, but
+                // their closures capture locals from this registering
+                // function. Account for those hidden reads at the exact
+                // registration point, just like an inline expression.
+                Stmt::PropertyCheck(id) => {
+                    if let Some(schema) = prog.property_checks.get(id.index()) {
+                        match &schema.shape {
+                            PropertyShape::Implies { ante, cons }
+                            | PropertyShape::ImpliesNext { ante, cons } => {
+                                check_e(ante, &defined, errs);
+                                check_e(cons, &defined, errs);
+                            }
+                            PropertyShape::Invariant(expr) => check_e(expr, &defined, errs),
+                        }
+                        for temporal in &schema.temporals {
+                            check_e(&temporal.inner, &defined, errs);
+                        }
+                        if let Some(message) = &schema.message {
+                            for arg in &message.args {
+                                check_e(&arg.expr, &defined, errs);
+                            }
+                        }
+                    }
+                }
+                Stmt::CoverCheck(id) => {
+                    if let Some(schema) = prog.cover_checks.get(id.index()) {
+                        check_e(&schema.cond, &defined, errs);
+                        for temporal in &schema.temporals {
+                            check_e(&temporal.inner, &defined, errs);
+                        }
+                    }
+                }
+                Stmt::CycleHandler(id) => {
+                    if let Some(CycleHandlerSchema {
+                        kind: CycleHandlerKind::Trigger { trigger, .. },
+                        ..
+                    }) = prog.cycle_handlers.get(id.index())
+                    {
+                        check_e(trigger, &defined, errs);
+                    }
+                }
                 // The channel local is DEFINED by its declaration (the
                 // emitter declares the subscriber vector at the hoisted
                 // local site), so subscribing/emitting only reads it —
@@ -3755,12 +5348,21 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
-        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::CovHookArg { .. } => {}
+        Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_local(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_local(idx, f);
+            }
+        }
         Expr::ComponentVecElement { index, .. } => for_each_local(index, f),
         Expr::ComponentValue { base } => {
             if let crate::ir::ComponentBase::Local(l) = base {

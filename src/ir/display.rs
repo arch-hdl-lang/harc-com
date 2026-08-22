@@ -656,11 +656,13 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             instance,
             field,
             path,
+            mid_indices,
+            index,
             value,
         } => {
+            let chain = record_chain_str(func, &path[0], &path[1..], mid_indices, index.as_ref());
             format!(
-                "TransactorStateRecordFieldWrite({instance}.{field}.{}, {})",
-                path.join("."),
+                "TransactorStateRecordFieldWrite({instance}.{field}.{chain}, {})",
                 expr_str(func, value)
             )
         }
@@ -788,14 +790,17 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::ComponentVecElementWrite {
             base,
             field,
+            index_pos,
             index,
             value,
-        } => format!(
-            "ComponentVecElementWrite({}.{field}[{}], {})",
-            comp_base_str(base),
-            expr_str(func, index),
-            expr_str(func, value)
-        ),
+        } => {
+            let field = indexed_chain_str(func, field, *index_pos, index);
+            format!(
+                "ComponentVecElementWrite({}.{field}, {})",
+                comp_base_str(base),
+                expr_str(func, value)
+            )
+        }
         Stmt::ComponentEmit { base, event, args } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
             format!(
@@ -1056,6 +1061,20 @@ fn record_chain_str(
     out
 }
 
+fn indexed_chain_str(func: &TbFunction, field: &str, index_pos: usize, index: &Expr) -> String {
+    let mut out = String::new();
+    for (pos, segment) in field.split('.').enumerate() {
+        if pos != 0 {
+            out.push('.');
+        }
+        out.push_str(segment);
+        if pos == index_pos {
+            out.push_str(&format!("[{}]", expr_str(func, index)));
+        }
+    }
+    out
+}
+
 fn port_str(func: Option<&TbFunction>, p: &PortRef) -> String {
     let mut out = format!("{}.{}", p.testbench_field, p.port_path.join("."));
     match &p.lane {
@@ -1148,7 +1167,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             instance,
             field,
             path,
-        } => format!("{instance}.{field}.{}", path.join(".")),
+            mid_indices,
+            index,
+        } => {
+            let chain = record_chain_str(func, &path[0], &path[1..], mid_indices, index.as_deref());
+            format!("{instance}.{field}.{chain}")
+        }
         Expr::TransactorStateQueueQuery {
             instance,
             field,
@@ -1176,8 +1200,14 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_str(base))
         }
-        Expr::ComponentVecElement { base, field, index } => {
-            format!("{}.{field}[{}]", comp_base_str(base), expr_str(func, index))
+        Expr::ComponentVecElement {
+            base,
+            field,
+            index_pos,
+            index,
+        } => {
+            let field = indexed_chain_str(func, field, *index_pos, index);
+            format!("{}.{field}", comp_base_str(base))
         }
         Expr::ComponentValue { base } => {
             format!("ComponentValue({})", comp_base_str(base))

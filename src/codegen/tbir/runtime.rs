@@ -13,13 +13,15 @@ pub(super) const INDENT: &str = "    ";
 ///
 /// `problem_table_cpp` is the rendered constraint-solver runtime problem
 /// table (`RuntimeProblemTable::render_cpp_table`) when the program has
-/// any randomize site, else empty — its non-emptiness also gates the
-/// `harc_z3_rt.h` include, mirroring v1's `uses_constraint_solver` gate.
+/// a cataloged randomize site, else empty. `uses_constraint_solver`
+/// independently gates the Z3 runtime include because component-scope
+/// randomize sites are not members of that table.
 pub(super) fn preamble(
     out: &mut String,
     dut_type: &str,
     test_names: &[String],
     problem_table_cpp: &str,
+    uses_constraint_solver: bool,
     has_probes: bool,
     cosim: Option<&crate::codegen::cpp_tb::CosimOpts>,
 ) {
@@ -82,7 +84,7 @@ using HarcTraceC = VerilatedFstC;
     // problem table, emitted only when a randomize site exists (v1's
     // `uses_constraint_solver` gate). Without a site, the generated TB
     // never links Z3 — same as v1.
-    if !problem_table_cpp.is_empty() {
+    if uses_constraint_solver {
         writeln!(
             out,
             "#include \"harc_z3_rt.h\"   // randomize(t) with <constraints>"
@@ -372,8 +374,28 @@ pub(super) fn scoreboard_struct(
     for f in &sb.fields {
         match &f.kind {
             crate::ir::ScoreboardFieldKind::Scalar { ty, default } => {
-                let (cty, init) = scalar_field_decl(ty, *default);
+                // `main`'s `ScoreboardScalarDefault` carries a WIDE
+                // literal, which the `u64` slot this branch documented
+                // as a limitation cannot. Its representation wins here;
+                // `scalar_field_decl` still serves the three emitters
+                // whose schema default is still a `u64`.
+                let init = match default {
+                    crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
+                        crate::ir::IrType::Bool => {
+                            if *value != 0 { "true" } else { "false" }.to_string()
+                        }
+                        _ => value.to_string(),
+                    },
+                    crate::ir::ScoreboardScalarDefault::Wide(words) => {
+                        super::expr::wide_literal_cpp(words)
+                    }
+                };
+                let cty = super::field_scalar_cty(ty);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
+            }
+            crate::ir::ScoreboardFieldKind::Record { record } => {
+                let cty = &records[record.index()].name;
+                writeln!(out, "{INDENT}{cty} {}{{}};", f.name).ok();
             }
             crate::ir::ScoreboardFieldKind::Queue { elem } => {
                 let elem = queue_elem_cty(elem, records);
@@ -758,6 +780,18 @@ pub(super) fn log_helpers_and_seed(out: &mut String) {
     auto sim_log_line = [&](const char* sev, const char* fmt, ...) {
         HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);
     };
+
+    // Route an empty-queue pop through the sim's own FATAL path instead
+    // of the runtime header's abort backstop: the run records the
+    // failure, unwinds normally, and still writes its log and trace.
+    // `_fatal` is a loop-exit condition, so the run stops at the next
+    // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
+    // verbatim by both codegens so the two traces stay diffable.
+    harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
+        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        ctx.errors++;
+        _fatal = true;
+    });
 
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 

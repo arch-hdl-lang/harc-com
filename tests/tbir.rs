@@ -453,8 +453,8 @@ test T
 end test T"#;
     let cpp = emit_cpp_src(masked);
     assert!(
-        cpp.contains(">> 4"),
-        "masked wide operand must emit a plain 64-bit shift; got:\n{cpp}"
+        cpp.contains("harc_rt::harc_shr_u128"),
+        "masked uint<128> operands must use the defined-width shift helper; got:\n{cpp}"
     );
 
     for (expr, helper) in [
@@ -466,7 +466,7 @@ end test T"#;
     let dut : Top
     run
         let wide : uint<128> = 1
-        let x : uint<64> = {expr}
+        let x : uint<128> = {expr}
         assert x == 2 else fail("x")
     end run
 end test T"#
@@ -2112,6 +2112,335 @@ fn scoreboard_basic_emitted_cpp_snapshot() {
     insta::assert_snapshot!(
         "scoreboard_basic_emitted_cpp",
         emit_fixture_cpp("scoreboard_basic_test.harc")
+    );
+}
+
+/// Persistent scoreboard scalars have a closed storage subset, and writes
+/// obey the same no-narrowing rule as local assignments and queue pushes.
+#[test]
+fn scoreboard_scalar_schema_and_write_width_are_verified() {
+    let prog = lower_src(&fixture("scoreboard_basic_test.harc")).expect("fixture lowers");
+    verify::verify_program(&prog).expect("fixture verifies");
+    for name in ["seeded", "sized"] {
+        let seeded = prog.scoreboards[0]
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .expect("fixture has seeded scalar");
+        assert!(matches!(
+            &seeded.kind,
+            ir::ScoreboardFieldKind::Scalar {
+                ty: ir::IrType::UInt(Some(128)),
+                default: ir::ScoreboardScalarDefault::Wide(words),
+            } if words == &[0, 0, 1]
+        ));
+    }
+
+    for bad_ty in [
+        ir::IrType::UInt(Some(0)),
+        ir::IrType::UInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
+        ir::IrType::SInt(Some(65)),
+        ir::IrType::Record(ir::RecordId(0)),
+    ] {
+        let mut broken = prog.clone();
+        let field = broken.scoreboards[0]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "wide")
+            .expect("fixture has wide scalar");
+        let ir::ScoreboardFieldKind::Scalar { ty, .. } = &mut field.kind else {
+            panic!("wide field is scalar");
+        };
+        *ty = bad_ty.clone();
+        let rendered = verify::verify_program(&broken)
+            .expect_err("invalid scoreboard scalar schema is rejected")
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("scoreboard sb0 field `wide` has invalid scalar type")
+                && rendered.contains(&format!("{bad_ty:?}")),
+            "schema error identifies the field and type: {rendered}"
+        );
+    }
+
+    let mut broken_default = prog.clone();
+    let seeded = broken_default.scoreboards[0]
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "seeded")
+        .expect("fixture has seeded scalar");
+    let ir::ScoreboardFieldKind::Scalar { default, .. } = &mut seeded.kind else {
+        panic!("seeded field is scalar");
+    };
+    *default = ir::ScoreboardScalarDefault::Wide(vec![0, 0, 0, 0, 1]);
+    let rendered = verify::verify_program(&broken_default)
+        .expect_err("a 129-bit default cannot enter a 128-bit field")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `seeded` has invalid scalar default"),
+        "default corruption is rejected before codegen: {rendered}"
+    );
+
+    let mut broken_signed_default = prog.clone();
+    let seeded = broken_signed_default.scoreboards[0]
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "seeded")
+        .expect("fixture has seeded scalar");
+    seeded.kind = ir::ScoreboardFieldKind::Scalar {
+        ty: ir::IrType::SInt(Some(8)),
+        default: ir::ScoreboardScalarDefault::Narrow(128),
+    };
+    let rendered = verify::verify_program(&broken_signed_default)
+        .expect_err("positive 128 is outside sint<8>")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `seeded` has invalid scalar default"),
+        "signed default corruption is rejected before codegen: {rendered}"
+    );
+
+    let mut broken = prog;
+    let run = broken.tests[0].run.index();
+    let write = broken.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "writes" => Some(value),
+            _ => None,
+        })
+        .expect("fixture writes the 32-bit counter");
+    *write = ir::Expr::WideLiteral(vec![0, 0, 1]);
+    let rendered = verify::verify_program(&broken)
+        .expect_err("a 65-bit value cannot enter a 32-bit scalar")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains(
+            "writes UInt(Some(65)) into scoreboard scalar `writes` declared UInt(Some(32))"
+        ),
+        "write error records assignment direction: {rendered}"
+    );
+
+    let read_types = r#"
+scoreboard Sb
+    wide : uint<256>
+    narrow : uint<8>
+    narrowq : queue<uint<8>>
+    signed : sint<8>
+    signedq : queue<sint<8>>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl NarrowingTest for Tb
+    run
+        let wide_copy = sb.wide
+        assert wide_copy[207:193] == 128
+    end run
+end impl NarrowingTest
+"#;
+    let inferred = lower_src(read_types).expect("untyped scoreboard read lowers");
+    verify::verify_program(&inferred).expect("untyped scoreboard read verifies");
+    assert!(
+        inferred
+            .function(inferred.tests[0].run)
+            .locals
+            .iter()
+            .any(|local| local.name == "wide_copy" && local.ty == ir::IrType::UInt(Some(256))),
+        "an untyped scoreboard read inherits the scalar field's width"
+    );
+    let emitted = tbir::emit(
+        &inferred,
+        &merged_src(read_types),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("untyped scoreboard read emits");
+    assert!(
+        emitted.contains("harc_rt::HarcWide<8> wide_copy = 0;")
+            && emitted.contains("wide_copy = _tb.sb.wide;"),
+        "the inferred local retains all 256 bits in C++: {emitted}"
+    );
+
+    let masked_write = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = (sb.wide & 0xFF) >> 4\n        sb.narrowq.push((sb.wide & 0xFF) >> 4)\n        let signed_a : sint<8> = -2\n        let signed_b : sint<8> = -1\n        sb.signed = signed_a & signed_b\n        sb.signedq.push(signed_a & signed_b)\n        sb.wide = sb.wide + 1",
+    );
+    let masked = lower_src(&masked_write).expect("a masked wide read can enter a narrow scalar");
+    verify::verify_program(&masked).expect("the masked scalar write verifies");
+    let emitted = tbir::emit(
+        &masked,
+        &merged_src(&masked_write),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("mixed-carrier wide expressions emit");
+    assert!(
+        emitted.contains("harc_rt::harc_wide_zext<8>(255, 8)")
+            && emitted.contains("harc_rt::harc_wide_zext<8>(1, 1)"),
+        "wide/scalar operators promote the scalar to HarcWide<8>:\n{emitted}"
+    );
+
+    let wide_read = ir::Expr::ScoreboardQuery {
+        sb: ir::ScoreboardId(0),
+        field: "sb".to_string(),
+        query: ir::ScoreboardQuery::Scalar {
+            scalar: "wide".to_string(),
+        },
+        nested_path: None,
+    };
+    let corruptions = [
+        ir::Expr::Literal {
+            value: 256,
+            ty: ir::IrType::Unknown,
+        },
+        ir::Expr::Binary(
+            ir::BinOp::Add,
+            Box::new(wide_read.clone()),
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Unknown,
+            }),
+        ),
+        ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(wide_read.clone()),
+            Box::new(ir::Expr::Literal {
+                value: 0,
+                ty: ir::IrType::Unknown,
+            }),
+        ),
+        ir::Expr::Unary(ir::UnOp::BitNot, Box::new(wide_read)),
+    ];
+    for corruption in corruptions {
+        let mut broken = masked.clone();
+        for block in &mut broken.functions[0].blocks {
+            for stmt in &mut block.stmts {
+                match stmt {
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                        ..
+                    } if scalar == "narrow" => *value = corruption.clone(),
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePush { queue, value },
+                        ..
+                    } if queue == "narrowq" => *value = corruption.clone(),
+                    _ => {}
+                }
+            }
+        }
+        let errors = verify::verify_program(&broken)
+            .expect_err("verifier rejects a pass-corrupted narrowing expression");
+        assert!(
+            errors.len() >= 2,
+            "both scalar write and queue push corruption must be rejected: {errors:?}"
+        );
+    }
+
+    let literal_writes = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.wide = 1\n        sb.narrow = 1",
+    );
+    let literals = lower_src(&literal_writes).expect("literal scoreboard writes lower");
+    verify::verify_program(&literals).expect("literal scoreboard writes verify");
+
+    let fitting_literals = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = 255\n        sb.narrowq.push(255)",
+    );
+    let fitting = lower_src(&fitting_literals).expect("fitting storage literals lower");
+    verify::verify_program(&fitting).expect("fitting storage literals verify");
+
+    for statement in ["sb.narrow = 256", "sb.narrowq.push(256)"] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            statement,
+        );
+        let err = lower_src(&narrowing).expect_err("storage literals must fit their declaration");
+        assert!(
+            err.to_string().contains("narrows"),
+            "an over-width literal must identify storage narrowing: {err}"
+        );
+    }
+
+    let narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "let narrow : uint<32> = sb.wide",
+    );
+    let err = lower_src(&narrowing).expect_err("narrowing is a source diagnostic");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && err.to_string().contains("assignment of a 256-bit value")
+            && err.to_string().contains("`narrow`, declared 32 bits"),
+        "scoreboard reads use the ordinary narrowing diagnostic: {err}"
+    );
+
+    let write_narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = sb.wide",
+    );
+    let err = lower_src(&write_narrowing).expect_err("scalar write narrowing is diagnosed");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && err.to_string().contains("assignment of a 256-bit value")
+            && err
+                .to_string()
+                .contains("scoreboard field `narrow`, declared 8 bits"),
+        "scoreboard writes use a source diagnostic: {err}"
+    );
+
+    for rhs in ["sb.wide + 1", "false ? sb.narrow : sb.wide"] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            &format!("sb.narrow = {rhs}"),
+        );
+        let err = lower_src(&narrowing).expect_err("complex scalar narrowing is diagnosed");
+        assert!(
+            err.to_string().contains("narrows"),
+            "`{rhs}` must not bypass scoreboard narrowing checks: {err}"
+        );
+    }
+
+    for statement in [
+        "let neg : sint<8> = -1\n        sb.narrow = sb.wide & neg",
+        "let neg : sint<8> = -1\n        sb.narrowq.push(sb.wide & neg)",
+    ] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            statement,
+        );
+        let err = lower_src(&narrowing).expect_err("a signed mask cannot narrow a wide value");
+        assert!(
+            err.to_string().contains("narrows"),
+            "signed masks retain the wide operand's bound: {err}"
+        );
+    }
+    let queue_narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrowq.push(sb.wide + 1)",
+    );
+    let err = lower_src(&queue_narrowing).expect_err("complex queue narrowing is diagnosed");
+    assert!(
+        err.to_string().contains("narrows"),
+        "queue arithmetic must not bypass narrowing checks: {err}"
     );
 }
 
@@ -9770,7 +10099,7 @@ end test T
 /// else, so the answer comes before them rather than by relabelling
 /// them.
 #[test]
-fn an_index_inside_a_component_or_state_record_path_says_so() {
+fn indexed_component_and_state_record_paths_lower() {
     let state = |body: &str| {
         format!(
             r#"
@@ -9811,21 +10140,366 @@ end impl T
 "#
         )
     };
-    for bad in [
-        "let z = ba.data[0]",
-        "ba.data[0] = 1",
-        "let z = ba.kids[0].p",
+    for (body, rendered) in [
+        ("let z = ba.data[0]", ".ba.data[0]"),
+        ("ba.data[0] = 1", ".ba.data[0] = 1"),
+        ("let z = ba.kids[0].p", ".ba.kids[0].p"),
     ] {
-        let src = state(bad);
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        let src = state(body);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{body}` verifies: {e:?}"));
+        let ir = format!("{prog}");
+        let rendered_path = rendered.split(" =").next().unwrap();
         assert!(
-            msg.contains("an element selection inside"),
-            "`{bad}`: {msg}"
+            ir.contains(rendered_path),
+            "`{body}` preserves the indexed path in IR display as `{rendered_path}`:\n{ir}"
+        );
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("`{body}` emits: {e:?}"));
+        assert!(
+            cpp.contains(rendered),
+            "`{body}` renders `{rendered}`:\n{cpp}"
         );
         // The `--codegen v1` this offers is a real one: v1 emits
         // `target.ba.data[0]` / `target.ba.kids[0].p` and g++ accepts.
-        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{bad}`: v1 emits: {e:?}"));
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{body}`: v1 emits: {e:?}"));
     }
+
+    let component = |body: &str| {
+        format!(
+            r#"
+struct Child
+    q : uint<8>
+end struct Child
+struct Other
+    q : uint<8>
+end struct Other
+struct Kid
+    p : uint<8>
+    child : Child
+end struct Kid
+struct Bundle
+    data : Vec<uint<8>, 4>
+    kids : Vec<Kid, 4>
+end struct Bundle
+agent Cmp
+    ba : Bundle
+    hookable step()
+        {body}
+    end step
+end agent Cmp
+test T
+    let dut : Top
+    let c : Cmp
+    run
+        c.step()
+        wait 1 cycle
+    end run
+end test T
+"#
+        )
+    };
+    for (body, rendered) in [
+        ("let z = ba.data[0]", "self.ba.data[0]"),
+        ("ba.data[0] = 6", "self.ba.data[0] = 6"),
+        ("let z = ba.kids[0].p", "self.ba.kids[0].p"),
+        ("ba.kids[0].p = 7", "self.ba.kids[0].p = 7"),
+    ] {
+        let src = component(body);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{body}` verifies: {e:?}"));
+        let ir = format!("{prog}");
+        let rendered_path = rendered.split(" =").next().unwrap();
+        assert!(
+            ir.contains(rendered_path),
+            "`{body}` preserves the indexed path in IR display as `{rendered_path}`:\n{ir}"
+        );
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("`{body}` emits: {e:?}"));
+        assert!(
+            cpp.contains(rendered),
+            "`{body}` renders `{rendered}`:\n{cpp}"
+        );
+        cpp_tb::emit(&merged_src(&src)).expect("v1 emits the indexed component path");
+    }
+
+    let err = lower_src(&component("let z = ba.kids[4].p"))
+        .expect_err("a literal component-record index must be in bounds");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)) && err.to_string().contains("length 4"),
+        "mid-path component bounds are a source diagnostic: {err:?}"
+    );
+
+    let non_vec = component("let z = ba.kids[0].p").replace("kids : Vec<Kid, 4>", "kids : Kid");
+    let err = lower_src(&non_vec).expect_err("a non-vector mid-path selection must not lower");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+
+    let mut bad_state = lower_src(&state("let z = ba.kids[0].p")).expect("control lowers");
+    let state_expr = bad_state
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::TransactorStateRecordField { mid_indices, .. })
+                if !mid_indices.is_empty() =>
+            {
+                Some(mid_indices)
+            }
+            _ => None,
+        })
+        .expect("indexed state read exists");
+    state_expr[0].0 = 99;
+    assert!(
+        verify::verify_program(&bad_state).is_err(),
+        "out-of-range state index metadata must fail verification"
+    );
+
+    let mut empty_state_path =
+        lower_src(&state("let z = ba.kids[0].p")).expect("state-path control lowers");
+    let (path, mid_indices) = empty_state_path
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::TransactorStateRecordField {
+                    path, mid_indices, ..
+                },
+            ) => Some((path, mid_indices)),
+            _ => None,
+        })
+        .expect("state read exists");
+    path.clear();
+    mid_indices.clear();
+    assert!(
+        verify::verify_program(&empty_state_path).is_err(),
+        "an empty responder-state read path must fail verification"
+    );
+
+    let mut empty_state_write_path =
+        lower_src(&state("ba.kids[0].p = 1")).expect("state-write control lowers");
+    let (path, mid_indices) = empty_state_write_path
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateRecordFieldWrite {
+                path, mid_indices, ..
+            } => Some((path, mid_indices)),
+            _ => None,
+        })
+        .expect("state write exists");
+    path.clear();
+    mid_indices.clear();
+    assert!(
+        verify::verify_program(&empty_state_write_path).is_err(),
+        "an empty responder-state write path must fail verification"
+    );
+
+    let mut bad_component = lower_src(&component("let z = ba.kids[0].p")).expect("control lowers");
+    let index_pos = bad_component
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index_pos, .. }) => Some(index_pos),
+            _ => None,
+        })
+        .expect("indexed component read exists");
+    *index_pos = 99;
+    assert!(
+        verify::verify_program(&bad_component).is_err(),
+        "out-of-range component index metadata must fail verification"
+    );
+
+    let mut bad_component_leaf =
+        lower_src(&component("let z = ba.data[0]")).expect("leaf-vector control lowers");
+    let index_pos = bad_component_leaf
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index_pos, .. }) => Some(index_pos),
+            _ => None,
+        })
+        .expect("indexed component leaf read exists");
+    *index_pos = 99;
+    assert!(
+        verify::verify_program(&bad_component_leaf).is_err(),
+        "a leaf-vector index position beyond the path must fail verification"
+    );
+
+    let mut bad_component_literal =
+        lower_src(&component("let z = ba.kids[0].p")).expect("literal-index control lowers");
+    let index = bad_component_literal
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index, .. }) => Some(index),
+            _ => None,
+        })
+        .expect("indexed component read exists");
+    *index = Box::new(ir::Expr::Literal {
+        value: 4,
+        ty: ir::IrType::Unknown,
+    });
+    assert!(
+        verify::verify_program(&bad_component_literal).is_err(),
+        "a corrupted literal component index must fail verification"
+    );
+
+    let record_write = component(
+        r#"
+        let child : Child
+        let other : Other
+        ba.kids[0].child = child
+"#,
+    );
+    let mut scalar_record_write = lower_src(&record_write).expect("record-write control lowers");
+    let value = scalar_record_write
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&scalar_record_write).is_err(),
+        "a scalar write into an indexed record field must fail verification"
+    );
+
+    let mut mismatched_record_write = lower_src(&record_write).expect("record control lowers");
+    let other = mismatched_record_write
+        .functions
+        .iter()
+        .flat_map(|f| f.locals.iter().enumerate())
+        .find_map(|(index, local)| (local.name == "other").then_some(ir::LocalId(index as u32)))
+        .expect("other record local exists");
+    let value = mismatched_record_write
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Local(other);
+    assert!(
+        verify::verify_program(&mismatched_record_write).is_err(),
+        "a mismatched record write into an indexed record field must fail verification"
+    );
+
+    let indexed_record = |field: &str| ir::Expr::ComponentVecElement {
+        base: ir::ComponentBase::SelfField,
+        field: field.to_string(),
+        index_pos: 1,
+        index: Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::Unknown,
+        }),
+    };
+    let mut mismatched_component_record =
+        lower_src(&record_write).expect("component-record RHS control lowers");
+    let value = mismatched_component_record
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = indexed_record("ba.kids");
+    assert!(
+        verify::verify_program(&mismatched_component_record).is_err(),
+        "a mismatched component-record expression must fail verification"
+    );
+
+    let mut matching_component_record =
+        lower_src(&record_write).expect("matching component-record RHS control lowers");
+    let value = matching_component_record
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = indexed_record("ba.kids.child");
+    verify::verify_program(&matching_component_record)
+        .expect("a matching component-record expression remains valid");
+
+    let mut mismatched_record_ternary =
+        lower_src(&record_write).expect("record-ternary control lowers");
+    let child = mismatched_record_ternary
+        .functions
+        .iter()
+        .flat_map(|f| f.locals.iter().enumerate())
+        .find_map(|(index, local)| (local.name == "child").then_some(ir::LocalId(index as u32)))
+        .expect("child record local exists");
+    let value = mismatched_record_ternary
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Local(child)),
+        Box::new(indexed_record("ba.kids")),
+    );
+    assert!(
+        verify::verify_program(&mismatched_record_ternary).is_err(),
+        "a ternary with mismatched record arms must fail verification"
+    );
+
+    let mut missing_state_rhs =
+        lower_src(&record_write).expect("transactor-state RHS control lowers");
+    let value = missing_state_rhs
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::TransactorState {
+        instance: "missing".to_string(),
+        field: "missing".to_string(),
+    };
+    assert!(
+        verify::verify_program(&missing_state_rhs).is_err(),
+        "an unresolved transactor-state RHS must fail verification"
+    );
 
     // A record LOCAL is unaffected — it carries mid-path selections and
     // always has.
@@ -11398,7 +12072,7 @@ end test T"#
 ///
 /// | construct | v1 | verdict |
 /// |---|---|---|
-/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
+/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | lowers through shared record keeps |
 /// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
 /// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
 /// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | lowers |
@@ -11421,16 +12095,102 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         )
     };
 
-    // A `keep` on a struct DOES reach the solver — the absence of a
-    // randomize metadata entry, which is what the first pass measured,
-    // says nothing about the generated solver lambda.
-    let keep = prog("struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n");
-    assert_unsupported(&lower_src(&keep).unwrap_err());
+    // A `keep` on a struct reaches the same typed randomize site as a
+    // transaction keep. The RecordSchema carries the diagnostic text and
+    // the ConstraintSite carries the original AST expression used by Z3.
+    let keep = prog(
+        "struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n\n\
+         struct Other\n    x : uint<8>\nend struct Other\n",
+    );
+    let lowered = lower_src(&keep).expect("a struct keep lowers");
+    verify::verify_program(&lowered).expect("a struct keep verifies");
+    assert_eq!(lowered.records[0].keeps, ["a < 10"]);
+    assert_eq!(lowered.constraint_sites.len(), 1);
+    assert_eq!(lowered.constraint_sites[0].record, "Rec");
+    assert_eq!(lowered.constraint_sites[0].constraints.len(), 1);
+    assert!(
+        lowered.constraint_sites[0].problem_id.is_some(),
+        "the struct keep reaches the typed Z3 problem table"
+    );
+    let tbir = tbir::emit(&lowered, &merged_src(&keep), &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits the struct keep solver");
+    assert!(
+        tbir.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
+        "TBIR emits the struct constraint into the solver: {tbir}"
+    );
     let v1 = cpp_tb::emit(&merged_src(&keep)).expect("v1 emits");
     assert!(
         v1.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
         "v1 emits the constraint into the solver: {v1}"
     );
+
+    // A pass cannot retarget the ConstraintRef to a different record schema:
+    // the emitter splices a record-specific solver/writeback snippet.
+    let mut broken = lowered.clone();
+    broken.constraint_sites[0].record = "Other".to_string();
+    let errs = verify::verify_program(&broken).expect_err("wrong-record constraint site rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::DanglingConstraintRef { detail, .. }
+                if detail.contains("for record `Other`") && detail.contains("record `Rec`")
+        )),
+        "{errs:?}"
+    );
+
+    // Nested record keeps are recursively prefixed into the outer
+    // randomize site; copying only the outer declaration's direct body
+    // would silently leave `leaf.value` unconstrained.
+    let nested = prog(
+        "struct Leaf\n    value : uint<8>\n    keep value < 10\nend struct Leaf\n\n\
+         struct Rec\n    leaf : Leaf\nend struct Rec\n",
+    );
+    let nested_ir = lower_src(&nested).expect("nested struct keeps lower");
+    verify::verify_program(&nested_ir).expect("nested struct keeps verify");
+    assert_eq!(nested_ir.constraint_sites[0].constraints.len(), 1);
+    assert!(nested_ir.constraint_sites[0].problem_id.is_some());
+    let nested_cpp = tbir::emit(
+        &nested_ir,
+        &merged_src(&nested),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("nested struct keeps emit");
+    assert!(
+        nested_cpp.contains("z3::ult(_z_leaf_value, _ctx.bv_val((uint64_t)10, 64))"),
+        "nested field keep is prefixed into the solver: {nested_cpp}"
+    );
+
+    // A component-only kept-struct site is not represented in the main
+    // typed runtime problem table. Include detection must still follow the
+    // emitted solver path, or the generated z3:: calls will not compile.
+    let component_only = fixture("component_struct_keep_randomize_test.harc");
+    let component_ir = lower_src(&component_only).expect("component-only struct keep lowers");
+    verify::verify_program(&component_ir).expect("component-only struct keep verifies");
+    assert_eq!(component_ir.constraint_sites.len(), 1);
+    assert!(component_ir.constraint_sites[0].problem_id.is_none());
+    let component_cpp = tbir::emit(
+        &component_ir,
+        &merged_src(&component_only),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("component-only struct keep emits");
+    assert!(component_cpp.contains("#include \"harc_z3_rt.h\""));
+    assert!(component_cpp.contains("z3::solver _s(_ctx);"));
+
+    // Custom phases are separate TestItem bodies, not Scope run/check
+    // blocks. They participate in the same source-level solver include
+    // decision when their body contains the only constrained randomize.
+    let phase_only = fixture("phase_struct_keep_randomize_test.harc");
+    let phase_ir = lower_src(&phase_only).expect("phase-only struct keep lowers");
+    verify::verify_program(&phase_ir).expect("phase-only struct keep verifies");
+    let phase_cpp = tbir::emit(
+        &phase_ir,
+        &merged_src(&phase_only),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("phase-only struct keep emits");
+    assert!(phase_cpp.contains("#include \"harc_z3_rt.h\""));
+    assert!(phase_cpp.contains("z3::solver _s(_ctx);"));
 
     // Both `default` shapes make v1 emit an initializer g++ rejects.
     for (decls, needle) in [
@@ -11515,7 +12275,8 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
 /// | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
 /// | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
 /// | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
-/// | `list<uint<8>>` / `uint<128>` field | `std::vector<uint64_t> l;` / `_harc_u128 l;` | a real escape hatch |
+/// | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+/// | unsigned scalar through 1024 bits | width-aware scalar member | supported by TBIR |
 /// | `list<Vec<uint<8>, 2>>` field | `std::vector<std::array<uint64_t, 2>> l;` | likewise — no randomize body to break |
 /// | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
 ///
@@ -11642,11 +12403,6 @@ end impl T"#
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
         ),
-        // A record-typed field. `txn_field_c_type` alone maps every
-        // named type to `int64_t`, and asking only it called this a
-        // flattening — but the member picker these fields actually go
-        // through adds one layer, and v1 emits the record itself.
-        ("Inner", "Inner l;"),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
         assert_unsupported(&lower_src(&src).unwrap_err());
@@ -11658,16 +12414,21 @@ end impl T"#
         );
     }
     // `uint<128>` used to sit in that list, refused with v1 named as
-    // the way out. It is not a gap any more: a declared scalar field
-    // is lowered up to `MAX_SCALAR_FIELD_WIDTH`, and BOTH backends
-    // emit the same wide member.
+    // the way out. It is not a gap any more: an UNSIGNED declared
+    // scalar field is lowered to the language's stated vector target,
+    // and BOTH backends emit the same wide member.
+    //
+    // `sint<128>` is NOT here, and that is `main`'s call, adopted at
+    // the merge: past 64 bits a scalar lives in `_harc_u128` or
+    // `HarcWide<N>`, both unsigned, so `<` and `/` on one answer by
+    // magnitude in either backend. This branch had widened signed
+    // fields too, without that.
     for (ty, shape) in [
         ("uint<128>", "_harc_u128 l"),
-        ("sint<128>", "_harc_u128 l"),
         ("uint<1024>", "harc_rt::HarcWide<32> l"),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
-        lower_src(&src).expect("a wide scoreboard field lowers");
+        lower_src(&src).expect("a wide unsigned scoreboard field lowers");
         let cpp = emit_cpp_src(&src);
         assert!(
             cpp.contains(shape),
@@ -11680,7 +12441,54 @@ end impl T"#
             "`{ty}`: v1 emits `{shape}` too — the two agree on the member"
         );
     }
+    // The signed cap, and the reason for it.
+    let signed = prog("scoreboard Sb\n    l : sint<128>\nend scoreboard Sb");
+    assert!(
+        lower_src(&signed).is_err(),
+        "a signed field past 64 bits must stay refused while the wide \
+         carrier has no signed comparison"
+    );
 
+    // A record-typed field now uses persistent by-value record storage,
+    // matching the component and transactor-state seams.
+    let record_src = prog("scoreboard Sb\n    l : Inner\nend scoreboard Sb");
+    let record_prog = lower_src(&record_src).expect("record scoreboard state lowers");
+    verify::verify_program(&record_prog).expect("record scoreboard state verifies");
+    let record_cpp = tbir::emit(
+        &record_prog,
+        &merged_src(&record_src),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("TBIR emits record scoreboard state");
+    assert!(record_cpp.contains("Inner l{};"), "{record_cpp}");
+    assert!(
+        cpp_tb::emit(&merged_src(&record_src))
+            .expect("v1 emits")
+            .contains("Inner l;"),
+        "v1 keeps the record member by value"
+    );
+    // Unsigned scalar state now uses the same width-aware carriers as
+    // locals and queue elements. Pin both sides of the 128-bit boundary.
+    for (ty, shape) in [
+        ("uint<65>", "_harc_u128 l = 0;"),
+        ("uint<128>", "_harc_u128 l = 0;"),
+        ("uint<256>", "harc_rt::HarcWide<8> l = 0;"),
+        ("uint<1024>", "harc_rt::HarcWide<32> l = 0;"),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        let lowered = lower_src(&src).expect("wide unsigned scoreboard scalar lowers");
+        verify::verify_program(&lowered).expect("wide unsigned scoreboard scalar verifies");
+        let emitted = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("TBIR emits wide unsigned scoreboard scalar");
+        assert!(
+            emitted.contains(shape),
+            "`{ty}`: TBIR emits `{shape}` in:\n{emitted}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{ty}` remains accepted by v1 during retirement"
+        );
+    }
     for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {
         let src = prog(&format!("scoreboard Sb\n    s : {ty}\nend scoreboard Sb"));
         assert_not_implemented(
@@ -11694,6 +12502,679 @@ end impl T"#
             "`{ty}`: v1 flattens it to `{shape}`"
         );
     }
+}
+
+#[test]
+fn scoreboard_record_state_copies_across_phases() {
+    let src = r#"struct Snapshot
+    value : uint<16>
+end struct Snapshot
+
+struct Other
+    value : uint<16>
+end struct Other
+
+scoreboard Sb
+    last : Snapshot
+    count : uint<8>
+    pending : queue<uint<8>>
+    flags : queue<bool>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        let item : Snapshot
+        let other : Other
+        let scalar : uint<8> = 0
+        item.value = 77
+        sb.last = item
+        sb.count = 1
+        sb.pending.push(1)
+        sb.flags.push(item == item)
+        wait 1 cycle
+    end run
+    check
+        let got : Snapshot = sb.last
+        assert got.value == 77 else fail("record scoreboard state changed")
+    end check
+end impl T"#;
+
+    let prog = lower_src(src).expect("whole-record scoreboard state lowers");
+    verify::verify_program(&prog).expect("whole-record scoreboard state verifies");
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("whole-record scoreboard state emits");
+    for needle in [
+        "Snapshot last{};",
+        "_tb.sb.last = item;",
+        "got = _tb.sb.last;",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+    cpp_tb::emit(&merged_src(src)).expect("v1 emits the same record-state copies");
+
+    for bad in [
+        src.replace("sb.last = item", "sb.last = other"),
+        src.replace("sb.last = item", "sb.last = 7"),
+    ] {
+        let err = lower_src(&bad).expect_err("record scoreboard writes require the exact record");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("scoreboard record field `last`") && msg.contains("Snapshot"),
+            "the record destination and expected type are named: {msg}"
+        );
+    }
+
+    let record_condition = src.replace("sb.last = item", "sb.last = item ? item : item");
+    let err = lower_src(&record_condition).expect_err("a record cannot be a ternary condition");
+    assert!(
+        assert_invalid(&err).contains("ternary condition must be a scalar value"),
+        "record ternary conditions get a source-facing type diagnostic: {err}"
+    );
+    let wrapped_record_condition = src.replace("sb.last = item", "sb.last = !item ? item : item");
+    let err = lower_src(&wrapped_record_condition)
+        .expect_err("a wrapped record cannot be a ternary condition");
+    assert!(
+        assert_invalid(&err).contains("scalar operator to a record value"),
+        "wrapped record conditions get the same source-facing type diagnostic: {err}"
+    );
+    let record_equality_condition =
+        src.replace("sb.last = item", "sb.last = (item == item) ? item : item");
+    let equality_prog =
+        lower_src(&record_equality_condition).expect("same-record equality is a valid condition");
+    verify::verify_program(&equality_prog).expect("same-record equality condition verifies");
+
+    for (label, inserted) in [
+        ("if", "if sb.last\n        end if\n        "),
+        ("assert", "assert sb.last\n        "),
+        ("wait", "wait until sb.last\n        "),
+    ] {
+        let truth_src = src.replace("wait 1 cycle", &format!("{inserted}wait 1 cycle"));
+        let err = lower_src(&truth_src).expect_err("record truth consumers require scalars");
+        assert!(
+            assert_invalid(&err).contains("must be a scalar value"),
+            "{label} record truth gets a source diagnostic: {err}"
+        );
+    }
+    let mixed_record_truth = src.replace(
+        "wait 1 cycle",
+        "assert !(1 ? item : other)\n        wait 1 cycle",
+    );
+    let err = lower_src(&mixed_record_truth)
+        .expect_err("a mixed-record ternary cannot hide under a scalar truth operator");
+    assert!(
+        assert_invalid(&err).contains("scalar operator to a record value"),
+        "mixed-record ternary composition gets a source diagnostic: {err}"
+    );
+    let mixed_scalar_assignment = src.replace(
+        "item.value = 77",
+        "scalar = 1 ? (0 as uint<8>) : sb.last\n        item.value = 77",
+    );
+    let err = lower_src(&mixed_scalar_assignment)
+        .expect_err("a scalar local cannot accept a scalar-first mixed record ternary");
+    assert!(
+        assert_invalid(&err).contains("invalid record composition"),
+        "mixed scalar/record ternary assignment gets a source diagnostic: {err}"
+    );
+    let event_control = src
+        .replace(
+            "let scalar : uint<8> = 0",
+            "let scalar : uint<8> = 0\n        let ev : event<bool>",
+        )
+        .replace(
+            "item.value = 77",
+            "emit ev(item == item)\n        item.value = 77",
+        );
+    let event_prog =
+        lower_src(&event_control).expect("same-record equality is a valid scalar event payload");
+    let mixed_event =
+        event_control.replace("emit ev(item == item)", "emit ev(1 ? false : sb.last)");
+    let err = lower_src(&mixed_event)
+        .expect_err("a scalar local event cannot accept a mixed record payload");
+    assert!(
+        assert_invalid(&err).contains("channel carries `event<uint>`"),
+        "mixed scalar/record local-event payload gets a source diagnostic: {err}"
+    );
+    let record_query = event_prog
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("event control retains the record scoreboard query");
+    let mut broken_event = event_prog.clone();
+    let arg = broken_event
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventEmit { args, .. } => args.first_mut(),
+            _ => None,
+        })
+        .expect("local event emit exists");
+    *arg = record_query;
+    assert!(
+        verify::verify_program(&broken_event).is_err(),
+        "a scalar local event cannot carry a direct record after lowering"
+    );
+
+    let component_record_trigger = r#"struct Snap
+    value : uint<8>
+end struct Snap
+
+agent Holder
+    last : Snap
+    on last level
+        log(info, "tick")
+    end on
+end agent Holder
+
+testbench Tb
+    dut : Top
+    holder : Holder
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    for (label, trigger, expected) in [
+        ("direct", "on last level", "must be a scalar value"),
+        (
+            "wrapped",
+            "on !last level",
+            "scalar operator to a record value",
+        ),
+    ] {
+        let trigger_src = component_record_trigger.replace("on last level", trigger);
+        let err = lower_src(&trigger_src)
+            .expect_err("component record cycle triggers require scalar expressions");
+        assert!(
+            assert_invalid(&err).contains(expected),
+            "{label} component record trigger gets a source diagnostic: {err}"
+        );
+    }
+    for (label, condition, expected) in [
+        ("direct", "last", "must be a scalar value"),
+        ("wrapped", "!last", "scalar operator to a record value"),
+    ] {
+        let ternary_src = component_record_trigger.replace(
+            "    on last level",
+            &format!(
+                "    function choose() -> Snap\n        let out : Snap = {condition} ? last : last\n        return out\n    end function\n\n    on 1 level"
+            ),
+        );
+        let err = lower_src(&ternary_src)
+            .expect_err("component record ternary conditions require scalar expressions");
+        assert!(
+            assert_invalid(&err).contains(expected),
+            "{label} component record ternary condition gets a source diagnostic: {err}"
+        );
+    }
+
+    let record_default = src.replace("last : Snapshot", "last : Snapshot default 0");
+    let err = lower_src(&record_default).expect_err("record scoreboard defaults do not compile");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+
+    for reserved in ["_last_in_cycle", "_last_out_cycle"] {
+        let reserved_src = src.replace("last : Snapshot", &format!("{reserved} : Snapshot"));
+        let err = lower_src(&reserved_src)
+            .expect_err("generated scoreboard heartbeat member names are reserved");
+        assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    }
+
+    let mut broken_schema = prog.clone();
+    let ir::ScoreboardFieldKind::Record { record } =
+        &mut broken_schema.scoreboards[0].fields[0].kind
+    else {
+        panic!("record scoreboard field exists")
+    };
+    *record = ir::RecordId(u32::MAX);
+    assert!(
+        verify::verify_program(&broken_schema).is_err(),
+        "a missing scoreboard record schema must fail verification"
+    );
+    for reserved in ["_last_in_cycle", "_last_out_cycle"] {
+        let mut broken_name = prog.clone();
+        broken_name.scoreboards[0].fields[0].name = reserved.to_string();
+        assert!(
+            verify::verify_program(&broken_name).is_err(),
+            "reserved generated scoreboard member `{reserved}` must fail verification"
+        );
+    }
+
+    let mut broken_write = prog.clone();
+    let write_function = broken_write
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.blocks.iter().any(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        ir::Stmt::ScoreboardOp {
+                            op: ir::ScoreboardOp::ScalarWrite { .. },
+                            ..
+                        }
+                    )
+                })
+            })
+        })
+        .expect("record scoreboard write function exists");
+    let other = write_function
+        .locals
+        .iter()
+        .position(|local| local.name == "other")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Other local exists");
+    let value = write_function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { value, .. },
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Local(other);
+    assert!(
+        verify::verify_program(&broken_write).is_err(),
+        "a mismatched scoreboard record write must fail verification"
+    );
+
+    for reverse in [false, true] {
+        let mut broken_ternary = prog.clone();
+        let function = broken_ternary
+            .functions
+            .iter_mut()
+            .find(|function| function.locals.iter().any(|local| local.name == "other"))
+            .expect("record write function exists");
+        let local = |name: &str| {
+            function
+                .locals
+                .iter()
+                .position(|local| local.name == name)
+                .map(|index| ir::LocalId(index as u32))
+                .expect("record local exists")
+        };
+        let item = local("item");
+        let other = local("other");
+        let value = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::ScalarWrite { value, .. },
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .expect("record scoreboard write exists");
+        let (then_value, else_value) = if reverse {
+            (ir::Expr::Local(other), ir::Expr::Local(item))
+        } else {
+            (ir::Expr::Local(item), ir::Expr::Local(other))
+        };
+        *value = ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(then_value),
+            Box::new(else_value),
+        );
+        assert!(
+            verify::verify_program(&broken_ternary).is_err(),
+            "mixed record ternary write must fail verification in either arm order"
+        );
+    }
+
+    let mut broken_wrapped_record = prog.clone();
+    let function = broken_wrapped_record
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "item"))
+        .expect("record write function exists");
+    let item = function
+        .locals
+        .iter()
+        .position(|local| local.name == "item")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Snapshot local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "last" => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Unary(
+        ir::UnOp::Neg,
+        Box::new(ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(ir::Expr::Local(item)),
+            Box::new(ir::Expr::Local(item)),
+        )),
+    );
+    assert!(
+        verify::verify_program(&broken_wrapped_record).is_err(),
+        "a scalar operator cannot turn a same-record ternary into a record write"
+    );
+
+    let mut broken_record_condition = prog.clone();
+    let function = broken_record_condition
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "item"))
+        .expect("record write function exists");
+    let item = function
+        .locals
+        .iter()
+        .position(|local| local.name == "item")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Snapshot local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "last" => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Local(item)),
+        Box::new(ir::Expr::Local(item)),
+        Box::new(ir::Expr::Local(item)),
+    );
+    assert!(
+        verify::verify_program(&broken_record_condition).is_err(),
+        "a corrupted record-valued ternary condition must fail verification"
+    );
+
+    for (queue, wrapped) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut broken_scalar_consumer = prog.clone();
+        let function = broken_scalar_consumer
+            .functions
+            .iter_mut()
+            .find(|function| function.locals.iter().any(|local| local.name == "other"))
+            .expect("record write function exists");
+        let local = |name: &str| {
+            function
+                .locals
+                .iter()
+                .position(|local| local.name == name)
+                .map(|index| ir::LocalId(index as u32))
+                .expect("record local exists")
+        };
+        let item = local("item");
+        let other = local("other");
+        let value = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::QueuePush { value, .. },
+                    ..
+                } if queue => Some(value),
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                    ..
+                } if !queue && scalar == "count" => Some(value),
+                _ => None,
+            })
+            .expect("scalar scoreboard consumer exists");
+        let mixed = ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(ir::Expr::Local(item)),
+            Box::new(ir::Expr::Local(other)),
+        );
+        *value = if wrapped {
+            ir::Expr::Unary(ir::UnOp::Neg, Box::new(mixed))
+        } else {
+            mixed
+        };
+        assert!(
+            verify::verify_program(&broken_scalar_consumer).is_err(),
+            "a scalar scoreboard write/push cannot accept a direct or nested mixed-record ternary"
+        );
+    }
+
+    let mut broken_local_assign = prog.clone();
+    let function = broken_local_assign
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(query),
+        Box::new(ir::Expr::Literal {
+            value: 7,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+    );
+    assert!(
+        verify::verify_program(&broken_local_assign).is_err(),
+        "a record local assignment cannot hide a mixed aggregate ternary"
+    );
+
+    let record_query = prog
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("record scoreboard query exists");
+    let mut broken_scalar_local = prog.clone();
+    let function = broken_scalar_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "scalar"))
+        .expect("scalar local function exists");
+    let scalar = function
+        .locals
+        .iter()
+        .position(|local| local.name == "scalar")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("scalar local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(local, value) if *local == scalar => Some(value),
+            _ => None,
+        })
+        .expect("scalar local initializer exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+        Box::new(record_query),
+    );
+    assert!(
+        verify::verify_program(&broken_scalar_local).is_err(),
+        "a scalar local cannot accept a scalar-first mixed record ternary after lowering"
+    );
+
+    let mut broken_wrapped_local = prog.clone();
+    let function = broken_wrapped_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Unary(
+        ir::UnOp::Neg,
+        Box::new(ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(query.clone()),
+            Box::new(query),
+        )),
+    );
+    assert!(
+        verify::verify_program(&broken_wrapped_local).is_err(),
+        "a scalar operator cannot turn a same-record ternary into a record local value"
+    );
+
+    let mut broken_bool_local = prog.clone();
+    let function = broken_bool_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Binary(ir::BinOp::Eq, Box::new(query.clone()), Box::new(query));
+    assert!(
+        verify::verify_program(&broken_bool_local).is_err(),
+        "a same-record equality result cannot be assigned to a record local"
+    );
+
+    let mut broken_truth = prog.clone();
+    let function = broken_truth
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let query = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("record scoreboard read exists");
+    let cond = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+            _ => None,
+        })
+        .expect("assert condition exists");
+    *cond = query;
+    assert!(
+        verify::verify_program(&broken_truth).is_err(),
+        "a record-valued assertion condition must fail verification"
+    );
+
+    let nested = lower_src(&fixture("scoreboard_record_state_test.harc"))
+        .expect("nested scoreboard fixture lowers");
+    let mut broken_nested_write = nested.clone();
+    let path = broken_nested_write
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                nested_path: Some(path),
+                ..
+            } => Some(path),
+            _ => None,
+        })
+        .expect("nested scoreboard write exists");
+    path[1] = "bogus".to_string();
+    assert!(
+        verify::verify_program(&broken_nested_write).is_err(),
+        "a corrupted nested scoreboard write path must fail verification"
+    );
+
+    let mut broken_nested_read = nested;
+    let path = broken_nested_read
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::ScoreboardQuery {
+                    nested_path: Some(path),
+                    ..
+                },
+            ) => Some(path),
+            _ => None,
+        })
+        .expect("nested scoreboard read exists");
+    path[1] = "bogus".to_string();
+    assert!(
+        verify::verify_program(&broken_nested_read).is_err(),
+        "a corrupted nested scoreboard read path must fail verification"
+    );
 }
 
 /// The five `= bind <name>` arms, and the hole between them.
@@ -12502,36 +13983,227 @@ end test WhenTest
     );
 }
 
-/// Record locals cannot live in *pure* helpers (they emit as
-/// scalar-only file-scope C++ functions in the tbir backend). Note the
-/// body must stay inside the pure scan subset to reach this gate — a
-/// field access would classify the helper impure and CFG-inline it,
-/// where record locals are legal.
+/// A pure helper may hold a record local while keeping its scalar ABI. v1
+/// emits the same default-constructed C++ record and compiles; record-typed
+/// helper returns are a different shape that v1 mis-types as a module pointer,
+/// so the negative control below must not suggest v1.
 #[test]
-fn record_let_in_pure_helper_is_unsupported() {
+fn record_local_in_pure_helper_lowers_and_emits() {
     let src = r#"
 transaction Req
     addr : uint<32> default 9
 end transaction Req
 
-function mk() -> uint<32>
-    let t : Req
-    return 1
+function mk(seed: uint<32>) -> uint<32>
+    let Req : Req
+    return seed
 end function mk
 
 test PureHelperTest
     let dut : Top
     run
-        let x = mk()
+        let x = mk(1)
+        assert x == 1 else fail("pure helper record local")
     end run
 end test PureHelperTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("a record local in a pure helper lowers");
+    verify::verify_program(&prog).expect("pure-helper record local verifies");
+    let helpers: Vec<_> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    assert_eq!(helpers.len(), 1, "the helper stays out of line");
     assert!(
-        msg.contains("pure helper"),
-        "names the helper context: {msg}"
+        helpers[0].blocks.iter().any(|block| block
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt, ir::Stmt::RecordInit(_, ir::RecordId(0))))),
+        "mk default-constructs its record local:\n{}",
+        helpers[0]
     );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    let init = helper
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::RecordInit(_, record) => Some(record),
+            _ => None,
+        })
+        .expect("helper has RecordInit");
+    *init = ir::RecordId(99);
+    let errs = verify::verify_program(&broken).expect_err("bad helper record id is rejected");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadRecord { .. })),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.locals[0].ty = ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("helper param/local drift is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("param 0 metadata")
+        )),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.params[0].ty = ir::IrType::Record(ir::RecordId(0));
+    helper.locals[0].ty = ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("record helper param ABI is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("param 0 must use the scalar helper ABI")
+        )),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.locals[helper.ret.expect("return slot").index()].ty =
+        ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("record helper return ABI is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("return") && what.contains("scalar helper ABI")
+        )),
+        "{errs:?}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("static uint64_t harc_helper_mk(uint64_t seed);")
+            && cpp.contains("::Req Req{};")
+            && cpp.contains("Req = decltype(Req){};")
+            && cpp.contains("return __ret;"),
+        "the helper declares and initializes its record local:\n{cpp}"
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the positive control");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("Req Req;"),
+        "v1 emits the same record-local helper shape:\n{v1}"
+    );
+
+    let record_return = src
+        .replace(
+            "function mk(seed: uint<32>) -> uint<32>",
+            "function mk(seed: uint<32>) -> Req",
+        )
+        .replace("return seed", "return Req")
+        .replace("let x = mk(1)", "let x : Req = mk(1)")
+        .replace("assert x == 1", "assert x.addr == 9");
+    let msg = assert_not_implemented(
+        &lower_src(&record_return).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("record return from pure helper `mk`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&record_return)).expect("v1 emits the broken control");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> VReq*") && v1.contains("return Req;"),
+        "v1 returns a record through a module-pointer ABI:\n{v1}"
+    );
+
+    let record_into_scalar_return = src.replace("return seed", "return Req");
+    let msg = assert_not_implemented(
+        &lower_src(&record_into_scalar_return).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("record value returned from a scalar-valued pure helper"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&record_into_scalar_return))
+        .expect("v1 emits the broken scalar return");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("return Req;"),
+        "v1 returns a record through a scalar ABI:\n{v1}"
+    );
+
+    let untyped_record_arg = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+function accept_untyped(x) -> uint<8>
+    return 1
+end function accept_untyped
+
+function outer() -> uint<8>
+    let value : Req
+    return accept_untyped(value)
+end function outer
+
+test PureHelperUntypedRecordArgTest
+    let dut : Top
+    run
+        let x = outer()
+    end run
+end test PureHelperUntypedRecordArgTest
+"#;
+    let declared_unknown_record_arg = untyped_record_arg
+        .replace("accept_untyped(x)", "accept_string(x: String)")
+        .replace("accept_untyped(value)", "accept_string(value)")
+        .replace("end function accept_untyped", "end function accept_string");
+    for (label, source, helper, v1_signature) in [
+        (
+            "untyped",
+            untyped_record_arg.to_string(),
+            "accept_untyped",
+            "auto accept_untyped = [&](int64_t x)",
+        ),
+        (
+            "declared String",
+            declared_unknown_record_arg,
+            "accept_string",
+            "auto accept_string = [&](const char* x)",
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&source).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(
+            msg.contains("record argument passed to scalar-ABI parameter `x`")
+                && msg.contains(&format!("pure helper `{helper}`")),
+            "{label}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits the broken call");
+        assert!(
+            v1.contains(v1_signature) && v1.contains(&format!("{helper}(value)")),
+            "{label}: v1 passes a record to the non-record parameter:\n{v1}"
+        );
+    }
 }
 
 #[test]
@@ -16529,9 +18201,9 @@ fn target_record_state_lowers() {
     verify::verify_program(&prog).expect("verifies");
     let x = &prog.transactors[0];
     assert_eq!(x.bound_bus.as_deref(), Some("TlmMemBus"));
-    // One whole-record state field.
+    // Both whole-record state fields.
     let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["last"]);
+    assert_eq!(names, ["last", "bundle"]);
     assert!(matches!(
         &x.state_fields[0].kind,
         ir::StateFieldKind::Record { .. }
@@ -16633,6 +18305,14 @@ fn target_record_state_emits_value_record() {
     assert!(
         cpp.contains("responder.last.data"),
         "record-subfield read; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.bundle.data[slot]"),
+        "indexed scalar state path; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.bundle.kids[slot].value"),
+        "indexed record state path; got:\n{cpp}"
     );
     // Guard against the v1 miscompile shape leaking into tbir.
     assert!(
@@ -20537,6 +22217,54 @@ end test T"#,
 end test T"#,
     )
     .expect("a signedness difference is the benign widening v1 also performs");
+}
+
+#[test]
+fn component_event_emit_verifies_instance_activation_mode() {
+    let src = r#"transactor Emitter
+    in_ev : event<bool>
+    when active
+        active_ev : out event<bool>
+        hookable fire()
+            emit active_ev(true)
+        end fire
+    end when
+end transactor Emitter
+
+testbench Tb
+    dut : Top
+    active_emitter : Emitter active
+    passive_emitter : Emitter passive
+end testbench Tb
+
+impl T for Tb
+    run
+        emit active_emitter.active_ev(true)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("active-only event through an active binding lowers");
+    verify::verify_program(&prog).expect("active-only control verifies");
+    let mut broken = prog.clone();
+    let path = broken
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentEmit {
+                base: ir::ComponentBase::Path(path),
+                event,
+                ..
+            } if event == "active_ev" => Some(path),
+            _ => None,
+        })
+        .expect("active-only path emit exists");
+    *path = vec!["passive_emitter".to_string()];
+    assert!(
+        verify::verify_program(&broken).is_err(),
+        "active-only event emission through a passive binding must fail verification"
+    );
 }
 
 /// A probe read that appears ONLY inside an `on <trigger>` predicate is
@@ -29944,15 +31672,17 @@ fn logf_takes_its_path_by_position_not_by_value() {
              \x20       {stmt}\n        wait 1 cycle\n    end run\nend test T\n"
         )
     };
-    // The emitted log call, for whichever backend. The `seed=` line is
-    // the harness preamble every test emits, not the statement under
-    // test — dropping it by name rather than by position so a change in
+    // The emitted log call, for whichever backend. The `seed=` line and
+    // the empty-queue-pop reporter installed by the prologue (#644) are
+    // harness preamble every test emits, not the statement under test —
+    // dropping them by name rather than by position so a change in
     // preamble ordering fails loudly instead of silently selecting the
     // wrong line.
     let line = |out: &str| -> String {
         out.lines()
             .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
             .filter(|l| !l.contains("seed="))
+            .filter(|l| !l.contains("pop() on an empty queue"))
             .map(|l| l.trim().to_string())
             .collect::<Vec<_>>()
             .join(" ;; ")
@@ -32375,8 +34105,14 @@ end impl TbQTest"#
     // as a program error for a statement v1 compiles and runs. Enumerate
     // what the struct declares and compare the whole set instead.
     let body = {
+        // Anchor on the opening brace, not the bare name. The header
+        // also declares `struct HarcQueueFatalScope` — the RAII
+        // installer for the empty-pop reporter (#644) — and it sorts
+        // BEFORE `struct HarcQueue` in the file, so a bare-name search
+        // silently scanned the wrong struct and reported its
+        // constructor as `HarcQueue`'s entire member set.
         let start = hdr
-            .find("struct HarcQueue")
+            .find("struct HarcQueue {")
             .expect("struct HarcQueue present");
         let open = hdr[start..].find('{').expect("struct body opens") + start;
         let end = hdr[open..].find("\n};").expect("struct body closes") + open;
@@ -32936,12 +34672,18 @@ end impl T"#;
 fn component_fixed_vec_elements_lower_emit_and_remain_per_instance() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>
+    shadow : Vec<uint<64>, 4>
     flags : Vec<bool, 4>
 
     hookable store(index: uint<32>, value: uint<64>)
         words[index] = value
         flags[index] = true
     end store
+
+    hookable snapshot()
+        shadow = words
+        assert shadow == words else fail("snapshot mismatch")
+    end snapshot
 end scoreboard Table
 
 testbench Tb
@@ -32954,9 +34696,13 @@ impl T for Tb
     run
         a.store(2, 0x1234)
         b.store(2, 0x5678)
+        a.snapshot()
         assert a.flags[2] else fail("a flag")
         assert a.words[2] == 0x1234 else fail("a value")
         assert b.words[2] == 0x5678 else fail("b value")
+        assert a.words != b.words else fail("vectors unexpectedly equal")
+        a.words = b.words
+        assert a.words == b.words else fail("whole-vector copy failed")
         wait 1 cycle
     end run
 end impl T"#;
@@ -32973,6 +34719,10 @@ end impl T"#;
     assert!(cpp.contains("std::array<uint64_t, 4> words{};"), "{cpp}");
     assert!(cpp.contains("std::array<bool, 4> flags{};"), "{cpp}");
     assert!(cpp.contains("self.words[index] = value;"), "{cpp}");
+    assert!(cpp.contains("self.shadow = self.words;"), "{cpp}");
+    assert!(cpp.contains("self.shadow == self.words"), "{cpp}");
+    assert!(cpp.contains("a.words = b.words;"), "{cpp}");
+    assert!(cpp.contains("a.words == b.words"), "{cpp}");
     assert!(cpp.contains("a.words[2]"), "{cpp}");
     assert!(cpp.contains("b.words[2]"), "{cpp}");
 }
@@ -33012,6 +34762,322 @@ end impl T"#;
     assert!(
         msg.contains("default value on fixed-vector field `Table.words`"),
         "{msg}"
+    );
+}
+
+#[test]
+fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
+    let src = r#"scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        a.words = b.words
+        assert a.words == b.words else fail("copy")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("same-shape component vectors lower");
+    verify::verify_program(&prog).expect("whole-vector component IR verifies");
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the same array operations");
+    let tbir = emit_cpp_src(src);
+    for (v1_rendered, tbir_rendered) in [
+        ("_tb.a.words = _tb.b.words;", "a.words = b.words;"),
+        ("_tb.a.words == _tb.b.words", "a.words == b.words"),
+    ] {
+        assert!(v1.contains(v1_rendered), "v1 emits `{v1_rendered}`:\n{v1}");
+        assert!(
+            tbir.contains(tbir_rendered),
+            "tbir emits `{tbir_rendered}`:\n{tbir}"
+        );
+    }
+
+    for bad in [
+        "a.words = b.flags",
+        "assert a.words == b.flags else fail(\"bad\")",
+    ] {
+        let bad_src = src.replacen("a.words = b.words", bad, 1);
+        let err = lower_src(&bad_src).expect_err("mismatched whole vectors are not C++ values");
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("whole-vector"), "`{bad}`: {msg}");
+    }
+    let naked = src.replacen("a.words = b.words", "let x = b.words", 1);
+    let msg = assert_not_implemented(
+        &lower_src(&naked).expect_err("a whole array cannot initialize a scalar local"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("whole-vector component field"), "{msg}");
+
+    let index_leak = r#"transaction Row
+    data : Vec<uint<64>, 4>
+end transaction Row
+transaction Bank
+    tbl : Vec<Row, 2>
+end transaction Bank
+scoreboard Table
+    words : Vec<uint<64>, 4>
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+testbench Tb
+    dut : Top
+    a : Table
+end testbench Tb
+impl T for Tb
+    run
+        let bank : Bank
+        a.words = bank.tbl[a.words].data
+        wait 1 cycle
+    end run
+end impl T"#;
+    let msg = assert_not_implemented(
+        &lower_src(index_leak)
+            .expect_err("whole-vector permission must not leak into an index expression"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("whole-vector component field `a.words`"),
+        "{msg}"
+    );
+
+    fn corrupt<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::ComponentBase, &mut String, &mut ir::Expr),
+    {
+        let (base, field, value) = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ComponentFieldWrite { base, field, value } => Some((base, field, value)),
+                _ => None,
+            })
+            .expect("fixture contains a whole-vector write");
+        mutate(base, field, value);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted component-vector metadata must not verify"
+        );
+    }
+
+    corrupt(prog.clone(), |_, field, _| *field = "missing".to_string());
+    corrupt(prog.clone(), |base, _, _| {
+        *base = ir::ComponentBase::Local(ir::LocalId(0))
+    });
+    corrupt(prog.clone(), |_, _, value| match value {
+        ir::Expr::ComponentField { field, .. } => *field = "flags".to_string(),
+        other => panic!("whole-vector RHS is not a component field: {other:?}"),
+    });
+    corrupt(prog.clone(), |_, _, value| {
+        *value = ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(None),
+        }
+    });
+    corrupt(prog.clone(), |_, field, _| *field = "flags".to_string());
+
+    fn corrupt_equality<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::BinOp, &mut ir::Expr, &mut ir::Expr),
+    {
+        let cond = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+                _ => None,
+            })
+            .expect("fixture contains a vector equality");
+        let ir::Expr::Binary(op, lhs, rhs) = cond else {
+            panic!("vector equality did not lower to Binary: {cond:?}")
+        };
+        mutate(op, lhs, rhs);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted whole-vector equality must not verify"
+        );
+    }
+    corrupt_equality(prog.clone(), |op, _, _| *op = ir::BinOp::Add);
+    corrupt_equality(prog, |_, _, rhs| match rhs {
+        ir::Expr::ComponentField { field, .. } => *field = "flags".to_string(),
+        other => panic!("whole-vector equality RHS is not a component field: {other:?}"),
+    });
+}
+
+#[test]
+fn component_fixed_vec_side_table_predicates_are_verified() {
+    let src = r#"property words_equal
+    a.words == b.words
+end property words_equal
+
+scoreboard Table
+    words : Vec<uint<64>, 4>
+    flags : Vec<bool, 4>
+
+    hookable keep_component()
+        words[0] = words[0]
+    end keep_component
+end scoreboard Table
+
+testbench Tb
+    dut : Top
+    a : Table
+    b : Table
+end testbench Tb
+
+impl T for Tb
+    run
+        assert property words_equal
+        cover a.words == b.words
+        on a.words == b.words
+            log(info, "equal")
+        end on
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("whole-vector side-table predicates lower");
+    verify::verify_program(&prog).expect("whole-vector side-table predicates verify");
+    assert_eq!(prog.property_checks.len(), 1);
+    assert_eq!(prog.cover_checks.len(), 1);
+    assert_eq!(prog.cycle_handlers.len(), 1);
+
+    fn set_add(expr: &mut ir::Expr) {
+        let ir::Expr::Binary(op, _, _) = expr else {
+            panic!("whole-vector predicate is not binary: {expr:?}")
+        };
+        *op = ir::BinOp::Add;
+    }
+
+    let mut bad_property = prog.clone();
+    match &mut bad_property.property_checks[0].shape {
+        ir::PropertyShape::Invariant(expr) => set_add(expr),
+        other => panic!("whole-vector property is not invariant: {other:?}"),
+    }
+    assert!(
+        verify::verify_program(&bad_property).is_err(),
+        "corrupted property side-table predicate must not verify"
+    );
+
+    let mut bad_cover = prog.clone();
+    set_add(&mut bad_cover.cover_checks[0].cond);
+    assert!(
+        verify::verify_program(&bad_cover).is_err(),
+        "corrupted cover side-table predicate must not verify"
+    );
+
+    let mut bad_handler = prog.clone();
+    let ir::CycleHandlerKind::Trigger { trigger, .. } = &mut bad_handler.cycle_handlers[0].kind
+    else {
+        panic!("whole-vector cycle handler is not trigger-based")
+    };
+    let ir::Expr::Binary(_, _, rhs) = trigger else {
+        panic!("whole-vector cycle trigger is not binary: {trigger:?}")
+    };
+    let ir::Expr::ComponentField { field, .. } = &mut **rhs else {
+        panic!("whole-vector cycle trigger RHS is not a component field: {rhs:?}")
+    };
+    *field = "flags".to_string();
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "cross-lane cycle-handler predicate must not verify"
+    );
+}
+
+#[test]
+fn side_table_local_reads_obey_registration_point_dominance() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let x = 3
+        assert past(x) == 3 else fail("x=${x}")
+        cover x == 3
+        on x == 3
+            log(info, "x")
+        end on
+        let y = 4
+        wait 1 cycle
+    end run
+end test T"#;
+
+    let prog = lower_src(src).expect("local-capturing side tables lower");
+    verify::verify_program(&prog).expect("defined local captures verify");
+    let run = prog.tests[0].run;
+    let y = prog
+        .function(run)
+        .locals
+        .iter()
+        .position(|l| l.name == "y")
+        .map(|index| ir::LocalId(index as u32))
+        .unwrap();
+
+    let assert_use_before_def = |bad: ir::TbProgram, site: &str| {
+        let errs = verify::verify_program(&bad).expect_err(site);
+        assert!(
+            errs.iter().any(|err| matches!(
+                err,
+                verify::VerifyError::LocalUseBeforeDef { local, .. } if *local == y
+            )),
+            "{site}: {errs:?}"
+        );
+    };
+
+    let mut bad_root = prog.clone();
+    let ir::PropertyShape::Invariant(root) = &mut bad_root.property_checks[0].shape else {
+        panic!("temporal equality did not lower as an invariant")
+    };
+    *root = ir::Expr::Local(y);
+    assert_use_before_def(bad_root, "later local in property root must not verify");
+
+    let mut bad_temporal = prog.clone();
+    bad_temporal.property_checks[0].temporals[0].inner = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_temporal,
+        "later local in temporal operand must not verify",
+    );
+
+    let mut bad_message = prog.clone();
+    bad_message.property_checks[0]
+        .message
+        .as_mut()
+        .expect("fixture has a property message")
+        .args[0]
+        .expr = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_message,
+        "later local in property message must not verify",
+    );
+
+    let mut bad_cover = prog.clone();
+    bad_cover.cover_checks[0].cond = ir::Expr::Local(y);
+    assert_use_before_def(bad_cover, "later local in cover root must not verify");
+
+    let mut bad_handler = prog;
+    let ir::CycleHandlerKind::Trigger { trigger, .. } = &mut bad_handler.cycle_handlers[0].kind
+    else {
+        panic!("fixture cycle handler is not trigger-based")
+    };
+    *trigger = ir::Expr::Local(y);
+    assert_use_before_def(
+        bad_handler,
+        "later local in cycle-handler root must not verify",
     );
 }
 
