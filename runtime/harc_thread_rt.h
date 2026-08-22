@@ -507,6 +507,51 @@ inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     return r;
 }
 
+// Mixed HarcWide/integer operands.
+//
+// `HarcWide<N>` converts implicitly to BOTH `uint64_t` and
+// `_harc_u128`, so `w + 1` names two equally good built-in additions
+// and g++ rejects it: "ambiguous overload for `operator+` (operand
+// types are `harc_rt::HarcWide<32>` and `int`)". Every emitted
+// `w = w + 1` on a scalar wider than 128 bits hit that, in both
+// backends — a lowered program that nobody can build.
+//
+// The rule is the one `operator==`/`operator!=` above already state,
+// and that `harc_wide_negate` writes out by hand as `(~value) +
+// HarcWide<N>(1)`: widen the integer to the wide operand's own width
+// and use the homogeneous operator. Stating it once here retires both
+// copies of the workaround and the ambiguity along with them.
+//
+// Both argument orders are defined because either can be written
+// (`w + 1` and `1 + w`), and the enable_if keeps `HarcWide` itself out
+// of `T` so the homogeneous overloads still win when both sides are
+// wide.
+#define HARC_WIDE_MIXED_OP(op)                                                                  \
+    template<std::size_t N, typename T,                                                         \
+             typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
+    inline auto operator op(const HarcWide<N>& lhs, T rhs) {                                    \
+        return lhs op HarcWide<N>(rhs);                                                         \
+    }                                                                                           \
+    template<std::size_t N, typename T,                                                         \
+             typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
+    inline auto operator op(T lhs, const HarcWide<N>& rhs) {                                    \
+        return HarcWide<N>(lhs) op rhs;                                                         \
+    }
+
+HARC_WIDE_MIXED_OP(+)
+HARC_WIDE_MIXED_OP(-)
+HARC_WIDE_MIXED_OP(*)
+HARC_WIDE_MIXED_OP(/)
+HARC_WIDE_MIXED_OP(%)
+HARC_WIDE_MIXED_OP(&)
+HARC_WIDE_MIXED_OP(|)
+HARC_WIDE_MIXED_OP(^)
+HARC_WIDE_MIXED_OP(<)
+HARC_WIDE_MIXED_OP(>)
+HARC_WIDE_MIXED_OP(<=)
+HARC_WIDE_MIXED_OP(>=)
+#undef HARC_WIDE_MIXED_OP
+
 template<std::size_t N>
 inline HarcWide<N> harc_wide_negate(HarcWide<N> value, unsigned width) {
     value = harc_wide_mask_bits(value, width);

@@ -70,8 +70,10 @@ use std::process::Command;
 /// What v1 measurably does with a program.
 #[derive(Debug, PartialEq, Eq)]
 enum V1Behaviour {
-    /// v1 refused to emit at all.
-    Refuses,
+    /// v1 refused to emit at all, with the reason it gave. A bare
+    /// "refuses" reading sent two probe templates down the wrong path
+    /// before the message was carried along with it.
+    Refuses(String),
     /// v1 emitted C++ and it typechecks.
     Compiles,
     /// v1 emitted C++ and the compiler rejected it.
@@ -139,7 +141,7 @@ fn v1_behaviour(cc: &str, src: &str, dir: &Path, stem: &str) -> V1Behaviour {
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = match cpp_tb::emit(&merged) {
         Ok(c) => c,
-        Err(_) => return V1Behaviour::Refuses,
+        Err(e) => return V1Behaviour::Refuses(e.to_string()),
     };
     match compile(cc, &cpp, dir, stem) {
         None => V1Behaviour::Compiles,
@@ -177,6 +179,21 @@ fn compile(cc: &str, cpp: &str, dir: &Path, stem: &str) -> Option<String> {
 /// verdict to what v1 measurably does. Returns a human-readable table
 /// so a passing run still shows the shape of the space.
 fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String {
+    check_space_with_control(label, template, hole, "", subs)
+}
+
+/// `check_space` for a hole that cannot simply be deleted — a type
+/// annotation, say, where an empty substitution is a parse error rather
+/// than a smaller program. `control` is the neutral row: a
+/// substitution already known to work, so the skeleton is still proved
+/// before any row is believed.
+fn check_space_with_control(
+    label: &str,
+    template: &str,
+    hole: &str,
+    control: &str,
+    subs: &[&str],
+) -> String {
     let Some(cc) = cxx() else {
         eprintln!("no C++ compiler on PATH — skipping {label}");
         return String::new();
@@ -187,16 +204,15 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
     // The CONTROL: the template with the hole emptied. A broken
     // skeleton has produced false "v1 refuses" readings more than once,
     // and every row is meaningless if the control does not pass.
-    let control = template.replace(hole, "");
+    let control = template.replace(hole, control);
     assert!(
         matches!(tb_verdict(cc, &control, &dir, "control"), TbVerdict::Lowers),
         "{label}: the control must lower — the template is broken, not the compiler"
     );
-    assert_eq!(
-        v1_behaviour(cc, &control, &dir, "control"),
-        V1Behaviour::Compiles,
-        "{label}: the control must compile under v1"
-    );
+    match v1_behaviour(cc, &control, &dir, "control") {
+        V1Behaviour::Compiles => {}
+        other => panic!("{label}: the control must compile under v1, got {other:?}"),
+    }
 
     let mut table = format!("\n{label}: control lowers and compiles\n");
     let mut failures = Vec::new();
@@ -217,7 +233,7 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
             },
             match &v1 {
                 V1Behaviour::Compiles => "compiles".to_string(),
-                V1Behaviour::Refuses => "refuses".to_string(),
+                V1Behaviour::Refuses(m) => format!("refuses: {m}"),
                 V1Behaviour::EmitsUncompilable(_) => "emits, g++ refuses".to_string(),
             }
         ));
@@ -227,8 +243,8 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
             (TbVerdict::Unsupported(c), V1Behaviour::EmitsUncompilable(e)) => failures.push(
                 format!("`{}`: tbir promises `--codegen v1` for `{c}`, but v1's output does not compile: {e}", sub.trim()),
             ),
-            (TbVerdict::Unsupported(c), V1Behaviour::Refuses) => failures.push(format!(
-                "`{}`: tbir promises `--codegen v1` for `{c}`, but v1 refuses the program",
+            (TbVerdict::Unsupported(c), V1Behaviour::Refuses(m)) => failures.push(format!(
+                "`{}`: tbir promises `--codegen v1` for `{c}`, but v1 refuses the program: {m}",
                 sub.trim()
             )),
             (TbVerdict::Invalid(m), V1Behaviour::Compiles) => failures.push(format!(
@@ -250,7 +266,13 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
             // the arm, whose worst landing may be genuinely bad), so
             // it is reported rather than asserted — and the report is
             // the real-gap inventory for this arm.
-            (TbVerdict::NotImplemented(..), V1Behaviour::Compiles) => {
+            //
+            // `Unsupported` belongs in that inventory too, and used to
+            // be missing from it. Pairing it with a compiling v1 is
+            // exactly what the label PROMISES, so no assertion fires —
+            // but the promise being kept is precisely what makes it a
+            // gap: v1 builds the program and TB-IR refuses it.
+            (TbVerdict::NotImplemented(..) | TbVerdict::Unsupported(_), V1Behaviour::Compiles) => {
                 gaps.push(sub.trim().to_string())
             }
             _ => {}
@@ -354,64 +376,265 @@ end impl T
     eprintln!("{table}");
 }
 
-/// `tb_scalar_field_ir_type` is one function deciding for FOUR call
-/// sites: a testbench field, a test-scope `let`, and a transactor state
-/// field (twice). Widening its `w > 64` gate to close one gap changes
-/// the answer at all of them, so each gets its own template here before
-/// anything is widened.
+/// `tb_scalar_field_ir_type` is one function deciding for FIVE call
+/// sites, and its `w > 64` gate is what refuses a wide declared field.
+/// Widening it to close one gap changes the answer at all five, so
+/// each gets its own template here before anything is widened:
+///
+///   * `mod.rs` testbench-field DECLARATION — the guard that refuses;
+///   * `mod.rs` testbench-field DEFAULT — no guard at all, an `else
+///     if let Some(..)`, so a type the gate rejects is silently
+///     DROPPED rather than diagnosed. The two must move together or a
+///     wide field becomes a member that does not exist;
+///   * `mod.rs` promoted test-scope `let` — falls back to
+///     `IrType::UInt(None)` instead of refusing, so a wide promoted
+///     let is a 64-bit member today;
+///   * `transactors.rs` component-hosted target-state FILTER — decides
+///     whether the responder view lowers the field at all;
+///   * `transactors.rs` transactor state field.
+///
+/// The rows use each field rather than only declaring it: a
+/// declaration that widens while its read/write path does not is a
+/// worse outcome than the refusal it replaced.
 #[test]
 fn the_shared_scalar_width_gate_across_its_call_sites() {
+    // One space, five landings. `uint<65>` and `uint<128>` share the
+    // `_harc_u128` storage class, `uint<1024>` crosses into
+    // `HarcWide<N>`, and `sint<128>` is the signed half — the emitter
+    // seam picks a different C++ type for each, so a fix that only
+    // reaches one of them shows up here.
     let widths = &[
-        "    w : uint<64>",
-        "    w : uint<65>",
-        "    w : uint<128>",
-        "    w : sint<128>",
-        "    w : uint<1024>",
+        "uint<64>",
+        "uint<65>",
+        "uint<128>",
+        "sint<128>",
+        "uint<1024>",
     ];
 
-    // Call site 1: a testbench field.
+    // Call site 1 + 2: a testbench field. Declaration and default are
+    // separate call sites in the same lowering pass.
     let tb_field = r#"
 testbench Tb
     dut : Top
-@@FIELD@@
+    w : @@TY@@ default 1
 end testbench Tb
 
 impl T for Tb
     run
+        w = 2
         dut.rst = 1
         wait 2 cycles
     end run
+    check
+        assert w == 2
+            else fail("w=${w}")
+    end check
 end impl T
 "#;
-    eprintln!("{}", check_space("tb-field", tb_field, "@@FIELD@@", widths));
+    eprintln!(
+        "{}",
+        check_space_with_control("tb-field", tb_field, "@@TY@@", "uint<32>", widths)
+    );
 
-    // Call site 2: a test-scope `let`. Spelled as a statement, so the
-    // hole sits in the run body rather than the field list.
-    let scope_let = r#"
+    // Call site 3: a test-scope `let` READ IN THE CHECK PHASE, which
+    // promotes it to a `_tb` host field. The unpromoted form already
+    // lowers wide (it is a plain local, not a field), so probing that
+    // one says nothing about this gate.
+    let promoted_let = r#"
 testbench Tb2
     dut : Top
 end testbench Tb2
 
 impl T2 for Tb2
+    let w : @@TY@@ = 1
     run
-@@FIELD@@
         dut.rst = 1
         wait 2 cycles
     end run
+    check
+        assert w == 1
+            else fail("w=${w}")
+    end check
 end impl T2
 "#;
     eprintln!(
         "{}",
-        check_space(
-            "scope-let",
-            scope_let,
-            "@@FIELD@@",
-            &[
-                "        let w : uint<64> = 1",
-                "        let w : uint<65> = 1",
-                "        let w : uint<128> = 1",
-                "        let w : sint<128> = 1",
-            ],
-        )
+        check_space_with_control("promoted-let", promoted_let, "@@TY@@", "uint<32>", widths)
+    );
+
+    // Call sites 4 + 5: a transactor state field, reached through the
+    // responder view.
+    let state_field = r#"
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    w : @@TY@@ default 1
+    thread bus.read(addr: uint<8>)
+        w = w + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb3
+    dut : TlmReadInitiator
+end testbench Tb3
+
+impl T3 for Tb3
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T3
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("state-field", state_field, "@@TY@@", "uint<32>", widths)
+    );
+
+    // The same scalar-field shape reached through the scoreboard and
+    // component field kinds, whose emitters carry their own copy of
+    // the `(bool | int64_t | uint64_t)` type choice.
+    let sb_field = r#"
+scoreboard Sb
+    w : @@TY@@ default 1
+end scoreboard Sb
+
+testbench Tb4
+    dut : Top
+    sb : Sb
+end testbench Tb4
+
+impl T4 for Tb4
+    run
+        sb.w = 2
+        dut.rst = 1
+        wait 2 cycles
+    end run
+    check
+        assert sb.w == 2
+            else fail("w=${sb.w}")
+    end check
+end impl T4
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("scoreboard-field", sb_field, "@@TY@@", "uint<32>", widths)
+    );
+
+    let comp_field = r#"
+transactor Src
+    w : @@TY@@ default 1
+    hookable bump(v: uint<8>)
+        w = w + 1
+    end bump
+end transactor Src
+
+testbench Tb5
+    dut : Top
+    src : Src passive
+end testbench Tb5
+
+impl T5 for Tb5
+    run
+        src.bump(1)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+    check
+        assert src.w == 2
+            else fail("w=${src.w}")
+    end check
+end impl T5
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("component-field", comp_field, "@@TY@@", "uint<32>", widths)
+    );
+}
+
+/// Declaring a wide scalar and USING it are different questions, and
+/// the width test above only assigns and compares. `HarcWide<N>` has
+/// `operator+` for `HarcWide<N> + HarcWide<N>` and implicit conversions
+/// to both `uint64_t` and `_harc_u128`, so `w + 1` is ambiguous rather
+/// than wrong — g++ reports "ambiguous overload for `operator+`". A
+/// declaration gate that widens without this row shipping green would
+/// trade a refusal for a build failure.
+#[test]
+fn wide_scalar_arithmetic_at_a_local_and_at_a_field() {
+    let widths = &["uint<64>", "uint<128>", "uint<1024>"];
+
+    let local = r#"
+testbench TbW
+    dut : Top
+end testbench TbW
+
+impl TW for TbW
+    run
+        let w : @@TY@@ = 1
+        w = w + 1
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TW
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("wide-arith-local", local, "@@TY@@", "uint<32>", widths)
+    );
+
+    let field = r#"
+testbench TbW2
+    dut : Top
+    w : @@TY@@ default 1
+end testbench TbW2
+
+impl TW2 for TbW2
+    run
+        w = w + 1
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TW2
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("wide-arith-field", field, "@@TY@@", "uint<32>", widths)
+    );
+}
+
+/// Every field schema in the IR carries its `default` as a `u64`, so a
+/// declared default that does not fit one has no representation. It
+/// must be REFUSED, at every field site, rather than silently becoming
+/// a different number — the field is wide precisely so that the value
+/// fits.
+#[test]
+fn a_field_default_too_wide_for_its_u64_slot_is_never_truncated() {
+    // 2^65 and 2^64: the first literal above `u64::MAX`, and the
+    // boundary itself.
+    let defaults = &[
+        "18446744073709551615",
+        "18446744073709551616",
+        "36893488147419103232",
+    ];
+    let tb_field = r#"
+testbench Tb6
+    dut : Top
+    w : uint<128> default @@D@@
+end testbench Tb6
+
+impl T6 for Tb6
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T6
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("wide-default", tb_field, "@@D@@", "1", defaults)
     );
 }

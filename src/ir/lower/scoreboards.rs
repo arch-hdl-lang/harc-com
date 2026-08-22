@@ -25,9 +25,9 @@
 //!     container. See the measurement at each arm.
 
 use super::{not_implemented, unsupported, LowerError, V1Status};
-use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
+use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, TypeExpr};
 use crate::codegen::cpp_tb::RecordLeafFate;
-use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
+use crate::ir::{RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
 
 pub(crate) fn lower_scoreboard(
@@ -312,7 +312,7 @@ fn scoreboard_field_kind(
         let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
-    let ty = scalar_ir_type(t).ok_or_else(|| {
+    let ty = super::components::scalar_field_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same
         // predicate rather than a second copy of it: what does v1 do
         // with this leaf? Measured here too, because a scoreboard's
@@ -352,33 +352,6 @@ fn scoreboard_field_kind(
         unsupported(&what, SUBSET)
     })?;
     Ok(ScoreboardFieldKind::Scalar { ty, default: 0 })
-}
-
-/// Scalar field-type mapping, mirroring v1's `txn_field_c_type` choices
-/// for the ≤ 64-bit subset. `None` for non-scalar / >64-bit.
-fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
-    let TypeExpr::Builtin { name, args, .. } = t else {
-        return None;
-    };
-    let width = match args.first() {
-        Some(TypeArg::Expr(e)) => match &*e.kind {
-            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
-            _ => return None,
-        },
-        Some(_) => return None,
-        None => None,
-    };
-    if width.is_some_and(|w| w == 0 || w > 64) {
-        return None;
-    }
-    match name {
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-            Some(IrType::UInt(width))
-        }
-        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
-        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
-        _ => None,
-    }
 }
 
 /// A scoreboard field's `default` — same rule as the component form

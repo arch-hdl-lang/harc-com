@@ -1450,10 +1450,10 @@ fn lower_field(
                     "",
                 ));
             }
-            let ty = scalar_ir_type(&f.ty).ok_or_else(|| {
+            let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
                 unsupported(
                     &format!("scalar field `{comp}.{fname}` of an unsupported type"),
-                    "only uint/sint/bits/bool fields up to 64 bits are lowered",
+                    "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
                 )
             })?;
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
@@ -2889,12 +2889,32 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
-/// The component/event/fixed-vector scalar subset remains capped at 64 bits.
-/// Queue elements call `decoded_scalar_ir_type` directly because their shared
-/// storage path already supports `_harc_u128` and `HarcWide<N>`.
+/// The component EVENT-payload and FIXED-VECTOR scalar subset, capped at
+/// 64 bits. Queue elements call `decoded_scalar_ir_type` directly
+/// because their shared storage path already supports `_harc_u128` and
+/// `HarcWide<N>`; declared scalar FIELDS go through
+/// `scalar_field_ir_type` below for the same reason.
+///
+/// The three subsets are separate on purpose. An event payload is a
+/// `std::function` parameter type and a fixed-vector element is an
+/// `std::array` element, and neither emitter has been shown to carry a
+/// width past 64 — widening the field sites through this one function
+/// would have widened both of those unmeasured.
 fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t)
         .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
+}
+
+/// The scalar subset of a DECLARED component/scoreboard field, capped at
+/// `MAX_SCALAR_FIELD_WIDTH`. Both emitters render the member through
+/// `field_scalar_cty`, which knows `_harc_u128` and `HarcWide<N>`, so
+/// the 64-bit cap `scalar_ir_type` still applies to payloads and vector
+/// elements never belonged here.
+pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t).filter(|ty| {
+        !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w))
+            if *w > super::MAX_SCALAR_FIELD_WIDTH)
+    })
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {

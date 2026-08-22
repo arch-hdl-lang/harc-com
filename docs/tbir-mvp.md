@@ -8449,6 +8449,69 @@ former `transaction` group lives in
      Both now fail when their guard is removed. A test written in the
      same edit as its guard is not automatically a test OF that guard.
 
+134. **A width cap written around a missing header overload
+     (2026-08-22).**
+
+     `w : uint<128>` as a declared field was refused at five call
+     sites, naming `--codegen v1` as the way out. The refusal was real
+     — v1 emits `_harc_u128 w` and builds — so this was one of the
+     thirteen measured gaps where v1 works and TB-IR does not.
+
+     Closing it needed three separate things, and only the first was
+     the one the gap list named.
+
+     - **The width rule.** `tb_scalar_field_ir_type` capped at 64 and
+       decides for FIVE sites: the testbench field declaration, the
+       testbench field DEFAULT (an `else if let Some(..)` with no
+       guard of its own — a type the gate rejects is silently dropped
+       there rather than diagnosed, so the two cannot move
+       separately), the promoted test-scope `let`, the component-hosted
+       target-state filter, and the transactor state field.
+       `components_impl.rs` capped at 64 through `scalar_ir_type`,
+       which ALSO decides event payloads and fixed-vector elements —
+       widening that one function would have widened both of those
+       unmeasured, so the declared-field subset is now its own
+       function. `scoreboards.rs` held a third byte-identical copy of
+       the same decoder; it is deleted, not edited.
+     - **The emitters.** Four of them — transactor state, scoreboard,
+       component, testbench — each carried its own
+       `(bool | int64_t | uint64_t)` triple, while the queue-element
+       emitter already went through `field_scalar_cty`, which knows
+       `_harc_u128` and `HarcWide<N>`. A wide type reaching any of the
+       four would have produced a 64-bit member that compiles, runs,
+       and drops the top half. No typecheck can see that, which is why
+       the member type is asserted directly.
+     - **A missing runtime overload, in BOTH backends.** The cap was
+       very nearly set at 128 instead of 1024, because above 128 a
+       field is declared `HarcWide<N>` and `w = w + 1` on one was
+       rejected: "ambiguous overload for `operator+` (operand types
+       are `harc_rt::HarcWide<32>` and `int`)" — `HarcWide` converts
+       to `uint64_t` and to `_harc_u128` equally well. That reproduces
+       on clean `main` for a plain wide LOCAL, with nothing to do with
+       fields: `let w : uint<1024> = 1; w = w + 1` lowered and emitted
+       C++ that nobody could build, in tbir and in v1 alike. The rule
+       was already stated twice in the tree — `operator==`/`operator!=`
+       carry the mixed HarcWide/integer form, and `harc_wide_negate`
+       writes `(~value) + HarcWide<N>(1)` by hand. Stating it once for
+       the arithmetic and relational operators retired the ambiguity
+       and the hand-written workaround together. A cap at 128 would
+       have written a language limit around a header omission.
+
+     What did NOT change: a `default` literal above `u64::MAX` is
+     still refused, because every field schema carries its default in a
+     `u64`. That refusal is correct rather than conservative — v1
+     emits `_harc_u128 w = 36893488147419103232;`, which g++ accepts
+     with a warning and evaluates to **0**. The differential harness
+     scores that row as "v1 compiles"; only running it shows the
+     value, which is the harness's documented blind spot and exactly
+     what the `SilentlyMisLowers` label already said.
+
+     The gap was found by asking v1 across a mechanically enumerated
+     width space rather than from one probe, and every step above was
+     mutation-tested: re-capping the shared rule, re-capping either of
+     the two per-file rules, restoring the hardcoded emitter triple,
+     and deleting the runtime operators each fail the suite.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

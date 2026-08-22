@@ -6065,10 +6065,28 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// The largest declared field width lowered as a scalar member.
+///
+/// 1024 bits is the language-level vector target `harc_thread_rt.h`
+/// states for `HarcWide<N>` (N <= 32), and the same ceiling the value
+/// model already used for locals and queue elements. A FIELD is not a
+/// local, but the storage seam is shared: `field_scalar_cty` renders
+/// 65..128 as v1's `_harc_u128` and wider as `harc_rt::HarcWide<N>`.
+///
+/// This was very nearly capped at 128 instead. Above that, a field is
+/// declared `HarcWide<N>`, and `w = w + 1` on one was rejected by g++
+/// in BOTH backends — "ambiguous overload for `operator+`", because
+/// `HarcWide` converts to `uint64_t` and to `_harc_u128` equally well.
+/// That is a missing runtime overload, not a width the language cannot
+/// express: the mixed HarcWide/integer operators now live next to the
+/// `operator==` that already stated the same rule. Capping here would
+/// have written a language limit around a header omission.
+pub(super) const MAX_SCALAR_FIELD_WIDTH: u32 = 1024;
+
 /// Scalar IR type of a testbench member field (`expected : uint<32>`),
 /// or `None` when the type is outside the scalar subset. Mirrors v1's
-/// `component_field_c_type` → `txn_field_c_type` C-type choice for
-/// the ≤64-bit subset.
+/// `component_field_c_type` → `txn_field_c_type` C-type choice, up to
+/// `MAX_SCALAR_FIELD_WIDTH`.
 pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
@@ -6081,7 +6099,7 @@ pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
         Some(_) => return None,
         None => None,
     };
-    if width.is_some_and(|w| w == 0 || w > 64) {
+    if width.is_some_and(|w| w == 0 || w > MAX_SCALAR_FIELD_WIDTH) {
         return None;
     }
     match name {

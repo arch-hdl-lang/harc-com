@@ -1258,7 +1258,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
 
 /// C++ storage type for a record field's scalar (or Vec element) type,
 /// using the same width-aware integer policy as standalone locals.
-fn field_scalar_cty(ty: &ir::IrType) -> String {
+pub(super) fn field_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
         ir::IrType::Bool => "bool".to_string(),
         _ => local_scalar_cty(ty),

@@ -11615,7 +11615,6 @@ end impl T"#
     // body is what stops compiling keeps a correct member here.
     for (ty, shape) in [
         ("list<uint<8>>", "std::vector<uint64_t> l;"),
-        ("uint<128>", "_harc_u128 l;"),
         (
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
@@ -11635,6 +11634,30 @@ end impl T"#
             "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
         );
     }
+    // `uint<128>` used to sit in that list, refused with v1 named as
+    // the way out. It is not a gap any more: a declared scalar field
+    // is lowered up to `MAX_SCALAR_FIELD_WIDTH`, and BOTH backends
+    // emit the same wide member.
+    for (ty, shape) in [
+        ("uint<128>", "_harc_u128 l"),
+        ("sint<128>", "_harc_u128 l"),
+        ("uint<1024>", "harc_rt::HarcWide<32> l"),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        lower_src(&src).expect("a wide scoreboard field lowers");
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(shape),
+            "`{ty}`: tbir must emit `{shape}`, got:\n{cpp}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 emits `{shape}` too — the two agree on the member"
+        );
+    }
+
     for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {
         let src = prog(&format!("scoreboard Sb\n    s : {ty}\nend scoreboard Sb"));
         assert_not_implemented(
@@ -33027,4 +33050,71 @@ end impl T"#;
         cpp.contains("((int64_t)(self.signed_values[0])) >> 1"),
         "a real test-scope `self` binding must win over the component sentinel:\n{cpp}"
     );
+}
+
+/// A declared scalar field wider than 64 bits, at each of the four
+/// emitters that render one.
+///
+/// All four carried their own copy of a `(bool | int64_t | uint64_t)`
+/// type choice. A `uint<128>` member reaching any of them without the
+/// shared `field_scalar_cty` seam is not a build failure — it is a
+/// 64-bit member that compiles, runs, and drops the top half. Nothing
+/// in the differential harness can see that, so the member type is
+/// asserted here directly.
+#[test]
+fn a_wide_scalar_field_keeps_its_width_at_every_field_emitter() {
+    // (source, expected member declaration) per emitter. `uint<1024>`
+    // crosses from `_harc_u128` into `harc_rt::HarcWide<32>`, so each
+    // emitter is checked on both sides of that boundary.
+    for (width, cty) in [(128u32, "_harc_u128"), (1024, "harc_rt::HarcWide<32>")] {
+        // 1. The testbench `_tb` struct.
+        let tb = format!(
+            "testbench Tb\n    dut : Top\n    w : uint<{width}> default 1\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        w = 2\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&tb).contains(&format!("{cty} w = 1;")),
+            "testbench field at {width} bits must be `{cty}`"
+        );
+
+        // 2. The scoreboard struct.
+        let sb = format!(
+            "scoreboard Sb\n    w : uint<{width}> default 1\nend scoreboard Sb\n\
+             \ntestbench Tb\n    dut : Top\n    sb : Sb\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        sb.w = 2\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&sb).contains(&format!("{cty} w = 1;")),
+            "scoreboard field at {width} bits must be `{cty}`"
+        );
+
+        // 3. The component struct (an unbound transactor as a member).
+        let comp = format!(
+            "transactor Src\n    w : uint<{width}> default 1\n\
+             \n    hookable bump(v: uint<8>)\n        w = w + 1\n    end bump\nend transactor Src\n\
+             \ntestbench Tb\n    dut : Top\n    src : Src passive\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        src.bump(1)\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&comp).contains(&format!("{cty} w = 1;")),
+            "component field at {width} bits must be `{cty}`"
+        );
+
+        // 4. The per-instance transactor-state struct.
+        let state = format!(
+            "bus TlmMemBus\n    tlm_method read(addr: uint<8>) -> uint<32>: blocking;\n\
+             end bus TlmMemBus\n\
+             \ntransactor TlmMemTarget bound to TlmMemBus\n    w : uint<{width}> default 1\n\
+             \n    thread bus.read(addr: uint<8>)\n        w = w + 1\n        return 1\n\
+             \n    end thread\nend transactor TlmMemTarget\n\
+             \ntestbench Tb\n    dut : TlmReadInitiator\nend testbench Tb\n\
+             \nimpl T for Tb\n    let mem : TlmMemBus = bind dut\n\
+             \n    let target : TlmMemTarget passive = bind mem\n    run\n        wait 1 cycle\n\
+             \n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&state).contains(&format!("{cty} w = 1;")),
+            "transactor state field at {width} bits must be `{cty}`"
+        );
+    }
 }
