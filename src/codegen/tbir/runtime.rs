@@ -13,13 +13,15 @@ pub(super) const INDENT: &str = "    ";
 ///
 /// `problem_table_cpp` is the rendered constraint-solver runtime problem
 /// table (`RuntimeProblemTable::render_cpp_table`) when the program has
-/// any randomize site, else empty — its non-emptiness also gates the
-/// `harc_z3_rt.h` include, mirroring v1's `uses_constraint_solver` gate.
+/// a cataloged randomize site, else empty. `uses_constraint_solver`
+/// independently gates the Z3 runtime include because component-scope
+/// randomize sites are not members of that table.
 pub(super) fn preamble(
     out: &mut String,
     dut_type: &str,
     test_names: &[String],
     problem_table_cpp: &str,
+    uses_constraint_solver: bool,
     has_probes: bool,
     cosim: Option<&crate::codegen::cpp_tb::CosimOpts>,
 ) {
@@ -82,7 +84,7 @@ using HarcTraceC = VerilatedFstC;
     // problem table, emitted only when a randomize site exists (v1's
     // `uses_constraint_solver` gate). Without a site, the generated TB
     // never links Z3 — same as v1.
-    if !problem_table_cpp.is_empty() {
+    if uses_constraint_solver {
         writeln!(
             out,
             "#include \"harc_z3_rt.h\"   // randomize(t) with <constraints>"

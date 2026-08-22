@@ -449,11 +449,10 @@ pub(crate) fn lower_transactor(
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        // A method body could host `randomize`, but the constraint-IR
-        // problem table only catalogs test/tseq sites — so these stay
-        // empty and a method-body `randomize` lowers with no problem-id
-        // (the nullptr-descriptor fallback, matching v1).
-        txn_keeps: HashMap::new(),
+        // A method body could host `randomize`. The constraint-IR problem
+        // table only catalogs test/tseq sites, so it has no problem-id,
+        // but declared record keeps still belong to the fallback site.
+        record_keeps: record_ctx.record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
@@ -887,9 +886,10 @@ fn lower_bound_target_transactor(
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        // Responder bodies are not cataloged in the constraint-IR
-        // problem table; a `randomize` here lowers with no problem-id.
-        txn_keeps: HashMap::new(),
+        // Responder bodies are not cataloged in the constraint-IR problem
+        // table; a `randomize` here has no problem-id but still merges the
+        // record's declared keeps.
+        record_keeps: record_ctx.record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
@@ -1471,7 +1471,7 @@ fn lower_bound_initiator_transactor(
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        txn_keeps: HashMap::new(),
+        record_keeps: record_ctx.record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.

@@ -1,14 +1,13 @@
-//! `transaction` declaration lowering → `RecordSchema`.
+//! `transaction` / `struct` declaration lowering → `RecordSchema`.
 //!
-//! Only the *structural* shape lowers: scalar fields with names,
-//! types, and literal defaults, in declaration order — the shape v1's
-//! `emit_record_struct` emits as a C++ value-record. Constraint
-//! metadata (`keep` clauses, `with [...]` field attributes, the `!`
-//! non-random prefix) is carried as inert, pretty-printed source text
-//! for dump-ir; the constraint-IR layer (`src/constraints`)
-//! re-elaborates constraints from the AST when `randomize` lands, so
-//! nothing downstream may interpret these strings (see the
-//! `RecordSchema` doc in `src/ir/mod.rs`).
+//! The value shape lowers as scalar fields with names, types, and literal
+//! defaults, in declaration order — the shape v1's `emit_record_struct`
+//! emits as a C++ value-record. Constraint metadata (`keep` clauses,
+//! `with [...]` field attributes, the `!` non-random prefix) is carried
+//! as inert, pretty-printed source text for dump-ir; the constraint-IR
+//! layer (`src/constraints`) re-elaborates constraints from the AST when
+//! `randomize` lands, so nothing downstream may interpret these strings
+//! (see the `RecordSchema` doc in `src/ir/mod.rs`).
 //!
 //! A field whose type names another transaction/struct lowers to a
 //! native nested record (`IrType::Record(rid)`, v1 parity) — copy,
@@ -314,6 +313,7 @@ pub(crate) fn lower_struct(
 ) -> Result<RecordSchema, LowerError> {
     let sname = &s.name.name;
     let mut fields: Vec<RecordFieldSchema> = Vec::new();
+    let mut keeps: Vec<String> = Vec::new();
     // The parser builds `s.fields` as a filtered copy of the `Field`
     // items in `s.body` (it shares the transaction body grammar), so
     // lower from `s.fields` only — exactly v1's `emit_struct_record`,
@@ -334,19 +334,8 @@ pub(crate) fn lower_struct(
     for item in &s.body {
         match item {
             TxnBodyItem::Field(_) => {}
-            TxnBodyItem::Keep(_) => {
-                // A real escape hatch. The absence of a randomize
-                // METADATA entry for a struct — which is what the first
-                // pass measured — says nothing about the solver: with
-                // `randomize(r)` in the run body v1 emits
-                // `_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)))`
-                // directly into the generated solver lambda, right
-                // under the field's own width bound.
-                return Err(unsupported(
-                    &format!("`keep` constraints in struct `{sname}`"),
-                    "only the structural (field) subset of a struct lowers; v1 emits the \
-                     constraint into the solver",
-                ));
+            TxnBodyItem::Keep(k) => {
+                keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
                 // Measured: v1's `struct Rec` is BYTE-IDENTICAL to the
@@ -367,9 +356,8 @@ pub(crate) fn lower_struct(
     }
     Ok(RecordSchema {
         name: sname.clone(),
-        // Structs carry no constraint metadata in this subset.
         fields,
-        keeps: Vec::new(),
+        keeps,
     })
 }
 

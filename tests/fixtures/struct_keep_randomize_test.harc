@@ -1,0 +1,39 @@
+// Struct-level keeps use the same typed solver path as transaction keeps.
+// The result range is deliberately narrow so both backends prove the keep
+// was applied rather than merely accepting the declaration.
+
+struct StructKeepLeaf
+    value : uint<8>
+    keep value >= 200
+    keep value <= 205
+end struct StructKeepLeaf
+
+// Randomizing the outer record must recursively import and prefix the leaf's
+// keeps as `inner.value ...`, exactly like v1.
+struct StructKeepValue
+    inner : StructKeepLeaf
+end struct StructKeepValue
+
+// Declaration lowering uses the same keep map in component methods. This
+// source is intentionally uninstantiated; both emitters still lower and
+// compile its method body, which protects the non-test/tseq context.
+transactor StructKeepSource
+    observed : out event<uint<8>>
+
+    hookable publish()
+        let item : StructKeepValue
+        randomize(item)
+        emit observed(item.inner.value)
+    end publish
+end transactor StructKeepSource
+
+test StructKeepRandomizeTest
+    let dut : Top
+    run
+        let item : StructKeepValue
+        randomize(item)
+        assert item.inner.value >= 200 else fail("struct keep lower bound ${item.inner.value}")
+        assert item.inner.value <= 205 else fail("struct keep upper bound ${item.inner.value}")
+        log(info, "nested struct keep randomized ${item.inner.value}")
+    end run
+end test StructKeepRandomizeTest
