@@ -1,0 +1,31 @@
+// Persistent scoreboard list declarations are host-side dynamic storage.
+// HARC list fields expose read-only size/empty queries, but not queue push/pop.
+// This proves both supported element layouts are materialized and their safe
+// queries survive the complete v1/TBIR compile-and-run pipeline.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+scoreboard ListState
+    bytes : list<uint<8>>
+    lanes : list<Vec<uint<8>, 2>>
+end scoreboard ListState
+
+testbench Tb
+    dut : Top
+    state : ListState
+end testbench Tb
+
+impl scoreboard_list_state_test for Tb
+    clock clk = SysDomain
+
+    run
+        assert state.bytes.empty()
+        assert state.bytes.size() == 0
+        assert state.lanes.empty()
+        assert state.lanes.size() == 0
+        wait 2 cycles
+        log(info, "scoreboard list state ready")
+    end run
+end impl scoreboard_list_state_test

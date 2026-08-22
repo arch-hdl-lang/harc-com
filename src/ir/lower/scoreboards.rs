@@ -1,11 +1,11 @@
 //! `scoreboard` declaration lowering → `ScoreboardSchema`.
 //!
 //! A scoreboard in the v0 subset is a *data-only* host-state record: a
-//! testbench field holding scalar counters, value-records, and typed FIFO queues. v1's
-//! `emit_scoreboard` is the behavior reference — it emits a C++ struct
+//! testbench field holding scalar counters, value-records, dynamic lists, and
+//! typed FIFO queues. v1's `emit_scoreboard` is the behavior reference — it emits a C++ struct
 //! whose scalar fields are `uint64_t`/`int64_t`/`bool` members (with
-//! their declared defaults) and whose `queue<T>` fields are
-//! `harc_rt::HarcQueue<T>` members. The test body manipulates them
+//! their declared defaults), whose `list<T>` fields are `std::vector<T>`
+//! members, and whose `queue<T>` fields are `harc_rt::HarcQueue<T>` members. The test body manipulates them
 //! through `Stmt::ScoreboardOp` (push/pop/value-write) and
 //! `Expr::ScoreboardQuery` (size/empty/value-read).
 //!
@@ -154,6 +154,12 @@ pub(crate) fn lower_scoreboard(
                                      v1 emits `Record field = 0`, which has no such conversion",
                                     V1Status::EmitsUncompilable,
                                 ),
+                                ScoreboardFieldKind::List { .. } => not_implemented(
+                                    &format!("a default on scoreboard list field `{sb}.{fname}`"),
+                                    "lists default-construct empty; v1 emits `std::vector<T> l = 0`, \
+                                     which has no such constructor",
+                                    V1Status::EmitsUncompilable,
+                                ),
                                 _ => not_implemented(
                                     &format!("a default on scoreboard queue field `{sb}.{fname}`"),
                                     "queues default-construct empty; v1 emits \
@@ -292,7 +298,7 @@ pub(crate) fn lower_scoreboard(
             _ => {
                 return Err(unsupported(
                     &format!("an unsupported item in scoreboard `{sb}`"),
-                    "only scalar, record, and queue fields are lowered",
+                    "only scalar, record, list, and queue fields are lowered",
                 ));
             }
         }
@@ -317,6 +323,92 @@ fn scoreboard_field_kind(
     record_ids: &HashMap<String, RecordId>,
     declared_records: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
+    if let TypeExpr::Named { name, generics, .. } = t {
+        if matches!(
+            name.segments.last().map(|s| s.name.as_str()),
+            Some("list" | "List")
+        ) {
+            let elem_ty = match generics.first() {
+                Some(TypeArg::Type(ty)) => ty,
+                // v1 cannot recover a type from this generic shape and emits
+                // `std::vector<uint64_t>`, silently flattening it.
+                _ => {
+                    return Err(not_implemented(
+                        &format!(
+                            "scoreboard list field `{sb}.{fname}` with an unsupported element type"
+                        ),
+                        "v1 flattens this list element to an unsigned scalar, so its stored \
+                         values do not preserve the declared element type",
+                        V1Status::SilentlyMisLowers,
+                    ));
+                }
+            };
+            let classify_list_gap = |what: String| {
+                if !scoreboard_list_value_type_is_preserved(elem_ty) {
+                    not_implemented(
+                        &what,
+                        "v1 changes or flattens this list element's C++ storage, so values do \
+                         not preserve the declared element type",
+                        V1Status::SilentlyMisLowers,
+                    )
+                } else {
+                    scoreboard_subset_gap(
+                        &what,
+                        "only scalar list elements and one-dimensional `Vec<scalar, N>` elements are lowered",
+                    )
+                }
+            };
+            let unsupported_elem = || {
+                classify_list_gap(format!(
+                    "scoreboard list field `{sb}.{fname}` with an unsupported element type"
+                ))
+            };
+            let (elem, vec_len) = match elem_ty {
+                TypeExpr::Builtin {
+                    name: BuiltinTy::Vec,
+                    args,
+                    ..
+                } => {
+                    let elem = match args.first() {
+                        Some(TypeArg::Type(ty)) => scoreboard_list_scalar_ir_type(ty),
+                        _ => None,
+                    }
+                    .ok_or_else(&unsupported_elem)?;
+                    let len = match args.get(1) {
+                        Some(TypeArg::Expr(e)) => match &*e.kind {
+                            ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                    .filter(|n| *n != 0)
+                    .ok_or_else(|| {
+                        let what = format!(
+                            "scoreboard list field `{sb}.{fname}` with an invalid fixed-vector length"
+                        );
+                        if scoreboard_list_value_type_is_preserved(elem_ty) {
+                            scoreboard_subset_gap(
+                                &what,
+                                "use a nonzero decimal compile-time literal for the fixed-vector length",
+                            )
+                        } else {
+                            not_implemented(
+                                &what,
+                                "v1 changes or flattens this list element's C++ storage, so values do not preserve the declared element type",
+                                V1Status::SilentlyMisLowers,
+                            )
+                        }
+                    })?;
+                    (elem, Some(len))
+                }
+                other => {
+                    let elem = scoreboard_list_scalar_ir_type(other).ok_or_else(unsupported_elem)?;
+                    (elem, None)
+                }
+            };
+            return Ok(ScoreboardFieldKind::List { elem, vec_len });
+        }
+    }
     if let TypeExpr::Builtin {
         name: BuiltinTy::Queue,
         args,
@@ -343,7 +435,7 @@ fn scoreboard_field_kind(
         // supported set differs (a `queue<T>` IS a scoreboard field)
         // even though the rule does not:
         //
-        //   list<uint<8>>  ->  std::vector<uint64_t> l;   a real hatch
+        //   list<uint<8>>  ->  std::vector<uint64_t> l;   lowered above
         //   string         ->  int64_t s;                 uninitialized
         //   event<uint<8>> ->  uint64_t e;                uninitialized
         //
@@ -359,7 +451,7 @@ fn scoreboard_field_kind(
         // `std::vector<std::array<uint64_t, 2>> l;` and compiles, while
         // the same leaf in a transaction does not.
         const SUBSET: &str = "only unsigned scalar fields through 1024 bits, signed scalar \
-                              fields up to 64 bits, bool fields, and \
+                              fields up to 64 bits, bool fields, supported `list<T>`, and \
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
@@ -374,7 +466,7 @@ fn scoreboard_field_kind(
                 V1Status::SilentlyMisLowers,
             );
         }
-        unsupported(&what, SUBSET)
+        scoreboard_subset_gap(&what, SUBSET)
     })?;
     Ok(ScoreboardFieldKind::Scalar {
         ty,
@@ -411,6 +503,48 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
         _ => None,
     }
+}
+
+/// Scalar element shapes that v1 preserves inside `std::vector<T>`. Keep
+/// language `int` out: v1 renders `list<int>` unsigned and the measured gap
+/// table classifies that spelling as a silent mis-lowering.
+fn scoreboard_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    let TypeExpr::Builtin { name, .. } = t else {
+        return None;
+    };
+    matches!(
+        name,
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::Bits
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+            | BuiltinTy::Bool
+            | BuiltinTy::BoolLower
+            | BuiltinTy::Bit
+    )
+    .then(|| scalar_ir_type(t))
+    .flatten()
+}
+
+/// Whether v1's declaration-only scoreboard member preserves this value type.
+/// This differs from `record_leaf_fate`, which also accounts for the
+/// transaction randomize body that scoreboards never emit. Nested fixed
+/// vectors are a real v1 escape hatch even though this TBIR batch models one
+/// vector layer; `int` and other flattened leaves are not.
+fn scoreboard_list_value_type_is_preserved(t: &TypeExpr) -> bool {
+    if scoreboard_list_scalar_ir_type(t).is_some() {
+        return true;
+    }
+    crate::codegen::cpp_tb::fixed_vec_type_args(t)
+        .is_some_and(|(elem, _)| scoreboard_list_value_type_is_preserved(elem))
+}
+
+/// Keep all scoreboard field-shape migration gaps on the existing shared
+/// Unsupported constructor. Source-shape branches call this classifier rather
+/// than multiplying raw inventory sites.
+fn scoreboard_subset_gap(what: &str, detail: impl Into<String>) -> LowerError {
+    unsupported(what, detail)
 }
 
 /// A scoreboard field's `default` — same rule as the component form

@@ -3137,6 +3137,7 @@ impl FuncBuilder<'_> {
         // The second is why this is not `Invalid`: v1 runs that program,
         // just not the one that was written. Worst-under-arm, and a
         // silent write to the DUT is the worst thing here.
+        self.reject_scoreboard_list_index(target, "write")?;
         self.reject_indexed_component_record_path(target, "a write through")?;
         Err(not_implemented(
             "assignment to a target that is neither a DUT port nor a local",
@@ -3205,6 +3206,10 @@ impl FuncBuilder<'_> {
         else {
             return None;
         };
+        let mut target = target;
+        while let ExprKind::Paren(inner) = &*target.kind {
+            target = inner;
+        }
         let ExprKind::Field {
             target: sb_t,
             name: queue,
@@ -3293,6 +3298,10 @@ impl FuncBuilder<'_> {
         &self,
         e: &crate::ast::Expr,
     ) -> Option<(crate::ir::ScoreboardId, String, Option<Vec<String>>)> {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &*e.kind {
+            e = inner;
+        }
         // Testbench-field form first (single-segment, possibly `_tb`-
         // prefixed): keeps the established `_tb.<field>` emission.
         match &*e.kind {
@@ -3348,6 +3357,60 @@ impl FuncBuilder<'_> {
         let &head_cid = self.ctx.component_fields.get(&path[0])?;
         let (sid, nested) = self.resolve_scoreboard_sub(head_cid, &path[1..], path[0].clone())?;
         Some((sid, path.last().unwrap().clone(), Some(nested)))
+    }
+
+    /// Reject direct indexing of persistent scoreboard list storage with an
+    /// honest v1 classification. v1 emits `std::vector::operator[]`, but a
+    /// scoreboard list starts empty and HARC exposes no operation that can
+    /// populate or resize it, so that apparent fallback is an unchecked
+    /// out-of-bounds access rather than a usable implementation.
+    pub(crate) fn reject_scoreboard_list_index(
+        &self,
+        e: &crate::ast::Expr,
+        action: &str,
+    ) -> Result<(), LowerError> {
+        let mut root = e;
+        let mut saw_index = false;
+        loop {
+            match &*root.kind {
+                ExprKind::Index { target, .. } => {
+                    saw_index = true;
+                    root = target;
+                }
+                ExprKind::Paren(inner) => root = inner,
+                _ => break,
+            }
+        }
+        if !saw_index {
+            return Ok(());
+        }
+        let ExprKind::Field {
+            target: sb_target,
+            name,
+        } = &*root.kind
+        else {
+            return Ok(());
+        };
+        let Some((sb, _, _)) = self.scoreboard_root(sb_target) else {
+            return Ok(());
+        };
+        let schema = &self.ctx.scoreboards[sb.index()];
+        if !matches!(
+            schema.field(&name.name).map(|f| &f.kind),
+            Some(crate::ir::ScoreboardFieldKind::List { .. })
+        ) {
+            return Ok(());
+        }
+        Err(not_implemented(
+            &format!(
+                "indexed {action} of scoreboard list `{}.{}`",
+                schema.name, name.name
+            ),
+            "scoreboard lists start empty and expose no populate or resize operation; v1 emits \
+             unchecked `std::vector::operator[]`, so the access is out of bounds rather than a \
+             safe fallback",
+            V1Status::SilentlyMisLowers,
+        ))
     }
 
     /// Walk a sub-component path from an env head down to a data-only
@@ -3425,9 +3488,9 @@ impl FuncBuilder<'_> {
             Some(f) => match &f.kind {
                 crate::ir::ScoreboardFieldKind::Scalar { .. }
                 | crate::ir::ScoreboardFieldKind::Record { .. } => Ok(field.to_string()),
-                crate::ir::ScoreboardFieldKind::Queue { .. } => Err(LowerError::Invalid(format!(
-                    "scoreboard `{}` field `{field}` is a queue, not a scalar — assign via \
-                     `push`/`pop`",
+                crate::ir::ScoreboardFieldKind::Queue { .. }
+                | crate::ir::ScoreboardFieldKind::List { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a container, not a scalar",
                     schema.name
                 ))),
             },
@@ -3482,6 +3545,10 @@ impl FuncBuilder<'_> {
                     "scoreboard `{}` field `{field}` is a record, not a queue",
                     schema.name
                 ))),
+                crate::ir::ScoreboardFieldKind::List { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a list, not a queue",
+                    schema.name
+                ))),
             },
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
@@ -3509,7 +3576,40 @@ impl FuncBuilder<'_> {
                     "scoreboard `{}` field `{field}` is a record, not a queue",
                     schema.name
                 ))),
+                crate::ir::ScoreboardFieldKind::List { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a list, not a queue",
+                    schema.name
+                ))),
             },
+            None => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
+    }
+
+    /// Validate a read-only `.size()` / `.empty()` receiver. Both queue and
+    /// list storage provide these operations with the same IR representation.
+    pub(crate) fn scoreboard_container_field(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<(), LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(f)
+                if matches!(
+                    f.kind,
+                    crate::ir::ScoreboardFieldKind::Queue { .. }
+                        | crate::ir::ScoreboardFieldKind::List { .. }
+                ) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` field `{field}` is not a queue or list",
+                schema.name
+            ))),
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
                 schema.name

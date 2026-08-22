@@ -12022,20 +12022,167 @@ end impl T"#
     // differently, and that difference is measured, not assumed. A
     // scoreboard emits no randomize body, so the leaf whose randomize
     // body is what stops compiling keeps a correct member here.
-    for (ty, shape) in [
-        ("list<uint<8>>", "std::vector<uint64_t> l;"),
+    for (ty, v1_shape, tbir_shape) in [
+        (
+            "list<uint<8>>",
+            "std::vector<uint64_t> l;",
+            "std::vector<uint64_t> l{};",
+        ),
         (
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
+            "std::vector<std::array<uint64_t, 2>> l{};",
         ),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
-        assert_unsupported(&lower_src(&src).unwrap_err());
+        let lowered = lower_src(&src).expect("a scoreboard list field lowers");
+        verify::verify_program(&lowered).expect("scoreboard list schema verifies");
+        let emitted = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("TBIR emits scoreboard list storage");
+        assert!(
+            emitted.contains(tbir_shape),
+            "`{ty}`: TBIR emits `{tbir_shape}` in:\n{emitted}"
+        );
         assert!(
             cpp_tb::emit(&merged_src(&src))
                 .expect("v1 emits")
-                .contains(shape),
-            "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
+                .contains(v1_shape),
+            "`{ty}`: v1 emits `{v1_shape}`, which is the retirement oracle"
+        );
+    }
+    // Lists share the safe read-only size/empty surface with queues. They
+    // start empty in both backends, so these queries are useful even though
+    // list mutation is not yet supported.
+    let list_queries = prog("scoreboard Sb\n    l : list<uint<8>>\nend scoreboard Sb").replace(
+        "        wait 1 cycle",
+        "        assert sb.l.empty()\n        assert sb.l.size() == 0\n        assert (sb.l).empty()\n        assert (sb).l.size() == 0\n        wait 1 cycle",
+    );
+    let list_query_prog = lower_src(&list_queries).expect("list queries lower");
+    verify::verify_program(&list_query_prog).expect("list queries verify");
+    let list_query_cpp = tbir::emit(
+        &list_query_prog,
+        &merged_src(&list_queries),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("TBIR emits list queries");
+    assert!(list_query_cpp.contains("_tb.sb.l.empty()"), "{list_query_cpp}");
+    assert!(
+        list_query_cpp.contains("((uint64_t)_tb.sb.l.size())"),
+        "{list_query_cpp}"
+    );
+    let mut bad_list_query = list_query_prog.clone();
+    bad_list_query.scoreboards[0].fields[0].kind = ir::ScoreboardFieldKind::Scalar {
+        ty: ir::IrType::UInt(Some(8)),
+        default: ir::ScoreboardScalarDefault::Narrow(0),
+    };
+    assert!(
+        verify::verify_program(&bad_list_query).is_err(),
+        "query metadata must still name a queue or list after IR mutation"
+    );
+
+    // Direct indexing is not a usable v1 escape hatch: scoreboard lists
+    // have no populate/resize operation and default empty, while v1 emits
+    // unchecked std::vector::operator[]. Keep that distinct from the generic
+    // scalar-index and assignment fallbacks.
+    for (action, ty, body) in [
+        ("read", "list<uint<8>>", "        let x : uint<8> = sb.l[0]"),
+        ("write", "list<uint<8>>", "        sb.l[0] = 1"),
+        (
+            "read",
+            "list<uint<8>>",
+            "        let x : uint<8> = (sb.l)[0]",
+        ),
+        ("write", "list<uint<8>>", "        (sb.l)[0] = 1"),
+        ("write", "list<uint<8>>", "        (sb.l[0]) = 1"),
+        (
+            "read",
+            "list<Vec<uint<8>, 2>>",
+            "        let x : uint<8> = sb.l[0][1]",
+        ),
+        (
+            "write",
+            "list<Vec<uint<8>, 2>>",
+            "        sb.l[0][1] = 1",
+        ),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"))
+            .replace("        wait 1 cycle", body);
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains(&format!("indexed {action}")), "{msg}");
+        assert!(msg.contains("out of bounds"), "{msg}");
+        let v1_cpp = cpp_tb::emit(&merged_src(&src)).expect("v1 emits unchecked list indexing");
+        assert!(
+            v1_cpp.contains("_tb.sb.l") && v1_cpp.contains("[0]"),
+            "v1 classification control for indexed {action}: {v1_cpp}"
+        );
+    }
+    for pop in ["sb.l.pop()", "(sb.l).pop()", "(sb).l.pop()"] {
+        let nested_list_pop = prog("scoreboard Sb\n    l : list<uint<8>>\nend scoreboard Sb")
+            .replace("        wait 1 cycle", &format!("        assert {pop} == 0"));
+        let err = lower_src(&nested_list_pop).unwrap_err();
+        assert!(matches!(err, lower::LowerError::Invalid(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("is a list, not a queue"), "{msg}");
+        assert!(!msg.contains("re-run with `--codegen v1`"), "{msg}");
+    }
+    let bad_list = prog("scoreboard Sb\n    l : list<int>\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&bad_list).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let record_list = prog("scoreboard Sb\n    l : list<Inner>\nend scoreboard Sb");
+    let msg = assert_not_implemented(
+        &lower_src(&record_list).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("unsupported element type"), "{msg}");
+    let symbolic_vec_list = prog(
+        "scoreboard Sb\n    l : list<Vec<uint<8>, N>>\nend scoreboard Sb",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&symbolic_vec_list).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("invalid fixed-vector length"), "{msg}");
+    let flattened_vec_list = prog(
+        "scoreboard Sb\n    l : list<Vec<int, 2>>\nend scoreboard Sb",
+    );
+    assert_not_implemented(
+        &lower_src(&flattened_vec_list).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    let nested_vec_list = prog(
+        "scoreboard Sb\n    l : list<Vec<Vec<uint<8>, 2>, 3>>\nend scoreboard Sb",
+    );
+    assert_unsupported(&lower_src(&nested_vec_list).unwrap_err());
+    let defaulted_list = prog("scoreboard Sb\n    l : list<uint<8>> default 0\nend scoreboard Sb");
+    assert_not_implemented(
+        &lower_src(&defaulted_list).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+
+    // The verifier owns the list element/layout contract rather than
+    // trusting lowering forever. Corrupt both independent pieces of metadata.
+    let list_src = prog("scoreboard Sb\n    l : list<Vec<uint<8>, 2>>\nend scoreboard Sb");
+    let list_prog = lower_src(&list_src).expect("list control lowers");
+    for corrupt in ["element", "length"] {
+        let mut broken = list_prog.clone();
+        let ir::ScoreboardFieldKind::List { elem, vec_len } =
+            &mut broken.scoreboards[0].fields[0].kind
+        else {
+            panic!("control field is a list")
+        };
+        match corrupt {
+            "element" => *elem = ir::IrType::Record(ir::RecordId(u32::MAX)),
+            "length" => *vec_len = Some(0),
+            _ => unreachable!(),
+        }
+        assert!(
+            verify::verify_program(&broken).is_err(),
+            "corrupt list {corrupt} must be rejected"
         );
     }
     // A record-typed field now uses persistent by-value record storage,
