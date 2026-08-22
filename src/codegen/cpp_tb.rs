@@ -1217,6 +1217,30 @@ fn eval_sv_const_expr(e: &str, params: &std::collections::HashMap<String, i64>) 
     Some(v)
 }
 
+/// Which artifact an [`Emitter`] is currently producing. The legacy
+/// self-contained layout keeps byte-identical output; the common-object
+/// layout flavors activate the glue-object call rewriting and per-run
+/// cell migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flavor {
+    /// Historical self-contained emission (one TU per shard/test).
+    Legacy,
+    /// The shared common TU: runtime + glue member definitions.
+    CommonImpl,
+    /// One stable per-test capsule TU.
+    Capsule,
+}
+
+/// A function-local mutable `static` migrated into the suite runtime's
+/// `_cells` block under the common layout, so two sequential runs in one
+/// process start with fresh state (issue #643, state ownership).
+#[derive(Debug, Clone)]
+pub(crate) struct PerRunCell {
+    pub tag: String,
+    pub ctype: String,
+    pub init: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GeneratedCppFile {
     pub filename: String,
@@ -1255,6 +1279,975 @@ pub fn emit(file: &SourceFile) -> Result<String, EmitError> {
 /// granularity); larger groups bundle `group_size` tests per `shard<N>.cpp`.
 pub fn emit_split_tests(file: &SourceFile, opts: EmitOpts) -> Result<SplitCppOutput, EmitError> {
     emit_split_tests_with_file_prefix(file, opts, "", 1)
+}
+
+
+
+/// Stable 64-bit FNV-1a fingerprint used for interface-ABI and
+/// build-profile hashes (issue #643). Hex-encoded, so it is stable
+/// across processes and platforms.
+pub fn stable_hash_hex(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Output of [`emit_common_split`]: one interface header, one or more
+/// common implementation TUs, one stable capsule per test, an explicit
+/// registry/dispatcher, all in deterministic order.
+#[derive(Debug, Clone)]
+pub struct CommonSplitOutput {
+    pub files: Vec<GeneratedCppFile>,
+    pub test_names: Vec<String>,
+    /// FNV fingerprint of the public generated surface. Any change to
+    /// shared layouts/signatures changes every dependent artifact.
+    pub interface_abi: String,
+    /// Fingerprint of every native-build-affecting option. Runtime
+    /// selectors (test/seed/variant/log path) never enter it.
+    pub build_profile: String,
+}
+
+pub(crate) fn sanitize_file_component(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if out.is_empty() {
+        out.push_str("test");
+    }
+    out
+}
+
+/// Native-build-affecting fingerprint (issue #643 incremental-build
+/// contract): covers toolchain-visible knobs only. Runtime selection,
+/// seed, variant, and log paths must NOT be included — callers pass
+/// exactly the option strings that reach the compiler/linker.
+pub fn build_profile_fingerprint(opts: &EmitOpts, extra: &[String]) -> String {
+    let mut canon = String::new();
+    canon.push_str("harc-cpp-suite-profile-v1\n");
+    canon.push_str(&format!("mt={}\n", opts.mt));
+    let mut extras: Vec<&String> = extra.iter().collect();
+    extras.sort();
+    for e in extras {
+        canon.push_str(e);
+        canon.push('\n');
+    }
+    stable_hash_hex(canon.as_bytes())
+}
+
+#[allow(dead_code)]
+const CPP_SUITE_SCHEMA: u32 = 1;
+
+/// Emit the v1 common-object split layout (issue #643): reusable
+/// runtime/testbench/component/checker/model infrastructure compiles
+/// ONCE into common objects; each test emits a small stable capsule;
+/// an explicit registry + dispatcher produces one ordinary executable
+/// that dispatches tests by name at runtime.
+///
+/// Ownership model: every shared callable becomes a member of the
+/// generated per-run glue object `HarcSuiteGlue`, whose reference
+/// members mirror the historical run-scope names (`dut`, `tick`,
+/// `_checkers`, hook vectors, ...). Callable BODIES therefore compile
+/// verbatim — no capture rewriting — while all mutable state lives on
+/// the per-run `HarcSuiteRuntime`, so two sequential runs in one
+/// process start fresh.
+pub fn emit_common_split(
+    file: &SourceFile,
+    opts: EmitOpts,
+    file_prefix: &str,
+    profile_extra: &[String],
+) -> Result<CommonSplitOutput, EmitError> {
+    let desugared = desugar_impl_for_test_in_file(file);
+    let normalized = normalize_vec_record_elem_fields(&desugared);
+    let prep = prepare_suite(&normalized, &opts)?;
+    let tests: Vec<&TestDecl> = prep.tests.clone();
+
+    // Registry contract: duplicate test names would make selection
+    // ambiguous. The parser may allow them today; common layout fails
+    // closed instead of silently picking one (issue #643 invariant).
+    let mut seen = std::collections::HashSet::new();
+    for t in &tests {
+        if !seen.insert(t.name.name.clone()) {
+            return Err(EmitError(format!(
+                "duplicate test name `{}` — common-object layout requires unique test identities",
+                t.name.name
+            )));
+        }
+    }
+
+    // ── Shared-callable inventory ────────────────────────────────────
+    // Suite functions/tseqs plus every component/transactor method and
+    // watchdog become glue members. Capsule call sites get a `_glue.`
+    // prefix through the emitter's callee table.
+    let mut glue_callees: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in &prep.funcs {
+        glue_callees.insert(f.name.name.clone());
+    }
+    for t in &prep.tseqs {
+        glue_callees.insert(t.name.name.clone());
+    }
+    let hook_regs = collect_hook_registries(prep.file, &prep.component_order);
+    for reg in &hook_regs {
+        if !reg.watchdog {
+            glue_callees.insert(format!("{}_{}", reg.comp_ty, reg.method));
+        } else {
+            glue_callees.insert(format!("{}_watchdog", reg.comp_ty));
+        }
+    }
+
+    // ── Common implementation TU ─────────────────────────────────────
+    let mut e_common = emitter_from_seed(prep.emitter_seed.clone());
+    e_common.flavor = Flavor::CommonImpl;
+    e_common.glue_callees = glue_callees.clone();
+
+    let profile = build_profile_fingerprint(&opts, profile_extra);
+    writeln!(e_common.out, "// Auto-generated by harc — do not edit.").ok();
+    writeln!(e_common.out, "// HARC common-object suite implementation (issue #643).").ok();
+    writeln!(e_common.out, "// harc build-profile: {profile}").ok();
+    writeln!(e_common.out, "").ok();
+    writeln!(e_common.out, "#ifdef __clang__").ok();
+    writeln!(e_common.out, "#pragma clang optimize off").ok();
+    writeln!(e_common.out, "#endif").ok();
+    writeln!(e_common.out, "").ok();
+    writeln!(e_common.out, "#include \"{file_prefix}suite_api.hpp\"").ok();
+    writeln!(e_common.out, "").ok();
+    // Interface-ABI anchor definition. Capsules and the registry take
+    // its address, so a capsule compiled against a different interface
+    // hash fails to LINK instead of running with stale layout
+    // assumptions (issue #643 fail-closed rule).
+    writeln!(e_common.out, "extern const char harc_suite_abi_ANCHOR[];").ok();
+
+    emit_glue_definitions(&mut e_common, &prep)?;
+    emit_shared_callables(&mut e_common, &prep)?;
+
+    let common_cpp = e_common.out;
+
+    // ── Test capsules (one stable source per test) ───────────────────
+    let mut files: Vec<GeneratedCppFile> = Vec::new();
+    let mut all_cells: Vec<PerRunCell> = Vec::new();
+    let mut test_names: Vec<String> = Vec::new();
+    let mut capsule_sources: Vec<(String, String)> = Vec::new(); // (filename, body)
+    for test in &tests {
+        let mut ec = emitter_from_seed(prep.emitter_seed.clone());
+        ec.flavor = Flavor::Capsule;
+        ec.glue_callees = glue_callees.clone();
+        ec.emit_test_run(&prep, test)?;
+        // Merge this capsule's per-run cells into the suite set
+        // (tags are span-derived and unique across the suite).
+        for cell in std::mem::take(&mut ec.per_run_cells) {
+            if !all_cells.iter().any(|c| c.tag == cell.tag) {
+                all_cells.push(cell);
+            }
+        }
+        let stem = sanitize_file_component(&test.name.name);
+        let fname = format!("{file_prefix}test_{stem}.cpp");
+        let mut body = String::new();
+        writeln!(body, "// Auto-generated by harc — do not edit.").ok();
+        writeln!(body, "// HARC test capsule: {}", test.name.name).ok();
+        writeln!(body, "// harc build-profile: {profile}").ok();
+        writeln!(body, "").ok();
+        writeln!(body, "#ifdef __clang__").ok();
+        writeln!(body, "#pragma clang optimize off").ok();
+        writeln!(body, "#endif").ok();
+        writeln!(body, "").ok();
+        writeln!(body, "#include \"{file_prefix}suite_api.hpp\"").ok();
+        writeln!(body, "").ok();
+        writeln!(body, "extern const char harc_suite_abi_ANCHOR[];").ok();
+        writeln!(body, "[[maybe_unused]] static const char* const harc_abi_ref_{stem} = harc_suite_abi_ANCHOR;").ok();
+        writeln!(body, "").ok();
+        body.push_str(ec.out.trim_start_matches('\n'));
+        // Per-test descriptor: explicit registry entry (issue #643 —
+        // no static constructors, no link-order discovery).
+        writeln!(body, "").ok();
+        writeln!(
+            body,
+            "extern \"C\" const HarcTestDescriptor harc_test_{stem} = {{"
+        )
+        .ok();
+        writeln!(body, "{INDENT}\"{}\"," , test.name.name).ok();
+        writeln!(body, "{INDENT}&run_{},", test.name.name).ok();
+        writeln!(body, "}};").ok();
+        capsule_sources.push((fname, body));
+        test_names.push(test.name.name.clone());
+    }
+
+
+    // Merge cells discovered while emitting the COMMON TU too.
+    for cell in std::mem::take(&mut e_common.per_run_cells) {
+        if !all_cells.iter().any(|c| c.tag == cell.tag) {
+            all_cells.push(cell);
+        }
+    }
+
+    // ── Registry / dispatcher TU ─────────────────────────────────────
+    let mut reg = String::new();
+    writeln!(reg, "// Auto-generated by harc — do not edit.").ok();
+    writeln!(reg, "// HARC common-object suite registry + dispatcher (issue #643).").ok();
+    writeln!(reg, "// harc build-profile: {profile}").ok();
+    writeln!(reg, "").ok();
+    writeln!(reg, "#include <cstring>").ok();
+    writeln!(reg, "#include <string>").ok();
+    writeln!(reg, "#include <vector>").ok();
+    writeln!(reg, "").ok();
+    writeln!(reg, "#include \"{file_prefix}suite_api.hpp\"").ok();
+    writeln!(reg, "").ok();
+    writeln!(reg, "extern const char harc_suite_abi_ANCHOR[];").ok();
+    for t in &test_names {
+        let stem = sanitize_file_component(t);
+        writeln!(reg, "extern \"C\" const HarcTestDescriptor harc_test_{stem};").ok();
+    }
+    writeln!(reg, "").ok();
+    writeln!(
+        reg,
+        "static const HarcTestDescriptor* const harc_suite_tests[] = {{"
+    )
+    .ok();
+    for t in &test_names {
+        let stem = sanitize_file_component(t);
+        writeln!(reg, "{INDENT}&harc_test_{stem},").ok();
+    }
+    writeln!(reg, "}};").ok();
+    writeln!(reg, "").ok();
+    writeln!(reg, "[[maybe_unused]] static const char* const harc_abi_ref_registry = harc_suite_abi_ANCHOR;").ok();
+    writeln!(reg, "").ok();
+    writeln!(reg, "int main(int argc, char** argv) {{").ok();
+    writeln!(
+        reg,
+        "{INDENT}const char* test_sel = harc_rt::log::harc_select_test(argc, argv);"
+    )
+    .ok();
+    writeln!(
+        reg,
+        "{INDENT}constexpr size_t harc_suite_test_count = sizeof(harc_suite_tests) / sizeof(harc_suite_tests[0]);"
+    )
+    .ok();
+    writeln!(reg, "{INDENT}if (!test_sel) return harc_suite_tests[0]->run(argc, argv);").ok();
+    writeln!(
+        reg,
+        "{INDENT}for (size_t _i = 0; _i < harc_suite_test_count; ++_i) {{"
+    )
+    .ok();
+    writeln!(
+        reg,
+        "{INDENT}{INDENT}if (std::strcmp(test_sel, harc_suite_tests[_i]->name) == 0) {{"
+    )
+    .ok();
+    writeln!(
+        reg,
+        "{INDENT}{INDENT}{INDENT}return harc_suite_tests[_i]->run(argc, argv);"
+    )
+    .ok();
+    writeln!(reg, "{INDENT}{INDENT}}}").ok();
+    writeln!(reg, "{INDENT}}}").ok();
+    writeln!(reg, "{INDENT}std::string avail;").ok();
+    writeln!(
+        reg,
+        "{INDENT}for (size_t _i = 0; _i < harc_suite_test_count; ++_i) {{"
+    )
+    .ok();
+    writeln!(
+        reg,
+        "{INDENT}{INDENT}if (_i) avail += \", \";"
+    )
+    .ok();
+    writeln!(reg, "{INDENT}{INDENT}avail += harc_suite_tests[_i]->name;").ok();
+    writeln!(reg, "{INDENT}}}").ok();
+    writeln!(
+        reg,
+        "{INDENT}harc_rt::log::harc_report_unknown_test(test_sel, avail.c_str());"
+    )
+    .ok();
+    writeln!(reg, "{INDENT}return 1;").ok();
+    writeln!(reg, "}}").ok();
+    writeln!(reg, "").ok();
+
+    // ── Interface header (rendered last: owns the complete cell set,
+    //    hook registries, and shared-callable prototypes) ─────────────
+    let mut eh = emitter_from_seed(prep.emitter_seed.clone());
+    eh.flavor = Flavor::CommonImpl;
+    eh.glue_callees = glue_callees;
+    let mut header = String::new();
+    writeln!(header, "// Auto-generated by harc — do not edit.").ok();
+    writeln!(header, "// HARC common-object suite interface (issue #643).").ok();
+    writeln!(
+        header,
+        "// One binary runs every test: common infra compiled once,"
+    )
+    .ok();
+    writeln!(header, "// per-test capsules carry scenario-only code.").ok();
+    writeln!(header, "").ok();
+    writeln!(header, "#pragma once").ok();
+    writeln!(header, "").ok();
+    // TU-scope helper dispatch: record randomize functions are static
+    // header members visible from every TU and take no explicit
+    // context, so they read the RNG through the active run pointer.
+    // Infrastructure indirection only — all mutable simulation state
+    // lives on the pointed-to per-run HarcSuiteRuntime, and each run
+    // republishes the pointer before any randomize can execute
+    // (issue #643 state ownership). Declared before the type surface
+    // because `randomize_<Record>` helpers are emitted by it.
+    writeln!(header, "#include <cstdint>").ok();
+    writeln!(header, "struct HarcSuiteRuntime;").ok();
+    writeln!(
+        header,
+        "inline thread_local HarcSuiteRuntime* harc_rt_current_run = nullptr;"
+    )
+    .ok();
+    writeln!(header, "static inline uint64_t harc_rng_next();").ok();
+    writeln!(header, "").ok();
+    // Reuse the exact legacy type surface so both layouts describe
+    // identical records/components/RAL/covergroup types.
+    std::mem::swap(&mut eh.out, &mut header);
+    eh.emit_file_scope_scaffolding(&prep)?;
+    std::mem::swap(&mut eh.out, &mut header);
+    // Scaffolding registers no per-run cells today; merge anyway so a
+    // future cell registered during type emission cannot be dropped.
+    for cell in std::mem::take(&mut eh.per_run_cells) {
+        if !all_cells.iter().any(|c| c.tag == cell.tag) {
+            all_cells.push(cell);
+        }
+    }
+    emit_runtime_decls(&mut header, &prep, &all_cells, &hook_regs)?;
+    let iface_start = header
+        .find("// === iface-begin ===")
+        .map(|i| i + "// === iface-begin ===".len())
+        .unwrap_or(0);
+    let iface_end = header.find("// === iface-end ===").unwrap_or(header.len());
+    let iface_abi = stable_hash_hex(header[iface_start..iface_end].as_bytes());
+    let anchor = format!("harc_suite_abi_{iface_abi}");
+    let header = header.replace(
+        "extern const char harc_suite_abi_ANCHOR[];",
+        &format!("extern const char {anchor}[];"),
+    );
+    let common_cpp = common_cpp.replace(
+        "extern const char harc_suite_abi_ANCHOR[];",
+        &format!("extern const char {anchor}[];\nconst char {anchor}[] = \"{}\";", iface_abi),
+    );
+    let mut fixed_capsules = Vec::with_capacity(capsule_sources.len());
+    for (fname, body) in capsule_sources {
+        fixed_capsules.push((
+            fname,
+            body.replace("extern const char harc_suite_abi_ANCHOR[];", &format!("extern const char {anchor}[];"))
+                .replace("harc_suite_abi_ANCHOR;", &format!("{anchor};")),
+        ));
+    }
+    let reg = reg
+        .replace("extern const char harc_suite_abi_ANCHOR[];", &format!("extern const char {anchor}[];"))
+        .replace("harc_suite_abi_ANCHOR;", &format!("{anchor};"));
+
+    files.push(GeneratedCppFile {
+        filename: format!("{file_prefix}suite_api.hpp"),
+        contents: header,
+    });
+    files.push(GeneratedCppFile {
+        filename: format!("{file_prefix}runtime.cpp"),
+        contents: common_cpp,
+    });
+    for (fname, body) in fixed_capsules {
+        files.push(GeneratedCppFile {
+            filename: fname,
+            contents: body,
+        });
+    }
+    files.push(GeneratedCppFile {
+        filename: format!("{file_prefix}registry.cpp"),
+        contents: reg,
+    });
+
+    Ok(CommonSplitOutput {
+        files,
+        test_names,
+        interface_abi: iface_abi,
+        build_profile: profile,
+    })
+}
+
+
+/// Emit the suite interface declarations appended after the shared type
+/// surface: per-run runtime struct, clock cell, glue object with every
+/// shared-callable prototype, hook registries, mutable-cell storage,
+/// and the test-descriptor contract (issue #643 generated C++
+/// contract). The iface-begin/end markers delimit the exact byte range
+/// hashed into the link-time ABI anchor.
+fn emit_runtime_decls(
+    out: &mut String,
+    prep: &SuitePrep,
+    cells: &[PerRunCell],
+    hooks: &[HookRegistryDesc],
+) -> Result<(), EmitError> {
+    let dut = prep.dut_type;
+    let mut o = std::mem::take(out);
+    writeln!(o, "").ok();
+    writeln!(o, "// === iface-begin ===").ok();
+    writeln!(o, "").ok();
+
+    // ── Contract types ──────────────────────────────────────────────
+    writeln!(o, "struct HarcTestDescriptor {{").ok();
+    writeln!(o, "{INDENT}const char* name;").ok();
+    writeln!(o, "{INDENT}int (*run)(int argc, char** argv);").ok();
+    writeln!(o, "{INDENT}const void* test_metadata;").ok();
+    writeln!(o, "}};").ok();
+    writeln!(o, "").ok();
+
+    // ── Clock cell (multi-clock configuration is capsule-provided) ──
+    writeln!(o, "struct HarcClockCell {{").ok();
+    writeln!(o, "{INDENT}const char* name;").ok();
+    writeln!(o, "{INDENT}long long half_period_ps;").ok();
+    writeln!(o, "{INDENT}long long next_edge_ps;").ok();
+    writeln!(o, "{INDENT}int level;").ok();
+    writeln!(o, "{INDENT}long long rising_count;").ok();
+    writeln!(o, "{INDENT}std::function<void(int)> set_level;").ok();
+    writeln!(o, "}};").ok();
+    writeln!(o, "").ok();
+
+    // ── Per-run runtime owner ───────────────────────────────────────
+    // Deepened `HarcTestContext`: owns DUT + waves + diagnostics +
+    // service registries as before, plus everything that used to be a
+    // mutable file-scope/function-local static: PRNG, unique-history /
+    // property-slot / watchdog / coverage cells, and the hook
+    // registries. One instance per run; two sequential runs in one
+    // process share nothing mutable.
+    writeln!(o, "struct HarcSuiteRuntime {{").ok();
+    writeln!(o, "{INDENT}V{dut}* dut = nullptr;", dut = dut).ok();
+    writeln!(o, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(o, "{INDENT}HarcTraceC* tfp = nullptr;").ok();
+    writeln!(o, "{INDENT}std::string _wave_path;").ok();
+    writeln!(o, "#endif").ok();
+    writeln!(o, "{INDENT}uint64_t _trace_time = 0;").ok();
+    writeln!(o, "{INDENT}int errors = 0;").ok();
+    writeln!(o, "{INDENT}bool _fatal = false;").ok();
+    writeln!(o, "{INDENT}int cycle_count = 0;").ok();
+    writeln!(o, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
+    writeln!(o, "{INDENT}harc_rt::log::HarcLogContext log_ctx;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>> _checkers;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>> _post_eval_services;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>> _auto_cov_reports;").ok();
+    writeln!(o, "{INDENT}harc_rt::random::HarcRng rng;").ok();
+    // Hook registries — one set per generated instance. Names mirror
+    // the historical run-scope variables exactly.
+    for reg in hooks {
+        let v = reg.vector();
+        let arg_csv = if reg.watchdog {
+            String::new()
+        } else {
+            hook_registry_arg_csv(prep, reg)
+        };
+        writeln!(
+            o,
+            "{INDENT}std::vector<std::function<void({args})>> {v};",
+            args = arg_csv
+        )
+        .ok();
+    }
+    if !cells.is_empty() {
+        writeln!(o, "{INDENT}struct {{").ok();
+        for c in cells {
+            match &c.init {
+                Some(init) => {
+                    writeln!(
+                        o,
+                        "{INDENT}{INDENT}{ty} {tag} = {init};",
+                        ty = c.ctype,
+                        tag = c.tag,
+                        init = init
+                    )
+                    .ok();
+                }
+                None => {
+                    writeln!(o, "{INDENT}{INDENT}{ty} {tag};", ty = c.ctype, tag = c.tag).ok();
+                }
+            }
+        }
+        writeln!(o, "{INDENT}}} _cells;").ok();
+    }
+    writeln!(o, "}};").ok();
+    writeln!(o, "").ok();
+
+    // Definition of the TU-scope RNG helper promised before the type
+    // surface; the runtime is complete here.
+    // Non-inline definition is intentional: the earlier `static inline`
+    // declaration pins internal linkage, so each TU gets its own copy
+    // reading ITS thread-local run pointer (no ODR surprises).
+    writeln!(o, "uint64_t harc_rng_next() {{ return harc_rt_current_run->rng.next(); }}").ok();
+    writeln!(o, "").ok();
+
+    // ── Glue object: lexical host for shared callables ───────────────
+    // Reference members recreate the historical run-scope names so the
+    // converted callable bodies compile verbatim; member functions give
+    // `tick`/logging/dump helpers a capture-free home.
+    writeln!(o, "struct HarcSuiteGlue {{").ok();
+    writeln!(o, "{INDENT}HarcSuiteRuntime& ctx;").ok();
+    writeln!(o, "{INDENT}V{dut}*& dut;", dut = dut).ok();
+    writeln!(o, "{INDENT}harc_rt::random::HarcRng& harc_rng;").ok();
+    writeln!(o, "{INDENT}int& cycle_count;").ok();
+    writeln!(o, "{INDENT}int& errors;").ok();
+    writeln!(o, "{INDENT}bool& _fatal;").ok();
+    writeln!(o, "{INDENT}uint64_t& _trace_time;").ok();
+    writeln!(o, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(o, "{INDENT}HarcTraceC*& tfp;").ok();
+    writeln!(o, "{INDENT}std::string& _wave_path;").ok();
+    writeln!(o, "#endif").ok();
+    writeln!(o, "{INDENT}harc_rt::trace::HarcTraceWriter& trace;").ok();
+    writeln!(o, "{INDENT}harc_rt::log::HarcLogContext& log_ctx;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>>& _checkers;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>>& _post_eval_services;").ok();
+    writeln!(o, "{INDENT}std::vector<std::function<void()>>& _auto_cov_reports;").ok();
+    for reg in hooks {
+        let v = reg.vector();
+        let arg_csv = if reg.watchdog {
+            String::new()
+        } else {
+            hook_registry_arg_csv(prep, reg)
+        };
+        writeln!(
+            o,
+            "{INDENT}std::vector<std::function<void({args})>>& {v};",
+            args = arg_csv
+        )
+        .ok();
+    }
+    writeln!(o, "{INDENT}std::vector<HarcClockCell> clocks_;").ok();
+    writeln!(o, "{INDENT}long long now_ps = 0;").ok();
+    writeln!(o, "").ok();
+    writeln!(o, "{INDENT}explicit HarcSuiteGlue(HarcSuiteRuntime& r);").ok();
+    writeln!(
+        o,
+        "{INDENT}HarcSuiteGlue(HarcSuiteRuntime& r, std::vector<HarcClockCell> clocks);"
+    )
+    .ok();
+    writeln!(o, "").ok();
+    writeln!(o, "{INDENT}void init_clocks();").ok();
+    writeln!(o, "{INDENT}uint64_t harc_rng_next();").ok();
+    writeln!(o, "{INDENT}void sim_logf_line(FILE* f, const char* sev, const char* fmt, ...);").ok();
+    writeln!(o, "{INDENT}void sim_log_line(const char* sev, const char* fmt, ...);").ok();
+    writeln!(o, "{INDENT}void _harc_trace_dump_next(const char* clock, uint64_t clock_cycle);").ok();
+    writeln!(o, "{INDENT}void _harc_trace_dump_at(uint64_t t, const char* clock, uint64_t clock_cycle);").ok();
+    writeln!(o, "{INDENT}void eval_clocks_until(long long t_ps);").ok();
+    writeln!(o, "{INDENT}void tick();").ok();
+    writeln!(o, "").ok();
+
+    // Shared-callable prototypes (bodies live in the common TU only).
+    // Emitted in dependency order so capsules and the common TU agree on
+    // declaration order regardless of test set.
+    for f in &prep.funcs {
+        let ret = f
+            .return_ty
+            .as_ref()
+            .map(c_type_for)
+            .unwrap_or_else(|| "void".to_string());
+        write!(o, "{INDENT}{ret} {}(", f.name.name).ok();
+        write_glue_params(&mut o, &f.params);
+        writeln!(o, ");").ok();
+    }
+    for t in &prep.tseqs {
+        let inner = t
+            .return_ty
+            .as_ref()
+            .and_then(tseq_inner_type)
+            .unwrap_or_else(|| "int64_t".to_string());
+        write!(o, "{INDENT}std::vector<{inner}> {}(", t.name.name).ok();
+        write_glue_params(&mut o, &t.params);
+        writeln!(o, ");").ok();
+    }
+    for reg in hooks {
+        // One prototype per callable (see emit_shared_callables).
+        if !reg.watchdog && !reg.pre {
+            continue;
+        }
+        if reg.watchdog {
+            continue;
+        }
+        let args = hook_registry_arg_csv(prep, reg);
+        let ret = hook_registry_ret_ty(prep, reg);
+        writeln!(
+            o,
+            "{INDENT}{ret} {ty}_{m}({ty}& self{csv});",
+            ret = ret,
+            ty = reg.comp_ty,
+            m = reg.method,
+            csv = if args.is_empty() {
+                String::new()
+            } else {
+                format!(", {args}")
+            }
+        )
+        .ok();
+    }
+    for reg in hooks {
+        if !reg.watchdog {
+            continue;
+        }
+        writeln!(
+            o,
+            "{INDENT}void {ty}_watchdog({ty}& self);",
+            ty = reg.comp_ty
+        )
+        .ok();
+    }
+    writeln!(o, "}};").ok();
+    writeln!(o, "").ok();
+    writeln!(o, "// === iface-end ===").ok();
+    // Link-time interface-ABI anchor: capsules and the registry take
+    // its address, so an artifact compiled against a different
+    // interface hash fails to LINK instead of running with stale
+    // layout assumptions (issue #643 fail-closed rule). The symbol
+    // name carries the hash of everything between the markers above.
+    writeln!(o, "").ok();
+    writeln!(o, "extern const char harc_suite_abi_ANCHOR[];").ok();
+    *out = o;
+    Ok(())
+}
+
+
+fn hook_registry_arg_csv(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
+    for &idx in &prep.component_order {
+        match &prep.file.items[idx] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
+                if c.name.name == reg.comp_ty =>
+            {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        if h.name.name == reg.method {
+                            return hook_param_csv(h);
+                        }
+                    }
+                }
+            }
+            Item::Transactor(t) if t.name.name == reg.comp_ty => {
+                let synth = synth_component_from_transactor(t, true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        if h.name.name == reg.method {
+                            return hook_param_csv(&h);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+fn hook_param_csv(h: &HookableMethod) -> String {
+    let names = cpp_param_names(&h.params);
+    let mut parts = Vec::new();
+    for (i, p) in h.params.iter().enumerate() {
+        let pty = p
+            .ty
+            .as_ref()
+            .map(c_type_for)
+            .unwrap_or_else(|| "int64_t".to_string());
+        parts.push(format!("{pty} {}", names[i]));
+    }
+    parts.join(", ")
+}
+
+
+fn hook_registry_ret_ty(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
+    for &idx in &prep.component_order {
+        match &prep.file.items[idx] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
+                if c.name.name == reg.comp_ty =>
+            {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        if h.name.name == reg.method {
+                            return h
+                                .return_ty
+                                .as_ref()
+                                .map(c_type_for)
+                                .unwrap_or_else(|| "void".to_string());
+                        }
+                    }
+                }
+            }
+            Item::Transactor(t) if t.name.name == reg.comp_ty => {
+                let synth = synth_component_from_transactor(t, true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        if h.name.name == reg.method {
+                            return h
+                                .return_ty
+                                .as_ref()
+                                .map(c_type_for)
+                                .unwrap_or_else(|| "void".to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    "void".to_string()
+}
+
+fn write_glue_params(out: &mut String, params: &[crate::ast::Param]) {
+    let names = cpp_param_names(params);
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            write!(out, ", ").ok();
+        }
+        let pty = p
+            .ty
+            .as_ref()
+            .map(c_type_for)
+            .unwrap_or_else(|| "int64_t".to_string());
+        write!(out, "{pty} {}", names[i]).ok();
+    }
+}
+
+/// Emit the glue object's runtime-member definitions into the common
+/// TU: constructors binding the historical run-scope names as
+/// references, clock initialization, RNG/logging/dump helpers, and the
+/// clock-advance state machine + `tick()` (issue #643).
+fn emit_glue_definitions(e: &mut Emitter, prep: &SuitePrep) -> Result<(), EmitError> {
+    let _dut = prep.dut_type; // DUT type appears only in the header decl
+    let hooks = collect_hook_registries(prep.file, &prep.component_order);
+    let o = &mut e.out;
+    // Reference bindings mirror the legacy prologue aliases exactly.
+    // Per-hook registries are reference members too — C++ requires
+    // them in every initializer list.
+    let mut init_list = String::from(
+        ": ctx(r), dut(r.dut), harc_rng(r.rng), cycle_count(r.cycle_count), errors(r.errors),",
+    );
+    for reg in &hooks {
+        init_list.push_str(&format!("
+{INDENT}{INDENT}{}(r.{}),", reg.vector(), reg.vector()));
+    }
+    writeln!(o, "HarcSuiteGlue::HarcSuiteGlue(HarcSuiteRuntime& r)").ok();
+    writeln!(o, "{INDENT}{init_list}").ok();
+    writeln!(
+        o,
+        "{INDENT}{INDENT}_fatal(r._fatal), _trace_time(r._trace_time),"
+    )
+    .ok();
+    writeln!(o, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(o, "{INDENT}{INDENT}tfp(r.tfp), _wave_path(r._wave_path),").ok();
+    writeln!(o, "#endif").ok();
+    writeln!(o, "{INDENT}{INDENT}trace(r.trace), log_ctx(r.log_ctx),").ok();
+    writeln!(o, "{INDENT}{INDENT}_checkers(r._checkers),").ok();
+    writeln!(o, "{INDENT}{INDENT}_post_eval_services(r._post_eval_services),").ok();
+    writeln!(
+        o,
+        "{INDENT}{INDENT}_auto_cov_reports(r._auto_cov_reports) {{ harc_rt_current_run = &r; }}"
+    )
+    .ok();
+    writeln!(o, "").ok();
+    writeln!(
+        o,
+        "HarcSuiteGlue::HarcSuiteGlue(HarcSuiteRuntime& r, std::vector<HarcClockCell> clocks)"
+    )
+    .ok();
+    writeln!(
+        o,
+        "{INDENT}: HarcSuiteGlue(r) {{ clocks_ = std::move(clocks); init_clocks(); }}"
+    )
+    .ok();
+    writeln!(o, "").ok();
+    writeln!(o, "void HarcSuiteGlue::init_clocks() {{").ok();
+    writeln!(
+        o,
+        "{INDENT}// First edge fires at half_period (rising) so initial level is 0."
+    )
+    .ok();
+    writeln!(o, "{INDENT}for (auto& c : clocks_) {{").ok();
+    writeln!(o, "{INDENT}{INDENT}c.next_edge_ps = c.half_period_ps;").ok();
+    writeln!(o, "{INDENT}{INDENT}c.level = 0;").ok();
+    writeln!(o, "{INDENT}{INDENT}if (c.set_level) c.set_level(0);").ok();
+    writeln!(o, "{INDENT}}}").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    writeln!(o, "uint64_t HarcSuiteGlue::harc_rng_next() {{ return ctx.rng.next(); }}").ok();
+    writeln!(o, "").ok();
+    // Variadic loggers — identical bodies to the legacy run-scope
+    // lambdas; the runtime owns the sinks.
+    writeln!(
+        o,
+        "void HarcSuiteGlue::sim_logf_line(FILE* f, const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(o, "{INDENT}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    writeln!(
+        o,
+        "void HarcSuiteGlue::sim_log_line(const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(
+        o,
+        "{INDENT}HARC_RT_LOG_PRINTF(ctx.log_ctx.sim_log, &ctx.trace, cycle_count, sev, fmt);"
+    )
+    .ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    // Wave dumps (no-op unless a waves build defined HARC_TRACE_*).
+    writeln!(
+        o,
+        "void HarcSuiteGlue::_harc_trace_dump_next(const char* clock, uint64_t clock_cycle) {{"
+    )
+    .ok();
+    writeln!(o, "{INDENT}uint64_t t = _trace_time++;").ok();
+    writeln!(o, "{INDENT}trace.set_timing(t, clock, clock_cycle);").ok();
+    writeln!(o, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    writeln!(
+        o,
+        "void HarcSuiteGlue::_harc_trace_dump_at(uint64_t t, const char* clock, uint64_t clock_cycle) {{"
+    )
+    .ok();
+    writeln!(o, "{INDENT}trace.set_timing(t, clock, clock_cycle);").ok();
+    writeln!(o, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    // Multi-clock advance loop. Empty `clocks_` means the suite (this
+    // run) is single-clock; tick() picks the matching path per run so
+    // mixed suites stay correct without per-test glue variants.
+    writeln!(o, "void HarcSuiteGlue::eval_clocks_until(long long t_ps) {{").ok();
+    writeln!(o, "{INDENT}while (now_ps < t_ps) {{").ok();
+    writeln!(o, "{INDENT}{INDENT}long long next = t_ps;").ok();
+    writeln!(o, "{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
+    writeln!(o, "{INDENT}{INDENT}now_ps = next;").ok();
+    writeln!(o, "{INDENT}{INDENT}bool _primary_rising = false;").ok();
+    writeln!(o, "{INDENT}{INDENT}const char* _last_edge_clock = \"\";").ok();
+    writeln!(o, "{INDENT}{INDENT}uint64_t _last_edge_cycle = 0;").ok();
+    writeln!(o, "{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}if (c.set_level) c.set_level(c.level);").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_clock = c.name;").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_cycle = (uint64_t)c.rising_count;").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) {{ cycle_count++; _primary_rising = true; }}").ok();
+    writeln!(o, "{INDENT}{INDENT}{INDENT}}}").ok();
+    writeln!(o, "{INDENT}{INDENT}}}").ok();
+    writeln!(o, "{INDENT}{INDENT}ctx.dut->eval();").ok();
+    writeln!(
+        o,
+        "{INDENT}{INDENT}trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+    )
+    .ok();
+    writeln!(
+        o,
+        "{INDENT}{INDENT}if (_primary_rising) {{ for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) ctx.dut->eval(); }}"
+    )
+    .ok();
+    writeln!(
+        o,
+        "{INDENT}{INDENT}_harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+    )
+    .ok();
+    writeln!(o, "{INDENT}}}").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    writeln!(o, "void HarcSuiteGlue::tick() {{").ok();
+    writeln!(o, "{INDENT}if (clocks_.empty()) {{").ok();
+    writeln!(o, "{INDENT}{INDENT}// Single-clock / combinational path.").ok();
+    writeln!(o, "{INDENT}{INDENT}_harc_eval_negedge(ctx.dut);").ok();
+    writeln!(o, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+    writeln!(o, "{INDENT}{INDENT}_harc_eval_posedge(ctx.dut);").ok();
+    writeln!(o, "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));").ok();
+    writeln!(o, "{INDENT}{INDENT}cycle_count++;").ok();
+    writeln!(o, "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();").ok();
+    writeln!(o, "{INDENT}{INDENT}if (!_post_eval_services.empty()) ctx.dut->eval();").ok();
+    writeln!(o, "{INDENT}{INDENT}if (!_post_eval_services.empty()) _harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+    writeln!(o, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+    writeln!(o, "{INDENT}}} else {{").ok();
+    writeln!(o, "{INDENT}{INDENT}// Multi-clock path: one full primary-clock period per tick.").ok();
+    writeln!(o, "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;").ok();
+    writeln!(o, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
+    writeln!(o, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+    writeln!(o, "{INDENT}}}").ok();
+    writeln!(o, "}}").ok();
+    writeln!(o, "").ok();
+    Ok(())
+}
+
+/// Emit every shared callable once into the common TU as an out-of-line
+/// glue member: suite functions, tseqs, hookable component methods
+/// (with instance-owned pre/post fan-out), and watchdogs. Body text is
+/// produced by the same emitters as the legacy layout — only the
+/// signature wrapper differs — so behavior is byte-equivalent per body
+/// (issue #643 ownership conversion).
+fn emit_shared_callables(e: &mut Emitter, prep: &SuitePrep) -> Result<(), EmitError> {
+    for f in &prep.funcs {
+        e.emit_function(f, 0);
+    }
+    for t in &prep.tseqs {
+        e.emit_tseq(t, 0);
+    }
+    let hooks = collect_hook_registries(prep.file, &prep.component_order);
+    for reg in &hooks {
+        // Registries carry one entry per side (pre/post); the callable
+        // itself is emitted once — on the `pre` entry.
+        if !reg.pre {
+            continue;
+        }
+        if !reg.watchdog {
+            // Locate the owning decl and reuse the dual-mode emitter.
+            for &idx in &prep.component_order {
+                match &prep.file.items[idx] {
+                    Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
+                        if c.name.name == reg.comp_ty =>
+                    {
+                        for ci in &c.items {
+                            if let ComponentItem::Hookable(h) = ci {
+                                if h.name.name == reg.method {
+                                    e.emit_component_method(c, h, 0);
+                                }
+                            }
+                        }
+                    }
+                    Item::Transactor(t) if t.name.name == reg.comp_ty => {
+                        let synth = synth_component_from_transactor(t, true);
+                        for ci in &synth.items {
+                            if let ComponentItem::Hookable(h) = ci {
+                                if h.name.name == reg.method {
+                                    e.emit_component_method(&synth, h, 0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            for &idx in &prep.component_order {
+                match &prep.file.items[idx] {
+                    Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
+                        if c.name.name == reg.comp_ty =>
+                    {
+                        for ci in &c.items {
+                            if let ComponentItem::Watchdog(w) = ci {
+                                if !w.disabled {
+                                    e.emit_watchdog(c, w, 0);
+                                }
+                            }
+                        }
+                    }
+                    Item::Transactor(t) if t.name.name == reg.comp_ty => {
+                        let synth = synth_component_from_transactor(t, true);
+                        for ci in &synth.items {
+                            if let ComponentItem::Watchdog(w) = ci {
+                                if !w.disabled {
+                                    e.emit_watchdog(&synth, w, 0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn emit_split_tests_with_file_prefix(
@@ -1420,21 +2413,6 @@ fn validate_split_tests_share_dut(
     Ok(())
 }
 
-pub(crate) fn sanitize_file_component(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "test".to_string()
-    } else {
-        out
-    }
-}
 
 /// Build a *focused* `Emitter` for the TB-IR backend's randomize seam.
 ///
@@ -1722,6 +2700,9 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         pending_tlm_forks: Vec::new(),
         next_tlm_fork_tag: std::collections::HashMap::new(),
         in_coroutine: false,
+        flavor: Flavor::Legacy,
+        per_run_cells: Vec::new(),
+        glue_callees: std::collections::HashSet::new(),
         actor_threads: Vec::new(),
         mt: opts.mt,
         driver_bus_for_hookables: std::collections::HashMap::new(),
@@ -1762,7 +2743,26 @@ pub fn emit_randomize_snippets(
     Ok(out)
 }
 
-pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
+/// Everything `emit_with_opts` derives from the merged source before any
+/// C++ text is produced. Shared by the legacy single-TU emitter and the
+/// common-object split layout so both backends analyze identically.
+struct SuitePrep<'a> {
+    pub file: &'a SourceFile,
+    pub tests: Vec<&'a TestDecl>,
+    pub funcs: Vec<&'a FunctionDecl>,
+    pub tseqs: Vec<&'a TseqDecl>,
+    pub domains: std::collections::HashMap<String, i64>,
+    pub dut_type: &'a str,
+    pub aggregated_probes: std::collections::HashMap<String, ProbeAccessor>,
+    pub component_order: Vec<usize>,
+    pub runtime_problem_table: crate::solver::runtime::RuntimeProblemTable,
+    /// Seed state for the per-suite `Emitter` (all FILE-SCOPE shared
+    /// maps). Per-test fields stay empty; they're reset+populated in the
+    /// per-test emission loop.
+    pub emitter_seed: EmitterSeed,
+}
+
+fn prepare_suite<'a>(file: &'a SourceFile, opts: &EmitOpts) -> Result<SuitePrep<'a>, EmitError> {
     // Desugar `impl <name> for <TbType>` tests into the classic
     // `test <name>` form before any other emission work runs. The
     // testbench-bound form (docs/test-ergonomics.md §3.3) folds a
@@ -1773,11 +2773,10 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // to `_tb.<field>` / `<TbType>_<method>(_tb, ...)`. Once
     // desugared, the test looks identical to a classic-form test
     // and threads through the existing pipeline unchanged.
-    let file = desugar_impl_for_test_in_file(file);
-    // Route `Vec<Record, N>` fields through the scalar-`Vec` emission
-    // path (see `normalize_vec_record_elem_fields`, harc#522).
-    let file = normalize_vec_record_elem_fields(&file);
-    let file = &file;
+    //
+    // Callers pass an already-desugared file (`emit_with_opts` keeps
+    // ownership of the desugared clone and forwards a reference), so
+    // this function itself is pure analysis over `file`.
     let typed_solver_problem_table =
         crate::solver::problem_table::build_typed_solver_problem_table(file);
     let mut runtime_randomize_problem_ids = std::collections::HashMap::new();
@@ -1861,8 +2860,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
             }
         }
     }
-    let dut_type: &str = shared_dut_type
-        .ok_or_else(|| EmitError("expected `let dut : <Type>` declaration in test body".into()))?;
+    let shared_dut_type = shared_dut_type;
 
     // Per-test metadata (custom_phases, other_lets, ...) is derived
     // inside the per-test emission loop further down. The few
@@ -2135,20 +3133,15 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         }
     }
 
-    // Construct the emitter with all FILE-SCOPE shared state. Per-test
-    // fields (let_types, let_modes, pointer_vars, probes, clock_names,
-    // bus_bindings, bus_remap, covers, actor_threads, field_subs,
-    // driver_bus_for_hookables, let_helper) are intentionally left
-    // empty here — they're reset+populated inside the per-test
-    // emission loop below.
-    let mut e = Emitter {
-        out: String::new(),
-        errors: Vec::new(),
-        pointer_vars: std::collections::HashSet::new(),
-        let_types: std::collections::HashMap::new(),
-        let_widths: std::collections::HashMap::new(),
+    // Construct the emitter seed with all FILE-SCOPE shared state.
+    // Per-test fields (let_types, let_modes, pointer_vars, probes,
+    // clock_names, bus_bindings, bus_remap, covers, actor_threads,
+    // field_subs, driver_bus_for_hookables, let_helper) are
+    // intentionally left empty here — they're reset+populated inside
+    // the per-test emission loop of whichever backend consumes the
+    // seed.
+    let emitter_seed = EmitterSeed {
         vec_lane_widths: opts.vec_lane_widths.clone(),
-        let_modes: std::collections::HashMap::new(),
         transactions,
         structs,
         scoreboards,
@@ -2161,516 +3154,273 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
         consts,
         const_widths,
         properties,
+        tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
+        buses,
+        dut_bus_port_overrides: opts.dut_bus_port_overrides.clone(),
+        mt: opts.mt,
+        transactors,
+        txn_keeps,
+        relations,
+        regblocks,
+        addrmaps,
+        runtime_randomize_problem_ids,
+    };
+    let dut_type: &'a str = shared_dut_type
+        .ok_or_else(|| EmitError("expected `let dut : <Type>` declaration in test body".into()))?;
+    Ok(SuitePrep {
+        file,
+        tests,
+        funcs,
+        tseqs,
+        domains,
+        dut_type,
+        aggregated_probes,
+        component_order: topo_sort_component_indices(file),
+        runtime_problem_table,
+        emitter_seed,
+    })
+}
+
+/// FILE-SCOPE analysis results moved into an `Emitter`. Split out of the
+/// `Emitter` literal so `prepare_suite` can produce it for both the legacy
+/// single-TU backend and the common-object split layout.
+#[derive(Clone)]
+struct EmitterSeed {
+    vec_lane_widths: std::collections::HashMap<String, u32>,
+    transactions: std::collections::HashSet<String>,
+    structs: std::collections::HashSet<String>,
+    scoreboards: std::collections::HashSet<String>,
+    components: std::collections::HashMap<String, ComponentDecl>,
+    covergroups: std::collections::HashMap<String, CovergroupDecl>,
+    txn_fields: std::collections::HashMap<String, Vec<TxnFieldInfo>>,
+    record_fields: std::collections::HashMap<String, Vec<Field>>,
+    enums: std::collections::HashMap<String, usize>,
+    enum_variants: std::collections::HashMap<String, i64>,
+    consts: std::collections::HashMap<String, String>,
+    const_widths: std::collections::HashMap<String, u32>,
+    properties: std::collections::HashMap<String, crate::ast::Expr>,
+    tseq_names: std::collections::HashSet<String>,
+    buses: std::collections::HashMap<String, BusDecl>,
+    dut_bus_port_overrides: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+    mt: bool,
+    transactors: std::collections::HashMap<String, TransactorDecl>,
+    txn_keeps: std::collections::HashMap<String, Vec<Expr>>,
+    relations: std::collections::HashMap<String, RelationDecl>,
+    regblocks: std::collections::HashMap<String, RegblockDecl>,
+    addrmaps: std::collections::HashMap<String, AddrmapDecl>,
+    runtime_randomize_problem_ids: std::collections::HashMap<(u32, u32), u32>,
+}
+
+fn empty_emitter_seed() -> EmitterSeed {
+    EmitterSeed {
+        vec_lane_widths: Default::default(),
+        transactions: Default::default(),
+        structs: Default::default(),
+        scoreboards: Default::default(),
+        components: Default::default(),
+        covergroups: Default::default(),
+        txn_fields: Default::default(),
+        record_fields: Default::default(),
+        enums: Default::default(),
+        enum_variants: Default::default(),
+        consts: Default::default(),
+        const_widths: Default::default(),
+        properties: Default::default(),
+        tseq_names: Default::default(),
+        buses: Default::default(),
+        dut_bus_port_overrides: Default::default(),
+        mt: false,
+        transactors: Default::default(),
+        txn_keeps: Default::default(),
+        relations: Default::default(),
+        regblocks: Default::default(),
+        addrmaps: Default::default(),
+        runtime_randomize_problem_ids: Default::default(),
+    }
+}
+
+/// One per-instance hook registry (pre/post callback vector) owned by
+/// the suite runtime under the common layout. `vector` is the generated
+/// C++ member/field name, identical to the historical run-scope variable
+/// so capsule registrations compile unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct HookRegistryDesc {
+    pub comp_ty: String,
+    pub method: String,
+    pub watchdog: bool,
+    pub pre: bool,
+}
+impl HookRegistryDesc {
+    pub fn vector(&self) -> String {
+        if self.watchdog {
+            format!("{}_watchdog_{}", self.comp_ty, self.side_name())
+        } else {
+            format!("{}_{}_{}", self.comp_ty, self.method, self.side_name())
+        }
+    }
+    fn side_name(&self) -> &'static str {
+        if self.pre {
+            "pre"
+        } else {
+            "post"
+        }
+    }
+}
+
+/// Enumerate every hookable method / watchdog across the dependency-
+/// sorted component list. Deterministic: derived purely from source AST
+/// order via `component_order`, independent of test set or emission
+/// job count (issue #643 stable-identity rule).
+fn collect_hook_registries(
+    file: &SourceFile,
+    component_order: &[usize],
+) -> Vec<HookRegistryDesc> {
+    let mut out = Vec::new();
+    for &idx in component_order {
+        match &file.items[idx] {
+            Item::Agent(c)
+            | Item::Env(c)
+            | Item::Sequencer(c)
+            | Item::Scoreboard(c) => {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        for pre in [true, false] {
+                            out.push(HookRegistryDesc {
+                                comp_ty: c.name.name.clone(),
+                                method: h.name.name.clone(),
+                                watchdog: false,
+                                pre,
+                            });
+                        }
+                    }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        if w.disabled {
+                            continue;
+                        }
+                        for pre in [true, false] {
+                            out.push(HookRegistryDesc {
+                                comp_ty: c.name.name.clone(),
+                                method: String::new(),
+                                watchdog: true,
+                                pre,
+                            });
+                        }
+                    }
+                }
+            }
+            Item::Transactor(t) => {
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        for pre in [true, false] {
+                            out.push(HookRegistryDesc {
+                                comp_ty: synth.name.name.clone(),
+                                method: h.name.name.clone(),
+                                watchdog: false,
+                                pre,
+                            });
+                        }
+                    }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        if w.disabled {
+                            continue;
+                        }
+                        for pre in [true, false] {
+                            out.push(HookRegistryDesc {
+                                comp_ty: synth.name.name.clone(),
+                                method: String::new(),
+                                watchdog: true,
+                                pre,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn emitter_from_seed(seed: EmitterSeed) -> Emitter {
+    Emitter {
+        out: String::new(),
+        errors: Vec::new(),
+        pointer_vars: std::collections::HashSet::new(),
+        let_types: std::collections::HashMap::new(),
+        let_widths: std::collections::HashMap::new(),
+        vec_lane_widths: seed.vec_lane_widths,
+        let_modes: std::collections::HashMap::new(),
+        transactions: seed.transactions,
+        structs: seed.structs,
+        scoreboards: seed.scoreboards,
+        components: seed.components,
+        covergroups: seed.covergroups,
+        txn_fields: seed.txn_fields,
+        record_fields: seed.record_fields,
+        enums: seed.enums,
+        enum_variants: seed.enum_variants,
+        consts: seed.consts,
+        const_widths: seed.const_widths,
+        properties: seed.properties,
         prop_subs: std::collections::HashMap::new(),
         event_types: std::collections::HashMap::new(),
         field_subs: std::collections::HashMap::new(),
         covers: Vec::new(),
         clock_names: Vec::new(),
         current_yield_target: None,
-        tseq_names: tseqs.iter().map(|t| t.name.name.clone()).collect(),
-        buses,
+        tseq_names: seed.tseq_names,
+        buses: seed.buses,
         bus_bindings: std::collections::HashMap::new(),
         bus_param_envs: std::collections::HashMap::new(),
-        dut_bus_port_overrides: opts.dut_bus_port_overrides.clone(),
+        dut_bus_port_overrides: seed.dut_bus_port_overrides,
         bus_remap: std::collections::HashMap::new(),
         pending_tlm_forks: Vec::new(),
         next_tlm_fork_tag: std::collections::HashMap::new(),
         in_coroutine: false,
+        flavor: Flavor::Legacy,
+        per_run_cells: Vec::new(),
+        glue_callees: std::collections::HashSet::new(),
         actor_threads: Vec::new(),
-        mt: opts.mt,
+        mt: seed.mt,
         driver_bus_for_hookables: std::collections::HashMap::new(),
-        transactors,
+        transactors: seed.transactors,
         current_component_instance: None,
         current_component_method: None,
-        txn_keeps,
-        relations,
+        txn_keeps: seed.txn_keeps,
+        relations: seed.relations,
         probes: std::collections::HashMap::new(),
         probe_widths: std::collections::HashMap::new(),
         shadowed_lets: std::collections::HashSet::new(),
-        regblocks,
-        addrmaps,
+        regblocks: seed.regblocks,
+        addrmaps: seed.addrmaps,
         let_helper: std::collections::HashMap::new(),
-        runtime_randomize_problem_ids,
-    };
-
-    // Header.
-    writeln!(e.out, "// Auto-generated by harc — do not edit.").ok();
-    if tests.len() == 1 {
-        writeln!(e.out, "// HARC test: {}", tests[0].name.name).ok();
-    } else {
-        let names: Vec<&str> = tests.iter().map(|t| t.name.name.as_str()).collect();
-        writeln!(
-            e.out,
-            "// HARC tests ({}): {}",
-            tests.len(),
-            names.join(", ")
-        )
-        .ok();
+        runtime_randomize_problem_ids: seed.runtime_randomize_problem_ids,
     }
-    writeln!(e.out, "").ok();
-    // Disable clang optimization for this file. clang 17+ on both
-    // Apple Silicon and Linux x86_64 mis-optimizes our `[&]`-
-    // capturing C++20 lambda coroutines at `-Os` / `-O2`: closure
-    // reference members fold against the original (freed) stack
-    // frame after a suspension, causing SEGV on resume. Per-file
-    // pragma keeps verilator-generated DUT `.cpp` files at `-Os`
-    // for fast simulation.
-    //
-    // GCC has the same class of miscompile but `#pragma optimize`
-    // doesn't propagate through C++20 coroutine codegen there.
-    // The structural fix (2026-06-22): every coroutine is stored
-    // in a named lambda variable (`auto _foo_lambda = [&](){...};
-    // slot.thread = _foo_lambda(&slot);`) so the closure object
-    // lives for the full duration of `run_<Test>`, not as a
-    // temporary freed at the IIFE semicolon. This fixes GCC on
-    // Linux without requiring HARC_CXX=clang++. The pragma remains
-    // as a redundant defence for clang.
-    writeln!(e.out, "#ifdef __clang__").ok();
-    writeln!(e.out, "#pragma clang optimize off").ok();
-    writeln!(e.out, "#endif").ok();
-    writeln!(e.out, "").ok();
-    writeln!(e.out, "#include \"V{dut_type}.h\"").ok();
-    // Probe access needs the root struct's full definition (the
-    // `rootp` field on V<Top> is a forward-declared pointer in
-    // `V<Top>.h`). When the test declares one or more probes, also
-    // include the root header so `dut->rootp-><mangled>` compiles.
-    if !aggregated_probes.is_empty() {
-        writeln!(e.out, "#include \"V{dut_type}___024root.h\"").ok();
-    }
-    writeln!(e.out, "#include \"verilated.h\"").ok();
-    writeln!(e.out, "#if VM_COVERAGE").ok();
-    writeln!(e.out, "#include \"verilated_cov.h\"").ok();
-    writeln!(e.out, "#endif").ok();
-    // Waveform trace headers (issue #209). Always emitted but gated
-    // on `-DHARC_TRACE_VCD` / `-DHARC_TRACE_FST`, both supplied by
-    // `harc sim --waves` at Verilator compile time. Non-trace builds
-    // never include either header, so the no-waves build cost is
-    // exactly zero.
-    writeln!(e.out, "#if defined(HARC_TRACE_VCD)").ok();
-    writeln!(e.out, "#include \"verilated_vcd_c.h\"").ok();
-    writeln!(e.out, "#define HARC_TRACE_ENABLED 1").ok();
-    writeln!(e.out, "using HarcTraceC = VerilatedVcdC;").ok();
-    writeln!(e.out, "#elif defined(HARC_TRACE_FST)").ok();
-    writeln!(e.out, "#include \"verilated_fst_c.h\"").ok();
-    writeln!(e.out, "#define HARC_TRACE_ENABLED 1").ok();
-    writeln!(e.out, "using HarcTraceC = VerilatedFstC;").ok();
-    writeln!(e.out, "#else").ok();
-    writeln!(e.out, "#define HARC_TRACE_ENABLED 0").ok();
-    writeln!(e.out, "#endif").ok();
-    writeln!(e.out, "#include <cstdio>").ok();
-    writeln!(e.out, "#include <cstdint>").ok();
-    writeln!(e.out, "#include <cstdlib>").ok();
-    writeln!(e.out, "#include <cstdarg>").ok();
-    writeln!(e.out, "#include <cstring>").ok();
-    writeln!(e.out, "#include <string>").ok();
-    writeln!(e.out, "#include <array>").ok();
-    writeln!(e.out, "#include <vector>").ok();
-    writeln!(e.out, "#include <deque>").ok();
-    writeln!(e.out, "#include <functional>").ok();
-    // Phase 3a: per-actor OS threads + barrier sync. Pulled in
-    // unconditionally — `<atomic>` is also indirectly available via
-    // `harc_thread_rt.h` but the explicit include keeps intent clear.
-    writeln!(e.out, "#include <thread>").ok();
-    writeln!(e.out, "#include <atomic>").ok();
-    // HARC's coroutine runtime — drives the test's `run` block as a
-    // C++20 coroutine via `harc_rt::ThreadScheduler`. Hookable methods
-    // and `on`-handler closures still run synchronously between the
-    // run coroutine's co_awaits; only the run body itself yields.
-    // Multi-actor parallelism (driver + monitor coroutines on the same
-    // bus) lands in Phase 2 on top of the same runtime.
-    writeln!(e.out, "#include \"harc_thread_rt.h\"").ok();
-    writeln!(e.out, "#include \"harc_random_rt.h\"").ok();
-    writeln!(e.out, "#include \"harc_queue_rt.h\"").ok();
-    writeln!(e.out, "#include \"harc_trace_rt.h\"").ok();
-    writeln!(e.out, "#include \"harc_log_rt.h\"").ok();
-    let uses_solver = uses_constraint_solver(file);
-    if uses_solver {
-        writeln!(
-            e.out,
-            "#include \"harc_z3_rt.h\"   // randomize(t) with <constraints>"
-        )
-        .ok();
-    }
-    writeln!(e.out, "").ok();
-    // Template helpers that gate clock toggling on whether the DUT exposes a
-    // `clk` member. `if constexpr (requires {{ ... }})` only suppresses the
-    // discarded branch inside a template body; moving the `dut->clk` write
-    // into a template function means calling it from `main()` or a lambda
-    // instantiates the right specialisation and the ill-formed branch for
-    // combinational DUTs is never compiled.
-    writeln!(e.out, "template<typename DUT>").ok();
-    writeln!(e.out, "static void _harc_eval_negedge(DUT* dut) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 0; }}"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}dut->eval();").ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "template<typename DUT>").ok();
-    writeln!(e.out, "static void _harc_eval_posedge(DUT* dut) {{").ok();
-    writeln!(
-        e.out,
-        "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 1; }}"
-    )
-    .ok();
-    writeln!(e.out, "{INDENT}dut->eval();").ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "").ok();
+}
 
-    if !runtime_problem_table.problems.is_empty() {
-        e.out.push_str(
-            &runtime_problem_table.render_cpp_table("_harc_runtime_random_problem_table"),
-        );
-    }
+pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitError> {
+    // Desugar `impl <name> for <TbType>` tests into the classic
+    // `test <name>` form before any other emission work runs. The
+    // testbench-bound form (docs/test-ergonomics.md §3.3) folds a
+    // testbench's fields + helper methods into the bound test's
+    // scope; desugaring synthesizes the equivalent `let dut : ...` /
+    // `let _tb : <TbType>` declarations at test scope and rewrites
+    // bare-name references inside run/setup/check/teardown bodies
+    // to `_tb.<field>` / `<TbType>_<method>(_tb, ...)`. Once
+    // desugared, the test looks identical to a classic-form test
+    // and threads through the existing pipeline unchanged.
+    let desugared = desugar_impl_for_test_in_file(file);
+    // Route `Vec<Record, N>` fields through the scalar-`Vec` emission
+    // path (see `normalize_vec_record_elem_fields`, harc#522).
+    let normalized = normalize_vec_record_elem_fields(&desugared);
+    let file = &normalized;
+    let mut prep = prepare_suite(file, &opts)?;
+    let tests = &prep.tests;
+    let seed = std::mem::replace(&mut prep.emitter_seed, empty_emitter_seed());
+    let mut e = emitter_from_seed(seed);
 
-    // ── PRNG runtime ──────────────────────────────────────────────────────
-    // Seed loaded from HARC_SEED through the random runtime helper.
-    writeln!(e.out, "static harc_rt::random::HarcRng harc_rng;").ok();
-    writeln!(e.out, "static inline uint64_t harc_rng_next() {{").ok();
-    writeln!(e.out, "{INDENT}return harc_rng.next();").ok();
-    writeln!(e.out, "}}").ok();
-    writeln!(e.out, "").ok();
-
-    // ── Shared HVL value records ────────────────────────────────────────
-    // Structs and transactions share the C++ record/equality/randomize
-    // lowering. Transactions layer keeps and protocol-facing semantics at
-    // the randomize call site and in transactors.
-    for it in &file.items {
-        if let Item::Struct(s) = it {
-            e.emit_struct_record(s);
-        }
-    }
-    for it in &file.items {
-        if let Item::Transaction(t) = it {
-            e.emit_transaction(t);
-        }
-    }
-
-    // ── Scoreboard / component / transactor structs ─────────────────────
-    // Emitted in field-dependency order so a transactor / component
-    // field whose type is another transactor / component declared
-    // later in the source list still finds a complete C++ type at
-    // its declaration site. See `topo_sort_component_indices` for
-    // the dependency rule and cycle-recovery behaviour, and issue
-    // #301 for the symptom this prevents (transactor field forward
-    // reference passed `harc check` but emitted undeclared C++).
-    //
-    // Scoreboards emit before regular components / transactors in
-    // the source-order pass below ONLY when they have no incoming
-    // edges from a transactor's fields — the topo sort handles the
-    // mixed case correctly. Covergroups still emit earlier (above)
-    // because covergroups are leaf observables that never name a
-    // component or transactor.
-    let component_order = topo_sort_component_indices(file);
-    for &idx in &component_order {
-        if let Item::Scoreboard(s) = &file.items[idx] {
-            e.emit_scoreboard(s);
-        }
-    }
-
-    // ── Per-channel payload structs ──────────────────────────────────────
-    // `bus.<ch>.recv()` and `on bus.<ch>.handshake(arg)` capture the
-    // channel's full payload — for multi-payload channels (e.g. AXI's
-    // `r` carrying both `data` and `resp`) users need `arg.data` /
-    // `arg.resp`. We emit one struct per `handshake_channel`, named
-    // `<BusName>_<chan>_payload`, with one field per payload signal.
-    //
-    // The struct also exposes `operator uint64_t() const` returning
-    // the first field — backward compatible with the previous v0
-    // behaviour (`recv()` returning a scalar). Existing fixtures that
-    // do `assert val == 0xCAFEBABE` keep working without change;
-    // multi-payload access just becomes available.
-    for it in &file.items {
-        if let Item::Bus(b) = it {
-            for h in &b.handshakes {
-                if h.payload.is_empty() {
-                    continue;
-                }
-                let struct_name = format!("{}_{}_payload", b.name.name, h.name.name);
-                writeln!(e.out, "struct {struct_name} {{").ok();
-                for sig in &h.payload {
-                    let cty = txn_field_c_type(&sig.ty);
-                    writeln!(e.out, "{INDENT}{cty} {};", sig.name.name).ok();
-                }
-                // Implicit conversion to the first payload field — keeps
-                // single-field-style usage (`val == N`, `last_read = val`)
-                // compiling against the new struct type.
-                let first_sig = &h.payload[0];
-                let first_cty = txn_field_c_type(&first_sig.ty);
-                writeln!(
-                    e.out,
-                    "{INDENT}operator {first_cty}() const {{ return {}; }}",
-                    first_sig.name.name,
-                )
-                .ok();
-                writeln!(e.out, "}};").ok();
-                writeln!(e.out, "").ok();
-            }
-        }
-    }
-
-    // ── RAL regblock mirror structs + address tables ────────────────────
-    // One POD `struct <Name>_Mirror { uint<W>_t REG; ... };` per
-    // declared `regblock`, plus a `constexpr` address table giving
-    // each register's byte offset. Accessor calls (`regs.NAME = v` /
-    // `let x = regs.NAME`) lower to mirror update + helper.write/read
-    // — see docs/ral-support.md §7.4 (frontdoor lowering). Phase 1a
-    // keeps the mirror flat — no nested addrmap composition yet.
-    let any_regblock = file.items.iter().any(|it| matches!(it, Item::Regblock(_)));
-    if any_regblock {
-        // Recursion-guard depth limit for `regs.record_write` callbacks.
-        // A callback body invoking `record_write` re-enters the same
-        // decode block synchronously; without a bound, a self-write
-        // (`on regs.A { regs.record_write(0x00, ...) }`) grows the
-        // stack unboundedly. 16 leaves plenty of room for realistic
-        // nested CSR cascades while catching runaway recursion fast.
-        // See docs/ral-support.md §3.2.
-        writeln!(e.out, "#ifndef HARC_RAL_CB_MAX_DEPTH").ok();
-        writeln!(
-            e.out,
-            "static constexpr uint32_t HARC_RAL_CB_MAX_DEPTH = 16;"
-        )
-        .ok();
-        writeln!(e.out, "#endif").ok();
-        writeln!(e.out, "").ok();
-    }
-    for it in &file.items {
-        if let Item::Regblock(r) = it {
-            let default_w = r.default_width.unwrap_or(32);
-            writeln!(e.out, "struct {}_Mirror {{", r.name.name).ok();
-            for reg in &r.registers {
-                let w = reg.width.unwrap_or(default_w);
-                let cty = mirror_field_c_type(w);
-                let init = match &reg.reset {
-                    Some(rv) => format!(" = {}", c_int_literal_from(&rv.kind)),
-                    None => " = 0".to_string(),
-                };
-                writeln!(e.out, "{INDENT}{cty} {}{};", reg.name.name, init).ok();
-            }
-            writeln!(e.out, "}};").ok();
-            writeln!(e.out, "").ok();
-
-            // constexpr address table — one entry per register, indexed
-            // by C++ identifier matching the source register name. Used
-            // by future bitbash() lowering; reads/writes inline the
-            // offset literal directly for simplicity in Phase 1a.
-            writeln!(
-                e.out,
-                "struct {}_AddrEntry {{ const char* name; uint64_t offset; uint32_t width; }};",
-                r.name.name,
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "static constexpr {}_AddrEntry {}_AddrTable[] = {{",
-                r.name.name, r.name.name,
-            )
-            .ok();
-            for reg in &r.registers {
-                let w = reg.width.unwrap_or(default_w);
-                let off = c_int_literal_from(&reg.offset.kind);
-                writeln!(
-                    e.out,
-                    "{INDENT}{{ \"{name}\", {off}, {w} }},",
-                    name = reg.name.name,
-                )
-                .ok();
-            }
-            writeln!(e.out, "}};").ok();
-            writeln!(e.out, "").ok();
-
-            // ── RAL per-register write callbacks + passive record API ──
-            // `<Name>_Callbacks` holds one optional `void(uint64_t)`
-            // closure per register. `on regs.REG ... end on` populates a
-            // slot; `regs.record_write(addr, data)` fires the matching
-            // slot after updating the mirror. `<Name>_record_read(m, addr)`
-            // is the passive read counterpart — it decodes the address to
-            // the mirror cell with no bus traffic. Both own the address
-            // decode at codegen time so a checker observing bus traffic
-            // never hand-writes an `if/elsif` address ladder.
-            // See docs/ral-support.md §3.2.
-            writeln!(e.out, "struct {}_Callbacks {{", r.name.name).ok();
-            for reg in &r.registers {
-                writeln!(
-                    e.out,
-                    "{INDENT}std::function<void(uint64_t)> {};",
-                    reg.name.name,
-                )
-                .ok();
-            }
-            writeln!(e.out, "}};").ok();
-            writeln!(e.out, "").ok();
-
-            writeln!(
-                e.out,
-                "static inline uint64_t {name}_record_read(const {name}_Mirror& m, uint64_t addr) {{",
-                name = r.name.name,
-            )
-            .ok();
-            for reg in &r.registers {
-                let off = c_int_literal_from(&reg.offset.kind);
-                writeln!(
-                    e.out,
-                    "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{};",
-                    reg.name.name,
-                )
-                .ok();
-            }
-            writeln!(e.out, "{INDENT}return 0;").ok();
-            writeln!(e.out, "}}").ok();
-            writeln!(e.out, "").ok();
-        }
-    }
-
-    // ── RAL addrmap mirror structs ──────────────────────────────────────
-    // Chip-level container. Each `addrmap A { instance inst : R @ B }`
-    // lowers to `struct A_Mirror { R_Mirror inst; ... };` — one
-    // member per instance, of the corresponding regblock's Mirror
-    // type. Bus addresses for `chip.inst.REG` are computed
-    // `BASE_inst + offset(REG)` at codegen time. See docs/ral-support.md §4.
-    for it in &file.items {
-        if let Item::Addrmap(a) = it {
-            writeln!(e.out, "struct {}_Mirror {{", a.name.name).ok();
-            for inst in &a.instances {
-                // Aliased instances share mirror storage with their
-                // target — no separate field. Access through the
-                // alias rewrites to the target's mirror path at
-                // codegen time. See docs/ral-support.md §4.
-                if inst.alias_of.is_some() {
-                    writeln!(
-                        e.out,
-                        "{INDENT}// {name}: alias of {target} — shares mirror",
-                        name = inst.name.name,
-                        target = inst.alias_of.as_ref().unwrap().name,
-                    )
-                    .ok();
-                    continue;
-                }
-                writeln!(
-                    e.out,
-                    "{INDENT}{ty}_Mirror {name};",
-                    ty = inst.regblock_ty.name,
-                    name = inst.name.name,
-                )
-                .ok();
-            }
-            writeln!(e.out, "}};").ok();
-            writeln!(e.out, "").ok();
-        }
-    }
-
-    // ── Covergroup structs (per-bin counters + sample() + report()) ─────
-    // Emitted BEFORE component structs so a `testbench Tb { cov : Cg }`
-    // body can name `Cg` as a field type without a forward-decl. The
-    // testbench/env composition is the only direction the dependency
-    // runs — covergroups are leaf observables, they never name a
-    // component or transactor.
-    for it in &file.items {
-        if let Item::Covergroup(g) = it {
-            e.emit_covergroup_struct(g);
-        }
-    }
-
-    // ── Monitor structs ──────────────────────────────────────────────────
-    // Same shape as scoreboards; output `event<T>` fields lower to
-    // ── Component structs (agent / env / sequencer).
-    // Scoreboards have their own dedicated path above; the rest are
-    // plain field-bearing structs. `hookable` methods are emitted
-    // separately as free `[&]`-capturing lambdas (below) so the
-    // method body sees `dut` / `tick` / `_checkers` from the test scope.
-    //
-    // Emission order: dependency-sorted (`component_order` computed
-    // above). A transactor whose field references another transactor
-    // / component declared later in the source list emits after its
-    // dependency — fixes #301.
-    for &idx in &component_order {
-        match &file.items[idx] {
-            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
-                e.emit_component_struct(c);
-            }
-            Item::Transactor(t) => {
-                // Compose a synthetic ComponentDecl with the union of
-                // always-present body items + active body items, and
-                // emit a single struct. Both modes get the same C++
-                // class layout — passive instances simply don't
-                // subscribe to / spawn actors against the active
-                // fields. Mode-specific elision lives in the lowering
-                // at instantiation, not in the struct shape.
-                let synth = synth_component_from_transactor(t, /*include_active*/ true);
-                e.emit_component_struct(&synth);
-            }
-            _ => {}
-        }
-    }
-
-    // ── Top-level `const` items ─────────────────────────────────────────
-    // `const NAME : Ty = expr` lowers to a file-scope
-    // `static constexpr <c_type> NAME = <expr>;` so the value is
-    // available everywhere — inside `main()`, hookable lambdas (which
-    // can't capture across translation-unit boundaries but can use
-    // file-scope constants directly), `tseq` lambdas, and on-handler
-    // closures. constexpr also folds into expressions used at struct
-    // field defaults if any future fixture goes there.
-    let mut emitted_const = false;
-    for it in &file.items {
-        if let Item::Const(c) = it {
-            let cty =
-                c.ty.as_ref()
-                    .map(c_type_for)
-                    .unwrap_or_else(|| "int64_t".to_string());
-            write!(e.out, "static constexpr {cty} {} = ", c.name.name).ok();
-            e.emit_expr(&c.value);
-            writeln!(e.out, ";").ok();
-            emitted_const = true;
-        }
-    }
-    if emitted_const {
-        writeln!(e.out, "").ok();
-    }
-
-    // `extern function name(params) -> ret` (spec §9) — emit C-linkage
-    // forward declarations at file scope so the user's `--ref-src
-    // <file>.cpp` can satisfy the linker without HARC needing to know
-    // its implementation. Shared with the TB-IR codegen so both emit
-    // byte-identical `extern "C"` blocks (`emit_extern_fn_decls`).
-    emit_extern_fn_decls(&mut e.out, file);
-
-    // Shared per-run state. This is the first step toward the phase-2
-    // member/context refactor: generated run bodies still use the
-    // historical local names (`dut`, `_checkers`, `errors`, ...), but the
-    // run prologue now binds those names as references into this common
-    // context object. Future shared helper functions can take
-    // `HarcTestContext& ctx` instead of relying on `[&]` captures.
-    writeln!(e.out, "struct HarcTestContext {{").ok();
-    writeln!(e.out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
-    writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
-    writeln!(e.out, "{INDENT}HarcTraceC* tfp = nullptr;").ok();
-    writeln!(e.out, "{INDENT}std::string _wave_path;").ok();
-    writeln!(e.out, "#endif").ok();
-    writeln!(e.out, "{INDENT}uint64_t _trace_time = 0;").ok();
-    writeln!(e.out, "{INDENT}int errors = 0;").ok();
-    writeln!(e.out, "{INDENT}bool _fatal = false;").ok();
-    writeln!(e.out, "{INDENT}int cycle_count = 0;").ok();
-    writeln!(e.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
-    writeln!(e.out, "{INDENT}harc_rt::log::HarcLogContext log_ctx;").ok();
-    writeln!(
-        e.out,
-        "{INDENT}std::vector<std::function<void()>> _checkers;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}std::vector<std::function<void()>> _post_eval_services;"
-    )
-    .ok();
-    writeln!(
-        e.out,
-        "{INDENT}std::vector<std::function<void()>> _auto_cov_reports;"
-    )
-    .ok();
-    writeln!(e.out, "}};").ok();
-    writeln!(e.out, "").ok();
+    e.emit_file_scope_scaffolding(&prep)?;
 
     // Per-test entry points. Each `Item::Test` in source gets its
     // own `int run_<TestName>(argc, argv)` function. The dispatcher
@@ -2680,1173 +3430,9 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     // Verilator instances, sequentially (one binary, dispatched).
     // See docs/separate-compilation-plan.md for the future per-test
     // `.o` direction (Phase 2).
-    for test in &tests {
-        // ── Reset Emitter per-test state ────────────────────────────
-        e.let_types.clear();
-        e.let_modes.clear();
-        e.let_widths.clear();
-        e.pointer_vars.clear();
-        e.pointer_vars.insert("dut".to_string());
-        e.bus_bindings.clear();
-        e.bus_param_envs.clear();
-        e.bus_remap.clear();
-        e.pending_tlm_forks.clear();
-        e.next_tlm_fork_tag.clear();
-        e.probes.clear();
-        e.probe_widths.clear();
-        e.shadowed_lets.clear();
-        e.clock_names.clear();
-        e.covers.clear();
-        e.actor_threads.clear();
-        e.field_subs.clear();
-        e.driver_bus_for_hookables.clear();
-        e.let_helper.clear();
-        e.in_coroutine = false;
-        e.current_yield_target = None;
-        e.current_component_instance = None;
-
-        // ── Derive per-test metadata ───────────────────────────────
-        let custom_phases: Vec<(Ident, Block)> = test
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                TestItem::Phase(name, body) => Some((name.clone(), body.clone())),
-                _ => None,
-            })
-            .collect();
-        let mut other_lets: Vec<&LetStmt> = Vec::new();
-        let mut bare_stmts: Vec<&Stmt> = Vec::new();
-        let mut explicit_run: Option<&Block> = None;
-        let mut clocks: Vec<&ClockDecl> = Vec::new();
-        for it in &test.items {
-            match it {
-                TestItem::Let(l) => {
-                    if l.name.name == "dut" {
-                        for p in &l.probes {
-                            e.probes.insert(
-                                p.name.name.clone(),
-                                ProbeAccessor {
-                                    read: crate::codegen::sv_stub::mangled_accessor(
-                                        dut_type,
-                                        &p.name.name,
-                                    ),
-                                    force: p.force,
-                                },
-                            );
-                            // Mirrors TB-IR's `probe_scalar_width`: a
-                            // `Bit`/`Bool` probe is one bit wide, not
-                            // width-less. Omitting those made v1 reject a
-                            // `dut.<bit probe> +% 1` that TB-IR wraps.
-                            if let TypeExpr::Builtin { name, args, .. } = &p.ty {
-                                let w = match name {
-                                    BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => {
-                                        Some(1)
-                                    }
-                                    BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => {
-                                        type_arg_width(args)
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(w) = w {
-                                    e.probe_widths.insert(p.name.name.clone(), w);
-                                }
-                            }
-                        }
-                    } else {
-                        other_lets.push(l);
-                    }
-                }
-                TestItem::Scope(s) => {
-                    if let Some(r) = &s.run {
-                        explicit_run = Some(r);
-                    }
-                }
-                TestItem::Stmt(s) => bare_stmts.push(s),
-                TestItem::Clock(c) => clocks.push(c),
-                _ => {}
-            }
-        }
-        if explicit_run.is_none() && bare_stmts.is_empty() {
-            return Err(EmitError(format!(
-                "test `{}` has no body — add a `scope sim`, `run`, or bare statements",
-                test.name.name,
-            )));
-        }
-        let _ = (&explicit_run, &bare_stmts);
-
-        // ── Seed Emitter per-test state ────────────────────────────
-        for l in &other_lets {
-            if let Some(s) = type_simple_name(l.ty.as_ref()) {
-                e.let_types.insert(l.name.name.clone(), s.to_string());
-            }
-            if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
-                e.let_modes.insert(l.name.name.clone(), *m);
-            }
-            // Track bit-widths for uint<W> / sint<W> / bits<W> lets so
-            // the width-method intrinsics (`.trunc<N>()` / `.sext<N>()`
-            // etc.) can statically check that the requested width
-            // direction matches the source width, and so sext can emit
-            // its shift-fill from the right MSB position.
-            if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
-                if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
-                    if let Some(w) = type_arg_width(args) {
-                        let lw = LetWidth {
-                            bits: w,
-                            signed: matches!(name, BuiltinTy::SInt),
-                        };
-                        if e.let_widths.insert(l.name.name.clone(), lw).is_some() {
-                            e.shadowed_lets.insert(l.name.name.clone());
-                        }
-                    }
-                }
-            }
-            if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                if e.transactions.contains(simple)
-                    || e.scoreboards.contains(simple)
-                    || e.components.contains_key(simple)
-                    || e.covergroups.contains_key(simple)
-                    || e.buses.contains_key(simple)
-                    || e.transactors.contains_key(simple)
-                    || e.regblocks.contains_key(simple)
-                    || e.addrmaps.contains_key(simple)
-                {
-                    continue;
-                }
-            }
-            if matches!(&l.ty, Some(TypeExpr::Named { .. })) {
-                e.pointer_vars.insert(l.name.name.clone());
-            }
-        }
-        // Seed `let_types` for the bound testbench's fields (impl-for
-        // form). After desugaring, a `testbench`-form test carries
-        // `let _tb : <TbType>` and its fields (`drv`, `cov`, ...) live on
-        // the `_tb` struct rather than as run-scope lets, so they never
-        // hit the `other_lets` loop above. Covergroup HOOK-trigger
-        // resolution (`covergroup G @(drv.method(t) post)`) resolves the
-        // receiver field via `let_types`, so without this seed it cannot
-        // find `drv` under the impl-for form (only the classic `test`
-        // form, where the fields ARE run-scope lets, worked). Field names
-        // are test-scoped; seeding them by their declared type lets the
-        // hook resolver reach the transactor/component method table.
-        if let Some(tb_ty) = e.let_types.get("_tb").cloned() {
-            if let Some(tb_comp) = e.components.get(&tb_ty).cloned() {
-                for ci in &tb_comp.items {
-                    if let ComponentItem::Field(f) = ci {
-                        if let Some(simple) = type_simple_name(Some(&f.ty)) {
-                            e.let_types
-                                .entry(f.name.name.clone())
-                                .or_insert_with(|| simple.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        e.clock_names = clocks.iter().map(|c| c.name.name.clone()).collect();
-
-        writeln!(
-            e.out,
-            "int run_{}(int argc, char** argv) {{",
-            test.name.name
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
-        writeln!(e.out, "{INDENT}HarcTestContext ctx;").ok();
-        writeln!(e.out, "{INDENT}ctx.dut = new V{dut_type};").ok();
-        writeln!(e.out, "{INDENT}auto* dut = ctx.dut;").ok();
-        writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
-        writeln!(e.out, "{INDENT}auto* tfp = ctx.tfp;").ok();
-        writeln!(e.out, "{INDENT}auto& _wave_path = ctx._wave_path;").ok();
-        writeln!(e.out, "#endif").ok();
-        writeln!(e.out, "{INDENT}auto& _trace_time = ctx._trace_time;").ok();
-        writeln!(e.out, "{INDENT}auto& errors = ctx.errors;").ok();
-        writeln!(e.out, "{INDENT}auto& _fatal = ctx._fatal;").ok();
-        writeln!(e.out, "{INDENT}auto& cycle_count = ctx.cycle_count;").ok();
-        writeln!(e.out, "{INDENT}auto& trace = ctx.trace;").ok();
-        writeln!(e.out, "{INDENT}auto& log_ctx = ctx.log_ctx;").ok();
-        writeln!(e.out, "{INDENT}auto& _checkers = ctx._checkers;").ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto& _post_eval_services = ctx._post_eval_services;"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto& _auto_cov_reports = ctx._auto_cov_reports;"
-        )
-        .ok();
-        // Waveform tracer setup (issue #209). Only compiled in when
-        // `harc sim --waves` defined `HARC_TRACE_VCD` or
-        // `HARC_TRACE_FST`. `HARC_WAVE_FILE` (set by `harc sim`)
-        // selects the output path; `HARC_TRACE_DEPTH` selects the
-        // hierarchy depth passed to `dut->trace()`. `_trace_time` is
-        // a monotonically increasing dump cursor — its absolute
-        // units do not matter, only that successive dump helper calls
-        // receive strictly-increasing values so GTKWave /
-        // surfer can order events.
-        writeln!(e.out, "#if HARC_TRACE_ENABLED").ok();
-        writeln!(e.out, "{INDENT}Verilated::traceEverOn(true);").ok();
-        writeln!(e.out, "{INDENT}tfp = new HarcTraceC;").ok();
-        writeln!(
-            e.out,
-            "{INDENT}_wave_path = harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"
-        )
-        .ok();
-        writeln!(e.out, "#endif").ok();
-        // Per spec §7.7: `log(fatal, ...)` aborts this test instance at
-        // the end of the current cycle. The flag is checked by the
-        // main simulation-loop guard below.
-        writeln!(e.out, "").ok();
-        // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
-        // is defined so it lands in sim.log along with normal test output.
-        writeln!(e.out, "{INDENT}harc_rng.seed_from_env();").ok();
-        writeln!(
-            e.out,
-            "{INDENT}harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"{dut_type}\", \"{}\", cycle_count);",
-            test.name.name
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto _harc_trace_dump_next = [&](const char* clock, uint64_t clock_cycle) {{"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}uint64_t t = _trace_time++;").ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(e.out, "").ok();
-        // sim.log captures every log()/assert/fail line with cycle + severity
-        // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
-        // outer harness can put it in the build dir); default `sim.log` in cwd.
-        // Echo the active waveform path into sim.log so post-mortem
-        // log inspection links to the matching VCD/FST without
-        // grepping stderr. No-op in non-trace builds.
-        writeln!(
-            e.out,
-            "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"
-        )
-        .ok();
-        writeln!(e.out, "").ok();
-        // Concurrent assertion hook — every `assert property <expr>` /
-        // `assert property NAME` registers a closure here; tick() invokes the
-        // whole list after each `eval()`. Same-cycle (`|->`) and one-cycle
-        // (`|=>`) properties run on every primary-clock edge.
-        writeln!(e.out, "").ok();
-
-        if clocks.is_empty() {
-            // Single-clock backward-compat path: drives `dut->clk` when the DUT
-            // has that member (clocked modules). Purely combinational DUTs have no
-            // `clk` port, so `_harc_eval_{negedge,posedge}` silently skip the
-            // assignment via `if constexpr (requires { dut->clk; })`.
-            // cycle_count increments once per tick.
-            writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}if (!_post_eval_services.empty()) _harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-            writeln!(e.out, "{INDENT}}};").ok();
-            writeln!(e.out, "").ok();
-        } else {
-            // Multi-clock scheduler: every declared clock keeps its own next-edge
-            // timestamp; we advance simulation time to the earliest pending edge,
-            // toggle that clock, call eval(). cycle_count tracks rising edges of
-            // the primary clock (first-declared) so existing log lines remain
-            // meaningful.
-            writeln!(e.out, "{INDENT}long long now_ps = 0;").ok();
-            writeln!(e.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; }};").ok();
-            writeln!(e.out, "{INDENT}std::vector<ClockState> clocks_;").ok();
-            for c in &clocks {
-                // Period source: time literal `5ns` OR domain reference `FastDomain`
-                // (looked up in the domain table → derived from freq_mhz).
-                let period_ps = match &*c.period.kind {
-                ExprKind::Time(s) => time_literal_to_ps(s).map_err(EmitError)?,
-                ExprKind::Ident(id) => *domains.get(&id.name).ok_or_else(|| EmitError(format!(
-                    "clock {} references domain `{}` but no `domain {}` declaration was found in any input file",
-                    c.name.name, id.name, id.name
-                )))?,
-                _ => return Err(EmitError(format!(
-                    "clock {} period must be a time literal (e.g. 5ns) or a domain name (e.g. FastDomain)",
-                    c.name.name
-                ))),
-            };
-                let half = period_ps / 2;
-                // First edge fires at half_period (rising) so initial state is 0.
-                writeln!(
-                    e.out,
-                    "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
-                    c.name.name
-                )
-                .ok();
-                writeln!(e.out, "{INDENT}dut->{} = 0;", c.name.name).ok();
-            }
-            writeln!(e.out, "").ok();
-            writeln!(
-                e.out,
-                "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}while (now_ps < t_ps) {{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}long long next = t_ps;").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}bool _primary_rising = false;"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}const char* _last_edge_clock = \"\";"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}uint64_t _last_edge_cycle = 0;"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;"
-            )
-            .ok();
-            // Per-clock signal write — done by name lookup.
-            for (idx, c) in clocks.iter().enumerate() {
-                writeln!(
-                    e.out,
-                    "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
-                    c.name.name
-                )
-                .ok();
-            }
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;"
-            )
-            .ok();
-            // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_clock = c.name;"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_cycle = (uint64_t)c.rising_count;"
-            )
-            .ok();
-            // Primary clock rising edge bumps cycle_count.
-            writeln!(
-            e.out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) {{ cycle_count++; _primary_rising = true; }}"
-        )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}}}").ok();
-            writeln!(e.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
-            // Set semantic trace timing for this edge *before* post_eval
-            // services (so their trace events carry the right time), but
-            // defer the waveform dump until after those services and the
-            // follow-up eval settle. VCD allows only one dump per physical
-            // timestamp, so we dump exactly once per `now_ps` (issue #477).
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}if (_primary_rising) {{ for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) dut->eval(); }}"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}{INDENT}_harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-            writeln!(e.out, "{INDENT}}};").ok();
-            writeln!(e.out, "").ok();
-            // `tick()` advances by one full primary clock period (one rising
-            // edge). Other clocks tick at their natural rate during this span.
-            writeln!(e.out, "{INDENT}auto tick = [&]() {{").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
-            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-            writeln!(e.out, "{INDENT}}};").ok();
-            writeln!(e.out, "").ok();
-        }
-        // Variadic so log()/assert/fail callers can pass printf-style args
-        // produced by `${expr}` string-interpolation lowering. The generated
-        // lambdas keep the varargs ABI; runtime helpers own the sinks.
-        // Per-file log handles, opened on first reference, closed at exit.
-        // Relative paths are anchored to HARC_LOG_DIR by the runtime helper.
-        writeln!(
-            e.out,
-            "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(e.out, "").ok();
-        // After sim_log_line below is defined, emit the seed line so it lands
-        // in sim.log on every run — required for reproducing failures.
-        let log_seed = true;
-
-        writeln!(
-            e.out,
-            "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(e.out, "").ok();
-
-        // Route an empty-queue pop through the sim's own FATAL path
-        // instead of the runtime header's abort backstop: the run
-        // records the failure, unwinds normally, and still writes its
-        // log and trace. `_fatal` is a loop-exit condition, so the run
-        // stops at the next scheduler tick — same semantics as
-        // `log(fatal, ...)`. The TB-IR prologue
-        // (`codegen/tbir/runtime.rs`) emits this verbatim too; the text
-        // must stay identical or the v1-vs-TB-IR trace-diff diverges on
-        // the FATAL line.
-        writeln!(
-            e.out,
-            "{INDENT}harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {{"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}{INDENT}sim_log_line(\"FATAL\", \"pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed\");"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}{INDENT}ctx.errors++;").ok();
-        writeln!(e.out, "{INDENT}{INDENT}_fatal = true;").ok();
-        writeln!(e.out, "{INDENT}}});").ok();
-        writeln!(e.out, "").ok();
-
-        if log_seed {
-            writeln!(
-                e.out,
-                "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng.state);"
-            )
-            .ok();
-            writeln!(e.out, "").ok();
-        }
-
-        // User-defined functions become lambdas. Emitted before the test body so
-        // the body can call them. Capture-all (`[&]`) so they see `dut`/`tick`/
-        // any test-level let bindings.
-        for f in &funcs {
-            e.emit_function(f, 1);
-        }
-        if !funcs.is_empty() {
-            writeln!(e.out, "").ok();
-        }
-        // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
-        // functions so the run-block can invoke them and consume the result.
-        for t in &tseqs {
-            e.emit_tseq(t, 1);
-        }
-        if !tseqs.is_empty() {
-            writeln!(e.out, "").ok();
-        }
-        // Hookable methods on driver / agent / env / sequencer / scoreboard
-        // become free `[&]`-capturing lambdas named `<Type>_<method>`. The
-        // method-call site rewrites `obj.method(args)` to
-        // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
-        // / etc. from the test scope.
-        //
-        // Pre/post hook vectors emit FIRST so the method bodies (and the
-        // test-scope `on obj.method pre/post` registrations) can `[&]`-
-        // capture them. Empty vectors are no-ops; the wrap is unconditional.
-        let mut emitted_any_method = false;
-        // Hook vectors emit in dependency order so that a method
-        // body which calls into another transactor / component's
-        // method finds the corresponding `<Type>_<method>_pre/_post`
-        // vector already declared at its capture site. The vectors
-        // themselves don't reference each other, but the method
-        // lambdas below — which `[&]`-capture these vectors — do
-        // call across component boundaries; co-locating hook
-        // vectors and methods in the same order keeps the capture
-        // graph acyclic. See `topo_sort_component_indices` (#301).
-        for &idx in &component_order {
-            match &file.items[idx] {
-                Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
-                    for ci in &c.items {
-                        if let ComponentItem::Hookable(h) = ci {
-                            e.emit_hook_vectors(c, h, 1);
-                        }
-                    }
-                }
-                Item::Transactor(t) => {
-                    let synth = synth_component_from_transactor(t, /*include_active*/ true);
-                    for ci in &synth.items {
-                        if let ComponentItem::Hookable(h) = ci {
-                            e.emit_hook_vectors(&synth, h, 1);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Watchdog hook vectors must be emitted in the same forward-decl
-        // pass as the hookable hook vectors — `on <Type>.watchdog pre/post`
-        // captures them. The `emit_watchdog` helper below emits BOTH the
-        // hook vectors AND the synthetic method body in one go, since the
-        // method body refers to those vectors. So we forward-declare the
-        // method via the same pass that emits hookable method lambdas
-        // below; here, no separate forward decl is needed because the
-        // method lambda + its hook vectors are emitted together at that
-        // point.
-        // Pre-scan: register test-scope bus bindings (`let axil :
-        // BusAxiLite = bind dut`) and driver-type → binding mappings
-        // BEFORE hookable methods emit. Hookables on `bound to BusType`
-        // drivers need the binding active so `bus.<ch>.send/recv` and
-        // `bus.<ch>.<sig>` resolve correctly. emit_let later re-registers
-        // the bus bindings (idempotent — same key, same value).
-        for it in &test.items {
-            if let TestItem::Let(l) = it {
-                if l.bind {
-                    if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                        if let Some(bus_decl) = e.buses.get(simple).cloned() {
-                            if let Some(v) = &l.value {
-                                let mut buf = String::new();
-                                std::mem::swap(&mut e.out, &mut buf);
-                                e.emit_expr(v);
-                                std::mem::swap(&mut e.out, &mut buf);
-                                let prefix = l.name.name.clone();
-                                // Effective param env for `generate_if` gate
-                                // evaluation: bus defaults overlaid with the
-                                // bind-site generic overrides (`BusAxi4#(READ=0)`)
-                                // and then the DUT port's own override
-                                // (`port s: target BusAxi4<WRITE=0>`), which is
-                                // authoritative for which gated channels
-                                // `arch build` actually flattened. The bind name
-                                // equals the DUT port name by convention.
-                                let env = bus_param_env_with_port_override(
-                                    &bus_decl,
-                                    l.ty.as_ref(),
-                                    e.dut_bus_port_overrides.get(&l.name.name),
-                                );
-                                e.bus_param_envs.insert(l.name.name.clone(), env);
-                                e.bus_bindings
-                                    .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
-                                // Populate the per-bind signal remap so hookable-
-                                // method emission (which precedes `emit_let`) can
-                                // resolve `bus.<ch>.<sig>` against the override
-                                // table. Without this pre-pass, transactor
-                                // bodies use only the prefix-convention name and
-                                // the override never fires for indirectly-routed
-                                // accesses.
-                                if !l.bind_remap.is_empty() {
-                                    let mut map: std::collections::HashMap<
-                                        (String, String),
-                                        String,
-                                    > = std::collections::HashMap::new();
-                                    for entry in &l.bind_remap {
-                                        if entry.path.len() == 2 {
-                                            map.insert(
-                                                (
-                                                    entry.path[0].name.clone(),
-                                                    entry.path[1].name.clone(),
-                                                ),
-                                                entry.port.clone(),
-                                            );
-                                        }
-                                    }
-                                    e.bus_remap.insert(prefix, map);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for it in &test.items {
-            if let TestItem::Let(l) = it {
-                if l.bind {
-                    if let Some(simple) = type_simple_name(l.ty.as_ref()) {
-                        let bound_decl_to_bus = e
-                            .components
-                            .get(simple)
-                            .and_then(|c| c.bound_to.as_ref().map(|_| ()))
-                            .is_some()
-                            || e.transactors
-                                .get(simple)
-                                .and_then(|t| t.bound_to.as_ref().map(|_| ()))
-                                .is_some();
-                        if bound_decl_to_bus {
-                            if let Some(v) = &l.value {
-                                if let ExprKind::Ident(rhs) = &*v.kind {
-                                    if let Some(binding) = e.bus_bindings.get(&rhs.name).cloned() {
-                                        // First binding wins; multi-instance is deferred.
-                                        e.driver_bus_for_hookables
-                                            .entry(simple.to_string())
-                                            .or_insert(binding);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Hookable methods on regular components (agent / env /
-        // sequencer / scoreboard) plus transactors. Transactor hookables
-        // are emitted via the synth ComponentDecl so the existing
-        // emit_component_method path finds the same struct shape.
-        //
-        // Emission order: dependency-sorted (`component_order` from
-        // above) — a method body that calls `field.method(...)`
-        // lowers to `<FieldType>_<method>(self.field, ...)`, so the
-        // referenced lambda must be declared before the calling
-        // lambda's `[&]` capture. Source-order emission breaks for
-        // a transactor whose field type appears later in the file
-        // (issue #301); the topo sort guarantees the callee's
-        // lambda is in scope at the caller's capture.
-        for &idx in &component_order {
-            match &file.items[idx] {
-                Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
-                    for ci in &c.items {
-                        if let ComponentItem::Hookable(h) = ci {
-                            e.emit_component_method(c, h, 1);
-                            emitted_any_method = true;
-                        }
-                        if let ComponentItem::Watchdog(w) = ci {
-                            e.emit_watchdog(c, w, 1);
-                            emitted_any_method = true;
-                        }
-                    }
-                }
-                Item::Transactor(t) => {
-                    // include_active = true so any hookable inside `when
-                    // active` is also emitted. Active-only hookables on a
-                    // passive instance still compile but won't be invoked
-                    // at runtime (no input event firing).
-                    let synth = synth_component_from_transactor(t, /*include_active*/ true);
-                    for ci in &synth.items {
-                        if let ComponentItem::Hookable(h) = ci {
-                            e.emit_component_method(&synth, h, 1);
-                            emitted_any_method = true;
-                        }
-                        if let ComponentItem::Watchdog(w) = ci {
-                            e.emit_watchdog(&synth, w, 1);
-                            emitted_any_method = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if emitted_any_method {
-            writeln!(e.out, "").ok();
-        }
-
-        // ── Scheduler — declared before hoisted lets so bound coroutine
-        // drivers (Phase 2b) can register their slots inline at the
-        // hoisted-let site. The run coroutine's slot is added below
-        // alongside its body.
-        writeln!(e.out, "{INDENT}harc_rt::ThreadScheduler sched;").ok();
-
-        // Other lets get hoisted up front. Bound coroutine drivers also
-        // emit their slot + per-driver transaction queue + actor
-        // coroutine here (see the `let drv : Drv = bind axil` arm in
-        // emit_let).
-        for l in &other_lets {
-            e.emit_let(l, 1);
-        }
-
-        // Custom `phase <name> ... end phase <name>` blocks from the test
-        // lifecycle body (spec §7.2). Emitted after hoisted lets so
-        // phase bodies can reference test-level env/agent/scoreboard
-        // instances. Calls of the form `<name>()` from inside `run` lower as
-        // plain C++ function calls; `wait` inside the phase takes the sync
-        // `tick()` path because the lambda body emits with `in_coroutine =
-        // false`.
-        if !custom_phases.is_empty() {
-            for (name, body) in &custom_phases {
-                e.pad(1);
-                writeln!(e.out, "auto {} = [&]() -> void {{", name.name).ok();
-                e.emit_block(body, 2);
-                e.pad(1);
-                writeln!(e.out, "}};").ok();
-            }
-            writeln!(e.out, "").ok();
-        }
-
-        // ── Coroutine wrap for the test body ───────────────────────────────
-        //
-        // The whole test body (bare stmts + scope sim/{setup,run,check,
-        // teardown}) becomes a single C++20 coroutine driven by
-        // `harc_rt::ThreadScheduler`. Setting `in_coroutine = true` flips
-        // the wait/tick lowering inside this scope to emit
-        // `co_await harc_rt::wait_cycles(_slot, N)` instead of the
-        // synchronous `for (...) tick();` form.
-        //
-        // The lambda captures by reference (`[&]`) so it sees `dut`,
-        // `tick`, `cycle_count`, `_checkers`, hookable-method lambdas,
-        // and any hoisted lets defined above in `main`'s scope.
-        //
-        // After the coroutine is constructed, `sched.bootstrap()` resumes
-        // every initially-Ready slot once (the run setup statements,
-        // plus any bound-driver actors' first wait_until on their queue).
-        // The main loop then drives the clock until the run coroutine is
-        // `Done` — driver coroutines may still be parked in WaitUntil
-        // (queue empty) at that point; abandoning them is intentional
-        // since the test is over.
-        writeln!(e.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
-        writeln!(e.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
-        writeln!(
-            e.out,
-            "{INDENT}auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
-        )
-        .ok();
-
-        e.in_coroutine = true;
-        for it in &test.items {
-            match it {
-                TestItem::Stmt(s) => e.emit_stmt(s, 2),
-                TestItem::Scope(s) => {
-                    if let Some(b) = &s.setup {
-                        e.emit_block(b, 2);
-                    }
-                    if let Some(b) = &s.run {
-                        e.emit_block(b, 2);
-                    }
-                    if let Some(b) = &s.check {
-                        e.emit_block(b, 2);
-                    }
-                    if let Some(b) = &s.teardown {
-                        e.emit_block(b, 2);
-                    }
-                }
-                _ => {}
-            }
-        }
-        e.in_coroutine = false;
-
-        writeln!(e.out, "{INDENT}{INDENT}co_return;").ok();
-        writeln!(e.out, "{INDENT}}};").ok();
-        writeln!(
-            e.out,
-            "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);"
-        )
-        .ok();
-        writeln!(e.out, "").ok();
-
-        // `actor_threads` is populated only when `--mt` is set (cooperative
-        // mode pushes actor slots into the global `sched` instead). So
-        // `mt` here means "we have per-actor schedulers needing barrier
-        // sync"; cooperative mode skips the worker spawn / barrier dance
-        // entirely even when actors are present.
-        let n_actors = e.actor_threads.len();
-        let mt = n_actors > 0;
-        debug_assert!(mt == (e.mt && !e.actor_threads.is_empty()));
-        let _ = e.mt; // suppress unused warning when no actors
-
-        // ── Bootstrap ──────────────────────────────────────────────────────
-        // Single-threaded — workers haven't started yet. Each scheduler
-        // (main + per-actor) runs its initially-Ready slots once until
-        // they hit their first co_await.
-        writeln!(
-            e.out,
-            "{INDENT}// Resume each coroutine once so initial-setup statements run"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// before the first clock edge. Single-threaded — workers"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}// haven't been spawned yet.").ok();
-        writeln!(e.out, "{INDENT}sched.bootstrap();").ok();
-        if mt {
-            for (sched_var, _) in &e.actor_threads {
-                writeln!(e.out, "{INDENT}{sched_var}.bootstrap();").ok();
-            }
-        }
-        writeln!(e.out, "").ok();
-
-        if mt {
-            // ── Phase 3a multi-thread topology ──────────────────────────
-            // Each actor coroutine runs on its own `std::thread`. Per
-            // posedge: main runs the run-coroutine, two atomic-spin
-            // barriers synchronize main with N worker threads, each
-            // worker runs `_<n>_sched.tick()` once. Then main does
-            // `dut->eval()` (single-threaded — Verilator-generated DUT
-            // code is not MT-safe) and runs `_checkers`. The dual
-            // barrier mirrors arch-com's Phase 3 design (`Barrier` class
-            // shared in `harc_thread_rt.h`); cycle batching to amortize
-            // barrier cost is Phase 3b.
-            writeln!(
-                e.out,
-                "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
-                n_actors,
-                n_actors + 1
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
-            writeln!(
-                e.out,
-                "{INDENT}harc_rt::Barrier _start_barrier({});",
-                n_actors + 1
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}harc_rt::Barrier _end_barrier({});",
-                n_actors + 1
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}std::vector<std::thread> _workers;").ok();
-            for (sched_var, _) in &e.actor_threads {
-                writeln!(e.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
-                writeln!(e.out, "{INDENT}{INDENT}while (true) {{").ok();
-                writeln!(e.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
-                writeln!(
-                    e.out,
-                    "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
-                )
-                .ok();
-                writeln!(e.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
-                writeln!(e.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
-                writeln!(e.out, "{INDENT}{INDENT}}}").ok();
-                writeln!(e.out, "{INDENT}}});").ok();
-            }
-            writeln!(e.out, "").ok();
-        }
-
-        writeln!(
-            e.out,
-            "{INDENT}// Drive the clock until the run coroutine completes."
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}//").ok();
-        writeln!(
-            e.out,
-            "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// values set in the segment BEFORE the wait are sampled at the"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}// next posedge. Per loop iteration:").ok();
-        writeln!(
-            e.out,
-            "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}//      values (set in the previous segment, or in bootstrap on"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}//      the first iteration).").ok();
-        writeln!(
-            e.out,
-            "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge."
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the"
-        )
-        .ok();
-        writeln!(e.out, "{INDENT}//      newly-set inputs.").ok();
-        writeln!(e.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
-        writeln!(
-            e.out,
-            "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly"
-        )
-        .ok();
-        writeln!(
-            e.out,
-            "{INDENT}// one posedge that observes the just-set values."
-        )
-        .ok();
-        if mt {
-            writeln!(e.out, "{INDENT}//").ok();
-            writeln!(
-                e.out,
-                "{INDENT}// MT mode: workers run between tick() and the falling edge,"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}// complete BEFORE workers wake → no race on shared queues."
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}// eval → no race on signal state.").ok();
-        }
-        if clocks.is_empty() {
-            // Initial comb settle — bootstrap's inputs propagate through
-            // combinational logic before the first posedge.
-            writeln!(e.out, "{INDENT}_harc_eval_negedge(dut);").ok();
-            writeln!(
-                e.out,
-                "{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
-            )
-            .ok();
-            // Posedge first — latches current input values.
-            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}cycle_count++;").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}if (!_post_eval_services.empty()) _harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
-            )
-            .ok();
-            // Then advance the run coroutine for the next cycle's inputs.
-            writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
-            if mt {
-                writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
-                writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
-            }
-            // Falling edge + comb resettle with the new inputs.
-            writeln!(e.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-            writeln!(e.out, "{INDENT}}}").ok();
-        } else {
-            // Multi-clock: initial bare eval() to settle combinational
-            // logic with bootstrap inputs (no clock advancement). The
-            // loop's eval_clocks_until then advances time by one full
-            // primary-clock period per iteration. Posedge-vs-tick ordering
-            // is constrained by eval_clocks_until's atomic per-edge eval
-            // — we tick AFTER eval_clocks_until so the run coroutine
-            // observes the just-completed cycle's outputs and sets the
-            // next cycle's inputs in time for the following iteration's
-            // first edge. Same effect as the single-clock branch, just
-            // with the clock toggling factored into eval_clocks_until.
-            writeln!(e.out, "{INDENT}dut->eval();").ok();
-            writeln!(
-                e.out,
-                "{INDENT}_harc_trace_dump_at((uint64_t)now_ps, \"\", 0);"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
-            )
-            .ok();
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
-            writeln!(e.out, "{INDENT}{INDENT}sched.tick();").ok();
-            if mt {
-                writeln!(e.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
-                writeln!(e.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
-            }
-            writeln!(e.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
-            writeln!(e.out, "{INDENT}}}").ok();
-        }
-
-        if mt {
-            // Shutdown sequence: workers are blocked on _start_barrier
-            // (their next iteration). Set _shutdown, wake them via the
-            // start barrier; they observe the flag and break out of their
-            // loop without reaching _end_barrier. Then join.
-            writeln!(e.out, "").ok();
-            writeln!(
-                e.out,
-                "{INDENT}_shutdown.store(true, std::memory_order_release);"
-            )
-            .ok();
-            writeln!(e.out, "{INDENT}_start_barrier.wait();").ok();
-            writeln!(e.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
-        }
-        writeln!(e.out, "").ok();
-
-        // Final + return.
-        writeln!(e.out, "").ok();
-        writeln!(e.out, "{INDENT}for (auto& _r : _auto_cov_reports) _r();").ok();
-        // Property-cover summary (ARCH-style: header line + per-point lines
-        // with `*NOT HIT*` marker; stdout destination — see covergroup
-        // report() for the rationale on stdout vs stderr).
-        if !e.covers.is_empty() {
-            let n_covers = e.covers.len();
-            writeln!(e.out, "{INDENT}{{").ok();
-            writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_total = {n_covers};").ok();
-            writeln!(e.out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
-            let covers_clone = e.covers.clone();
-            for c in &covers_clone {
-                writeln!(
-                    e.out,
-                    "{INDENT}{INDENT}if (_cov_{tag}_hits > 0) _cov_hit++;",
-                    tag = c.tag
-                )
-                .ok();
-            }
-            writeln!(
-                e.out,
-                "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);"
-            )
-            .ok();
-            for c in &covers_clone {
-                writeln!(e.out,
-                "{INDENT}{INDENT}harc_rt::log::harc_print_cover_point(\"{label}\", _cov_{tag}_hits);",
-                tag = c.tag, label = escape_c(&c.label)).ok();
-            }
-            writeln!(e.out, "{INDENT}}}").ok();
-        }
-        writeln!(e.out, "{INDENT}dut->final();").ok();
-        // Verilator coverage write — the runtime macro is a no-op unless the
-        // TB was built with `harc sim --coverage` (which sets `--coverage` on
-        // verilator → defines `VM_COVERAGE=1`).
-        writeln!(
-            e.out,
-            "{INDENT}HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"
-        )
-        .ok();
-        // Waveform tracer teardown (issue #209). Must precede
-        // `delete dut` because `tfp->close()` writes the
-        // end-of-trace marker via the trace dispatcher held by the
-        // DUT root. Skipped via the same compile-time gate as
-        // tracer construction.
-        writeln!(e.out, "{INDENT}HARC_RT_CLOSE_WAVE_TRACE(tfp);").ok();
-        writeln!(e.out, "{INDENT}delete dut;").ok();
-        writeln!(e.out, "").ok();
-        writeln!(
-            e.out,
-            "{INDENT}return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"
-        )
-        .ok();
-        writeln!(e.out, "}}").ok();
-        writeln!(e.out, "").ok();
-    } // end of `for test in &tests`
+    for test in tests.iter() {
+        e.emit_test_run(&prep, test)?;
+    }
 
     // Dispatcher `main()` (Phase 1b). One branch per test: the
     // dispatcher reads `--test <name>` from argv (preferred) or the
@@ -3867,7 +3453,7 @@ pub fn emit_with_opts(file: &SourceFile, opts: EmitOpts) -> Result<String, EmitE
     )
     .ok();
     // Branches for every test.
-    for t in &tests {
+    for t in tests.iter() {
         let n = &t.name.name;
         writeln!(
             e.out,
@@ -6404,6 +5990,22 @@ struct Emitter {
     /// "running" (between its co_awaits), so a sync `tick()` from
     /// inside a method does not race the scheduler.
     in_coroutine: bool,
+    /// Common-object layout flavor. [`Flavor::Legacy`] keeps the
+    /// historical self-contained byte stream; [`Flavor::CommonImpl`] and
+    /// [`Flavor::Capsule`] route shared-callable references through the
+    /// generated per-run glue object (`_glue.` prefix) and move
+    /// function-local mutable statics into per-run runtime storage so
+    /// two sequential runs in one process never share state.
+    flavor: Flavor,
+    /// Mutable per-run cells recorded while emitting under the common
+    /// layout. The suite header is rendered last, after every artifact
+    /// has declared its cells, so the runtime `_cells` block is complete.
+    per_run_cells: Vec<PerRunCell>,
+    /// Names of shared callables (suite functions, tseqs, hookable
+    /// methods, watchdogs) that live as members of the generated glue
+    /// object. Under the common layout, plain-name calls to these emit a
+    /// `_glue.` prefix.
+    glue_callees: std::collections::HashSet<String>,
     /// Phase 3a: list of `(scheduler_var, slot_var)` pairs for every
     /// actor coroutine that should run on its own OS thread. Each
     /// entry corresponds to a bound-driver or bound-monitor actor.
@@ -6876,10 +6478,19 @@ impl Emitter {
 
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
-        // Static slots for delay state — survive across closure calls.
-        for (i, _t) in temporals.iter().enumerate() {
-            self.pad(depth + 1);
-            writeln!(self.out, "static int64_t {tag}_ps{i} = 0;").ok();
+        // Delay-state cells — survive across closure calls. Under the
+        // common layout they live in the suite runtime's per-run
+        // `_cells` block instead of function-local statics.
+        let ps_cells: Vec<String> = (0..temporals.len())
+            .map(|i| {
+                self.per_run_cell(format!("{tag}_ps{i}"), "int64_t", Some("0"))
+            })
+            .collect();
+        if self.flavor == Flavor::Legacy {
+            for (i, _t) in temporals.iter().enumerate() {
+                self.pad(depth + 1);
+                writeln!(self.out, "static int64_t {tag}_ps{i} = 0;").ok();
+            }
         }
         // Current-value locals + populate prop_subs.
         for (i, t) in temporals.iter().enumerate() {
@@ -6887,11 +6498,12 @@ impl Emitter {
             write!(self.out, "int64_t {tag}_cur{i} = (int64_t)(").ok();
             self.emit_expr(&t.inner);
             writeln!(self.out, ");").ok();
+            let ps = &ps_cells[i];
             let sub = match t.kind {
-                SystemFn::Past => format!("{tag}_ps{i}"),
-                SystemFn::Rose => format!("(!{tag}_ps{i} && {tag}_cur{i})"),
-                SystemFn::Fell => format!("({tag}_ps{i} && !{tag}_cur{i})"),
-                SystemFn::Stable => format!("({tag}_ps{i} == {tag}_cur{i})"),
+                SystemFn::Past => format!("{ps}"),
+                SystemFn::Rose => format!("(!{ps} && {tag}_cur{i})"),
+                SystemFn::Fell => format!("({ps} && !{tag}_cur{i})"),
+                SystemFn::Stable => format!("({ps} == {tag}_cur{i})"),
                 SystemFn::Clog2 => continue, // not temporal — skip
             };
             self.prop_subs
@@ -6904,8 +6516,12 @@ impl Emitter {
                 lhs,
                 rhs,
             } => {
-                self.pad(depth + 1);
-                writeln!(self.out, "static bool {tag}_prev = false;").ok();
+                let prev_cell =
+                    self.per_run_cell(format!("{tag}_prev"), "bool", Some("false"));
+                if self.flavor == Flavor::Legacy {
+                    self.pad(depth + 1);
+                    writeln!(self.out, "static bool {tag}_prev = false;").ok();
+                }
                 self.pad(depth + 1);
                 write!(self.out, "bool _curr_a = (bool)(").ok();
                 self.emit_expr(lhs);
@@ -6915,7 +6531,7 @@ impl Emitter {
                 self.emit_expr(rhs);
                 writeln!(self.out, ");").ok();
                 self.pad(depth + 1);
-                writeln!(self.out, "if ({tag}_prev && !_curr_b) {{").ok();
+                writeln!(self.out, "if ({prev_cell} && !_curr_b) {{").ok();
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
@@ -6930,7 +6546,7 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
                 self.pad(depth + 1);
-                writeln!(self.out, "{tag}_prev = _curr_a;").ok();
+                writeln!(self.out, "{prev_cell} = _curr_a;").ok();
             }
             // a |-> b — same-cycle implication.
             ExprKind::Binary {
@@ -7015,8 +6631,12 @@ impl Emitter {
             // Initial state: last_fired = 0 means first firing is at
             // cycle N (NOT cycle 0 — the user didn't ask for an
             // immediate-fire-on-start; they asked for "every N cycles").
-            self.pad(depth + 1);
-            writeln!(self.out, "static int64_t {tag}_last = 0;").ok();
+            let last_cell =
+                self.per_run_cell(format!("{tag}_last"), "int64_t", Some("0"));
+            if self.flavor == Flavor::Legacy {
+                self.pad(depth + 1);
+                writeln!(self.out, "static int64_t {tag}_last = 0;").ok();
+            }
             self.pad(depth + 1);
             write!(self.out, "int64_t {tag}_period = (int64_t)(").ok();
             self.emit_expr(&h.event);
@@ -7027,11 +6647,11 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+                "if ({tag}_period > 0 && (int64_t)cycle_count - {last_cell} >= {tag}_period) {{"
             )
             .ok();
             self.pad(depth + 2);
-            writeln!(self.out, "{tag}_last = (int64_t)cycle_count;").ok();
+            writeln!(self.out, "{last_cell} = (int64_t)cycle_count;").ok();
             self.emit_block(&h.body, depth + 2);
             self.pad(depth + 1);
             writeln!(self.out, "}}").ok();
@@ -7050,16 +6670,20 @@ impl Emitter {
                 writeln!(self.out, "}}").ok();
             }
             EdgeMode::Rising | EdgeMode::Falling => {
-                self.pad(depth + 1);
-                writeln!(self.out, "static bool {tag}_prev = false;").ok();
+                let prev_cell =
+                    self.per_run_cell(format!("{tag}_prev"), "bool", Some("false"));
+                if self.flavor == Flavor::Legacy {
+                    self.pad(depth + 1);
+                    writeln!(self.out, "static bool {tag}_prev = false;").ok();
+                }
                 self.pad(depth + 1);
                 write!(self.out, "bool {tag}_curr = (bool)(").ok();
                 self.emit_expr(&h.event);
                 writeln!(self.out, ");").ok();
                 self.pad(depth + 1);
                 let cond = match h.edge {
-                    EdgeMode::Rising => format!("!{tag}_prev && {tag}_curr"),
-                    EdgeMode::Falling => format!("{tag}_prev && !{tag}_curr"),
+                    EdgeMode::Rising => format!("!{prev_cell} && {tag}_curr"),
+                    EdgeMode::Falling => format!("{prev_cell} && !{tag}_curr"),
                     EdgeMode::Level => unreachable!(),
                 };
                 writeln!(self.out, "if ({cond}) {{").ok();
@@ -7067,7 +6691,7 @@ impl Emitter {
                 self.pad(depth + 1);
                 writeln!(self.out, "}}").ok();
                 self.pad(depth + 1);
-                writeln!(self.out, "{tag}_prev = {tag}_curr;").ok();
+                writeln!(self.out, "{prev_cell} = {tag}_curr;").ok();
             }
         }
         self.pad(depth);
@@ -11845,18 +11469,23 @@ impl Emitter {
             })
             .collect();
         let arg_csv = arg_tys.join(", ");
-        self.pad(depth);
-        writeln!(
-            self.out,
-            "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_pre;",
-        )
-        .ok();
-        self.pad(depth);
-        writeln!(
-            self.out,
-            "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_post;",
-        )
-        .ok();
+        // Common layout: the vectors live on the suite runtime (one
+        // registry per generated instance), so the run-scope
+        // declarations are skipped; the capsule binds aliases instead.
+        if self.flavor == Flavor::Legacy {
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_pre;",
+            )
+            .ok();
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "std::vector<std::function<void({arg_csv})>> {comp_ty}_{m_name}_post;",
+            )
+            .ok();
+        }
     }
 
     fn emit_component_method(&mut self, c: &ComponentDecl, h: &HookableMethod, depth: usize) {
@@ -11869,7 +11498,19 @@ impl Emitter {
             .map(|t| self.c_type_for_value(t))
             .unwrap_or_else(|| "void".to_string());
         self.pad(depth);
-        write!(self.out, "auto {comp_ty}_{m_name} = [&]({comp_ty}& self").ok();
+        // Common layout: out-of-line member of the per-run glue object
+        // (defined once in the common TU). Legacy: `[&]` lambda inside
+        // `run_<Test>`. The body machinery below is shared verbatim.
+        let common_member = self.flavor != Flavor::Legacy;
+        if common_member {
+            write!(
+                self.out,
+                "{ret} HarcSuiteGlue::{comp_ty}_{m_name}({comp_ty}& self"
+            )
+            .ok();
+        } else {
+            write!(self.out, "auto {comp_ty}_{m_name} = [&]({comp_ty}& self").ok();
+        }
         // Track Named-typed params as pointers so dut.field rewrites
         // properly in the body. Restore on exit. Transaction / enum /
         // sub-component params are by-value (not pointer-shaped).
@@ -11899,7 +11540,11 @@ impl Emitter {
                 }
             }
         }
-        writeln!(self.out, ") -> {ret} {{").ok();
+        if common_member {
+            writeln!(self.out, ") {{").ok();
+        } else {
+            writeln!(self.out, ") -> {ret} {{").ok();
+        }
         // Build field-name substitution: bare `count` inside the body
         // resolves to `self.count`. Dut-pointer fields also get a
         // pointer_vars entry so `dut.field` lowers to `dut->field`.
@@ -12022,8 +11667,13 @@ impl Emitter {
         for k in added {
             self.pointer_vars.remove(&k);
         }
-        self.pad(depth);
-        writeln!(self.out, "}};").ok();
+        if common_member {
+            self.pad(depth);
+            writeln!(self.out, "}}").ok();
+        } else {
+            self.pad(depth);
+            writeln!(self.out, "}};").ok();
+        }
     }
 
     /// Default watchdog period (cycles) when the user writes `watchdog`
@@ -12060,27 +11710,39 @@ impl Emitter {
         }
         let comp_ty = &c.name.name;
         // Hook vectors — `watchdog` takes no args, so `void()` signature.
-        self.pad(depth);
-        writeln!(
-            self.out,
-            "std::vector<std::function<void()>> {comp_ty}_watchdog_pre;"
-        )
-        .ok();
-        self.pad(depth);
-        writeln!(
-            self.out,
-            "std::vector<std::function<void()>> {comp_ty}_watchdog_post;"
-        )
-        .ok();
+        // Common layout: they live on the suite runtime instead.
+        if self.flavor == Flavor::Legacy {
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "std::vector<std::function<void()>> {comp_ty}_watchdog_pre;"
+            )
+            .ok();
+            self.pad(depth);
+            writeln!(
+                self.out,
+                "std::vector<std::function<void()>> {comp_ty}_watchdog_post;"
+            )
+            .ok();
+        }
         // The method itself: a `[&]`-capturing lambda parallelling the
         // shape of `emit_component_method` so the hookable-dispatch
         // path (`<Type>_<method>(obj, args)`) finds the same symbol.
         self.pad(depth);
-        writeln!(
-            self.out,
-            "auto {comp_ty}_watchdog = [&]({comp_ty}& self) -> void {{"
-        )
-        .ok();
+        let common_member = self.flavor != Flavor::Legacy;
+        if common_member {
+            writeln!(
+                self.out,
+                "void HarcSuiteGlue::{comp_ty}_watchdog({comp_ty}& self) {{"
+            )
+            .ok();
+        } else {
+            writeln!(
+                self.out,
+                "auto {comp_ty}_watchdog = [&]({comp_ty}& self) -> void {{"
+            )
+            .ok();
+        }
         // Field substitution: bare `wdog_max_idle` inside the user body
         // resolves to `self.wdog_max_idle`. Same shape as
         // emit_component_method's `subs` setup.
@@ -12149,7 +11811,11 @@ impl Emitter {
             self.pointer_vars.remove(&k);
         }
         self.pad(depth);
-        writeln!(self.out, "}};").ok();
+        if common_member {
+            writeln!(self.out, "}}").ok();
+        } else {
+            writeln!(self.out, "}};").ok();
+        }
     }
 
     /// Emit a periodic `_checkers` closure that calls `<Type>_watchdog(<inst>)`
@@ -12185,8 +11851,15 @@ impl Emitter {
 
         self.pad(depth);
         writeln!(self.out, "_checkers.push_back([&]() {{").ok();
-        self.pad(depth + 1);
-        writeln!(self.out, "static int64_t _wdog_{inst_tag}_last = 0;").ok();
+        let wdog_last = self.per_run_cell(
+            format!("_wdog_{inst_tag}_last"),
+            "int64_t",
+            Some("0"),
+        );
+        if self.flavor == Flavor::Legacy {
+            self.pad(depth + 1);
+            writeln!(self.out, "static int64_t _wdog_{inst_tag}_last = 0;").ok();
+        }
         self.pad(depth + 1);
         write!(self.out, "int64_t _wdog_{inst_tag}_period = (int64_t)(").ok();
         if let Some(p) = &w.period {
@@ -12199,13 +11872,14 @@ impl Emitter {
         writeln!(
             self.out,
             "if (_wdog_{inst_tag}_period > 0 \
-             && (int64_t)cycle_count - _wdog_{inst_tag}_last >= _wdog_{inst_tag}_period) {{"
+             && (int64_t)cycle_count - {wdog_last} >= _wdog_{inst_tag}_period) {{"
         )
         .ok();
         self.pad(depth + 2);
-        writeln!(self.out, "_wdog_{inst_tag}_last = (int64_t)cycle_count;").ok();
+        writeln!(self.out, "{wdog_last} = (int64_t)cycle_count;").ok();
         self.pad(depth + 2);
-        writeln!(self.out, "{comp_ty}_watchdog({instance});").ok();
+        let glue = if self.flavor == Flavor::Capsule { "_glue." } else { "" };
+        writeln!(self.out, "{glue}{comp_ty}_watchdog({instance});").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
         self.pad(depth);
@@ -14838,13 +14512,20 @@ impl Emitter {
             let c_name = c_ident(&f.name);
             let scope = c_scope_ident(field_attr_unique_scope(f));
             let value_ty = txn_field_solver_c_type(f);
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static harc_rt::random::HarcUniqueHistory<{}> {cache_tag}_unique_{}_{};",
-                value_ty, scope, c_name
-            )
-            .ok();
+            let cell_name = format!("{cache_tag}_unique_{scope}_{}", c_name.clone());
+            let unique_cell =
+                self.per_run_cell(cell_name, &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"), None);
+            if self.flavor == Flavor::Legacy {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "static harc_rt::random::HarcUniqueHistory<{}> {cache_tag}_unique_{}_{};",
+                    value_ty, scope, c_name
+                )
+                .ok();
+            }
+            let _ = unique_cell;
+
         }
         if !auto_goals.is_empty() {
             for goal in &auto_goals {
@@ -14955,34 +14636,48 @@ impl Emitter {
                 auto_crosses.len()
             )
             .ok();
+            let cov_state_cell = self.per_run_cell(
+                format!("_auto_cov_state_{cache_tag}"),
+                "harc_rt::random::HarcAutoCovState",
+                None,
+            );
+            if self.flavor == Flavor::Legacy {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "static harc_rt::random::HarcAutoCovState _auto_cov_state_{cache_tag};"
+                )
+                .ok();
+            }
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "static harc_rt::random::HarcAutoCovState _auto_cov_state_{cache_tag};"
+                "harc_rt::random::harc_auto_cov_init(_auto_cov_plan_{cache_tag}, {cov_state_cell});"
             )
             .ok();
+            let cov_report_cell = self.per_run_cell(
+                format!("_auto_cov_report_registered_{cache_tag}"),
+                "bool",
+                Some("false"),
+            );
+            if self.flavor == Flavor::Legacy {
+                self.pad(depth + 1);
+                writeln!(
+                    self.out,
+                    "static bool _auto_cov_report_registered_{cache_tag} = false;"
+                )
+                .ok();
+            }
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_init(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag});"
-            )
-            .ok();
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "static bool _auto_cov_report_registered_{cache_tag} = false;"
-            )
-            .ok();
-            self.pad(depth + 1);
-            writeln!(
-                self.out,
-                "harc_rt::random::harc_auto_cov_register_report(_auto_cov_report_registered_{cache_tag}, _auto_cov_reports, [&]() {{"
+                "harc_rt::random::harc_auto_cov_register_report({cov_report_cell}, _auto_cov_reports, [&]() {{"
             )
             .ok();
             self.pad(depth + 2);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_report(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag});"
+                "harc_rt::random::harc_auto_cov_report(_auto_cov_plan_{cache_tag}, {cov_state_cell});"
             )
             .ok();
             self.pad(depth + 1);
@@ -15138,13 +14833,20 @@ impl Emitter {
             let scope = c_scope_ident(field_attr_unique_scope(f));
             self.pad(depth + 1);
             let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
+            let value_ty = txn_field_solver_c_type(f);
+            let unique_use = self.per_run_cell(
+                format!("{cache_tag}_unique_{scope}_{}", c_name.clone()),
+                &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"),
+                None,
+            );
+            let scope_txt = escape_c(field_attr_unique_scope(f));
             writeln!(
                 self.out,
-                "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});   // [unique within {}] policy: no repeat until exhausted",
-                c_name,
-                c_name,
-                v_expr,
-                escape_c(field_attr_unique_scope(f))
+                "for (auto _v : harc_rt::random::harc_unique_values({uu})) _s.add(_z_{cn} != {ve});   // [unique within {sc}] policy: no repeat until exhausted",
+                uu = unique_use,
+                cn = c_name,
+                ve = v_expr,
+                sc = scope_txt,
             )
             .ok();
         }
@@ -15236,11 +14938,19 @@ impl Emitter {
                 let c_name = c_ident(&other.name);
                 let scope = c_scope_ident(field_attr_unique_scope(other));
                 let v_expr = solver_bv_value_call("_v", other.signed, other.width, solver_width);
+                let value_ty = txn_field_solver_c_type(other);
+                let unique_use = self.per_run_cell(
+                    format!("{cache_tag}_unique_{scope}_{}", c_name.clone()),
+                    &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"),
+                    None,
+                );
                 self.pad(depth + 3);
                 writeln!(
                     self.out,
-                    "for (auto _v : harc_rt::random::harc_unique_values({cache_tag}_unique_{scope}_{})) _s.add(_z_{} != {});",
-                    c_name, c_name, v_expr
+                    "for (auto _v : harc_rt::random::harc_unique_values({uu})) _s.add(_z_{cn} != {ve});",
+                    uu = unique_use,
+                    cn = c_name,
+                    ve = v_expr,
                 )
                 .ok();
             }
@@ -17240,6 +16950,1855 @@ impl Emitter {
     /// Emit a `tseq` declaration as a `[&]`-capturing lambda that returns
     /// a `std::vector<T>` filled in by `yield` statements. The inner type
     /// `T` is the argument of `TSeq<T>` in the return-type slot.
+    /// Emit one test's `run_<Name>(int argc, char** argv)` entry point:
+    /// prologue (runtime context, DUT, waves, seed, scheduler), the
+    /// scenario coroutine, the drive loop, and the epilogue. Shared by
+    /// the legacy single-TU backend and the common-object capsule
+    /// emitter so both produce identical run bodies.
+    /// True when emitting a common-layout artifact (glue TU or capsule).
+    fn in_common_layout(&self) -> bool {
+        self.flavor != Flavor::Legacy
+    }
+
+    /// Register (or look up) a per-run mutable cell named `tag` and
+    /// return the C++ lvalue every use must go through.
+    ///
+    /// Legacy flavor returns the bare name — callers keep emitting their
+    /// historical function-local `static` declaration, so legacy bytes
+    /// never change. Common flavors record the cell for the suite
+    /// runtime's `_cells` block and return `ctx._cells.<tag>`; the
+    /// caller must then skip its local `static` declaration. Tags are
+    /// derived from source spans, so they are stable across emission
+    /// orders and independent of test registry position (issue #643).
+    fn per_run_cell(&mut self, tag: String, ctype: &str, init: Option<&str>) -> String {
+        if self.flavor == Flavor::Legacy {
+            return tag;
+        }
+        if !self.per_run_cells.iter().any(|c| c.tag == tag) {
+            self.per_run_cells.push(PerRunCell {
+                tag: tag.clone(),
+                ctype: ctype.to_string(),
+                init: init.map(str::to_string),
+            });
+        }
+        format!("ctx._cells.{tag}")
+    }
+
+    /// Bind the historical trace-dump helper names to their glue
+    /// implementations inside a common-layout capsule.
+    fn emit_capsule_dump_shims(&mut self) {
+        writeln!(
+            self.out,
+            "{INDENT}auto _harc_trace_dump_next = [&](const char* clock, uint64_t clock_cycle) {{ _glue._harc_trace_dump_next(clock, clock_cycle); }};"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {{ _glue._harc_trace_dump_at(t, clock, clock_cycle); }};"
+        )
+        .ok();
+    }
+
+
+
+    /// Emit the suite-wide type surface: includes, template helpers,
+    /// record/component/RAL/covergroup definitions, constants, and —
+    /// under the legacy flavor — the TU-local PRNG statics and the
+    /// `HarcTestContext` bridge struct. Shared verbatim by the legacy
+    /// single-TU emitter and the common-layout `suite_api.hpp`
+    /// generator so both describe identical types (issue #643).
+    fn emit_file_scope_scaffolding(&mut self, prep: &SuitePrep) -> Result<(), EmitError> {
+        let SuitePrep {
+            file,
+            tests,
+            domains,
+            dut_type,
+            aggregated_probes,
+            runtime_problem_table,
+            ..
+        } = prep;
+        let domains = domains;
+        let _domains = &domains;
+        let dut_type = *dut_type;
+        let uses_solver = uses_constraint_solver(file);
+        let _uses_solver = uses_solver;
+    // Header.
+        if self.flavor == Flavor::Legacy {
+writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
+    if tests.len() == 1 {
+        writeln!(self.out, "// HARC test: {}", tests[0].name.name).ok();
+    } else {
+        let names: Vec<&str> = tests.iter().map(|t| t.name.name.as_str()).collect();
+        writeln!(
+            self.out,
+            "// HARC tests ({}): {}",
+            tests.len(),
+            names.join(", ")
+        )
+        .ok();
+    }
+    writeln!(self.out, "").ok();
+    // Disable clang optimization for this file. clang 17+ on both
+    // Apple Silicon and Linux x86_64 mis-optimizes our `[&]`-
+    // capturing C++20 lambda coroutines at `-Os` / `-O2`: closure
+    // reference members fold against the original (freed) stack
+    // frame after a suspension, causing SEGV on resume. Per-file
+    // pragma keeps verilator-generated DUT `.cpp` files at `-Os`
+    // for fast simulation.
+    //
+    // GCC has the same class of miscompile but `#pragma optimize`
+    // doesn't propagate through C++20 coroutine codegen there.
+    // The structural fix (2026-06-22): every coroutine is stored
+    // in a named lambda variable (`auto _foo_lambda = [&](){...};
+    // slot.thread = _foo_lambda(&slot);`) so the closure object
+    // lives for the full duration of `run_<Test>`, not as a
+    // temporary freed at the IIFE semicolon. This fixes GCC on
+    // Linux without requiring HARC_CXX=clang++. The pragma remains
+    // as a redundant defence for clang.
+    writeln!(self.out, "#ifdef __clang__").ok();
+    writeln!(self.out, "#pragma clang optimize off").ok();
+    writeln!(self.out, "#endif").ok();
+    }
+    writeln!(self.out, "").ok();
+    writeln!(self.out, "#include \"V{dut_type}.h\"").ok();
+    // Probe access needs the root struct's full definition (the
+    // `rootp` field on V<Top> is a forward-declared pointer in
+    // `V<Top>.h`). When the test declares one or more probes, also
+    // include the root header so `dut->rootp-><mangled>` compiles.
+    if !aggregated_probes.is_empty() {
+        writeln!(self.out, "#include \"V{dut_type}___024root.h\"").ok();
+    }
+    writeln!(self.out, "#include \"verilated.h\"").ok();
+    writeln!(self.out, "#if VM_COVERAGE").ok();
+    writeln!(self.out, "#include \"verilated_cov.h\"").ok();
+    writeln!(self.out, "#endif").ok();
+    // Waveform trace headers (issue #209). Always emitted but gated
+    // on `-DHARC_TRACE_VCD` / `-DHARC_TRACE_FST`, both supplied by
+    // `harc sim --waves` at Verilator compile time. Non-trace builds
+    // never include either header, so the no-waves build cost is
+    // exactly zero.
+    writeln!(self.out, "#if defined(HARC_TRACE_VCD)").ok();
+    writeln!(self.out, "#include \"verilated_vcd_c.h\"").ok();
+    writeln!(self.out, "#define HARC_TRACE_ENABLED 1").ok();
+    writeln!(self.out, "using HarcTraceC = VerilatedVcdC;").ok();
+    writeln!(self.out, "#elif defined(HARC_TRACE_FST)").ok();
+    writeln!(self.out, "#include \"verilated_fst_c.h\"").ok();
+    writeln!(self.out, "#define HARC_TRACE_ENABLED 1").ok();
+    writeln!(self.out, "using HarcTraceC = VerilatedFstC;").ok();
+    writeln!(self.out, "#else").ok();
+    writeln!(self.out, "#define HARC_TRACE_ENABLED 0").ok();
+    writeln!(self.out, "#endif").ok();
+    writeln!(self.out, "#include <cstdio>").ok();
+    writeln!(self.out, "#include <cstdint>").ok();
+    writeln!(self.out, "#include <cstdlib>").ok();
+    writeln!(self.out, "#include <cstdarg>").ok();
+    writeln!(self.out, "#include <cstring>").ok();
+    writeln!(self.out, "#include <string>").ok();
+    writeln!(self.out, "#include <array>").ok();
+    writeln!(self.out, "#include <vector>").ok();
+    writeln!(self.out, "#include <deque>").ok();
+    writeln!(self.out, "#include <functional>").ok();
+    // Phase 3a: per-actor OS threads + barrier sync. Pulled in
+    // unconditionally — `<atomic>` is also indirectly available via
+    // `harc_thread_rt.h` but the explicit include keeps intent clear.
+    writeln!(self.out, "#include <thread>").ok();
+    writeln!(self.out, "#include <atomic>").ok();
+    // HARC's coroutine runtime — drives the test's `run` block as a
+    // C++20 coroutine via `harc_rt::ThreadScheduler`. Hookable methods
+    // and `on`-handler closures still run synchronously between the
+    // run coroutine's co_awaits; only the run body itself yields.
+    // Multi-actor parallelism (driver + monitor coroutines on the same
+    // bus) lands in Phase 2 on top of the same runtime.
+    writeln!(self.out, "#include \"harc_thread_rt.h\"").ok();
+    writeln!(self.out, "#include \"harc_random_rt.h\"").ok();
+    writeln!(self.out, "#include \"harc_queue_rt.h\"").ok();
+    writeln!(self.out, "#include \"harc_trace_rt.h\"").ok();
+    writeln!(self.out, "#include \"harc_log_rt.h\"").ok();
+    let uses_solver = uses_constraint_solver(file);
+    if uses_solver {
+        writeln!(
+            self.out,
+            "#include \"harc_z3_rt.h\"   // randomize(t) with <constraints>"
+        )
+        .ok();
+    }
+    writeln!(self.out, "").ok();
+    // Template helpers that gate clock toggling on whether the DUT exposes a
+    // `clk` member. `if constexpr (requires {{ ... }})` only suppresses the
+    // discarded branch inside a template body; moving the `dut->clk` write
+    // into a template function means calling it from `main()` or a lambda
+    // instantiates the right specialisation and the ill-formed branch for
+    // combinational DUTs is never compiled.
+    writeln!(self.out, "template<typename DUT>").ok();
+    writeln!(self.out, "static void _harc_eval_negedge(DUT* dut) {{").ok();
+    writeln!(
+        self.out,
+        "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 0; }}"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}dut->eval();").ok();
+    writeln!(self.out, "}}").ok();
+    writeln!(self.out, "template<typename DUT>").ok();
+    writeln!(self.out, "static void _harc_eval_posedge(DUT* dut) {{").ok();
+    writeln!(
+        self.out,
+        "{INDENT}if constexpr (requires {{ dut->clk; }}) {{ dut->clk = 1; }}"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}dut->eval();").ok();
+    writeln!(self.out, "}}").ok();
+    writeln!(self.out, "").ok();
+
+    if !runtime_problem_table.problems.is_empty() {
+        self.out.push_str(
+            &runtime_problem_table.render_cpp_table("_harc_runtime_random_problem_table"),
+        );
+    }
+
+    // ── PRNG runtime ──────────────────────────────────────────────────────
+    // Seed loaded from HARC_SEED through the random runtime helper.
+    if self.flavor == Flavor::Legacy {
+    writeln!(self.out, "static harc_rt::random::HarcRng harc_rng;").ok();
+    writeln!(self.out, "static inline uint64_t harc_rng_next() {{").ok();
+    writeln!(self.out, "{INDENT}return harc_rng.next();").ok();
+    writeln!(self.out, "}}").ok();
+    writeln!(self.out, "").ok();
+    } // end Legacy-only PRNG statics
+
+    // ── Shared HVL value records ────────────────────────────────────────
+    // Structs and transactions share the C++ record/equality/randomize
+    // lowering. Transactions layer keeps and protocol-facing semantics at
+    // the randomize call site and in transactors.
+    for it in &file.items {
+        if let Item::Struct(s) = it {
+            self.emit_struct_record(s);
+        }
+    }
+    for it in &file.items {
+        if let Item::Transaction(t) = it {
+            self.emit_transaction(t);
+        }
+    }
+
+    // ── Scoreboard / component / transactor structs ─────────────────────
+    // Emitted in field-dependency order so a transactor / component
+    // field whose type is another transactor / component declared
+    // later in the source list still finds a complete C++ type at
+    // its declaration site. See `topo_sort_component_indices` for
+    // the dependency rule and cycle-recovery behaviour, and issue
+    // #301 for the symptom this prevents (transactor field forward
+    // reference passed `harc check` but emitted undeclared C++).
+    //
+    // Scoreboards emit before regular components / transactors in
+    // the source-order pass below ONLY when they have no incoming
+    // edges from a transactor's fields — the topo sort handles the
+    // mixed case correctly. Covergroups still emit earlier (above)
+    // because covergroups are leaf observables that never name a
+    // component or transactor.
+    let component_order = topo_sort_component_indices(file);
+    for &idx in component_order.iter() {
+        if let Item::Scoreboard(s) = &file.items[idx] {
+            self.emit_scoreboard(s);
+        }
+    }
+
+    // ── Per-channel payload structs ──────────────────────────────────────
+    // `bus.<ch>.recv()` and `on bus.<ch>.handshake(arg)` capture the
+    // channel's full payload — for multi-payload channels (e.g. AXI's
+    // `r` carrying both `data` and `resp`) users need `arg.data` /
+    // `arg.resp`. We emit one struct per `handshake_channel`, named
+    // `<BusName>_<chan>_payload`, with one field per payload signal.
+    //
+    // The struct also exposes `operator uint64_t() const` returning
+    // the first field — backward compatible with the previous v0
+    // behaviour (`recv()` returning a scalar). Existing fixtures that
+    // do `assert val == 0xCAFEBABE` keep working without change;
+    // multi-payload access just becomes available.
+    for it in &file.items {
+        if let Item::Bus(b) = it {
+            for h in &b.handshakes {
+                if h.payload.is_empty() {
+                    continue;
+                }
+                let struct_name = format!("{}_{}_payload", b.name.name, h.name.name);
+                writeln!(self.out, "struct {struct_name} {{").ok();
+                for sig in &h.payload {
+                    let cty = txn_field_c_type(&sig.ty);
+                    writeln!(self.out, "{INDENT}{cty} {};", sig.name.name).ok();
+                }
+                // Implicit conversion to the first payload field — keeps
+                // single-field-style usage (`val == N`, `last_read = val`)
+                // compiling against the new struct type.
+                let first_sig = &h.payload[0];
+                let first_cty = txn_field_c_type(&first_sig.ty);
+                writeln!(
+                    self.out,
+                    "{INDENT}operator {first_cty}() const {{ return {}; }}",
+                    first_sig.name.name,
+                )
+                .ok();
+                writeln!(self.out, "}};").ok();
+                writeln!(self.out, "").ok();
+            }
+        }
+    }
+
+    // ── RAL regblock mirror structs + address tables ────────────────────
+    // One POD `struct <Name>_Mirror { uint<W>_t REG; ... };` per
+    // declared `regblock`, plus a `constexpr` address table giving
+    // each register's byte offset. Accessor calls (`regs.NAME = v` /
+    // `let x = regs.NAME`) lower to mirror update + helper.write/read
+    // — see docs/ral-support.md §7.4 (frontdoor lowering). Phase 1a
+    // keeps the mirror flat — no nested addrmap composition yet.
+    let any_regblock = file.items.iter().any(|it| matches!(it, Item::Regblock(_)));
+    if any_regblock {
+        // Recursion-guard depth limit for `regs.record_write` callbacks.
+        // A callback body invoking `record_write` re-enters the same
+        // decode block synchronously; without a bound, a self-write
+        // (`on regs.A { regs.record_write(0x00, ...) }`) grows the
+        // stack unboundedly. 16 leaves plenty of room for realistic
+        // nested CSR cascades while catching runaway recursion fast.
+        // See docs/ral-support.md §3.2.
+        writeln!(self.out, "#ifndef HARC_RAL_CB_MAX_DEPTH").ok();
+        writeln!(
+            self.out,
+            "static constexpr uint32_t HARC_RAL_CB_MAX_DEPTH = 16;"
+        )
+        .ok();
+        writeln!(self.out, "#endif").ok();
+        writeln!(self.out, "").ok();
+    }
+    for it in &file.items {
+        if let Item::Regblock(r) = it {
+            let default_w = r.default_width.unwrap_or(32);
+            writeln!(self.out, "struct {}_Mirror {{", r.name.name).ok();
+            for reg in &r.registers {
+                let w = reg.width.unwrap_or(default_w);
+                let cty = mirror_field_c_type(w);
+                let init = match &reg.reset {
+                    Some(rv) => format!(" = {}", c_int_literal_from(&rv.kind)),
+                    None => " = 0".to_string(),
+                };
+                writeln!(self.out, "{INDENT}{cty} {}{};", reg.name.name, init).ok();
+            }
+            writeln!(self.out, "}};").ok();
+            writeln!(self.out, "").ok();
+
+            // constexpr address table — one entry per register, indexed
+            // by C++ identifier matching the source register name. Used
+            // by future bitbash() lowering; reads/writes inline the
+            // offset literal directly for simplicity in Phase 1a.
+            writeln!(
+                self.out,
+                "struct {}_AddrEntry {{ const char* name; uint64_t offset; uint32_t width; }};",
+                r.name.name,
+            )
+            .ok();
+            writeln!(
+                self.out,
+                "static constexpr {}_AddrEntry {}_AddrTable[] = {{",
+                r.name.name, r.name.name,
+            )
+            .ok();
+            for reg in &r.registers {
+                let w = reg.width.unwrap_or(default_w);
+                let off = c_int_literal_from(&reg.offset.kind);
+                writeln!(
+                    self.out,
+                    "{INDENT}{{ \"{name}\", {off}, {w} }},",
+                    name = reg.name.name,
+                )
+                .ok();
+            }
+            writeln!(self.out, "}};").ok();
+            writeln!(self.out, "").ok();
+
+            // ── RAL per-register write callbacks + passive record API ──
+            // `<Name>_Callbacks` holds one optional `void(uint64_t)`
+            // closure per register. `on regs.REG ... end on` populates a
+            // slot; `regs.record_write(addr, data)` fires the matching
+            // slot after updating the mirror. `<Name>_record_read(m, addr)`
+            // is the passive read counterpart — it decodes the address to
+            // the mirror cell with no bus traffic. Both own the address
+            // decode at codegen time so a checker observing bus traffic
+            // never hand-writes an `if/elsif` address ladder.
+            // See docs/ral-support.md §3.2.
+            writeln!(self.out, "struct {}_Callbacks {{", r.name.name).ok();
+            for reg in &r.registers {
+                writeln!(
+                    self.out,
+                    "{INDENT}std::function<void(uint64_t)> {};",
+                    reg.name.name,
+                )
+                .ok();
+            }
+            writeln!(self.out, "}};").ok();
+            writeln!(self.out, "").ok();
+
+            writeln!(
+                self.out,
+                "static inline uint64_t {name}_record_read(const {name}_Mirror& m, uint64_t addr) {{",
+                name = r.name.name,
+            )
+            .ok();
+            for reg in &r.registers {
+                let off = c_int_literal_from(&reg.offset.kind);
+                writeln!(
+                    self.out,
+                    "{INDENT}if (addr == (uint64_t)({off})) return (uint64_t)m.{};",
+                    reg.name.name,
+                )
+                .ok();
+            }
+            writeln!(self.out, "{INDENT}return 0;").ok();
+            writeln!(self.out, "}}").ok();
+            writeln!(self.out, "").ok();
+        }
+    }
+
+    // ── RAL addrmap mirror structs ──────────────────────────────────────
+    // Chip-level container. Each `addrmap A { instance inst : R @ B }`
+    // lowers to `struct A_Mirror { R_Mirror inst; ... };` — one
+    // member per instance, of the corresponding regblock's Mirror
+    // type. Bus addresses for `chip.inst.REG` are computed
+    // `BASE_inst + offset(REG)` at codegen time. See docs/ral-support.md §4.
+    for it in &file.items {
+        if let Item::Addrmap(a) = it {
+            writeln!(self.out, "struct {}_Mirror {{", a.name.name).ok();
+            for inst in &a.instances {
+                // Aliased instances share mirror storage with their
+                // target — no separate field. Access through the
+                // alias rewrites to the target's mirror path at
+                // codegen time. See docs/ral-support.md §4.
+                if inst.alias_of.is_some() {
+                    writeln!(
+                        self.out,
+                        "{INDENT}// {name}: alias of {target} — shares mirror",
+                        name = inst.name.name,
+                        target = inst.alias_of.as_ref().unwrap().name,
+                    )
+                    .ok();
+                    continue;
+                }
+                writeln!(
+                    self.out,
+                    "{INDENT}{ty}_Mirror {name};",
+                    ty = inst.regblock_ty.name,
+                    name = inst.name.name,
+                )
+                .ok();
+            }
+            writeln!(self.out, "}};").ok();
+            writeln!(self.out, "").ok();
+        }
+    }
+
+    // ── Covergroup structs (per-bin counters + sample() + report()) ─────
+    // Emitted BEFORE component structs so a `testbench Tb { cov : Cg }`
+    // body can name `Cg` as a field type without a forward-decl. The
+    // testbench/env composition is the only direction the dependency
+    // runs — covergroups are leaf observables, they never name a
+    // component or transactor.
+    for it in &file.items {
+        if let Item::Covergroup(g) = it {
+            self.emit_covergroup_struct(g);
+        }
+    }
+
+    // ── Monitor structs ──────────────────────────────────────────────────
+    // Same shape as scoreboards; output `event<T>` fields lower to
+    // ── Component structs (agent / env / sequencer).
+    // Scoreboards have their own dedicated path above; the rest are
+    // plain field-bearing structs. `hookable` methods are emitted
+    // separately as free `[&]`-capturing lambdas (below) so the
+    // method body sees `dut` / `tick` / `_checkers` from the test scope.
+    //
+    // Emission order: dependency-sorted (`component_order` computed
+    // above). A transactor whose field references another transactor
+    // / component declared later in the source list emits after its
+    // dependency — fixes #301.
+    for &idx in component_order.iter() {
+        match &file.items[idx] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) => {
+                self.emit_component_struct(c);
+            }
+            Item::Transactor(t) => {
+                // Compose a synthetic ComponentDecl with the union of
+                // always-present body items + active body items, and
+                // emit a single struct. Both modes get the same C++
+                // class layout — passive instances simply don't
+                // subscribe to / spawn actors against the active
+                // fields. Mode-specific elision lives in the lowering
+                // at instantiation, not in the struct shape.
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                self.emit_component_struct(&synth);
+            }
+            _ => {}
+        }
+    }
+
+    // ── Top-level `const` items ─────────────────────────────────────────
+    // `const NAME : Ty = expr` lowers to a file-scope
+    // `static constexpr <c_type> NAME = <expr>;` so the value is
+    // available everywhere — inside `main()`, hookable lambdas (which
+    // can't capture across translation-unit boundaries but can use
+    // file-scope constants directly), `tseq` lambdas, and on-handler
+    // closures. constexpr also folds into expressions used at struct
+    // field defaults if any future fixture goes there.
+    let mut emitted_const = false;
+    for it in &file.items {
+        if let Item::Const(c) = it {
+            let cty =
+                c.ty.as_ref()
+                    .map(c_type_for)
+                    .unwrap_or_else(|| "int64_t".to_string());
+            write!(self.out, "static constexpr {cty} {} = ", c.name.name).ok();
+            self.emit_expr(&c.value);
+            writeln!(self.out, ";").ok();
+            emitted_const = true;
+        }
+    }
+    if emitted_const {
+        writeln!(self.out, "").ok();
+    }
+
+    // `extern function name(params) -> ret` (spec §9) — emit C-linkage
+    // forward declarations at file scope so the user's `--ref-src
+    // <file>.cpp` can satisfy the linker without HARC needing to know
+    // its implementation. Shared with the TB-IR codegen so both emit
+    // byte-identical `extern "C"` blocks (`emit_extern_fn_decls`).
+    emit_extern_fn_decls(&mut self.out, file);
+
+    // Shared per-run state. This is the first step toward the phase-2
+    // member/context refactor: generated run bodies still use the
+    // historical local names (`dut`, `_checkers`, `errors`, ...), but the
+    // run prologue now binds those names as references into this common
+    // context object. Future shared helper functions can take
+    // `HarcTestContext& ctx` instead of relying on `[&]` captures.
+    if self.flavor == Flavor::Legacy {
+    writeln!(self.out, "struct HarcTestContext {{").ok();
+    writeln!(self.out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
+    writeln!(self.out, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(self.out, "{INDENT}HarcTraceC* tfp = nullptr;").ok();
+    writeln!(self.out, "{INDENT}std::string _wave_path;").ok();
+    writeln!(self.out, "#endif").ok();
+    writeln!(self.out, "{INDENT}uint64_t _trace_time = 0;").ok();
+    writeln!(self.out, "{INDENT}int errors = 0;").ok();
+    writeln!(self.out, "{INDENT}bool _fatal = false;").ok();
+    writeln!(self.out, "{INDENT}int cycle_count = 0;").ok();
+    writeln!(self.out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
+    writeln!(self.out, "{INDENT}harc_rt::log::HarcLogContext log_ctx;").ok();
+    writeln!(
+        self.out,
+        "{INDENT}std::vector<std::function<void()>> _checkers;"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}std::vector<std::function<void()>> _post_eval_services;"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}std::vector<std::function<void()>> _auto_cov_reports;"
+    )
+    .ok();
+    writeln!(self.out, "}};").ok();
+    }
+    writeln!(self.out, "").ok();
+
+        Ok(())
+    }
+
+    fn emit_test_run(&mut self, prep: &SuitePrep, test: &TestDecl) -> Result<(), EmitError> {
+        let file = prep.file;
+        let funcs = &prep.funcs;
+        let tseqs = &prep.tseqs;
+        let domains = &prep.domains;
+        let dut_type = prep.dut_type;
+        let component_order = &prep.component_order;
+    // ── Reset Emitter per-test state ────────────────────────────
+    self.let_types.clear();
+    self.let_modes.clear();
+    self.let_widths.clear();
+    self.pointer_vars.clear();
+    self.pointer_vars.insert("dut".to_string());
+    self.bus_bindings.clear();
+    self.bus_param_envs.clear();
+    self.bus_remap.clear();
+    self.pending_tlm_forks.clear();
+    self.next_tlm_fork_tag.clear();
+    self.probes.clear();
+    self.probe_widths.clear();
+    self.shadowed_lets.clear();
+    self.clock_names.clear();
+    self.covers.clear();
+    self.actor_threads.clear();
+    self.field_subs.clear();
+    self.driver_bus_for_hookables.clear();
+    self.let_helper.clear();
+    self.in_coroutine = false;
+    self.current_yield_target = None;
+    self.current_component_instance = None;
+
+    // ── Derive per-test metadata ───────────────────────────────
+    let custom_phases: Vec<(Ident, Block)> = test
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            TestItem::Phase(name, body) => Some((name.clone(), body.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut other_lets: Vec<&LetStmt> = Vec::new();
+    let mut bare_stmts: Vec<&Stmt> = Vec::new();
+    let mut explicit_run: Option<&Block> = None;
+    let mut clocks: Vec<&ClockDecl> = Vec::new();
+    for it in &test.items {
+        match it {
+            TestItem::Let(l) => {
+                if l.name.name == "dut" {
+                    for p in &l.probes {
+                        self.probes.insert(
+                            p.name.name.clone(),
+                            ProbeAccessor {
+                                read: crate::codegen::sv_stub::mangled_accessor(
+                                    dut_type,
+                                    &p.name.name,
+                                ),
+                                force: p.force,
+                            },
+                        );
+                        // Mirrors TB-IR's `probe_scalar_width`: a
+                        // `Bit`/`Bool` probe is one bit wide, not
+                        // width-less. Omitting those made v1 reject a
+                        // `dut.<bit probe> +% 1` that TB-IR wraps.
+                        if let TypeExpr::Builtin { name, args, .. } = &p.ty {
+                            let w = match name {
+                                BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => {
+                                    Some(1)
+                                }
+                                BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => {
+                                    type_arg_width(args)
+                                }
+                                _ => None,
+                            };
+                            if let Some(w) = w {
+                                self.probe_widths.insert(p.name.name.clone(), w);
+                            }
+                        }
+                    }
+                } else {
+                    other_lets.push(l);
+                }
+            }
+            TestItem::Scope(s) => {
+                if let Some(r) = &s.run {
+                    explicit_run = Some(r);
+                }
+            }
+            TestItem::Stmt(s) => bare_stmts.push(s),
+            TestItem::Clock(c) => clocks.push(c),
+            _ => {}
+        }
+    }
+    if explicit_run.is_none() && bare_stmts.is_empty() {
+        return Err(EmitError(format!(
+            "test `{}` has no body — add a `scope sim`, `run`, or bare statements",
+            test.name.name,
+        )));
+    }
+    let _ = (&explicit_run, &bare_stmts);
+
+    // ── Seed Emitter per-test state ────────────────────────────
+    for l in &other_lets {
+        if let Some(s) = type_simple_name(l.ty.as_ref()) {
+            self.let_types.insert(l.name.name.clone(), s.to_string());
+        }
+        if let Some(TypeExpr::Named { mode: Some(m), .. }) = l.ty.as_ref() {
+            self.let_modes.insert(l.name.name.clone(), *m);
+        }
+        // Track bit-widths for uint<W> / sint<W> / bits<W> lets so
+        // the width-method intrinsics (`.trunc<N>()` / `.sext<N>()`
+        // etc.) can statically check that the requested width
+        // direction matches the source width, and so sext can emit
+        // its shift-fill from the right MSB position.
+        if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
+            if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
+                if let Some(w) = type_arg_width(args) {
+                    let lw = LetWidth {
+                        bits: w,
+                        signed: matches!(name, BuiltinTy::SInt),
+                    };
+                    if self.let_widths.insert(l.name.name.clone(), lw).is_some() {
+                        self.shadowed_lets.insert(l.name.name.clone());
+                    }
+                }
+            }
+        }
+        if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+            if self.transactions.contains(simple)
+                || self.scoreboards.contains(simple)
+                || self.components.contains_key(simple)
+                || self.covergroups.contains_key(simple)
+                || self.buses.contains_key(simple)
+                || self.transactors.contains_key(simple)
+                || self.regblocks.contains_key(simple)
+                || self.addrmaps.contains_key(simple)
+            {
+                continue;
+            }
+        }
+        if matches!(&l.ty, Some(TypeExpr::Named { .. })) {
+            self.pointer_vars.insert(l.name.name.clone());
+        }
+    }
+    // Seed `let_types` for the bound testbench's fields (impl-for
+    // form). After desugaring, a `testbench`-form test carries
+    // `let _tb : <TbType>` and its fields (`drv`, `cov`, ...) live on
+    // the `_tb` struct rather than as run-scope lets, so they never
+    // hit the `other_lets` loop above. Covergroup HOOK-trigger
+    // resolution (`covergroup G @(drv.method(t) post)`) resolves the
+    // receiver field via `let_types`, so without this seed it cannot
+    // find `drv` under the impl-for form (only the classic `test`
+    // form, where the fields ARE run-scope lets, worked). Field names
+    // are test-scoped; seeding them by their declared type lets the
+    // hook resolver reach the transactor/component method table.
+    if let Some(tb_ty) = self.let_types.get("_tb").cloned() {
+        if let Some(tb_comp) = self.components.get(&tb_ty).cloned() {
+            for ci in &tb_comp.items {
+                if let ComponentItem::Field(f) = ci {
+                    if let Some(simple) = type_simple_name(Some(&f.ty)) {
+                        self.let_types
+                            .entry(f.name.name.clone())
+                            .or_insert_with(|| simple.to_string());
+                    }
+                }
+            }
+        }
+    }
+    self.clock_names = clocks.iter().map(|c| c.name.name.clone()).collect();
+
+    writeln!(
+        self.out,
+        "int run_{}(int argc, char** argv) {{",
+        test.name.name
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
+    if self.flavor == Flavor::Capsule {
+        // Common layout: deep per-run owner (issue #643).
+        writeln!(self.out, "{INDENT}HarcSuiteRuntime ctx;").ok();
+        writeln!(
+            self.out,
+            "{INDENT}// Publish the active run for TU-scope helpers"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}// (record randomize); infrastructure indirection only —").ok();
+        writeln!(self.out, "{INDENT}// every mutable datum lives on this per-run instance.").ok();
+        writeln!(self.out, "{INDENT}harc_rt_current_run = &ctx;").ok();
+    } else {
+        writeln!(self.out, "{INDENT}HarcTestContext ctx;").ok();
+    }
+    writeln!(self.out, "{INDENT}ctx.dut = new V{dut_type};").ok();
+    writeln!(self.out, "{INDENT}auto* dut = ctx.dut;").ok();
+    writeln!(self.out, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(self.out, "{INDENT}auto* tfp = ctx.tfp;").ok();
+    writeln!(self.out, "{INDENT}auto& _wave_path = ctx._wave_path;").ok();
+    writeln!(self.out, "#endif").ok();
+    writeln!(self.out, "{INDENT}auto& _trace_time = ctx._trace_time;").ok();
+    writeln!(self.out, "{INDENT}auto& errors = ctx.errors;").ok();
+    writeln!(self.out, "{INDENT}auto& _fatal = ctx._fatal;").ok();
+    writeln!(self.out, "{INDENT}auto& cycle_count = ctx.cycle_count;").ok();
+    writeln!(self.out, "{INDENT}auto& trace = ctx.trace;").ok();
+    writeln!(self.out, "{INDENT}auto& log_ctx = ctx.log_ctx;").ok();
+    writeln!(self.out, "{INDENT}auto& _checkers = ctx._checkers;").ok();
+    writeln!(
+        self.out,
+        "{INDENT}auto& _post_eval_services = ctx._post_eval_services;"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}auto& _auto_cov_reports = ctx._auto_cov_reports;"
+    )
+    .ok();
+    if self.flavor == Flavor::Capsule {
+        // Common layout (issue #643): the PRNG lives on the suite
+        // runtime so two sequential runs in one process never share a
+        // stream; the historical bare-name references keep compiling
+        // through this alias. Hook registries likewise live on the
+        // runtime — one registry per generated instance — and are bound
+        // to their historical names below, so test-scope
+        // `on obj.method pre/post` registrations compile unchanged.
+        writeln!(self.out, "{INDENT}auto& harc_rng = ctx.rng;").ok();
+        let hook_regs = collect_hook_registries(file, component_order);
+        for reg in &hook_regs {
+            writeln!(
+                self.out,
+                "{INDENT}auto& {v} = ctx.{v};",
+                v = reg.vector()
+            )
+            .ok();
+        }
+    }
+    // Waveform tracer setup (issue #209). Only compiled in when
+    // `harc sim --waves` defined `HARC_TRACE_VCD` or
+    // `HARC_TRACE_FST`. `HARC_WAVE_FILE` (set by `harc sim`)
+    // selects the output path; `HARC_TRACE_DEPTH` selects the
+    // hierarchy depth passed to `dut->trace()`. `_trace_time` is
+    // a monotonically increasing dump cursor — its absolute
+    // units do not matter, only that successive dump helper calls
+    // receive strictly-increasing values so GTKWave /
+    // surfer can order events.
+    writeln!(self.out, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(self.out, "{INDENT}Verilated::traceEverOn(true);").ok();
+    writeln!(self.out, "{INDENT}tfp = new HarcTraceC;").ok();
+    writeln!(
+        self.out,
+        "{INDENT}_wave_path = harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"
+    )
+    .ok();
+    writeln!(self.out, "#endif").ok();
+    // Per spec §7.7: `log(fatal, ...)` aborts this test instance at
+    // the end of the current cycle. The flag is checked by the
+    // main simulation-loop guard below.
+    writeln!(self.out, "").ok();
+    // Seed PRNG from HARC_SEED env (or 1 if unset). Logged after sim_log_line
+    // is defined so it lands in sim.log along with normal test output.
+    writeln!(self.out, "{INDENT}harc_rng.seed_from_env();").ok();
+    writeln!(
+        self.out,
+        "{INDENT}harc_rt::trace::harc_start_trace(trace, harc_rng.state, \"{dut_type}\", \"{}\", cycle_count);",
+        test.name.name
+    )
+    .ok();
+    if self.flavor == Flavor::Legacy {
+    writeln!(
+        self.out,
+        "{INDENT}auto _harc_trace_dump_next = [&](const char* clock, uint64_t clock_cycle) {{"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}{INDENT}uint64_t t = _trace_time++;").ok();
+    writeln!(
+        self.out,
+        "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(self.out, "{INDENT}}};").ok();
+    writeln!(
+        self.out,
+        "{INDENT}auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {{"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}{INDENT}trace.set_timing(t, clock, clock_cycle);"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(self.out, "{INDENT}}};").ok();
+    writeln!(self.out, "").ok();
+    }
+    if self.flavor != Flavor::Legacy {
+        // Dump-helper shims are emitted together with the tick binding
+        // below (both live on the common-layout glue object).
+        writeln!(self.out, "").ok();
+    }
+    // sim.log captures every log()/assert/fail line with cycle + severity
+    // prefix. Path is configurable via the HARC_SIM_LOG env var (so the
+    // outer harness can put it in the build dir); default `sim.log` in cwd.
+    // Echo the active waveform path into sim.log so post-mortem
+    // log inspection links to the matching VCD/FST without
+    // grepping stderr. No-op in non-trace builds.
+    writeln!(
+        self.out,
+        "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"
+    )
+    .ok();
+    writeln!(self.out, "").ok();
+    // Concurrent assertion hook — every `assert property <expr>` /
+    // `assert property NAME` registers a closure here; tick() invokes the
+    // whole list after each `eval()`. Same-cycle (`|->`) and one-cycle
+    // (`|=>`) properties run on every primary-clock edge.
+    writeln!(self.out, "").ok();
+
+    let capsule = self.flavor == Flavor::Capsule;
+    // Resolve every declared clock's half-period up front so both the
+    // legacy inline scheduler and the common-layout glue configuration
+    // see identical values (`5ns` literal or `domain` reference).
+    let mut resolved_clocks: Vec<(String, i64)> = Vec::with_capacity(clocks.len());
+    for c in &clocks {
+        let period_ps = match &*c.period.kind {
+            ExprKind::Time(s) => time_literal_to_ps(s).map_err(EmitError)?,
+            ExprKind::Ident(id) => *domains.get(&id.name).ok_or_else(|| EmitError(format!(
+                "clock {} references domain `{}` but no `domain {}` declaration was found in any input file",
+                c.name.name, id.name, id.name
+            )))?,
+            _ => return Err(EmitError(format!(
+                "clock {} period must be a time literal (e.g. 5ns) or a domain name (e.g. FastDomain)",
+                c.name.name
+            ))),
+        };
+        resolved_clocks.push((c.name.name.clone(), period_ps / 2));
+    }
+
+    if clocks.is_empty() {
+        if capsule {
+            // Common layout: tick is a glue member defined once in the
+            // common TU; the capsule binds the historical name to it.
+            // The glue also owns the dump helpers' bodies — bind those
+            // names here too so drive-loop dumps compile unchanged.
+            writeln!(self.out, "{INDENT}HarcSuiteGlue _glue(ctx);").ok();
+            writeln!(self.out, "{INDENT}auto tick = [&]() {{ _glue.tick(); }};").ok();
+            self.emit_capsule_dump_shims();
+            writeln!(self.out, "").ok();
+        } else {
+        // Single-clock backward-compat path: drives `dut->clk` when the DUT
+        // has that member (clocked modules). Purely combinational DUTs have no
+        // `clk` port, so `_harc_eval_{negedge,posedge}` silently skip the
+        // assignment via `if constexpr (requires { dut->clk; })`.
+        // cycle_count increments once per tick.
+        writeln!(self.out, "{INDENT}auto tick = [&]() {{").ok();
+        writeln!(self.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}cycle_count++;").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}if (!_post_eval_services.empty()) _harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(self.out, "{INDENT}}};").ok();
+        writeln!(self.out, "").ok();
+        }
+    } else {
+        // Multi-clock scheduler: every declared clock keeps its own next-edge
+        // timestamp; we advance simulation time to the earliest pending edge,
+        // toggle that clock, call eval(). cycle_count tracks rising edges of
+        // the primary clock (first-declared) so existing log lines remain
+        // meaningful.
+        if capsule {
+            // Per-clock signal writes are capsule-provided setters (the
+            // glue cannot name DUT members generically); the glue owns
+            // the edge-advance state machine itself.
+            writeln!(
+                self.out,
+                "{INDENT}std::vector<HarcClockCell> _harc_clock_cells;"
+            )
+            .ok();
+            for (name, half) in &resolved_clocks {
+                writeln!(
+                    self.out,
+                    "{INDENT}_harc_clock_cells.push_back(HarcClockCell{{\"{name}\", {half}, {half}, 0, 0, [&](int l) {{ dut->{name} = l; }}}});",
+                    name = name,
+                    half = half
+                )
+                .ok();
+            }
+            writeln!(
+                self.out,
+                "{INDENT}HarcSuiteGlue _glue(ctx, std::move(_harc_clock_cells));"
+            )
+            .ok();
+            writeln!(self.out, "{INDENT}auto& now_ps = _glue.now_ps;").ok();
+            writeln!(self.out, "{INDENT}auto& clocks_ = _glue.clocks_;").ok();
+            writeln!(
+                self.out,
+                "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{ _glue.eval_clocks_until(t_ps); }};"
+            )
+            .ok();
+            writeln!(self.out, "{INDENT}auto tick = [&]() {{ _glue.tick(); }};").ok();
+            self.emit_capsule_dump_shims();
+            writeln!(self.out, "").ok();
+        } else {
+        writeln!(self.out, "{INDENT}long long now_ps = 0;").ok();
+        writeln!(self.out, "{INDENT}struct ClockState {{ const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; }};").ok();
+        writeln!(self.out, "{INDENT}std::vector<ClockState> clocks_;").ok();
+        for (name, half) in &resolved_clocks {
+            // First edge fires at half_period (rising) so initial state is 0.
+            writeln!(
+                self.out,
+                "{INDENT}clocks_.push_back(ClockState{{\"{}\", {half}, {half}, 0, 0}});",
+                name
+            )
+            .ok();
+            writeln!(self.out, "{INDENT}dut->{} = 0;", name).ok();
+        }
+        writeln!(self.out, "").ok();
+        writeln!(
+            self.out,
+            "{INDENT}auto eval_clocks_until = [&](long long t_ps) {{"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}while (now_ps < t_ps) {{").ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}long long next = t_ps;").ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}now_ps = next;").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}bool _primary_rising = false;"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}const char* _last_edge_clock = \"\";"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}uint64_t _last_edge_cycle = 0;"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}for (size_t i = 0; i < clocks_.size(); i++) {{"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}auto& c = clocks_[i];"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == now_ps) {{"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;"
+        )
+        .ok();
+        // Per-clock signal write — done by name lookup.
+        for (idx, c) in clocks.iter().enumerate() {
+            writeln!(
+                self.out,
+                "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == {idx}) dut->{} = c.level;",
+                c.name.name
+            )
+            .ok();
+        }
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;"
+        )
+        .ok();
+        // Per-clock rising-edge count (consumed by `wait N cycles on <clock>`).
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_clock = c.name;"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_cycle = (uint64_t)c.rising_count;"
+        )
+        .ok();
+        // Primary clock rising edge bumps cycle_count.
+        writeln!(
+        self.out,
+        "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) {{ cycle_count++; _primary_rising = true; }}"
+    )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}}}").ok();
+        writeln!(self.out, "{INDENT}{INDENT}{INDENT}dut->eval();").ok();
+        // Set semantic trace timing for this edge *before* post_eval
+        // services (so their trace events carry the right time), but
+        // defer the waveform dump until after those services and the
+        // follow-up eval settle. VCD allows only one dump per physical
+        // timestamp, so we dump exactly once per `now_ps` (issue #477).
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}if (_primary_rising) {{ for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) dut->eval(); }}"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}{INDENT}_harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}}}").ok();
+        writeln!(self.out, "{INDENT}}};").ok();
+        writeln!(self.out, "").ok();
+        // `tick()` advances by one full primary clock period (one rising
+        // edge). Other clocks tick at their natural rate during this span.
+        writeln!(self.out, "{INDENT}auto tick = [&]() {{").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}long long target = now_ps + clocks_[0].half_period_ps * 2;"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
+        writeln!(self.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(self.out, "{INDENT}}};").ok();
+        writeln!(self.out, "").ok();
+        }
+    }
+    // Variadic so log()/assert/fail callers can pass printf-style args
+    // produced by `${expr}` string-interpolation lowering. The generated
+    // lambdas keep the varargs ABI; runtime helpers own the sinks.
+    // Per-file log handles, opened on first reference, closed at exit.
+    // Relative paths are anchored to HARC_LOG_DIR by the runtime helper.
+    writeln!(
+        self.out,
+        "{INDENT}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}{INDENT}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}}};").ok();
+    writeln!(self.out, "").ok();
+    // After sim_log_line below is defined, emit the seed line so it lands
+    // in sim.log on every run — required for reproducing failures.
+    let log_seed = true;
+
+    writeln!(
+        self.out,
+        "{INDENT}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}{INDENT}HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}}};").ok();
+    writeln!(self.out, "").ok();
+
+    // Route an empty-queue pop through the sim's own FATAL path
+    // instead of the runtime header's abort backstop: the run
+    // records the failure, unwinds normally, and still writes its
+    // log and trace. `_fatal` is a loop-exit condition, so the run
+    // stops at the next scheduler tick — same semantics as
+    // `log(fatal, ...)`. The TB-IR prologue
+    // (`codegen/tbir/runtime.rs`) emits this verbatim too; the text
+    // must stay identical or the v1-vs-TB-IR trace-diff diverges on
+    // the FATAL line.
+    writeln!(
+        self.out,
+        "{INDENT}harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {{"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}{INDENT}sim_log_line(\"FATAL\", \"pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed\");"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}{INDENT}ctx.errors++;").ok();
+    writeln!(self.out, "{INDENT}{INDENT}_fatal = true;").ok();
+    writeln!(self.out, "{INDENT}}});").ok();
+    writeln!(self.out, "").ok();
+
+    if log_seed {
+        writeln!(
+            self.out,
+            "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng.state);"
+        )
+        .ok();
+        writeln!(self.out, "").ok();
+    }
+
+    // User-defined functions become lambdas. Emitted before the test body so
+    // the body can call them. Capture-all (`[&]`) so they see `dut`/`tick`/
+    // any test-level let bindings.
+    //
+    // Common layout: suite-level helpers are glue members defined once in
+    // the common TU, so capsules skip the per-test lambda copies entirely
+    // (issue #643).
+    if self.flavor == Flavor::Legacy {
+        for f in funcs.iter() {
+            self.emit_function(f, 1);
+        }
+        if !funcs.is_empty() {
+            writeln!(self.out, "").ok();
+        }
+        // Tseqs lower to lambdas returning `std::vector<T>`; emitted alongside
+        // functions so the run-block can invoke them and consume the result.
+        for t in tseqs.iter() {
+            self.emit_tseq(t, 1);
+        }
+        if !tseqs.is_empty() {
+            writeln!(self.out, "").ok();
+        }
+    }
+    // Hookable methods on driver / agent / env / sequencer / scoreboard
+    // become free `[&]`-capturing lambdas named `<Type>_<method>`. The
+    // method-call site rewrites `obj.method(args)` to
+    // `<Type>_<method>(obj, args)` so the body sees `tick` / `_checkers`
+    // / etc. from the test scope.
+    //
+    // Pre/post hook vectors emit FIRST so the method bodies (and the
+    // test-scope `on obj.method pre/post` registrations) can `[&]`-
+    // capture them. Empty vectors are no-ops; the wrap is unconditional.
+    let mut emitted_any_method = false;
+    // Hook vectors emit in dependency order so that a method
+    // body which calls into another transactor / component's
+    // method finds the corresponding `<Type>_<method>_pre/_post`
+    // vector already declared at its capture site. The vectors
+    // themselves don't reference each other, but the method
+    // lambdas below — which `[&]`-capture these vectors — do
+    // call across component boundaries; co-locating hook
+    // vectors and methods in the same order keeps the capture
+    // graph acyclic. See `topo_sort_component_indices` (#301).
+    for &idx in component_order.iter() {
+        match &file.items[idx] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        self.emit_hook_vectors(c, h, 1);
+                    }
+                }
+            }
+            Item::Transactor(t) => {
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        self.emit_hook_vectors(&synth, h, 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Watchdog hook vectors must be emitted in the same forward-decl
+    // pass as the hookable hook vectors — `on <Type>.watchdog pre/post`
+    // captures them. The `emit_watchdog` helper below emits BOTH the
+    // hook vectors AND the synthetic method body in one go, since the
+    // method body refers to those vectors. So we forward-declare the
+    // method via the same pass that emits hookable method lambdas
+    // below; here, no separate forward decl is needed because the
+    // method lambda + its hook vectors are emitted together at that
+    // point.
+    // Pre-scan: register test-scope bus bindings (`let axil :
+    // BusAxiLite = bind dut`) and driver-type → binding mappings
+    // BEFORE hookable methods emit. Hookables on `bound to BusType`
+    // drivers need the binding active so `bus.<ch>.send/recv` and
+    // `bus.<ch>.<sig>` resolve correctly. emit_let later re-registers
+    // the bus bindings (idempotent — same key, same value).
+    for it in &test.items {
+        if let TestItem::Let(l) = it {
+            if l.bind {
+                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                    if let Some(bus_decl) = self.buses.get(simple).cloned() {
+                        if let Some(v) = &l.value {
+                            let mut buf = String::new();
+                            std::mem::swap(&mut self.out, &mut buf);
+                            self.emit_expr(v);
+                            std::mem::swap(&mut self.out, &mut buf);
+                            let prefix = l.name.name.clone();
+                            // Effective param env for `generate_if` gate
+                            // evaluation: bus defaults overlaid with the
+                            // bind-site generic overrides (`BusAxi4#(READ=0)`)
+                            // and then the DUT port's own override
+                            // (`port s: target BusAxi4<WRITE=0>`), which is
+                            // authoritative for which gated channels
+                            // `arch build` actually flattened. The bind name
+                            // equals the DUT port name by convention.
+                            let env = bus_param_env_with_port_override(
+                                &bus_decl,
+                                l.ty.as_ref(),
+                                self.dut_bus_port_overrides.get(&l.name.name),
+                            );
+                            self.bus_param_envs.insert(l.name.name.clone(), env);
+                            self.bus_bindings
+                                .insert(l.name.name.clone(), (bus_decl, buf, prefix.clone()));
+                            // Populate the per-bind signal remap so hookable-
+                            // method emission (which precedes `emit_let`) can
+                            // resolve `bus.<ch>.<sig>` against the override
+                            // table. Without this pre-pass, transactor
+                            // bodies use only the prefix-convention name and
+                            // the override never fires for indirectly-routed
+                            // accesses.
+                            if !l.bind_remap.is_empty() {
+                                let mut map: std::collections::HashMap<
+                                    (String, String),
+                                    String,
+                                > = std::collections::HashMap::new();
+                                for entry in &l.bind_remap {
+                                    if entry.path.len() == 2 {
+                                        map.insert(
+                                            (
+                                                entry.path[0].name.clone(),
+                                                entry.path[1].name.clone(),
+                                            ),
+                                            entry.port.clone(),
+                                        );
+                                    }
+                                }
+                                self.bus_remap.insert(prefix, map);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for it in &test.items {
+        if let TestItem::Let(l) = it {
+            if l.bind {
+                if let Some(simple) = type_simple_name(l.ty.as_ref()) {
+                    let bound_decl_to_bus = self
+                        .components
+                        .get(simple)
+                        .and_then(|c| c.bound_to.as_ref().map(|_| ()))
+                        .is_some()
+                        || self.transactors
+                            .get(simple)
+                            .and_then(|t| t.bound_to.as_ref().map(|_| ()))
+                            .is_some();
+                    if bound_decl_to_bus {
+                        if let Some(v) = &l.value {
+                            if let ExprKind::Ident(rhs) = &*v.kind {
+                                if let Some(binding) = self.bus_bindings.get(&rhs.name).cloned() {
+                                    // First binding wins; multi-instance is deferred.
+                                    self.driver_bus_for_hookables
+                                        .entry(simple.to_string())
+                                        .or_insert(binding);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Hookable methods on regular components (agent / env /
+    // sequencer / scoreboard) plus transactors. Transactor hookables
+    // are emitted via the synth ComponentDecl so the existing
+    // emit_component_method path finds the same struct shape.
+    //
+    // Emission order: dependency-sorted (`component_order` from
+    // above) — a method body that calls `field.method(...)`
+    // lowers to `<FieldType>_<method>(self.field, ...)`, so the
+    // referenced lambda must be declared before the calling
+    // lambda's `[&]` capture. Source-order emission breaks for
+    // a transactor whose field type appears later in the file
+    // (issue #301); the topo sort guarantees the callee's
+    // lambda is in scope at the caller's capture.
+    for &idx in component_order.iter() {
+        if self.flavor != Flavor::Legacy {
+            // Common layout: method/watchdog bodies are glue members in
+            // the common TU. The bus-binding pre-scans above still run —
+            // `emit_let` reuses their results when instantiating bound
+            // drivers inside this capsule.
+            break;
+        }
+        match &file.items[idx] {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                for ci in &c.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        self.emit_component_method(c, h, 1);
+                        emitted_any_method = true;
+                    }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        self.emit_watchdog(c, w, 1);
+                        emitted_any_method = true;
+                    }
+                }
+            }
+            Item::Transactor(t) => {
+                // include_active = true so any hookable inside `when
+                // active` is also emitted. Active-only hookables on a
+                // passive instance still compile but won't be invoked
+                // at runtime (no input event firing).
+                let synth = synth_component_from_transactor(t, /*include_active*/ true);
+                for ci in &synth.items {
+                    if let ComponentItem::Hookable(h) = ci {
+                        self.emit_component_method(&synth, h, 1);
+                        emitted_any_method = true;
+                    }
+                    if let ComponentItem::Watchdog(w) = ci {
+                        self.emit_watchdog(&synth, w, 1);
+                        emitted_any_method = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if emitted_any_method {
+        writeln!(self.out, "").ok();
+    }
+
+    // ── Scheduler — declared before hoisted lets so bound coroutine
+    // drivers (Phase 2b) can register their slots inline at the
+    // hoisted-let site. The run coroutine's slot is added below
+    // alongside its body.
+    writeln!(self.out, "{INDENT}harc_rt::ThreadScheduler sched;").ok();
+
+    // Other lets get hoisted up front. Bound coroutine drivers also
+    // emit their slot + per-driver transaction queue + actor
+    // coroutine here (see the `let drv : Drv = bind axil` arm in
+    // emit_let).
+    for l in &other_lets {
+        self.emit_let(l, 1);
+    }
+
+    // Custom `phase <name> ... end phase <name>` blocks from the test
+    // lifecycle body (spec §7.2). Emitted after hoisted lets so
+    // phase bodies can reference test-level env/agent/scoreboard
+    // instances. Calls of the form `<name>()` from inside `run` lower as
+    // plain C++ function calls; `wait` inside the phase takes the sync
+    // `tick()` path because the lambda body emits with `in_coroutine =
+    // false`.
+    if !custom_phases.is_empty() {
+        for (name, body) in &custom_phases {
+            self.pad(1);
+            writeln!(self.out, "auto {} = [&]() -> void {{", name.name).ok();
+            self.emit_block(body, 2);
+            self.pad(1);
+            writeln!(self.out, "}};").ok();
+        }
+        writeln!(self.out, "").ok();
+    }
+
+    // ── Coroutine wrap for the test body ───────────────────────────────
+    //
+    // The whole test body (bare stmts + scope sim/{setup,run,check,
+    // teardown}) becomes a single C++20 coroutine driven by
+    // `harc_rt::ThreadScheduler`. Setting `in_coroutine = true` flips
+    // the wait/tick lowering inside this scope to emit
+    // `co_await harc_rt::wait_cycles(_slot, N)` instead of the
+    // synchronous `for (...) tick();` form.
+    //
+    // The lambda captures by reference (`[&]`) so it sees `dut`,
+    // `tick`, `cycle_count`, `_checkers`, hookable-method lambdas,
+    // and any hoisted lets defined above in `main`'s scope.
+    //
+    // After the coroutine is constructed, `sched.bootstrap()` resumes
+    // every initially-Ready slot once (the run setup statements,
+    // plus any bound-driver actors' first wait_until on their queue).
+    // The main loop then drives the clock until the run coroutine is
+    // `Done` — driver coroutines may still be parked in WaitUntil
+    // (queue empty) at that point; abandoning them is intentional
+    // since the test is over.
+    writeln!(self.out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
+    writeln!(self.out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
+    writeln!(
+        self.out,
+        "{INDENT}auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+    )
+    .ok();
+
+    self.in_coroutine = true;
+    for it in &test.items {
+        match it {
+            TestItem::Stmt(s) => self.emit_stmt(s, 2),
+            TestItem::Scope(s) => {
+                if let Some(b) = &s.setup {
+                    self.emit_block(b, 2);
+                }
+                if let Some(b) = &s.run {
+                    self.emit_block(b, 2);
+                }
+                if let Some(b) = &s.check {
+                    self.emit_block(b, 2);
+                }
+                if let Some(b) = &s.teardown {
+                    self.emit_block(b, 2);
+                }
+            }
+            _ => {}
+        }
+    }
+    self.in_coroutine = false;
+
+    writeln!(self.out, "{INDENT}{INDENT}co_return;").ok();
+    writeln!(self.out, "{INDENT}}};").ok();
+    writeln!(
+        self.out,
+        "{INDENT}_run_slot.thread = _run_slot_lambda(&_run_slot);"
+    )
+    .ok();
+    writeln!(self.out, "").ok();
+
+    // `actor_threads` is populated only when `--mt` is set (cooperative
+    // mode pushes actor slots into the global `sched` instead). So
+    // `mt` here means "we have per-actor schedulers needing barrier
+    // sync"; cooperative mode skips the worker spawn / barrier dance
+    // entirely even when actors are present.
+    let n_actors = self.actor_threads.len();
+    let mt = n_actors > 0;
+    debug_assert!(mt == (self.mt && !self.actor_threads.is_empty()));
+    let _ = self.mt; // suppress unused warning when no actors
+
+    // ── Bootstrap ──────────────────────────────────────────────────────
+    // Single-threaded — workers haven't started yet. Each scheduler
+    // (main + per-actor) runs its initially-Ready slots once until
+    // they hit their first co_await.
+    writeln!(
+        self.out,
+        "{INDENT}// Resume each coroutine once so initial-setup statements run"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}// before the first clock edge. Single-threaded — workers"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}// haven't been spawned yet.").ok();
+    writeln!(self.out, "{INDENT}sched.bootstrap();").ok();
+    if mt {
+        for (sched_var, _) in &self.actor_threads {
+            writeln!(self.out, "{INDENT}{sched_var}.bootstrap();").ok();
+        }
+    }
+    writeln!(self.out, "").ok();
+
+    if mt {
+        // ── Phase 3a multi-thread topology ──────────────────────────
+        // Each actor coroutine runs on its own `std::thread`. Per
+        // posedge: main runs the run-coroutine, two atomic-spin
+        // barriers synchronize main with N worker threads, each
+        // worker runs `_<n>_sched.tick()` once. Then main does
+        // `dut->eval()` (single-threaded — Verilator-generated DUT
+        // code is not MT-safe) and runs `_checkers`. The dual
+        // barrier mirrors arch-com's Phase 3 design (`Barrier` class
+        // shared in `harc_thread_rt.h`); cycle batching to amortize
+        // barrier cost is Phase 3b.
+        writeln!(
+            self.out,
+            "{INDENT}// Phase 3a: per-actor OS threads with dual barrier sync."
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}// {} actor(s) → {} barrier participants (main + workers).",
+            n_actors,
+            n_actors + 1
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}std::atomic<bool> _shutdown{{false}};").ok();
+        writeln!(
+            self.out,
+            "{INDENT}harc_rt::Barrier _start_barrier({});",
+            n_actors + 1
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}harc_rt::Barrier _end_barrier({});",
+            n_actors + 1
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}std::vector<std::thread> _workers;").ok();
+        for (sched_var, _) in &self.actor_threads {
+            writeln!(self.out, "{INDENT}_workers.emplace_back([&]() {{").ok();
+            writeln!(self.out, "{INDENT}{INDENT}while (true) {{").ok();
+            writeln!(self.out, "{INDENT}{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(
+                self.out,
+                "{INDENT}{INDENT}{INDENT}if (_shutdown.load(std::memory_order_acquire)) break;"
+            )
+            .ok();
+            writeln!(self.out, "{INDENT}{INDENT}{INDENT}{sched_var}.tick();").ok();
+            writeln!(self.out, "{INDENT}{INDENT}{INDENT}_end_barrier.wait();").ok();
+            writeln!(self.out, "{INDENT}{INDENT}}}").ok();
+            writeln!(self.out, "{INDENT}}});").ok();
+        }
+        writeln!(self.out, "").ok();
+    }
+
+    writeln!(
+        self.out,
+        "{INDENT}// Drive the clock until the run coroutine completes."
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}//").ok();
+    writeln!(
+        self.out,
+        "{INDENT}// `wait N cycles` matches Verilog's `@(posedge clk)` semantic:"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}// values set in the segment BEFORE the wait are sampled at the"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}// next posedge. Per loop iteration:").ok();
+    writeln!(
+        self.out,
+        "{INDENT}//   1. Posedge (clk 0→1, eval) — DUT FFs latch the current input"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}//      values (set in the previous segment, or in bootstrap on"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}//      the first iteration).").ok();
+    writeln!(
+        self.out,
+        "{INDENT}//   2. `sched.tick()` — advance the run coroutine to its next"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}//      wait, setting the inputs for the NEXT cycle's posedge."
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}//   3. Falling edge (clk 1→0, eval) — comb re-settles with the"
+    )
+    .ok();
+    writeln!(self.out, "{INDENT}//      newly-set inputs.").ok();
+    writeln!(self.out, "{INDENT}//   4. Cycle counter + checkers.").ok();
+    writeln!(
+        self.out,
+        "{INDENT}// One initial `eval(clk=0)` before the loop settles combinational"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}// logic with the bootstrap inputs — same role as `initial`-block"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}// settle in Verilog. Each `wait 1 cycle` then maps to exactly"
+    )
+    .ok();
+    writeln!(
+        self.out,
+        "{INDENT}// one posedge that observes the just-set values."
+    )
+    .ok();
+    if mt {
+        writeln!(self.out, "{INDENT}//").ok();
+        writeln!(
+            self.out,
+            "{INDENT}// MT mode: workers run between tick() and the falling edge,"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}// gated by _start_barrier / _end_barrier. Run-coroutine writes"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}// complete BEFORE workers wake → no race on shared queues."
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}// Workers' DUT-input writes complete BEFORE the falling-edge"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}// eval → no race on signal state.").ok();
+    }
+    if clocks.is_empty() {
+        // Initial comb settle — bootstrap's inputs propagate through
+        // combinational logic before the first posedge.
+        writeln!(self.out, "{INDENT}_harc_eval_negedge(dut);").ok();
+        writeln!(
+            self.out,
+            "{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+        )
+        .ok();
+        // Posedge first — latches current input values.
+        writeln!(self.out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}cycle_count++;").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}if (!_post_eval_services.empty()) dut->eval();"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}if (!_post_eval_services.empty()) _harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+        )
+        .ok();
+        // Then advance the run coroutine for the next cycle's inputs.
+        writeln!(self.out, "{INDENT}{INDENT}sched.tick();").ok();
+        if mt {
+            writeln!(self.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(self.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+        }
+        // Falling edge + comb resettle with the new inputs.
+        writeln!(self.out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}_harc_trace_dump_next(\"clk\", (uint64_t)cycle_count);"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(self.out, "{INDENT}}}").ok();
+    } else {
+        // Multi-clock: initial bare eval() to settle combinational
+        // logic with bootstrap inputs (no clock advancement). The
+        // loop's eval_clocks_until then advances time by one full
+        // primary-clock period per iteration. Posedge-vs-tick ordering
+        // is constrained by eval_clocks_until's atomic per-edge eval
+        // — we tick AFTER eval_clocks_until so the run coroutine
+        // observes the just-completed cycle's outputs and sets the
+        // next cycle's inputs in time for the following iteration's
+        // first edge. Same effect as the single-clock branch, just
+        // with the clock toggling factored into eval_clocks_until.
+        writeln!(self.out, "{INDENT}dut->eval();").ok();
+        writeln!(
+            self.out,
+            "{INDENT}_harc_trace_dump_at((uint64_t)now_ps, \"\", 0);"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {{"
+        )
+        .ok();
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}long long _target = now_ps + clocks_[0].half_period_ps * 2;"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}{INDENT}eval_clocks_until(_target);").ok();
+        writeln!(self.out, "{INDENT}{INDENT}sched.tick();").ok();
+        if mt {
+            writeln!(self.out, "{INDENT}{INDENT}_start_barrier.wait();").ok();
+            writeln!(self.out, "{INDENT}{INDENT}_end_barrier.wait();").ok();
+        }
+        writeln!(self.out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+        writeln!(self.out, "{INDENT}}}").ok();
+    }
+
+    if mt {
+        // Shutdown sequence: workers are blocked on _start_barrier
+        // (their next iteration). Set _shutdown, wake them via the
+        // start barrier; they observe the flag and break out of their
+        // loop without reaching _end_barrier. Then join.
+        writeln!(self.out, "").ok();
+        writeln!(
+            self.out,
+            "{INDENT}_shutdown.store(true, std::memory_order_release);"
+        )
+        .ok();
+        writeln!(self.out, "{INDENT}_start_barrier.wait();").ok();
+        writeln!(self.out, "{INDENT}for (auto& _w : _workers) _w.join();").ok();
+    }
+    writeln!(self.out, "").ok();
+
+    // Final + return.
+    writeln!(self.out, "").ok();
+    writeln!(self.out, "{INDENT}for (auto& _r : _auto_cov_reports) _r();").ok();
+    // Property-cover summary (ARCH-style: header line + per-point lines
+    // with `*NOT HIT*` marker; stdout destination — see covergroup
+    // report() for the rationale on stdout vs stderr).
+    if !self.covers.is_empty() {
+        let n_covers = self.covers.len();
+        writeln!(self.out, "{INDENT}{{").ok();
+        writeln!(self.out, "{INDENT}{INDENT}uint64_t _cov_total = {n_covers};").ok();
+        writeln!(self.out, "{INDENT}{INDENT}uint64_t _cov_hit = 0;").ok();
+        let covers_clone = self.covers.clone();
+        let cover_cells: Vec<String> = covers_clone
+            .iter()
+            .map(|c| {
+                if self.flavor == Flavor::Legacy {
+                    format!("_cov_{}_hits", c.tag)
+                } else {
+                    // Lookup only — the capsule registered these cells
+                    // when emitting the `cover` statement.
+                    format!("ctx._cells._cov_{}_hits", c.tag)
+                }
+            })
+            .collect();
+        for cell in &cover_cells {
+            writeln!(
+                self.out,
+                "{INDENT}{INDENT}if ({cell} > 0) _cov_hit++;",
+            )
+            .ok();
+        }
+        writeln!(
+            self.out,
+            "{INDENT}{INDENT}harc_rt::log::harc_print_cover_summary(_cov_hit, _cov_total);"
+        )
+        .ok();
+        for (c, cell) in covers_clone.iter().zip(cover_cells.iter()) {
+            writeln!(self.out,
+            "{INDENT}{INDENT}harc_rt::log::harc_print_cover_point(\"{label}\", {cell});",
+            label = escape_c(&c.label)).ok();
+        }
+        writeln!(self.out, "{INDENT}}}").ok();
+    }
+    writeln!(self.out, "{INDENT}dut->final();").ok();
+    // Verilator coverage write — the runtime macro is a no-op unless the
+    // TB was built with `harc sim --coverage` (which sets `--coverage` on
+    // verilator → defines `VM_COVERAGE=1`).
+    writeln!(
+        self.out,
+        "{INDENT}HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"
+    )
+    .ok();
+    // Waveform tracer teardown (issue #209). Must precede
+    // `delete dut` because `tfp->close()` writes the
+    // end-of-trace marker via the trace dispatcher held by the
+    // DUT root. Skipped via the same compile-time gate as
+    // tracer construction.
+    writeln!(self.out, "{INDENT}HARC_RT_CLOSE_WAVE_TRACE(tfp);").ok();
+    writeln!(self.out, "{INDENT}delete dut;").ok();
+    writeln!(self.out, "").ok();
+    writeln!(
+        self.out,
+        "{INDENT}return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"
+    )
+    .ok();
+    writeln!(self.out, "}}").ok();
+    writeln!(self.out, "").ok();
+        Ok(())
+    }
     fn emit_tseq(&mut self, t: &TseqDecl, depth: usize) {
         // Inner type: pull T out of `TSeq<T>`. Default to `int64_t` if
         // the user wrote a bare `tseq`-as-block without a return clause.
@@ -17249,7 +18808,12 @@ impl Emitter {
             .and_then(tseq_inner_type)
             .unwrap_or_else(|| "int64_t".to_string());
         self.pad(depth);
-        write!(self.out, "auto {} = [&](", t.name.name).ok();
+        let common_member = self.flavor != Flavor::Legacy;
+        if common_member {
+            write!(self.out, "std::vector<{inner}> HarcSuiteGlue::{}(", t.name.name).ok();
+        } else {
+            write!(self.out, "auto {} = [&](", t.name.name).ok();
+        }
         let mut added: Vec<String> = Vec::new();
         let param_names = cpp_param_names(&t.params);
         for (i, p) in t.params.iter().enumerate() {
@@ -17267,7 +18831,11 @@ impl Emitter {
                 }
             }
         }
-        writeln!(self.out, ") -> std::vector<{inner}> {{").ok();
+        if common_member {
+            writeln!(self.out, ") {{").ok();
+        } else {
+            writeln!(self.out, ") -> std::vector<{inner}> {{").ok();
+        }
         self.pad(depth + 1);
         writeln!(self.out, "std::vector<{inner}> _result;").ok();
         let prev = self.current_yield_target.replace("_result".to_string());
@@ -17278,18 +18846,28 @@ impl Emitter {
         for k in added {
             self.pointer_vars.remove(&k);
         }
-        self.pad(depth);
-        writeln!(self.out, "}};").ok();
+        if common_member {
+            self.pad(depth);
+            writeln!(self.out, "}}").ok();
+        } else {
+            self.pad(depth);
+            writeln!(self.out, "}};").ok();
+        }
     }
 
     fn emit_function(&mut self, f: &FunctionDecl, depth: usize) {
         self.pad(depth);
+        let common_member = self.flavor != Flavor::Legacy;
         let ret = f
             .return_ty
             .as_ref()
             .map(c_type_for)
-            .unwrap_or("void".to_string());
-        write!(self.out, "auto {} = [&](", f.name.name).ok();
+            .unwrap_or_else(|| "void".to_string());
+        if common_member {
+            write!(self.out, "{ret} HarcSuiteGlue::{}(", f.name.name).ok();
+        } else {
+            write!(self.out, "auto {} = [&](", f.name.name).ok();
+        }
         // Track which params are Named-typed (pointer-shaped). Add to
         // `pointer_vars` while emitting the body, then remove on exit so
         // siblings don't leak each other's params.
@@ -17310,13 +18888,22 @@ impl Emitter {
                 }
             }
         }
-        writeln!(self.out, ") -> {ret} {{").ok();
+        if common_member {
+            writeln!(self.out, ") {{").ok();
+        } else {
+            writeln!(self.out, ") -> {ret} {{").ok();
+        }
         self.emit_block(&f.body, depth + 1);
         for k in added {
             self.pointer_vars.remove(&k);
         }
-        self.pad(depth);
-        writeln!(self.out, "}};").ok();
+        if common_member {
+            self.pad(depth);
+            writeln!(self.out, "}}").ok();
+        } else {
+            self.pad(depth);
+            writeln!(self.out, "}};").ok();
+        }
     }
 
     fn emit_block(&mut self, b: &Block, depth: usize) {
@@ -17612,8 +19199,12 @@ impl Emitter {
                     tag: tag.clone(),
                     label,
                 });
-                self.pad(depth);
-                writeln!(self.out, "static uint64_t _cov_{tag}_hits = 0;").ok();
+                let hits_cell =
+                    self.per_run_cell(format!("_cov_{tag}_hits"), "uint64_t", Some("0"));
+                if self.flavor == Flavor::Legacy {
+                    self.pad(depth);
+                    writeln!(self.out, "static uint64_t _cov_{tag}_hits = 0;").ok();
+                }
                 self.pad(depth);
                 writeln!(self.out, "_checkers.push_back([&]() {{").ok();
                 self.pad(depth + 1);
@@ -17625,7 +19216,7 @@ impl Emitter {
                 // and `cover <name>` for temporal patterns, or stick to
                 // same-cycle bool expressions inline.
                 self.emit_expr(&body);
-                writeln!(self.out, ")) _cov_{tag}_hits++;").ok();
+                writeln!(self.out, ")) {hits_cell}++;").ok();
                 self.pad(depth);
                 writeln!(self.out, "}});").ok();
             }
@@ -19828,7 +21419,10 @@ impl Emitter {
                             return;
                         }
                     }
-                    write!(self.out, "{comp_ty}_{method}({instance}").ok();
+                    // Prefix only from capsules: inside common-TU member
+                    // bodies the callee resolves as a sibling member.
+                    let glue = if self.flavor == Flavor::Capsule { "_glue." } else { "" };
+                    write!(self.out, "{glue}{comp_ty}_{method}({instance}").ok();
                     for a in args.iter() {
                         write!(self.out, ", ").ok();
                         match a {
@@ -19838,6 +21432,28 @@ impl Emitter {
                     }
                     write!(self.out, ")").ok();
                     return;
+                }
+                // Common layout: suite-level helpers (functions,
+                // tseqs) are members of the per-run glue object; a
+                // plain-name call to one resolves through `_glue.`.
+                if self.flavor == Flavor::Capsule {
+                    if let ExprKind::Ident(id) = &*callee.kind {
+                        if self.glue_callees.contains(&id.name) {
+                            write!(self.out, "_glue.{}", id.name).ok();
+                            write!(self.out, "(").ok();
+                            for (i, a) in args.iter().enumerate() {
+                                if i > 0 {
+                                    write!(self.out, ", ").ok();
+                                }
+                                match a {
+                                    CallArg::Expr(ex) => self.emit_expr(ex),
+                                    CallArg::Named { value, .. } => self.emit_expr(value),
+                                }
+                            }
+                            write!(self.out, ")").ok();
+                            return;
+                        }
+                    }
                 }
                 self.emit_expr(callee);
                 write!(self.out, "(").ok();
