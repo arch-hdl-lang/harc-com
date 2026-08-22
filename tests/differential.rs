@@ -182,6 +182,39 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
     check_space_with_control(label, template, hole, "", subs)
 }
 
+/// `check_space_with_control` plus an assertion that EVERY row lowers.
+///
+/// The three falsifiable directions are all about verdicts that
+/// over-promise. None of them can fail on a verdict that over-REFUSES:
+/// re-capping a width gate turns every row into
+/// `(Unsupported, v1 compiles)`, which is exactly what `Unsupported`
+/// means and is only reported. A space covering a capability that is
+/// supposed to work needs to say so, or reverting the capability
+/// leaves it green.
+fn check_space_all_lower(
+    label: &str,
+    template: &str,
+    hole: &str,
+    control: &str,
+    subs: &[&str],
+) -> String {
+    let table = check_space_with_control(label, template, hole, control, subs);
+    if table.is_empty() {
+        return table; // no compiler on PATH
+    }
+    let refused: Vec<&str> = table
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.contains("tbir=LOWERS "))
+        .filter(|l| l.contains("tbir="))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "{table}\n{label}: these rows must lower and do not:\n{}",
+        refused.join("\n")
+    );
+    table
+}
+
 /// `check_space` for a hole that cannot simply be deleted — a type
 /// annotation, say, where an empty substitution is a parse error rather
 /// than a smaller program. `control` is the neutral row: a
@@ -433,7 +466,7 @@ end impl T
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("tb-field", tb_field, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("tb-field", tb_field, "@@TY@@", "uint<32>", widths)
     );
 
     // Call site 3: a test-scope `let` READ IN THE CHECK PHASE, which
@@ -459,7 +492,7 @@ end impl T2
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("promoted-let", promoted_let, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("promoted-let", promoted_let, "@@TY@@", "uint<32>", widths)
     );
 
     // Call sites 4 + 5: a transactor state field, reached through the
@@ -492,7 +525,7 @@ end impl T3
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("state-field", state_field, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("state-field", state_field, "@@TY@@", "uint<32>", widths)
     );
 
     // The same scalar-field shape reached through the scoreboard and
@@ -522,7 +555,7 @@ end impl T4
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("scoreboard-field", sb_field, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("scoreboard-field", sb_field, "@@TY@@", "uint<32>", widths)
     );
 
     let comp_field = r#"
@@ -552,7 +585,7 @@ end impl T5
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("component-field", comp_field, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("component-field", comp_field, "@@TY@@", "uint<32>", widths)
     );
 }
 
@@ -583,7 +616,7 @@ end impl TW
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("wide-arith-local", local, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("wide-arith-local", local, "@@TY@@", "uint<32>", widths)
     );
 
     let field = r#"
@@ -602,7 +635,153 @@ end impl TW2
 "#;
     eprintln!(
         "{}",
-        check_space_with_control("wide-arith-field", field, "@@TY@@", "uint<32>", widths)
+        check_space_all_lower("wide-arith-field", field, "@@TY@@", "uint<32>", widths)
+    );
+
+    // The OPERATOR space, at the width where a scalar stops being a
+    // builtin integer type. `_harc_u128` takes part in ordinary C++
+    // arithmetic and none of this arises; `HarcWide<N>` is a struct,
+    // and every operator it does not define is a program that lowers
+    // and does not build.
+    let ops = r#"
+testbench TbW3
+    dut : Top
+    w : uint<1024> default 7
+    r : uint<1024> default 0
+end testbench TbW3
+
+impl TW3 for TbW3
+    run
+@@OP@@
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TW3
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "wide-ops-unsigned",
+            ops,
+            "@@OP@@",
+            "        r = w",
+            &[
+                "        r = w + 1",
+                "        r = w - 1",
+                "        r = w * 3",
+                "        r = w / 2",
+                "        r = w % 2",
+                "        r = w & 1",
+                "        r = w | 2",
+                "        r = w ^ 1",
+                "        r = w << 1",
+                "        r = w >> 1",
+                "        assert w == 7 else fail(\"eq\")",
+                "        assert w != 8 else fail(\"ne\")",
+                "        assert w < 8 else fail(\"lt\")",
+                "        assert w > 1 else fail(\"gt\")",
+                "        assert w <= 7 else fail(\"le\")",
+                "        assert w >= 7 else fail(\"ge\")",
+            ],
+        )
+    );
+
+    // Two wide operands of DIFFERENT widths: no `N` deduces for the
+    // homogeneous operator, so this is its own ambiguity rather than a
+    // special case of the integer one.
+    let mixed = r#"
+testbench TbW4
+    dut : Top
+    a : uint<160> default 1
+    b : uint<256> default 1
+end testbench TbW4
+
+impl TW4 for TbW4
+    run
+@@OP@@
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TW4
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "wide-ops-mixed-width",
+            mixed,
+            "@@OP@@",
+            "        b = b",
+            &[
+                "        b = b + a",
+                "        b = b - a",
+                "        b = b * a",
+                "        b = b & a",
+                "        b = b | a",
+                "        b = b ^ a",
+                "        b = b / a",
+                "        assert b == a else fail(\"eq\")",
+                "        assert b < a else fail(\"lt\")",
+            ],
+        )
+    );
+}
+
+/// PAST the declared-field width cap, at the two sites whose
+/// diagnostics name v1 as the way out. `Unsupported` and that
+/// parenthetical are both promises about v1; a landing where v1's own
+/// output does not build falsifies them.
+#[test]
+fn a_scalar_field_past_the_cap_is_only_promised_to_v1_where_v1_builds() {
+    let over = &["uint<1025>", "uint<2048>", "uint<4096>"];
+
+    let tb_field = r#"
+testbench TbP
+    dut : Top
+    w : @@TY@@ default 1
+end testbench TbP
+
+impl TP for TbP
+    run
+        w = w + 1
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TP
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("over-cap-tb-field", tb_field, "@@TY@@", "uint<1024>", over)
+    );
+
+    let state = r#"
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    w : @@TY@@ default 1
+    thread bus.read(addr: uint<8>)
+        w = w + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench TbP2
+    dut : TlmReadInitiator
+end testbench TbP2
+
+impl TP2 for TbP2
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TP2
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("over-cap-state-field", state, "@@TY@@", "uint<1024>", over)
     );
 }
 
@@ -611,16 +790,38 @@ end impl TW2
 /// must be REFUSED, at every field site, rather than silently becoming
 /// a different number — the field is wide precisely so that the value
 /// fits.
+///
+/// Asserted directly rather than through `check_space`, which cannot
+/// see this: a truncating implementation reports `(Lowers, v1
+/// compiles)`, which is a perfectly consistent pairing. The defect is
+/// in the VALUE, and the only thing that distinguishes it is that the
+/// backend must not accept the program at all.
 #[test]
 fn a_field_default_too_wide_for_its_u64_slot_is_never_truncated() {
-    // 2^65 and 2^64: the first literal above `u64::MAX`, and the
-    // boundary itself.
-    let defaults = &[
-        "18446744073709551615",
-        "18446744073709551616",
-        "36893488147419103232",
+    let Some(cc) = cxx() else {
+        eprintln!("no C++ compiler on PATH — skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join("harc-diff-wide-default");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    // `u64::MAX`, then the first literal above it, then 2^65. The
+    // first must lower — a gate that refuses everything would pass a
+    // refusal-only assertion.
+    let rows: &[(&str, bool)] = &[
+        ("18446744073709551615", true),
+        ("18446744073709551616", false),
+        ("36893488147419103232", false),
     ];
-    let tb_field = r#"
+
+    // Both sites that fold a declared default into a `u64` slot: a
+    // testbench field, and a test-scope `let` promoted into one by a
+    // check-phase read. The second answered `Invalid` — "no backend
+    // runs this" — for a literal v1 compiles.
+    let sites: &[(&str, &str)] = &[
+        (
+            "tb-field",
+            r#"
 testbench Tb6
     dut : Top
     w : uint<128> default @@D@@
@@ -632,9 +833,59 @@ impl T6 for Tb6
         wait 2 cycles
     end run
 end impl T6
-"#;
-    eprintln!(
-        "{}",
-        check_space_with_control("wide-default", tb_field, "@@D@@", "1", defaults)
-    );
+"#,
+        ),
+        (
+            "promoted-let",
+            r#"
+testbench Tb7
+    dut : Top
+end testbench Tb7
+
+impl T7 for Tb7
+    let w : uint<128> = @@D@@
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+    check
+        assert w != 0
+            else fail("w=${w}")
+    end check
+end impl T7
+"#,
+        ),
+    ];
+
+    for (site, template) in sites {
+        for (i, (lit, must_lower)) in rows.iter().enumerate() {
+            let src = template.replace("@@D@@", lit);
+            let stem = format!("{site}{i}");
+            let tb = tb_verdict(cc, &src, &dir, &stem);
+            if *must_lower {
+                assert!(
+                    matches!(tb, TbVerdict::Lowers),
+                    "{site}: `default {lit}` fits a u64 and must lower, got {tb:?}"
+                );
+                continue;
+            }
+            // v1 is measured, not remembered: it emits
+            // `_harc_u128 w = <literal>;`, which g++ accepts with a
+            // `-Woverflow` warning and evaluates to 0. That is
+            // `SilentlyMisLowers`, and it is why `Invalid` — which
+            // claims no backend runs the program — was wrong here.
+            assert_eq!(
+                v1_behaviour(cc, &src, &dir, &stem),
+                V1Behaviour::Compiles,
+                "{site}: v1 is expected to compile `default {lit}` (and get it wrong)"
+            );
+            match tb {
+                TbVerdict::NotImplemented(lower::V1Status::SilentlyMisLowers, _) => {}
+                other => panic!(
+                    "{site}: `default {lit}` does not fit a `u64` slot; it must be refused \
+                     as NotImplemented{{SilentlyMisLowers}}, got {other:?}"
+                ),
+            }
+        }
+    }
 }

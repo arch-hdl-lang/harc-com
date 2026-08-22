@@ -8471,8 +8471,11 @@ former `transaction` group lives in
        which ALSO decides event payloads and fixed-vector elements —
        widening that one function would have widened both of those
        unmeasured, so the declared-field subset is now its own
-       function. `scoreboards.rs` held a third byte-identical copy of
-       the same decoder; it is deleted, not edited.
+       function. `scoreboards.rs` held a third copy of the same
+       decoder, differing from `decoded_scalar_ir_type` in exactly its
+       name and its width line — an earlier draft of this entry called
+       the two byte-identical, which they were not; it is deleted, not
+       edited.
      - **The emitters.** Four of them — transactor state, scoreboard,
        component, testbench — each carried its own
        `(bool | int64_t | uint64_t)` triple, while the queue-element
@@ -8492,10 +8495,43 @@ former `transaction` group lives in
        C++ that nobody could build, in tbir and in v1 alike. The rule
        was already stated twice in the tree — `operator==`/`operator!=`
        carry the mixed HarcWide/integer form, and `harc_wide_negate`
-       writes `(~value) + HarcWide<N>(1)` by hand. Stating it once for
-       the arithmetic and relational operators retired the ambiguity
-       and the hand-written workaround together. A cap at 128 would
+       writes `(~value) + HarcWide<N>(1)` by hand. A cap at 128 would
        have written a language limit around a header omission.
+
+       The first version of that fix defined ALL TWELVE operators, and
+       an adversarial review found three defects in it:
+
+       * `/ % < > <= >=` are **not** the rule `operator==` states.
+         Equality is sign-agnostic; ordering and division are not, and
+         every `HarcWide` implementation of the six is UNSIGNED.
+         `expr.rs` emits a bare `<` for a `sint` compare (the only
+         signed-wide path, `harc_wide_slt`, is reached from covergroup
+         lowering alone), so defining them turned "this program cannot
+         be built" into `w < 0` quietly answering false on a negative
+         `sint<1024>` — a loud correct diagnostic traded for a silent
+         wrong answer, in `--codegen v1` as well, since the header is
+         shared. They are undefined now, refused at lowering by
+         `reject_unbuildable_wide_operator` with the
+         `EmitsUncompilable` grade v1 measurably earns, and
+         `tests/wide_mixed_ops_cpp.rs` pins their absence so nobody
+         closes the ambiguity error by adding them back.
+       * `HarcWide<N>(v)` for a NEGATIVE `v` zero-filled above bit 128
+         instead of sign-extending, so `w + (0 - 1)` answered 2^128
+         while `w - 1` — the same arithmetic — answered 0. The mixed
+         operators routed every negative operand through it.
+       * The ambiguity was only half retired: two wide values of
+         DIFFERENT widths deduce no `N` either. Reachable straight
+         from source once fields could be wide (`a : uint<160>`,
+         `b : uint<256>`, `b = b + a`), and `LowersUncompilable` in
+         both backends. `operator==` states that half too, as an
+         `<A, B>` form comparing at the wider of the two; the six now
+         carry it.
+
+       None of the three could be caught by a typecheck — two of them
+       compiled and computed the wrong number — so the operators are
+       gated by a probe that is built AND RUN
+       (`tests/wide_mixed_ops_cpp.rs`), in the style of
+       `wide_cast_cpp.rs`.
 
      What did NOT change: a `default` literal above `u64::MAX` is
      still refused, because every field schema carries its default in a
@@ -8506,11 +8542,38 @@ former `transaction` group lives in
      value, which is the harness's documented blind spot and exactly
      what the `SilentlyMisLowers` label already said.
 
+     Two more findings from the same review, both instances of the
+     recurring shape:
+
+     * **One landing measured, the rule written from it.** A `default`
+       literal above `u64::MAX` is refused at the testbench-field site
+       as `NotImplemented{SilentlyMisLowers}`, which is honest. At the
+       PROMOTED-`let` site the same class of literal answered
+       `Invalid` — "no backend runs this" — against a v1 that compiles
+       it, and said "non-integer initializer" about an integer. Both
+       sites fold into the same `u64` slot and now carry the same
+       label; the differential harness asserts on precisely that
+       pairing and simply had no row for the second site.
+     * **A space that could not fail.** None of the harness's three
+       falsifiable directions fires on a verdict that over-REFUSES:
+       re-capping a width gate turns every row into
+       `(Unsupported, v1 compiles)`, which is what `Unsupported`
+       means. The five width spaces were green under a reverted
+       widening. `check_space_all_lower` asserts the rows of a
+       capability that is meant to work actually lower, and the
+       wide-default test asserts its refusal directly rather than
+       through a report line — a truncating implementation reports
+       `(Lowers, v1 compiles)`, a perfectly consistent pairing whose
+       only defect is in the value.
+
      The gap was found by asking v1 across a mechanically enumerated
-     width space rather than from one probe, and every step above was
-     mutation-tested: re-capping the shared rule, re-capping either of
+     width space rather than from one probe, and every step above is
+     mutation-tested: re-capping the shared rule (now caught by the
+     differential harness as well as `tbir.rs`), re-capping either of
      the two per-file rules, restoring the hardcoded emitter triple,
-     and deleting the runtime operators each fail the suite.
+     deleting any one of the six runtime operators, reverting the
+     sign-extension, and neutering the wide-operator refusal each fail
+     the suite.
 
 ## Next steps
 

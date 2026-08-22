@@ -450,7 +450,7 @@ pub(crate) fn lower_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -894,7 +894,7 @@ fn lower_bound_target_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1476,7 +1476,7 @@ fn lower_bound_initiator_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1882,14 +1882,20 @@ fn lower_state_field(
     let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
         // The catch-all of `tb_scalar_field_ir_type`, which answers
         // `None` for every non-`Builtin` type and every builtin that is
-        // not `uint`/`sint`/`bits`/`bool`/`bit` <= 64 bits. Enumerated
-        // rather than probed once, because an arm's verdict is the
-        // WORST thing v1 does anywhere under it:
+        // not `uint`/`sint`/`bits`/`bool`/`bit` within
+        // `MAX_SCALAR_FIELD_WIDTH`. Enumerated rather than probed once,
+        // because an arm's verdict is the WORST thing v1 does anywhere
+        // under it:
         //
-        //   `uint<128>`         -> `_harc_u128 w;`, compiles, and is
-        //                          CORRECT — a landing where v1 is a
-        //                          genuine way out (width > 64 also
-        //                          answers `None` here)
+        //   `uint<128>`         -> lowered. It reached this arm while
+        //                          the shared rule capped at 64, and
+        //                          was the one landing here where v1
+        //                          was a genuine way out; the cap is
+        //                          the declared-field width now, so
+        //                          this no longer answers `None`
+        //   `uint<2048>`        -> `harc_rt::HarcWide<64> w;`, compiles
+        //                          — past the declared-field width, and
+        //                          v1 does handle the declaration
         //   `Vec<uint<8>, 4>`   -> `std::array<uint64_t, 4> v{};`, compiles
         //   `stream<uint<8>>`   -> `uint64_t s;`                 , compiles
         //   `buffer<uint<8>,N>` -> `uint64_t bf;`                , compiles
@@ -1905,11 +1911,11 @@ fn lower_state_field(
         // `Unsupported` a `Vec`-only probe suggested.
         return Err(not_implemented(
             &format!("{who} `{tname}` state field `{fname}` with a non-scalar type"),
-            "transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (<=64 bits), \
-             a whole value-record, or a `queue<scalar>` / `queue<Record>`; v1 \
+            "transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (up to 1024 \
+             bits), a whole value-record, or a `queue<scalar>` / `queue<Record>`; v1 \
              emits a bare `uint64_t` member for a `stream`/`buffer` field, which compiles \
-             and means something else (for a `uint<N>` wider than 64 bits v1 is correct, \
-             so `--codegen v1` does work for that one)"
+             and means something else (for a `uint<N>` past 1024 bits v1 declares the \
+             member correctly, so `--codegen v1` does work for that one)"
                 .to_string(),
             V1Status::SilentlyMisLowers,
         ));

@@ -336,9 +336,6 @@ fn emit_state_struct_body(
     writeln!(out, "{pad}uint64_t _last_out_cycle = 0;").ok();
 }
 
-/// The C++ element type for a `queue<T>` field. Scalars reuse the exact
-/// width-aware local mapping; a value-record element is the record struct
-/// (carried by value, matching v1's `HarcQueue<Rec>`).
 /// C++ type and initializer for one declared scalar FIELD, shared by
 /// the transactor-state, scoreboard, component, and testbench field
 /// emitters. All four carried their own copy of a
@@ -356,6 +353,9 @@ fn scalar_field_decl(ty: &crate::ir::IrType, default: u64) -> (String, String) {
     }
 }
 
+/// The C++ element type for a `queue<T>` field. Scalars reuse the exact
+/// width-aware local mapping; a value-record element is the record struct
+/// (carried by value, matching v1's `HarcQueue<Rec>`).
 fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
     match elem {
         crate::ir::QueueElem::Scalar { ty } => super::field_scalar_cty(ty),

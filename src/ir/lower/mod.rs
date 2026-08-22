@@ -1912,7 +1912,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1982,7 +1982,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -2195,7 +2195,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -2898,7 +2898,7 @@ fn validate_testbench_component(
                             "testbench field `{}` with a non-scalar, non-named type",
                             f.name.name
                         ),
-                        "only uint/sint/bits/bool fields up to 64 bits are lowered",
+                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
                     ));
                 }
             }
@@ -5067,12 +5067,46 @@ fn lower_test(
                     .or(inferred_ty)
                     .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
-                Some(ExprKind::Int(s)) => s.replace('_', "").parse::<u64>().map_err(|_| {
-                    LowerError::Invalid(format!(
-                        "promoted `let {}` has a non-integer initializer",
-                        l.name.name
-                    ))
-                })?,
+                Some(ExprKind::Int(s)) => {
+                    let digits = s.replace('_', "");
+                    match digits.parse::<u64>() {
+                        Ok(v) => v,
+                        // Not "non-integer" — the literal IS an integer,
+                        // it just has no slot: a promoted `let` becomes a
+                        // `_tb` field, and every field schema carries its
+                        // default as a `u64`. `Invalid` was the wrong
+                        // grade for it as well, and the differential
+                        // harness asserts on exactly that pairing: v1
+                        // compiles `_harc_u128 w = <literal>;`, which g++
+                        // accepts with a `-Woverflow` warning and
+                        // evaluates to 0. That is the same measurement
+                        // the testbench-field default already carries, so
+                        // it gets the same label.
+                        Err(_) if digits.chars().all(|c| c.is_ascii_digit()) => {
+                            return Err(not_implemented(
+                                &format!(
+                                    "a promoted test-scope `let {}` whose initializer \
+                                     `{digits}` does not fit the 64-bit \
+                                     constant-evaluation domain",
+                                    l.name.name
+                                ),
+                                "a test-scope let captured by a closure hook OR read in \
+                                 the check phase is promoted to a `_tb` host field, whose \
+                                 default is held as a 64-bit value; v1 emits the literal \
+                                 into the member initializer, where g++ truncates it to 0 \
+                                 with only a warning"
+                                    .to_string(),
+                                V1Status::SilentlyMisLowers,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(LowerError::Invalid(format!(
+                                "promoted `let {}` has a non-integer initializer",
+                                l.name.name
+                            )))
+                        }
+                    }
+                }
                 Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
                 _ => {
@@ -5319,7 +5353,10 @@ fn lower_test(
         properties: properties.clone(),
         owner: Some(tb_id),
         const_signed: const_signed.clone(),
-        tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        tb_scalar_fields: scalar_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect(),
         tb_queue_fields: queue_fields
             .iter()
             .map(|f| (f.name.clone(), f.elem.clone()))
@@ -6068,10 +6105,18 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
 /// The largest declared field width lowered as a scalar member.
 ///
 /// 1024 bits is the language-level vector target `harc_thread_rt.h`
-/// states for `HarcWide<N>` (N <= 32), and the same ceiling the value
-/// model already used for locals and queue elements. A FIELD is not a
-/// local, but the storage seam is shared: `field_scalar_cty` renders
-/// 65..128 as v1's `_harc_u128` and wider as `harc_rt::HarcWide<N>`.
+/// states for `HarcWide<N>` (N <= 32). Locals and queue elements have
+/// NO ceiling — `wide_scalar_words` is `(w > 128).then(|| w / 32)`,
+/// unbounded, and `queue<uint<4096>>` really does emit
+/// `HarcQueue<HarcWide<128>>`. An earlier draft of this comment
+/// claimed 1024 was "the same ceiling the value model already used",
+/// which would have been the reason for the number and is not true.
+/// The number is the stated language limit; the value model is simply
+/// more permissive than the language is.
+///
+/// A FIELD is not a local, but the storage seam is shared:
+/// `field_scalar_cty` renders 65..128 as v1's `_harc_u128` and wider
+/// as `harc_rt::HarcWide<N>`.
 ///
 /// This was very nearly capped at 128 instead. Above that, a field is
 /// declared `HarcWide<N>`, and `w = w + 1` on one was rejected by g++
@@ -6323,9 +6368,13 @@ pub(crate) struct LowerCtx {
     /// substituted bit patterns so TB-IR preserves signed operators at
     /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
     pub const_signed: HashMap<String, bool>,
-    /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
-    /// for `_tb.<field>` access lowering.
-    pub tb_scalar_fields: HashSet<String>,
+    /// Scalar testbench fields (`TestbenchSchema::scalar_fields`), for
+    /// `_tb.<field>` access lowering, with each field's declared IR
+    /// type. The type is what tells a binary-operator guard whether an
+    /// operand is held as `harc_rt::HarcWide<N>`; a name-only set
+    /// could not answer that, and the operand shapes are exactly the
+    /// ones a wide declared field made reachable.
+    pub tb_scalar_fields: HashMap<String, IrType>,
     /// Testbench-owned typed queue fields (`TestbenchSchema::queue_fields`),
     /// for `_tb.<field>.push/pop/size/empty` lowering.
     pub tb_queue_fields: HashMap<String, crate::ir::QueueElem>,
@@ -7391,7 +7440,7 @@ impl FuncBuilder<'_> {
 
     pub(crate) fn tb_scalar_field_in_capture_scope(&self, name: &str) -> Option<String> {
         let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
-        (can_capture && self.ctx.tb_scalar_fields.contains(name)).then(|| name.to_string())
+        (can_capture && self.ctx.tb_scalar_fields.contains_key(name)).then(|| name.to_string())
     }
 
     pub(crate) fn set_local_type(&mut self, l: LocalId, ty: IrType) {

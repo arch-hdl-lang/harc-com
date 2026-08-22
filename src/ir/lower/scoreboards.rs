@@ -334,7 +334,7 @@ fn scoreboard_field_kind(
         // uses. Measured: `list<Vec<uint<8>, 2>>` gives
         // `std::vector<std::array<uint64_t, 2>> l;` and compiles, while
         // the same leaf in a transaction does not.
-        const SUBSET: &str = "only scalar uint/sint/bits/bool fields up to 64 bits and \
+        const SUBSET: &str = "only scalar uint/sint/bits/bool fields up to 1024 bits and \
                               `queue<T>` of such a scalar element type or a \
                               `queue<transaction|struct>` are lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");

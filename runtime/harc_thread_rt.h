@@ -75,11 +75,18 @@ struct HarcWide {
 
     HarcWide() = default;
 
+    // A negative operand SIGN-extends across every word, not just the
+    // low four. Zero-filling above bit 128 made `HarcWide<32>(-1)` the
+    // value 2^128-1 rather than the all-ones two's-complement -1, so
+    // `w + (0 - 1)` answered 2^128 where 0 was correct — and `w - 1`,
+    // the same arithmetic spelled differently, answered correctly.
+    // Unsigned and non-negative operands zero-fill exactly as before.
     template<typename T, typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>
     HarcWide(T v) {
         _harc_u128 u = static_cast<_harc_u128>(v);
+        const uint32_t fill = (std::is_signed_v<T> && v < T{0}) ? 0xFFFFFFFFu : 0u;
         for (std::size_t i = 0; i < N; ++i) {
-            words[i] = (i < 4) ? static_cast<uint32_t>(u >> (32 * i)) : 0u;
+            words[i] = (i < 4) ? static_cast<uint32_t>(u >> (32 * i)) : fill;
         }
     }
 
@@ -507,49 +514,61 @@ inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     return r;
 }
 
-// Mixed HarcWide/integer operands.
+// Mixed operands: HarcWide with an integer, and HarcWide with a
+// DIFFERENTLY sized HarcWide.
 //
 // `HarcWide<N>` converts implicitly to BOTH `uint64_t` and
 // `_harc_u128`, so `w + 1` names two equally good built-in additions
 // and g++ rejects it: "ambiguous overload for `operator+` (operand
-// types are `harc_rt::HarcWide<32>` and `int`)". Every emitted
-// `w = w + 1` on a scalar wider than 128 bits hit that, in both
-// backends — a lowered program that nobody can build.
+// types are `harc_rt::HarcWide<32>` and `int`)". `a + b` on two wide
+// values of different widths deduces no `N` for the homogeneous
+// overload and falls into the same ambiguity. Both shapes were emitted
+// by both backends for any scalar past 128 bits — lowered programs
+// nobody could build.
 //
-// The rule is the one `operator==`/`operator!=` above already state,
-// and that `harc_wide_negate` writes out by hand as `(~value) +
-// HarcWide<N>(1)`: widen the integer to the wide operand's own width
-// and use the homogeneous operator. Stating it once here retires both
-// copies of the workaround and the ambiguity along with them.
+// `operator==`/`operator!=` above already state both halves of the
+// rule: a `<A, B>` form that compares at the wider of the two, and a
+// `<N, T>` form that widens the integer. `harc_wide_negate` writes the
+// integer half out by hand as `(~value) + HarcWide<N>(1)`. Stating it
+// once here retires the workaround and both ambiguities.
 //
-// Both argument orders are defined because either can be written
-// (`w + 1` and `1 + w`), and the enable_if keeps `HarcWide` itself out
-// of `T` so the homogeneous overloads still win when both sides are
-// wide.
+// ONLY the sign-agnostic operators are defined. `+`, `-`, `*`, `&`,
+// `|` and `^` give the same N-word answer whether the operands are
+// read as signed or unsigned, so one implementation is correct for
+// both. `/`, `%`, `<`, `>`, `<=` and `>=` do NOT: the homogeneous
+// `HarcWide` implementations of all six are unsigned, and `expr.rs`
+// emits a bare `<` for a `sint` compare (there is no signed-wide path
+// outside `harc_wide_slt`, which only covergroup lowering reaches).
+// Defining them here would silently answer `0` for `w < 0` on a
+// negative `sint<1024>` instead of failing to build. A refusal at
+// lowering is the honest outcome until a signed-wide compare exists;
+// see `wide_scalar_relational_and_division_operands` in
+// `src/ir/lower/exprs.rs`.
 #define HARC_WIDE_MIXED_OP(op)                                                                  \
     template<std::size_t N, typename T,                                                         \
              typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
-    inline auto operator op(const HarcWide<N>& lhs, T rhs) {                                    \
+    inline HarcWide<N> operator op(const HarcWide<N>& lhs, T rhs) {                              \
         return lhs op HarcWide<N>(rhs);                                                         \
     }                                                                                           \
     template<std::size_t N, typename T,                                                         \
              typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
-    inline auto operator op(T lhs, const HarcWide<N>& rhs) {                                    \
+    inline HarcWide<N> operator op(T lhs, const HarcWide<N>& rhs) {                              \
         return HarcWide<N>(lhs) op rhs;                                                         \
+    }                                                                                           \
+    template<std::size_t A, std::size_t B,                                                      \
+             typename = std::enable_if_t<(A != B)>>                                             \
+    inline HarcWide<(A > B ? A : B)> operator op(                                               \
+        const HarcWide<A>& lhs, const HarcWide<B>& rhs) {                                       \
+        constexpr std::size_t M = (A > B) ? A : B;                                              \
+        return harc_wide_zext<M>(lhs) op harc_wide_zext<M>(rhs);                                \
     }
 
 HARC_WIDE_MIXED_OP(+)
 HARC_WIDE_MIXED_OP(-)
 HARC_WIDE_MIXED_OP(*)
-HARC_WIDE_MIXED_OP(/)
-HARC_WIDE_MIXED_OP(%)
 HARC_WIDE_MIXED_OP(&)
 HARC_WIDE_MIXED_OP(|)
 HARC_WIDE_MIXED_OP(^)
-HARC_WIDE_MIXED_OP(<)
-HARC_WIDE_MIXED_OP(>)
-HARC_WIDE_MIXED_OP(<=)
-HARC_WIDE_MIXED_OP(>=)
 #undef HARC_WIDE_MIXED_OP
 
 template<std::size_t N>

@@ -877,6 +877,7 @@ impl FuncBuilder<'_> {
                 };
                 self.vec_read_ok = saved;
                 let (l, r) = (l?, r?);
+                self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
                 // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
                 // to `max(W(lhs), W(rhs))` bits, matching ARCH's
@@ -2618,7 +2619,9 @@ impl FuncBuilder<'_> {
                         {
                             return Ok(None);
                         }
-                        if segments.len() == 1 && self.ctx.tb_scalar_fields.contains(&segments[0]) {
+                        if segments.len() == 1
+                            && self.ctx.tb_scalar_fields.contains_key(&segments[0])
+                        {
                             return Ok(None);
                         }
                         if self
@@ -2899,7 +2902,7 @@ impl FuncBuilder<'_> {
         let ExprKind::Ident(root) = &*target.kind else {
             return None;
         };
-        (root.name == tb_field && self.ctx.tb_scalar_fields.contains(&name.name))
+        (root.name == tb_field && self.ctx.tb_scalar_fields.contains_key(&name.name))
             .then(|| name.name.clone())
     }
 
@@ -3360,6 +3363,124 @@ impl FuncBuilder<'_> {
     /// silently degrading to the un-wrapped value (the exact hazard the
     /// operator exists to prevent): a scoreboard mirroring a wrapping
     /// datapath would otherwise compute values the DUT can never emit.
+    /// Is this operand held as `harc_rt::HarcWide<N>` rather than a
+    /// builtin integer?
+    ///
+    /// `expr_type` answers for locals, literals, casts and slices, but
+    /// returns `None` for every HOST-STATE read — a testbench field, a
+    /// component/scoreboard field, a transactor state field. Those are
+    /// precisely the reads a wide declared field made reachable, so
+    /// they are resolved here against their schemas rather than by
+    /// widening `expr_type`, which decides hint and guard questions
+    /// throughout lowering and would change all of them at once.
+    ///
+    /// Deliberately narrow: a shape it cannot resolve answers `false`
+    /// and keeps the behaviour that shipped before — the expression
+    /// lowers, and if the emitted C++ turns out not to build that is
+    /// the pre-existing defect, not a new one. `differential.rs`'s
+    /// wide-operator spaces are what say which shapes must be here.
+    fn is_wide_scalar(&self, e: &Expr) -> bool {
+        let wide = |ty: Option<&IrType>| {
+            matches!(
+                ty,
+                Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w)))
+                    if *w > Self::BUILTIN_SCALAR_BITS
+            )
+        };
+        match e {
+            Expr::TbField(name) => wide(self.ctx.tb_scalar_fields.get(name)),
+            Expr::ComponentField { base, field } => {
+                let Some(cid) = self.component_base_id(base) else {
+                    return false;
+                };
+                let Some(f) = self
+                    .ctx
+                    .components
+                    .get(cid.index())
+                    .and_then(|c| c.field(field))
+                else {
+                    return false;
+                };
+                matches!(&f.kind, crate::ir::ComponentFieldKind::Scalar { ty, .. } if wide(Some(ty)))
+            }
+            // Both operands of a same-width comparison are equally
+            // wide, so either side answering is enough; recursing keeps
+            // `(w + 1) < 8` from slipping past on the parenthesised
+            // side.
+            Expr::Unary(_, inner) => self.is_wide_scalar(inner),
+            Expr::Binary(_, a, b) => self.is_wide_scalar(a) || self.is_wide_scalar(b),
+            Expr::Ternary(_, t, f) => self.is_wide_scalar(t) || self.is_wide_scalar(f),
+            other => wide(self.expr_type(other).as_ref()),
+        }
+    }
+
+    /// The widest scalar that is still a builtin C++ integer type.
+    /// Past this, `local_scalar_cty` renders the value as
+    /// `harc_rt::HarcWide<N>` — a struct, whose operator set is what a
+    /// binary expression on it can use. Named here rather than
+    /// imported from codegen so lowering does not depend on the
+    /// emitter, and kept in step with `wide_scalar_words`.
+    const BUILTIN_SCALAR_BITS: u32 = 128;
+
+    /// Refuse `/ % < > <= >=` when either operand is wider than a
+    /// builtin integer type.
+    ///
+    /// `HarcWide<N>` defines all six for two operands of the SAME
+    /// width, and all six are UNSIGNED. Against an integer (`w < 8`)
+    /// they are not defined at all: `HarcWide` converts to `uint64_t`
+    /// and to `_harc_u128` equally well, so the call is ambiguous and
+    /// g++ rejects it — in both backends, which is how these landed
+    /// here. `+ - * & | ^` are defined for the mixed shapes instead,
+    /// because those six give the same N-word answer read signed or
+    /// unsigned and one implementation is correct for both.
+    ///
+    /// Defining the other six in the header would be worse than this
+    /// refusal, not better: there is no signed-wide compare outside
+    /// `harc_wide_slt` (which only covergroup lowering reaches), so
+    /// `w < 0` on a negative `sint<1024>` would quietly answer false
+    /// rather than fail to build.
+    ///
+    /// The label is `EmitsUncompilable` because that is measured: v1
+    /// emits the same `HarcWide<32> < int` and g++ refuses it too, so
+    /// `--codegen v1` is not a way out and must not be offered.
+    fn reject_unbuildable_wide_operator(
+        &self,
+        op: BinaryOp,
+        ir_op: BinOp,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), LowerError> {
+        let sym = match ir_op {
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            _ => return Ok(()),
+        };
+        // `+% -% *%` reach `wrap_to_operand_width`, never these six.
+        let _ = op;
+        if !self.is_wide_scalar(l) && !self.is_wide_scalar(r) {
+            return Ok(());
+        }
+        Err(not_implemented(
+            &format!(
+                "the operator `{sym}` on a scalar wider than {} bits",
+                Self::BUILTIN_SCALAR_BITS
+            ),
+            format!(
+                "a scalar wider than {} bits is held as `harc_rt::HarcWide<N>`, which \
+                 defines `{sym}` only between two operands of the same width, and only \
+                 as an UNSIGNED operation; `+ - * & | ^ << >> == !=` are lowered at any \
+                 width. v1 emits the same expression and its C++ does not compile either, \
+                 so `--codegen v1` is not a way out",
+                Self::BUILTIN_SCALAR_BITS
+            ),
+            V1Status::EmitsUncompilable,
+        ))
+    }
+
     fn wrap_to_operand_width(
         &self,
         op: BinaryOp,
