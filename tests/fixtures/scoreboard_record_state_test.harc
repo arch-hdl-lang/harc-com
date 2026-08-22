@@ -1,0 +1,36 @@
+struct ScoreboardSnapshot
+    value : uint<16>
+end struct ScoreboardSnapshot
+
+scoreboard RecordStateBoard
+    last : ScoreboardSnapshot
+end scoreboard RecordStateBoard
+
+env RecordStateEnv
+    nested : RecordStateBoard
+end env RecordStateEnv
+
+testbench ScoreboardRecordStateTb
+    dut : Top
+    sb  : RecordStateBoard
+    top : RecordStateEnv
+end testbench ScoreboardRecordStateTb
+
+impl ScoreboardRecordStateTest for ScoreboardRecordStateTb
+    run
+        let item : ScoreboardSnapshot
+        item.value = 77
+        sb.last = item
+        top.nested.last = item
+        log(info, "stored=${item.value}")
+        wait 1 cycle
+    end run
+
+    check
+        let got : ScoreboardSnapshot = sb.last
+        let nested : ScoreboardSnapshot = top.nested.last
+        assert got.value == 77 else fail("record scoreboard state changed: ${got.value}")
+        assert nested.value == 77 else fail("nested record scoreboard state changed: ${nested.value}")
+        log(info, "loaded=${got.value}")
+    end check
+end impl ScoreboardRecordStateTest

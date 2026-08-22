@@ -6983,6 +6983,7 @@ fn lower_tb_cycle_service_body<'a>(
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     let trigger = b.lower_expr(&trigger_expr)?;
+    b.validate_truth_expr(&trigger, "testbench cycle-handler trigger")?;
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);

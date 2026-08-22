@@ -1657,21 +1657,29 @@ fn emit_stmt(
                     writeln!(out, "{pad}{name} = {base}.{queue}.pop();").ok();
                 }
                 ScoreboardOp::ScalarWrite { scalar, value } => {
-                    let ty = prog
+                    let kind = prog
                         .scoreboards
                         .get(sb.index())
                         .and_then(|schema| schema.fields.iter().find(|f| f.name == *scalar))
-                        .and_then(|field| match &field.kind {
-                            crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty),
-                            _ => None,
-                        })
+                        .map(|field| &field.kind)
                         .ok_or_else(|| {
                             EmitError(format!(
-                                "tbir: scoreboard {} scalar `{scalar}` has no scalar schema",
+                                "tbir: scoreboard {} field `{scalar}` has no value schema",
                                 sb.0
                             ))
                         })?;
-                    let e = scalar_assignment_expr_cpp(cx, value, ty)?;
+                    let e = match kind {
+                        crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => {
+                            scalar_assignment_expr_cpp(cx, value, ty)?
+                        }
+                        crate::ir::ScoreboardFieldKind::Record { .. } => expr_cpp(cx, value)?,
+                        crate::ir::ScoreboardFieldKind::Queue { .. } => {
+                            return Err(EmitError(format!(
+                                "tbir: scoreboard {} field `{scalar}` is a queue",
+                                sb.0
+                            )))
+                        }
+                    };
                     writeln!(out, "{pad}{base}.{scalar} = {e};").ok();
                 }
             }

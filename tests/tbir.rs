@@ -12028,11 +12028,6 @@ end impl T"#
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
         ),
-        // A record-typed field. `txn_field_c_type` alone maps every
-        // named type to `int64_t`, and asking only it called this a
-        // flattening — but the member picker these fields actually go
-        // through adds one layer, and v1 emits the record itself.
-        ("Inner", "Inner l;"),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
         assert_unsupported(&lower_src(&src).unwrap_err());
@@ -12043,6 +12038,24 @@ end impl T"#
             "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
         );
     }
+    // A record-typed field now uses persistent by-value record storage,
+    // matching the component and transactor-state seams.
+    let record_src = prog("scoreboard Sb\n    l : Inner\nend scoreboard Sb");
+    let record_prog = lower_src(&record_src).expect("record scoreboard state lowers");
+    verify::verify_program(&record_prog).expect("record scoreboard state verifies");
+    let record_cpp = tbir::emit(
+        &record_prog,
+        &merged_src(&record_src),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("TBIR emits record scoreboard state");
+    assert!(record_cpp.contains("Inner l{};"), "{record_cpp}");
+    assert!(
+        cpp_tb::emit(&merged_src(&record_src))
+            .expect("v1 emits")
+            .contains("Inner l;"),
+        "v1 keeps the record member by value"
+    );
     // Unsigned scalar state now uses the same width-aware carriers as
     // locals and queue elements. Pin both sides of the 128-bit boundary.
     for (ty, shape) in [
@@ -12078,6 +12091,680 @@ end impl T"#
             "`{ty}`: v1 flattens it to `{shape}`"
         );
     }
+}
+
+#[test]
+fn scoreboard_record_state_copies_across_phases() {
+    let src = r#"struct Snapshot
+    value : uint<16>
+end struct Snapshot
+
+struct Other
+    value : uint<16>
+end struct Other
+
+scoreboard Sb
+    last : Snapshot
+    count : uint<8>
+    pending : queue<uint<8>>
+    flags : queue<bool>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        let item : Snapshot
+        let other : Other
+        let scalar : uint<8> = 0
+        item.value = 77
+        sb.last = item
+        sb.count = 1
+        sb.pending.push(1)
+        sb.flags.push(item == item)
+        wait 1 cycle
+    end run
+    check
+        let got : Snapshot = sb.last
+        assert got.value == 77 else fail("record scoreboard state changed")
+    end check
+end impl T"#;
+
+    let prog = lower_src(src).expect("whole-record scoreboard state lowers");
+    verify::verify_program(&prog).expect("whole-record scoreboard state verifies");
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("whole-record scoreboard state emits");
+    for needle in [
+        "Snapshot last{};",
+        "_tb.sb.last = item;",
+        "got = _tb.sb.last;",
+    ] {
+        assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
+    }
+    cpp_tb::emit(&merged_src(src)).expect("v1 emits the same record-state copies");
+
+    for bad in [
+        src.replace("sb.last = item", "sb.last = other"),
+        src.replace("sb.last = item", "sb.last = 7"),
+    ] {
+        let err = lower_src(&bad).expect_err("record scoreboard writes require the exact record");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("scoreboard record field `last`") && msg.contains("Snapshot"),
+            "the record destination and expected type are named: {msg}"
+        );
+    }
+
+    let record_condition = src.replace("sb.last = item", "sb.last = item ? item : item");
+    let err = lower_src(&record_condition).expect_err("a record cannot be a ternary condition");
+    assert!(
+        assert_invalid(&err).contains("ternary condition must be a scalar value"),
+        "record ternary conditions get a source-facing type diagnostic: {err}"
+    );
+    let wrapped_record_condition = src.replace("sb.last = item", "sb.last = !item ? item : item");
+    let err = lower_src(&wrapped_record_condition)
+        .expect_err("a wrapped record cannot be a ternary condition");
+    assert!(
+        assert_invalid(&err).contains("scalar operator to a record value"),
+        "wrapped record conditions get the same source-facing type diagnostic: {err}"
+    );
+    let record_equality_condition =
+        src.replace("sb.last = item", "sb.last = (item == item) ? item : item");
+    let equality_prog =
+        lower_src(&record_equality_condition).expect("same-record equality is a valid condition");
+    verify::verify_program(&equality_prog).expect("same-record equality condition verifies");
+
+    for (label, inserted) in [
+        ("if", "if sb.last\n        end if\n        "),
+        ("assert", "assert sb.last\n        "),
+        ("wait", "wait until sb.last\n        "),
+    ] {
+        let truth_src = src.replace("wait 1 cycle", &format!("{inserted}wait 1 cycle"));
+        let err = lower_src(&truth_src).expect_err("record truth consumers require scalars");
+        assert!(
+            assert_invalid(&err).contains("must be a scalar value"),
+            "{label} record truth gets a source diagnostic: {err}"
+        );
+    }
+    let mixed_record_truth =
+        src.replace("wait 1 cycle", "assert !(1 ? item : other)\n        wait 1 cycle");
+    let err = lower_src(&mixed_record_truth)
+        .expect_err("a mixed-record ternary cannot hide under a scalar truth operator");
+    assert!(
+        assert_invalid(&err).contains("scalar operator to a record value"),
+        "mixed-record ternary composition gets a source diagnostic: {err}"
+    );
+    let mixed_scalar_assignment = src.replace(
+        "item.value = 77",
+        "scalar = 1 ? (0 as uint<8>) : sb.last\n        item.value = 77",
+    );
+    let err = lower_src(&mixed_scalar_assignment)
+        .expect_err("a scalar local cannot accept a scalar-first mixed record ternary");
+    assert!(
+        assert_invalid(&err).contains("invalid record composition"),
+        "mixed scalar/record ternary assignment gets a source diagnostic: {err}"
+    );
+    let event_control = src
+        .replace(
+            "let scalar : uint<8> = 0",
+            "let scalar : uint<8> = 0\n        let ev : event<bool>",
+        )
+        .replace("item.value = 77", "emit ev(item == item)\n        item.value = 77");
+    let event_prog =
+        lower_src(&event_control).expect("same-record equality is a valid scalar event payload");
+    let mixed_event = event_control.replace(
+        "emit ev(item == item)",
+        "emit ev(1 ? false : sb.last)",
+    );
+    let err = lower_src(&mixed_event)
+        .expect_err("a scalar local event cannot accept a mixed record payload");
+    assert!(
+        assert_invalid(&err).contains("channel carries `event<uint>`"),
+        "mixed scalar/record local-event payload gets a source diagnostic: {err}"
+    );
+    let record_query = event_prog
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("event control retains the record scoreboard query");
+    let mut broken_event = event_prog.clone();
+    let arg = broken_event
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventEmit { args, .. } => args.first_mut(),
+            _ => None,
+        })
+        .expect("local event emit exists");
+    *arg = record_query;
+    assert!(
+        verify::verify_program(&broken_event).is_err(),
+        "a scalar local event cannot carry a direct record after lowering"
+    );
+
+    let component_record_trigger = r#"struct Snap
+    value : uint<8>
+end struct Snap
+
+agent Holder
+    last : Snap
+    on last level
+        log(info, "tick")
+    end on
+end agent Holder
+
+testbench Tb
+    dut : Top
+    holder : Holder
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    for (label, trigger, expected) in [
+        ("direct", "on last level", "must be a scalar value"),
+        (
+            "wrapped",
+            "on !last level",
+            "scalar operator to a record value",
+        ),
+    ] {
+        let trigger_src = component_record_trigger.replace("on last level", trigger);
+        let err = lower_src(&trigger_src)
+            .expect_err("component record cycle triggers require scalar expressions");
+        assert!(
+            assert_invalid(&err).contains(expected),
+            "{label} component record trigger gets a source diagnostic: {err}"
+        );
+    }
+    for (label, condition, expected) in [
+        ("direct", "last", "must be a scalar value"),
+        (
+            "wrapped",
+            "!last",
+            "scalar operator to a record value",
+        ),
+    ] {
+        let ternary_src = component_record_trigger.replace(
+            "    on last level",
+            &format!(
+                "    function choose() -> Snap\n        let out : Snap = {condition} ? last : last\n        return out\n    end function\n\n    on 1 level"
+            ),
+        );
+        let err = lower_src(&ternary_src)
+            .expect_err("component record ternary conditions require scalar expressions");
+        assert!(
+            assert_invalid(&err).contains(expected),
+            "{label} component record ternary condition gets a source diagnostic: {err}"
+        );
+    }
+
+    let record_default = src.replace("last : Snapshot", "last : Snapshot default 0");
+    let err = lower_src(&record_default).expect_err("record scoreboard defaults do not compile");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+
+    for reserved in ["_last_in_cycle", "_last_out_cycle"] {
+        let reserved_src = src.replace("last : Snapshot", &format!("{reserved} : Snapshot"));
+        let err = lower_src(&reserved_src)
+            .expect_err("generated scoreboard heartbeat member names are reserved");
+        assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    }
+
+    let mut broken_schema = prog.clone();
+    let ir::ScoreboardFieldKind::Record { record } =
+        &mut broken_schema.scoreboards[0].fields[0].kind
+    else {
+        panic!("record scoreboard field exists")
+    };
+    *record = ir::RecordId(u32::MAX);
+    assert!(
+        verify::verify_program(&broken_schema).is_err(),
+        "a missing scoreboard record schema must fail verification"
+    );
+    for reserved in ["_last_in_cycle", "_last_out_cycle"] {
+        let mut broken_name = prog.clone();
+        broken_name.scoreboards[0].fields[0].name = reserved.to_string();
+        assert!(
+            verify::verify_program(&broken_name).is_err(),
+            "reserved generated scoreboard member `{reserved}` must fail verification"
+        );
+    }
+
+    let mut broken_write = prog.clone();
+    let write_function = broken_write
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.blocks.iter().any(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        ir::Stmt::ScoreboardOp {
+                            op: ir::ScoreboardOp::ScalarWrite { .. },
+                            ..
+                        }
+                    )
+                })
+            })
+        })
+        .expect("record scoreboard write function exists");
+    let other = write_function
+        .locals
+        .iter()
+        .position(|local| local.name == "other")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Other local exists");
+    let value = write_function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { value, .. },
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Local(other);
+    assert!(
+        verify::verify_program(&broken_write).is_err(),
+        "a mismatched scoreboard record write must fail verification"
+    );
+
+    for reverse in [false, true] {
+        let mut broken_ternary = prog.clone();
+        let function = broken_ternary
+            .functions
+            .iter_mut()
+            .find(|function| function.locals.iter().any(|local| local.name == "other"))
+            .expect("record write function exists");
+        let local = |name: &str| {
+            function
+                .locals
+                .iter()
+                .position(|local| local.name == name)
+                .map(|index| ir::LocalId(index as u32))
+                .expect("record local exists")
+        };
+        let item = local("item");
+        let other = local("other");
+        let value = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::ScalarWrite { value, .. },
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .expect("record scoreboard write exists");
+        let (then_value, else_value) = if reverse {
+            (ir::Expr::Local(other), ir::Expr::Local(item))
+        } else {
+            (ir::Expr::Local(item), ir::Expr::Local(other))
+        };
+        *value = ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(then_value),
+            Box::new(else_value),
+        );
+        assert!(
+            verify::verify_program(&broken_ternary).is_err(),
+            "mixed record ternary write must fail verification in either arm order"
+        );
+    }
+
+    let mut broken_wrapped_record = prog.clone();
+    let function = broken_wrapped_record
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "item"))
+        .expect("record write function exists");
+    let item = function
+        .locals
+        .iter()
+        .position(|local| local.name == "item")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Snapshot local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "last" => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Unary(
+        ir::UnOp::Neg,
+        Box::new(ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(ir::Expr::Local(item)),
+            Box::new(ir::Expr::Local(item)),
+        )),
+    );
+    assert!(
+        verify::verify_program(&broken_wrapped_record).is_err(),
+        "a scalar operator cannot turn a same-record ternary into a record write"
+    );
+
+    let mut broken_record_condition = prog.clone();
+    let function = broken_record_condition
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "item"))
+        .expect("record write function exists");
+    let item = function
+        .locals
+        .iter()
+        .position(|local| local.name == "item")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("Snapshot local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "last" => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard write exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Local(item)),
+        Box::new(ir::Expr::Local(item)),
+        Box::new(ir::Expr::Local(item)),
+    );
+    assert!(
+        verify::verify_program(&broken_record_condition).is_err(),
+        "a corrupted record-valued ternary condition must fail verification"
+    );
+
+    for (queue, wrapped) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut broken_scalar_consumer = prog.clone();
+        let function = broken_scalar_consumer
+            .functions
+            .iter_mut()
+            .find(|function| function.locals.iter().any(|local| local.name == "other"))
+            .expect("record write function exists");
+        let local = |name: &str| {
+            function
+                .locals
+                .iter()
+                .position(|local| local.name == name)
+                .map(|index| ir::LocalId(index as u32))
+                .expect("record local exists")
+        };
+        let item = local("item");
+        let other = local("other");
+        let value = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::QueuePush { value, .. },
+                    ..
+                } if queue => Some(value),
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                    ..
+                } if !queue && scalar == "count" => Some(value),
+                _ => None,
+            })
+            .expect("scalar scoreboard consumer exists");
+        let mixed = ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(ir::Expr::Local(item)),
+            Box::new(ir::Expr::Local(other)),
+        );
+        *value = if wrapped {
+            ir::Expr::Unary(ir::UnOp::Neg, Box::new(mixed))
+        } else {
+            mixed
+        };
+        assert!(
+            verify::verify_program(&broken_scalar_consumer).is_err(),
+            "a scalar scoreboard write/push cannot accept a direct or nested mixed-record ternary"
+        );
+    }
+
+    let mut broken_local_assign = prog.clone();
+    let function = broken_local_assign
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(query),
+        Box::new(ir::Expr::Literal {
+            value: 7,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+    );
+    assert!(
+        verify::verify_program(&broken_local_assign).is_err(),
+        "a record local assignment cannot hide a mixed aggregate ternary"
+    );
+
+    let record_query = prog
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("record scoreboard query exists");
+    let mut broken_scalar_local = prog.clone();
+    let function = broken_scalar_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "scalar"))
+        .expect("scalar local function exists");
+    let scalar = function
+        .locals
+        .iter()
+        .position(|local| local.name == "scalar")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("scalar local exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(local, value) if *local == scalar => Some(value),
+            _ => None,
+        })
+        .expect("scalar local initializer exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+        Box::new(record_query),
+    );
+    assert!(
+        verify::verify_program(&broken_scalar_local).is_err(),
+        "a scalar local cannot accept a scalar-first mixed record ternary after lowering"
+    );
+
+    let mut broken_wrapped_local = prog.clone();
+    let function = broken_wrapped_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Unary(
+        ir::UnOp::Neg,
+        Box::new(ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(query.clone()),
+            Box::new(query),
+        )),
+    );
+    assert!(
+        verify::verify_program(&broken_wrapped_local).is_err(),
+        "a scalar operator cannot turn a same-record ternary into a record local value"
+    );
+
+    let mut broken_bool_local = prog.clone();
+    let function = broken_bool_local
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let value = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value),
+            _ => None,
+        })
+        .expect("record scoreboard read assignment exists");
+    let query = value.clone();
+    *value = ir::Expr::Binary(ir::BinOp::Eq, Box::new(query.clone()), Box::new(query));
+    assert!(
+        verify::verify_program(&broken_bool_local).is_err(),
+        "a same-record equality result cannot be assigned to a record local"
+    );
+
+    let mut broken_truth = prog.clone();
+    let function = broken_truth
+        .functions
+        .iter_mut()
+        .find(|function| function.locals.iter().any(|local| local.name == "got"))
+        .expect("record read function exists");
+    let query = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::ScoreboardQuery { .. }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("record scoreboard read exists");
+    let cond = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+            _ => None,
+        })
+        .expect("assert condition exists");
+    *cond = query;
+    assert!(
+        verify::verify_program(&broken_truth).is_err(),
+        "a record-valued assertion condition must fail verification"
+    );
+
+    let nested = lower_src(&fixture("scoreboard_record_state_test.harc"))
+        .expect("nested scoreboard fixture lowers");
+    let mut broken_nested_write = nested.clone();
+    let path = broken_nested_write
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                nested_path: Some(path),
+                ..
+            } => Some(path),
+            _ => None,
+        })
+        .expect("nested scoreboard write exists");
+    path[1] = "bogus".to_string();
+    assert!(
+        verify::verify_program(&broken_nested_write).is_err(),
+        "a corrupted nested scoreboard write path must fail verification"
+    );
+
+    let mut broken_nested_read = nested;
+    let path = broken_nested_read
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::ScoreboardQuery {
+                    nested_path: Some(path),
+                    ..
+                },
+            ) => Some(path),
+            _ => None,
+        })
+        .expect("nested scoreboard read exists");
+    path[1] = "bogus".to_string();
+    assert!(
+        verify::verify_program(&broken_nested_read).is_err(),
+        "a corrupted nested scoreboard read path must fail verification"
+    );
 }
 
 /// The five `= bind <name>` arms, and the hole between them.
@@ -21108,6 +21795,54 @@ end test T"#,
 end test T"#,
     )
     .expect("a signedness difference is the benign widening v1 also performs");
+}
+
+#[test]
+fn component_event_emit_verifies_instance_activation_mode() {
+    let src = r#"transactor Emitter
+    in_ev : event<bool>
+    when active
+        active_ev : out event<bool>
+        hookable fire()
+            emit active_ev(true)
+        end fire
+    end when
+end transactor Emitter
+
+testbench Tb
+    dut : Top
+    active_emitter : Emitter active
+    passive_emitter : Emitter passive
+end testbench Tb
+
+impl T for Tb
+    run
+        emit active_emitter.active_ev(true)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("active-only event through an active binding lowers");
+    verify::verify_program(&prog).expect("active-only control verifies");
+    let mut broken = prog.clone();
+    let path = broken
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentEmit {
+                base: ir::ComponentBase::Path(path),
+                event,
+                ..
+            } if event == "active_ev" => Some(path),
+            _ => None,
+        })
+        .expect("active-only path emit exists");
+    *path = vec!["passive_emitter".to_string()];
+    assert!(
+        verify::verify_program(&broken).is_err(),
+        "active-only event emission through a passive binding must fail verification"
+    );
 }
 
 /// A probe read that appears ONLY inside an `on <trigger>` predicate is

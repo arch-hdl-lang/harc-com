@@ -1,13 +1,13 @@
 //! `scoreboard` declaration lowering → `ScoreboardSchema`.
 //!
 //! A scoreboard in the v0 subset is a *data-only* host-state record: a
-//! testbench field holding scalar counters and typed FIFO queues. v1's
+//! testbench field holding scalar counters, value-records, and typed FIFO queues. v1's
 //! `emit_scoreboard` is the behavior reference — it emits a C++ struct
 //! whose scalar fields are `uint64_t`/`int64_t`/`bool` members (with
 //! their declared defaults) and whose `queue<T>` fields are
 //! `harc_rt::HarcQueue<T>` members. The test body manipulates them
-//! through `Stmt::ScoreboardOp` (push/pop/scalar-write) and
-//! `Expr::ScoreboardQuery` (size/empty/scalar-read).
+//! through `Stmt::ScoreboardOp` (push/pop/value-write) and
+//! `Expr::ScoreboardQuery` (size/empty/value-read).
 //!
 //! Out-of-scope shapes are explicit rejections, never silent drops.
 //! `Unsupported` (v1 runs the program):
@@ -101,6 +101,14 @@ pub(crate) fn lower_scoreboard(
         match item {
             ComponentItem::Field(f) => {
                 let fname = &f.name.name;
+                if matches!(fname.as_str(), "_last_in_cycle" | "_last_out_cycle") {
+                    return Err(not_implemented(
+                        &format!("scoreboard field `{sb}.{fname}`"),
+                        "v1 emits this user field beside a generated scoreboard heartbeat field \
+                         with the same name, so the generated C++ has duplicate members",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 if f.direction.is_some() {
                     // v1 emits `uint64_t p;` — no direction, and no
                     // initializer either, so the field reads
@@ -139,12 +147,20 @@ pub(crate) fn lower_scoreboard(
                             // and g++ rejects it: "could not convert '0'
                             // from 'int' to 'harc_rt::HarcQueue<long
                             // unsigned int>'" (`-std=gnu++20`).
-                            return Err(not_implemented(
-                                &format!("a default on scoreboard queue field `{sb}.{fname}`"),
-                                "queues default-construct empty; v1 emits \
-                                 `HarcQueue<T> q = 0;`, which has no such constructor",
-                                V1Status::EmitsUncompilable,
-                            ));
+                            return Err(match other {
+                                ScoreboardFieldKind::Record { .. } => not_implemented(
+                                    &format!("a default on scoreboard record field `{sb}.{fname}`"),
+                                    "record fields use their type-derived default initialization; \
+                                     v1 emits `Record field = 0`, which has no such conversion",
+                                    V1Status::EmitsUncompilable,
+                                ),
+                                _ => not_implemented(
+                                    &format!("a default on scoreboard queue field `{sb}.{fname}`"),
+                                    "queues default-construct empty; v1 emits \
+                                     `HarcQueue<T> q = 0;`, which has no such constructor",
+                                    V1Status::EmitsUncompilable,
+                                ),
+                            });
                         }
                         other
                     }
@@ -276,7 +292,7 @@ pub(crate) fn lower_scoreboard(
             _ => {
                 return Err(unsupported(
                     &format!("an unsupported item in scoreboard `{sb}`"),
-                    "only scalar/queue fields are lowered",
+                    "only scalar, record, and queue fields are lowered",
                 ));
             }
         }
@@ -311,6 +327,14 @@ fn scoreboard_field_kind(
         // component-path helper (don't fork the record-queue seam).
         let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
+    }
+    if let TypeExpr::Named { name, .. } = t {
+        let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+        if declared_records.contains(simple) {
+            return Ok(ScoreboardFieldKind::Record {
+                record: record_ids[simple],
+            });
+        }
     }
     let ty = scalar_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same

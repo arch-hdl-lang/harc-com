@@ -378,6 +378,10 @@ pub(super) fn scoreboard_struct(
                 let cty = super::field_scalar_cty(ty);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
+            crate::ir::ScoreboardFieldKind::Record { record } => {
+                let cty = &records[record.index()].name;
+                writeln!(out, "{INDENT}{cty} {}{{}};", f.name).ok();
+            }
             crate::ir::ScoreboardFieldKind::Queue { elem } => {
                 let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();

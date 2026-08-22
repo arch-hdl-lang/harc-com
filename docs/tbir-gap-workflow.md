@@ -58,6 +58,9 @@ family of rejections over a one-site exception. Current implementation order:
   state (`bundle.data[i]`, `bundle.records[i].field`), with verifier-checked
   path/index metadata and v1/TBIR runtime parity. Component paths with
   multiple selections remain classified by the shared unsupported diagnostic.
+- [x] Persistent whole-record data-scoreboard state, including direct
+  testbench fields and env-nested scoreboards, exact record-identity checks,
+  and cross-phase whole-record copies.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -118,6 +121,9 @@ rejection and leaves 151 textual matches (150 constructors plus the helper).
 The indexed record-state batch removes a proven migration blocker but shares
 its diagnostic constructor with still-excluded malformed and multi-selection
 component-path shapes, so the raw textual count remains 151.
+The whole-record scoreboard batch similarly shares its field-type diagnostic
+with still-unsupported dynamic `list` fields, so it removes another proven
+migration family while leaving the raw textual count at 151.
 
 ## Review-derived semantic gates
 
@@ -183,7 +189,7 @@ not applicable before requesting review:
    state, pure-helper record-local, and struct-keep slices reduce the count
    from 174 to 151 textual matches (150 constructors plus the helper
    definition). The
-   scoreboard source family did not remove a constructor because unsupported
+   scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths
    were also reclassified because v1 rejects or silently mis-lowers them.
 9. Before a PR, obtain the independent findings-first review required by
