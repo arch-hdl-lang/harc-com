@@ -1483,6 +1483,7 @@ impl FuncBuilder<'_> {
                 // subscript verbatim, so `let b = a[0]` on a scalar
                 // local becomes `int64_t b = a[0];` — subscripting an
                 // integer, which the C++ compiler rejects.
+                self.reject_scoreboard_list_index(e, "read")?;
                 self.reject_indexed_component_record_path(e, "a read through")?;
                 Err(not_implemented(
                     "index expressions",
@@ -2861,6 +2862,11 @@ impl FuncBuilder<'_> {
                 queue: queue.clone(),
             },
             "pop" => {
+                // Validate the receiver before issuing the queue-specific
+                // expression-position advice. A scoreboard list has no
+                // `.pop()` member in v1's std::vector storage, so telling a
+                // list user to bind the result and retry v1 is a dead end.
+                self.scoreboard_queue_field(sb, &queue)?;
                 return Err(queue_pop_in_expression_position(&format!(
                     "scoreboard `{field}.{queue}.pop()`"
                 )));
@@ -2877,7 +2883,7 @@ impl FuncBuilder<'_> {
                 "scoreboard `{field}.{queue}.{method}()` takes no arguments"
             )));
         }
-        self.scoreboard_queue_field(sb, &queue)?;
+        self.scoreboard_container_field(sb, &queue)?;
         Ok(Some(Expr::ScoreboardQuery {
             sb,
             field,

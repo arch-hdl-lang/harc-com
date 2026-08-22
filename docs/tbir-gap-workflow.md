@@ -61,6 +61,10 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Persistent whole-record data-scoreboard state, including direct
   testbench fields and env-nested scoreboards, exact record-identity checks,
   and cross-phase whole-record copies.
+- [x] Persistent data-scoreboard list declarations for scalar and
+  one-dimensional fixed-vector elements, using exact `std::vector` storage
+  with verifier-checked element and vector-length metadata plus read-only
+  `size()`/`empty()` queries.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -121,9 +125,12 @@ rejection and leaves 151 textual matches (150 constructors plus the helper).
 The indexed record-state batch removes a proven migration blocker but shares
 its diagnostic constructor with still-excluded malformed and multi-selection
 component-path shapes, so the raw textual count remains 151.
-The whole-record scoreboard batch similarly shares its field-type diagnostic
-with still-unsupported dynamic `list` fields, so it removes another proven
+The whole-record scoreboard batch similarly shared its field-type diagnostic
+with the then-unsupported dynamic `list` fields, so it removed another proven
 migration family while leaving the raw textual count at 151.
+The scoreboard-list batch closes those measured scalar and fixed-vector list
+declarations. It shares the same field-type diagnostic with unsupported list
+element shapes, so the raw textual count remains unchanged.
 
 ## Review-derived semantic gates
 

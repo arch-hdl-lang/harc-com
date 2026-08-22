@@ -912,6 +912,21 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         });
                     }
                 }
+                ScoreboardFieldKind::List { elem, vec_len } => {
+                    let valid_elem = matches!(
+                        elem,
+                        IrType::Bool | IrType::UInt(None) | IrType::SInt(None)
+                    ) || matches!(elem, IrType::UInt(Some(width)) if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width))
+                        || matches!(elem, IrType::SInt(Some(width)) if (1..=64).contains(width));
+                    if !valid_elem || vec_len.is_some_and(|len| len == 0) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "scoreboard sb{si} field `{}` has invalid list schema {:?} x {:?}",
+                                field.name, elem, vec_len
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -2225,7 +2240,10 @@ impl Checker<'_> {
             .field(event)
             .ok_or_else(|| format!("component `{}` has no field `{event}`", schema.name))?;
         let ComponentFieldKind::Event { payload } = &field.kind else {
-            return Err(format!("component `{}.{event}` is not an event field", schema.name));
+            return Err(format!(
+                "component `{}.{event}` is not an event field",
+                schema.name
+            ));
         };
         let payload = *payload;
         match base {
@@ -2233,22 +2251,17 @@ impl Checker<'_> {
                 verify_component_event_ref(self.prog, self.func, base, component, event, payload)?;
             }
             ComponentBase::SelfField => {
-                let active_context = schema
-                    .methods
-                    .iter()
-                    .any(|m| m.function == self.fid && matches!(m.activation, Activation::ActiveOnly))
-                    || schema.on_handlers.iter().any(|h| {
-                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
-                    })
-                    || schema.periodic_handlers.iter().any(|h| {
-                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
-                    })
-                    || schema.cycle_handlers.iter().any(|h| {
-                        h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
-                    })
-                    || schema.watchdog.as_ref().is_some_and(|w| {
-                        w.function == self.fid && matches!(w.activation, Activation::ActiveOnly)
-                    });
+                let active_context = schema.methods.iter().any(|m| {
+                    m.function == self.fid && matches!(m.activation, Activation::ActiveOnly)
+                }) || schema.on_handlers.iter().any(|h| {
+                    h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                }) || schema.periodic_handlers.iter().any(|h| {
+                    h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                }) || schema.cycle_handlers.iter().any(|h| {
+                    h.function == self.fid && matches!(h.activation, Activation::ActiveOnly)
+                }) || schema.watchdog.as_ref().is_some_and(|w| {
+                    w.function == self.fid && matches!(w.activation, Activation::ActiveOnly)
+                });
                 if matches!(field.activation, Activation::ActiveOnly) && !active_context {
                     return Err(format!(
                         "always-on component body cannot emit active-only event `{event}`"
@@ -2935,10 +2948,12 @@ impl Checker<'_> {
                         let aggregate_actual = self.aggregate_assignment_expr_type(e);
                         let aggregate_incompatible = self.contains_invalid_record_composition(e)
                             || match expected {
-                                IrType::Record(_) => aggregate_actual.as_ref().is_some_and(|actual| {
-                                    *actual != IrType::Unknown
-                                        && !aggregate_assignment_compatible(expected, actual)
-                                }),
+                                IrType::Record(_) => {
+                                    aggregate_actual.as_ref().is_some_and(|actual| {
+                                        *actual != IrType::Unknown
+                                            && !aggregate_assignment_compatible(expected, actual)
+                                    })
+                                }
                                 IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => {
                                     matches!(&aggregate_actual, Some(IrType::Record(_)))
                                 }
@@ -3997,6 +4012,28 @@ impl Checker<'_> {
         }
     }
 
+    fn check_scoreboard_container(&mut self, sb: crate::ir::ScoreboardId, field: &str) {
+        let ok = self
+            .prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(field))
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::ScoreboardFieldKind::Queue { .. }
+                        | crate::ir::ScoreboardFieldKind::List { .. }
+                )
+            });
+        if !ok {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!("scoreboard sb{} has no queue or list field `{field}`", sb.0),
+            });
+        }
+    }
+
     fn scoreboard_queue_elem(&self, sb: crate::ir::ScoreboardId, queue: &str) -> Option<QueueElem> {
         self.prog
             .scoreboards
@@ -4005,7 +4042,8 @@ impl Checker<'_> {
             .and_then(|field| match &field.kind {
                 crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem.clone()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. }
-                | crate::ir::ScoreboardFieldKind::Record { .. } => None,
+                | crate::ir::ScoreboardFieldKind::Record { .. }
+                | crate::ir::ScoreboardFieldKind::List { .. } => None,
             })
     }
 
@@ -4520,7 +4558,7 @@ impl Checker<'_> {
                     }
                     crate::ir::ScoreboardQuery::QueueSize { queue }
                     | crate::ir::ScoreboardQuery::QueueEmpty { queue } => {
-                        self.check_scoreboard_queue(*sb, queue)
+                        self.check_scoreboard_container(*sb, queue)
                     }
                 }
             }

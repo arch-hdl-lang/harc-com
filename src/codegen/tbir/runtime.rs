@@ -397,6 +397,14 @@ pub(super) fn scoreboard_struct(
                 let cty = &records[record.index()].name;
                 writeln!(out, "{INDENT}{cty} {}{{}};", f.name).ok();
             }
+            crate::ir::ScoreboardFieldKind::List { elem, vec_len } => {
+                let elem = super::field_scalar_cty(elem);
+                let elem = match vec_len {
+                    Some(len) => format!("std::array<{elem}, {len}>"),
+                    None => elem,
+                };
+                writeln!(out, "{INDENT}std::vector<{elem}> {}{{}};", f.name).ok();
+            }
             crate::ir::ScoreboardFieldKind::Queue { elem } => {
                 let elem = queue_elem_cty(elem, records);
                 writeln!(out, "{INDENT}harc_rt::HarcQueue<{elem}> {};", f.name).ok();

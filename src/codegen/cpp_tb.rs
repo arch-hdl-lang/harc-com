@@ -20199,7 +20199,7 @@ fn list_elem_type(t: &TypeExpr) -> Option<&TypeExpr> {
     })
 }
 
-fn fixed_vec_type_args(t: &TypeExpr) -> Option<(&TypeExpr, usize)> {
+pub(crate) fn fixed_vec_type_args(t: &TypeExpr) -> Option<(&TypeExpr, usize)> {
     let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
         args,

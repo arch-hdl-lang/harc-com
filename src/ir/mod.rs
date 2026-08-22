@@ -644,18 +644,21 @@ impl RecordSchema {
 }
 
 /// One `scoreboard` declaration, lowered to its structural shape: a
-/// host-state record of scalar counters, value-records, and typed FIFO queues, in
-/// declaration order. Both backends emit this as a C++ struct (v1's
+/// host-state record of scalar counters, value-records, dynamic lists, and
+/// typed FIFO queues, in declaration order. Both backends emit this as a C++ struct (v1's
 /// `emit_scoreboard` shape is the behavior reference): scalar fields as
 /// `uint64_t`/`int64_t`/`bool` members with their declared defaults,
-/// value-record fields as default-constructed record members, and
+/// value-record fields as default-constructed record members, `list<T>` fields
+/// as `std::vector<T>` members, and
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields, whole value-record fields, and `queue<T>` fields where `T`
+/// Scalar fields, whole value-record fields, `list<T>` fields with scalar or
+/// one-dimensional fixed-vector elements, and `queue<T>` fields where `T`
 /// is `bool`, an explicitly sized `uint`/`sint` in the language range
 /// 1..=1024, or a value-record lower; the test body manipulates them through
-/// `Stmt::ScoreboardOp` (scalar/record read/write, queue push/pop/size/empty).
+/// `Stmt::ScoreboardOp` (scalar/record read/write and queue push/pop), plus
+/// read-only size/empty queries shared by list and queue storage.
 /// Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
 /// state and therefore need per-instance materialization — are NOT
@@ -674,8 +677,7 @@ pub struct ScoreboardFieldSchema {
     pub kind: ScoreboardFieldKind,
 }
 
-/// A scoreboard field is a scalar counter, a whole value-record, or a typed
-/// FIFO queue.
+/// A scoreboard field is persistent host-side value storage.
 #[derive(Debug, Clone)]
 pub enum ScoreboardFieldKind {
     /// `writes : uint<32> default 0` — a scalar host counter. The
@@ -688,6 +690,15 @@ pub enum ScoreboardFieldKind {
     /// scoreboard struct. Whole-record reads/writes use the existing
     /// scoreboard query/op seam; the record is default-constructed.
     Record { record: RecordId },
+    /// `history : list<uint<8>>` / `lanes : list<Vec<uint<8>, 2>>` —
+    /// dynamically-sized storage emitted as `std::vector<T>`. Lists expose
+    /// read-only size/empty queries but not queue push/pop operations; this
+    /// schema preserves the declaration and its exact scalar or
+    /// one-dimensional fixed-vector element layout.
+    List {
+        elem: IrType,
+        vec_len: Option<usize>,
+    },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is an exact scalar type through the 1024-bit
     /// language ceiling or a value-record.
