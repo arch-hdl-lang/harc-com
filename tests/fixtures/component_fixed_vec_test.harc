@@ -26,6 +26,10 @@ impl ComponentVecTest for ComponentVecTb
         right.store(2, 0x5678)
         assert left.words[2] == 0x1234 else fail("right write aliased left value")
         assert right.words[2] == 0x5678 else fail("right value changed")
+        assert left.words != right.words else fail("distinct vectors compared equal")
+        left.words = right.words
+        assert left.words == right.words else fail("whole-vector copy did not compare equal")
+        assert left.words[2] == 0x5678 else fail("whole-vector copy lost element")
         wait 1 cycle
     end run
 end impl ComponentVecTest

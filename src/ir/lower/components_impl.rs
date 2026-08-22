@@ -3842,7 +3842,7 @@ impl super::FuncBuilder<'_> {
             // shape, which both backends emit and g++ accepts
             // (`self.a.data == self.b.data`). See `vec_read_ok`; the
             // pairing check is what sets it.
-            if rf.leaf_vec.is_some() && !self.vec_read_ok {
+            if rf.leaf_vec.is_some() && !self.whole_vec_read_allowed(e) {
                 // Measured on the landings that still reach here:
                 // `let d = a.data` gives "cannot convert
                 // `std::array<…,4>` to `int64_t` in initialization" from
@@ -3868,12 +3868,21 @@ impl super::FuncBuilder<'_> {
                         if matches!(
                             field.kind,
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
-                        ) {
+                        ) || (self.whole_vec_read_allowed(e)
+                            && matches!(field.kind, ComponentFieldKind::FixedVec(_)))
+                        {
                             self.require_self_activation(field.activation, "field", &id.name)?;
                             return Ok(Some(IrExpr::ComponentField {
                                 base: ComponentBase::SelfField,
                                 field: id.name.clone(),
                             }));
+                        }
+                        if matches!(field.kind, ComponentFieldKind::FixedVec(_)) {
+                            return Err(not_implemented(
+                                &format!("a whole-vector component field `{}`", id.name),
+                                format!("index the field element-wise (`{}[i]`)", id.name),
+                                V1Status::EmitsUncompilable,
+                            ));
                         }
                     }
                 }
@@ -3899,7 +3908,9 @@ impl super::FuncBuilder<'_> {
                         if matches!(
                             schema.kind,
                             ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
-                        ) {
+                        ) || (self.whole_vec_read_allowed(e)
+                            && matches!(schema.kind, ComponentFieldKind::FixedVec(_)))
+                        {
                             self.require_component_activation(
                                 &path[0],
                                 head_cid,
@@ -3915,6 +3926,13 @@ impl super::FuncBuilder<'_> {
                                 base: ComponentBase::Path(base),
                                 field,
                             }));
+                        }
+                        if matches!(schema.kind, ComponentFieldKind::FixedVec(_)) {
+                            return Err(not_implemented(
+                                &format!("a whole-vector component field `{}`", path.join(".")),
+                                format!("index the field element-wise (`{}[i]`)", path.join(".")),
+                                V1Status::EmitsUncompilable,
+                            ));
                         }
                     }
                 }
