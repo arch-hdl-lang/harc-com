@@ -1460,8 +1460,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema =
-                scoreboards::lower_scoreboard(c, &record_ids, &declared_record_names, &const_vals)?;
+            let schema = scoreboards::lower_scoreboard(
+                c,
+                &record_ids,
+                &declared_record_names,
+                &enum_names,
+                &const_vals,
+            )?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1750,6 +1755,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &components,
                         &covgroup_ids,
                         &record_ids,
+                        &enum_names,
                         &transactor_ids,
                         &scoreboard_ids,
                         &component_type_names,
@@ -2532,6 +2538,9 @@ fn validate_testbench_component(
     components: &HashMap<String, &ComponentDecl>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
+    // Every `enum` NAME in the file, for the shared
+    // `v1_leaves_the_type_name_undeclared` rule at the queue-element seam.
+    enum_names: &HashSet<String>,
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
@@ -2896,6 +2905,7 @@ fn validate_testbench_component(
                         &f.name.name,
                         args.first(),
                         record_ids,
+                        enum_names,
                     )?;
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
                     return Err(unsupported(
@@ -4174,6 +4184,7 @@ fn lower_test(
                                 &f.name.name,
                                 args.first(),
                                 record_ids,
+                                enum_names,
                             )?;
                             let queue = ir::TbQueueFieldSchema {
                                 name: f.name.name.clone(),

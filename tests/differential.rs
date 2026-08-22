@@ -949,6 +949,133 @@ end impl TL
     );
 }
 
+/// The component FIELD grammar, on the two hosts that carry one.
+///
+/// `lower_field` discriminates event / queue / `Vec` / other-builtin /
+/// named, each with a directional sub-arm, and holds the largest
+/// remaining cluster of `Unsupported` sites in the tree. The rows below
+/// are enumerated from THAT grammar rather than from the shapes that
+/// came to mind — every batch in this series has found at least one arm
+/// whose label came from a single landing.
+#[test]
+fn the_component_field_grammar_against_v1() {
+    let decls = r#"
+struct Beat
+    p : uint<8>
+end struct Beat
+
+enum Color { RED, GREEN }
+
+scoreboard Sb
+    n : uint<32> default 0
+end scoreboard Sb
+
+transactor Helper
+    n : uint<32> default 0
+    hookable ping(v: uint<8>)
+        n = n + 1
+    end ping
+end transactor Helper
+"#;
+
+    // The field rows. One per arm the grammar distinguishes, plus the
+    // directional variant of each — `f.direction.is_some()` is a
+    // separate guard in four of the five arms and answers before the
+    // type does.
+    let rows = &[
+        // builtin scalar: the arm that works, and its directional twin
+        "    x : uint<8> default 1",
+        "    x : in uint<8>",
+        "    x : out uint<8>",
+        "    x : uint<0>",
+        // queue
+        "    q : queue<uint<8>>",
+        "    q : in queue<uint<8>>",
+        "    q : queue<Beat>",
+        "    q : queue<Color>",
+        "    q : queue<string>",
+        // Vec
+        "    v : Vec<uint<8>, 4>",
+        "    v : in Vec<uint<8>, 4>",
+        "    v : Vec<Beat, 2>",
+        "    v : Vec<uint<1024>, 2>",
+        "    v : Vec<Vec<uint<8>, 2>, 2>",
+        // other builtins the scalar arm declines
+        "    s : string",
+        "    s : stream<uint<8>>",
+        "    s : buffer<uint<8>, 4>",
+        "    s : list<uint<8>>",
+        // named types
+        "    r : Beat",
+        "    r : in Beat",
+        "    m : Color",
+        "    sb2 : Sb",
+        "    h : Helper",
+        "    h : Helper passive",
+        "    w : Widget",
+        "    r : Beat<uint<8>>",
+    ];
+
+    // Host 1: an unbound transactor held as a passive testbench field.
+    let xactor = format!(
+        r#"{decls}
+transactor Src
+    n : uint<32> default 0
+@@FIELD@@
+
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor Src
+
+testbench TbCF
+    dut : Top
+    src : Src passive
+end testbench TbCF
+
+impl TCF for TbCF
+    run
+        src.bump(1)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TCF
+"#
+    );
+    eprintln!(
+        "{}",
+        check_space("component-field-transactor", &xactor, "@@FIELD@@", rows)
+    );
+
+    // Host 2: an `env`, which reaches the same `lower_field` through a
+    // different `CompSource` — the `is_transactor` flag alone changes
+    // two of the arms.
+    let env = format!(
+        r#"{decls}
+env E
+@@FIELD@@
+    h2 : Helper passive
+end env E
+
+testbench TbCF2
+    dut : Top
+    e : E
+end testbench TbCF2
+
+impl TCF2 for TbCF2
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TCF2
+"#
+    );
+    eprintln!(
+        "{}",
+        check_space("component-field-env", &env, "@@FIELD@@", rows)
+    );
+}
+
 /// Shapes the wide-operator guard must NOT fire on.
 ///
 /// A guard that refuses a program v1 builds is as wrong as one that

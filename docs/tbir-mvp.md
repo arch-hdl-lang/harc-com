@@ -8723,6 +8723,54 @@ former `transaction` group lives in
      the same problem and was re-run against a fresh binary before
      being believed. Both come out identical to the merge base.
 
+136. **One question, asked three times, answered wrong twice
+     (2026-08-22).**
+
+     `components_impl.rs` holds the largest remaining `Unsupported`
+     cluster — 52 of the 296 left in the tree. A differential space
+     enumerated from `lower_field`'s own grammar (event / queue / `Vec`
+     / other-builtin / named, each with its directional sub-arm) across
+     two hosts found twelve real gaps and two false promises.
+
+     Both false promises were the SAME rule the previous divergence had
+     just fixed at the event-payload seam: v1 emits the bare TYPE NAME
+     for a record or an ENUM, declares the records it emits, and emits
+     no C++ enum at all. `queue<Color>` and a bare `m : Color` field
+     each promised `--codegen v1` for a program v1 cannot build. Three
+     seams, one question, found one at a time. It is
+     `v1_leaves_the_type_name_undeclared` now, asked in one place —
+     which is what should have happened when the second one turned up.
+
+     Two shipped tests had PINNED the wrong grade, and one of them
+     spelled out the reasoning that made it wrong: "v1 handles it, so
+     v1 is a real escape hatch here", asserted from the presence of
+     `Mode weird` in v1's output. The member is exactly the problem. A
+     test that checks a construct appears in the emitted text has not
+     checked that the text compiles.
+
+     **The directional arms.** Four arms of `lower_field` carry a
+     `f.direction.is_some()` guard, and all four answered `Unsupported`
+     — three of them behind an EMPTY reason string. v1 compiles every
+     one, which is how the label survived. What it does is DISCARD the
+     marker: `a_direction_on_a_component_field_is_discarded_by_v1` pins
+     v1's output for the directional spelling as byte-identical to the
+     undirected one, with the sources padded to equal length so no
+     source-offset residue can explain it — the technique the `bound
+     to` field arm two hundred lines away already uses. A program that
+     builds and runs meaning something other than what was written is
+     `SilentlyMisLowers`, two grades from what these arms claimed.
+
+     Ten real gaps remain in this space, and they are genuine
+     implementation work rather than mislabels: `Vec<Record, N>`,
+     `Vec<wide, N>`, nested `Vec`, `queue<string>`, `stream`, `buffer`,
+     and a zero-width scalar.
+
+     One reading worth recording: `h : Helper` with no mode LOWERS
+     under tbir and is REFUSED by v1, which wants an `active`/`passive`
+     annotation. tbir is the more permissive backend there. That
+     pairing is outside the harness's three falsifiable directions, so
+     it is reported here rather than asserted.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

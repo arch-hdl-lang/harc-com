@@ -1347,6 +1347,24 @@ fn validate_event_handler(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Why a DIRECTION on a component field is not an escape hatch.
+///
+/// Four arms of `lower_field` carry the same guard, and three of them
+/// shipped an empty reason string behind an `Unsupported` — "re-run
+/// with `--codegen v1`". v1 does compile all four shapes. What it does
+/// is DISCARD the marker: `a_direction_on_a_component_field_is_
+/// discarded_by_v1` pins v1's output for the directional spelling as
+/// byte-identical to the undirected one, with the two sources padded to
+/// equal length so no source-offset residue can explain it. A program
+/// that builds and runs meaning something other than what was written
+/// is what `SilentlyMisLowers` is for, and it is two grades away from
+/// what these arms were claiming.
+const DIRECTIONAL_FIELD_DETAIL: &str =
+    "a direction is a PORT marker; a component field is host state and has no direction. \
+     v1 discards the marker and emits the member for the field's own type — with the two \
+     spellings padded to equal length its output is byte-identical — so the program builds \
+     and runs meaning something other than what was written";
+
 fn lower_field(
     comp: &str,
     f: &ComponentField,
@@ -1440,9 +1458,10 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional queue field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             // The element is an exact scalar type or a value-record
@@ -1450,7 +1469,7 @@ fn lower_field(
             // `harc_rt::HarcQueue<Rec>` and is manipulated through the
             // component-queue ops; anything else (enum / Vec /
             // unknown named type) is rejected precisely.
-            let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
+            let elem = lower_queue_elem(comp, fname, args.first(), record_ids, enum_names)?;
             Ok(ComponentFieldKind::Queue { elem })
         }
         TypeExpr::Builtin {
@@ -1459,9 +1478,10 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional fixed-vector field `{comp}.{fname}`"),
-                    "fixed component state is non-directional",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             if f.default.is_some() {
@@ -1501,9 +1521,10 @@ fn lower_field(
         // AnalysisSource passive` / `sb : AnalysisSb`).
         TypeExpr::Builtin { .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional scalar field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
@@ -1517,9 +1538,10 @@ fn lower_field(
         }
         TypeExpr::Named { name, mode, .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional named-type field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -1617,6 +1639,26 @@ fn lower_field(
                     "component `{comp}` field `{fname}` has type `{simple}`, which is not \
                      declared anywhere in the file"
                 )));
+            }
+            //   * a declared ENUM. v1 emits `Color m;` — the bare
+            //     type name, and it declares no C++ enum — so g++ says
+            //     "`Color` does not name a type" and `--codegen v1` is a
+            //     dead end. THIRD landing of one rule: the event-payload
+            //     and queue-element seams each promised v1 for an enum
+            //     too, and each was found separately. It is one question
+            //     now, asked through
+            //     `v1_leaves_the_type_name_undeclared`.
+            if v1_leaves_the_type_name_undeclared(simple, enum_names) {
+                return Err(not_implemented(
+                    &format!("an enum-typed field `{comp}.{fname}` of type `{simple}`"),
+                    format!(
+                        "only env/method-scoreboard/data-scoreboard/analysis-source \
+                         sub-components are lowered; v1 emits `{simple}` as the member \
+                         type and declares no C++ enum, so its output does not compile \
+                         either"
+                    ),
+                    V1Status::EmitsUncompilable,
+                ));
             }
             Err(unsupported(
                 &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
@@ -2797,9 +2839,21 @@ pub(crate) fn lower_queue_elem(
     fname: &str,
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<crate::ir::QueueElem, LowerError> {
     use crate::ir::QueueElem;
     let reject_named = |named: &str| -> LowerError {
+        if v1_leaves_the_type_name_undeclared(named, enum_names) {
+            return not_implemented(
+                &format!("an enum queue element `{named}` on `{comp}.{fname}`"),
+                format!(
+                    "only `queue<scalar>` and `queue<transaction|struct>` elements are \
+                     lowered; v1 emits `{named}` as the `HarcQueue` element type and \
+                     declares no C++ enum, so its output does not compile either"
+                ),
+                V1Status::EmitsUncompilable,
+            );
+        }
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
             "only `queue<scalar>` and `queue<transaction|struct>` elements are \
@@ -2841,6 +2895,27 @@ pub(crate) fn lower_queue_elem(
             "declare the element type: `queue<uint<W>>` / `queue<Record>`",
         )),
     }
+}
+
+/// Does v1 emit this type NAME into its C++ without declaring it?
+///
+/// v1's `payload_type_for_arg` and its queue-element mapping emit the
+/// bare name for a record or an ENUM and route everything else through
+/// `record_field_c_type`. v1 declares the records it emits; it emits no
+/// C++ enum at all. So an enum name reaching a subscriber signature or
+/// a `HarcQueue<T>` parameter is undeclared and g++ refuses — which
+/// makes `--codegen v1` a dead end there, and every other non-record
+/// name an honest `Unsupported`.
+///
+/// Asked at both the event-payload and queue-element seams. The first
+/// version of this rule lived only at the event one, and the queue seam
+/// went on promising a v1 that cannot build `queue<Color>`. They are
+/// two spellings of one question, so it gets asked in one place.
+pub(crate) fn v1_leaves_the_type_name_undeclared(
+    named: &str,
+    enum_names: &std::collections::HashSet<String>,
+) -> bool {
+    enum_names.contains(named)
 }
 
 /// Resolve the `<T>` inside an `event<T>` analysis-port field to its
@@ -2889,7 +2964,7 @@ pub(crate) fn lower_event_payload(
         )
     };
     let reject_named = |named: &str| -> LowerError {
-        if enum_names.contains(named) {
+        if v1_leaves_the_type_name_undeclared(named, enum_names) {
             return reject_enum(named);
         }
         unsupported(

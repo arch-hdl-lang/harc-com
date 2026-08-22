@@ -1821,7 +1821,13 @@ fn lower_state_field(
                 V1Status::EmitsUncompilable,
             ));
         }
-        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
+        let elem = super::components::lower_queue_elem(
+            tname,
+            fname,
+            args.first(),
+            record_ids,
+            &record_ctx.enum_names,
+        )?;
         return Ok(StateFieldSchema {
             name: fname.clone(),
             kind: StateFieldKind::Queue { elem },

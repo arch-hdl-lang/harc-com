@@ -38,6 +38,9 @@ pub(crate) fn lower_scoreboard(
     // record, and v1's `Emitter::is_record_type` does not — see the
     // capture site in `lower_program`.
     declared_records: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file, for the shared
+    // `v1_leaves_the_type_name_undeclared` rule at the queue-element seam.
+    enum_names: &std::collections::HashSet<String>,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
@@ -127,7 +130,14 @@ pub(crate) fn lower_scoreboard(
                         "scoreboard `{sb}` declares field `{fname}` more than once"
                     )));
                 }
-                let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids, declared_records)?;
+                let kind = scoreboard_field_kind(
+                    sb,
+                    fname,
+                    &f.ty,
+                    record_ids,
+                    declared_records,
+                    enum_names,
+                )?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
                         let default = scalar_default(&f.default, sb, fname, &f.ty, consts)?;
@@ -300,6 +310,7 @@ fn scoreboard_field_kind(
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
     declared_records: &std::collections::HashSet<String>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Queue,
@@ -309,7 +320,8 @@ fn scoreboard_field_kind(
     {
         // Exact scalar or value-record element — resolved through the shared
         // component-path helper (don't fork the record-queue seam).
-        let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
+        let elem =
+            super::components::lower_queue_elem(sb, fname, args.first(), record_ids, enum_names)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
     let ty = super::components::scalar_field_ir_type(t).ok_or_else(|| {

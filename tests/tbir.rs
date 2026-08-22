@@ -3080,13 +3080,19 @@ end impl QueueBoundaryTest
     }
 }
 
-/// Direct scalar queues deliberately widen only the scalar element subset.
-/// Aggregate elements other than value records remain explicit
-/// `Unsupported` diagnostics instead of being flattened into scalar storage.
+/// Direct scalar queues deliberately widen only the scalar element
+/// subset. Aggregate elements other than value records stay explicit
+/// refusals instead of being flattened into scalar storage — each on
+/// the grade v1 earns, which is not the same grade for all of them.
+///
+/// `Vec` and `list` keep `Unsupported`: v1 gives them a real C++
+/// element type and builds. An ENUM does not — v1 emits the bare name
+/// into `HarcQueue<Color>` and declares no C++ enum, so g++ refuses and
+/// `--codegen v1` is a dead end. One label used to cover all three.
 #[test]
 fn scalar_queue_rollout_keeps_aggregate_elements_unsupported() {
-    for elem in ["Color", "Vec", "list"] {
-        let src = format!(
+    let prog = |elem: &str| {
+        format!(
             r#"
 enum Color {{ RED, GREEN }}
 
@@ -3101,13 +3107,28 @@ impl AggregateQueueTest for AggregateQueueTb
     end run
 end impl AggregateQueueTest
 "#
-        );
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        )
+    };
+    let msg = assert_not_implemented(
+        &lower_src(&prog("Color")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("enum queue element"), "{msg}");
+    let v1_enum = cpp_tb::emit(&merged_src(&prog("Color"))).expect("v1 emits");
+    assert!(v1_enum.contains("HarcQueue<Color>"), "v1 names the type…");
+    assert!(
+        !v1_enum.contains("enum Color"),
+        "…and never declares it, which is why the suggestion had to go"
+    );
+
+    for elem in ["Vec", "list"] {
+        let msg = assert_unsupported(&lower_src(&prog(elem)).unwrap_err());
         assert!(
             msg.contains("non-scalar queue element")
                 && msg.contains("enum/Vec/nested elements gate on a later slice"),
             "`queue<{elem}>` must stay explicitly unsupported: {msg}"
         );
+        cpp_tb::emit(&merged_src(&prog(elem))).expect("v1 emits these, which keeps it honest");
     }
 }
 
@@ -26703,22 +26724,34 @@ env AnalysisEnv"#;
     // was a whitelist of the kinds that seemed relevant, and omitting
     // one turns a valid program into a false "not declared anywhere".
     // The set is over-inclusive for exactly this reason — a missing name
-    // is a hard error on working code, a spurious one is just the honest
-    // `Unsupported`.
+    // is a hard error on working code, a spurious one is a refusal on
+    // the grade v1 earns.
+    //
+    // That grade is NOT `Unsupported`. v1 emits `Mode weird;` — the bare
+    // name, and it declares no C++ enum — so g++ answers "`Mode` does
+    // not name a type". "v1 handles it, so v1 is a real escape hatch
+    // here", which this test asserted from the presence of the member
+    // text alone, was false: the member is exactly the problem. Two
+    // sibling seams (the event payload and the queue element) promised
+    // v1 for an enum too, and each was found separately; they ask
+    // `v1_leaves_the_type_name_undeclared` now.
     let enum_field = format!(
         "enum Mode {{ A, B }}\n\n{}",
         fixture.replace(ANCHOR, &format!("{ANCHOR}\n    weird  : Mode"))
     );
-    let msg = assert_unsupported(&lower_src(&enum_field).unwrap_err());
-    assert!(
-        msg.contains("sub-component field"),
-        "an enum is declared: {msg}"
+    let msg = assert_not_implemented(
+        &lower_src(&enum_field).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
     );
     assert!(
-        cpp_tb::emit(&merged_src(&enum_field))
-            .expect("v1 emits an enum field")
-            .contains("Mode weird"),
-        "v1 handles it, so v1 is a real escape hatch here"
+        msg.contains("enum-typed field"),
+        "an enum is declared: {msg}"
+    );
+    let v1_enum = cpp_tb::emit(&merged_src(&enum_field)).expect("v1 emits an enum field");
+    assert!(v1_enum.contains("Mode weird"), "v1 names the type…");
+    assert!(
+        !v1_enum.contains("enum Mode"),
+        "…and never declares it, which is why the suggestion had to go"
     );
     // v1's evidence: a real member, and the sampling is wired.
     let v1 = cpp_tb::emit(&merged_src(&declared)).expect("v1 emits a covergroup field");
@@ -33117,6 +33150,84 @@ fn a_wide_scalar_field_keeps_its_width_at_every_field_emitter() {
         assert!(
             emit_cpp_src(&state).contains(&format!("{cty} w = 1;")),
             "transactor state field at {width} bits must be `{cty}`"
+        );
+    }
+}
+
+/// A DIRECTION on a component field, at every arm that carries the
+/// guard.
+///
+/// The arms answer `Unsupported` — "re-run with `--codegen v1`". v1
+/// does compile all five, which is why the label survived four review
+/// rounds. What it does is DISCARD the direction: emit the member for
+/// the field's own type, exactly as if the marker were not there. That
+/// is not an escape hatch, it is a program that means something else,
+/// and it is what `SilentlyMisLowers` is for.
+///
+/// Proved by byte-identity against the undirected spelling, with the
+/// two sources padded to the SAME length so no source-offset residue
+/// can explain it — the technique the `bound to` field arm already
+/// uses two hundred lines away.
+#[test]
+fn a_direction_on_a_component_field_is_discarded_by_v1() {
+    let prog = |field: &str| {
+        format!(
+            r#"struct Beat
+    p : uint<8>
+end struct Beat
+
+transactor Src
+    n : uint<32> default 0
+{field}
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor Src
+
+testbench TbDir
+    dut : Top
+    src : Src passive
+end testbench TbDir
+
+impl TDir for TbDir
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TDir
+"#
+        )
+    };
+
+    for (directional, undirected) in [
+        ("    x : in uint<8>", "    x :    uint<8>"),
+        ("    x : out uint<8>", "    x :     uint<8>"),
+        ("    q : in queue<uint<8>>", "    q :    queue<uint<8>>"),
+        ("    v : in Vec<uint<8>, 4>", "    v :    Vec<uint<8>, 4>"),
+        ("    r : in Beat", "    r :    Beat"),
+    ] {
+        assert_eq!(
+            directional.len(),
+            undirected.len(),
+            "the two spellings must be the same length for byte-identity to mean anything"
+        );
+        let with = cpp_tb::emit(&merged_src(&prog(directional))).expect("v1 emits the directional");
+        let without = cpp_tb::emit(&merged_src(&prog(undirected))).expect("v1 emits the plain one");
+        assert_eq!(
+            with, without,
+            "`{directional}`: v1's output must be byte-identical to the undirected \
+             spelling — that identity is the whole evidence for the grade"
+        );
+        // …and tbir refuses it, on that grade.
+        let err = lower_src(&prog(directional)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("direction"),
+            "`{directional}`: the reason must name the direction, got `{msg}`"
+        );
+        assert!(
+            msg.len() > 40,
+            "`{directional}`: three of these arms shipped an EMPTY reason string"
         );
     }
 }
