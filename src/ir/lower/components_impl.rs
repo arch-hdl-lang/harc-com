@@ -2990,7 +2990,23 @@ pub(crate) fn fold_field_default(
         Some(v) => v,
         None => super::fold_const(d, consts, "").map_err(|e| match e {
             super::ConstFoldErr::Unsupported(detail) => not_implemented(
-                &format!("a non-constant default on {what}"),
+                // "non-constant" is false of a constant that is merely
+                // too WIDE. `default 0x1_0000_0000_0000_0000` is as
+                // constant as `default 1`; what it does not have is a
+                // slot, since every field schema carries its default in
+                // a `u64`. The grade is the same either way, but the
+                // construct named in the diagnostic sends the reader to
+                // a different part of their file.
+                &if matches!(
+                    &*d.kind,
+                    ExprKind::Int(lit)
+                        if super::exprs::parse_int_literal_checked(lit)
+                            == Err(super::exprs::IntLiteralErr::Overflows)
+                ) {
+                    format!("a default on {what} that does not fit a 64-bit slot")
+                } else {
+                    format!("a non-constant default on {what}")
+                },
                 detail,
                 V1Status::SilentlyMisLowers,
             ),

@@ -5068,8 +5068,7 @@ fn lower_test(
                     .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
                 Some(ExprKind::Int(s)) => {
-                    let digits = s.replace('_', "");
-                    match digits.parse::<u64>() {
+                    match exprs::parse_int_literal_checked(s) {
                         Ok(v) => v,
                         // Not "non-integer" — the literal IS an integer,
                         // it just has no slot: a promoted `let` becomes a
@@ -5082,11 +5081,11 @@ fn lower_test(
                         // evaluates to 0. That is the same measurement
                         // the testbench-field default already carries, so
                         // it gets the same label.
-                        Err(_) if digits.chars().all(|c| c.is_ascii_digit()) => {
+                        Err(exprs::IntLiteralErr::Overflows) => {
                             return Err(not_implemented(
                                 &format!(
                                     "a promoted test-scope `let {}` whose initializer \
-                                     `{digits}` does not fit the 64-bit \
+                                     `{s}` does not fit the 64-bit \
                                      constant-evaluation domain",
                                     l.name.name
                                 ),
@@ -5099,7 +5098,7 @@ fn lower_test(
                                 V1Status::SilentlyMisLowers,
                             ));
                         }
-                        Err(_) => {
+                        Err(exprs::IntLiteralErr::NotAnInteger) => {
                             return Err(LowerError::Invalid(format!(
                                 "promoted `let {}` has a non-integer initializer",
                                 l.name.name
@@ -6106,7 +6105,8 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
 ///
 /// 1024 bits is the language-level vector target `harc_thread_rt.h`
 /// states for `HarcWide<N>` (N <= 32). Locals and queue elements have
-/// NO ceiling — `wide_scalar_words` is `(w > 128).then(|| w / 32)`,
+/// NO ceiling — `wide_scalar_words` is
+/// `(width > 128).then(|| width.div_ceil(32))`,
 /// unbounded, and `queue<uint<4096>>` really does emit
 /// `HarcQueue<HarcWide<128>>`. An earlier draft of this comment
 /// claimed 1024 was "the same ceiling the value model already used",

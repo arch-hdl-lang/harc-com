@@ -712,6 +712,10 @@ end impl TW4
             "@@OP@@",
             "        b = b",
             &[
+                // The WIDE destination direction, and the narrow one.
+                // An earlier version defined mixed-width operators and
+                // measured only the first, which was the landing they
+                // happened to get right.
                 "        b = b + a",
                 "        b = b - a",
                 "        b = b * a",
@@ -719,8 +723,218 @@ end impl TW4
                 "        b = b | a",
                 "        b = b ^ a",
                 "        b = b / a",
+                "        a = a + b",
+                "        a = a - b",
+                "        a = a & b",
                 "        assert b == a else fail(\"eq\")",
                 "        assert b < a else fail(\"lt\")",
+            ],
+        )
+    );
+}
+
+/// Every HOST-STATE read a wide declared field made reachable, against
+/// the operators `HarcWide` does not define for a mixed pair.
+///
+/// The first version of the guard resolved two of these shapes and
+/// answered "not wide" for the rest, so six programs lowered into C++
+/// nobody could build. `expr_type` returns `None` for all of them, and
+/// "it falls back to `expr_type`" was doing no work at all here.
+#[test]
+fn the_wide_operator_refusal_covers_every_host_state_read() {
+    let ops = &["        r = w / 2", "        r = w % 2"];
+    let asserts = &["        assert w < 8\n            else fail(\"lt\")"];
+
+    // A scoreboard scalar field, read as `sb.w`.
+    let sb = r#"
+scoreboard Sb
+    w : uint<1024> default 7
+    r : uint<1024> default 0
+end scoreboard Sb
+
+testbench TbH
+    dut : Top
+    sb : Sb
+end testbench TbH
+
+impl TH for TbH
+@@HOLE@@
+end impl TH
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "host-scoreboard",
+            sb,
+            "@@HOLE@@",
+            "    run\n        sb.r = sb.w\n        wait 1 cycle\n    end run",
+            &[
+                "    run\n        sb.r = sb.w / 2\n        wait 1 cycle\n    end run",
+                "    run\n        wait 1 cycle\n    end run\n    check\n        assert sb.w < 8\n            else fail(\"lt\")\n    end check",
+            ],
+        )
+    );
+
+    // The same scoreboard held inside an env — a different base, a
+    // different emission path, the same field kind.
+    let env = r#"
+scoreboard SbE
+    w : uint<1024> default 7
+end scoreboard SbE
+
+env EnvA
+    sb : SbE
+end env EnvA
+
+testbench TbH2
+    dut : Top
+    top : EnvA
+end testbench TbH2
+
+impl TH2 for TbH2
+    run
+        wait 1 cycle
+    end run
+    check
+@@HOLE@@
+    end check
+end impl TH2
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "host-scoreboard-in-env",
+            env,
+            "@@HOLE@@",
+            "        assert top.sb.w == 7\n            else fail(\"eq\")",
+            &["        assert top.sb.w < 8\n            else fail(\"lt\")"],
+        )
+    );
+
+    // A bound-to transactor's state, read from INSIDE the responder
+    // body (where the instance name is the empty placeholder) and from
+    // the test scope (where it is a real testbench field), plus a leaf
+    // of a whole-record state field.
+    let state = r#"
+struct Last
+    w : uint<1024>
+end struct Last
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    w : uint<1024> default 7
+    last : Last
+    thread bus.read(addr: uint<8>)
+@@HOLE@@
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench TbH3
+    dut : TlmReadInitiator
+end testbench TbH3
+
+impl TH3 for TbH3
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TH3
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "host-transactor-state",
+            state,
+            "@@HOLE@@",
+            "        w = w + 1",
+            &[
+                "        w = w / 2",
+                "        if w < 8\n            w = w + 1\n        end if",
+                "        if last.w < 8\n            w = w + 1\n        end if",
+            ],
+        )
+    );
+
+    let from_test = r#"
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    w : uint<1024> default 7
+    thread bus.read(addr: uint<8>)
+        w = w + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench TbH4
+    dut : TlmReadInitiator
+end testbench TbH4
+
+impl TH4 for TbH4
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+    check
+@@HOLE@@
+    end check
+end impl TH4
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "host-transactor-state-from-test",
+            from_test,
+            "@@HOLE@@",
+            "        assert target.w == 7\n            else fail(\"eq\")",
+            &["        assert target.w < 8\n            else fail(\"lt\")"],
+        )
+    );
+
+    let _ = (ops, asserts);
+}
+
+/// Two statement positions consume a value through a SYNTHESIZED
+/// comparison or conversion, so the binary-operator guard never sees
+/// them. Both were left behind when the field gate widened.
+#[test]
+fn a_wide_scalar_in_a_loop_bound_or_a_cycle_count_is_refused() {
+    let tmpl = r#"
+testbench TbL
+    dut : Top
+    w : uint<1024> default 3
+    r : uint<1024> default 0
+end testbench TbL
+
+impl TL for TbL
+    run
+@@HOLE@@
+        wait 1 cycle
+    end run
+end impl TL
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "wide-loop-and-wait",
+            tmpl,
+            "@@HOLE@@",
+            "        r = w + 1",
+            &[
+                // tbir LOWERED this, silently iterating the low 64 bits
+                // of a 1024-bit bound, while v1 could not build it.
+                "        for i in 0 .. w\n            r = r + 1\n        end for",
+                "        wait w cycles",
             ],
         )
     );
@@ -808,10 +1022,21 @@ fn a_field_default_too_wide_for_its_u64_slot_is_never_truncated() {
     // `u64::MAX`, then the first literal above it, then 2^65. The
     // first must lower — a gate that refuses everything would pass a
     // refusal-only assertion.
+    // `u64::MAX`, the first value above it, 2^65 — and the HEX
+    // spelling of that same first value. The decimal rows alone are
+    // three spellings of ONE landing: the first fix gated on
+    // `all(is_ascii_digit)`, so `0x…` fell into the old `Invalid`
+    // branch and kept the wrong grade and the wrong words.
     let rows: &[(&str, bool)] = &[
         ("18446744073709551615", true),
+        ("0xFFFF_FFFF_FFFF_FFFF", true),
         ("18446744073709551616", false),
+        ("0x1_0000_0000_0000_0000", false),
         ("36893488147419103232", false),
+        (
+            "0b10000000000000000000000000000000000000000000000000000000000000000",
+            false,
+        ),
     ];
 
     // Both sites that fold a declared default into a `u64` slot: a

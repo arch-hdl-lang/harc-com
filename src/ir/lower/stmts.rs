@@ -759,6 +759,23 @@ impl FuncBuilder<'_> {
             None => None,
         };
         let n = self.lower_expr_no_ports(duration)?;
+        // A cycle count is a `uint32_t` at the emitter. A wide operand
+        // reaches it through `HarcWide`'s two implicit conversions and
+        // g++ calls the narrowing ambiguous — in both backends. Same
+        // shape as the `for` upper bound: the count is consumed by a
+        // synthesized terminator, not by a source-level operator, so
+        // the binary-operator guard never sees it.
+        if self.is_wide_scalar(&n) {
+            return Err(not_implemented(
+                "a `wait <n> cycles` count that is a scalar wider than 128 bits",
+                "a cycle count is a 32-bit value; narrow it explicitly \
+                 (`n.trunc<32>()`) if that is what you mean. v1 emits the same \
+                 conversion and its C++ does not compile either, so `--codegen v1` \
+                 is not a way out"
+                    .to_string(),
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let next = self.new_block();
         // Plain waits inside an inlined helper / testbench-method body
         // take v1's synchronous lambda path (no coroutine yield) — see

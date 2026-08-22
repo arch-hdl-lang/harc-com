@@ -145,6 +145,15 @@ impl FuncBuilder<'_> {
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
+        // The loop counter is a `uint64_t`. A wide bound reaches the
+        // header through `HarcWide`'s implicit `uint64_t` conversion,
+        // which SILENTLY drops everything above bit 64 — tbir emitted a
+        // loop over the low 64 bits of a 1024-bit bound and said
+        // nothing, while v1 could not build the same program at all.
+        // The header's `i <= hi` is synthesized below rather than
+        // lowered from source, so it never passes the binary-operator
+        // guard; the check belongs here.
+        self.reject_wide_loop_bound(&hi_ir)?;
         let hi_operand = self.stash_if_impure(hi_ir);
 
         // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
@@ -345,6 +354,31 @@ impl FuncBuilder<'_> {
 
     /// Shared header/body/latch/exit shape for `for` and `repeat`.
     /// Precondition: counter init already emitted in the current block.
+    /// Refuse a `for i in lo .. hi` whose upper bound is held as
+    /// `harc_rt::HarcWide<N>`.
+    ///
+    /// Unlike the six operators `reject_unbuildable_wide_operator`
+    /// names, this one does not fail to build: the loop counter is a
+    /// `uint64_t` and `HarcWide` converts to one implicitly, so tbir
+    /// emitted a loop over the bound's low 64 bits with no diagnostic.
+    /// v1 emits `i <= hi` against the `HarcWide` directly and g++
+    /// refuses it, which is what sets the grade — v1 does not run this
+    /// program either, so `--codegen v1` must not be offered.
+    fn reject_wide_loop_bound(&self, hi: &Expr) -> Result<(), LowerError> {
+        if !self.is_wide_scalar(hi) {
+            return Ok(());
+        }
+        Err(not_implemented(
+            "a `for` range whose upper bound is a scalar wider than 128 bits",
+            "the loop counter is a 64-bit value; a wider bound would be truncated to its \
+             low 64 bits without a word. Narrow the bound explicitly (`hi.trunc<64>()`) if \
+             that is what you mean. v1 compares the counter against the wide value \
+             directly and its C++ does not compile, so `--codegen v1` is not a way out"
+                .to_string(),
+            V1Status::EmitsUncompilable,
+        ))
+    }
+
     fn lower_counted_loop(
         &mut self,
         header_cond: Expr,

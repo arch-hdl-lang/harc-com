@@ -124,19 +124,26 @@ int main() {{
     check("w + (0 - 1)", is(w + (0 - 1), 6));
     check("HarcWide<32>(-1) is all ones", all_ones(HarcWide<32>(-1)));
 
-    // Two wide values of DIFFERENT widths: no `N` deduces for the
-    // homogeneous operator, so this is its own overload set. The result
-    // takes the wider of the two.
-    check("w + n", is(w + n, 12));
-    check("n + w", is(n + w, 12));
-    check("w - n", is(w - n, 2));
-    check("w * n", is(w * n, 35));
-    check("w & n", is(w & n, 5));
-    check("w | n", is(w | n, 7));
-    check("w ^ n", is(w ^ n, 2));
-    static_assert(std::is_same_v<decltype(w + n), HarcWide<32>>);
-    static_assert(std::is_same_v<decltype(n + w), HarcWide<32>>);
+    (void)n;
     static_assert(std::is_same_v<decltype(w + 1), HarcWide<32>>);
+    static_assert(std::is_same_v<decltype(w + w), HarcWide<32>>);
+
+    // `harc_wide_zext` ZERO-extends whatever the source's sign. The
+    // converting constructor sign-extends (the `w + (0 - 1)` row above
+    // depends on it), and a function named zero-extend must not inherit
+    // that: zero-extending a 64-bit -1 is 2^64-1, so exactly the low two
+    // words are set. It answered 2^128-1 before the constructor gained
+    // sign-extension, and 2^1024-1 for one commit after.
+    {{
+        const auto z = harc_rt::harc_wide_zext<32>(int64_t(-1));
+        check("zext<32>(-1) is not all ones", !all_ones(z));
+        check("zext<32>(-1) sets exactly the low two words",
+              z.words[0] == 0xFFFFFFFFu && z.words[1] == 0xFFFFFFFFu
+                  && z.words[2] == 0u && z.words[31] == 0u);
+        // The unsigned spelling of the same bits is unchanged.
+        const auto zu = harc_rt::harc_wide_zext<32>(uint64_t(0xFFFFFFFFFFFFFFFFull));
+        check("zext<32>(u64 max) matches", zu == z);
+    }}
 
     // Equality already carried both mixed forms; kept here so the six
     // new ones are not the only thing holding the shapes up.
@@ -163,31 +170,51 @@ int main() {{
     );
 }
 
-/// `/ % < > <= >=` are deliberately NOT defined for a mixed pair.
+/// Two shapes are deliberately left UNDEFINED, and both were defined
+/// once before being measured.
 ///
-/// All six are unsigned on `HarcWide`, and lowering emits a bare
-/// operator for a `sint` too, so defining them here would answer `w < 0`
-/// on a negative `sint<1024>` with `false` instead of failing to build.
-/// Lowering refuses them with a named diagnostic
-/// (`reject_unbuildable_wide_operator`); this pins the header half, so
-/// nobody closes the "ambiguous overload" error by adding them back.
+/// 1. `/ % < > <= >=` against an integer. All six are unsigned on
+///    `HarcWide`, and lowering emits a bare operator for a `sint` too,
+///    so defining them answers `w < 0` on a negative `sint<1024>` with
+///    `false` instead of failing to build.
+/// 2. ANY operator between two `HarcWide`s of different widths.
+///    Sign-agnosticism does not survive a width change: widening the
+///    narrower side is where the sign matters, and the C++ type does
+///    not carry it. A version that widened with `harc_wide_zext`
+///    answered `b + a` as `b + (2^160 - 1)` for a negative
+///    `sint<160>` while `b + (-1)`, through the integer overload
+///    beside it, answered correctly.
+///
+/// Lowering refuses both with named diagnostics
+/// (`reject_unbuildable_wide_operator`). This pins the header half, so
+/// nobody closes an "ambiguous overload" error by adding them back.
 #[test]
-fn the_sign_sensitive_operators_stay_undefined_for_mixed_operands() {
+fn the_sign_sensitive_shapes_stay_undefined() {
     let cxx = cxx().expect("a host C++ compiler is required for this test");
+    let mut cases: Vec<(String, String)> = Vec::new();
     for op in ["/", "%", "<", ">", "<=", ">="] {
-        let body = format!(
-            "{PRELUDE}\nint main() {{ HarcWide<32> w = 7; auto r = w {op} 2; (void)r; return 0; }}\n"
-        );
-        let tag = format!("nodef{}", op.chars().map(|c| c as u32).sum::<u32>());
-        match build(&cxx, &body, &tag) {
+        cases.push((
+            format!("HarcWide<32> {op} int"),
+            format!("HarcWide<32> w = 7; auto r = w {op} 2; (void)r;"),
+        ));
+    }
+    for op in ["+", "-", "*", "&", "|", "^", "/", "%", "<", ">", "<=", ">="] {
+        cases.push((
+            format!("HarcWide<32> {op} HarcWide<8>"),
+            format!("HarcWide<32> w = 7; HarcWide<8> n = 5; auto r = w {op} n; (void)r;"),
+        ));
+    }
+    for (i, (what, stmt)) in cases.iter().enumerate() {
+        let body = format!("{PRELUDE}\nint main() {{ {stmt} return 0; }}\n");
+        match build(&cxx, &body, &format!("nodef{i}")) {
             Ok(_) => panic!(
-                "`HarcWide<32> {op} int` compiles. It must not: `{op}` is unsigned on \
-                 HarcWide and lowering emits it for `sint` too, so defining it turns a \
-                 build failure into a wrong answer. Refuse it in lowering instead."
+                "`{what}` compiles. It must not: the operation is not sign-agnostic in \
+                 that shape, so defining it turns a build failure into a wrong answer. \
+                 Refuse it in lowering instead."
             ),
             Err(e) => assert!(
-                e.contains("ambiguous") || e.contains("no match"),
-                "`{op}` failed to compile for an unexpected reason:\n{e}"
+                e.contains("ambiguous") || e.contains("no match") || e.contains("no operator"),
+                "`{what}` failed to compile for an unexpected reason:\n{e}"
             ),
         }
     }

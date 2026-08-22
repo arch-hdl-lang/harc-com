@@ -8498,8 +8498,10 @@ former `transaction` group lives in
        writes `(~value) + HarcWide<N>(1)` by hand. A cap at 128 would
        have written a language limit around a header omission.
 
-       The first version of that fix defined ALL TWELVE operators, and
-       an adversarial review found three defects in it:
+       That fix took two review rounds. The first version defined ALL
+       TWELVE operators; the second still defined six of them across
+       widths. Both times the defect was the same one, and both times
+       it was found by measurement rather than by reading:
 
        * `/ % < > <= >=` are **not** the rule `operator==` states.
          Equality is sign-agnostic; ordering and division are not, and
@@ -8523,15 +8525,46 @@ former `transaction` group lives in
          DIFFERENT widths deduce no `N` either. Reachable straight
          from source once fields could be wide (`a : uint<160>`,
          `b : uint<256>`, `b = b + a`), and `LowersUncompilable` in
-         both backends. `operator==` states that half too, as an
-         `<A, B>` form comparing at the wider of the two; the six now
-         carry it.
+         both backends.
 
-       None of the three could be caught by a typecheck — two of them
-       compiled and computed the wrong number — so the operators are
-       gated by a probe that is built AND RUN
-       (`tests/wide_mixed_ops_cpp.rs`), in the style of
-       `wide_cast_cpp.rs`.
+       The second round's fix for that last one was to define the six
+       across widths too, widening the narrower side with
+       `harc_wide_zext`. That is the SAME defect a third time, and the
+       sharpest instance of it: **sign-agnosticism does not survive a
+       width change.** `+ - * & | ^` give one N-word answer for signed
+       and unsigned alike only while N is fixed; widening is exactly
+       where the sign matters, and the C++ type does not carry it. So
+       `b + a` for a negative `sint<160>` answered `b + (2^160 - 1)`
+       while `b + (-1)`, through the integer overload directly beside
+       it, answered correctly — two halves of one macro disagreeing
+       about one value, in v1 as well.
+
+       Both shapes are refused at lowering now, by
+       `reject_unbuildable_wide_operator`, with the grade v1
+       measurably earns. `==`/`!=` are the exception and are NOT
+       refused across widths: they carry their own `<A, B>` form, and
+       a first version of the refusal blanket-covered them, refusing a
+       program v1 builds under a label the measurement contradicts.
+
+       NAMED and not fixed: that `<A, B>` equality compares raw words,
+       so two SIGNED values of different widths compare unequal when
+       both are -1. Both backends agree on the wrong answer; it
+       predates the declared-field widening.
+
+       None of these could be caught by a typecheck — most compiled
+       and computed the wrong number — so the operators are gated by a
+       probe that is built AND RUN (`tests/wide_mixed_ops_cpp.rs`), in
+       the style of `wide_cast_cpp.rs`.
+
+     - **Two statement positions consume a value through a SYNTHESIZED
+       comparison or conversion**, so the binary-operator guard never
+       sees them, and both were left behind when the field gate
+       widened. `for i in 0 .. w` builds its `i <= hi` header in
+       `control.rs`; tbir LOWERED it, silently iterating the low 64
+       bits of a 1024-bit bound through `HarcWide`'s implicit
+       `uint64_t` conversion, while v1 could not build the same
+       program at all. `wait w cycles` narrows to a `uint32_t` and is
+       ambiguous in both. Both are refused now.
 
      What did NOT change: a `default` literal above `u64::MAX` is
      still refused, because every field schema carries its default in a
@@ -8545,15 +8578,36 @@ former `transaction` group lives in
      Two more findings from the same review, both instances of the
      recurring shape:
 
-     * **One landing measured, the rule written from it.** A `default`
-       literal above `u64::MAX` is refused at the testbench-field site
-       as `NotImplemented{SilentlyMisLowers}`, which is honest. At the
+     * **One landing measured, the rule written from it — twice, on
+       the same rule.** A `default` literal above `u64::MAX` is
+       refused at the testbench-field site as
+       `NotImplemented{SilentlyMisLowers}`, which is honest. At the
        PROMOTED-`let` site the same class of literal answered
        `Invalid` — "no backend runs this" — against a v1 that compiles
-       it, and said "non-integer initializer" about an integer. Both
-       sites fold into the same `u64` slot and now carry the same
-       label; the differential harness asserts on precisely that
-       pairing and simply had no row for the second site.
+       it, and said "non-integer initializer" about an integer. The
+       fix for that gated on `all(is_ascii_digit)`, so the HEX
+       spelling of the very same value kept the wrong grade and the
+       wrong words, and the three replacement test rows were three
+       decimal spellings of one landing. `parse_int_literal_checked`
+       answers "overflows" and "not an integer" separately now — one
+       parse, two answers — and the rows cover decimal, hex and
+       binary. The related diagnostic that called a constant-but-wide
+       literal "a non-constant default" is fixed too.
+     * **`is_wide_scalar` resolved two of the four host-state reads
+       its own doc comment named.** Scoreboard fields (directly and
+       through an env), transactor state fields (inside a responder
+       body and from the test scope) and record leaves of a state
+       field all answered "not wide", so six programs lowered into C++
+       nobody could build. Its escape clause — a shape it cannot
+       resolve keeps the pre-existing behaviour — did not apply: none
+       of those shapes could carry a >128-bit value before this branch
+       widened the field gate.
+     * **`harc_wide_zext` inherited the constructor's sign
+       extension.** Fixing `HarcWide<N>(negative)` to sign-extend made
+       the one-argument `harc_wide_zext` — a function named
+       *zero*-extend — answer 2^1024-1 for a 64-bit -1 where it had
+       answered 2^128-1. Neither is right; it zero-extends explicitly
+       now and answers 2^64-1.
      * **A space that could not fail.** None of the harness's three
        falsifiable directions fires on a verdict that over-REFUSES:
        re-capping a width gate turns every row into
@@ -8568,12 +8622,14 @@ former `transaction` group lives in
 
      The gap was found by asking v1 across a mechanically enumerated
      width space rather than from one probe, and every step above is
-     mutation-tested: re-capping the shared rule (now caught by the
+     mutation-tested: re-capping the shared rule (caught by the
      differential harness as well as `tbir.rs`), re-capping either of
      the two per-file rules, restoring the hardcoded emitter triple,
      deleting any one of the six runtime operators, reverting the
-     sign-extension, and neutering the wide-operator refusal each fail
-     the suite.
+     sign-extension, neutering the wide-operator refusal, dropping the
+     mixed-width refusal, neutering either host-state lookup,
+     truncating the promoted-`let` default, and removing the `for`-
+     bound or `wait`-count guard each fail the suite.
 
 ## Next steps
 

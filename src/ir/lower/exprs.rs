@@ -3351,18 +3351,6 @@ impl FuncBuilder<'_> {
         })
     }
 
-    /// Wrap a lowered `+% / -% / *%` result to `max(W(lhs), W(rhs))` bits
-    /// (harc#473). ARCH's wrapping operators take the wider operand's width
-    /// as the result width with no widening; the mask is emitted as a
-    /// `WidthCast::Trunc`, so codegen produces `(a OP b) & ((1<<W)-1)` for
-    /// `W < 64` (and a no-op cast at `W == 64`, since 64 b fills the slot).
-    ///
-    /// Both operand widths must be statically determinable — literals are
-    /// self-sized, typed locals / DUT ports / casts carry their width. If
-    /// either operand's width is unknown, lowering fails loudly rather than
-    /// silently degrading to the un-wrapped value (the exact hazard the
-    /// operator exists to prevent): a scoreboard mirroring a wrapping
-    /// datapath would otherwise compute values the DUT can never emit.
     /// Is this operand held as `harc_rt::HarcWide<N>` rather than a
     /// builtin integer?
     ///
@@ -3379,37 +3367,88 @@ impl FuncBuilder<'_> {
     /// lowers, and if the emitted C++ turns out not to build that is
     /// the pre-existing defect, not a new one. `differential.rs`'s
     /// wide-operator spaces are what say which shapes must be here.
-    fn is_wide_scalar(&self, e: &Expr) -> bool {
-        let wide = |ty: Option<&IrType>| {
-            matches!(
-                ty,
+    pub(super) fn is_wide_scalar(&self, e: &Expr) -> bool {
+        self.wide_scalar_words(e).is_some()
+    }
+
+    /// `HarcWide` word count of a wide operand, or `None` when the
+    /// operand is not held as `HarcWide` (or its width is unknown).
+    /// Mirrors `wide_scalar_words` in the emitter: the storage class and
+    /// its size are one decision, and a guard that disagreed with the
+    /// emitter about either would fire on the wrong expressions.
+    fn wide_scalar_words(&self, e: &Expr) -> Option<u32> {
+        let wide = |ty: Option<&IrType>| -> Option<u32> {
+            match ty {
                 Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w)))
-                    if *w > Self::BUILTIN_SCALAR_BITS
-            )
+                    if *w > Self::BUILTIN_SCALAR_BITS =>
+                {
+                    Some(w.div_ceil(32))
+                }
+                _ => None,
+            }
         };
         match e {
             Expr::TbField(name) => wide(self.ctx.tb_scalar_fields.get(name)),
-            Expr::ComponentField { base, field } => {
-                let Some(cid) = self.component_base_id(base) else {
-                    return false;
+            // `sb.<scalar>`, on a scoreboard-typed testbench field or a
+            // scoreboard held inside an env.
+            Expr::ScoreboardQuery {
+                sb,
+                query: crate::ir::ScoreboardQuery::Scalar { scalar },
+                ..
+            } => {
+                let f = self
+                    .ctx
+                    .scoreboards
+                    .get(sb.index())
+                    .and_then(|s| s.field(scalar))?;
+                match &f.kind {
+                    crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => wide(Some(ty)),
+                    _ => None,
+                }
+            }
+            // A bound-to transactor's persistent scalar state, read
+            // inside a responder body or through the test-scope
+            // instance.
+            Expr::TransactorState { instance, field } => {
+                match self.state_field_kind(instance, field) {
+                    Some(crate::ir::StateFieldKind::Scalar { ty, .. }) => wide(Some(ty)),
+                    _ => None,
+                }
+            }
+            // A leaf of a whole-record state field. The record schema
+            // carries the leaf's declared type, same as any other
+            // record field.
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+            } => {
+                let Some(crate::ir::StateFieldKind::Record { record }) =
+                    self.state_field_kind(instance, field)
+                else {
+                    return None;
                 };
-                let Some(f) = self
+                wide(self.record_leaf_type(*record, path).as_ref())
+            }
+            Expr::ComponentField { base, field } => {
+                let cid = self.component_base_id(base)?;
+                let f = self
                     .ctx
                     .components
                     .get(cid.index())
-                    .and_then(|c| c.field(field))
-                else {
-                    return false;
-                };
-                matches!(&f.kind, crate::ir::ComponentFieldKind::Scalar { ty, .. } if wide(Some(ty)))
+                    .and_then(|c| c.field(field))?;
+                match &f.kind {
+                    crate::ir::ComponentFieldKind::Scalar { ty, .. } => wide(Some(ty)),
+                    _ => None,
+                }
             }
-            // Both operands of a same-width comparison are equally
-            // wide, so either side answering is enough; recursing keeps
-            // `(w + 1) < 8` from slipping past on the parenthesised
-            // side.
-            Expr::Unary(_, inner) => self.is_wide_scalar(inner),
-            Expr::Binary(_, a, b) => self.is_wide_scalar(a) || self.is_wide_scalar(b),
-            Expr::Ternary(_, t, f) => self.is_wide_scalar(t) || self.is_wide_scalar(f),
+            // A sub-expression can be the wide one: `(w + 1) < 8` puts
+            // the wide operand one level down on the left. Either side
+            // answering is enough, and the widest wins so a mixed-width
+            // nest is still seen as mixed.
+            Expr::Unary(_, inner) => self.wide_scalar_words(inner),
+            Expr::Binary(_, a, b) => self.wide_scalar_words(a).max(self.wide_scalar_words(b)),
+            Expr::Ternary(_, t, f) => self.wide_scalar_words(t).max(self.wide_scalar_words(f)),
             other => wide(self.expr_type(other).as_ref()),
         }
     }
@@ -3450,6 +3489,50 @@ impl FuncBuilder<'_> {
         l: &Expr,
         r: &Expr,
     ) -> Result<(), LowerError> {
+        // `+% -% *%` reach `wrap_to_operand_width` first; everything
+        // else is judged on the lowered operands.
+        let _ = op;
+        // Two wide operands of DIFFERENT widths deduce no `N` for the
+        // homogeneous `HarcWide` operators, so the shape is unbuildable
+        // for every operator EXCEPT `==`/`!=`, which carry their own
+        // `<A, B>` form comparing at the wider of the two. Widening for
+        // the rest would need the narrower side's signedness, which the
+        // C++ type does not carry; see the header note beside
+        // `HARC_WIDE_MIXED_OP`.
+        //
+        // A first version refused this shape for every operator, and
+        // claimed `EmitsUncompilable` while v1 built `b == a` perfectly
+        // well — a refusal of something that worked, under a label the
+        // measurement contradicts.
+        //
+        // NAMED and not fixed: that `<A, B>` equality compares raw
+        // words, so two SIGNED values of different widths compare
+        // unequal when they are both -1 (`sint<160>` fills 5 words,
+        // `sint<256>` fills 8). Both backends agree on the wrong
+        // answer, which predates the declared-field widening and is
+        // not this seam's to change.
+        let cross_width_ok = matches!(ir_op, BinOp::Eq | BinOp::Ne);
+        if let (Some(a), Some(b)) = (self.wide_scalar_words(l), self.wide_scalar_words(r)) {
+            if a != b && !cross_width_ok {
+                return Err(not_implemented(
+                    &format!(
+                        "the operator `{}` between scalars of {} and {} words",
+                        crate::ir::display::bin_op_str(ir_op),
+                        a,
+                        b
+                    ),
+                    "a scalar wider than 128 bits is held as `harc_rt::HarcWide<N>`, whose \
+                     operators take two operands of the SAME width; widening the narrower \
+                     side needs its signedness, which the C++ type does not carry (zero- \
+                     extending a negative `sint` turns -1 into 2^W-1). Give both operands \
+                     the same declared width, or narrow one with `.trunc<N>()`. v1 emits \
+                     the same expression and its C++ does not compile either, so \
+                     `--codegen v1` is not a way out"
+                        .to_string(),
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+        }
         let sym = match ir_op {
             BinOp::Div => "/",
             BinOp::Mod => "%",
@@ -3459,8 +3542,6 @@ impl FuncBuilder<'_> {
             BinOp::Ge => ">=",
             _ => return Ok(()),
         };
-        // `+% -% *%` reach `wrap_to_operand_width`, never these six.
-        let _ = op;
         if !self.is_wide_scalar(l) && !self.is_wide_scalar(r) {
             return Ok(());
         }
@@ -3479,6 +3560,62 @@ impl FuncBuilder<'_> {
             ),
             V1Status::EmitsUncompilable,
         ))
+    }
+
+    /// Wrap a lowered `+% / -% / *%` result to `max(W(lhs), W(rhs))` bits
+    /// (harc#473). ARCH's wrapping operators take the wider operand's width
+    /// as the result width with no widening; the mask is emitted as a
+    /// `WidthCast::Trunc`, so codegen produces `(a OP b) & ((1<<W)-1)` for
+    /// `W < 64` (and a no-op cast at `W == 64`, since 64 b fills the slot).
+    ///
+    /// Both operand widths must be statically determinable — literals are
+    /// self-sized, typed locals / DUT ports / casts carry their width. If
+    /// either operand's width is unknown, lowering fails loudly rather than
+    /// silently degrading to the un-wrapped value (the exact hazard the
+    /// operator exists to prevent): a scoreboard mirroring a wrapping
+    /// datapath would otherwise compute values the DUT can never emit.
+    /// The `StateFieldKind` of `<instance>.<field>`.
+    ///
+    /// Inside a responder body `instance` is the EMPTY placeholder that
+    /// test-binding fills later, and the builder already carries the
+    /// owning transactor's fields in `target_state_fields` — the same
+    /// table the bare-ident read above resolves against. From the test
+    /// scope `instance` is a real testbench field, in either of the two
+    /// instance maps.
+    fn state_field_kind(&self, instance: &str, field: &str) -> Option<&crate::ir::StateFieldKind> {
+        if instance.is_empty() {
+            return self.target_state_fields.get(field);
+        }
+        let id = self
+            .ctx
+            .transactor_fields
+            .get(instance)
+            .or_else(|| self.ctx.target_transactor_fields.get(instance))?;
+        self.ctx
+            .transactors
+            .get(id.index())?
+            .state_fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| &f.kind)
+    }
+
+    /// The declared type of a record leaf reached by `path` from
+    /// `record`. `None` when any step is not a record or the leaf does
+    /// not exist.
+    fn record_leaf_type(&self, record: crate::ir::RecordId, path: &[String]) -> Option<IrType> {
+        let mut cur = record;
+        for (i, seg) in path.iter().enumerate() {
+            let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+            if i + 1 == path.len() {
+                return Some(fld.ty.clone());
+            }
+            match fld.ty {
+                IrType::Record(r) => cur = r,
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn wrap_to_operand_width(
@@ -3881,16 +4018,36 @@ fn wide_literal_bits(words: &[u32]) -> u32 {
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
 /// separators). Verilog-style sized literals are not lowered.
 pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
+    parse_int_literal_checked(s).ok()
+}
+
+/// Why an integer literal did not become a `u64`.
+///
+/// `parse_int_literal` answers `None` for both, and a caller that has to
+/// tell them apart was reading the digits itself to decide — which got
+/// the hex spelling wrong, grading `0x1_0000_0000_0000_0000` as "a
+/// non-integer initializer" while the decimal spelling of the same value
+/// was graded correctly. One parse, two answers.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IntLiteralErr {
+    /// A well-formed integer literal whose value exceeds `u64`.
+    Overflows,
+    /// Not an integer literal in any supported base.
+    NotAnInteger,
+}
+
+pub(crate) fn parse_int_literal_checked(s: &str) -> Result<u64, IntLiteralErr> {
     let t = s.replace('_', "");
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).ok()
-    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        u64::from_str_radix(bin, 2).ok()
-    } else if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        u64::from_str_radix(oct, 8).ok()
-    } else {
-        t.parse::<u64>().ok()
+    let (digits, radix) = match () {
+        _ if t.starts_with("0x") || t.starts_with("0X") => (&t[2..], 16),
+        _ if t.starts_with("0b") || t.starts_with("0B") => (&t[2..], 2),
+        _ if t.starts_with("0o") || t.starts_with("0O") => (&t[2..], 8),
+        _ => (&t[..], 10),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(IntLiteralErr::NotAnInteger);
     }
+    u64::from_str_radix(digits, radix).map_err(|_| IntLiteralErr::Overflows)
 }
 
 /// Parse the VALUE of a validated HARC/Verilog-style sized literal such

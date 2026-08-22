@@ -227,9 +227,30 @@ inline HarcWide<N> harc_wide_mask_bits(HarcWide<N> value, unsigned width) {
     return value;
 }
 
+// ZERO-extend, whatever the source's sign. The converting constructor
+// sign-extends a negative operand (see its comment), which is right for
+// `w + (0 - 1)` and wrong for a function named zext: routing this
+// through it turned `zext<1024>` of a negative into 2^1024-1 where it
+// had been 2^128-1. Neither is the 2^64-1 a 64-bit source should give —
+// that needs the source width, which the two-argument overload below
+// takes and masks with — but a widening step named "zero-extend" must
+// not be the thing that introduces the sign bits.
 template<std::size_t N, typename T>
 inline HarcWide<N> harc_wide_zext(T value) {
-    return HarcWide<N>(value);
+    HarcWide<N> out;
+    _harc_u128 u;
+    if constexpr (std::is_enum_v<T>) {
+        u = static_cast<_harc_u128>(
+            static_cast<std::make_unsigned_t<std::underlying_type_t<T>>>(value));
+    } else if constexpr (std::is_signed_v<T>) {
+        u = static_cast<_harc_u128>(static_cast<std::make_unsigned_t<T>>(value));
+    } else {
+        u = static_cast<_harc_u128>(value);
+    }
+    for (std::size_t i = 0; i < N && i < 4; ++i) {
+        out.words[i] = static_cast<uint32_t>(u >> (32 * i));
+    }
+    return out;
 }
 
 template<std::size_t N, std::size_t M>
@@ -514,53 +535,54 @@ inline HarcWide<N> operator%(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     return r;
 }
 
-// Mixed operands: HarcWide with an integer, and HarcWide with a
-// DIFFERENTLY sized HarcWide.
+// Mixed operands: `HarcWide<N>` with an INTEGER.
 //
 // `HarcWide<N>` converts implicitly to BOTH `uint64_t` and
 // `_harc_u128`, so `w + 1` names two equally good built-in additions
 // and g++ rejects it: "ambiguous overload for `operator+` (operand
-// types are `harc_rt::HarcWide<32>` and `int`)". `a + b` on two wide
-// values of different widths deduces no `N` for the homogeneous
-// overload and falls into the same ambiguity. Both shapes were emitted
-// by both backends for any scalar past 128 bits — lowered programs
-// nobody could build.
+// types are `harc_rt::HarcWide<32>` and `int`)". Both backends emitted
+// that for any scalar past 128 bits — lowered programs nobody could
+// build. `operator==`/`operator!=` above already state the rule, and
+// `harc_wide_negate` writes it out by hand as `(~value) +
+// HarcWide<N>(1)`: widen the integer to the wide operand's width and
+// use the homogeneous operator.
 //
-// `operator==`/`operator!=` above already state both halves of the
-// rule: a `<A, B>` form that compares at the wider of the two, and a
-// `<N, T>` form that widens the integer. `harc_wide_negate` writes the
-// integer half out by hand as `(~value) + HarcWide<N>(1)`. Stating it
-// once here retires the workaround and both ambiguities.
+// ONLY the sign-agnostic operators are defined, and only for two
+// operands of the SAME width. `+`, `-`, `*`, `&`, `|` and `^` give the
+// same N-word answer whether their operands are read as signed or
+// unsigned, so one implementation is correct for both. Two rules
+// follow, and both were learned by getting them wrong:
 //
-// ONLY the sign-agnostic operators are defined. `+`, `-`, `*`, `&`,
-// `|` and `^` give the same N-word answer whether the operands are
-// read as signed or unsigned, so one implementation is correct for
-// both. `/`, `%`, `<`, `>`, `<=` and `>=` do NOT: the homogeneous
-// `HarcWide` implementations of all six are unsigned, and `expr.rs`
-// emits a bare `<` for a `sint` compare (there is no signed-wide path
-// outside `harc_wide_slt`, which only covergroup lowering reaches).
-// Defining them here would silently answer `0` for `w < 0` on a
-// negative `sint<1024>` instead of failing to build. A refusal at
-// lowering is the honest outcome until a signed-wide compare exists;
-// see `wide_scalar_relational_and_division_operands` in
-// `src/ir/lower/exprs.rs`.
+//   * `/`, `%`, `<`, `>`, `<=` and `>=` are NOT sign-agnostic. Every
+//     `HarcWide` implementation of them is unsigned, and `expr.rs`
+//     emits a bare `<` for a `sint` too (the only signed-wide compare,
+//     `harc_wide_slt`, is reached from covergroup lowering alone).
+//     Defining them would answer `w < 0` on a negative `sint<1024>`
+//     with false instead of failing to build.
+//   * Sign-agnosticism does NOT survive a width change. An earlier
+//     version defined the six for `HarcWide<A>` against `HarcWide<B>`
+//     as well, widening both with `harc_wide_zext`. Widening is where
+//     the sign matters — zero-extending a negative `sint<160>` into
+//     256 bits turns -1 into 2^160-1 — so that overload answered
+//     `b + a` as `b + (2^160 - 1)` while `b + (-1)`, through the
+//     integer overload right beside it, answered correctly. Two halves
+//     of one macro disagreeing about one value.
+//
+// Both shapes are refused at lowering instead, by
+// `reject_unbuildable_wide_operator` in `src/ir/lower/exprs.rs`, with
+// the grade v1 measurably earns: v1 emits the same expression and its
+// C++ does not compile either. A refusal is the honest outcome until
+// the emitter carries signedness into an explicit widening cast.
 #define HARC_WIDE_MIXED_OP(op)                                                                  \
     template<std::size_t N, typename T,                                                         \
              typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
-    inline HarcWide<N> operator op(const HarcWide<N>& lhs, T rhs) {                              \
+    inline HarcWide<N> operator op(const HarcWide<N>& lhs, T rhs) {                             \
         return lhs op HarcWide<N>(rhs);                                                         \
     }                                                                                           \
     template<std::size_t N, typename T,                                                         \
              typename = std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>>>           \
-    inline HarcWide<N> operator op(T lhs, const HarcWide<N>& rhs) {                              \
+    inline HarcWide<N> operator op(T lhs, const HarcWide<N>& rhs) {                             \
         return HarcWide<N>(lhs) op rhs;                                                         \
-    }                                                                                           \
-    template<std::size_t A, std::size_t B,                                                      \
-             typename = std::enable_if_t<(A != B)>>                                             \
-    inline HarcWide<(A > B ? A : B)> operator op(                                               \
-        const HarcWide<A>& lhs, const HarcWide<B>& rhs) {                                       \
-        constexpr std::size_t M = (A > B) ? A : B;                                              \
-        return harc_wide_zext<M>(lhs) op harc_wide_zext<M>(rhs);                                \
     }
 
 HARC_WIDE_MIXED_OP(+)
