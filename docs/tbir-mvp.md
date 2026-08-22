@@ -8556,15 +8556,25 @@ former `transaction` group lives in
        probe that is built AND RUN (`tests/wide_mixed_ops_cpp.rs`), in
        the style of `wide_cast_cpp.rs`.
 
-     - **Two statement positions consume a value through a SYNTHESIZED
-       comparison or conversion**, so the binary-operator guard never
-       sees them, and both were left behind when the field gate
-       widened. `for i in 0 .. w` builds its `i <= hi` header in
-       `control.rs`; tbir LOWERED it, silently iterating the low 64
-       bits of a 1024-bit bound through `HarcWide`'s implicit
+     - **FOUR statement positions consume a value through a
+       SYNTHESIZED comparison or conversion**, so the binary-operator
+       guard never sees them, and all four were left behind when the
+       field gate widened. `for i in 0 .. w` builds its `i <= hi`
+       header in `control.rs`; tbir LOWERED it, silently iterating the
+       low 64 bits of a 1024-bit bound through `HarcWide`'s implicit
        `uint64_t` conversion, while v1 could not build the same
-       program at all. `wait w cycles` narrows to a `uint32_t` and is
-       ambiguous in both. Both are refused now.
+       program at all. `wait w cycles` narrows to a `uint32_t`,
+       `wait until ... timeout w cycles` to an `int64_t`, and both are
+       ambiguous in v1.
+
+       `repeat w` is the one worth naming twice. A first pass guarded
+       `for` and `wait` and called that "two statement positions" —
+       but `repeat` builds the SAME header through the SAME
+       `lower_counted_loop`, whose doc line says "shared header /
+       body / latch / exit shape for `for` **and `repeat`**". That
+       sentence was sitting directly above the new guard, because the
+       guard had been inserted in front of the function it documents.
+       The re-parented comment named the missed landing.
 
      What did NOT change: a `default` literal above `u64::MAX` is
      still refused, because every field schema carries its default in a
@@ -8622,14 +8632,32 @@ former `transaction` group lives in
 
      The gap was found by asking v1 across a mechanically enumerated
      width space rather than from one probe, and every step above is
-     mutation-tested: re-capping the shared rule (caught by the
-     differential harness as well as `tbir.rs`), re-capping either of
-     the two per-file rules, restoring the hardcoded emitter triple,
+     mutation-tested.
+
+     **Measured and NAMED, not fixed** — each recorded at its site: the
+     `<A, B>` equality compares raw words, so two SIGNED values of
+     different widths compare unequal when both are -1; the homogeneous
+     `/ % < > <= >=` are unsigned, so `x < y` on two negative
+     `sint<1024>`s answers by magnitude; a `Vec<uint<1024>, N>` element
+     and a nested-`pop()` expression sit under `Unsupported` arms this
+     branch did not edit but did make reachable, and v1 cannot build
+     either; and an unknown-width DUT port past 64 bits reaches a
+     `uint64_t` temp in tbir where v1 refuses to build. Every one
+     predates the declared-field widening or belongs to an arm outside
+     it. Recording them beats widening the change until nothing is left
+     to record.
+
+     Eighteen mutations are checked: re-capping the shared rule (caught
+     by the differential harness as well as `tbir.rs`), re-capping
+     either per-file rule, restoring the hardcoded emitter triple,
      deleting any one of the six runtime operators, reverting the
      sign-extension, neutering the wide-operator refusal, dropping the
-     mixed-width refusal, neutering either host-state lookup,
-     truncating the promoted-`let` default, and removing the `for`-
-     bound or `wait`-count guard each fail the suite.
+     mixed-width refusal, neutering either host-state lookup, dropping
+     the `Bool`-result rule, firing the six-operator guard on a
+     same-width wide pair, removing the wide shift-count guard,
+     removing any of the `for` / `repeat` / `wait` / `timeout` guards,
+     and truncating the promoted-`let` default. The 206-fixture corpus
+     lowers identically to the merge base.
 
 ## Next steps
 

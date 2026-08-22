@@ -931,10 +931,176 @@ end impl TL
             "@@HOLE@@",
             "        r = w + 1",
             &[
-                // tbir LOWERED this, silently iterating the low 64 bits
-                // of a 1024-bit bound, while v1 could not build it.
+                // Each of these consumes the value through a
+                // SYNTHESIZED comparison or conversion, so the
+                // binary-operator guard never sees it. tbir LOWERED
+                // the first two, silently keeping the low 64 bits of a
+                // 1024-bit value, while v1 could not build either.
+                // A first pass guarded `for` and `wait` and called
+                // that "two statement positions"; `repeat` builds the
+                // SAME header as `for` through the same helper, whose
+                // doc line says so.
                 "        for i in 0 .. w\n            r = r + 1\n        end for",
                 "        wait w cycles",
+                "        repeat w\n            r = r + 1\n        end repeat",
+                "        wait until dut.rst == 1 timeout w cycles",
+            ],
+        )
+    );
+}
+
+/// Shapes the wide-operator guard must NOT fire on.
+///
+/// A guard that refuses a program v1 builds is as wrong as one that
+/// lets an unbuildable program through, and harder to notice: the
+/// harness's falsifiable directions do not catch an over-refusal.
+/// These rows must all lower.
+#[test]
+fn the_wide_operator_refusal_does_not_over_fire() {
+    let tmpl = r#"
+testbench TbN
+    dut : Top
+    a : uint<160> default 1
+    b : uint<256> default 1
+    n : uint<64> default 1
+    s : uint<160> default 0
+end testbench TbN
+
+impl TN for TbN
+    run
+@@HOLE@@
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TN
+"#;
+    eprintln!(
+        "{}",
+        check_space_all_lower(
+            "wide-not-over-refused",
+            tmpl,
+            "@@HOLE@@",
+            "        s = a",
+            &[
+                // `and`/`or` produce a BOOL whatever their operands
+                // are. A version of the guard recursed through
+                // `Expr::Binary` itself and dropped that rule, so this
+                // was refused as "`&&` between scalars of 5 and 8
+                // words" — under a label claiming v1 could not build
+                // it either.
+                "        assert (a == 1) and (b == 1)\n            else fail(\"both\")",
+                "        assert (a == 1) or (b == 1)\n            else fail(\"either\")",
+                // Same-width wide operands are exactly what the
+                // homogeneous operators take.
+                "        s = a + a",
+                "        s = a / a",
+                "        assert a < a + 1\n            else fail(\"lt\")",
+                // A shift by an ordinary integer, and by a narrow
+                // field: the COUNT is what must not be wide.
+                "        s = a << 1",
+                "        s = a >> n",
+                // Cross-width EQUALITY has its own `<A, B>` form.
+                "        assert a == b\n            else fail(\"eq\")",
+                "        assert a != b\n            else fail(\"ne\")",
+                // Narrow operands are untouched.
+                "        assert n < 8\n            else fail(\"n\")",
+                // The loop guards must not fire on a narrow bound.
+                "        repeat n\n            s = s + 1\n        end repeat",
+                "        for i in 0 .. n\n            s = s + 1\n        end for",
+            ],
+        )
+    );
+}
+
+/// A wide value narrowed into a narrower slot, and a wide shift COUNT.
+///
+/// The narrowing check read `expr_type`, which answers `None` for every
+/// host-state read, so an assignment between two declared FIELDS
+/// skipped it. Harmless while a field could not exceed 64 bits; once
+/// they could, `a : uint<160> = b : uint<256>` lowered into
+/// `HarcWide<5> = HarcWide<8>`, which has no `operator=`. The `let`
+/// spelling was worse — v1 gave a clean narrowing diagnostic there.
+#[test]
+fn a_wide_value_narrowed_or_used_as_a_shift_count_is_refused() {
+    let tmpl = r#"
+testbench TbX
+    dut : Top
+    a : uint<160> default 1
+    b : uint<256> default 1
+    s : uint<160> default 0
+end testbench TbX
+
+impl TX for TbX
+    run
+@@HOLE@@
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TX
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "wide-narrowing-and-shift-count",
+            tmpl,
+            "@@HOLE@@",
+            "        s = a",
+            &[
+                "        a = b",
+                "        let c : uint<160> = b\n        s = c",
+                // `HarcWide`'s shifts take an integral count, so a
+                // `HarcWide` count is ambiguous at ANY width — two
+                // equal ones included, which the mixed-width check
+                // cannot see.
+                "        s = a << a",
+                "        s = a >> a",
+            ],
+        )
+    );
+}
+
+/// The component-record LEAF, which `ComponentField` spells as a DOTTED
+/// member name (`cur.w`) — so a lookup by the whole name never matched
+/// and every wide leaf answered "not wide".
+#[test]
+fn a_wide_leaf_of_a_component_record_field_is_seen() {
+    let tmpl = r#"
+struct Payload
+    w : uint<1024>
+end struct Payload
+
+transactor Src
+    cur : Payload
+    r : uint<1024> default 0
+
+    hookable bump(x: uint<8>)
+@@HOLE@@
+    end bump
+end transactor Src
+
+testbench TbR
+    dut : Top
+    src : Src passive
+end testbench TbR
+
+impl TR for TbR
+    run
+        src.bump(1)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TR
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "component-record-leaf",
+            tmpl,
+            "@@HOLE@@",
+            "        r = cur.w",
+            &[
+                "        r = cur.w / 2",
+                "        if cur.w < 8\n            r = r + 1\n        end if"
             ],
         )
     );
@@ -1019,9 +1185,6 @@ fn a_field_default_too_wide_for_its_u64_slot_is_never_truncated() {
     let dir = std::env::temp_dir().join("harc-diff-wide-default");
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    // `u64::MAX`, then the first literal above it, then 2^65. The
-    // first must lower — a gate that refuses everything would pass a
-    // refusal-only assertion.
     // `u64::MAX`, the first value above it, 2^65 — and the HEX
     // spelling of that same first value. The decimal rows alone are
     // three spellings of ONE landing: the first fix gated on

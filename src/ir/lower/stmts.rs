@@ -1625,6 +1625,14 @@ impl FuncBuilder<'_> {
         // narrowed value such as `(wide & 0xFF) >> 4`. Pure-helper and
         // extern calls are included because their CallTarget carries the
         // exact declared return type.
+        // …plus any shape `scalar_type_of` resolves as WIDE. Those are
+        // host-state reads, which `expr_type` declines and which this
+        // set therefore never admitted; harmless while a field could
+        // not exceed 64 bits, but once it could, `let c : uint<160> =
+        // b` for a `uint<256>` field `b` lowered into `HarcWide<5> =
+        // HarcWide<8>`, which has no `operator=`. Restricted to wide
+        // sources so the narrowing rule for every existing shape is
+        // exactly what it was.
         if !matches!(
             e,
             Expr::Literal { .. }
@@ -1636,7 +1644,8 @@ impl FuncBuilder<'_> {
                     crate::ir::CallTarget::Helper { .. } | crate::ir::CallTarget::ExternFn { .. },
                     _,
                 )
-        ) {
+        ) && self.wide_scalar_words(e).is_none()
+        {
             return Ok(());
         }
         // Signedness, not just width: invariant 15's `assign_compatible`
@@ -1648,7 +1657,16 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(w)) => (*w, true),
             _ => return Ok(()),
         };
-        let (aw, a_signed) = match self.expr_type(e) {
+        // `scalar_type_of`, not `expr_type`: the latter answers `None`
+        // for every host-state read, so `a = b` between two declared
+        // FIELDS skipped this check entirely. Harmless while a field
+        // could not exceed 64 bits and both sides were `uint64_t`
+        // anyway; once fields could be wide it let `a : uint<160> =
+        // b : uint<256>` lower into `HarcWide<5> = HarcWide<8>`, which
+        // has no `operator=`. The `let` spelling was worse still — v1
+        // gave a clean narrowing diagnostic there and tbir emitted C++
+        // nobody could build.
+        let (aw, a_signed) = match self.scalar_type_of(e) {
             Some(IrType::UInt(Some(w))) => (w, false),
             Some(IrType::SInt(Some(w))) => (w, true),
             _ => return Ok(()),
@@ -1675,6 +1693,42 @@ impl FuncBuilder<'_> {
             )));
         }
         Ok(())
+    }
+
+    /// Refuse a WIDE value assigned into a narrower wide slot.
+    ///
+    /// The local narrowing check above is keyed on `local_type`, so a
+    /// FIELD destination never reaches it. `HarcWide<A> = HarcWide<B>`
+    /// has no `operator=` for `A != B`, so `a = b` between two declared
+    /// fields lowered into C++ nobody could build — in v1 too. Only
+    /// wide pairs are judged here; every narrower assignment keeps the
+    /// rule it had.
+    fn reject_wide_narrowing_into(
+        &self,
+        dest: Option<IrType>,
+        e: &Expr,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let words = |ty: Option<&IrType>| match ty {
+            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if *w > 128 => Some(w.div_ceil(32)),
+            _ => None,
+        };
+        let (Some(dw), Some(sw)) = (words(dest.as_ref()), self.wide_scalar_words(e)) else {
+            return Ok(());
+        };
+        if dw == sw {
+            return Ok(());
+        }
+        Err(not_implemented(
+            &format!("a {sw}-word value assigned into {what}, which holds {dw} words"),
+            "a scalar wider than 128 bits is held as `harc_rt::HarcWide<N>`, and there is \
+             no assignment between two different `N`. Narrow the value explicitly with \
+             `.trunc<N>()`, or declare both at the same width. v1 emits the same \
+             assignment and its C++ does not compile either, so `--codegen v1` is not a \
+             way out"
+                .to_string(),
+            V1Status::EmitsUncompilable,
+        ))
     }
 
     fn check_component_method_result_assignable(
@@ -2047,6 +2101,11 @@ impl FuncBuilder<'_> {
         if let Some(field) = self.as_tb_scalar_field(target) {
             let e = self.lower_expr_no_ports(value)?;
             self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
+            self.reject_wide_narrowing_into(
+                self.ctx.tb_scalar_fields.get(&field).cloned(),
+                &e,
+                &format!("testbench field `{field}`"),
+            )?;
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }

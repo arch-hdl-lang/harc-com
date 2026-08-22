@@ -153,7 +153,7 @@ impl FuncBuilder<'_> {
         // The header's `i <= hi` is synthesized below rather than
         // lowered from source, so it never passes the binary-operator
         // guard; the check belongs here.
-        self.reject_wide_loop_bound(&hi_ir)?;
+        self.reject_wide_loop_bound("a `for` range", &hi_ir)?;
         let hi_operand = self.stash_if_impure(hi_ir);
 
         // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
@@ -330,6 +330,9 @@ impl FuncBuilder<'_> {
             },
         ));
         let count_ir = self.lower_expr_no_ports(&r.count)?;
+        // Same synthesized `uint64_t` counter as `for`, same silent
+        // truncation, same v1 build failure.
+        self.reject_wide_loop_bound("a `repeat` count", &count_ir)?;
         let count_operand = self.stash_if_impure(count_ir);
         let cond = Expr::Binary(
             BinOp::Lt,
@@ -352,26 +355,31 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// Shared header/body/latch/exit shape for `for` and `repeat`.
-    /// Precondition: counter init already emitted in the current block.
-    /// Refuse a `for i in lo .. hi` whose upper bound is held as
-    /// `harc_rt::HarcWide<N>`.
+    /// Refuse a synthesized counter bound held as `harc_rt::HarcWide<N>`.
     ///
-    /// Unlike the six operators `reject_unbuildable_wide_operator`
-    /// names, this one does not fail to build: the loop counter is a
-    /// `uint64_t` and `HarcWide` converts to one implicitly, so tbir
-    /// emitted a loop over the bound's low 64 bits with no diagnostic.
-    /// v1 emits `i <= hi` against the `HarcWide` directly and g++
-    /// refuses it, which is what sets the grade — v1 does not run this
-    /// program either, so `--codegen v1` must not be offered.
-    fn reject_wide_loop_bound(&self, hi: &Expr) -> Result<(), LowerError> {
+    /// `what` names the construct — `for` and `repeat` build the same
+    /// `lower_counted_loop` header from different source shapes, and a
+    /// guard on one of them is a guard on half the landings. The first
+    /// version of this was called from `lower_for` only, and `repeat w`
+    /// went on lowering; the sentence naming the missed keyword was the
+    /// doc line for `lower_counted_loop`, which this helper had been
+    /// inserted in front of.
+    ///
+    /// Unlike the operators `reject_unbuildable_wide_operator` names,
+    /// this one does not fail to build: the counter is a `uint64_t` and
+    /// `HarcWide` converts to one implicitly, so tbir emitted a loop
+    /// over the bound's low 64 bits with no diagnostic. v1 compares the
+    /// counter against the `HarcWide` directly and g++ refuses it,
+    /// which is what sets the grade — v1 does not run this program
+    /// either, so `--codegen v1` must not be offered.
+    fn reject_wide_loop_bound(&self, what: &str, hi: &Expr) -> Result<(), LowerError> {
         if !self.is_wide_scalar(hi) {
             return Ok(());
         }
         Err(not_implemented(
-            "a `for` range whose upper bound is a scalar wider than 128 bits",
+            &format!("{what} bounded by a scalar wider than 128 bits"),
             "the loop counter is a 64-bit value; a wider bound would be truncated to its \
-             low 64 bits without a word. Narrow the bound explicitly (`hi.trunc<64>()`) if \
+             low 64 bits without a word. Narrow the bound explicitly (`n.trunc<64>()`) if \
              that is what you mean. v1 compares the counter against the wide value \
              directly and its C++ does not compile, so `--codegen v1` is not a way out"
                 .to_string(),
@@ -379,6 +387,8 @@ impl FuncBuilder<'_> {
         ))
     }
 
+    /// Shared header/body/latch/exit shape for `for` and `repeat`.
+    /// Precondition: counter init already emitted in the current block.
     fn lower_counted_loop(
         &mut self,
         header_cond: Expr,
@@ -648,6 +658,13 @@ impl FuncBuilder<'_> {
         // so the default timeout header reports the same value the
         // countdown used.
         let cycles_ir = self.lower_expr_no_ports(&to.cycles)?;
+        // `_wu_budget` is an `int64_t`; a wide budget reaches it
+        // through `HarcWide`'s two implicit conversions, which tbir
+        // resolved silently (keeping the low 64 bits) and g++ called
+        // ambiguous under v1. The third synthesized-conversion
+        // position, after the `for`/`repeat` counter and the cycle
+        // count — an enumeration that said "two" for one round.
+        self.reject_wide_loop_bound("a `wait until ... timeout`", &cycles_ir)?;
         let budget = self.fresh_temp();
         self.push(Stmt::Assign(budget, cycles_ir));
 
