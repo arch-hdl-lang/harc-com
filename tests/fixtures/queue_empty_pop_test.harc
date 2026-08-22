@@ -1,0 +1,55 @@
+// Queue empty-pop guard — end-to-end exercise of the runtime abort.
+//
+// `harc_rt::HarcQueue<T>::pop()` used to call `std::deque::front()`
+// with no emptiness check (#644), so popping an empty scoreboard queue
+// was undefined behaviour: the testbench read garbage, or crashed
+// somewhere unrelated to the mistake that caused it. The scoreboard /
+// component-queue seam is the exposed one — the direct-actor thread pop
+// waits on `!queue.empty()` first, but `sb.expected.pop()` calls the
+// helper straight through.
+//
+// Pass criterion: the run aborts with
+//   "HARC-ERROR: pop() on an empty queue"
+// and never reports "ALL TESTS PASSED". Like
+// `regblock_record_recursion_test`, this fixture is therefore NOT
+// runnable via the standard run_fixtures.sh sentinel check — see
+// tests/run_negative_fixtures.sh.
+//
+// `tests/queue_pop_guard_cpp.rs` pins the same guard at the C++ level,
+// so a regression fails in `cargo test` too, not only in the Verilator
+// fixture job.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard EmptyPopSb
+    expected : queue<uint<32>>
+end scoreboard EmptyPopSb
+
+testbench QueueEmptyPopTb
+    dut : Top
+    sb  : EmptyPopSb
+end testbench QueueEmptyPopTb
+
+impl QueueEmptyPopTest for QueueEmptyPopTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "queue empty-pop: draining the queue, then popping once more")
+
+        // A normal round-trip first, so a guard that fired on a
+        // NON-empty queue would fail here rather than looking like the
+        // abort under test.
+        sb.expected.push(7)
+        let first = sb.expected.pop()
+        assert first == 7
+            else fail("push/pop round-trip returned ${first}, expected 7")
+        assert sb.expected.empty()
+            else fail("queue not drained: ${sb.expected.size()} value(s) left")
+
+        // Nothing left to return: the runtime must abort here.
+        let boom = sb.expected.pop()
+        fail("pop() on an empty queue returned ${boom} instead of aborting")
+    end run
+end impl QueueEmptyPopTest

@@ -30,6 +30,7 @@ fi
 # unrelated log noise can't accidentally satisfy it.
 read -r -d '' FIXTURES <<'EOF' || true
 regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | RAL record_write callback recursion exceeded HARC_RAL_CB_MAX_DEPTH
+queue_empty_pop_test | Top | top_counter.sv | HARC-ERROR: pop() on an empty queue
 EOF
 
 PASS=0
