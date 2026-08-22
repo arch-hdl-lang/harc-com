@@ -450,6 +450,7 @@ pub(crate) fn lower_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
@@ -591,11 +592,11 @@ fn lower_bound_target_transactor(
     side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
-    let component_hosted = t
-        .items
-        .iter()
-        .chain(t.when_active.iter().flatten())
-        .any(|item| matches!(item, ComponentItem::OnHandler(handler) if !handler.periodic));
+    // The SAME question `transactor_is_component` answers for this
+    // transactor, asked through the same function rather than re-derived
+    // here. When it says yes, the component view owns every field this
+    // pass is about to skip.
+    let component_hosted = super::components::bound_transactor_is_component(t);
     // Resolve the bound bus.
     let bus_name = match t.bound_to.as_ref() {
         Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
@@ -894,6 +895,7 @@ fn lower_bound_target_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
@@ -1476,6 +1478,7 @@ fn lower_bound_initiator_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),

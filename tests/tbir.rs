@@ -10091,23 +10091,30 @@ end impl T
     lower_src(&control_src).expect("the control lowers");
     let control_v1 = cpp_tb::emit(&merged_src(&control_src)).expect("v1 emits the control");
 
-    // ── the directional guard: the EVENT half is itself mixed ────────
-    // `Unsupported` holds only where v1 declares the payload AND there
-    // is no default. Probing `out event<uint<8>>` alone said the whole
-    // event half was a real escape hatch; it is not.
+    // ── the EVENT half is no longer this arm's business ─────────────
+    // A `bound to` transactor that declares an event field now gets a
+    // COMPONENT view as well, so its event fields lower through the
+    // same `lower_field` / `lower_event_payload` path an unbound
+    // transactor's have always used, and the target view skips them.
+    // The allow-list this arm used to carry — five review rounds of it
+    // — was a second, weaker copy of rules that already lived there.
+    //
+    // The certified payloads LOWER now, at both sites.
     for ok in [
         "    ev : out event<uint<8>>",
-        "    ev : out event<uint<128>>",
         "    ev : out event<bool>",
+        "    ev : out event<sint<8>>",
         // A bare `event` is certified too. `lower_event_payload`
         // already said so — "a bare `event` with no payload defaults to
         // an unsigned scalar" — and v1 emits the SAME member it gives
-        // `event<uint<8>>`. Refusing it gave two spellings of one C++
-        // member opposite verdicts.
+        // `event<uint<8>>`.
         "    ev : out event",
+        // A record payload, which v1 does handle.
+        "    ev : out event<Beat>",
+        // The consumer half.
+        "    ev : in event<uint<8>>",
     ] {
-        let msg = assert_unsupported(&lower_src(&prog(ok)).unwrap_err());
-        assert!(msg.contains("directional event field"), "`{ok}`: {msg}");
+        lower_src(&prog(ok)).unwrap_or_else(|e| panic!("`{ok}` must lower now: {e:?}"));
         cpp_tb::emit(&merged_src(&prog(ok))).expect("v1 emits");
     }
     assert!(
@@ -10116,63 +10123,58 @@ end impl T
             .contains("std::vector<std::function<void(uint64_t)>> ev;"),
         "v1 gives an event field a real subscriber vector"
     );
-    // Everything else is UNCERTIFIED, and the label is the worst thing
-    // under that arm. Two v1 behaviours share it: the enum payload does
-    // not compile (5 g++ errors — v1 emits no C++ enum, so the name in
-    // the subscriber signature is undeclared), and the rest are
-    // silently FLATTENED to `void(uint64_t)` and compile.
-    // A field that is BOTH defaulted and uncertified is under two
-    // arms; the payload one is graded higher, so it must answer first.
-    // Checking the default first handed this the weaker
-    // `EmitsUncompilable` while v1 compiled it and flattened the
-    // payload to `void(uint64_t)`.
-    // The both-arms field must be declared FIRST. With `ev2` first,
-    // lowering errors on `ev2` — itself uncertified with no default —
-    // and the assertion below is met by the wrong field under EITHER
-    // guard order; measured, swapping the guards back passed all 553
-    // tests. Declared first, `ev` gives `EmitsUncompilable` under the
-    // old order and `SilentlyMisLowers` under the shipped one.
-    let both = "    ev : out event<string> default ev2\n    ev2 : out event<string>";
-    let err = lower_src(&prog(both)).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-    assert!(msg.contains("uncertified payload"), "{msg}");
     assert!(
-        cpp_tb::emit(&merged_src(&prog(both))).is_ok(),
-        "v1 emits it — which is why the weaker grade was wrong"
+        emit_cpp_src(&prog("    ev : out event<uint<8>>"))
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "…and so does tbir, through the component view"
     );
 
-    for bad in [
-        "    ev : out event<Color>",
-        "    ev : out event<string>",
-        "    ev : out event<queue<uint<8>>>",
-        "    ev : out event<uint<8>, uint<16>>",
-        // A record payload v1 actually handles — refused because this
-        // arm also covers a regblock mirror, which v1 flattens, and
-        // `record_ids` cannot tell the two apart here.
-        "    ev : out event<Beat>",
-    ] {
-        let err = lower_src(&prog(bad)).unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(msg.contains("uncertified payload"), "`{bad}`: {msg}");
-    }
+    // What the shared path refuses, it refuses on the grade v1 earns.
+    //
+    // An ENUM payload is the one v1 cannot build: `payload_type_for_arg`
+    // emits the bare name for a record or an enum, v1 declares the
+    // records it emits and no C++ enum at all, so `Color` is undeclared
+    // in the subscriber signature. Every OTHER non-record payload goes
+    // through `record_field_c_type`, gets a real C++ type, and builds —
+    // so it keeps the honest `Unsupported`. One label used to cover
+    // both and promised a v1 that cannot build the enum half; splitting
+    // it on "is it a NAMED type" instead got `string` wrong the other
+    // way, since `string` parses as a named type and v1 builds it.
+    let err = lower_src(&prog("    ev : out event<Color>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("enum event payload"), "{msg}");
     assert!(
         !cpp_tb::emit(&merged_src(&prog("    ev : out event<Color>")))
             .expect("v1 emits")
             .contains("enum Color"),
         "v1 never declares the enum it names"
     );
+    for still_refused in [
+        "    ev : out event<string>",
+        "    ev : out event<queue<uint<8>>>",
+        "    ev : inout event<uint<8>>",
+    ] {
+        let msg = assert_unsupported(&lower_src(&prog(still_refused)).unwrap_err());
+        assert!(!msg.is_empty(), "`{still_refused}` keeps a reason");
+        cpp_tb::emit(&merged_src(&prog(still_refused))).expect("v1 emits and builds these");
+    }
     assert!(
         cpp_tb::emit(&merged_src(&prog("    ev : out event<string>")))
             .expect("v1 emits")
             .contains("std::vector<std::function<void(uint64_t)>> ev;"),
-        "…and flattens an uncertified payload to a 64-bit integer"
+        "…flattening the payload to a 64-bit integer, which is why the \
+         suggestion stays honest there"
     );
-    // …and a `default` on an event field: pasted into the vector's
-    // initialiser, which does not convert.
+
+    // A `default` on an event field: pasted into the subscriber
+    // vector's initialiser, which does not convert. Same rule and same
+    // grade as the sibling `queue<T> default` and `Record default`
+    // arms — and it lives on the shared component path now, where it
+    // was missing entirely: an unbound transactor accepted it and
+    // dropped it silently.
     let err = lower_src(&prog("    ev : out event<uint<8>> default 0")).unwrap_err();
     let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("event field"), "{msg}");
-    assert!(msg.contains("with a default"), "{msg}");
+    assert!(msg.contains("default on event field"), "{msg}");
 
     // A directional NON-EVENT field: v1 emits the member for the
     // field's own type and DROPS the direction, and the file compiles.

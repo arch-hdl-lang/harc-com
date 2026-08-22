@@ -42,6 +42,40 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
         .any(|it| matches!(it, ComponentItem::Hookable(_)))
 }
 
+/// Does a `bound to` transactor ALSO get a component view?
+///
+/// It does when it carries a non-periodic `on` handler — an
+/// event-driven driver (`in event` + a subscribing `on ev(arg)`) or a
+/// PASSIVE bus monitor (`on bus.<ch>.handshake(arg)`) — OR when it
+/// declares an EVENT field at all. A `bound to` transactor with
+/// neither (a hookable-method initiator BFM, or a `thread bus.<m>`
+/// target responder holding only scalar/queue/record state) stays on
+/// the dedicated transactor path alone.
+///
+/// The event clause is the point. Without it, a bound target that
+/// happened to carry an `on` handler had its event fields lowered by
+/// the component path, and the identical transactor without one had
+/// them refused by a hand-built allow-list in the target path — five
+/// review rounds of allow-list for a path that already worked.
+///
+/// The bound-to TARGET pass asks the same question, to decide which
+/// fields its own view must lower and which the component view already
+/// owns. It used to ask it by re-deriving the `any(OnHandler if
+/// !periodic)` scan inline — one rule spelled twice, in two files, with
+/// nothing keeping them in step. Widening one without the other would
+/// leave the target pass refusing fields the component pass had taken
+/// over, or lowering fields twice.
+pub(crate) fn bound_transactor_is_component(t: &TransactorDecl) -> bool {
+    t.items
+        .iter()
+        .chain(t.when_active.iter().flatten())
+        .any(|it| match it {
+            ComponentItem::OnHandler(h) => !h.periodic,
+            ComponentItem::Field(f) => is_event_field(f),
+            _ => false,
+        })
+}
+
 /// True when a `transactor` declaration routes to the composite-component
 /// table rather than the DUT-poking `TransactorSchema`. Two shapes:
 ///   * pure analysis source — at least one `event<T>` field and NO
@@ -62,8 +96,11 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 ///     handler. This is the reusable passive monitor shape: methods read
 ///     DUT pins or update monitor state and exist on both active and passive
 ///     instances.
-/// A `bound to` target responder (`thread bus.<m>(...)` bodies, no event
-/// field) is excluded — it stays on the separate TLM responder path.
+///
+/// A `bound to` transactor answers through `bound_transactor_is_component`
+/// above; a pure target responder (`thread bus.<m>(...)` bodies, no event
+/// field, no `on` handler) stays on the separate TLM responder path alone.
+///
 /// `env_held` is true when this transactor type is referenced as a
 /// by-value sub-component field of some `env`/`agent` declaration in the
 /// file. It only matters for the purely-structural DUT-poking BFM (the
@@ -106,16 +143,8 @@ pub(crate) fn transactor_is_component(
             _ => {}
         }
     }
-    // A `bound to` transactor routes here when it carries a non-periodic
-    // `on` handler — either an event-driven driver (`in event` + a
-    // subscribing `on ev(arg)`) or a PASSIVE bus monitor (`on
-    // bus.<ch>.handshake(arg)` with no event/driver half). A `bound to`
-    // transactor with NO `on` handler (a hookable-method initiator BFM or
-    // a `thread bus.<m>` target responder — both structurally distinct
-    // item kinds, `Hookable` / `TargetTlmThread`, never `OnHandler`) stays
-    // on the dedicated transactor path.
     if t.bound_to.is_some() {
-        return has_on_handler;
+        return bound_transactor_is_component(t);
     }
     // Pure analysis source: events, no DUT.
     if has_event && !has_module_field {
@@ -457,6 +486,11 @@ pub(crate) fn lower_component_schema(
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
     declared_types: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file. v1's payload type mapping keys on
+    // enum-ness specifically (it emits the bare name and declares no
+    // C++ enum), so the honest grade for an enum payload differs from
+    // every other non-record one.
+    enum_names: &std::collections::HashSet<String>,
     // `record_ids` restricted to transactions and structs — v1's
     // `Emitter::is_record_type`. `record_ids` itself also holds every
     // regblock's mirror record by the time components lower, and the
@@ -678,6 +712,7 @@ pub(crate) fn lower_component_schema(
                         is_transactor,
                         consts,
                         declared_types,
+                        enum_names,
                         declared_records,
                     )?;
                     if fields.iter().any(|x| x.name == f.name.name) {
@@ -1325,6 +1360,11 @@ fn lower_field(
     // very different things to the two, and the site had been treating
     // them alike.
     declared_types: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file. v1's payload type mapping keys on
+    // enum-ness specifically (it emits the bare name and declares no
+    // C++ enum), so the honest grade for an enum payload differs from
+    // every other non-record one.
+    enum_names: &std::collections::HashSet<String>,
     declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
@@ -1374,7 +1414,23 @@ fn lower_field(
                      transactor (consumer BFM); use a directionless self-event elsewhere",
                 ));
             }
-            let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
+            if f.default.is_some() {
+                // v1 emits the default into the member initializer, and
+                // the member is a subscriber LIST:
+                // `std::vector<std::function<void(uint64_t)>> ev = 0;`
+                // — g++: "could not convert `0` from `int` to
+                // `std::vector<...>`". tbir would drop the default
+                // silently instead, which is not better. Same rule, and
+                // the same grade, as the sibling `queue<T> default` and
+                // `Record default` arms.
+                return Err(not_implemented(
+                    &format!("a default on event field `{comp}.{fname}`"),
+                    "an event is a subscriber list with no initial value; drop the \
+                     `default`",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            let payload = lower_event_payload(comp, fname, args.first(), record_ids, enum_names)?;
             Ok(ComponentFieldKind::Event { payload })
         }
         // `expected : queue<T>` FIFO.
@@ -2805,8 +2861,37 @@ pub(crate) fn lower_event_payload(
     fname: &str,
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<EventPayload, LowerError> {
+    // Two outcomes, not one, and the discriminator is v1's own.
+    // `payload_type_for_arg` (`cpp_tb.rs`) emits the bare TYPE NAME for
+    // a record or an ENUM and routes everything else through
+    // `record_field_c_type`. v1 declares the records it emits; it emits
+    // no C++ enum at all, so an enum payload becomes
+    // `std::function<void(Color)>` with `Color` undeclared — g++
+    // refuses, and `--codegen v1` is a dead end. Every other non-record
+    // payload gets a real C++ type and builds.
+    //
+    // One `unsupported` used to cover both and promised a v1 that
+    // cannot build the enum half. Splitting on "is it a NAMED type"
+    // instead of "is it an enum" got `event<string>` wrong in the
+    // other direction — `string` parses as a named type and v1 builds
+    // it fine.
+    let reject_enum = |named: &str| -> LowerError {
+        not_implemented(
+            &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
+            format!(
+                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
+                 are lowered; v1 emits `{named}` as the subscriber's parameter type \
+                 and declares no C++ enum, so its output does not compile either"
+            ),
+            V1Status::EmitsUncompilable,
+        )
+    };
     let reject_named = |named: &str| -> LowerError {
+        if enum_names.contains(named) {
+            return reject_enum(named);
+        }
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \

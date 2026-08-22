@@ -8659,6 +8659,70 @@ former `transaction` group lives in
      and truncating the promoted-`let` default. The 206-fixture corpus
      lowers identically to the merge base.
 
+135. **The allow-list was a second copy of a path that already worked
+     (2026-08-22).**
+
+     Fourteen event rows on a `bound to` target transactor were refused
+     while v1 handled them — the largest cluster in the measured gap
+     list. Five review rounds had gone into the allow-list doing the
+     refusing (divergences 131-133). It should never have existed.
+
+     The SAME `ev : out event<uint<8>>` on an unbound transactor lowers
+     and emits, through `lower_field` → `lower_event_payload`. A
+     `bound to` transactor reaches that path too — but only when
+     `transactor_is_component` says so, and its bound-to branch was
+     `return has_on_handler`. An event field was not evidence. So a
+     bound target with an `on` handler had its events lowered by the
+     component view, and the identical transactor without one had them
+     refused by a hand-built allow-list in the target view.
+
+     The rule is `has_on_handler || has_event` now. What made that a
+     one-line change safely is that the SAME question was being asked
+     in two places: `transactor_is_component`'s bound-to branch, and a
+     `component_hosted` re-derivation of it inline in
+     `lower_bound_target_transactor` that decides which fields the
+     target view skips. Widening one without the other would have left
+     the target pass refusing fields the component pass had taken over,
+     or lowering them twice. They are one function now, extracted first
+     and verified to change nothing, then widened.
+
+     Eight of the fourteen rows lower as a result. The other six keep
+     measured refusals — and two of them were WRONG on the shared path,
+     which is to say wrong for the unbound site as well, all along:
+
+     - **`event<Color>` promised a v1 that cannot build it.** v1's
+       `payload_type_for_arg` emits the bare TYPE NAME for a record or
+       an ENUM and routes everything else through
+       `record_field_c_type`. It declares the records it emits and no
+       C++ enum at all, so an enum payload becomes
+       `std::function<void(Color)>` with `Color` undeclared. One
+       `Unsupported` covered every non-record payload and promised
+       `--codegen v1` for the half it cannot build. Splitting on "is it
+       a NAMED type" — the obvious guess — gets `event<string>` wrong
+       in the other direction, because `string` parses as a named type
+       and v1 builds it. The discriminator is enum-ness, which is what
+       v1 keys on; `enum_names` is threaded to the payload rule so it
+       can ask the same question rather than approximate it.
+     - **A `default` on an event field was accepted and dropped.** v1
+       emits it into the member initializer, and the member is a
+       subscriber LIST: `std::vector<std::function<void(uint64_t)>> ev
+       = 0;` — g++ refuses. The target view's allow-list HAD this
+       check; the shared component path, which every unbound
+       transactor goes through, did not. The sibling `queue<T>
+       default` and `Record default` arms state the same rule with the
+       same grade, two arms away.
+
+     The allow-list is deleted. What replaced it is not a
+     reimplementation: it is the pre-existing path, plus the two rules
+     it was missing.
+
+     One process note. A probe said the `default` fix had not reached
+     the unbound site, and the reading was false — `cargo test` builds
+     test binaries and leaves `target/debug/harc` stale, so the probe
+     was running the previous build. The 206-fixture corpus sweep had
+     the same problem and was re-run against a fresh binary before
+     being believed. Both come out identical to the merge base.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

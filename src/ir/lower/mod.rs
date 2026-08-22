@@ -1912,6 +1912,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
@@ -1982,6 +1983,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
@@ -2141,6 +2143,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &mut next_fn,
             &const_vals,
             &declared_types,
+            &enum_names,
             &declared_record_names,
         )?;
         prog.components.push(schema);
@@ -2195,6 +2198,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
@@ -2333,6 +2337,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &addrmap_decls,
             &buses,
             &unresolved_use_names,
+            &enum_names,
             &consts,
             &const_signed,
             &properties,
@@ -3130,6 +3135,9 @@ fn lower_test(
     addrmap_decls: &HashMap<String, &AddrmapDecl>,
     buses: &HashMap<String, &BusDecl>,
     unresolved_use_names: &HashSet<String>,
+    // Every `enum` NAME in the file — the discriminator v1's payload
+    // type mapping keys on (see `lower_event_payload`).
+    enum_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
@@ -5325,6 +5333,7 @@ fn lower_test(
         } else {
             Some("_tb".to_string())
         },
+        enum_names: enum_names.clone(),
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
@@ -6374,6 +6383,9 @@ pub(crate) struct LowerCtx {
     /// operand is held as `harc_rt::HarcWide<N>`; a name-only set
     /// could not answer that, and the operand shapes are exactly the
     /// ones a wide declared field made reachable.
+    /// Every `enum` NAME in the file, for the payload rule that keys on
+    /// enum-ness (see `lower_event_payload`).
+    pub enum_names: HashSet<String>,
     pub tb_scalar_fields: HashMap<String, IrType>,
     /// Testbench-owned typed queue fields (`TestbenchSchema::queue_fields`),
     /// for `_tb.<field>.push/pop/size/empty` lowering.

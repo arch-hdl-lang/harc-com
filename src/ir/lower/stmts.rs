@@ -810,6 +810,7 @@ impl FuncBuilder<'_> {
             &l.name.name,
             args.first(),
             &self.ctx.record_ids,
+            &self.ctx.enum_names,
         )?;
         Ok(Some(payload))
     }
