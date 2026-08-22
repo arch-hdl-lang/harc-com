@@ -8222,6 +8222,555 @@ former `transaction` group lives in
      identically. Every case in the test now runs its own no-`apply`
      control first.
 
+130. **Probing an arm is not measuring it (2026-08-20).**
+
+     Five refusals in the transactor state-field lowering were probed
+     one landing each and labelled from that one probe. Two came out
+     wrong, and both were wrong in the direction that matters: an
+     `Unsupported` pointing users at a backend that silently changes
+     what their program means.
+
+     The guards admit more than the probes covered:
+
+     | guard | probed | also admits |
+     |---|---|---|
+     | `f.direction.is_some()` | `out event<T>` — v1 emits a real subscriber vector | a directional SCALAR — v1 emits `uint64_t p;`, the direction DROPPED, and it compiles |
+     | `tb_scalar_field_ir_type(..) == None` | `Vec<uint<8>, 4>` — v1 emits a usable `std::array` | `stream`/`buffer` — v1 emits a bare `uint64_t`, which compiles and is not a stream; and enums, which do not compile at all |
+
+     The non-event and non-scalar arms take `SilentlyMisLowers`, because
+     an arm's verdict is the worst thing v1 does anywhere under it. The
+     directional arm was SPLIT rather than relabelled — see below, where
+     the event half turned out to be mixed too.
+
+     **The directional split already existed in this file.**
+     `lower_unbound_item` separates the event half from the scalar half
+     of the identical `f.direction.is_some()` test, with the scalar half
+     already labelled `SilentlyMisLowers` and the reason written out. It
+     was copied this time instead of re-derived. That is the third
+     occasion in this sweep where the rule was already stated somewhere
+     in the repo and got reconstructed from one example instead.
+
+     Two more things the one-probe method hid:
+
+     - **The two `default` arms are mixed.** `default 0` gives
+       `HarcQueue<uint64_t> q = 0;` and g++ refuses it, but
+       `format_simple_expr` pastes a bare `Ident` verbatim, so
+       `default q0` naming another queue field compiles. The label is
+       `EmitsUncompilable` — the worst under the arm — where the tree
+       this lands on had `Unsupported`.
+     - **`lower_state_field` has four callers**, and every message said
+       "bound-to transactor" — including on the unbound DUT-poking form,
+       which is bound to nothing, and on the two initiator-side paths,
+       whose sibling arms in the same functions say "initiator-side
+       bound-to transactor". A `StateFieldOwner` label now travels with
+       the call.
+
+     And the generic-applied justification was false twice over. A
+     record declaration CAN take generic parameters — `parse_transaction`
+     calls `parse_optional_generic_params`; only `struct` cannot — and
+     "the file compiles" does not hold for the regblock-mirror landing,
+     where v1 emits `VDmaRegs* b = nullptr;` and g++ refuses. The label
+     survives (`SilentlyMisLowers` outranks `EmitsUncompilable`), but a
+     wrong measurement recorded as a reason not to re-measure is worse
+     than no comment at all.
+
+     Method, stated so the next batch inherits it: **work out what the
+     GUARD admits before labelling the arm.** One probe measures one
+     landing. A control — the same program with the field removed —
+     goes with every row; the control caught an invalid `enum` in the
+     probe skeleton that had every row, including itself, reporting "v1
+     rejects".
+
+131. **The event half was mixed too, and the fix was unreachable
+     (2026-08-20).**
+
+     Divergence 130 split the directional guard and kept `Unsupported`
+     for the event half, with a comment saying it had been measured. It
+     had been measured on ONE landing — `out event<uint<8>>` — which is
+     the method 130 exists to condemn, applied inside 130 itself.
+
+     The event guard says nothing about the payload type or about
+     `default`, and both vary:
+
+     | landing | v1 |
+     |---|---|
+     | `event<uint<8>>`, `event<uint<128>>`, `event<Beat>` | subscriber vector, 0 g++ errors |
+     | `event<Color>` | v1 emits no C++ enum at all, so the payload name in the signature is undeclared — 5 errors |
+     | `event<T> default 0` | pasted into the vector's initialiser — 1 error |
+
+     `Unsupported` now holds only where v1 declares the payload AND
+     there is no default. `record_ids` is the "does v1 declare this
+     type" test, which is the same map the `queue<Record>` lowering
+     already uses.
+
+     Reading the payload took a second correction: `event<Color>`
+     arrives as `TypeArg::Expr(Ident)`, not `TypeArg::Type`, so the
+     first check silently passed the enum through and the probe still
+     reported `Unsupported`. A guard that cannot see its input is
+     indistinguishable from one that approves of it.
+
+     **And the split was dead code on three of its four call sites.**
+     Both initiator-side paths tested `f.direction.is_some()` and
+     refused two lines above the call, so a directional scalar kept a
+     blanket `Unsupported` there while v1 dropped the direction and
+     compiled — the exact defect 130 opens by describing, still live in
+     the same function. Adding a rule is not the same as reaching the
+     code that needs it. (Two of the three pre-checks were deleted at
+     this point; the third survived another round — see 132.)
+
+     Smaller, same round: the non-event arm called itself "scalar" while
+     catching `in Vec<…>` and `in Beat`; the `uint<N>` wider than 64
+     bits landing was missing from the non-scalar enumeration, and it is
+     one where v1 is CORRECT, so the reason now says so; the generic
+     arm's reason said "a struct type" for an arm spanning transactions
+     and regblock mirrors; and `lower_state_field`'s doc comment had
+     been orphaned onto the new `StateFieldOwner` enum, taking three
+     false claims with it (a transaction-typed field is not out of
+     subset, there is no `guard`/`reset` clause to reject, and
+     `record_ids` is never empty).
+
+132. **A blacklist that grew three times, and the pre-check that was
+     never counted (2026-08-20).**
+
+     Divergence 131 said "the pre-checks are gone, and
+     `lower_state_field` owns the directional case for all three
+     owners". It deleted TWO. The third, in `lower_unbound_item`,
+     survived — so the unbound form kept the pre-split blanket
+     `Unsupported` for exactly the two landings 131 had just measured as
+     uncompilable (`event<Color>`, `event<T> default 0`). The sentence
+     was false when it was written, and its own analysis ("dead on three
+     of four call sites") said so.
+
+     **The event guard is an allow-list now, after the blacklist grew in
+     three consecutive rounds.** Each round added the landings the
+     previous one had missed, and each time the next round found more:
+     enum payloads, then `string` / bus names / transactor names, then
+     `queue` / `stream` / dotted paths / multi-arg / `TypeArg::Named` /
+     regblock mirrors — all silently FLATTENED by v1 to
+     `void(uint64_t)`. Enumerating a blacklist means proving a negative
+     over a space the parser keeps extending.
+
+     What can be certified at that site is a single positional BUILTIN
+     scalar payload — or none at all — with no `default`. That keeps
+     `Unsupported`. An uncertified payload takes `SilentlyMisLowers`; a
+     `default` on an otherwise-certified payload takes
+     `EmitsUncompilable`, and the payload check has to answer FIRST,
+     since a field can be under both.
+
+     `event<Beat>` is over-refused by this: v1 declares the record and
+     emits `void(Beat)` correctly. It is refused because `record_ids`
+     **cannot tell a struct from a regblock MIRROR**, and the mirror is
+     one of the flattening rows — a fact stated in a comment 70 lines
+     below the guard that 131's doc comment nonetheless described as the
+     "does v1 declare this type" test. Certifying a record payload needs
+     a regblock set that does not reach this function. Over-cautious
+     under a mixed arm is the repo's own worst-wins rule; an
+     `Unsupported` promising v1 works where it silently does not is not.
+
+     Two tests were ENTRENCHING the old blanket verdicts
+     (`in event<uint<8>>` and `in event<Req>` asserted as `Unsupported`
+     on the unbound path). A test that pins a wrong verdict is worse
+     than no test: it makes the next sweep read the mistake as settled.
+
+     Four rounds on five arms. The method that finally held was not a
+     better enumeration — it was giving up on enumerating the bad cases
+     and certifying the good ones instead.
+
+133. **Round five: what an allow-list fixed, and what it did not
+     (2026-08-20).**
+
+     The event allow-list from 132 held. A 40-row sweep over builtin ×
+     width × direction × owner × position found v1 correct on every
+     certified row — the one part of this series that is finished. What
+     did not hold was everything AROUND it, in the same three ways as
+     every previous round.
+
+     - **A regression.** Deleting 132's third pre-check let a
+       directional MODULE handle through: `dut : in TlmReadInitiator`
+       stopped being refused and lowered, with tbir dropping the `in`
+       marker itself — byte-identical output to the undirected
+       spelling. The delete removed a check that ran BEFORE the
+       named-type branches; those branches then answered first. A
+       directional field is dispatched to the shared rule explicitly
+       now.
+     - **The arm in FRONT of the fix was graded from a subset.** A
+       field that is both defaulted and uncertified is under two arms,
+       and the `default` one is graded a notch lower;
+       `event<string> default ev2` therefore claimed "v1 emits C++ that
+       does not compile" while v1 compiled it and flattened the payload.
+       The payload check answers first now. This is structurally the
+       same finding 130 made about the queue and record default arms —
+       third occurrence.
+     - **A rule the repo already stated, reconstructed wrong again.** A
+       bare `event` with no payload was refused as "uncertified", while
+       `lower_event_payload` says in as many words that it "defaults to
+       an unsigned scalar" and v1 emits the SAME member it gives
+       `event<uint<8>>`. Two spellings of one C++ member, opposite
+       verdicts. Fourth occurrence of this specific failure.
+
+     **Named and NOT fixed**, with the measurement recorded at the site:
+     `record_ids` holds regblock MIRRORS, so `b : DmaRegs` is accepted
+     as a value-record — tbir emits `DmaRegs b{};` and compiles, v1
+     emits `VDmaRegs* b = nullptr;` and g++ refuses. `queue<DmaRegs>`
+     is the same hole with both backends building different element
+     types. Gating it needs a regblock-name set that does not reach the
+     function. The event allow-list sidesteps that map rather than
+     trusting it; these two arms still trust it.
+
+     **Out of scope, also unfixed:** a FOURTH owner. A transactor
+     carrying an `on` handler routes through `lower_field`
+     (`components_impl.rs:1321` — an earlier draft of this entry named
+     a `lower_component_field` that does not exist anywhere in the
+     tree), whose four directional arms still answer a blanket
+     `Unsupported` for landings where v1 drops the direction and
+     compiles — the defect this whole series was opened to remove,
+     three of them shipping an empty reason string.
+
+     The suite could not previously catch a reinstated pre-check on the
+     INITIATOR owner: there was no directional-field case there at all.
+     The sentence this entry first carried — that the suite could not
+     catch a reinstated pre-check at all — is false, and names the
+     wrong owner besides: the check this round restored was on the
+     UNBOUND owner, which already had two directional cases with their
+     `V1Status` pinned, and reinstating it fails them. There is a case
+     on each of the three owners now.
+
+     Two of the tests added for this round did not test what they
+     claimed, which a mutant showed and the assertions did not:
+
+     - the both-arms event probe declared the SECOND field first, so
+       lowering errored on the wrong field and the assertion was met
+       under either guard order — swapping the guards back passed all
+       553 tests;
+     - the unbound directional row used a SECOND module handle, which
+       the handle-count arm refuses before the directional dispatch is
+       reached, so it passed whether or not the dispatch existed.
+
+     Both now fail when their guard is removed. A test written in the
+     same edit as its guard is not automatically a test OF that guard.
+
+134. **A width cap written around a missing header overload
+     (2026-08-22).**
+
+     `w : uint<128>` as a declared field was refused at five call
+     sites, naming `--codegen v1` as the way out. The refusal was real
+     — v1 emits `_harc_u128 w` and builds — so this was one of the
+     thirteen measured gaps where v1 works and TB-IR does not.
+
+     Closing it needed three separate things, and only the first was
+     the one the gap list named.
+
+     - **The width rule.** `tb_scalar_field_ir_type` capped at 64 and
+       decides for FIVE sites: the testbench field declaration, the
+       testbench field DEFAULT (an `else if let Some(..)` with no
+       guard of its own — a type the gate rejects is silently dropped
+       there rather than diagnosed, so the two cannot move
+       separately), the promoted test-scope `let`, the component-hosted
+       target-state filter, and the transactor state field.
+       `components_impl.rs` capped at 64 through `scalar_ir_type`,
+       which ALSO decides event payloads and fixed-vector elements —
+       widening that one function would have widened both of those
+       unmeasured, so the declared-field subset is now its own
+       function. `scoreboards.rs` held a third copy of the same
+       decoder, differing from `decoded_scalar_ir_type` in exactly its
+       name and its width line — an earlier draft of this entry called
+       the two byte-identical, which they were not; it is deleted, not
+       edited.
+     - **The emitters.** Four of them — transactor state, scoreboard,
+       component, testbench — each carried its own
+       `(bool | int64_t | uint64_t)` triple, while the queue-element
+       emitter already went through `field_scalar_cty`, which knows
+       `_harc_u128` and `HarcWide<N>`. A wide type reaching any of the
+       four would have produced a 64-bit member that compiles, runs,
+       and drops the top half. No typecheck can see that, which is why
+       the member type is asserted directly.
+     - **A missing runtime overload, in BOTH backends.** The cap was
+       very nearly set at 128 instead of 1024, because above 128 a
+       field is declared `HarcWide<N>` and `w = w + 1` on one was
+       rejected: "ambiguous overload for `operator+` (operand types
+       are `harc_rt::HarcWide<32>` and `int`)" — `HarcWide` converts
+       to `uint64_t` and to `_harc_u128` equally well. That reproduces
+       on clean `main` for a plain wide LOCAL, with nothing to do with
+       fields: `let w : uint<1024> = 1; w = w + 1` lowered and emitted
+       C++ that nobody could build, in tbir and in v1 alike. The rule
+       was already stated twice in the tree — `operator==`/`operator!=`
+       carry the mixed HarcWide/integer form, and `harc_wide_negate`
+       writes `(~value) + HarcWide<N>(1)` by hand. A cap at 128 would
+       have written a language limit around a header omission.
+
+       That fix took two review rounds. The first version defined ALL
+       TWELVE operators; the second still defined six of them across
+       widths. Both times the defect was the same one, and both times
+       it was found by measurement rather than by reading:
+
+       * `/ % < > <= >=` are **not** the rule `operator==` states.
+         Equality is sign-agnostic; ordering and division are not, and
+         every `HarcWide` implementation of the six is UNSIGNED.
+         `expr.rs` emits a bare `<` for a `sint` compare (the only
+         signed-wide path, `harc_wide_slt`, is reached from covergroup
+         lowering alone), so defining them turned "this program cannot
+         be built" into `w < 0` quietly answering false on a negative
+         `sint<1024>` — a loud correct diagnostic traded for a silent
+         wrong answer, in `--codegen v1` as well, since the header is
+         shared. They are undefined now, refused at lowering by
+         `reject_unbuildable_wide_operator` with the
+         `EmitsUncompilable` grade v1 measurably earns, and
+         `tests/wide_mixed_ops_cpp.rs` pins their absence so nobody
+         closes the ambiguity error by adding them back.
+       * `HarcWide<N>(v)` for a NEGATIVE `v` zero-filled above bit 128
+         instead of sign-extending, so `w + (0 - 1)` answered 2^128
+         while `w - 1` — the same arithmetic — answered 0. The mixed
+         operators routed every negative operand through it.
+       * The ambiguity was only half retired: two wide values of
+         DIFFERENT widths deduce no `N` either. Reachable straight
+         from source once fields could be wide (`a : uint<160>`,
+         `b : uint<256>`, `b = b + a`), and `LowersUncompilable` in
+         both backends.
+
+       The second round's fix for that last one was to define the six
+       across widths too, widening the narrower side with
+       `harc_wide_zext`. That is the SAME defect a third time, and the
+       sharpest instance of it: **sign-agnosticism does not survive a
+       width change.** `+ - * & | ^` give one N-word answer for signed
+       and unsigned alike only while N is fixed; widening is exactly
+       where the sign matters, and the C++ type does not carry it. So
+       `b + a` for a negative `sint<160>` answered `b + (2^160 - 1)`
+       while `b + (-1)`, through the integer overload directly beside
+       it, answered correctly — two halves of one macro disagreeing
+       about one value, in v1 as well.
+
+       Both shapes are refused at lowering now, by
+       `reject_unbuildable_wide_operator`, with the grade v1
+       measurably earns. `==`/`!=` are the exception and are NOT
+       refused across widths: they carry their own `<A, B>` form, and
+       a first version of the refusal blanket-covered them, refusing a
+       program v1 builds under a label the measurement contradicts.
+
+       NAMED and not fixed: that `<A, B>` equality compares raw words,
+       so two SIGNED values of different widths compare unequal when
+       both are -1. Both backends agree on the wrong answer; it
+       predates the declared-field widening.
+
+       None of these could be caught by a typecheck — most compiled
+       and computed the wrong number — so the operators are gated by a
+       probe that is built AND RUN (`tests/wide_mixed_ops_cpp.rs`), in
+       the style of `wide_cast_cpp.rs`.
+
+     - **FOUR statement positions consume a value through a
+       SYNTHESIZED comparison or conversion**, so the binary-operator
+       guard never sees them, and all four were left behind when the
+       field gate widened. `for i in 0 .. w` builds its `i <= hi`
+       header in `control.rs`; tbir LOWERED it, silently iterating the
+       low 64 bits of a 1024-bit bound through `HarcWide`'s implicit
+       `uint64_t` conversion, while v1 could not build the same
+       program at all. `wait w cycles` narrows to a `uint32_t`,
+       `wait until ... timeout w cycles` to an `int64_t`, and both are
+       ambiguous in v1.
+
+       `repeat w` is the one worth naming twice. A first pass guarded
+       `for` and `wait` and called that "two statement positions" —
+       but `repeat` builds the SAME header through the SAME
+       `lower_counted_loop`, whose doc line says "shared header /
+       body / latch / exit shape for `for` **and `repeat`**". That
+       sentence was sitting directly above the new guard, because the
+       guard had been inserted in front of the function it documents.
+       The re-parented comment named the missed landing.
+
+     What did NOT change: a `default` literal above `u64::MAX` is
+     still refused, because every field schema carries its default in a
+     `u64`. That refusal is correct rather than conservative — v1
+     emits `_harc_u128 w = 36893488147419103232;`, which g++ accepts
+     with a warning and evaluates to **0**. The differential harness
+     scores that row as "v1 compiles"; only running it shows the
+     value, which is the harness's documented blind spot and exactly
+     what the `SilentlyMisLowers` label already said.
+
+     Two more findings from the same review, both instances of the
+     recurring shape:
+
+     * **One landing measured, the rule written from it — twice, on
+       the same rule.** A `default` literal above `u64::MAX` is
+       refused at the testbench-field site as
+       `NotImplemented{SilentlyMisLowers}`, which is honest. At the
+       PROMOTED-`let` site the same class of literal answered
+       `Invalid` — "no backend runs this" — against a v1 that compiles
+       it, and said "non-integer initializer" about an integer. The
+       fix for that gated on `all(is_ascii_digit)`, so the HEX
+       spelling of the very same value kept the wrong grade and the
+       wrong words, and the three replacement test rows were three
+       decimal spellings of one landing. `parse_int_literal_checked`
+       answers "overflows" and "not an integer" separately now — one
+       parse, two answers — and the rows cover decimal, hex and
+       binary. The related diagnostic that called a constant-but-wide
+       literal "a non-constant default" is fixed too.
+     * **`is_wide_scalar` resolved two of the four host-state reads
+       its own doc comment named.** Scoreboard fields (directly and
+       through an env), transactor state fields (inside a responder
+       body and from the test scope) and record leaves of a state
+       field all answered "not wide", so six programs lowered into C++
+       nobody could build. Its escape clause — a shape it cannot
+       resolve keeps the pre-existing behaviour — did not apply: none
+       of those shapes could carry a >128-bit value before this branch
+       widened the field gate.
+     * **`harc_wide_zext` inherited the constructor's sign
+       extension.** Fixing `HarcWide<N>(negative)` to sign-extend made
+       the one-argument `harc_wide_zext` — a function named
+       *zero*-extend — answer 2^1024-1 for a 64-bit -1 where it had
+       answered 2^128-1. Neither is right; it zero-extends explicitly
+       now and answers 2^64-1.
+     * **A space that could not fail.** None of the harness's three
+       falsifiable directions fires on a verdict that over-REFUSES:
+       re-capping a width gate turns every row into
+       `(Unsupported, v1 compiles)`, which is what `Unsupported`
+       means. The five width spaces were green under a reverted
+       widening. `check_space_all_lower` asserts the rows of a
+       capability that is meant to work actually lower, and the
+       wide-default test asserts its refusal directly rather than
+       through a report line — a truncating implementation reports
+       `(Lowers, v1 compiles)`, a perfectly consistent pairing whose
+       only defect is in the value.
+
+     The gap was found by asking v1 across a mechanically enumerated
+     width space rather than from one probe, and every step above is
+     mutation-tested.
+
+     **Measured and NAMED, not fixed** — each recorded at its site: the
+     `<A, B>` equality compares raw words, so two SIGNED values of
+     different widths compare unequal when both are -1; the homogeneous
+     `/ % < > <= >=` are unsigned, so `x < y` on two negative
+     `sint<1024>`s answers by magnitude; a `Vec<uint<1024>, N>` element
+     and a nested-`pop()` expression sit under `Unsupported` arms this
+     branch did not edit but did make reachable, and v1 cannot build
+     either; and an unknown-width DUT port past 64 bits reaches a
+     `uint64_t` temp in tbir where v1 refuses to build. Every one
+     predates the declared-field widening or belongs to an arm outside
+     it. Recording them beats widening the change until nothing is left
+     to record.
+
+     Eighteen mutations are checked: re-capping the shared rule (caught
+     by the differential harness as well as `tbir.rs`), re-capping
+     either per-file rule, restoring the hardcoded emitter triple,
+     deleting any one of the six runtime operators, reverting the
+     sign-extension, neutering the wide-operator refusal, dropping the
+     mixed-width refusal, neutering either host-state lookup, dropping
+     the `Bool`-result rule, firing the six-operator guard on a
+     same-width wide pair, removing the wide shift-count guard,
+     removing any of the `for` / `repeat` / `wait` / `timeout` guards,
+     and truncating the promoted-`let` default. The 206-fixture corpus
+     lowers identically to the merge base.
+
+135. **The allow-list was a second copy of a path that already worked
+     (2026-08-22).**
+
+     Fourteen event rows on a `bound to` target transactor were refused
+     while v1 handled them — the largest cluster in the measured gap
+     list. Five review rounds had gone into the allow-list doing the
+     refusing (divergences 131-133). It should never have existed.
+
+     The SAME `ev : out event<uint<8>>` on an unbound transactor lowers
+     and emits, through `lower_field` → `lower_event_payload`. A
+     `bound to` transactor reaches that path too — but only when
+     `transactor_is_component` says so, and its bound-to branch was
+     `return has_on_handler`. An event field was not evidence. So a
+     bound target with an `on` handler had its events lowered by the
+     component view, and the identical transactor without one had them
+     refused by a hand-built allow-list in the target view.
+
+     The rule is `has_on_handler || has_event` now. What made that a
+     one-line change safely is that the SAME question was being asked
+     in two places: `transactor_is_component`'s bound-to branch, and a
+     `component_hosted` re-derivation of it inline in
+     `lower_bound_target_transactor` that decides which fields the
+     target view skips. Widening one without the other would have left
+     the target pass refusing fields the component pass had taken over,
+     or lowering them twice. They are one function now, extracted first
+     and verified to change nothing, then widened.
+
+     Eight of the fourteen rows lower as a result. The other six keep
+     measured refusals — and two of them were WRONG on the shared path,
+     which is to say wrong for the unbound site as well, all along:
+
+     - **`event<Color>` promised a v1 that cannot build it.** v1's
+       `payload_type_for_arg` emits the bare TYPE NAME for a record or
+       an ENUM and routes everything else through
+       `record_field_c_type`. It declares the records it emits and no
+       C++ enum at all, so an enum payload becomes
+       `std::function<void(Color)>` with `Color` undeclared. One
+       `Unsupported` covered every non-record payload and promised
+       `--codegen v1` for the half it cannot build. Splitting on "is it
+       a NAMED type" — the obvious guess — gets `event<string>` wrong
+       in the other direction, because `string` parses as a named type
+       and v1 builds it. The discriminator is enum-ness, which is what
+       v1 keys on; `enum_names` is threaded to the payload rule so it
+       can ask the same question rather than approximate it.
+     - **A `default` on an event field was accepted and dropped.** v1
+       emits it into the member initializer, and the member is a
+       subscriber LIST: `std::vector<std::function<void(uint64_t)>> ev
+       = 0;` — g++ refuses. The target view's allow-list HAD this
+       check; the shared component path, which every unbound
+       transactor goes through, did not. The sibling `queue<T>
+       default` and `Record default` arms state the same rule with the
+       same grade, two arms away.
+
+     The allow-list is deleted. What replaced it is not a
+     reimplementation: it is the pre-existing path, plus the two rules
+     it was missing.
+
+     One process note. A probe said the `default` fix had not reached
+     the unbound site, and the reading was false — `cargo test` builds
+     test binaries and leaves `target/debug/harc` stale, so the probe
+     was running the previous build. The 206-fixture corpus sweep had
+     the same problem and was re-run against a fresh binary before
+     being believed. Both come out identical to the merge base.
+
+136. **One question, asked three times, answered wrong twice
+     (2026-08-22).**
+
+     `components_impl.rs` holds the largest remaining `Unsupported`
+     cluster — 52 of the 296 left in the tree. A differential space
+     enumerated from `lower_field`'s own grammar (event / queue / `Vec`
+     / other-builtin / named, each with its directional sub-arm) across
+     two hosts found twelve real gaps and two false promises.
+
+     Both false promises were the SAME rule the previous divergence had
+     just fixed at the event-payload seam: v1 emits the bare TYPE NAME
+     for a record or an ENUM, declares the records it emits, and emits
+     no C++ enum at all. `queue<Color>` and a bare `m : Color` field
+     each promised `--codegen v1` for a program v1 cannot build. Three
+     seams, one question, found one at a time. It is
+     `v1_leaves_the_type_name_undeclared` now, asked in one place —
+     which is what should have happened when the second one turned up.
+
+     Two shipped tests had PINNED the wrong grade, and one of them
+     spelled out the reasoning that made it wrong: "v1 handles it, so
+     v1 is a real escape hatch here", asserted from the presence of
+     `Mode weird` in v1's output. The member is exactly the problem. A
+     test that checks a construct appears in the emitted text has not
+     checked that the text compiles.
+
+     **The directional arms.** Four arms of `lower_field` carry a
+     `f.direction.is_some()` guard, and all four answered `Unsupported`
+     — three of them behind an EMPTY reason string. v1 compiles every
+     one, which is how the label survived. What it does is DISCARD the
+     marker: `a_direction_on_a_component_field_is_discarded_by_v1` pins
+     v1's output for the directional spelling as byte-identical to the
+     undirected one, with the sources padded to equal length so no
+     source-offset residue can explain it — the technique the `bound
+     to` field arm two hundred lines away already uses. A program that
+     builds and runs meaning something other than what was written is
+     `SilentlyMisLowers`, two grades from what these arms claimed.
+
+     Ten real gaps remain in this space, and they are genuine
+     implementation work rather than mislabels: `Vec<Record, N>`,
+     `Vec<wide, N>`, nested `Vec`, `queue<string>`, `stream`, `buffer`,
+     and a zero-width scalar.
+
+     One reading worth recording: `h : Helper` with no mode LOWERS
+     under tbir and is REFUSED by v1, which wants an `active`/`passive`
+     annotation. tbir is the more permissive backend there. That
+     pairing is outside the harness's three falsifiable directions, so
+     it is reported here rather than asserted.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -42,6 +42,40 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
         .any(|it| matches!(it, ComponentItem::Hookable(_)))
 }
 
+/// Does a `bound to` transactor ALSO get a component view?
+///
+/// It does when it carries a non-periodic `on` handler — an
+/// event-driven driver (`in event` + a subscribing `on ev(arg)`) or a
+/// PASSIVE bus monitor (`on bus.<ch>.handshake(arg)`) — OR when it
+/// declares an EVENT field at all. A `bound to` transactor with
+/// neither (a hookable-method initiator BFM, or a `thread bus.<m>`
+/// target responder holding only scalar/queue/record state) stays on
+/// the dedicated transactor path alone.
+///
+/// The event clause is the point. Without it, a bound target that
+/// happened to carry an `on` handler had its event fields lowered by
+/// the component path, and the identical transactor without one had
+/// them refused by a hand-built allow-list in the target path — five
+/// review rounds of allow-list for a path that already worked.
+///
+/// The bound-to TARGET pass asks the same question, to decide which
+/// fields its own view must lower and which the component view already
+/// owns. It used to ask it by re-deriving the `any(OnHandler if
+/// !periodic)` scan inline — one rule spelled twice, in two files, with
+/// nothing keeping them in step. Widening one without the other would
+/// leave the target pass refusing fields the component pass had taken
+/// over, or lowering fields twice.
+pub(crate) fn bound_transactor_is_component(t: &TransactorDecl) -> bool {
+    t.items
+        .iter()
+        .chain(t.when_active.iter().flatten())
+        .any(|it| match it {
+            ComponentItem::OnHandler(h) => !h.periodic,
+            ComponentItem::Field(f) => is_event_field(f),
+            _ => false,
+        })
+}
+
 /// True when a `transactor` declaration routes to the composite-component
 /// table rather than the DUT-poking `TransactorSchema`. Two shapes:
 ///   * pure analysis source — at least one `event<T>` field and NO
@@ -62,8 +96,11 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 ///     handler. This is the reusable passive monitor shape: methods read
 ///     DUT pins or update monitor state and exist on both active and passive
 ///     instances.
-/// A `bound to` target responder (`thread bus.<m>(...)` bodies, no event
-/// field) is excluded — it stays on the separate TLM responder path.
+///
+/// A `bound to` transactor answers through `bound_transactor_is_component`
+/// above; a pure target responder (`thread bus.<m>(...)` bodies, no event
+/// field, no `on` handler) stays on the separate TLM responder path alone.
+///
 /// `env_held` is true when this transactor type is referenced as a
 /// by-value sub-component field of some `env`/`agent` declaration in the
 /// file. It only matters for the purely-structural DUT-poking BFM (the
@@ -106,16 +143,8 @@ pub(crate) fn transactor_is_component(
             _ => {}
         }
     }
-    // A `bound to` transactor routes here when it carries a non-periodic
-    // `on` handler — either an event-driven driver (`in event` + a
-    // subscribing `on ev(arg)`) or a PASSIVE bus monitor (`on
-    // bus.<ch>.handshake(arg)` with no event/driver half). A `bound to`
-    // transactor with NO `on` handler (a hookable-method initiator BFM or
-    // a `thread bus.<m>` target responder — both structurally distinct
-    // item kinds, `Hookable` / `TargetTlmThread`, never `OnHandler`) stays
-    // on the dedicated transactor path.
     if t.bound_to.is_some() {
-        return has_on_handler;
+        return bound_transactor_is_component(t);
     }
     // Pure analysis source: events, no DUT.
     if has_event && !has_module_field {
@@ -457,6 +486,11 @@ pub(crate) fn lower_component_schema(
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
     declared_types: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file. v1's payload type mapping keys on
+    // enum-ness specifically (it emits the bare name and declares no
+    // C++ enum), so the honest grade for an enum payload differs from
+    // every other non-record one.
+    enum_names: &std::collections::HashSet<String>,
     // `record_ids` restricted to transactions and structs — v1's
     // `Emitter::is_record_type`. `record_ids` itself also holds every
     // regblock's mirror record by the time components lower, and the
@@ -678,6 +712,7 @@ pub(crate) fn lower_component_schema(
                         is_transactor,
                         consts,
                         declared_types,
+                        enum_names,
                         declared_records,
                     )?;
                     if fields.iter().any(|x| x.name == f.name.name) {
@@ -1312,6 +1347,24 @@ fn validate_event_handler(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Why a DIRECTION on a component field is not an escape hatch.
+///
+/// Four arms of `lower_field` carry the same guard, and three of them
+/// shipped an empty reason string behind an `Unsupported` — "re-run
+/// with `--codegen v1`". v1 does compile all four shapes. What it does
+/// is DISCARD the marker: `a_direction_on_a_component_field_is_
+/// discarded_by_v1` pins v1's output for the directional spelling as
+/// byte-identical to the undirected one, with the two sources padded to
+/// equal length so no source-offset residue can explain it. A program
+/// that builds and runs meaning something other than what was written
+/// is what `SilentlyMisLowers` is for, and it is two grades away from
+/// what these arms were claiming.
+const DIRECTIONAL_FIELD_DETAIL: &str =
+    "a direction is a PORT marker; a component field is host state and has no direction. \
+     v1 discards the marker and emits the member for the field's own type — with the two \
+     spellings padded to equal length its output is byte-identical — so the program builds \
+     and runs meaning something other than what was written";
+
 fn lower_field(
     comp: &str,
     f: &ComponentField,
@@ -1325,6 +1378,11 @@ fn lower_field(
     // very different things to the two, and the site had been treating
     // them alike.
     declared_types: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file. v1's payload type mapping keys on
+    // enum-ness specifically (it emits the bare name and declares no
+    // C++ enum), so the honest grade for an enum payload differs from
+    // every other non-record one.
+    enum_names: &std::collections::HashSet<String>,
     declared_records: &std::collections::HashSet<String>,
 ) -> Result<ComponentFieldKind, LowerError> {
     let fname = &f.name.name;
@@ -1374,7 +1432,23 @@ fn lower_field(
                      transactor (consumer BFM); use a directionless self-event elsewhere",
                 ));
             }
-            let payload = lower_event_payload(comp, fname, args.first(), record_ids)?;
+            if f.default.is_some() {
+                // v1 emits the default into the member initializer, and
+                // the member is a subscriber LIST:
+                // `std::vector<std::function<void(uint64_t)>> ev = 0;`
+                // — g++: "could not convert `0` from `int` to
+                // `std::vector<...>`". tbir would drop the default
+                // silently instead, which is not better. Same rule, and
+                // the same grade, as the sibling `queue<T> default` and
+                // `Record default` arms.
+                return Err(not_implemented(
+                    &format!("a default on event field `{comp}.{fname}`"),
+                    "an event is a subscriber list with no initial value; drop the \
+                     `default`",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            let payload = lower_event_payload(comp, fname, args.first(), record_ids, enum_names)?;
             Ok(ComponentFieldKind::Event { payload })
         }
         // `expected : queue<T>` FIFO.
@@ -1384,9 +1458,10 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional queue field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             // The element is an exact scalar type or a value-record
@@ -1394,7 +1469,7 @@ fn lower_field(
             // `harc_rt::HarcQueue<Rec>` and is manipulated through the
             // component-queue ops; anything else (enum / Vec /
             // unknown named type) is rejected precisely.
-            let elem = lower_queue_elem(comp, fname, args.first(), record_ids)?;
+            let elem = lower_queue_elem(comp, fname, args.first(), record_ids, enum_names)?;
             Ok(ComponentFieldKind::Queue { elem })
         }
         TypeExpr::Builtin {
@@ -1403,9 +1478,10 @@ fn lower_field(
             ..
         } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional fixed-vector field `{comp}.{fname}`"),
-                    "fixed component state is non-directional",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             if f.default.is_some() {
@@ -1445,15 +1521,16 @@ fn lower_field(
         // AnalysisSource passive` / `sb : AnalysisSb`).
         TypeExpr::Builtin { .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional scalar field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
-            let ty = scalar_ir_type(&f.ty).ok_or_else(|| {
+            let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
                 unsupported(
                     &format!("scalar field `{comp}.{fname}` of an unsupported type"),
-                    "only uint/sint/bits/bool fields up to 64 bits are lowered",
+                    "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
                 )
             })?;
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
@@ -1461,9 +1538,10 @@ fn lower_field(
         }
         TypeExpr::Named { name, mode, .. } => {
             if f.direction.is_some() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a directional named-type field `{comp}.{fname}`"),
-                    "",
+                    DIRECTIONAL_FIELD_DETAIL.to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -1561,6 +1639,26 @@ fn lower_field(
                     "component `{comp}` field `{fname}` has type `{simple}`, which is not \
                      declared anywhere in the file"
                 )));
+            }
+            //   * a declared ENUM. v1 emits `Color m;` — the bare
+            //     type name, and it declares no C++ enum — so g++ says
+            //     "`Color` does not name a type" and `--codegen v1` is a
+            //     dead end. THIRD landing of one rule: the event-payload
+            //     and queue-element seams each promised v1 for an enum
+            //     too, and each was found separately. It is one question
+            //     now, asked through
+            //     `v1_leaves_the_type_name_undeclared`.
+            if v1_leaves_the_type_name_undeclared(simple, enum_names) {
+                return Err(not_implemented(
+                    &format!("an enum-typed field `{comp}.{fname}` of type `{simple}`"),
+                    format!(
+                        "only env/method-scoreboard/data-scoreboard/analysis-source \
+                         sub-components are lowered; v1 emits `{simple}` as the member \
+                         type and declares no C++ enum, so its output does not compile \
+                         either"
+                    ),
+                    V1Status::EmitsUncompilable,
+                ));
             }
             Err(unsupported(
                 &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
@@ -2742,9 +2840,21 @@ pub(crate) fn lower_queue_elem(
     fname: &str,
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<crate::ir::QueueElem, LowerError> {
     use crate::ir::QueueElem;
     let reject_named = |named: &str| -> LowerError {
+        if v1_leaves_the_type_name_undeclared(named, enum_names) {
+            return not_implemented(
+                &format!("an enum queue element `{named}` on `{comp}.{fname}`"),
+                format!(
+                    "only `queue<scalar>` and `queue<transaction|struct>` elements are \
+                     lowered; v1 emits `{named}` as the `HarcQueue` element type and \
+                     declares no C++ enum, so its output does not compile either"
+                ),
+                V1Status::EmitsUncompilable,
+            );
+        }
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
             "only `queue<scalar>` and `queue<transaction|struct>` elements are \
@@ -2788,6 +2898,27 @@ pub(crate) fn lower_queue_elem(
     }
 }
 
+/// Does v1 emit this type NAME into its C++ without declaring it?
+///
+/// v1's `payload_type_for_arg` and its queue-element mapping emit the
+/// bare name for a record or an ENUM and route everything else through
+/// `record_field_c_type`. v1 declares the records it emits; it emits no
+/// C++ enum at all. So an enum name reaching a subscriber signature or
+/// a `HarcQueue<T>` parameter is undeclared and g++ refuses — which
+/// makes `--codegen v1` a dead end there, and every other non-record
+/// name an honest `Unsupported`.
+///
+/// Asked at both the event-payload and queue-element seams. The first
+/// version of this rule lived only at the event one, and the queue seam
+/// went on promising a v1 that cannot build `queue<Color>`. They are
+/// two spellings of one question, so it gets asked in one place.
+pub(crate) fn v1_leaves_the_type_name_undeclared(
+    named: &str,
+    enum_names: &std::collections::HashSet<String>,
+) -> bool {
+    enum_names.contains(named)
+}
+
 /// Resolve the `<T>` inside an `event<T>` analysis-port field to its
 /// `EventPayload`. Mirrors v1's `payload_type_for_arg` for the lowered
 /// subset:
@@ -2806,8 +2937,37 @@ pub(crate) fn lower_event_payload(
     fname: &str,
     arg: Option<&TypeArg>,
     record_ids: &HashMap<String, RecordId>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<EventPayload, LowerError> {
+    // Two outcomes, not one, and the discriminator is v1's own.
+    // `payload_type_for_arg` (`cpp_tb.rs`) emits the bare TYPE NAME for
+    // a record or an ENUM and routes everything else through
+    // `record_field_c_type`. v1 declares the records it emits; it emits
+    // no C++ enum at all, so an enum payload becomes
+    // `std::function<void(Color)>` with `Color` undeclared — g++
+    // refuses, and `--codegen v1` is a dead end. Every other non-record
+    // payload gets a real C++ type and builds.
+    //
+    // One `unsupported` used to cover both and promised a v1 that
+    // cannot build the enum half. Splitting on "is it a NAMED type"
+    // instead of "is it an enum" got `event<string>` wrong in the
+    // other direction — `string` parses as a named type and v1 builds
+    // it fine.
+    let reject_enum = |named: &str| -> LowerError {
+        not_implemented(
+            &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
+            format!(
+                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
+                 are lowered; v1 emits `{named}` as the subscriber's parameter type \
+                 and declares no C++ enum, so its output does not compile either"
+            ),
+            V1Status::EmitsUncompilable,
+        )
+    };
     let reject_named = |named: &str| -> LowerError {
+        if v1_leaves_the_type_name_undeclared(named, enum_names) {
+            return reject_enum(named);
+        }
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
@@ -2890,12 +3050,65 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
-/// The component/event/fixed-vector scalar subset remains capped at 64 bits.
-/// Queue elements call `decoded_scalar_ir_type` directly because their shared
-/// storage path already supports `_harc_u128` and `HarcWide<N>`.
+/// The component EVENT-payload and FIXED-VECTOR scalar subset, capped at
+/// 64 bits. Queue elements call `decoded_scalar_ir_type` directly
+/// because their shared storage path already supports `_harc_u128` and
+/// `HarcWide<N>`; declared scalar FIELDS go through
+/// `scalar_field_ir_type` below for the same reason.
+///
+/// The three subsets are separate on purpose. An event payload is a
+/// `std::function` parameter type and a fixed-vector element is an
+/// `std::array` element, and neither emitter has been shown to carry a
+/// width past 64 — widening the field sites through this one function
+/// would have widened both of those unmeasured.
 fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t)
         .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
+}
+
+/// The scalar subset of a DECLARED component/scoreboard/testbench
+/// field. Both emitters render the member through `field_scalar_cty`,
+/// which knows `_harc_u128` and `HarcWide<N>`, so the 64-bit cap
+/// `scalar_ir_type` still applies to event payloads and fixed-vector
+/// elements never belonged here.
+///
+/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`, the language's stated
+/// vector target, which `lib.rs` has held all along — this branch added
+/// a `MAX_SCALAR_FIELD_WIDTH` beside it with a doc comment re-deriving
+/// the number 1024 that the constant it duplicated already fixed.
+///
+/// SIGNED stops at 64. Past that a scalar lives in `_harc_u128` or
+/// `HarcWide<N>`, and BOTH are unsigned: `<` and `/` on either answer
+/// by magnitude, in v1 as well as here. That is `main`'s scoreboard
+/// rule, capped for exactly that reason while this branch was widening
+/// every declared field to 1024 without it. The narrower position is
+/// the right one, and one decoder is the place for it — `main` had
+/// re-introduced a second copy in `scoreboards.rs` to hold it.
+pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// The width policy for a declared scalar FIELD, at every site that has
+/// one.
+///
+/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`; SIGNED stops at 64.
+///
+/// There are two field-type decoders — this file's, which also accepts
+/// `BuiltinTy::Int`, and `tb_scalar_field_ir_type` in `mod.rs` — and
+/// they are allowed to differ about which SPELLINGS they admit. They
+/// are not allowed to differ about WIDTH: a `sint<128>` refused on a
+/// scoreboard and lowered on a testbench field is one language with two
+/// rules. Landing the cap in only one of them is exactly what happened
+/// at the merge that introduced it.
+pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
+    match ty {
+        IrType::UInt(Some(w)) => *w <= crate::MAX_WIDTH_METHOD_BITS,
+        // Past 64 a scalar lives in `_harc_u128` or `HarcWide<N>`, and
+        // BOTH are unsigned: `<` and `/` on one answer by magnitude, in
+        // v1 as well as here.
+        IrType::SInt(Some(w)) => *w <= 64,
+        _ => true,
+    }
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {
@@ -2971,7 +3184,23 @@ pub(crate) fn fold_field_default(
         Some(v) => v,
         None => super::fold_const(d, consts, "").map_err(|e| match e {
             super::ConstFoldErr::Unsupported(detail) => not_implemented(
-                &format!("a non-constant default on {what}"),
+                // "non-constant" is false of a constant that is merely
+                // too WIDE. `default 0x1_0000_0000_0000_0000` is as
+                // constant as `default 1`; what it does not have is a
+                // slot, since every field schema carries its default in
+                // a `u64`. The grade is the same either way, but the
+                // construct named in the diagnostic sends the reader to
+                // a different part of their file.
+                &if matches!(
+                    &*d.kind,
+                    ExprKind::Int(lit)
+                        if super::exprs::parse_int_literal_checked(lit)
+                            == Err(super::exprs::IntLiteralErr::Overflows)
+                ) {
+                    format!("a default on {what} that does not fit a 64-bit slot")
+                } else {
+                    format!("a non-constant default on {what}")
+                },
                 detail,
                 V1Status::SilentlyMisLowers,
             ),

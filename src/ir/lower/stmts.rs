@@ -759,6 +759,23 @@ impl FuncBuilder<'_> {
             None => None,
         };
         let n = self.lower_expr_no_ports(duration)?;
+        // A cycle count is a `uint32_t` at the emitter. A wide operand
+        // reaches it through `HarcWide`'s two implicit conversions and
+        // g++ calls the narrowing ambiguous — in both backends. Same
+        // shape as the `for` upper bound: the count is consumed by a
+        // synthesized terminator, not by a source-level operator, so
+        // the binary-operator guard never sees it.
+        if self.is_wide_scalar(&n) {
+            return Err(not_implemented(
+                "a `wait <n> cycles` count that is a scalar wider than 128 bits",
+                "a cycle count is a 32-bit value; narrow it explicitly \
+                 (`n.trunc<32>()`) if that is what you mean. v1 emits the same \
+                 conversion and its C++ does not compile either, so `--codegen v1` \
+                 is not a way out"
+                    .to_string(),
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let next = self.new_block();
         // Plain waits inside an inlined helper / testbench-method body
         // take v1's synchronous lambda path (no coroutine yield) — see
@@ -793,6 +810,7 @@ impl FuncBuilder<'_> {
             &l.name.name,
             args.first(),
             &self.ctx.record_ids,
+            &self.ctx.enum_names,
         )?;
         Ok(Some(payload))
     }
@@ -1346,9 +1364,7 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         let e = self.lower_expr_no_ports(value)?;
-        if self.record_id_of_expr(&e).is_none()
-            && self.bool_expr_has_invalid_record_operand(&e)
-        {
+        if self.record_id_of_expr(&e).is_none() && self.bool_expr_has_invalid_record_operand(&e) {
             return Err(LowerError::Invalid(format!(
                 "`let {}` is initialised from an invalid record composition",
                 l.name.name
@@ -1607,6 +1623,12 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(w)) => (*w, true),
             _ => return Ok(()),
         };
+        // `scalar_assignment_type` bottoms out on
+        // `host_state_scalar_type`, so this now sees a FIELD source
+        // too. `expr_type` answered `None` for those, and while a field
+        // could not exceed 64 bits both sides were `uint64_t` anyway;
+        // once they could, `a : uint<160> = b : uint<256>` lowered into
+        // `HarcWide<5> = HarcWide<8>`, which has no `operator=`.
         let (aw, a_signed) = match self.scalar_assignment_type(e) {
             Some(IrType::UInt(Some(w))) => (w, false),
             Some(IrType::SInt(Some(w))) => (w, true),
@@ -1634,6 +1656,42 @@ impl FuncBuilder<'_> {
             )));
         }
         Ok(())
+    }
+
+    /// Refuse a WIDE value assigned into a narrower wide slot.
+    ///
+    /// The local narrowing check above is keyed on `local_type`, so a
+    /// FIELD destination never reaches it. `HarcWide<A> = HarcWide<B>`
+    /// has no `operator=` for `A != B`, so `a = b` between two declared
+    /// fields lowered into C++ nobody could build — in v1 too. Only
+    /// wide pairs are judged here; every narrower assignment keeps the
+    /// rule it had.
+    fn reject_wide_narrowing_into(
+        &self,
+        dest: Option<IrType>,
+        e: &Expr,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let words = |ty: Option<&IrType>| match ty {
+            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if *w > 128 => Some(w.div_ceil(32)),
+            _ => None,
+        };
+        let (Some(dw), Some(sw)) = (words(dest.as_ref()), self.wide_scalar_words(e)) else {
+            return Ok(());
+        };
+        if dw == sw {
+            return Ok(());
+        }
+        Err(not_implemented(
+            &format!("a {sw}-word value assigned into {what}, which holds {dw} words"),
+            "a scalar wider than 128 bits is held as `harc_rt::HarcWide<N>`, and there is \
+             no assignment between two different `N`. Narrow the value explicitly with \
+             `.trunc<N>()`, or declare both at the same width. v1 emits the same \
+             assignment and its C++ does not compile either, so `--codegen v1` is not a \
+             way out"
+                .to_string(),
+            V1Status::EmitsUncompilable,
+        ))
     }
 
     fn check_component_method_result_assignable(
@@ -2066,6 +2124,11 @@ impl FuncBuilder<'_> {
         if let Some(field) = self.as_tb_scalar_field(target) {
             let e = self.lower_expr_no_ports(value)?;
             self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
+            self.reject_wide_narrowing_into(
+                self.ctx.tb_scalar_fields.get(&field).cloned(),
+                &e,
+                &format!("testbench field `{field}`"),
+            )?;
             self.push(Stmt::TbFieldWrite { field, value: e });
             return Ok(());
         }

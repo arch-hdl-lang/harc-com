@@ -38,6 +38,9 @@ pub(crate) fn lower_scoreboard(
     // record, and v1's `Emitter::is_record_type` does not — see the
     // capture site in `lower_program`.
     declared_records: &std::collections::HashSet<String>,
+    // Every `enum` NAME in the file, for the shared
+    // `v1_leaves_the_type_name_undeclared` rule at the queue-element seam.
+    enum_names: &std::collections::HashSet<String>,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
@@ -135,7 +138,14 @@ pub(crate) fn lower_scoreboard(
                         "scoreboard `{sb}` declares field `{fname}` more than once"
                     )));
                 }
-                let kind = scoreboard_field_kind(sb, fname, &f.ty, record_ids, declared_records)?;
+                let kind = scoreboard_field_kind(
+                    sb,
+                    fname,
+                    &f.ty,
+                    record_ids,
+                    declared_records,
+                    enum_names,
+                )?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
                         let default = scalar_default(&f.default, sb, fname, &f.ty, &ty, consts)?;
@@ -322,6 +332,7 @@ fn scoreboard_field_kind(
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
     declared_records: &std::collections::HashSet<String>,
+    enum_names: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
     if let TypeExpr::Named { name, generics, .. } = t {
         if matches!(
@@ -402,7 +413,8 @@ fn scoreboard_field_kind(
                     (elem, Some(len))
                 }
                 other => {
-                    let elem = scoreboard_list_scalar_ir_type(other).ok_or_else(unsupported_elem)?;
+                    let elem =
+                        scoreboard_list_scalar_ir_type(other).ok_or_else(unsupported_elem)?;
                     (elem, None)
                 }
             };
@@ -417,7 +429,8 @@ fn scoreboard_field_kind(
     {
         // Exact scalar or value-record element — resolved through the shared
         // component-path helper (don't fork the record-queue seam).
-        let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
+        let elem =
+            super::components::lower_queue_elem(sb, fname, args.first(), record_ids, enum_names)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }
     if let TypeExpr::Named { name, .. } = t {
@@ -428,7 +441,7 @@ fn scoreboard_field_kind(
             });
         }
     }
-    let ty = scalar_ir_type(t).ok_or_else(|| {
+    let ty = super::components::scalar_field_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same
         // predicate rather than a second copy of it: what does v1 do
         // with this leaf? Measured here too, because a scoreboard's
@@ -474,37 +487,6 @@ fn scoreboard_field_kind(
     })
 }
 
-/// Scalar field-type mapping for persistent data-scoreboard state. Unsigned
-/// fields reuse the full scalar carrier already shipped for locals and queue
-/// elements (`uint64_t`, `_harc_u128`, `HarcWide<N>`); signed state remains
-/// capped at 64 bits until the wide carrier has signed value semantics.
-fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
-    let TypeExpr::Builtin { name, args, .. } = t else {
-        return None;
-    };
-    let width = match args.first() {
-        Some(TypeArg::Expr(e)) => match &*e.kind {
-            ExprKind::Int(s) => Some(s.replace('_', "").parse::<u32>().ok()?),
-            _ => return None,
-        },
-        Some(_) => return None,
-        None => None,
-    };
-    if width.is_some_and(|w| w == 0 || w > crate::MAX_WIDTH_METHOD_BITS) {
-        return None;
-    }
-    match name {
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-            Some(IrType::UInt(width))
-        }
-        BuiltinTy::SInt | BuiltinTy::SIntCap if !width.is_some_and(|w| w > 64) => {
-            Some(IrType::SInt(width))
-        }
-        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
-        _ => None,
-    }
-}
-
 /// Scalar element shapes that v1 preserves inside `std::vector<T>`. Keep
 /// language `int` out: v1 renders `list<int>` unsigned and the measured gap
 /// table classifies that spelling as a silent mis-lowering.
@@ -523,7 +505,11 @@ fn scoreboard_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
             | BuiltinTy::BoolLower
             | BuiltinTy::Bit
     )
-    .then(|| scalar_ir_type(t))
+    // `components::scalar_field_ir_type`, not a local copy: unsigned
+    // to `MAX_WIDTH_METHOD_BITS`, signed capped at 64. That cap is
+    // `main`'s and is right; it lives in one decoder now, and the copy
+    // written here to hold it has been folded back in twice.
+    .then(|| super::components::scalar_field_ir_type(t))
     .flatten()
 }
 

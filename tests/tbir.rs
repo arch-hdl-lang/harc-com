@@ -3409,13 +3409,19 @@ end impl QueueBoundaryTest
     }
 }
 
-/// Direct scalar queues deliberately widen only the scalar element subset.
-/// Aggregate elements other than value records remain explicit
-/// `Unsupported` diagnostics instead of being flattened into scalar storage.
+/// Direct scalar queues deliberately widen only the scalar element
+/// subset. Aggregate elements other than value records stay explicit
+/// refusals instead of being flattened into scalar storage — each on
+/// the grade v1 earns, which is not the same grade for all of them.
+///
+/// `Vec` and `list` keep `Unsupported`: v1 gives them a real C++
+/// element type and builds. An ENUM does not — v1 emits the bare name
+/// into `HarcQueue<Color>` and declares no C++ enum, so g++ refuses and
+/// `--codegen v1` is a dead end. One label used to cover all three.
 #[test]
 fn scalar_queue_rollout_keeps_aggregate_elements_unsupported() {
-    for elem in ["Color", "Vec", "list"] {
-        let src = format!(
+    let prog = |elem: &str| {
+        format!(
             r#"
 enum Color {{ RED, GREEN }}
 
@@ -3430,13 +3436,28 @@ impl AggregateQueueTest for AggregateQueueTb
     end run
 end impl AggregateQueueTest
 "#
-        );
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        )
+    };
+    let msg = assert_not_implemented(
+        &lower_src(&prog("Color")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("enum queue element"), "{msg}");
+    let v1_enum = cpp_tb::emit(&merged_src(&prog("Color"))).expect("v1 emits");
+    assert!(v1_enum.contains("HarcQueue<Color>"), "v1 names the type…");
+    assert!(
+        !v1_enum.contains("enum Color"),
+        "…and never declares it, which is why the suggestion had to go"
+    );
+
+    for elem in ["Vec", "list"] {
+        let msg = assert_unsupported(&lower_src(&prog(elem)).unwrap_err());
         assert!(
             msg.contains("non-scalar queue element")
                 && msg.contains("enum/Vec/nested elements gate on a later slice"),
             "`queue<{elem}>` must stay explicitly unsupported: {msg}"
         );
+        cpp_tb::emit(&merged_src(&prog(elem))).expect("v1 emits these, which keeps it honest");
     }
 }
 
@@ -10701,6 +10722,360 @@ end impl T
     }
 }
 
+/// The transactor state-field arms, one row per LANDING the guard
+/// admits — not one probe per arm.
+///
+/// The first attempt at these probed one landing each and labelled the
+/// whole arm from it. Two verdicts came out wrong that way: the
+/// directional guard is `f.direction.is_some()`, which admits a
+/// directional SCALAR as well as the `out event` that was probed; and
+/// the non-scalar guard is the catch-all of `tb_scalar_field_ir_type`,
+/// which admits `stream`/`buffer` as well as the `Vec` that was probed.
+/// Both of those extra landings have v1 emitting a member that COMPILES
+/// and means something else — the worst verdict in the enum — under an
+/// arm that was telling users to go there.
+///
+/// Each row below is measured against a control (the same program with
+/// the field removed), which lowers under tbir and compiles under v1.
+#[test]
+fn the_transactor_state_field_arms_are_labelled_per_landing() {
+    let prog = |field: &str| {
+        format!(
+            r#"
+struct Beat
+    p : uint<8>
+end struct Beat
+
+enum Color {{ RED, GREEN }}
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    n : uint<32> default 0
+{field}
+    thread bus.read(addr: uint<8>)
+        n = n + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#
+        )
+    };
+
+    // The control. Every row below differs from it by one field, so a
+    // verdict is attributable to that field and nothing else — an
+    // earlier probe round reported "v1 rejects" for a reason that was
+    // really a missing mode annotation, and a control would have caught
+    // it immediately.
+    let control_src = prog("    b : Beat");
+    lower_src(&control_src).expect("the control lowers");
+    let control_v1 = cpp_tb::emit(&merged_src(&control_src)).expect("v1 emits the control");
+
+    // ── the EVENT half is no longer this arm's business ─────────────
+    // A `bound to` transactor that declares an event field now gets a
+    // COMPONENT view as well, so its event fields lower through the
+    // same `lower_field` / `lower_event_payload` path an unbound
+    // transactor's have always used, and the target view skips them.
+    // The allow-list this arm used to carry — five review rounds of it
+    // — was a second, weaker copy of rules that already lived there.
+    //
+    // The certified payloads LOWER now, at both sites.
+    for ok in [
+        "    ev : out event<uint<8>>",
+        "    ev : out event<bool>",
+        "    ev : out event<sint<8>>",
+        // A bare `event` is certified too. `lower_event_payload`
+        // already said so — "a bare `event` with no payload defaults to
+        // an unsigned scalar" — and v1 emits the SAME member it gives
+        // `event<uint<8>>`.
+        "    ev : out event",
+        // A record payload, which v1 does handle.
+        "    ev : out event<Beat>",
+        // The consumer half.
+        "    ev : in event<uint<8>>",
+    ] {
+        lower_src(&prog(ok)).unwrap_or_else(|e| panic!("`{ok}` must lower now: {e:?}"));
+        cpp_tb::emit(&merged_src(&prog(ok))).expect("v1 emits");
+    }
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    ev : out event<uint<8>>")))
+            .expect("v1 emits")
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "v1 gives an event field a real subscriber vector"
+    );
+    assert!(
+        emit_cpp_src(&prog("    ev : out event<uint<8>>"))
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "…and so does tbir, through the component view"
+    );
+
+    // What the shared path refuses, it refuses on the grade v1 earns.
+    //
+    // An ENUM payload is the one v1 cannot build: `payload_type_for_arg`
+    // emits the bare name for a record or an enum, v1 declares the
+    // records it emits and no C++ enum at all, so `Color` is undeclared
+    // in the subscriber signature. Every OTHER non-record payload goes
+    // through `record_field_c_type`, gets a real C++ type, and builds —
+    // so it keeps the honest `Unsupported`. One label used to cover
+    // both and promised a v1 that cannot build the enum half; splitting
+    // it on "is it a NAMED type" instead got `string` wrong the other
+    // way, since `string` parses as a named type and v1 builds it.
+    let err = lower_src(&prog("    ev : out event<Color>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("enum event payload"), "{msg}");
+    assert!(
+        !cpp_tb::emit(&merged_src(&prog("    ev : out event<Color>")))
+            .expect("v1 emits")
+            .contains("enum Color"),
+        "v1 never declares the enum it names"
+    );
+    for still_refused in [
+        "    ev : out event<string>",
+        "    ev : out event<queue<uint<8>>>",
+        "    ev : inout event<uint<8>>",
+    ] {
+        let msg = assert_unsupported(&lower_src(&prog(still_refused)).unwrap_err());
+        assert!(!msg.is_empty(), "`{still_refused}` keeps a reason");
+        cpp_tb::emit(&merged_src(&prog(still_refused))).expect("v1 emits and builds these");
+    }
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    ev : out event<string>")))
+            .expect("v1 emits")
+            .contains("std::vector<std::function<void(uint64_t)>> ev;"),
+        "…flattening the payload to a 64-bit integer, which is why the \
+         suggestion stays honest there"
+    );
+
+    // A `default` on an event field: pasted into the subscriber
+    // vector's initialiser, which does not convert. Same rule and same
+    // grade as the sibling `queue<T> default` and `Record default`
+    // arms — and it lives on the shared component path now, where it
+    // was missing entirely: an unbound transactor accepted it and
+    // dropped it silently.
+    let err = lower_src(&prog("    ev : out event<uint<8>> default 0")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("default on event field"), "{msg}");
+
+    // A directional NON-EVENT field: v1 emits the member for the
+    // field's own type and DROPS the direction, and the file compiles.
+    // Pointing there hands the user a program that means something else.
+    for (field, needle) in [
+        ("    p : in uint<8>", "uint64_t p;"),
+        // Not a "scalar" — the arm catches every non-event shape.
+        ("    v : in Vec<uint<8>, 4>", "std::array<uint64_t, 4> v{};"),
+    ] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("directional non-event field"),
+            "`{field}`: {msg}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(field)))
+                .expect("v1 emits")
+                .contains(needle),
+            "`{field}`: v1 emits `{needle}` with the direction gone"
+        );
+    }
+
+    // ── the non-scalar guard admits five, and `stream` sets the label ─
+    for (field, needle) in [
+        ("    v : Vec<uint<8>, 4>", "std::array<uint64_t, 4> v{};"),
+        // The row that sets the verdict: a stream becomes a bare
+        // integer. It compiles, and it is not a stream.
+        ("    s : stream<uint<8>>", "uint64_t s;"),
+    ] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("non-scalar type"), "`{field}`: {msg}");
+        assert!(
+            cpp_tb::emit(&merged_src(&prog(field)))
+                .expect("v1 emits")
+                .contains(needle),
+            "`{field}`: v1 emits `{needle}`"
+        );
+    }
+    // …and an enum under the SAME arm is the uncompilable end of it,
+    // which is why the arm cannot claim `Unsupported` either.
+    assert!(
+        cpp_tb::emit(&merged_src(&prog("    m : Color")))
+            .expect("v1 emits")
+            .contains("Color m;"),
+        "v1 emits a C++ enum name it never declares"
+    );
+
+    // ── the two default arms are mixed, and `EmitsUncompilable` wins ─
+    for field in ["    q : queue<uint<8>> default 0", "    b : Beat default 0"] {
+        let err = lower_src(&prog(field)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(msg.contains("with a default"), "`{field}`: {msg}");
+    }
+    // The landing that keeps those arms from being uniform: a bare
+    // `Ident` default is pasted verbatim by `format_simple_expr` and
+    // compiles under v1. Refused all the same — the arm takes its
+    // WORST outcome — but the source must not claim there is no v1.
+    assert!(
+        cpp_tb::emit(&merged_src(&prog(
+            "    q0 : queue<uint<8>>\n    q : queue<uint<8>> default q0"
+        )))
+        .expect("v1 emits")
+        .contains("q = q0;"),
+        "v1 pastes a bare identifier default verbatim"
+    );
+
+    // ── the message names the construct the user actually wrote ─────
+    // `lower_state_field` serves four callers. Every message used to
+    // say "bound-to transactor", including on the UNBOUND DUT-poking
+    // form, which is bound to nothing. A mutation that ignores the
+    // owner label survives every assertion above, so it gets its own.
+    let unbound = r#"
+transactor Poker
+    dut : TlmReadInitiator
+    n : uint<32> default 0
+    v : Vec<uint<8>, 4>
+
+    when active
+        hookable poke()
+            n = n + 1
+        end poke
+    end when
+end transactor Poker
+
+testbench Tb
+    dut : TlmReadInitiator
+    px  : Poker active
+end testbench Tb
+
+impl T for Tb
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    let msg = lower_src(unbound).unwrap_err().to_string();
+    // `contains("transactor `Poker` …")` alone would be satisfied by the
+    // OLD wrong message, which contains it as a suffix. The label has to
+    // be pinned exactly.
+    assert!(
+        msg.contains("HARC does not implement transactor `Poker` state field `v`"),
+        "the unbound form names itself exactly: {msg}"
+    );
+
+    // …and the two initiator-side sites, which say something different
+    // again. Without a case each, a mutant that collapses
+    // `StateFieldOwner` to one string survives the whole test — the
+    // first round's did.
+    let initiator = r#"
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    n : uint<32> default 0
+    v : Vec<uint<8>, 4>
+
+    hookable poke()
+        n = n + 1
+    end poke
+end transactor AxilHelper
+
+testbench Tb
+    dut : AxiLiteRegs
+end testbench Tb
+
+impl T for Tb
+    let axil : BusAxiLite = bind dut
+    let h : AxilHelper active = bind axil
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    let msg = lower_with_stdlib_bus_src(initiator)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("initiator-side bound-to transactor `AxilHelper` state field `v`"),
+        "the initiator form names itself: {msg}"
+    );
+
+    // A DIRECTIONAL field on the INITIATOR owner. The suite had none,
+    // so reinstating the pre-check that used to shadow the shared rule
+    // on this path passed every test. (The unbound owner already had
+    // two such cases — an earlier claim that the suite could not catch
+    // ANY reinstated pre-check was wrong, and named the wrong owner.)
+    let err = lower_with_stdlib_bus_src(
+        &initiator.replace("    v : Vec<uint<8>, 4>", "    p : in uint<8>"),
+    )
+    .unwrap_err();
+    // `Unsupported`'s Display carries the same construct substring, so
+    // `contains` alone would pass if the arm flipped back.
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains(
+            "initiator-side bound-to transactor `AxilHelper` directional non-event field `p`"
+        ),
+        "the initiator owner reaches the shared directional rule: {msg}"
+    );
+
+    // …and a directional module handle on the UNBOUND owner, which the
+    // named-type branches would otherwise swallow: `in TlmReadInitiator`
+    // lowered for one commit, tbir dropping the `in` itself.
+    //
+    // It must be the SOLE handle. A second one alongside `dut` is
+    // refused by the handle-COUNT arm instead, so that spelling passed
+    // whether or not the directional dispatch existed — measured, a
+    // mutant leaking exactly the sole-handle shape survived the suite.
+    let sole = unbound.replace("    v : Vec<uint<8>, 4>\n", "").replace(
+        "    dut : TlmReadInitiator",
+        "    dut : in TlmReadInitiator",
+    );
+    let err = lower_src(&sole).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        msg.contains("transactor `Poker` directional non-event field `dut`"),
+        "a directional module handle is still refused: {msg}"
+    );
+
+    // The bound-TARGET label, pinned on a row above that only checked
+    // the construct.
+    let msg = lower_src(&prog("    v : Vec<uint<8>, 4>"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("bound-to transactor `TlmMemTarget` state field `v`")
+            && !msg.contains("initiator-side"),
+        "the bound-target form names itself: {msg}"
+    );
+
+    // ── generic application: dropped without a word ──────────────────
+    let err = lower_src(&prog("    b : Beat<uint<8>>")).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("generic-applied type"), "{msg}");
+    // The claim IS a whole-output equality — "the program that runs is
+    // the one `b : Beat` would have given" — so it is asserted as one.
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&prog("    b : Beat<uint<8>>"))).expect("v1 emits"),
+        control_v1,
+        "v1's output is byte-identical to the control: the argument list vanishes"
+    );
+}
+
 /// The two record-traversal arms that had no cell of their own.
 ///
 /// `indexing the non-`Vec` record field` had its verdict flipped to
@@ -12065,7 +12440,10 @@ end impl T"#
         &cpp_tb::EmitOpts::default(),
     )
     .expect("TBIR emits list queries");
-    assert!(list_query_cpp.contains("_tb.sb.l.empty()"), "{list_query_cpp}");
+    assert!(
+        list_query_cpp.contains("_tb.sb.l.empty()"),
+        "{list_query_cpp}"
+    );
     assert!(
         list_query_cpp.contains("((uint64_t)_tb.sb.l.size())"),
         "{list_query_cpp}"
@@ -12099,11 +12477,7 @@ end impl T"#
             "list<Vec<uint<8>, 2>>",
             "        let x : uint<8> = sb.l[0][1]",
         ),
-        (
-            "write",
-            "list<Vec<uint<8>, 2>>",
-            "        sb.l[0][1] = 1",
-        ),
+        ("write", "list<Vec<uint<8>, 2>>", "        sb.l[0][1] = 1"),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"))
             .replace("        wait 1 cycle", body);
@@ -12121,7 +12495,10 @@ end impl T"#
     }
     for pop in ["sb.l.pop()", "(sb.l).pop()", "(sb).l.pop()"] {
         let nested_list_pop = prog("scoreboard Sb\n    l : list<uint<8>>\nend scoreboard Sb")
-            .replace("        wait 1 cycle", &format!("        assert {pop} == 0"));
+            .replace(
+                "        wait 1 cycle",
+                &format!("        assert {pop} == 0"),
+            );
         let err = lower_src(&nested_list_pop).unwrap_err();
         assert!(matches!(err, lower::LowerError::Invalid(_)), "{err}");
         let msg = err.to_string();
@@ -12139,24 +12516,19 @@ end impl T"#
         lower::V1Status::SilentlyMisLowers,
     );
     assert!(msg.contains("unsupported element type"), "{msg}");
-    let symbolic_vec_list = prog(
-        "scoreboard Sb\n    l : list<Vec<uint<8>, N>>\nend scoreboard Sb",
-    );
+    let symbolic_vec_list = prog("scoreboard Sb\n    l : list<Vec<uint<8>, N>>\nend scoreboard Sb");
     let msg = assert_not_implemented(
         &lower_src(&symbolic_vec_list).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
     );
     assert!(msg.contains("invalid fixed-vector length"), "{msg}");
-    let flattened_vec_list = prog(
-        "scoreboard Sb\n    l : list<Vec<int, 2>>\nend scoreboard Sb",
-    );
+    let flattened_vec_list = prog("scoreboard Sb\n    l : list<Vec<int, 2>>\nend scoreboard Sb");
     assert_not_implemented(
         &lower_src(&flattened_vec_list).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
     );
-    let nested_vec_list = prog(
-        "scoreboard Sb\n    l : list<Vec<Vec<uint<8>, 2>, 3>>\nend scoreboard Sb",
-    );
+    let nested_vec_list =
+        prog("scoreboard Sb\n    l : list<Vec<Vec<uint<8>, 2>, 3>>\nend scoreboard Sb");
     assert_unsupported(&lower_src(&nested_vec_list).unwrap_err());
     let defaulted_list = prog("scoreboard Sb\n    l : list<uint<8>> default 0\nend scoreboard Sb");
     assert_not_implemented(
@@ -12185,6 +12557,42 @@ end impl T"#
             "corrupt list {corrupt} must be rejected"
         );
     }
+    // `uint<128>` used to sit in that list, refused with v1 named as
+    // the way out. It is not a gap any more: an UNSIGNED declared
+    // scalar field is lowered to the language's stated vector target,
+    // and BOTH backends emit the same wide member.
+    //
+    // `sint<128>` is NOT here, and that is `main`'s call, adopted at
+    // the merge: past 64 bits a scalar lives in `_harc_u128` or
+    // `HarcWide<N>`, both unsigned, so `<` and `/` on one answer by
+    // magnitude in either backend. This branch had widened signed
+    // fields too, without that.
+    for (ty, shape) in [
+        ("uint<128>", "_harc_u128 l"),
+        ("uint<1024>", "harc_rt::HarcWide<32> l"),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        lower_src(&src).expect("a wide unsigned scoreboard field lowers");
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(shape),
+            "`{ty}`: tbir must emit `{shape}`, got:\n{cpp}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(shape),
+            "`{ty}`: v1 emits `{shape}` too — the two agree on the member"
+        );
+    }
+    // The signed cap, and the reason for it.
+    let signed = prog("scoreboard Sb\n    l : sint<128>\nend scoreboard Sb");
+    assert!(
+        lower_src(&signed).is_err(),
+        "a signed field past 64 bits must stay refused while the wide \
+         carrier has no signed comparison"
+    );
+
     // A record-typed field now uses persistent by-value record storage,
     // matching the component and transactor-state seams.
     let record_src = prog("scoreboard Sb\n    l : Inner\nend scoreboard Sb");
@@ -12336,8 +12744,10 @@ end impl T"#;
             "{label} record truth gets a source diagnostic: {err}"
         );
     }
-    let mixed_record_truth =
-        src.replace("wait 1 cycle", "assert !(1 ? item : other)\n        wait 1 cycle");
+    let mixed_record_truth = src.replace(
+        "wait 1 cycle",
+        "assert !(1 ? item : other)\n        wait 1 cycle",
+    );
     let err = lower_src(&mixed_record_truth)
         .expect_err("a mixed-record ternary cannot hide under a scalar truth operator");
     assert!(
@@ -12359,13 +12769,14 @@ end impl T"#;
             "let scalar : uint<8> = 0",
             "let scalar : uint<8> = 0\n        let ev : event<bool>",
         )
-        .replace("item.value = 77", "emit ev(item == item)\n        item.value = 77");
+        .replace(
+            "item.value = 77",
+            "emit ev(item == item)\n        item.value = 77",
+        );
     let event_prog =
         lower_src(&event_control).expect("same-record equality is a valid scalar event payload");
-    let mixed_event = event_control.replace(
-        "emit ev(item == item)",
-        "emit ev(1 ? false : sb.last)",
-    );
+    let mixed_event =
+        event_control.replace("emit ev(item == item)", "emit ev(1 ? false : sb.last)");
     let err = lower_src(&mixed_event)
         .expect_err("a scalar local event cannot accept a mixed record payload");
     assert!(
@@ -12438,11 +12849,7 @@ end impl T"#;
     }
     for (label, condition, expected) in [
         ("direct", "last", "must be a scalar value"),
-        (
-            "wrapped",
-            "!last",
-            "scalar operator to a record value",
-        ),
+        ("wrapped", "!last", "scalar operator to a record value"),
     ] {
         let ternary_src = component_record_trigger.replace(
             "    on last level",
@@ -13184,7 +13591,7 @@ end impl T"#
                 &lower_src(&src).unwrap_err(),
                 lower::V1Status::SilentlyMisLowers,
             );
-            assert!(msg.contains("directional scalar field"), "{msg}");
+            assert!(msg.contains("directional non-event field"), "{msg}");
             let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
             assert!(v1.contains("uint64_t p;"), "v1 flattens it: {v1}");
         }
@@ -18452,16 +18859,28 @@ impl EvTest for EvTb
     end run
 end impl EvTest
 "#;
-    let msg = assert_unsupported(&lower_src(event_src).unwrap_err());
+    // A RECORD payload is not certified. v1 handles this one — it
+    // declares `Req` and emits `void(Req)` — but the arm also covers a
+    // regblock mirror, which v1 flattens to `void(uint64_t)` without a
+    // word, and `record_ids` cannot tell the two apart at that site.
+    // Worst wins, so the arm is `SilentlyMisLowers`; a builtin-scalar
+    // payload is the certified shape and keeps `Unsupported`.
+    let msg = assert_not_implemented(
+        &lower_src(event_src).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("uncertified payload"), "{msg}");
+    let certified = event_src.replace("req : in event<Req>", "req : in event<uint<8>>");
+    let msg = assert_unsupported(&lower_src(&certified).unwrap_err());
     assert!(msg.contains("directional event field `req`"), "{msg}");
-    // The directional SCALAR spelling is a different verdict — v1
-    // models the event field and flattens the scalar one.
+    // The directional NON-EVENT spelling is a different verdict — v1
+    // models the event field and flattens this one.
     let scalar_src = event_src.replace("req : in event<Req>", "req : in uint<8>");
     let msg = assert_not_implemented(
         &lower_src(&scalar_src).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("directional scalar field `req`"), "{msg}");
+    assert!(msg.contains("directional non-event field `req`"), "{msg}");
 
     // A scalar state field now lowers: the transactor carries it on its
     // schema and the testbench records the instance for per-instance
@@ -28177,22 +28596,34 @@ env AnalysisEnv"#;
     // was a whitelist of the kinds that seemed relevant, and omitting
     // one turns a valid program into a false "not declared anywhere".
     // The set is over-inclusive for exactly this reason — a missing name
-    // is a hard error on working code, a spurious one is just the honest
-    // `Unsupported`.
+    // is a hard error on working code, a spurious one is a refusal on
+    // the grade v1 earns.
+    //
+    // That grade is NOT `Unsupported`. v1 emits `Mode weird;` — the bare
+    // name, and it declares no C++ enum — so g++ answers "`Mode` does
+    // not name a type". "v1 handles it, so v1 is a real escape hatch
+    // here", which this test asserted from the presence of the member
+    // text alone, was false: the member is exactly the problem. Two
+    // sibling seams (the event payload and the queue element) promised
+    // v1 for an enum too, and each was found separately; they ask
+    // `v1_leaves_the_type_name_undeclared` now.
     let enum_field = format!(
         "enum Mode {{ A, B }}\n\n{}",
         fixture.replace(ANCHOR, &format!("{ANCHOR}\n    weird  : Mode"))
     );
-    let msg = assert_unsupported(&lower_src(&enum_field).unwrap_err());
-    assert!(
-        msg.contains("sub-component field"),
-        "an enum is declared: {msg}"
+    let msg = assert_not_implemented(
+        &lower_src(&enum_field).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
     );
     assert!(
-        cpp_tb::emit(&merged_src(&enum_field))
-            .expect("v1 emits an enum field")
-            .contains("Mode weird"),
-        "v1 handles it, so v1 is a real escape hatch here"
+        msg.contains("enum-typed field"),
+        "an enum is declared: {msg}"
+    );
+    let v1_enum = cpp_tb::emit(&merged_src(&enum_field)).expect("v1 emits an enum field");
+    assert!(v1_enum.contains("Mode weird"), "v1 names the type…");
+    assert!(
+        !v1_enum.contains("enum Mode"),
+        "…and never declares it, which is why the suggestion had to go"
     );
     // v1's evidence: a real member, and the sampling is wired.
     let v1 = cpp_tb::emit(&merged_src(&declared)).expect("v1 emits a covergroup field");
@@ -34864,4 +35295,149 @@ end impl T"#;
         cpp.contains("((int64_t)(self.signed_values[0])) >> 1"),
         "a real test-scope `self` binding must win over the component sentinel:\n{cpp}"
     );
+}
+
+/// A declared scalar field wider than 64 bits, at each of the four
+/// emitters that render one.
+///
+/// All four carried their own copy of a `(bool | int64_t | uint64_t)`
+/// type choice. A `uint<128>` member reaching any of them without the
+/// shared `field_scalar_cty` seam is not a build failure — it is a
+/// 64-bit member that compiles, runs, and drops the top half. Nothing
+/// in the differential harness can see that, so the member type is
+/// asserted here directly.
+#[test]
+fn a_wide_scalar_field_keeps_its_width_at_every_field_emitter() {
+    // (source, expected member declaration) per emitter. `uint<1024>`
+    // crosses from `_harc_u128` into `harc_rt::HarcWide<32>`, so each
+    // emitter is checked on both sides of that boundary.
+    for (width, cty) in [(128u32, "_harc_u128"), (1024, "harc_rt::HarcWide<32>")] {
+        // 1. The testbench `_tb` struct.
+        let tb = format!(
+            "testbench Tb\n    dut : Top\n    w : uint<{width}> default 1\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        w = 2\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&tb).contains(&format!("{cty} w = 1;")),
+            "testbench field at {width} bits must be `{cty}`"
+        );
+
+        // 2. The scoreboard struct.
+        let sb = format!(
+            "scoreboard Sb\n    w : uint<{width}> default 1\nend scoreboard Sb\n\
+             \ntestbench Tb\n    dut : Top\n    sb : Sb\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        sb.w = 2\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&sb).contains(&format!("{cty} w = 1;")),
+            "scoreboard field at {width} bits must be `{cty}`"
+        );
+
+        // 3. The component struct (an unbound transactor as a member).
+        let comp = format!(
+            "transactor Src\n    w : uint<{width}> default 1\n\
+             \n    hookable bump(v: uint<8>)\n        w = w + 1\n    end bump\nend transactor Src\n\
+             \ntestbench Tb\n    dut : Top\n    src : Src passive\nend testbench Tb\n\
+             \nimpl T for Tb\n    run\n        src.bump(1)\n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&comp).contains(&format!("{cty} w = 1;")),
+            "component field at {width} bits must be `{cty}`"
+        );
+
+        // 4. The per-instance transactor-state struct.
+        let state = format!(
+            "bus TlmMemBus\n    tlm_method read(addr: uint<8>) -> uint<32>: blocking;\n\
+             end bus TlmMemBus\n\
+             \ntransactor TlmMemTarget bound to TlmMemBus\n    w : uint<{width}> default 1\n\
+             \n    thread bus.read(addr: uint<8>)\n        w = w + 1\n        return 1\n\
+             \n    end thread\nend transactor TlmMemTarget\n\
+             \ntestbench Tb\n    dut : TlmReadInitiator\nend testbench Tb\n\
+             \nimpl T for Tb\n    let mem : TlmMemBus = bind dut\n\
+             \n    let target : TlmMemTarget passive = bind mem\n    run\n        wait 1 cycle\n\
+             \n    end run\nend impl T\n"
+        );
+        assert!(
+            emit_cpp_src(&state).contains(&format!("{cty} w = 1;")),
+            "transactor state field at {width} bits must be `{cty}`"
+        );
+    }
+}
+
+/// A DIRECTION on a component field, at every arm that carries the
+/// guard.
+///
+/// The arms answer `Unsupported` — "re-run with `--codegen v1`". v1
+/// does compile all five, which is why the label survived four review
+/// rounds. What it does is DISCARD the direction: emit the member for
+/// the field's own type, exactly as if the marker were not there. That
+/// is not an escape hatch, it is a program that means something else,
+/// and it is what `SilentlyMisLowers` is for.
+///
+/// Proved by byte-identity against the undirected spelling, with the
+/// two sources padded to the SAME length so no source-offset residue
+/// can explain it — the technique the `bound to` field arm already
+/// uses two hundred lines away.
+#[test]
+fn a_direction_on_a_component_field_is_discarded_by_v1() {
+    let prog = |field: &str| {
+        format!(
+            r#"struct Beat
+    p : uint<8>
+end struct Beat
+
+transactor Src
+    n : uint<32> default 0
+{field}
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor Src
+
+testbench TbDir
+    dut : Top
+    src : Src passive
+end testbench TbDir
+
+impl TDir for TbDir
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TDir
+"#
+        )
+    };
+
+    for (directional, undirected) in [
+        ("    x : in uint<8>", "    x :    uint<8>"),
+        ("    x : out uint<8>", "    x :     uint<8>"),
+        ("    q : in queue<uint<8>>", "    q :    queue<uint<8>>"),
+        ("    v : in Vec<uint<8>, 4>", "    v :    Vec<uint<8>, 4>"),
+        ("    r : in Beat", "    r :    Beat"),
+    ] {
+        assert_eq!(
+            directional.len(),
+            undirected.len(),
+            "the two spellings must be the same length for byte-identity to mean anything"
+        );
+        let with = cpp_tb::emit(&merged_src(&prog(directional))).expect("v1 emits the directional");
+        let without = cpp_tb::emit(&merged_src(&prog(undirected))).expect("v1 emits the plain one");
+        assert_eq!(
+            with, without,
+            "`{directional}`: v1's output must be byte-identical to the undirected \
+             spelling — that identity is the whole evidence for the grade"
+        );
+        // …and tbir refuses it, on that grade.
+        let err = lower_src(&prog(directional)).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("direction"),
+            "`{directional}`: the reason must name the direction, got `{msg}`"
+        );
+        assert!(
+            msg.len() > 40,
+            "`{directional}`: three of these arms shipped an EMPTY reason string"
+        );
+    }
 }

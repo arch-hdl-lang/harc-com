@@ -1460,8 +1460,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             if components::scoreboard_is_component(c) {
                 continue;
             }
-            let schema =
-                scoreboards::lower_scoreboard(c, &record_ids, &declared_record_names, &const_vals)?;
+            let schema = scoreboards::lower_scoreboard(
+                c,
+                &record_ids,
+                &declared_record_names,
+                &enum_names,
+                &const_vals,
+            )?;
             if scoreboard_ids
                 .insert(
                     c.name.name.clone(),
@@ -1750,6 +1755,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &components,
                         &covgroup_ids,
                         &record_ids,
+                        &enum_names,
                         &transactor_ids,
                         &scoreboard_ids,
                         &component_type_names,
@@ -1928,7 +1934,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1999,7 +2006,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -2158,6 +2166,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &mut next_fn,
             &const_vals,
             &declared_types,
+            &enum_names,
             &declared_record_names,
         )?;
         prog.components.push(schema);
@@ -2212,7 +2221,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -2351,6 +2361,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &addrmap_decls,
             &buses,
             &unresolved_use_names,
+            &enum_names,
             &consts,
             &const_signed,
             &properties,
@@ -2545,6 +2556,9 @@ fn validate_testbench_component(
     components: &HashMap<String, &ComponentDecl>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
+    // Every `enum` NAME in the file, for the shared
+    // `v1_leaves_the_type_name_undeclared` rule at the queue-element seam.
+    enum_names: &HashSet<String>,
     transactor_ids: &HashMap<String, TransactorId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     component_type_names: &HashSet<String>,
@@ -2909,6 +2923,7 @@ fn validate_testbench_component(
                         &f.name.name,
                         args.first(),
                         record_ids,
+                        enum_names,
                     )?;
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
                     return Err(unsupported(
@@ -2916,7 +2931,7 @@ fn validate_testbench_component(
                             "testbench field `{}` with a non-scalar, non-named type",
                             f.name.name
                         ),
-                        "only uint/sint/bits/bool fields up to 64 bits are lowered",
+                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
                     ));
                 }
             }
@@ -3148,6 +3163,9 @@ fn lower_test(
     addrmap_decls: &HashMap<String, &AddrmapDecl>,
     buses: &HashMap<String, &BusDecl>,
     unresolved_use_names: &HashSet<String>,
+    // Every `enum` NAME in the file — the discriminator v1's payload
+    // type mapping keys on (see `lower_event_payload`).
+    enum_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
     properties: &HashMap<String, crate::ast::Expr>,
@@ -4184,6 +4202,7 @@ fn lower_test(
                                 &f.name.name,
                                 args.first(),
                                 record_ids,
+                                enum_names,
                             )?;
                             let queue = ir::TbQueueFieldSchema {
                                 name: f.name.name.clone(),
@@ -5085,12 +5104,45 @@ fn lower_test(
                     .or(inferred_ty)
                     .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
-                Some(ExprKind::Int(s)) => s.replace('_', "").parse::<u64>().map_err(|_| {
-                    LowerError::Invalid(format!(
-                        "promoted `let {}` has a non-integer initializer",
-                        l.name.name
-                    ))
-                })?,
+                Some(ExprKind::Int(s)) => {
+                    match exprs::parse_int_literal_checked(s) {
+                        Ok(v) => v,
+                        // Not "non-integer" — the literal IS an integer,
+                        // it just has no slot: a promoted `let` becomes a
+                        // `_tb` field, and every field schema carries its
+                        // default as a `u64`. `Invalid` was the wrong
+                        // grade for it as well, and the differential
+                        // harness asserts on exactly that pairing: v1
+                        // compiles `_harc_u128 w = <literal>;`, which g++
+                        // accepts with a `-Woverflow` warning and
+                        // evaluates to 0. That is the same measurement
+                        // the testbench-field default already carries, so
+                        // it gets the same label.
+                        Err(exprs::IntLiteralErr::Overflows) => {
+                            return Err(not_implemented(
+                                &format!(
+                                    "a promoted test-scope `let {}` whose initializer \
+                                     `{s}` does not fit the 64-bit \
+                                     constant-evaluation domain",
+                                    l.name.name
+                                ),
+                                "a test-scope let captured by a closure hook OR read in \
+                                 the check phase is promoted to a `_tb` host field, whose \
+                                 default is held as a 64-bit value; v1 emits the literal \
+                                 into the member initializer, where g++ truncates it to 0 \
+                                 with only a warning"
+                                    .to_string(),
+                                V1Status::SilentlyMisLowers,
+                            ));
+                        }
+                        Err(exprs::IntLiteralErr::NotAnInteger) => {
+                            return Err(LowerError::Invalid(format!(
+                                "promoted `let {}` has a non-integer initializer",
+                                l.name.name
+                            )))
+                        }
+                    }
+                }
                 Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
                 _ => {
@@ -5310,6 +5362,7 @@ fn lower_test(
         } else {
             Some("_tb".to_string())
         },
+        enum_names: enum_names.clone(),
         cov_fields: cov_fields.iter().cloned().collect(),
         covgroups: prog.covgroups.clone(),
         clock_names: clock_specs.iter().map(|c| c.name.clone()).collect(),
@@ -5337,7 +5390,10 @@ fn lower_test(
         properties: properties.clone(),
         owner: Some(tb_id),
         const_signed: const_signed.clone(),
-        tb_scalar_fields: scalar_fields.iter().map(|f| f.name.clone()).collect(),
+        tb_scalar_fields: scalar_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect(),
         tb_queue_fields: queue_fields
             .iter()
             .map(|f| (f.name.clone(), f.elem.clone()))
@@ -6085,8 +6141,9 @@ fn collect_idents_in_expr(e: &crate::ast::Expr, out: &mut HashSet<String>) {
 
 /// Scalar IR type of a testbench member field (`expected : uint<32>`),
 /// or `None` when the type is outside the scalar subset. Mirrors v1's
-/// `component_field_c_type` → `txn_field_c_type` C-type choice for
-/// the ≤64-bit subset.
+/// `component_field_c_type` → `txn_field_c_type` C-type choice, up to
+/// `MAX_WIDTH_METHOD_BITS`. Signed widths are NOT capped here — the
+/// declared-FIELD rule that does that is `scalar_field_ir_type`.
 pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
@@ -6099,15 +6156,19 @@ pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
         Some(_) => return None,
         None => None,
     };
-    if width.is_some_and(|w| w == 0 || w > 64) {
+    if width == Some(0) {
         return None;
     }
-    match name {
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
-        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
-        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
-        _ => None,
-    }
+    let ty = match name {
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => IrType::UInt(width),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => IrType::SInt(width),
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
+        _ => return None,
+    };
+    // The width policy is `components::field_scalar_width_ok`, shared
+    // with the other field-type decoder. The two may differ about which
+    // SPELLINGS they admit; they must not differ about width.
+    components::field_scalar_width_ok(&ty).then_some(ty)
 }
 
 /// Simple (last-segment) name of a `Named` type expression, if any.
@@ -6323,9 +6384,16 @@ pub(crate) struct LowerCtx {
     /// substituted bit patterns so TB-IR preserves signed operators at
     /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
     pub const_signed: HashMap<String, bool>,
-    /// Scalar testbench field names (`TestbenchSchema::scalar_fields`),
-    /// for `_tb.<field>` access lowering.
-    pub tb_scalar_fields: HashSet<String>,
+    /// Scalar testbench fields (`TestbenchSchema::scalar_fields`), for
+    /// `_tb.<field>` access lowering, with each field's declared IR
+    /// type. The type is what tells a binary-operator guard whether an
+    /// operand is held as `harc_rt::HarcWide<N>`; a name-only set
+    /// could not answer that, and the operand shapes are exactly the
+    /// ones a wide declared field made reachable.
+    /// Every `enum` NAME in the file, for the payload rule that keys on
+    /// enum-ness (see `lower_event_payload`).
+    pub enum_names: HashSet<String>,
+    pub tb_scalar_fields: HashMap<String, IrType>,
     /// Testbench-owned typed queue fields (`TestbenchSchema::queue_fields`),
     /// for `_tb.<field>.push/pop/size/empty` lowering.
     pub tb_queue_fields: HashMap<String, crate::ir::QueueElem>,
@@ -7396,7 +7464,7 @@ impl FuncBuilder<'_> {
 
     pub(crate) fn tb_scalar_field_in_capture_scope(&self, name: &str) -> Option<String> {
         let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
-        (can_capture && self.ctx.tb_scalar_fields.contains(name)).then(|| name.to_string())
+        (can_capture && self.ctx.tb_scalar_fields.contains_key(name)).then(|| name.to_string())
     }
 
     pub(crate) fn set_local_type(&mut self, l: LocalId, ty: IrType) {

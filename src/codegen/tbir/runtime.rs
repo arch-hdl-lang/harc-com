@@ -315,14 +315,7 @@ fn emit_state_struct_body(
     for f in &schema.state_fields {
         match &f.kind {
             crate::ir::StateFieldKind::Scalar { ty, default } => {
-                let (cty, init) = match ty {
-                    crate::ir::IrType::Bool => (
-                        "bool",
-                        if *default != 0 { "true" } else { "false" }.to_string(),
-                    ),
-                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
-                    _ => ("uint64_t", default.to_string()),
-                };
+                let (cty, init) = scalar_field_decl(ty, *default);
                 writeln!(out, "{pad}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::StateFieldKind::Queue { elem } => {
@@ -345,6 +338,23 @@ fn emit_state_struct_body(
     writeln!(out, "{pad}uint64_t _last_out_cycle = 0;").ok();
 }
 
+/// C++ type and initializer for one declared scalar FIELD, shared by
+/// the transactor-state, scoreboard, component, and testbench field
+/// emitters. All four carried their own copy of a
+/// `(bool | int64_t | uint64_t)` choice, which silently narrowed any
+/// field wider than 64 bits to a 64-bit member; `field_scalar_cty` is
+/// the same seam the queue-element emitter already uses, and it knows
+/// about `_harc_u128` and `harc_rt::HarcWide<N>`.
+fn scalar_field_decl(ty: &crate::ir::IrType, default: u64) -> (String, String) {
+    match ty {
+        crate::ir::IrType::Bool => (
+            "bool".to_string(),
+            if default != 0 { "true" } else { "false" }.to_string(),
+        ),
+        _ => (super::field_scalar_cty(ty), default.to_string()),
+    }
+}
+
 /// The C++ element type for a `queue<T>` field. Scalars reuse the exact
 /// width-aware local mapping; a value-record element is the record struct
 /// (carried by value, matching v1's `HarcQueue<Rec>`).
@@ -364,6 +374,11 @@ pub(super) fn scoreboard_struct(
     for f in &sb.fields {
         match &f.kind {
             crate::ir::ScoreboardFieldKind::Scalar { ty, default } => {
+                // `main`'s `ScoreboardScalarDefault` carries a WIDE
+                // literal, which the `u64` slot this branch documented
+                // as a limitation cannot. Its representation wins here;
+                // `scalar_field_decl` still serves the three emitters
+                // whose schema default is still a `u64`.
                 let init = match default {
                     crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
                         crate::ir::IrType::Bool => {
@@ -440,14 +455,7 @@ pub(super) fn component_struct(
     for f in &c.fields {
         match &f.kind {
             ComponentFieldKind::Scalar { ty, default } => {
-                let (cty, init) = match ty {
-                    crate::ir::IrType::Bool => (
-                        "bool",
-                        if *default != 0 { "true" } else { "false" }.to_string(),
-                    ),
-                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
-                    _ => ("uint64_t", default.to_string()),
-                };
+                let (cty, init) = scalar_field_decl(ty, *default);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             ComponentFieldKind::FixedVec(vec) => {
@@ -563,14 +571,7 @@ pub(super) fn tb_struct(
     for field in state_fields {
         match field {
             crate::ir::TbStateFieldSchema::Scalar(f) => {
-                let (cty, init) = match f.ty {
-                    crate::ir::IrType::Bool => (
-                        "bool",
-                        if f.default != 0 { "true" } else { "false" }.to_string(),
-                    ),
-                    crate::ir::IrType::SInt(_) => ("int64_t", f.default.to_string()),
-                    _ => ("uint64_t", f.default.to_string()),
-                };
+                let (cty, init) = scalar_field_decl(&f.ty, f.default);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::TbStateFieldSchema::Queue(f) => {

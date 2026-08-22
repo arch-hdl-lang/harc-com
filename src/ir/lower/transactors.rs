@@ -105,7 +105,13 @@ fn lower_unbound_item<'a>(
     state_names: &mut HashMap<String, StateFieldKind>,
 ) -> Result<(), LowerError> {
     let mut push_state = |f: &crate::ast::ComponentField| -> Result<(), LowerError> {
-        let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+        let sf = lower_state_field(
+            tname,
+            f,
+            &record_ctx.record_ids,
+            record_ctx,
+            StateFieldOwner::Unbound,
+        )?;
         if state_names
             .insert(sf.name.clone(), sf.kind.clone())
             .is_some()
@@ -122,24 +128,35 @@ fn lower_unbound_item<'a>(
         ComponentItem::Hookable(h) => methods_ast.push((h, from_when_active)),
         ComponentItem::Field(f) => {
             let fname = &f.name.name;
+            // The directional rule lives in `lower_state_field`. This
+            // was the THIRD pre-check shadowing it — the previous commit
+            // deleted the two on the initiator paths, said "all three
+            // owners" and left this one, so the unbound form kept the
+            // pre-split blanket `Unsupported` for `event<Color>` and
+            // `event<T> default 0`, both of which v1 fails to compile.
+            // A DIRECTIONAL field goes to `lower_state_field`, which
+            // owns that rule, before any of the named-type branches
+            // below get a look. Deleting the old pre-check without this
+            // was a regression: `dut : in TlmReadInitiator` fell into
+            // the module-handle branch and LOWERED, tbir dropping the
+            // `in` marker itself — byte-identical output to the
+            // undirected spelling — where it had been refused.
             if f.direction.is_some() {
-                if super::components::is_event_field(f) {
-                    return Err(unsupported(
-                        &format!("transactor `{tname}` directional event field `{fname}`"),
-                        "event-driven transactors await the event slice",
-                    ));
-                }
-                return Err(not_implemented(
-                    &format!("transactor `{tname}` directional scalar field `{fname}`"),
-                    "event-driven transactors await the event slice; v1 emits a plain \
-                     scalar member and DROPS the direction, so the field means something \
-                     other than what was written (and reads indeterminate unless it also \
-                     carries a `default`)",
-                    V1Status::SilentlyMisLowers,
-                ));
+                return push_state(f);
             }
             if let TypeExpr::Named { name, .. } = &f.ty {
                 let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                // KNOWN GAP, measured and deliberately not fixed here:
+                // `record_ids` also holds regblock MIRRORS, so
+                // `b : DmaRegs` is accepted as a value-record — tbir
+                // emits `DmaRegs b{};` and compiles, while v1 emits
+                // `VDmaRegs* b = nullptr;` and g++ refuses it (1 error).
+                // `queue<DmaRegs>` is the same hole: tbir gives
+                // `HarcQueue<DmaRegs>`, v1 `HarcQueue<uint64_t>`, both
+                // building. Gating it needs a regblock-name set that
+                // does not reach this function; the event allow-list
+                // above sidesteps the same map rather than trusting it.
+                //
                 // A whole value-record held as transactor state
                 // (`cur : Beat`), legal in BOTH declaration positions —
                 // v1 compiles one written inside `when active` exactly
@@ -433,7 +450,8 @@ pub(crate) fn lower_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -573,11 +591,11 @@ fn lower_bound_target_transactor(
     side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
-    let component_hosted = t
-        .items
-        .iter()
-        .chain(t.when_active.iter().flatten())
-        .any(|item| matches!(item, ComponentItem::OnHandler(handler) if !handler.periodic));
+    // The SAME question `transactor_is_component` answers for this
+    // transactor, asked through the same function rather than re-derived
+    // here. When it says yes, the component view owns every field this
+    // pass is about to skip.
+    let component_hosted = super::components::bound_transactor_is_component(t);
     // Resolve the bound bus.
     let bus_name = match t.bound_to.as_ref() {
         Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
@@ -643,7 +661,13 @@ fn lower_bound_target_transactor(
                 if component_hosted && !target_state_field {
                     continue;
                 }
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+                let sf = lower_state_field(
+                    tname,
+                    f,
+                    &record_ctx.record_ids,
+                    record_ctx,
+                    StateFieldOwner::BoundTarget,
+                )?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -870,7 +894,8 @@ fn lower_bound_target_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1181,26 +1206,24 @@ fn lower_bound_initiator_transactor(
                 // An event/directional field (`req : in event<T>`) on a
                 // bound-to transactor is the event-driven driver form —
                 // it routes to the component path, which does not yet
-                // carry the bound-bus handshake context. Reject it
-                // precisely (the unbound event-driven form is #382;
-                // bound-to event-driven is a follow-up slice).
-                if f.direction.is_some() {
-                    return Err(unsupported(
-                        &format!(
-                            "initiator-side bound-to transactor `{tname}` event/directional \
-                             field `{}`",
-                            f.name.name
-                        ),
-                        "event-driven bound-to transactors (`in event<T>` + `on <ev>` driving \
-                         the bound bus) are a follow-up slice; only `hookable`-method BFMs \
-                         with scalar state are lowered",
-                    ));
-                }
+                // carry the bound-bus handshake context.
+                // The directional rule lives in `lower_state_field`,
+                // which every state field already goes through. This
+                // site used to answer first, which made the split there
+                // dead code on this path — a directional SCALAR kept a
+                // blanket `Unsupported` while v1 dropped the direction
+                // and compiled. One rule, one place, three owners.
                 // A scalar persistent state field (`uint<N>`/`sint<N>`/
                 // `bool` ≤64 bits with a plain-literal default). Reuse the
                 // bound-to target state-field lowering; reject module/
                 // transaction-typed and non-scalar fields inside it.
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+                let sf = lower_state_field(
+                    tname,
+                    f,
+                    &record_ctx.record_ids,
+                    record_ctx,
+                    StateFieldOwner::BoundInitiator,
+                )?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -1298,19 +1321,19 @@ fn lower_bound_initiator_transactor(
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push((h, true)),
             ComponentItem::Field(f) => {
-                if f.direction.is_some() {
-                    return Err(unsupported(
-                        &format!(
-                            "initiator-side bound-to transactor `{tname}` event/directional \
-                             field `{}`",
-                            f.name.name
-                        ),
-                        "event-driven bound-to transactors (`in event<T>` + `on <ev>` driving \
-                         the bound bus) are a follow-up slice; only `hookable`-method BFMs \
-                         with scalar state are lowered",
-                    ));
-                }
-                let sf = lower_state_field(tname, f, &record_ctx.record_ids, record_ctx)?;
+                // The directional rule lives in `lower_state_field`,
+                // which every state field already goes through. This
+                // site used to answer first, which made the split there
+                // dead code on this path — a directional SCALAR kept a
+                // blanket `Unsupported` while v1 dropped the direction
+                // and compiled. One rule, one place, three owners.
+                let sf = lower_state_field(
+                    tname,
+                    f,
+                    &record_ctx.record_ids,
+                    record_ctx,
+                    StateFieldOwner::BoundInitiator,
+                )?;
                 if state_names
                     .insert(sf.name.clone(), sf.kind.clone())
                     .is_some()
@@ -1455,7 +1478,8 @@ fn lower_bound_initiator_transactor(
         properties: record_ctx.properties.clone(),
         owner: None,
         const_signed: record_ctx.const_signed.clone(),
-        tb_scalar_fields: HashSet::new(),
+        enum_names: HashSet::new(),
+        tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
@@ -1573,30 +1597,200 @@ fn lower_bound_initiator_transactor(
     Ok((schema, funcs))
 }
 
-/// Lower one persistent state field of a bound-to target transactor.
-/// Two kinds are lowered, reusing the same machinery scoreboards and
-/// composite components already carry:
-///   * a scalar `≤64`-bit counter/latch (`read_count : uint<32> default
-///     0`) with a plain-integer/bool default (or no default → 0);
-///   * a typed FIFO `queue<scalar>` / `queue<Record>`
-///     (`pending : queue<uint<32>>` / `queue<Beat>`), whose element type
-///     resolves through the shared `lower_queue_elem` seam.
-/// Event/directional fields, module/transaction-typed fields, a `default`
-/// on a queue field, and `guard`/`reset` clauses are out of subset.
+/// How the transactor whose state field this is was declared. Every
+/// message in `lower_state_field` used to say "bound-to transactor", on all
+/// FOUR call sites — including the unbound DUT-poking form, which is
+/// bound to nothing, and the two initiator-side ones, whose sibling
+/// arms in the same functions say "initiator-side bound-to transactor".
+/// A diagnostic that names the wrong construct sends the reader to the
+/// wrong part of their file.
+#[derive(Clone, Copy)]
+pub(crate) enum StateFieldOwner {
+    /// `transactor X` with no `bound to` — drives the DUT directly.
+    Unbound,
+    /// `transactor X bound to <Bus>` serving `thread bus.<m>(...)`.
+    BoundTarget,
+    /// `transactor X bound to <Bus>` with `hookable` methods.
+    BoundInitiator,
+}
+
+impl StateFieldOwner {
+    fn label(self) -> &'static str {
+        match self {
+            StateFieldOwner::Unbound => "transactor",
+            StateFieldOwner::BoundTarget => "bound-to transactor",
+            StateFieldOwner::BoundInitiator => "initiator-side bound-to transactor",
+        }
+    }
+}
+
+/// Lower one persistent state field of a transactor, in any of the
+/// three forms `StateFieldOwner` names. Two kinds are lowered, reusing
+/// the machinery scoreboards and composite components already carry:
+///   * a scalar `<=64`-bit counter/latch (`read_count : uint<32>
+///     default 0`) with a plain-integer/bool default (or none -> 0);
+///   * a typed FIFO `queue<scalar>` / `queue<Record>`, whose
+///     element type resolves through the shared `lower_queue_elem` seam.
 ///
-/// `record_ids` resolves `queue<Record>` element names (empty for the
-/// unbound DUT-poking form's ctx, which then only admits scalar queues).
+/// `record_ids` resolves `queue<Record>` element names. It is NOT a
+/// "does v1 declare this type" oracle — it also holds regblock MIRRORS,
+/// which v1 declares under a different name and flattens in an event
+/// signature, which is why the event allow-list does not consult it. It
+/// is the
+/// same non-empty map at all four call sites — the previous version of
+/// this comment claimed it was empty for the unbound form, which it
+/// never was.
+///
+/// A transaction-typed field is NOT out of subset (it lowers through
+/// `record_ids` like any other record), and there is no `guard`/`reset`
+/// clause to reject — `ComponentField` carries no such thing. Both were
+/// claimed here too.
 fn lower_state_field(
     tname: &str,
     f: &ComponentField,
     record_ids: &std::collections::HashMap<String, crate::ir::RecordId>,
     record_ctx: &super::LowerCtx,
+    owner: StateFieldOwner,
 ) -> Result<StateFieldSchema, LowerError> {
     let fname = &f.name.name;
+    let who = owner.label();
     if f.direction.is_some() {
-        return Err(unsupported(
-            &format!("bound-to transactor `{tname}` event/directional field `{fname}`"),
-            "",
+        // `f.direction.is_some()` admits an EVENT field and everything
+        // else, and they get different verdicts. The event half is
+        // itself mixed — see the allow-list below.
+        //
+        //   * an EVENT field — v1 emits the subscriber vector
+        //     (`std::vector<std::function<void(uint64_t)>>`) and it
+        //     works, so `--codegen v1` is a real way out;
+        //   * a directional SCALAR (`p : in uint<8>`) — v1 emits a
+        //     plain `uint64_t p;` and DROPS the direction, compiling a
+        //     program that means something else. Measured: g++ exit 0.
+        //
+        // Labelling the whole arm from the event probe alone pointed
+        // the scalar case at a backend that silently changes what the
+        // field means.
+        if super::components::is_event_field(f) {
+            // An ALLOW-LIST, after a blacklist grew three times.
+            //
+            // `Unsupported` promises v1 handles the program, so it may
+            // only be given to a payload shape whose v1 behaviour is
+            // certified HERE. What can be certified at this site is a
+            // single positional BUILTIN scalar payload with no
+            // `default`: v1 emits `std::vector<std::function<void(
+            // uint64_t)>> ev;` and it compiles and works.
+            //
+            // Everything else v1 does one of two things to, measured:
+            //   `event<Color>`            5 g++ errors — v1 emits no
+            //                             C++ enum, so the payload name
+            //                             in the signature is undeclared
+            //   `event<string>`,
+            //   `event<BusName>`,
+            //   `event<TransactorName>`,
+            //   `event<queue<T>>`,
+            //   `event<stream<T>>`,
+            //   `event<pkg.Beat>`,
+            //   `event<T, U>`,
+            //   `event<depth=16>`,
+            //   `event<RegblockMirror>`   0 errors — the payload is
+            //                             silently FLATTENED to
+            //                             `void(uint64_t)`
+            //
+            // The flattening rows are `SilentlyMisLowers`, which
+            // outranks the enum row's `EmitsUncompilable`, so one label
+            // covers the lot.
+            //
+            // A record payload (`event<Beat>`) does work under v1, and
+            // this refuses it too — because `record_ids` cannot tell a
+            // struct from a REGBLOCK MIRROR, and the mirror is one of
+            // the flattening rows. Certifying it needs a regblock set
+            // that does not reach this function. Over-cautious beats
+            // actively false: the alternative is an `Unsupported` that
+            // promises v1 works for a shape where it silently does not.
+            let payload_certified = match &f.ty {
+                TypeExpr::Builtin { args, .. } => match args.as_slice() {
+                    // A bare `event` with no payload. Certified, and the
+                    // rule is not new: `lower_event_payload` already
+                    // says "a bare `event` with no payload defaults to
+                    // an unsigned scalar". v1 agrees — it emits the same
+                    // `void(uint64_t)` member the certified
+                    // `event<uint<8>>` produces, byte for byte. Answering
+                    // `false` here gave two spellings of one member
+                    // opposite verdicts.
+                    [] => true,
+                    [crate::ast::TypeArg::Type(TypeExpr::Builtin { name, .. })] => matches!(
+                        name,
+                        crate::ast::BuiltinTy::UInt
+                            | crate::ast::BuiltinTy::UIntCap
+                            | crate::ast::BuiltinTy::SInt
+                            | crate::ast::BuiltinTy::SIntCap
+                            | crate::ast::BuiltinTy::Bits
+                            | crate::ast::BuiltinTy::Bool
+                            | crate::ast::BuiltinTy::BoolLower
+                            | crate::ast::BuiltinTy::Bit
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            };
+            // Payload FIRST. A field that is both defaulted and
+            // uncertified is under both arms, and this one is graded a
+            // notch lower — checking the default first handed
+            // `event<string> default ev` the weaker
+            // `EmitsUncompilable` while v1 compiled it and flattened
+            // the payload.
+            if !payload_certified {
+                return Err(not_implemented(
+                    &format!("{who} `{tname}` event field `{fname}` with an uncertified payload"),
+                    "TB-IR lowers an event payload that is a single builtin scalar, or none \
+                     at all; for anything else v1 either flattens the payload to a 64-bit \
+                     integer without a word, or names a type it never declares"
+                        .to_string(),
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            if f.default.is_some() {
+                return Err(not_implemented(
+                    &format!("{who} `{tname}` event field `{fname}` with a default"),
+                    // NOT "which does not convert": `format_simple_expr`
+                    // pastes a bare `Ident` verbatim, so `default ev2`
+                    // naming another event field emits
+                    // `... ev = ev2;` and compiles. `EmitsUncompilable`
+                    // is the worst under the arm, which is what sets it.
+                    "an event field is a subscriber list, not a value; v1 pastes the \
+                     default into its initialiser, which does not convert for a literal"
+                        .to_string(),
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            return Err(unsupported(
+                &format!("{who} `{tname}` directional event field `{fname}`"),
+                "event-driven transactors await the event slice; an `in event<T>` needs an \
+                 `on <ev>` handler and an `out event<T>` needs an `emit` site and a \
+                 subscriber, and neither is lowered yet",
+            ));
+        }
+        // NOT "scalar": this is everything directional that is not an
+        // event — `in Vec<uint<8>, 4>`, `in Beat`, `in Color`, and a
+        // module handle (`dut : in Top`), which is routed here
+        // deliberately by the dispatch at the top of
+        // `lower_unbound_item`.
+        //
+        // What most of them share is that v1 emits the member for the
+        // underlying type and DROPS the direction. The module handle is
+        // the exception and the reason text below does NOT describe it:
+        // v1's output for `dut : in Top` is byte-identical to
+        // `dut : Top` and correct, since the handle is bound by the
+        // test. It sits under this arm because `SilentlyMisLowers` is
+        // the arm's WORST landing (`p : in uint<8>` genuinely does mean
+        // something else), not because v1 mis-lowers this one.
+        return Err(not_implemented(
+            &format!("{who} `{tname}` directional non-event field `{fname}`"),
+            "event-driven transactors await the event slice; v1 emits the member for the \
+             field's own type and DROPS the direction, so the field means something other \
+             than what was written (and reads indeterminate unless it also carries a \
+             `default`)"
+                .to_string(),
+            V1Status::SilentlyMisLowers,
         ));
     }
     // A `queue<T>` state field → the shared queue-element machinery
@@ -1611,14 +1805,29 @@ fn lower_state_field(
     } = &f.ty
     {
         if f.default.is_some() {
-            return Err(unsupported(
-                &format!(
-                    "bound-to transactor `{tname}` queue state field `{fname}` with a default"
-                ),
-                "a `queue<T>` state field starts empty; drop the `default`",
+            // v1 pastes the default's SOURCE TEXT into the member
+            // initialiser. Enumerated over what that text can be:
+            //   `default 0`  -> `HarcQueue<uint64_t> q = 0;`
+            //                   g++: could not convert `0` from `int`
+            //   `default q0` -> `HarcQueue<uint64_t> q = q0;` (a bare
+            //                   `Ident` is pasted verbatim) — compiles
+            // So the arm is NOT uniformly uncompilable, and a comment
+            // saying "there is no `--codegen v1` to send anyone to"
+            // would be false. `EmitsUncompilable` is the WORST outcome
+            // under it, which is what sets the label.
+            return Err(not_implemented(
+                &format!("{who} `{tname}` queue state field `{fname}` with a default"),
+                "a `queue<T>` state field starts empty; drop the `default`".to_string(),
+                V1Status::EmitsUncompilable,
             ));
         }
-        let elem = super::components::lower_queue_elem(tname, fname, args.first(), record_ids)?;
+        let elem = super::components::lower_queue_elem(
+            tname,
+            fname,
+            args.first(),
+            record_ids,
+            &record_ctx.enum_names,
+        )?;
         return Ok(StateFieldSchema {
             name: fname.clone(),
             kind: StateFieldKind::Queue { elem },
@@ -1634,20 +1843,43 @@ fn lower_state_field(
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(&rid) = record_ids.get(simple) {
             if !generics.is_empty() {
-                return Err(unsupported(
+                // NOT "a record cannot take generic parameters":
+                // `parse_transaction` calls
+                // `parse_optional_generic_params`, so
+                // `transaction Beat#(W: int = 8)` parses and has its own
+                // measured arm in `records.rs`. Only `struct` has no
+                // slot. `record_ids` is transactions UNION structs UNION
+                // regblock mirrors, so this arm spans all three:
+                //   struct / transaction -> v1 emits `Beat b;`, dropping
+                //     the argument list without a word; compiles, and
+                //     runs the program `b : Beat` would have given
+                //   regblock mirror      -> v1 emits
+                //     `VDmaRegs* b = nullptr;` (its
+                //     `is_dut_pointer_field_type` does not consult
+                //     regblocks) and g++ refuses it
+                // `SilentlyMisLowers` outranks `EmitsUncompilable`, so
+                // that is the arm's label.
+                return Err(not_implemented(
                     &format!(
-                        "bound-to transactor `{tname}` record state field `{fname}` of a \
-                         generic-applied type"
+                        "{who} `{tname}` record state field `{fname}` of a generic-applied type"
                     ),
-                    "",
+                    "this type takes no generic arguments here (only a `transaction` \
+                     declares them, and not at this site); v1 drops the argument list \
+                     without a word and lowers the field as if it were not written"
+                        .to_string(),
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             if f.default.is_some() {
-                return Err(unsupported(
-                    &format!(
-                        "bound-to transactor `{tname}` record state field `{fname}` with a default"
-                    ),
-                    "a record state field is default-constructed; drop the `default`",
+                // Same shape and same enumeration as the `queue`
+                // default above: `default 0` gives `Beat b = 0;` and
+                // g++ answers "could not convert `0` from `int`", while
+                // `default b0` naming another record field pastes
+                // verbatim and compiles. Worst wins.
+                return Err(not_implemented(
+                    &format!("{who} `{tname}` record state field `{fname}` with a default"),
+                    "a record state field is default-constructed; drop the `default`".to_string(),
+                    V1Status::EmitsUncompilable,
                 ));
             }
             return Ok(StateFieldSchema {
@@ -1657,10 +1889,44 @@ fn lower_state_field(
         }
     }
     let Some(ty) = super::tb_scalar_field_ir_type(&f.ty) else {
-        return Err(unsupported(
-            &format!("bound-to transactor `{tname}` state field `{fname}` with a non-scalar type"),
-            "target-transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (≤64 bits), \
-             a whole value-record, or a `queue<scalar>` / `queue<Record>`",
+        // The catch-all of `tb_scalar_field_ir_type`, which answers
+        // `None` for every non-`Builtin` type and every builtin that is
+        // not `uint`/`sint`/`bits`/`bool`/`bit` within
+        // `scalar_field_ir_type`. Enumerated rather than probed once,
+        // because an arm's verdict is the WORST thing v1 does anywhere
+        // under it:
+        //
+        //   `uint<128>`         -> lowered. It reached this arm while
+        //                          the shared rule capped at 64, and
+        //                          was the one landing here where v1
+        //                          was a genuine way out; the cap is
+        //                          the declared-field width now, so
+        //                          this no longer answers `None`
+        //   `uint<2048>`        -> `harc_rt::HarcWide<64> w;`, compiles
+        //                          — past the declared-field width, and
+        //                          v1 does handle the declaration
+        //   `Vec<uint<8>, 4>`   -> `std::array<uint64_t, 4> v{};`, compiles
+        //   `stream<uint<8>>`   -> `uint64_t s;`                 , compiles
+        //   `buffer<uint<8>,N>` -> `uint64_t bf;`                , compiles
+        //   an enum type        -> `Color m;`  — g++: does not name a type
+        //   an unknown named ty -> `VWidget* d = nullptr;`  — likewise
+        //   `Vec<...> default 0`-> `std::array<...> v = 0;`  — no conversion
+        //
+        // The `stream`/`buffer` rows set the label. They fall through
+        // `component_field_c_type`'s `_ =>` into `scalar_leaf_c_type`,
+        // which answers `None`, and come out as a bare `uint64_t` — a
+        // member that compiles and means something else entirely. That
+        // is `SilentlyMisLowers`, two grades worse than the
+        // `Unsupported` a `Vec`-only probe suggested.
+        return Err(not_implemented(
+            &format!("{who} `{tname}` state field `{fname}` with a non-scalar type"),
+            "transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (up to 1024 \
+             bits), a whole value-record, or a `queue<scalar>` / `queue<Record>`; v1 \
+             emits a bare `uint64_t` member for a `stream`/`buffer` field, which compiles \
+             and means something else (for a `uint<N>` past 1024 bits v1 declares the \
+             member correctly, so `--codegen v1` does work for that one)"
+                .to_string(),
+            V1Status::SilentlyMisLowers,
         ));
     };
     // Same rule as the component/scoreboard field defaults, and the
