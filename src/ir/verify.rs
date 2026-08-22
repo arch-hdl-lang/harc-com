@@ -3145,6 +3145,29 @@ impl Checker<'_> {
                         block: self.bid,
                         detail: format!("c{} out of range", constraints.0),
                     });
+                } else if let Some(local) = self.func.locals.get(target.index()) {
+                    if let IrType::Record(record) = local.ty {
+                        let site = &self.prog.constraint_sites[constraints.index()];
+                        match self.prog.records.get(record.index()) {
+                            Some(schema) if schema.name == site.record => {}
+                            Some(schema) => self.errs.push(VerifyError::DanglingConstraintRef {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "c{} is for record `{}` but target local `{}` has record `{}`",
+                                    constraints.0, site.record, local.name, schema.name
+                                ),
+                            }),
+                            None => self.errs.push(VerifyError::DanglingConstraintRef {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "target local `{}` references missing record r{}",
+                                    local.name, record.0
+                                ),
+                            }),
+                        }
+                    }
                 }
             }
             Terminator::Fatal(args) => self.check_fmt_args(args),

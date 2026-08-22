@@ -121,6 +121,7 @@ struct SuiteScaffold {
     // program table, so today every shard is emitted with identical bytes,
     // including shards whose own tests use no probe and no `randomize`.
     has_probes: bool,
+    uses_constraint_solver: bool,
     problem_table_cpp: String,
     randomize_snippets: Vec<String>,
 }
@@ -171,6 +172,11 @@ impl SuiteScaffold {
         // body depth (run/check fn = depth 2 → block stmts at depth 5).
         let randomize_snippets =
             crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
+        // The runtime metadata table intentionally excludes component-scope
+        // sites. Include detection must follow the source/codegen decision,
+        // not table non-emptiness, or a component-only kept struct emits Z3
+        // calls without the runtime header.
+        let uses_constraint_solver = crate::codegen::cpp_tb::uses_constraint_solver(file);
 
         // Probe reads/forces dereference `dut->rootp->...`, which needs the
         // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
@@ -188,6 +194,7 @@ impl SuiteScaffold {
         Ok(SuiteScaffold {
             dut_type,
             has_probes,
+            uses_constraint_solver,
             problem_table_cpp,
             randomize_snippets,
         })
@@ -243,6 +250,7 @@ fn emit_selected_tests(
         dut_type,
         &test_names,
         &scaffold.problem_table_cpp,
+        scaffold.uses_constraint_solver,
         scaffold.has_probes,
         opts.cosim.as_ref(),
     );

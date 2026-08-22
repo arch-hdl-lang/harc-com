@@ -51,6 +51,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Persistent data-scoreboard unsigned scalar state through 1024 bits,
   including cross-phase reads/writes and width-checked IR assignments.
 - [x] Default-constructed record locals inside scalar-valued pure helpers.
+- [x] `keep` constraints on randomized `struct` values, including nested
+  record prefixing and component-only solver sites, merged through the same
+  typed constraint site and Z3 path as transaction keeps.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -59,8 +62,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 151 remaining constructor call sites (152 textual matches including
-the `unsupported` helper definition) as an inventory, not 152 separate tasks.
+Treat the 150 remaining constructor call sites (151 textual matches including
+the `unsupported` helper definition) as an inventory, not 151 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -91,10 +94,10 @@ fixture runs under both emitters and trace-diffs wide add, bit-not, ternary, and
 wrapped-nibble samples. Wrapping above 64 bits remains a measured v1 rejection,
 not a retirement blocker.
 
-The recommended next family is the remaining state/helper gaps with a positive
-v1 control. Cluster those sites by the missing shared IR value shape rather
-than by source spelling, and keep verifier type metadata in the same patch as
-each new lowering path.
+The recommended next family is the remaining state gaps with a positive v1
+control. Cluster those sites by the missing shared IR value shape rather than
+by source spelling, and keep verifier type metadata in the same patch as each
+new lowering path.
 
 Wide unsigned data-scoreboard state is complete: `uint`/`bits` fields through
 1024 bits reuse the native, `_harc_u128`, and `HarcWide<N>` carriers already
@@ -106,7 +109,8 @@ has signed value semantics. This source-shape family shares the
 generic unsupported field-type constructor with non-scalar fields, so that
 batch left the raw inventory at 153 textual matches. The pure-helper
 record-local batch below removes one constructor, leaving 152 textual matches
-(151 constructors plus the helper).
+(151 constructors plus the helper). The struct-keep batch removes the dedicated
+rejection and leaves 151 textual matches (150 constructors plus the helper).
 
 ## Review-derived semantic gates
 
@@ -169,8 +173,9 @@ not applicable before requesting review:
    The completed event, queue-query, method-hook, transactor-heartbeat, and
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
-   state, and pure-helper record-local slices reduce the count from 174 to 152
-   textual matches (151 constructors plus the helper definition). The
+   state, pure-helper record-local, and struct-keep slices reduce the count
+   from 174 to 151 textual matches (150 constructors plus the helper
+   definition). The
    scoreboard source family did not remove a constructor because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths
    were also reclassified because v1 rejects or silently mis-lowers them.

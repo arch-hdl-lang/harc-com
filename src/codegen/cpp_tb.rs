@@ -20129,6 +20129,7 @@ pub fn uses_constraint_solver(file: &SourceFile) -> bool {
         }
         Item::Test(t) => t.items.iter().any(|ti| match ti {
             TestItem::Stmt(s) => stmt(s, &solver_bearing),
+            TestItem::Phase(_, body) => block(body, &solver_bearing),
             TestItem::Scope(sc) => {
                 sc.setup
                     .as_ref()
@@ -23354,7 +23355,10 @@ fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
     out
 }
 
-fn collect_record_keeps(
+/// Collect a record's direct keeps plus recursively-prefixed keeps from
+/// nested record fields. Shared with TB-IR lowering so both emitters build
+/// identical call-site constraint expressions.
+pub(crate) fn collect_record_keeps(
     items: &[TxnBodyItem],
     record_bodies: &std::collections::HashMap<String, Vec<TxnBodyItem>>,
     record_fields: &std::collections::HashMap<String, Vec<Field>>,

@@ -11352,7 +11352,7 @@ end test T"#
 ///
 /// | construct | v1 | verdict |
 /// |---|---|---|
-/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
+/// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | lowers through shared record keeps |
 /// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
 /// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
 /// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | lowers |
@@ -11375,16 +11375,102 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         )
     };
 
-    // A `keep` on a struct DOES reach the solver — the absence of a
-    // randomize metadata entry, which is what the first pass measured,
-    // says nothing about the generated solver lambda.
-    let keep = prog("struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n");
-    assert_unsupported(&lower_src(&keep).unwrap_err());
+    // A `keep` on a struct reaches the same typed randomize site as a
+    // transaction keep. The RecordSchema carries the diagnostic text and
+    // the ConstraintSite carries the original AST expression used by Z3.
+    let keep = prog(
+        "struct Rec\n    a : uint<8>\n    keep a < 10\nend struct Rec\n\n\
+         struct Other\n    x : uint<8>\nend struct Other\n",
+    );
+    let lowered = lower_src(&keep).expect("a struct keep lowers");
+    verify::verify_program(&lowered).expect("a struct keep verifies");
+    assert_eq!(lowered.records[0].keeps, ["a < 10"]);
+    assert_eq!(lowered.constraint_sites.len(), 1);
+    assert_eq!(lowered.constraint_sites[0].record, "Rec");
+    assert_eq!(lowered.constraint_sites[0].constraints.len(), 1);
+    assert!(
+        lowered.constraint_sites[0].problem_id.is_some(),
+        "the struct keep reaches the typed Z3 problem table"
+    );
+    let tbir = tbir::emit(&lowered, &merged_src(&keep), &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits the struct keep solver");
+    assert!(
+        tbir.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
+        "TBIR emits the struct constraint into the solver: {tbir}"
+    );
     let v1 = cpp_tb::emit(&merged_src(&keep)).expect("v1 emits");
     assert!(
         v1.contains("_s.add(z3::ult(_z_a, _ctx.bv_val((uint64_t)10, 64)));"),
         "v1 emits the constraint into the solver: {v1}"
     );
+
+    // A pass cannot retarget the ConstraintRef to a different record schema:
+    // the emitter splices a record-specific solver/writeback snippet.
+    let mut broken = lowered.clone();
+    broken.constraint_sites[0].record = "Other".to_string();
+    let errs = verify::verify_program(&broken).expect_err("wrong-record constraint site rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::DanglingConstraintRef { detail, .. }
+                if detail.contains("for record `Other`") && detail.contains("record `Rec`")
+        )),
+        "{errs:?}"
+    );
+
+    // Nested record keeps are recursively prefixed into the outer
+    // randomize site; copying only the outer declaration's direct body
+    // would silently leave `leaf.value` unconstrained.
+    let nested = prog(
+        "struct Leaf\n    value : uint<8>\n    keep value < 10\nend struct Leaf\n\n\
+         struct Rec\n    leaf : Leaf\nend struct Rec\n",
+    );
+    let nested_ir = lower_src(&nested).expect("nested struct keeps lower");
+    verify::verify_program(&nested_ir).expect("nested struct keeps verify");
+    assert_eq!(nested_ir.constraint_sites[0].constraints.len(), 1);
+    assert!(nested_ir.constraint_sites[0].problem_id.is_some());
+    let nested_cpp = tbir::emit(
+        &nested_ir,
+        &merged_src(&nested),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("nested struct keeps emit");
+    assert!(
+        nested_cpp.contains("z3::ult(_z_leaf_value, _ctx.bv_val((uint64_t)10, 64))"),
+        "nested field keep is prefixed into the solver: {nested_cpp}"
+    );
+
+    // A component-only kept-struct site is not represented in the main
+    // typed runtime problem table. Include detection must still follow the
+    // emitted solver path, or the generated z3:: calls will not compile.
+    let component_only = fixture("component_struct_keep_randomize_test.harc");
+    let component_ir = lower_src(&component_only).expect("component-only struct keep lowers");
+    verify::verify_program(&component_ir).expect("component-only struct keep verifies");
+    assert_eq!(component_ir.constraint_sites.len(), 1);
+    assert!(component_ir.constraint_sites[0].problem_id.is_none());
+    let component_cpp = tbir::emit(
+        &component_ir,
+        &merged_src(&component_only),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("component-only struct keep emits");
+    assert!(component_cpp.contains("#include \"harc_z3_rt.h\""));
+    assert!(component_cpp.contains("z3::solver _s(_ctx);"));
+
+    // Custom phases are separate TestItem bodies, not Scope run/check
+    // blocks. They participate in the same source-level solver include
+    // decision when their body contains the only constrained randomize.
+    let phase_only = fixture("phase_struct_keep_randomize_test.harc");
+    let phase_ir = lower_src(&phase_only).expect("phase-only struct keep lowers");
+    verify::verify_program(&phase_ir).expect("phase-only struct keep verifies");
+    let phase_cpp = tbir::emit(
+        &phase_ir,
+        &merged_src(&phase_only),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("phase-only struct keep emits");
+    assert!(phase_cpp.contains("#include \"harc_z3_rt.h\""));
+    assert!(phase_cpp.contains("z3::solver _s(_ctx);"));
 
     // Both `default` shapes make v1 emit an initializer g++ rejects.
     for (decls, needle) in [

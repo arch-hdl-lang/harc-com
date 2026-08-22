@@ -1,0 +1,27 @@
+// A custom callable phase containing the program's only solver site. The
+// source-level solver-use walker must visit TestItem::Phase so TBIR includes
+// the Z3 runtime before emitting the phase method's kept-struct randomize.
+
+struct PhaseKeepValue
+    value : uint<16>
+    keep value > 3000
+    keep value < 4000
+end struct PhaseKeepValue
+
+testbench PhaseStructKeepTb
+    dut : Top
+end testbench PhaseStructKeepTb
+
+impl PhaseStructKeepRandomizeTest for PhaseStructKeepTb
+    phase solve
+        let item : PhaseKeepValue
+        randomize(item)
+        assert item.value > 3000 else fail("phase keep lower bound ${item.value}")
+        assert item.value < 4000 else fail("phase keep upper bound ${item.value}")
+        log(info, "phase struct keep randomized ${item.value}")
+    end phase solve
+
+    run
+        solve()
+    end run
+end impl PhaseStructKeepRandomizeTest

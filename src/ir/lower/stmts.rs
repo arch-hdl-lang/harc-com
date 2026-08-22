@@ -3698,11 +3698,11 @@ impl FuncBuilder<'_> {
         };
         let record = self.ctx.records[record_id.index()].name.clone();
 
-        // Spec §4: transaction-level `keep`s are part of every
+        // Spec §4: transaction/struct-level `keep`s are part of every
         // `randomize(t)` of that type. Merge them ahead of the call-site
         // `with {...}` body, exactly as v1's `StmtKind::Randomize` arm.
         let mut constraints: Vec<crate::ast::Expr> = Vec::new();
-        if let Some(keeps) = self.ctx.txn_keeps.get(&record) {
+        if let Some(keeps) = self.ctx.record_keeps.get(&record) {
             constraints.extend(keeps.iter().cloned());
         }
         constraints.extend(with_body.iter().cloned());

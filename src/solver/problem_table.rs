@@ -170,7 +170,11 @@ fn push_site_entries(
     next_problem_id: &mut u32,
 ) {
     for site in sites {
-        let Some(txn) = elab.transaction(&site.txn_name).cloned() else {
+        let Some(txn) = elab
+            .transaction(&site.txn_name)
+            .or_else(|| elab.struct_schema(&site.txn_name))
+            .cloned()
+        else {
             continue;
         };
         let source = TypedSolverProblemSource::RandomizeSite {

@@ -1859,24 +1859,43 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
-    // Transaction-level `keep` clauses as AST exprs, by transaction
+    // Record-level `keep` clauses as AST exprs, by transaction/struct
     // name. Spec §4: these are part of every `randomize(t)` of that
     // type, merged ahead of any call-site `with {...}` body (v1's
-    // `txn_keeps` merge in `StmtKind::Randomize`).
-    let mut txn_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
+    // record-keep merge in `StmtKind::Randomize`).
+    let mut record_bodies: HashMap<String, Vec<crate::ast::TxnBodyItem>> = HashMap::new();
+    let mut record_fields: HashMap<String, Vec<crate::ast::Field>> = HashMap::new();
     for it in &file.items {
-        if let Item::Transaction(t) = it {
-            let keeps: Vec<crate::ast::Expr> = t
-                .body
-                .iter()
-                .filter_map(|item| match item {
-                    crate::ast::TxnBodyItem::Keep(k) => Some(k.expr.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !keeps.is_empty() {
-                txn_keeps.insert(t.name.name.clone(), keeps);
+        match it {
+            Item::Transaction(t) => {
+                record_bodies.insert(t.name.name.clone(), t.body.clone());
+                record_fields.insert(
+                    t.name.name.clone(),
+                    t.body
+                        .iter()
+                        .filter_map(|item| match item {
+                            crate::ast::TxnBodyItem::Field(field) => Some(field.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                );
             }
+            Item::Struct(s) => {
+                record_bodies.insert(s.name.name.clone(), s.body.clone());
+                record_fields.insert(s.name.name.clone(), s.fields.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut record_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
+    for (name, body) in &record_bodies {
+        let keeps = crate::codegen::cpp_tb::collect_record_keeps(
+            body,
+            &record_bodies,
+            &record_fields,
+        );
+        if !keeps.is_empty() {
+            record_keeps.insert(name.clone(), keeps);
         }
     }
 
@@ -1929,8 +1948,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
         // Pure helpers cannot randomize records (that statement is outside
-        // the pure scan subset), so these maps stay inert here.
-        txn_keeps: HashMap::new(),
+        // the pure scan subset), but declaration lowerers reuse this context
+        // when constructing method contexts that can host `randomize`.
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
@@ -1998,7 +2018,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        txn_keeps: txn_keeps.clone(),
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         // tseq generator bodies never access the DUT.
@@ -2212,9 +2232,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
         // Component method bodies are not cataloged in the constraint-IR
-        // problem table; a `randomize` inside one lowers with no
-        // problem-id (v1's nullptr-descriptor fallback).
-        txn_keeps: HashMap::new(),
+        // problem table; a `randomize` inside one still merges declared
+        // keeps, but lowers with no problem-id (v1's nullptr-descriptor
+        // fallback).
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         // Component methods cannot call a tseq generator (test-scope only).
         tseqs: HashMap::new(),
@@ -2338,7 +2359,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &properties,
             &extern_fns,
             &helper_registry,
-            &txn_keeps,
+            &record_keeps,
             &randomize_problem_ids,
             &tseq_records,
             &side_tables,
@@ -3135,7 +3156,7 @@ fn lower_test(
     properties: &HashMap<String, crate::ast::Expr>,
     extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
-    txn_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
+    record_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
     randomize_problem_ids: &HashMap<(u32, u32), u32>,
     tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
@@ -5338,7 +5359,7 @@ fn lower_test(
         components: prog.components.clone(),
         component_fields: component_field_map,
         component_modes: component_field_modes,
-        txn_keeps: txn_keeps.clone(),
+        record_keeps: record_keeps.clone(),
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         probes: probes.clone(),
@@ -6400,12 +6421,12 @@ pub(crate) struct LowerCtx {
     /// Declared root mode for a component instance. Structural roots use this
     /// only as inherited context for nested transactor fields.
     pub component_modes: HashMap<String, Option<ir::ComponentInstanceMode>>,
-    /// Per-transaction `keep` constraint clauses as AST expressions, by
-    /// transaction name. Merged ahead of a `randomize(t)` call-site
+    /// Per-record `keep` constraint clauses as AST expressions, by
+    /// transaction/struct name. Merged ahead of a `randomize(t)` call-site
     /// `with {...}` body (v1's spec-§4 merge) when building the
     /// `ConstraintSite`. Empty for keep-free transactions and for
     /// contexts that cannot host a `randomize` (pure helpers).
-    pub txn_keeps: HashMap<String, Vec<crate::ast::Expr>>,
+    pub record_keeps: HashMap<String, Vec<crate::ast::Expr>>,
     /// Randomize-target span → typed constraint-problem id. The handle
     /// (`ConstraintProblemId.0`) the constraint-IR layer assigned to the
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
