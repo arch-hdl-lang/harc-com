@@ -912,6 +912,21 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         });
                     }
                 }
+                ScoreboardFieldKind::List { elem, vec_len } => {
+                    let valid_elem = matches!(
+                        elem,
+                        IrType::Bool | IrType::UInt(None) | IrType::SInt(None)
+                    ) || matches!(elem, IrType::UInt(Some(width)) if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width))
+                        || matches!(elem, IrType::SInt(Some(width)) if (1..=64).contains(width));
+                    if !valid_elem || vec_len.is_some_and(|len| len == 0) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "scoreboard sb{si} field `{}` has invalid list schema {:?} x {:?}",
+                                field.name, elem, vec_len
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -3997,6 +4012,31 @@ impl Checker<'_> {
         }
     }
 
+    fn check_scoreboard_container(&mut self, sb: crate::ir::ScoreboardId, field: &str) {
+        let ok = self
+            .prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(field))
+            .is_some_and(|f| {
+                matches!(
+                    f.kind,
+                    crate::ir::ScoreboardFieldKind::Queue { .. }
+                        | crate::ir::ScoreboardFieldKind::List { .. }
+                )
+            });
+        if !ok {
+            self.errs.push(VerifyError::BadScoreboard {
+                func: self.fid,
+                block: self.bid,
+                detail: format!(
+                    "scoreboard sb{} has no queue or list field `{field}`",
+                    sb.0
+                ),
+            });
+        }
+    }
+
     fn scoreboard_queue_elem(&self, sb: crate::ir::ScoreboardId, queue: &str) -> Option<QueueElem> {
         self.prog
             .scoreboards
@@ -4005,7 +4045,8 @@ impl Checker<'_> {
             .and_then(|field| match &field.kind {
                 crate::ir::ScoreboardFieldKind::Queue { elem } => Some(elem.clone()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. }
-                | crate::ir::ScoreboardFieldKind::Record { .. } => None,
+                | crate::ir::ScoreboardFieldKind::Record { .. }
+                | crate::ir::ScoreboardFieldKind::List { .. } => None,
             })
     }
 
@@ -4520,7 +4561,7 @@ impl Checker<'_> {
                     }
                     crate::ir::ScoreboardQuery::QueueSize { queue }
                     | crate::ir::ScoreboardQuery::QueueEmpty { queue } => {
-                        self.check_scoreboard_queue(*sb, queue)
+                        self.check_scoreboard_container(*sb, queue)
                     }
                 }
             }

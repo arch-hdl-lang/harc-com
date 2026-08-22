@@ -1679,6 +1679,12 @@ fn emit_stmt(
                                 sb.0
                             )))
                         }
+                        crate::ir::ScoreboardFieldKind::List { .. } => {
+                            return Err(EmitError(format!(
+                                "tbir: scoreboard {} field `{scalar}` is a list",
+                                sb.0
+                            )))
+                        }
                     };
                     writeln!(out, "{pad}{base}.{scalar} = {e};").ok();
                 }
