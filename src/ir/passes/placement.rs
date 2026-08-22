@@ -351,7 +351,9 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             // wherever this block is placed.
             // Fanning out to subscribers is host-side work; the
             // subscriber bodies are their own functions.
-            Stmt::EventSubscribe { .. } | Stmt::EventEmit { .. } => {
+            Stmt::EventSubscribe { .. }
+            | Stmt::MethodHookSubscribe { .. }
+            | Stmt::EventEmit { .. } => {
                 host_service_only = false;
             }
             Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {
@@ -514,7 +516,9 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(e, accesses, transactor);
         }
         Expr::WidthCast { inner, .. } => visit_expr(inner, accesses, transactor),
-        Expr::ComponentIdle { n, .. } => visit_expr(n, accesses, transactor),
+        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
+            visit_expr(n, accesses, transactor)
+        }
         Expr::SeqIndex { index, .. } => visit_expr(index, accesses, transactor),
         Expr::Call(target, args) => {
             if matches!(target, CallTarget::TransactorMethod { .. }) {

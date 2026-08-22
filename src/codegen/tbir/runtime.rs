@@ -287,16 +287,17 @@ pub(super) fn unbound_state_struct_decl(
     writeln!(out, "{INDENT}}};").ok();
 }
 
-/// Emit one instance variable of the shared per-TYPE state struct
-/// (`_<Type>_state <instance>;`). Multiple instances of one type each get
-/// their own variable with independent default-initialized state.
+/// Emit one storage variable of the shared per-TYPE state struct. `storage`
+/// may be a generated symbol distinct from the source instance name; this
+/// prevents a demand-created heartbeat object from colliding with a method
+/// lambda such as `<Type>_<method>`.
 pub(super) fn unbound_state_var(
     out: &mut String,
     schema: &crate::ir::TransactorSchema,
-    instance: &str,
+    storage: &str,
 ) {
     let ty = unbound_state_struct_ty(schema);
-    writeln!(out, "{INDENT}{ty} {instance};").ok();
+    writeln!(out, "{INDENT}{ty} {storage};").ok();
 }
 
 /// The shared field layout of a per-instance transactor-state struct:
@@ -342,13 +343,12 @@ fn emit_state_struct_body(
     writeln!(out, "{pad}uint64_t _last_out_cycle = 0;").ok();
 }
 
-/// The C++ element type for a `queue<T>` field. Mirrors `event_payload_cty`:
-/// a scalar widens to `uint64_t`/`int64_t`; a value-record element is the
-/// record struct (carried by value, matching v1's `HarcQueue<Rec>`).
+/// The C++ element type for a `queue<T>` field. Scalars reuse the exact
+/// width-aware local mapping; a value-record element is the record struct
+/// (carried by value, matching v1's `HarcQueue<Rec>`).
 fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
     match elem {
-        crate::ir::QueueElem::Scalar { signed: true } => "int64_t".to_string(),
-        crate::ir::QueueElem::Scalar { signed: false } => "uint64_t".to_string(),
+        crate::ir::QueueElem::Scalar { ty } => super::field_scalar_cty(ty),
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }
 }
@@ -438,7 +438,12 @@ pub(super) fn component_struct(
                     crate::ir::IrType::SInt(_) => "int64_t",
                     _ => "uint64_t",
                 };
-                writeln!(out, "{INDENT}std::array<{cty}, {}> {}{{}};", vec.len, f.name).ok();
+                writeln!(
+                    out,
+                    "{INDENT}std::array<{cty}, {}> {}{{}};",
+                    vec.len, f.name
+                )
+                .ok();
             }
             ComponentFieldKind::Record { record } => {
                 let rname = &records[record.index()].name;

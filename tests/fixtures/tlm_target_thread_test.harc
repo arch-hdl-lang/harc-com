@@ -25,6 +25,9 @@ impl TlmTargetThreadTest for TlmTargetThreadTb
     let target : TlmMemTarget passive = bind mem
 
     run
+        // Target responders live outside the direct transactor-field map,
+        // but their per-instance state struct carries the same stamps.
+        assert !target.idle(2) else fail("target responder idle true at cycle 0")
         dut.rst = 1
         wait 2 cycles
         dut.rst = 0

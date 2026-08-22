@@ -505,6 +505,10 @@ pub struct TargetTlmMethodSchema {
     /// `params` mirror the thread's declared parameters and its `ret`
     /// is the return-value slot for value-returning methods.
     pub function: FunctionId,
+    /// Whether the source thread is always present or declared inside
+    /// `when active`. Passive bindings must not schedule active-only
+    /// responder actors.
+    pub activation: Activation,
     /// Declared argument names (one per thread parameter), in order —
     /// the request-payload wire bases (`<bus>_<method>_<arg>`).
     pub args: Vec<String>,
@@ -566,20 +570,6 @@ pub struct TransactorMethodSchema {
     /// rejects it (mirroring v1's "`<m>` is declared inside `when
     /// active`" diagnostic). Always-on methods are callable on both.
     pub active_only: bool,
-    /// Test-scope `on <obj>.<method> pre` hook bodies, registration
-    /// order. Each is a `FunctionKind::TransactorBody` function sharing
-    /// the method's parameter signature (the hook sees the same args).
-    /// The hook bodies mutate promoted host state (`_tb` scalar fields)
-    /// by reference and read the firing instance's transactor state
-    /// (`drv.last_read`); host-state promotion (a captured run-scope
-    /// `let` becomes a `_tb` field) is what lets the function-per-CFG IR
-    /// express v1's `[&]`-capturing hook closure. Fired BEFORE the body
-    /// at the `emit_method` call site (mirrors v1's `<Type>_<method>_pre`
-    /// fan-out loop). Empty for a method with no registered hooks.
-    pub pre_hooks: Vec<FunctionId>,
-    /// Test-scope `on <obj>.<method> post` hook bodies — fired AFTER the
-    /// body. See `pre_hooks`.
-    pub post_hooks: Vec<FunctionId>,
     /// Covergroup auto-samplers that subscribe to this method's pre/post
     /// hook boundary (`covergroup G @(drv.send(t) post)`). Populated by
     /// the `covergroup_hooks` pass after transactors are lowered. Each
@@ -661,7 +651,8 @@ impl RecordSchema {
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields and `queue<T>` fields where `T` is a scalar ≤ 64 bits
+/// Scalar fields and `queue<T>` fields where `T` is `bool`, an explicitly
+/// sized `uint`/`sint` in the language range 1..=1024, or a value-record
 /// lower; the test body manipulates them through `Stmt::ScoreboardOp`
 /// (scalar read/write, queue push/pop/size/empty). Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
@@ -688,23 +679,37 @@ pub enum ScoreboardFieldKind {
     /// `default` is the declared initializer literal (0 fallback, v1).
     Scalar { ty: IrType, default: u64 },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is a scalar ≤ 64 bits or a value-record.
+    /// FIFO whose element is an exact scalar type through the 1024-bit
+    /// language ceiling or a value-record.
     Queue { elem: QueueElem },
 }
 
-/// The element type of a `queue<T>` field, mirroring `EventPayload`:
-/// a scalar ≤ 64 bits, or a value-record carried by struct. Shared by
-/// scoreboard and composite-component queue fields so both lower a
-/// `queue<Record>` element through one shape (`harc_rt::HarcQueue<Rec>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The element type of a `queue<T>` field: an exact scalar IR type, or a
+/// value-record carried by struct. Shared by testbenches, scoreboards,
+/// composite components, and transactor state so every queue owner uses one
+/// storage descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
-    /// `queue<uint<32>>` / `queue<sint<…>>` / `queue<bool>` — a scalar
-    /// ≤ 64 bits. `signed` selects the C element type (`int64_t` vs
-    /// `uint64_t`) and printf width.
-    Scalar { signed: bool },
+    /// `queue<uint<256>>` / `queue<sint<65>>` / `queue<bool>` — the exact
+    /// scalar type (1..=1024 bits when sized) drives inferred pop locals and
+    /// the width-aware C++ storage mapping (`uint64_t`, `_harc_u128`, or
+    /// `HarcWide<N>`).
+    Scalar { ty: IrType },
     /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
     /// `TbProgram::records`; the C++ element type is the record struct.
     Record(RecordId),
+}
+
+impl QueueElem {
+    /// The queue's full IR element type, shared by lowering and verification
+    /// so inferred/discarded pop destinations cannot lose scalar width or
+    /// signedness.
+    pub fn ir_type(&self) -> IrType {
+        match self {
+            Self::Scalar { ty } => ty.clone(),
+            Self::Record(record) => IrType::Record(*record),
+        }
+    }
 }
 
 impl ScoreboardSchema {
@@ -1105,9 +1110,9 @@ pub fn resolve_component_path_mode(
             schema
                 .field(segment)
                 .ok_or_else(|| ComponentPathResolutionError::NotSubcomponent {
-                component: schema.name.clone(),
-                segment: segment.clone(),
-        })?;
+                    component: schema.name.clone(),
+                    segment: segment.clone(),
+                })?;
         let ComponentFieldKind::Sub {
             component: child,
             mode: declared_mode,
@@ -1284,10 +1289,10 @@ pub enum ComponentFieldKind {
     /// component/transactor state.
     Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
-    /// FIFO whose element is a scalar ≤ 64 bits or a value-record (`elem`
-    /// selects the C element type). Manipulated through the component-queue
-    /// ops (`Stmt::ComponentQueuePush`/`ComponentQueuePop`,
-    /// `Expr::ComponentQueueSize`).
+    /// FIFO whose element is an exact scalar through 1024 bits or a
+    /// value-record (`elem` selects the C element type). Manipulated through
+    /// the component-queue ops (`Stmt::ComponentQueuePush`/
+    /// `ComponentQueuePop`, `Expr::ComponentQueueSize`).
     Queue { elem: QueueElem },
     /// `observed : out event<uint<8>>` — an analysis port. Lowers to a
     /// `std::vector<std::function<void(<payload>)>>` member; `payload`
@@ -1549,16 +1554,14 @@ pub struct TestbenchSchema {
     /// locals (v1's `AnalysisEnv env;`), so `connect` push_backs and
     /// method calls work against the run function's `env`.
     pub component_fields: Vec<ComponentFieldBinding>,
-    /// Unbound DUT-poking transactor instances that carry persistent
-    /// scalar state fields (`drv : SeqXactor active` where `SeqXactor`
-    /// has a `last_read : uint<32>` field), in declaration order. Each
-    /// names an entry in `transactor_fields`; emission generates a
-    /// per-instance state struct (mirroring the bound-to target form's
-    /// `target_state_struct_inst`) that the method lambdas and the
-    /// run/check coroutine share by `[&]` capture. Stateless unbound
-    /// transactors (no state fields) are absent here — their methods are
-    /// pure DUT-poking lambdas with no per-instance struct.
-    pub unbound_state_actors: Vec<(String, TransactorId)>,
+    /// Unbound DUT-poking transactor instances that need persistent
+    /// storage, in declaration order: either they declare state fields or
+    /// an idle/quiesced predicate needs their heartbeat stamps. Each names
+    /// an entry in `transactor_fields`; emission generates a per-instance
+    /// state struct that method lambdas and run/check share by capture.
+    /// Otherwise-stateless instances absent from heartbeat expressions do
+    /// not appear here.
+    pub unbound_state_actors: Vec<UnboundStateActorSchema>,
     /// True when no `testbench` declaration existed in source and this
     /// schema was synthesized for a classic-form test. Codegen skips
     /// the `_tb` struct + wire statement for synthetic testbenches.
@@ -1651,7 +1654,7 @@ pub struct ComponentFieldBinding {
 /// bus binding's blocking req/rsp wire protocol on the DUT.
 #[derive(Debug, Clone)]
 pub struct TargetTlmActorSchema {
-    /// Passive instance name (the per-instance struct + actor prefix).
+    /// Instance name (the per-instance struct + actor prefix).
     pub instance: String,
     /// The test-scope bus-binding field this responder serves — also
     /// the flat DUT signal prefix (`mem` → `mem_read_req_valid`, ...).
@@ -1659,6 +1662,24 @@ pub struct TargetTlmActorSchema {
     /// The bound-to transactor type providing the responder bodies and
     /// state fields (`TbProgram::transactors[transactor]`).
     pub transactor: TransactorId,
+    /// Component IR host for a mixed bound transactor that also declares
+    /// `on` handlers. `None` means the actor owns its generated target-state
+    /// object; `Some(c)` means the matching component field owns storage.
+    pub host_component: Option<ComponentId>,
+    /// Effective source binding mode. Standalone target responders are
+    /// currently passive; a mixed component-hosted responder may be active.
+    pub active: bool,
+}
+
+/// Per-instance storage for an unbound DUT-poking or initiator transactor.
+/// `field` is the source-level receiver used for resolution; `storage` is
+/// the C++ identifier emitted for the state object. They are deliberately
+/// distinct so a source field cannot collide with a generated method slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundStateActorSchema {
+    pub field: String,
+    pub transactor: TransactorId,
+    pub storage: String,
 }
 
 /// One `let regs : R = bind <helper>` register-block binding. The
@@ -1693,7 +1714,8 @@ pub struct TbScalarFieldSchema {
 }
 
 /// One testbench-owned FIFO (`pending : queue<uint<32>>` or
-/// `pending : queue<Record>`). Queue elements reuse the shared queue shape
+/// `pending : queue<Record>`). Scalar elements retain their exact type through
+/// the 1024-bit language ceiling. Queue elements reuse the shared queue shape
 /// used by scoreboards, components, and transactor state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TbQueueFieldSchema {
@@ -1726,9 +1748,10 @@ pub enum StateFieldKind {
     /// `default` is the declared initializer literal (0 fallback).
     Scalar { ty: IrType, default: u64 },
     /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
-    /// whose element is a scalar ≤ 64 bits or a value-record. Manipulated
-    /// through the state-queue ops (`Stmt::TransactorStateQueuePush`/
-    /// `TransactorStateQueuePop`, `Expr::TransactorStateQueueQuery`).
+    /// whose element is an exact scalar type through 1024 bits or a
+    /// value-record. Manipulated through the state-queue ops
+    /// (`Stmt::TransactorStateQueuePush`/`TransactorStateQueuePop`,
+    /// `Expr::TransactorStateQueueQuery`).
     Queue { elem: QueueElem },
     /// `last : Beat` — a whole value-record held as persistent state.
     /// `RecordId` indexes `TbProgram::records`; the C++ member is the
@@ -2117,14 +2140,26 @@ pub enum Stmt {
     /// `_post_eval_services` closure installed at this statement's
     /// position, exactly where v1's `emit_cycle_trigger` pushes it.
     CycleHandler(CycleHandlerId),
-    /// `on e(v) ... end on` on a test-scope event local — push a
-    /// subscriber onto the channel. `handler` is a one-parameter
+    /// `on e(v) ... end on` on a test-scope event local, or
+    /// `on comp.event(v)` on a component event field — push a subscriber
+    /// onto the channel. `handler` is a one-parameter
     /// `FunctionKind::TestHook` function (the payload is its parameter),
     /// declared at test scope so the pushed closure outlives the block
     /// that registered it.
     EventSubscribe {
-        event: LocalId,
+        event: EventChannelRef,
         handler: FunctionId,
+    },
+    /// Register a pre/post subscriber on a hookable method at this
+    /// statement's runtime position.
+    MethodHookSubscribe {
+        target: MethodHookTarget,
+        side: crate::ast::HookSide,
+        handler: FunctionId,
+        /// Enclosing flow locals captured by reference at this registration
+        /// point. The handler's trailing parameters have matching types and
+        /// are emitted as C++ reference parameters.
+        captures: Vec<LocalId>,
     },
     /// `emit e(x)` on a test-scope event local — call every subscriber
     /// synchronously, in subscription order. Mirrors v1's
@@ -2288,6 +2323,39 @@ pub enum Stmt {
     /// Mixing tagged and untagged forks before one join_all is rejected
     /// at lowering. An empty list is a no-op (v1's "no pending forks").
     TlmJoinAll(Vec<TlmForkDesc>),
+}
+
+/// Event channel targeted by a statement-position subscription.
+#[derive(Debug, Clone)]
+pub enum EventChannelRef {
+    /// A test-scope `let e : event<T>` local.
+    Local(LocalId),
+    /// An event field on a test-scope component path (`env.src.obs`).
+    Component {
+        base: ComponentBase,
+        /// Resolved schema of the component that owns `event`.
+        component: ComponentId,
+        event: String,
+        payload: EventPayload,
+    },
+}
+
+/// Hookable method targeted by a statement-position subscription.
+#[derive(Debug, Clone)]
+pub enum MethodHookTarget {
+    /// A method on a direct transactor testbench field. Transactor hook
+    /// vectors are type-scoped, matching v1's `<Type>_<method>_pre/post`.
+    Transactor {
+        field: String,
+        transactor: TransactorId,
+        method: String,
+    },
+    /// A hookable method on a component path (`env.source.publish`).
+    Component {
+        base: ComponentBase,
+        component: ComponentId,
+        method: String,
+    },
 }
 
 /// One deferred bus-bound `tlm_method` fork: the request payload plus
@@ -2641,6 +2709,23 @@ pub enum Expr {
         kind: IdleKind,
         n: Box<Expr>,
     },
+    /// A heartbeat-idle predicate on a direct transactor instance:
+    /// `drv.idle_in(N)`, `drv.idle_out(N)`, `drv.idle(N)`, or
+    /// `drv.quiesced(N)` (the latter is equivalent to `idle(N)` for a
+    /// transactor, which has no nested component leaves in this schema).
+    /// `field` and `transactor` are carried together so verification can
+    /// prove the owning testbench still binds that field to that schema
+    /// after an IR-mutating pass. The threshold reads the same activity
+    /// stamps already emitted on every transactor state struct.
+    TransactorIdle {
+        field: String,
+        transactor: TransactorId,
+        /// Verified C++ state-object symbol. This differs from `field` for
+        /// demand-created storage on otherwise-stateless transactors.
+        storage: String,
+        kind: IdleKind,
+        n: Box<Expr>,
+    },
     /// The global simulation cycle counter (`cycle_count`). A bare
     /// `cycle_count` ident resolves here (it is a framework-provided
     /// value, not a user local). Both backends emit the in-scope
@@ -2770,7 +2855,7 @@ pub enum Expr {
     },
 }
 
-/// Which heartbeat stamp(s) an `Expr::ComponentIdle` predicate reads.
+/// Which heartbeat stamp(s) a component/transactor idle predicate reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleKind {
     /// `idle_in(N)` — N cycles since last input activity.
@@ -2804,14 +2889,20 @@ pub enum ScoreboardQuery {
 pub enum CallTarget {
     /// Pure helper call plus the declared return type used by caller-side
     /// local inference and signed/width-sensitive expression emission.
-    Helper { name: String, ret: IrType },
+    Helper {
+        name: String,
+        ret: IrType,
+    },
     Builtin(String),
     /// Call to a `extern function name(...) -> ret` (spec §9) — a C
     /// reference model linked in via `--ref-src`. Emitted with the RAW
     /// symbol name (no `harc_helper_` mangling) so it resolves against
     /// the user-provided `extern "C"` definition; the forward
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
-    ExternFn { name: String, ret: IrType },
+    ExternFn {
+        name: String,
+        ret: IrType,
+    },
     TransactorMethod {
         bus_field: String,
         method: String,

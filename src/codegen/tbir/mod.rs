@@ -42,6 +42,67 @@ fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
     !tb.synthetic || !tb.state_fields.is_empty()
 }
 
+/// Whether this testbench installs a user hook on this transactor method.
+/// Both test-scope and statement-position registrations are represented by
+/// `MethodHookSubscribe`; restricting the scan to `owner` prevents a shared
+/// transactor schema from leaking hook vectors between tests.
+pub(super) fn has_transactor_method_hook_subscription(
+    prog: &TbProgram,
+    owner: ir::TestbenchId,
+    transactor: ir::TransactorId,
+    method: &str,
+) -> bool {
+    prog.functions
+        .iter()
+        .filter(|f| f.owner == Some(owner))
+        .any(|f| {
+            f.blocks.iter().any(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(
+                        s,
+                        ir::Stmt::MethodHookSubscribe {
+                            target: ir::MethodHookTarget::Transactor {
+                                transactor: target,
+                                method: target_method,
+                                ..
+                            },
+                            ..
+                        } if *target == transactor && target_method == method
+                    )
+                })
+            })
+        })
+}
+
+/// Component counterpart of `has_transactor_method_hook_subscription`.
+pub(super) fn has_component_method_hook_subscription(
+    prog: &TbProgram,
+    owner: ir::TestbenchId,
+    component: ir::ComponentId,
+    method: &str,
+) -> bool {
+    prog.functions
+        .iter()
+        .filter(|f| f.owner == Some(owner))
+        .any(|f| {
+            f.blocks.iter().any(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(
+                        s,
+                        ir::Stmt::MethodHookSubscribe {
+                            target: ir::MethodHookTarget::Component {
+                                component: target,
+                                method: target_method,
+                                ..
+                            },
+                            ..
+                        } if *target == component && target_method == method
+                    )
+                })
+            })
+        })
+}
+
 /// Suite-global emission state: everything `emit` computes that is the
 /// same for any subset of the suite's tests.
 ///
@@ -327,7 +388,10 @@ fn emit_selected_tests(
         EmitTail::Whole if opts.cosim.is_some() => runtime::cosim_entrypoints(
             &mut out,
             &test_names,
-            opts.cosim.as_ref().map(|c| c.half_period_ps).unwrap_or(5000),
+            opts.cosim
+                .as_ref()
+                .map(|c| c.half_period_ps)
+                .unwrap_or(5000),
         ),
         EmitTail::Whole => runtime::dispatcher(&mut out, &test_names),
         EmitTail::ShardBody => {}
@@ -653,10 +717,9 @@ where
                     // payload, which `thread::scope` would otherwise replace
                     // with its own message. It is re-raised on the caller
                     // once the scope joins.
-                    let handed =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            on_shard(&plan.shards[i], cpp, started.elapsed())
-                        }));
+                    let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        on_shard(&plan.shards[i], cpp, started.elapsed())
+                    }));
                     match handed {
                         Ok(Ok(())) => delivered.lock().unwrap_or_else(|p| p.into_inner()).push(i),
                         // Also bounds the damage: workers stop claiming
@@ -799,7 +862,7 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
-        ComponentIdle { n, .. } => expr_has_probe(n),
+        ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
         ComponentVecElement { index, .. } => expr_has_probe(index),
         _ => false,
     }
@@ -854,7 +917,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         // `cover_checks` directly so a probe read inside a concurrent
         // property is still seen.
         EventEmit { args, .. } => args.iter().any(expr_has_probe),
-        EventSubscribe { .. } => false,
+        EventSubscribe { .. } | MethodHookSubscribe { .. } => false,
         PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => false,
         RecordInit(_, _) | CovReport(_) => false,
     }
@@ -1123,7 +1186,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         // Check bodies are walked at program level — see
         // `for_each_check_body_expr`.
         EventEmit { args, .. } => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        EventSubscribe { .. } => {}
+        EventSubscribe { .. } | MethodHookSubscribe { .. } => {}
         PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => {}
         RecordInit(_, _) | CovReport(_) => {}
     }
@@ -1187,7 +1250,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         WidthCast { inner, .. } => for_each_port_in_expr(inner, f),
         SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        ComponentIdle { n, .. } => for_each_port_in_expr(n, f),
+        ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
         ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
         _ => {}
     }
@@ -1485,7 +1548,12 @@ fn emit_structured_unpack_field(
     }
     if let ir::IrType::Record(rid) = ty {
         let inner = &records[rid.index()];
-        writeln!(out, "{pad}{target_expr} = harc_unpack_{}({raw_expr});", inner.name).ok();
+        writeln!(
+            out,
+            "{pad}{target_expr} = harc_unpack_{}({raw_expr});",
+            inner.name
+        )
+        .ok();
         return;
     }
     let rhs = match ty {
@@ -1538,15 +1606,20 @@ fn emit_structured_drive_field(
     }
     if let ir::IrType::Record(rid) = ty {
         let inner = &records[rid.index()];
-        writeln!(out, "{pad}harc_drive_{}({sig_expr}, {value_expr});", inner.name).ok();
+        writeln!(
+            out,
+            "{pad}harc_drive_{}({sig_expr}, {value_expr});",
+            inner.name
+        )
+        .ok();
     } else {
         let normalized = match ty {
             ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
                 format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
             }
-            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => format!(
-                "harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})"
-            ),
+            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => {
+                format!("harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})")
+            }
             _ => value_expr.to_string(),
         };
         writeln!(out, "{pad}harc_rt::harc_assign({sig_expr}, {normalized});").ok();
@@ -1757,22 +1830,14 @@ fn edge_is_enabled(
     inherited: Option<ir::ComponentInstanceMode>,
     edge: &ir::ConnectEdgeSchema,
 ) -> bool {
-    let source_mode = ir::resolve_component_path_mode(
-        &prog.components,
-        owner,
-        inherited,
-        &edge.src_path,
-    )
-    .expect("verified component connect source path")
-    .effective_mode;
-    let sink_mode = ir::resolve_component_path_mode(
-        &prog.components,
-        owner,
-        inherited,
-        &edge.sink_path,
-    )
-    .expect("verified component connect sink path")
-    .effective_mode;
+    let source_mode =
+        ir::resolve_component_path_mode(&prog.components, owner, inherited, &edge.src_path)
+            .expect("verified component connect source path")
+            .effective_mode;
+    let sink_mode =
+        ir::resolve_component_path_mode(&prog.components, owner, inherited, &edge.sink_path)
+            .expect("verified component connect sink path")
+            .effective_mode;
     ir::component_mode_includes_activation(source_mode, edge.src_activation)
         && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
 }
@@ -2298,13 +2363,42 @@ fn emit_test(
     // fan-out (`emit_method`) reach the same vectors by `[&]` capture.
     // Mirrors v1's `emit_hook_vectors`. Only methods used by THIS
     // testbench's transactor fields are declared.
+    let mut hook_vector_xactors = HashSet::new();
     for (_field, xid) in &tb.transactor_fields {
+        if !hook_vector_xactors.insert(*xid) {
+            continue;
+        }
         let schema = prog.transactor(*xid);
         for m in &schema.methods {
-            if m.cov_hook_subs.is_empty() {
+            if m.cov_hook_subs.is_empty()
+                && !has_transactor_method_hook_subscription(prog, test.testbench, *xid, &m.name)
+            {
                 continue;
             }
             covergroup::transactor_hook_vector_decls(out, prog, schema, m, INDENT)?;
+        }
+    }
+    // User method hooks on components follow v1's type-scoped vector
+    // contract (`<Component>_<method>_pre/post`). Keep these separate from
+    // per-instance covergroup vectors stored on the component struct.
+    for (ci, component) in prog.components.iter().enumerate() {
+        for method in &component.methods {
+            if has_component_method_hook_subscription(
+                prog,
+                test.testbench,
+                ir::ComponentId(ci as u32),
+                &method.name,
+            ) {
+                covergroup::hook_vector_decls(
+                    out,
+                    prog,
+                    &component.name,
+                    &method.name,
+                    method.function,
+                    method.param_names.len(),
+                    INDENT,
+                )?;
+            }
         }
     }
     // Covergroup auto-sampler registration, in testbench-field
@@ -2346,6 +2440,7 @@ fn emit_test(
                     schema,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
+                    &opts.dut_port_widths,
                 )?;
             }
             ir::CovTrigger::Hook {
@@ -2364,9 +2459,11 @@ fn emit_test(
                         receiver_path.join(".")
                     )));
                 };
-                if let Some(binding) = tb.component_fields.iter().find(|binding| {
-                    binding.field == *receiver
-                }) {
+                if let Some(binding) = tb
+                    .component_fields
+                    .iter()
+                    .find(|binding| binding.field == *receiver)
+                {
                     let component = &prog.components[binding.component.index()];
                     if let Some(target_method) = component.method(method) {
                         if !ir::component_mode_includes_activation(
@@ -2429,6 +2526,7 @@ fn emit_test(
                     *side,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
+                    &opts.dut_port_widths,
                 )?;
             }
         }
@@ -2453,46 +2551,21 @@ fn emit_test(
     // (passed in as `self_state`) and the run/check coroutine reads them.
     //
     // State-receiver ABI (#494 P1b): one SHARED `_<Type>_state` struct type
-    // per transactor type, then one instance VARIABLE per instance. The
+    // per transactor type, then one storage VARIABLE per instance. A
+    // demand-created stateless heartbeat object uses the schema's generated
+    // storage symbol rather than its potentially-colliding source field. The
     // type-shared method lambda takes the receiver by reference, so any
     // number of active instances of one type coexist with independent
     // state (`Drv_go(a)` and `Drv_go(b)` mutate `a`/`b` separately).
     let mut emitted_state_ty = HashSet::new();
-    for (_, xid) in &tb.unbound_state_actors {
-        if !emitted_state_ty.insert(*xid) {
+    for actor in &tb.unbound_state_actors {
+        if !emitted_state_ty.insert(actor.transactor) {
             continue;
         }
-        runtime::unbound_state_struct_decl(out, prog.transactor(*xid), &prog.records);
+        runtime::unbound_state_struct_decl(out, prog.transactor(actor.transactor), &prog.records);
     }
-    for (instance, xid) in &tb.unbound_state_actors {
-        runtime::unbound_state_var(out, prog.transactor(*xid), instance);
-    }
-    // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
-    // `on regs.REG` per-register write callbacks) — emitted as free
-    // `[&]`-capturing lambdas BEFORE the transactor method lambdas and the
-    // run coroutine, so both the firing method (`emit_method` pre/post
-    // fan-out) and the `record_write` dispatch see them. They capture the
-    // shared `_tb` host struct + transactor-state structs + regblock
-    // mirror by reference — the host-state-promotion mechanism.
-    // Testbench-scoped periodic-service bodies (issue #485) are ALSO
-    // `TestHook` functions, but they read composite scoreboard/component
-    // instances + their method lambdas, which are declared LATER (just
-    // before the run coroutine). Emitting them here would reference those
-    // symbols before declaration, so skip them — `emit_tb_periodic_services`
-    // emits their body + registration together, after the decls.
-    let tb_service_fns: HashSet<ir::FunctionId> = tb
-        .periodic_services
-        .iter()
-        .map(|s| s.function)
-        .chain(tb.cycle_services.iter().map(|s| s.function))
-        .collect();
-    for f in &prog.functions {
-        if matches!(f.kind, ir::FunctionKind::TestHook)
-            && f.owner == Some(test.testbench)
-            && !tb_service_fns.contains(&f.id)
-        {
-            func::emit_test_hook(out, prog, f, dut_type, 1)?;
-        }
+    for actor in &tb.unbound_state_actors {
+        runtime::unbound_state_var(out, prog.transactor(actor.transactor), &actor.storage);
     }
     let mut emitted_xactors = HashSet::new();
     for (_, xid) in &tb.transactor_fields {
@@ -2520,7 +2593,16 @@ fn emit_test(
             func::declare_method_slot(out, prog, schema, m, 1)?;
         }
         for m in &schema.methods {
-            func::emit_method(out, prog, schema, m, randomize_snippets, 1)?;
+            func::emit_method(
+                out,
+                prog,
+                test.testbench,
+                *xid,
+                schema,
+                m,
+                randomize_snippets,
+                1,
+            )?;
         }
     }
     // Bound-to target-side TLM responder instances: one per-instance
@@ -2529,6 +2611,9 @@ fn emit_test(
     // and the actor coroutines capture it by reference, then one
     // background-coroutine actor per target method.
     for actor in &tb.target_tlm_actors {
+        if actor.host_component.is_some() {
+            continue;
+        }
         let schema = prog.transactor(actor.transactor);
         runtime::target_state_struct_inst(out, schema, &actor.instance, &prog.records);
     }
@@ -2552,7 +2637,16 @@ fn emit_test(
     for ci in component_emit_order(prog) {
         let comp = &prog.components[ci];
         for m in &comp.methods {
-            func::emit_component_method(out, prog, comp, m, randomize_snippets, 1)?;
+            func::emit_component_method(
+                out,
+                prog,
+                test.testbench,
+                ir::ComponentId(ci as u32),
+                comp,
+                m,
+                randomize_snippets,
+                1,
+            )?;
         }
         for oh in &comp.on_handlers {
             func::emit_component_on_handler(out, prog, comp, oh, randomize_snippets, 1)?;
@@ -2565,6 +2659,28 @@ fn emit_test(
         }
         if let Some(w) = &comp.watchdog {
             func::emit_component_watchdog(out, prog, comp, w, randomize_snippets, 1)?;
+        }
+    }
+    // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
+    // `on regs.REG` per-register write callbacks) are free `[&]`-capturing
+    // lambdas. Emit them only after every callable transactor/component
+    // method has been declared: a valid hook body may call another method,
+    // and C++ name lookup requires that callable to exist first. Their
+    // subscription/dispatch sites live later in the run/check coroutine.
+    // Periodic/cycle service functions are emitted with their registration
+    // below and are excluded here.
+    let tb_service_fns: HashSet<ir::FunctionId> = tb
+        .periodic_services
+        .iter()
+        .map(|s| s.function)
+        .chain(tb.cycle_services.iter().map(|s| s.function))
+        .collect();
+    for f in &prog.functions {
+        if matches!(f.kind, ir::FunctionKind::TestHook)
+            && f.owner == Some(test.testbench)
+            && !tb_service_fns.contains(&f.id)
+        {
+            func::emit_test_hook(out, prog, f, dut_type, 1)?;
         }
     }
     // Composite-component connection and lifecycle setup for the instances
@@ -2642,8 +2758,8 @@ fn emit_test(
 
     // Testbench-scoped `on <N> cycles [phase post_eval]` periodic services
     // (issue #485). Each registers a `_checkers` / `_post_eval_services`
-    // closure that fires the handler's free lambda (already emitted with
-    // the method hooks above) once every `period` primary-clock cycles,
+    // closure that fires the handler's free lambda once every `period`
+    // primary-clock cycles,
     // gated on a per-service last-fire stamp — the flow-scope analogue of
     // a component's `emit_lifecycle_checkers` periodic registration.
     emit_tb_periodic_services(out, prog, tb, dut_type)?;
@@ -2659,15 +2775,29 @@ fn emit_test(
     if !tb.synthetic {
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
+    let run = prog.function(test.run);
+    let run_hook_captures: HashSet<ir::LocalId> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::MethodHookSubscribe { captures, .. } => Some(captures.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    func::declare_flow_hook_captures(out, prog, run, &run_hook_captures, 2)?;
     func::emit_function(
         out,
         prog,
-        prog.function(test.run),
+        run,
         &prog.records,
         &tb.bus_bindings,
         &opts.vec_lane_widths,
         randomize_snippets,
         dut_type,
+        &run_hook_captures,
         2,
     )?;
     if let Some(check) = test.check {
@@ -2680,6 +2810,7 @@ fn emit_test(
             &opts.vec_lane_widths,
             randomize_snippets,
             dut_type,
+            &HashSet::new(),
             2,
         )?;
     }

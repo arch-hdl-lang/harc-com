@@ -7,60 +7,108 @@ use crate::ast::{
     TypeExpr,
 };
 use crate::ir::{
-    Expr, FileLogLevel, FmtArg, FmtArgs, IrType, LogLevel, Stmt, TbFunction, Terminator,
+    ComponentBase, ComponentFieldKind, EventChannelRef, Expr, FileLogLevel, FmtArg, FmtArgs,
+    IrType, LogLevel, MethodHookTarget, Stmt, TbFunction, Terminator, TypedParam,
 };
 
-/// Does a hooked `on <obj>.<method>` path name a real `hookable`?
-///
-/// v1's own condition, and the same one the test-scope arm in `mod.rs`
-/// applies: the receiver must be a transactor or component testbench
-/// field, and the trailing segment must be a `hookable` method on it.
-/// A shape test cannot answer this — `drv.plain` and `nosuch.send` are
-/// the same SHAPE as `drv.send` and v1 refuses them.
-fn hook_path_names_a_hookable(b: &super::FuncBuilder<'_>, h: &crate::ast::OnHandler) -> bool {
-    fn path(e: &crate::ast::Expr) -> Option<Vec<String>> {
-        match &*e.kind {
-            ExprKind::Ident(id) => Some(vec![id.name.clone()]),
-            ExprKind::Field { target, name } => {
-                let mut p = path(target)?;
-                p.push(name.name.clone());
-                Some(p)
-            }
-            _ => None,
-        }
-    }
-    let Some(segs) = path(&h.event) else {
-        return false;
+/// Resolve a strict (no-parentheses) method-hook path against the current
+/// testbench. Returns `None` for a path v1's method-hook resolver rejects.
+fn resolve_statement_method_hook_target(
+    b: &super::FuncBuilder<'_>,
+    h: &crate::ast::OnHandler,
+) -> Result<Option<(MethodHookTarget, Vec<TypedParam>)>, LowerError> {
+    let Some(raw) = super::strict_method_hook_path(&h.event) else {
+        return Ok(None);
     };
-    // Strip the desugarer's `_tb` root locally rather than through
-    // `strip_tb_prefix`, which only strips ahead of a COMPONENT field —
-    // the field here is usually a transactor (`_tb.drv.send`), so the
-    // shared helper leaves the path three segments long and every path
-    // then fails the two-segment test below. Widening the shared helper
-    // would change what its other callers resolve.
-    let segs: &[String] = if segs.len() >= 2
-        && Some(segs[0].as_str()) == b.ctx.tb_field.as_deref()
-        && (b.ctx.transactor_fields.contains_key(&segs[1])
-            || b.ctx.component_fields.contains_key(&segs[1]))
+    let segs: &[String] = if raw.len() >= 2
+        && Some(raw[0].as_str()) == b.ctx.tb_field.as_deref()
+        && (b.ctx.transactor_fields.contains_key(&raw[1])
+            || b.ctx.component_fields.contains_key(&raw[1]))
     {
-        &segs[1..]
+        &raw[1..]
     } else {
-        &segs
+        &raw
     };
-    // Exactly `<field>.<method>`: a longer path (`drv.send.x`) is a
-    // nested reach v1's resolver does not walk here.
-    let [field, method] = segs else { return false };
-    let hookable_on = |methods: &[crate::ir::ComponentMethodSchema]| {
-        methods.iter().any(|m| m.name == *method && m.hookable)
-    };
-    if let Some(xid) = b.ctx.transactor_fields.get(field) {
-        let x = &b.ctx.transactors[xid.index()];
-        return x.methods.iter().any(|m| m.name == *method && m.hookable);
+    if segs.len() < 2 {
+        return Ok(None);
     }
-    b.ctx
-        .component_fields
-        .get(field)
-        .is_some_and(|cid| hookable_on(&b.ctx.components[cid.index()].methods))
+    let receiver = &segs[..segs.len() - 1];
+    let method = segs.last().expect("hook path has method").clone();
+    if let [field] = receiver {
+        let Some(xid) = b.ctx.transactor_fields.get(field).copied() else {
+            // A component field with the same one-segment receiver is
+            // handled below.
+            if !b.ctx.component_fields.contains_key(field) {
+                return Ok(None);
+            }
+            return resolve_component_hook_target(b, receiver, method);
+        };
+        let x = &b.ctx.transactors[xid.index()];
+        let Some(m) = x.methods.iter().find(|m| m.name == method && m.hookable) else {
+            return Ok(None);
+        };
+        if m.active_only && b.ctx.passive_transactor_fields.contains(field) {
+            return Ok(None);
+        }
+        let params = m
+            .param_names
+            .iter()
+            .cloned()
+            .zip(m.param_tys.iter().cloned())
+            .map(|(name, ty)| TypedParam { name, ty })
+            .collect();
+        return Ok(Some((
+            MethodHookTarget::Transactor {
+                field: field.clone(),
+                transactor: xid,
+                method,
+            },
+            params,
+        )));
+    }
+    resolve_component_hook_target(b, receiver, method)
+}
+
+fn resolve_component_hook_target(
+    b: &super::FuncBuilder<'_>,
+    receiver: &[String],
+    method: String,
+) -> Result<Option<(MethodHookTarget, Vec<TypedParam>)>, LowerError> {
+    let Some((head, tail)) = receiver.split_first() else {
+        return Ok(None);
+    };
+    let Some(&head_cid) = b.ctx.component_fields.get(head) else {
+        return Ok(None);
+    };
+    let cid = b.resolve_component_recv(head_cid, tail)?;
+    let comp = &b.ctx.components[cid.index()];
+    let Some(m) = comp.methods.iter().find(|m| m.name == method && m.hookable) else {
+        return Ok(None);
+    };
+    b.require_component_activation(
+        head,
+        head_cid,
+        b.binding_mode(head),
+        tail,
+        m.activation,
+        "method hook",
+        &method,
+    )?;
+    let params = m
+        .param_names
+        .iter()
+        .cloned()
+        .zip(m.param_tys.iter().cloned())
+        .map(|(name, ty)| TypedParam { name, ty })
+        .collect();
+    Ok(Some((
+        MethodHookTarget::Component {
+            base: ComponentBase::Path(receiver.to_vec()),
+            component: cid,
+            method,
+        },
+        params,
+    )))
 }
 
 impl FuncBuilder<'_> {
@@ -316,10 +364,16 @@ impl FuncBuilder<'_> {
                             self.push(Stmt::TbQueuePop { field, dest });
                             return Ok(());
                         }
-                        return Err(queue_method_in_statement_position(
-                            &format!("testbench queue method `{field}.{method}(...)`"),
+                        if discard_queue_query_statement(
+                            &format!("testbench queue `{field}`"),
                             &method,
-                        ));
+                            args,
+                        )? {
+                            return Ok(());
+                        }
+                        return Err(queue_method_in_statement_position(&format!(
+                            "testbench queue method `{field}.{method}(...)`"
+                        )));
                     }
                 }
                 // `cov.report()` (post-desugar `_tb.cov.report()`) on a
@@ -389,10 +443,16 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(queue_method_in_statement_position(
-                            &format!("scoreboard queue method `{field}.{queue}.{method}(...)`"),
+                        if discard_queue_query_statement(
+                            &format!("scoreboard queue `{field}.{queue}`"),
                             &method,
-                        ));
+                            args,
+                        )? {
+                            return Ok(());
+                        }
+                        return Err(queue_method_in_statement_position(&format!(
+                            "scoreboard queue method `{field}.{queue}.{method}(...)`"
+                        )));
                     }
                 }
                 // Statement-position component-queue op:
@@ -427,16 +487,25 @@ impl FuncBuilder<'_> {
                             self.push(Stmt::ComponentQueuePop { base, queue, dest });
                             return Ok(());
                         }
-                        return Err(queue_method_in_statement_position(
-                            &format!("component queue method `{queue}.{method}(...)`"),
+                        if discard_queue_query_statement(
+                            &format!("component queue `{queue}`"),
                             &method,
-                        ));
+                            args,
+                        )? {
+                            return Ok(());
+                        }
+                        return Err(queue_method_in_statement_position(&format!(
+                            "component queue method `{queue}.{method}(...)`"
+                        )));
                     }
                 }
                 // Statement-position bound-to target-responder queue
                 // state-field op: `pending.push(x)` / `pending.pop()`
                 // (bare field name), mirroring the component form.
                 if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let ExprKind::Field { target, .. } = &*callee.kind {
+                        self.reject_inactive_target_state_root(target)?;
+                    }
                     if let Some((field, method)) = self.as_state_queue_call(callee) {
                         if method == "push" {
                             let [CallArg::Expr(arg)] = args.as_slice() else {
@@ -484,10 +553,16 @@ impl FuncBuilder<'_> {
                             });
                             return Ok(());
                         }
-                        return Err(queue_method_in_statement_position(
-                            &format!("target-state queue method `{field}.{method}(...)`"),
+                        if discard_queue_query_statement(
+                            &format!("target-state queue `{field}`"),
                             &method,
-                        ));
+                            args,
+                        )? {
+                            return Ok(());
+                        }
+                        return Err(queue_method_in_statement_position(&format!(
+                            "target-state queue method `{field}.{method}(...)`"
+                        )));
                     }
                 }
                 // Statement-position TEST-SCOPE target-responder queue
@@ -541,13 +616,17 @@ impl FuncBuilder<'_> {
                                     });
                                     return Ok(());
                                 }
-                                return Err(queue_method_in_statement_position(
-                                    &format!(
-                                        "target-state queue method \
-                                         `{instance}.{field}.{method}(...)`"
-                                    ),
+                                if discard_queue_query_statement(
+                                    &format!("target-state queue `{instance}.{field}`"),
                                     &method,
-                                ));
+                                    args,
+                                )? {
+                                    return Ok(());
+                                }
+                                return Err(queue_method_in_statement_position(&format!(
+                                    "target-state queue method \
+                                         `{instance}.{field}.{method}(...)`"
+                                )));
                             }
                         }
                     }
@@ -571,6 +650,20 @@ impl FuncBuilder<'_> {
                             args: lowered,
                             dest: None,
                         });
+                        return Ok(());
+                    }
+                }
+                // A direct transactor heartbeat predicate is a pure value,
+                // not a method edge. In statement position v1 still
+                // evaluates its threshold expression and discards the
+                // boolean, so retain it in an unread temp rather than
+                // dropping the statement or routing it through
+                // `Stmt::TransactorCall`.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let Some(idle) = self.as_transactor_idle(callee, args)? {
+                        let discard = self.fresh_temp();
+                        self.set_local_type(discard, crate::ir::IrType::Bool);
+                        self.push(Stmt::Assign(discard, idle));
                         return Ok(());
                     }
                 }
@@ -732,19 +825,7 @@ impl FuncBuilder<'_> {
                     let elem = self.tb_queue_elem(&field)?;
                     self.check_pop_let_type(l, &elem, &format!("testbench queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                self.set_local_type(id, ty);
-                            }
-                        }
-                    }
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::TbQueuePop { field, dest: id });
                     return Ok(());
                 }
@@ -764,16 +845,7 @@ impl FuncBuilder<'_> {
                     let elem = self.component_queue_elem(&base, &queue)?;
                     self.check_pop_let_type(l, &elem, &format!("component queue `{queue}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                        }
-                    }
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::ComponentQueuePop {
                         base,
                         queue,
@@ -796,19 +868,7 @@ impl FuncBuilder<'_> {
                 let elem = self.scoreboard_queue_elem(sb, &queue)?;
                 self.check_pop_let_type(l, &elem, &format!("scoreboard queue `{queue}`"))?;
                 let id = self.declare(&l.name.name);
-                match elem {
-                    crate::ir::QueueElem::Record(rid) => {
-                        self.set_local_type(id, IrType::Record(rid));
-                    }
-                    crate::ir::QueueElem::Scalar { .. } => {
-                        if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                            self.let_widths.insert(id, w);
-                        }
-                        if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                            self.set_local_type(id, ty);
-                        }
-                    }
-                }
+                self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -835,19 +895,7 @@ impl FuncBuilder<'_> {
                     };
                     self.check_pop_let_type(l, &elem, &format!("target-state queue `{field}`"))?;
                     let id = self.declare(&l.name.name);
-                    match elem {
-                        crate::ir::QueueElem::Record(rid) => {
-                            self.set_local_type(id, IrType::Record(rid));
-                        }
-                        crate::ir::QueueElem::Scalar { .. } => {
-                            if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                self.let_widths.insert(id, w);
-                            }
-                            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                self.set_local_type(id, ty);
-                            }
-                        }
-                    }
+                    self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                     self.push(Stmt::TransactorStateQueuePop {
                         instance: String::new(),
                         field,
@@ -875,19 +923,7 @@ impl FuncBuilder<'_> {
                                 &format!("target-state queue `{instance}.{field}`"),
                             )?;
                             let id = self.declare(&l.name.name);
-                            match elem {
-                                crate::ir::QueueElem::Record(rid) => {
-                                    self.set_local_type(id, IrType::Record(rid));
-                                }
-                                crate::ir::QueueElem::Scalar { .. } => {
-                                    if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
-                                        self.let_widths.insert(id, w);
-                                    }
-                                    if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
-                                        self.set_local_type(id, ty);
-                                    }
-                                }
-                            }
+                            self.type_queue_pop_local(id, &elem, l.ty.as_ref());
                             self.push(Stmt::TransactorStateQueuePop {
                                 instance,
                                 field,
@@ -1470,9 +1506,47 @@ impl FuncBuilder<'_> {
                 }
                 format!("a `{}`", self.ctx.records[rid.index()].name)
             }
-            crate::ir::QueueElem::Scalar { .. } => {
+            crate::ir::QueueElem::Scalar { ty: actual } => {
                 if declared_record.is_none() {
-                    return Ok(());
+                    let Some(expected) = typed_let_ir_type(ty) else {
+                        return Ok(());
+                    };
+                    if component_method_result_compatible(&expected, actual) {
+                        return Ok(());
+                    }
+                    let scalar_shape = |ty: &IrType| match ty {
+                        IrType::UInt(Some(width)) => Some((*width, false)),
+                        IrType::SInt(Some(width)) => Some((*width, true)),
+                        _ => None,
+                    };
+                    if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+                        (scalar_shape(&expected), scalar_shape(actual))
+                    {
+                        if dest_signed != src_signed {
+                            return Err(LowerError::Invalid(format!(
+                                "{what} yields a {} {src_width}-bit value, but `let {}` is \
+                                 declared as {} {dest_width}-bit. Signedness must match — \
+                                 relabel the value explicitly with `as {}<{dest_width}>`.",
+                                if src_signed { "signed" } else { "unsigned" },
+                                l.name.name,
+                                if dest_signed { "signed" } else { "unsigned" },
+                                if dest_signed { "sint" } else { "uint" },
+                            )));
+                        }
+                        if src_width > dest_width {
+                            return Err(LowerError::Invalid(format!(
+                                "{what} yields a {src_width}-bit value, but `let {}` is \
+                                 declared {dest_width}-bit, so the pop assignment narrows. \
+                                 Use `.trunc<{dest_width}>()` explicitly after popping into \
+                                 a {src_width}-bit local, or widen the declaration.",
+                                l.name.name
+                            )));
+                        }
+                    }
+                    return Err(LowerError::Invalid(format!(
+                        "{what} yields {actual:?}, but `let {}` is declared {expected:?}",
+                        l.name.name
+                    )));
                 }
                 "a scalar".to_string()
             }
@@ -1485,6 +1559,28 @@ impl FuncBuilder<'_> {
             "`let {}` is declared as {want} and {what} yields {got}",
             l.name.name
         )))
+    }
+
+    /// Type a direct testbench, scoreboard, or composite-component queue-pop
+    /// destination from the queue element unless the source `let` supplied a
+    /// scalar annotation. Record handling is unchanged; scalar inference
+    /// preserves the field's exact width and signedness.
+    fn type_queue_pop_local(
+        &mut self,
+        dest: crate::ir::LocalId,
+        elem: &crate::ir::QueueElem,
+        declared: Option<&TypeExpr>,
+    ) {
+        let ty = match elem {
+            crate::ir::QueueElem::Scalar { ty } => declared
+                .and_then(typed_let_ir_type)
+                .unwrap_or_else(|| ty.clone()),
+            crate::ir::QueueElem::Record(rid) => IrType::Record(*rid),
+        };
+        if let IrType::UInt(Some(width)) | IrType::SInt(Some(width)) = &ty {
+            self.let_widths.insert(dest, *width);
+        }
+        self.set_local_type(dest, ty);
     }
 
     /// Reject a narrowing scalar assignment at lowering, where it can
@@ -1811,7 +1907,47 @@ impl FuncBuilder<'_> {
             crate::ir::QueueElem::Record(rid) => Some(*rid),
             crate::ir::QueueElem::Scalar { .. } => None,
         };
-        self.check_slot_type(value, want, what)
+        self.check_slot_type(value, want, what)?;
+
+        let crate::ir::QueueElem::Scalar { ty: expected } = elem else {
+            return Ok(());
+        };
+        let Some(actual) = self.expr_type(value) else {
+            return Ok(());
+        };
+        if queue_scalar_assignment_compatible(expected, &actual) {
+            return Ok(());
+        }
+
+        let scalar_shape = |ty: &IrType| match ty {
+            IrType::UInt(Some(width)) => Some((*width, false)),
+            IrType::SInt(Some(width)) => Some((*width, true)),
+            _ => None,
+        };
+        if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+            (scalar_shape(expected), scalar_shape(&actual))
+        {
+            if dest_signed != src_signed {
+                return Err(LowerError::Invalid(format!(
+                    "{what} holds an {} {dest_width}-bit value, but the pushed value is {} \
+                     {src_width}-bit. Signedness must match — relabel the value explicitly with \
+                     `as {}<{src_width}>`.",
+                    if dest_signed { "signed" } else { "unsigned" },
+                    if src_signed { "signed" } else { "unsigned" },
+                    if dest_signed { "sint" } else { "uint" },
+                )));
+            }
+            if src_width > dest_width {
+                return Err(LowerError::Invalid(format!(
+                    "the value pushed into {what} is {src_width}-bit, but the queue holds \
+                     {dest_width}-bit values, so the push narrows. Truncate the value explicitly \
+                     before pushing it or widen the queue element type."
+                )));
+            }
+        }
+        Err(LowerError::Invalid(format!(
+            "{what} holds {expected:?}, but the pushed value is {actual:?}"
+        )))
     }
 
     /// The verdict for a whole-record assignment whose RHS did not type
@@ -1855,6 +1991,7 @@ impl FuncBuilder<'_> {
         target: &crate::ast::Expr,
         value: &crate::ast::Expr,
     ) -> Result<(), LowerError> {
+        self.reject_inactive_target_state_root(target)?;
         if let Some(port) = self.as_port_ref(target)? {
             // Writing a read-only `probe` is a hard error: only a
             // `probe force` declaration opts into the SV procedural-force
@@ -2146,6 +2283,66 @@ impl FuncBuilder<'_> {
         }
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
+                // `v = pending.pop()` on a direct testbench scalar queue.
+                // Unlike a generic expression, `pop()` is a mutating queue
+                // operation and therefore lowers directly to a statement
+                // whose destination is the already-declared local.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((field, method)) = self.as_tb_queue_call(callee) {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("testbench queue `{field}`"),
+                                args,
+                            )?;
+                            let elem = self.tb_queue_elem(&field)?;
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and testbench queue \
+                                         `{field}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::TbQueuePop { field, dest: local });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                // `v = <component>.<queue>.pop()` into an existing scalar
+                // local. Record-result assignment remains outside the shipped
+                // component-queue surface; a fresh record-typed `let` is the
+                // existing supported spelling.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((base, queue, method)) = self.as_component_queue_call(callee)? {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("component queue `{queue}`"),
+                                args,
+                            )?;
+                            let elem = self.component_queue_elem(&base, &queue)?;
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and component queue \
+                                         `{queue}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::ComponentQueuePop {
+                                    base,
+                                    queue,
+                                    dest: local,
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 // NOTE: `x = bus.m(...)` (bus call into an existing
                 // local) is deliberately NOT lowered — v1 supports bus
                 // calls only in `let`-RHS and statement position, and
@@ -2153,6 +2350,7 @@ impl FuncBuilder<'_> {
                 // below rejects it with a precise message.
                 // `v = sb.q.pop()` — pop into an existing local.
                 if let Some((sb, field, queue, nested_path)) = self.as_scoreboard_pop(value)? {
+                    let elem = self.scoreboard_queue_elem(sb, &queue)?;
                     // The mirror, first: a SCALAR local taking a
                     // RECORD element. v1 emits `x = _tb.sb.q.pop();`
                     // under a `uint64_t x` — "cannot convert 'Beat' to
@@ -2161,9 +2359,7 @@ impl FuncBuilder<'_> {
                     // rejected by `check_pop_let_type`; the assignment
                     // spelling was the unchecked lane.
                     if self.record_of_local(local).is_none() {
-                        if let crate::ir::QueueElem::Record(rid) =
-                            self.scoreboard_queue_elem(sb, &queue)?
-                        {
+                        if let crate::ir::QueueElem::Record(rid) = &elem {
                             return Err(LowerError::Invalid(format!(
                                 "local `{}` is a scalar and scoreboard queue `{queue}` \
                                  yields a `{}`",
@@ -2181,9 +2377,7 @@ impl FuncBuilder<'_> {
                         // type error, and v1's identical line then gets
                         // "no match for 'operator=', operand types are
                         // 'Beat' and 'long unsigned int'".
-                        if self.scoreboard_queue_elem(sb, &queue)?
-                            != crate::ir::QueueElem::Record(rid)
-                        {
+                        if elem != crate::ir::QueueElem::Record(rid) {
                             return Err(LowerError::Invalid(format!(
                                 "transaction local `{}` is a `{}`, and scoreboard queue \
                                  `{queue}` does not hold that record type",
@@ -2191,15 +2385,15 @@ impl FuncBuilder<'_> {
                                 self.ctx.records[rid.index()].name
                             )));
                         }
-                        return Err(unsupported(
-                            &format!(
-                                "assignment of a scoreboard `pop()` result to transaction \
-                                 local `{}`",
-                                id.name
-                            ),
-                            "pop into a fresh `let` instead; v1 emits the same struct copy \
-                             and it compiles",
-                        ));
+                    }
+                    let expected = self.local_type(local).clone();
+                    let actual = elem.ir_type();
+                    if !component_method_result_compatible(&expected, &actual) {
+                        return Err(LowerError::Invalid(format!(
+                            "local `{}` is declared {:?} and scoreboard queue `{queue}` \
+                             yields {:?}",
+                            id.name, expected, actual
+                        )));
                     }
                     self.push(Stmt::ScoreboardOp {
                         sb,
@@ -2208,6 +2402,78 @@ impl FuncBuilder<'_> {
                         nested_path,
                     });
                     return Ok(());
+                }
+                // `v = pending.pop()` inside a target responder. Scalar
+                // state queues support the same existing-local assignment
+                // spelling as the other direct queue owners; record-result
+                // assignment remains on its established fresh-`let` path.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let Some((field, method)) = self.as_state_queue_call(callee) {
+                        if method == "pop" {
+                            queue_pop_takes_no_arguments(
+                                &format!("target-state queue `{field}`"),
+                                args,
+                            )?;
+                            let crate::ir::StateFieldKind::Queue { elem } =
+                                self.target_state_fields[&field].clone()
+                            else {
+                                unreachable!("as_state_queue_call gated on the Queue kind");
+                            };
+                            if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                let expected = self.local_type(local).clone();
+                                let actual = elem.ir_type();
+                                if !component_method_result_compatible(&expected, &actual) {
+                                    return Err(LowerError::Invalid(format!(
+                                        "local `{}` is declared {:?} and target-state queue \
+                                         `{field}` yields {:?}",
+                                        id.name, expected, actual
+                                    )));
+                                }
+                                self.push(Stmt::TransactorStateQueuePop {
+                                    instance: String::new(),
+                                    field,
+                                    dest: local,
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                // `v = responder.pending.pop()` at test scope: the same
+                // scalar assignment operation with an already-resolved
+                // persistent-state instance.
+                if let ExprKind::Call { callee, args } = &*value.kind {
+                    if let ExprKind::Field { target, name } = &*callee.kind {
+                        if name.name == "pop" {
+                            if let Some((instance, field, kind)) =
+                                self.as_transactor_state_any(target)
+                            {
+                                if let crate::ir::StateFieldKind::Queue { elem } = kind {
+                                    queue_pop_takes_no_arguments(
+                                        &format!("target-state queue `{instance}.{field}`"),
+                                        args,
+                                    )?;
+                                    if matches!(elem, crate::ir::QueueElem::Scalar { .. }) {
+                                        let expected = self.local_type(local).clone();
+                                        let actual = elem.ir_type();
+                                        if !component_method_result_compatible(&expected, &actual) {
+                                            return Err(LowerError::Invalid(format!(
+                                                "local `{}` is declared {:?} and target-state \
+                                                 queue `{instance}.{field}` yields {:?}",
+                                                id.name, expected, actual
+                                            )));
+                                        }
+                                        self.push(Stmt::TransactorStateQueuePop {
+                                            instance,
+                                            field,
+                                            dest: local,
+                                        });
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // `v = xact.method(...)` — call edge into an existing
                 // local.
@@ -2697,13 +2963,11 @@ impl FuncBuilder<'_> {
                      individually (`<field>.<sub> = ...`)",
                 ));
             }
-            // The copy itself is not lowered yet — but the suggestion
-            // is honest now, because v1 does compile this one.
-            return Err(unsupported(
-                "a whole-record write of a testbench record field",
-                "v1 emits the struct copy `_tb.<field> = <rhs>;` and it compiles; assign \
-                 the record's fields individually to stay in the TB-IR subset",
-            ));
+            let local = self
+                .record_target_local(target)
+                .expect("tb_record_field_target resolved a declared synthetic record local");
+            self.push(Stmt::Assign(local, e));
+            return Ok(());
         }
         // Two measured shapes, and they are not the same failure.
         //
@@ -3033,7 +3297,7 @@ impl FuncBuilder<'_> {
         let schema = &self.ctx.scoreboards[sb.index()];
         match schema.field(field) {
             Some(f) => match &f.kind {
-                crate::ir::ScoreboardFieldKind::Queue { elem } => Ok(*elem),
+                crate::ir::ScoreboardFieldKind::Queue { elem } => Ok(elem.clone()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
                     schema.name
@@ -3639,8 +3903,9 @@ impl FuncBuilder<'_> {
     }
 
     /// `on <channel>(<param>) ... end on` — subscribe to a test-scope
-    /// event channel. The body becomes a ONE-parameter
-    /// `FunctionKind::TestHook` function whose parameter is the payload;
+    /// event channel or a component event field. The body becomes a
+    /// ONE-parameter `FunctionKind::TestHook` function whose parameter is
+    /// the payload;
     /// the registration statement pushes a closure calling it onto the
     /// channel vector, exactly as v1 pushes its inline closure.
     fn lower_event_subscription(
@@ -3650,50 +3915,103 @@ impl FuncBuilder<'_> {
         args: &[CallArg],
     ) -> Result<(), LowerError> {
         self.require_test_body("an `on <event>(...)` subscription")?;
-        let ExprKind::Ident(id) = &*callee.kind else {
-            return Err(unsupported(
-                "an `on <path>.<event>(arg)` subscription in statement position",
-                "subscribe from the component that owns the `event` field",
-            ));
-        };
-        let Some(channel) = self.lookup(&id.name) else {
-            // `lookup` failing means the name is not a LOCAL here. It
-            // does NOT mean the name is undefined — an earlier version
-            // of this comment said so and was wrong. Measured, all of
-            // these land here: a testbench component field (`s`), a
-            // testbench scalar field (`seen`), the clock (`clk`), the
-            // DUT binding (`dut`), an agent TYPE name (`Src`), and a
-            // component METHOD name (`fire`). Every one is declared
-            // somewhere in the program.
-            //
-            // The verdict survives anyway, and that was measured too:
-            // v1 emits `<name>.push_back(...)` for each and g++ refuses
-            // all six ("'s' was not declared in this scope", "request
-            // for member 'push_back' in 'dut', which is of pointer type
-            // 'VTop*'", and so on). The message says "names no event
-            // channel in scope", which is true of all of them; it is
-            // the reasoning that was over-stated, not the wording.
-            //
-            // MEASURED: v1 emits `nosuch.push_back([&](int64_t v) {...})`
-            // — g++: "'nosuch' was not declared in this scope". A
-            // program error under both backends.
-            //
-            // Its sibling arm above keeps `Unsupported`, and that is
-            // measured too rather than assumed: `on s.obs(v)` for a
-            // component's `event` field makes v1 emit
-            // `_tb.s.obs.push_back(...)` against a real member, and the
-            // program COMPILES AND RUNS — built and run, `seen=3`. Same
-            // statement position, same construct, opposite verdicts.
-            return Err(LowerError::Invalid(format!(
-                "`on {}(...)`: `{}` names no event channel in scope",
-                id.name, id.name
-            )));
-        };
-        let IrType::Event(payload) = *self.local_type(channel) else {
-            return Err(LowerError::Invalid(format!(
-                "`on {}(...)`: `{}` is not an event channel",
-                id.name, id.name
-            )));
+        let (event_ref, payload, display_name) = if let ExprKind::Ident(id) = &*callee.kind {
+            let Some(channel) = self.lookup(&id.name) else {
+                // `lookup` failing means the name is not a LOCAL here. It
+                // does NOT mean the name is undefined — an earlier version
+                // of this comment said so and was wrong. Measured, all of
+                // these land here: a testbench component field (`s`), a
+                // testbench scalar field (`seen`), the clock (`clk`), the
+                // DUT binding (`dut`), an agent TYPE name (`Src`), and a
+                // component METHOD name (`fire`). Every one is declared
+                // somewhere in the program.
+                //
+                // The verdict survives anyway, and that was measured too:
+                // v1 emits `<name>.push_back(...)` for each and g++ refuses
+                // all six ("'s' was not declared in this scope", "request
+                // for member 'push_back' in 'dut', which is of pointer type
+                // 'VTop*'", and so on). The message says "names no event
+                // channel in scope", which is true of all of them; it is
+                // the reasoning that was over-stated, not the wording.
+                //
+                // MEASURED: v1 emits `nosuch.push_back([&](int64_t v) {...})`
+                // — g++: "'nosuch' was not declared in this scope". A
+                // program error under both backends.
+                //
+                // A component event path is handled by the branch below;
+                // this diagnostic is only for a bare name with no local
+                // event-channel binding.
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)`: `{}` names no event channel in scope",
+                    id.name, id.name
+                )));
+            };
+            let IrType::Event(payload) = *self.local_type(channel) else {
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)`: `{}` is not an event channel",
+                    id.name, id.name
+                )));
+            };
+            (EventChannelRef::Local(channel), payload, id.name.clone())
+        } else {
+            let Some(raw) = super::components::dotted_path(callee) else {
+                return Err(LowerError::Invalid(
+                    "an event subscription target must be an event-channel name or component \
+                     event path"
+                        .to_string(),
+                ));
+            };
+            let path = self.strip_tb_prefix(&raw).to_vec();
+            if path.len() < 2 {
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)` does not name a component event field",
+                    path.join(".")
+                )));
+            }
+            let head = path[0].clone();
+            let Some(&head_cid) = self.ctx.component_fields.get(&head) else {
+                return Err(LowerError::Invalid(format!(
+                    "`on {}(...)`: `{head}` is not a component binding",
+                    path.join(".")
+                )));
+            };
+            let recv = path[..path.len() - 1].to_vec();
+            let event = path.last().expect("path has event segment").clone();
+            let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+            let comp = &self.ctx.components[cid.index()];
+            let Some(field) = comp.field(&event) else {
+                return Err(LowerError::Invalid(format!(
+                    "component `{}` has no event field `{event}`",
+                    comp.name
+                )));
+            };
+            let ComponentFieldKind::Event { payload } = field.kind else {
+                return Err(LowerError::Invalid(format!(
+                    "component `{}.{event}` is not an event field",
+                    comp.name
+                )));
+            };
+            let activation = field.activation;
+            self.require_component_activation(
+                &head,
+                head_cid,
+                self.binding_mode(&head),
+                &recv[1..],
+                activation,
+                "event",
+                &event,
+            )?;
+            let display = path.join(".");
+            (
+                EventChannelRef::Component {
+                    base: ComponentBase::Path(recv),
+                    component: cid,
+                    event,
+                    payload,
+                },
+                payload,
+                display,
+            )
         };
         // Exactly one parameter, and it must be a plain binding name —
         // the payload the emitter passes in.
@@ -3702,15 +4020,13 @@ impl FuncBuilder<'_> {
                 ExprKind::Ident(p) => p.name.clone(),
                 _ => {
                     return Err(LowerError::Invalid(format!(
-                        "`on {}(...)`: the payload binding must be a name",
-                        id.name
+                        "`on {display_name}(...)`: the payload binding must be a name"
                     )))
                 }
             },
             _ => {
                 return Err(LowerError::Invalid(format!(
-                    "`on {}(...)` takes exactly one payload binding, got {}",
-                    id.name,
+                    "`on {display_name}(...)` takes exactly one payload binding, got {}",
                     args.len()
                 )))
             }
@@ -3746,7 +4062,7 @@ impl FuncBuilder<'_> {
 
         self.commit_pending_function(pending_id, f);
         self.push(Stmt::EventSubscribe {
-            event: channel,
+            event: event_ref,
             handler: pending_id,
         });
         Ok(())
@@ -3832,8 +4148,7 @@ impl FuncBuilder<'_> {
             // field? Checked in the recoverable direction — a miss
             // yields the honest `Rejects`, and a hit only ever upgrades
             // to the suggestion.
-            let resolves = hook_path_names_a_hookable(self, h);
-            if !resolves {
+            let Some((target, params)) = resolve_statement_method_hook_target(self, h)? else {
                 return Err(not_implemented(
                     "a `pre`/`post` hook whose path names no `hookable` in statement position",
                     "v1 routes every hooked `on` through its method-hook resolver and \
@@ -3841,14 +4156,35 @@ impl FuncBuilder<'_> {
                      component type, so it is not a way to run this program",
                     V1Status::Rejects,
                 ));
-            }
-            return Err(unsupported(
-                "an `on <obj>.<method> pre/post` hook in statement position",
-                "declare the hook at test scope (`impl ... for <Tb>` / `test` body), on a \
-                 transactor testbench field — a hook body must be registered in the \
-                 method's pre/post vector before any call site runs, not at a point \
-                 inside the run body",
-            ));
+            };
+            let captures = self.method_hook_captures(&params, &h.body);
+            let capture_params: Vec<TypedParam> = captures
+                .iter()
+                .map(|(name, local)| TypedParam {
+                    name: name.clone(),
+                    ty: self.local_type(*local).clone(),
+                })
+                .collect();
+            let pending_id = self.reserve_pending_function();
+            let hook_fn = super::lower_method_hook_body(
+                pending_id,
+                format!("_on_method_hook_{}", pending_id.0),
+                self.ctx.owner,
+                &params,
+                &capture_params,
+                &h.body,
+                self.ctx,
+                self.helpers,
+                self.side_tables,
+            )?;
+            self.commit_pending_function(pending_id, hook_fn);
+            self.push(Stmt::MethodHookSubscribe {
+                target,
+                side: h.hook.expect("hook branch has a side"),
+                handler: pending_id,
+                captures: captures.into_iter().map(|(_, local)| local).collect(),
+            });
+            return Ok(());
         }
         // `on e(v) ... end on` — an event subscription. A test-scope
         // channel (`let e : event<T>`) subscribes here; a component's
@@ -4239,15 +4575,11 @@ impl FuncBuilder<'_> {
     /// lands in a temp nothing reads. v1 emits the same call and drops
     /// the return value.
     ///
-    /// Typed from the queue's element so a record-element pop declares a
-    /// struct slot rather than a scalar one; a scalar element leaves the
-    /// temp at the default u64, exactly as a `let` with no annotation
-    /// does on the bound path.
+    /// Typed from the queue's exact element so both record and scalar pops
+    /// declare the same storage they would have used in a bound `let`.
     fn discard_slot(&mut self, elem: crate::ir::QueueElem) -> crate::ir::LocalId {
         let dest = self.fresh_temp();
-        if let crate::ir::QueueElem::Record(rid) = elem {
-            self.set_local_type(dest, IrType::Record(rid));
-        }
+        self.set_local_type(dest, elem.ir_type());
         dest
     }
 
@@ -4965,6 +5297,25 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
+fn queue_scalar_assignment_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
+    if expected == actual {
+        return true;
+    }
+    let widthless = |ty: &IrType| matches!(ty, IrType::UInt(None) | IrType::SInt(None));
+    if widthless(expected) || widthless(actual) {
+        return true;
+    }
+    match (expected, actual) {
+        (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
+        | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
+        (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
+        _ => false,
+    }
+}
+
 fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> bool {
     if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
         return true;
@@ -4996,8 +5347,8 @@ fn is_log_severity(s: &str) -> bool {
 /// a proxy:
 ///
 ///   * `size` / `empty` — compile. The value is discarded, which makes
-///     the statement a legal no-op, and v1 runs the program. That is a
-///     TB-IR subset gap with a working escape hatch.
+///     the statement a legal no-op; `discard_queue_query_statement`
+///     accepts and elides it before this diagnostic helper is reached.
 ///   * anything else — `clear`, `front`, a typo — g++: "'struct
 ///     harc_rt::HarcQueue<long unsigned int>' has no member named
 ///     'clear'". No backend runs it.
@@ -5018,21 +5369,27 @@ fn is_log_severity(s: &str) -> bool {
 /// each take their own probe. All five behave this way — which is why
 /// they now share this helper instead of three of them carrying a
 /// hand-written `EmitsUncompilable` that measurement contradicts.
-fn queue_method_in_statement_position(what: &str, method: &str) -> LowerError {
-    // `HarcQueue`'s value-returning half. Kept beside the reason it
-    // matters: apart from the four width-method names noted above, v1
-    // emits whatever name is written straight through, so this list is
-    // the runtime's API, and it has to track `runtime/harc_queue_rt.h`
-    // or a working call starts being called a program error. The test
-    // enumerates the header's declared members and compares the whole
-    // set, so growing `HarcQueue` fails here rather than silently.
-    if matches!(method, "size" | "empty") {
-        return unsupported(
-            &format!("{what} in statement position"),
-            "the value is discarded, so v1 emits a legal no-op and runs the program; \
-             TB-IR lowers `size`/`empty` in expression position instead",
-        );
+fn discard_queue_query_statement(
+    what: &str,
+    method: &str,
+    args: &[CallArg],
+) -> Result<bool, LowerError> {
+    if !matches!(method, "size" | "empty") {
+        return Ok(false);
     }
+    if !args.is_empty() {
+        return Err(LowerError::Invalid(format!(
+            "{what}.{method}() takes no arguments, got {}",
+            args.len()
+        )));
+    }
+    // The result is intentionally discarded. An IR statement is not
+    // needed for this pure host-state query; omitting it is behaviorally
+    // identical to v1's emitted `<queue>.size();` / `.empty();` no-op.
+    Ok(true)
+}
+
+fn queue_method_in_statement_position(what: &str) -> LowerError {
     LowerError::Invalid(format!(
         "{what} in statement position: `HarcQueue` has only `push`, `pop`, `size` and \
          `empty`"

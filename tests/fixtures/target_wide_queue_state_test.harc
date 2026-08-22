@@ -1,0 +1,102 @@
+// Wide scalar queue state is persistent per target-transactor instance.
+// Exercise every pop landing through both the responder-local spelling and
+// the instance-qualified test-scope spelling.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor WideQueueResponder bound to TlmMemBus
+    wide_values   : queue<uint<256>>
+    odd_values    : queue<uint<65>>
+    signed_values : queue<sint<8>>
+
+    thread bus.read(addr: uint<8>)
+        wait 1 cycle
+
+        let one : uint<256> = 1
+        wide_values.push(one << 200)
+        wide_values.push(one << 201)
+        wide_values.push(one << 202)
+        wide_values.push(one << 203)
+        assert wide_values.size() == 4
+            else fail("responder wide queue did not retain four values")
+
+        let bare_inferred = wide_values.pop()
+        let bare_typed : uint<256> = wide_values.pop()
+        let bare_assigned : uint<256> = 0
+        bare_assigned = wide_values.pop()
+        wide_values.pop()
+
+        assert (bare_inferred >> 200) == 1
+            else fail("responder inferred pop lost bit 200")
+        assert (bare_typed >> 201) == 1
+            else fail("responder typed pop lost bit 201")
+        assert (bare_assigned >> 202) == 1
+            else fail("responder assigned pop lost bit 202")
+        assert wide_values.empty()
+            else fail("responder discarded pop did not drain the queue")
+
+        let negative_one : sint<8> = (0 - 1) as sint<8>
+        let negative_two : sint<8> = (0 - 2) as sint<8>
+        signed_values.push(negative_one)
+        signed_values.push(negative_two)
+        let signed_first : sint<8> = signed_values.pop()
+        let signed_second = signed_values.pop()
+        assert signed_first == negative_one
+            else fail("target signed queue changed its first value")
+        assert signed_second == negative_two
+            else fail("target signed queue lost FIFO order")
+        assert signed_values.empty()
+            else fail("target signed queue did not drain")
+
+        let odd_one : uint<65> = 1
+        odd_values.push((odd_one << 64) + addr)
+        return 256 + addr
+    end thread
+end transactor WideQueueResponder
+
+testbench TargetWideQueueStateTb
+    dut : TlmReadInitiator
+end testbench TargetWideQueueStateTb
+
+impl TargetWideQueueStateTest for TargetWideQueueStateTb
+    let mem : TlmMemBus = bind dut
+    let responder : WideQueueResponder passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 40 cycles fail("DUT initiator did not receive HARC target response")
+        assert dut.result == 261
+            else fail("target TLM response mismatch")
+
+        let odd_one : uint<65> = 1
+        responder.odd_values.push((odd_one << 64) + 6)
+        responder.odd_values.push((odd_one << 64) + 7)
+        responder.odd_values.push((odd_one << 64) + 8)
+        assert responder.odd_values.size() == 4
+            else fail("instance-qualified wide queue did not retain four values")
+
+        let instance_inferred = responder.odd_values.pop()
+        let instance_typed : uint<65> = responder.odd_values.pop()
+        let instance_assigned : uint<65> = 0
+        instance_assigned = responder.odd_values.pop()
+        responder.odd_values.pop()
+
+        assert (instance_inferred >> 64) == 1
+            else fail("instance-qualified inferred pop lost bit 64")
+        assert (instance_inferred & 255) == 5
+            else fail("instance-qualified inferred pop changed low bits")
+        assert (instance_typed & 255) == 6
+            else fail("instance-qualified typed pop changed low bits")
+        assert (instance_assigned & 255) == 7
+            else fail("instance-qualified assigned pop changed low bits")
+        assert responder.odd_values.empty()
+            else fail("instance-qualified discarded pop did not drain the queue")
+
+        log(info, "PASS: target-transactor wide scalar queue state preserves exact values")
+    end run
+end impl TargetWideQueueStateTest

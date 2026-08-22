@@ -15,8 +15,8 @@
 //!     materialization — rejected at the call site, but the declaration
 //!     itself is also rejected here so an unreferenced method-bearing
 //!     scoreboard does not lower to a struct missing its methods);
-//!   - queue element types that are not scalars ≤ 64 bits (e.g.
-//!     `queue<SomeStruct>` — needs the record-payload-in-queue seam);
+//!   - queue element types other than exact scalars through the 1024-bit
+//!     language ceiling or value-records (enum/Vec/list/event/nested);
 //!   - non-scalar / >64-bit scalar fields.
 //!
 //! `NotImplemented { v1: SilentlyMisLowers }` (v1 is not a way out):
@@ -289,7 +289,7 @@ pub(crate) fn lower_scoreboard(
 
 /// Classify a scoreboard field type. Scalar fields mirror v1's
 /// `scoreboard_field_c_type` → `txn_field_c_type` choices; `queue<T>`
-/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar ≤ 64 bits or a
+/// maps to `harc_rt::HarcQueue<T>` when `T` is a scalar or a
 /// value-record (transaction/struct), mirroring v1's `HarcQueue<Struct>`.
 /// The record-element resolution reuses the composite-component path's
 /// `lower_queue_elem` so both queue seams agree on the `QueueElem` shape.
@@ -307,8 +307,8 @@ fn scoreboard_field_kind(
         ..
     } = t
     {
-        // Scalar ≤ 64 bits or a value-record element — resolved through the
-        // shared component-path helper (don't fork the record-queue seam).
+        // Exact scalar or value-record element — resolved through the shared
+        // component-path helper (don't fork the record-queue seam).
         let elem = super::components::lower_queue_elem(sb, fname, args.first(), record_ids)?;
         return Ok(ScoreboardFieldKind::Queue { elem });
     }

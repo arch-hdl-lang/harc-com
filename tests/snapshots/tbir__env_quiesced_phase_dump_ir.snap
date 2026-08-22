@@ -1,5 +1,6 @@
 ---
 source: tests/tbir.rs
+assertion_line: 1607
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -29,7 +30,7 @@ fn fn1 run_EnvQuiescedPhaseTest [kind=Run, owner=tb0]
   locals:
     %0 i : unknown
     %1 t : record(r0)
-    %2 drained : unknown
+    %2 drained : uint<8>
     %3 __t0 : unknown
   entry = b0
 

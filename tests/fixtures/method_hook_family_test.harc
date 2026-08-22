@@ -1,0 +1,121 @@
+// Method-hook family parity: nested component resolution, signed method
+// parameters, and statement-position registration timing.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent MethodHookWatcher
+    calls : uint<32> default 0
+
+    hookable note(v: sint<8>)
+        calls = calls + 1
+    end note
+end agent MethodHookWatcher
+
+scoreboard MethodHookSink
+    total : sint<32> default 0
+
+    hookable add(v: sint<8>)
+        total = total + v
+    end add
+end scoreboard MethodHookSink
+
+transactor MethodHookDriver
+    hookable ping(v: uint<8>)
+        if v == 0
+            return
+        end if
+    end ping
+end transactor MethodHookDriver
+
+env MethodHookEnv
+    watcher : MethodHookWatcher
+    sibling : MethodHookWatcher
+    sink    : MethodHookSink
+end env MethodHookEnv
+
+testbench MethodHookFamilyTb
+    dut          : Top
+    env          : MethodHookEnv
+    drv          : MethodHookDriver passive
+    static_sum   : sint<32> default 0
+    dynamic_sum  : sint<32> default 0
+    drv_post_hits : uint<32> default 0
+    registration_order : uint<64> default 0
+end testbench MethodHookFamilyTb
+
+impl MethodHookFamilyTest for MethodHookFamilyTb
+    clock clk = SysDomain
+
+    on env.watcher.note pre
+        static_sum = static_sum + v
+    end on
+
+    on env.watcher.note pre
+        registration_order = registration_order * 10 + 1
+    end on
+
+    on env.watcher.note pre
+        registration_order = registration_order * 10 + 2
+    end on
+
+    on drv.ping post
+        drv_post_hits = drv_post_hits + 1
+    end on
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // The static test-scope hook sees both calls.
+        env.watcher.note(-2)
+
+        // This hook must not see the call above: registration occurs here.
+        // Its body also captures and mutates a preceding run-local by
+        // reference, as v1's local `[&]` closure does.
+        let local_bias : sint<32> = 4
+        on env.watcher.note post
+            dynamic_sum = dynamic_sum + v + local_bias
+            local_bias = local_bias + 1
+            env.sink.add(v)
+        end on
+        on env.watcher.note pre
+            registration_order = registration_order * 10 + 3
+        end on
+        env.watcher.note(5)
+        // v1 hook vectors are component-type scoped, so a same-typed sibling
+        // also fires both registrations. TBIR must preserve that contract.
+        env.sibling.note(7)
+
+        // A post hook fires only after natural completion. The explicit
+        // return in ping(0) bypasses it, matching the v1 method emitter.
+        drv.ping(0)
+        drv.ping(1)
+
+        assert static_sum == 10 else fail("static hook sum ${static_sum}, expected 10")
+        assert dynamic_sum == 21 else fail("dynamic hook sum ${dynamic_sum}, expected 21")
+        assert local_bias == 6 else fail("captured local ${local_bias}, expected 6")
+        assert env.watcher.calls == 2 else fail("method body count ${env.watcher.calls}, expected 2")
+        assert env.sibling.calls == 1 else fail("sibling body count ${env.sibling.calls}, expected 1")
+        assert env.sink.total == 12 else fail("hook-called method sum ${env.sink.total}, expected 12")
+        assert drv_post_hits == 1 else fail("driver post hook count ${drv_post_hits}, expected 1")
+        assert registration_order == 12123123
+            else fail("method hook registration order ${registration_order}, expected 12123123")
+        log(info, "PASS: nested and statement-position method hooks")
+    end run
+
+    check
+        // The run-local captured by the dynamic hook must remain alive when
+        // the persistent hook vector fires in the later check phase.
+        env.watcher.note(3)
+        assert static_sum == 13 else fail("cross-phase static sum ${static_sum}, expected 13")
+        assert dynamic_sum == 30 else fail("cross-phase dynamic sum ${dynamic_sum}, expected 30")
+        assert env.watcher.calls == 3 else fail("cross-phase method count ${env.watcher.calls}, expected 3")
+        assert env.sink.total == 15 else fail("cross-phase hook-called sum ${env.sink.total}, expected 15")
+        assert registration_order == 12123123123
+            else fail("cross-phase registration order ${registration_order}, expected 12123123123")
+    end check
+end impl MethodHookFamilyTest

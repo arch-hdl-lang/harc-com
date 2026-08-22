@@ -2827,6 +2827,711 @@ end impl QueueOwnerTest
     assert!(cpp.contains("_tb.pending.pop()"), "{cpp}");
 }
 
+/// A direct testbench queue is typed by its declared scalar element, not by
+/// the historical 64-bit queue carrier. This fixture crosses every pop
+/// landing (typed/inferred/assigned/discarded) and the generated storage.
+#[test]
+fn wide_queue_testbench_ir_display_and_emission_preserve_scalar_type() {
+    let src = fixture("testbench_wide_queue_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide testbench queue lowers");
+    verify::verify_program(&prog).expect("wide testbench queue verifies");
+
+    let dump = format!("{prog}");
+    assert!(
+        dump.contains("queue wide_values:uint<256>"),
+        "dump-ir must retain the declared queue element width: {dump}"
+    );
+    assert!(
+        dump.contains("inferred_wide : uint<256>") && dump.contains("signed_value : sint<8>"),
+        "inferred pops must use the queue's exact scalar type: {dump}"
+    );
+
+    let run = prog.function(prog.tests[0].run);
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. } if run.local(*dest).name.starts_with("__t") => {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded queue pop");
+    assert_eq!(
+        discarded.ty,
+        ir::IrType::UInt(Some(256)),
+        "a discarded pop still needs width-correct storage"
+    );
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide testbench queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide queue storage must reuse the scalar local C++ mapping: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcWide<8> inferred_wide")
+            && cpp.contains("harc_rt::HarcWide<8> __t"),
+        "inferred and discarded wide pops must not truncate: {cpp}"
+    );
+}
+
+/// A boolean queue is boolean host state, not an integer carrier. The queue
+/// element mapper is shared by every direct owner, so this direct-testbench
+/// boundary catches accidental reuse of the scalar-local widening policy.
+#[test]
+fn scalar_queue_bool_uses_bool_cpp_storage() {
+    let src = r#"
+testbench BoolQueueTb
+    dut   : Top
+    flags : queue<bool>
+end testbench BoolQueueTb
+
+impl BoolQueueTest for BoolQueueTb
+    run
+        flags.push(true)
+        let flag = flags.pop()
+        assert flag
+    end run
+end impl BoolQueueTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<bool> flags;"),
+        "queue<bool> must emit boolean storage: {cpp}"
+    );
+}
+
+/// Signedness is part of a scalar queue's element type even when the pop has
+/// no annotation to seed the destination local.
+#[test]
+fn wide_queue_inferred_signed_pop_keeps_declared_signedness() {
+    let src = r#"
+testbench SignedQueueTb
+    dut : Top
+    values : queue<sint<8>>
+end testbench SignedQueueTb
+
+impl SignedQueueTest for SignedQueueTb
+    run
+        let value = values.pop()
+    end run
+end impl SignedQueueTest
+"#;
+    let prog = lower_src(src).expect("signed scalar queue lowers");
+    verify::verify_program(&prog).expect("signed scalar queue verifies");
+    let run = prog.function(prog.tests[0].run);
+    let value = run
+        .locals
+        .iter()
+        .find(|local| local.name == "value")
+        .expect("pop destination local exists");
+    assert_eq!(value.ty, ir::IrType::SInt(Some(8)));
+}
+
+/// A discarded pop is still a value-producing queue operation internally;
+/// its unread destination must therefore retain a width above 128 bits.
+#[test]
+fn wide_queue_discarded_pop_uses_exact_element_type() {
+    let src = r#"
+testbench DiscardQueueTb
+    dut : Top
+    values : queue<uint<256>>
+end testbench DiscardQueueTb
+
+impl DiscardQueueTest for DiscardQueueTb
+    run
+        values.pop()
+    end run
+end impl DiscardQueueTest
+"#;
+    let prog = lower_src(src).expect("discarded wide queue pop lowers");
+    verify::verify_program(&prog).expect("discarded wide queue pop verifies");
+    let run = prog.function(prog.tests[0].run);
+    let dest = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. } => Some(*dest),
+            _ => None,
+        })
+        .expect("discarded pop lowers to TbQueuePop");
+    assert_eq!(run.local(dest).ty, ir::IrType::UInt(Some(256)));
+}
+
+/// The verifier uses the full queue element type in assignment direction:
+/// pushes cannot exceed the element width and pops cannot narrow it.
+#[test]
+fn wide_queue_verifier_rejects_lossy_scalar_transfers() {
+    let mut push_prog =
+        lower_src(&fixture("testbench_wide_queue_test.harc")).expect("fixture lowers");
+    let run = push_prog.tests[0].run.index();
+    let push = push_prog.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePush { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("fixture has a queue push");
+    *push = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&push_prog).is_err(),
+        "a 512-bit value cannot enter a 256-bit queue"
+    );
+
+    let mut pop_prog =
+        lower_src(&fixture("testbench_wide_queue_test.harc")).expect("fixture lowers");
+    let run = pop_prog.tests[0].run.index();
+    let dest = pop_prog.functions[run]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TbQueuePop { dest, .. }
+                if pop_prog.functions[run].local(*dest).name == "typed_wide" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has a typed wide pop");
+    pop_prog.functions[run].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&pop_prog).is_err(),
+        "a 256-bit queue value cannot enter a 128-bit local"
+    );
+}
+
+/// The two C++ storage transitions are exact: 64 -> 65 bits moves from a
+/// native carrier to `_harc_u128`, and 128 -> 129 bits moves from
+/// `_harc_u128` to `HarcWide`. Signed queues use the same bit carriers but
+/// retain signedness in the inferred pop locals, including non-word-aligned
+/// widths on both sides of the second transition.
+#[test]
+fn scalar_queue_storage_preserves_64_65_and_128_129_boundaries() {
+    let src = r#"
+testbench QueueBoundaryTb
+    dut  : Top
+    u64  : queue<uint<64>>
+    u65  : queue<uint<65>>
+    u128 : queue<uint<128>>
+    u129 : queue<uint<129>>
+    s65  : queue<sint<65>>
+    s129 : queue<sint<129>>
+end testbench QueueBoundaryTb
+
+impl QueueBoundaryTest for QueueBoundaryTb
+    run
+        let got_u64 = u64.pop()
+        let got_u65 = u65.pop()
+        let got_u128 = u128.pop()
+        let got_u129 = u129.pop()
+        let got_s65 = s65.pop()
+        let got_s129 = s129.pop()
+    end run
+end impl QueueBoundaryTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("scalar queue boundaries lower");
+    verify::verify_program(&prog).expect("scalar queue boundaries verify");
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("got_u64", ir::IrType::UInt(Some(64))),
+        ("got_u65", ir::IrType::UInt(Some(65))),
+        ("got_u128", ir::IrType::UInt(Some(128))),
+        ("got_u129", ir::IrType::UInt(Some(129))),
+        ("got_s65", ir::IrType::SInt(Some(65))),
+        ("got_s129", ir::IrType::SInt(Some(129))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "queue pop `{name}` retains its exact scalar type"
+        );
+    }
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("scalar queue boundaries emit");
+    for declaration in [
+        "harc_rt::HarcQueue<uint64_t> u64;",
+        "harc_rt::HarcQueue<_harc_u128> u65;",
+        "harc_rt::HarcQueue<_harc_u128> u128;",
+        "harc_rt::HarcQueue<harc_rt::HarcWide<5>> u129;",
+        "harc_rt::HarcQueue<_harc_u128> s65;",
+        "harc_rt::HarcQueue<harc_rt::HarcWide<5>> s129;",
+    ] {
+        assert!(
+            cpp.contains(declaration),
+            "expected boundary storage `{declaration}` in:\n{cpp}"
+        );
+    }
+}
+
+/// Direct scalar queues deliberately widen only the scalar element subset.
+/// Aggregate elements other than value records remain explicit
+/// `Unsupported` diagnostics instead of being flattened into scalar storage.
+#[test]
+fn scalar_queue_rollout_keeps_aggregate_elements_unsupported() {
+    for elem in ["Color", "Vec", "list"] {
+        let src = format!(
+            r#"
+enum Color {{ RED, GREEN }}
+
+testbench AggregateQueueTb
+    dut    : Top
+    values : queue<{elem}>
+end testbench AggregateQueueTb
+
+impl AggregateQueueTest for AggregateQueueTb
+    run
+        wait 1 cycle
+    end run
+end impl AggregateQueueTest
+"#
+        );
+        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        assert!(
+            msg.contains("non-scalar queue element")
+                && msg.contains("enum/Vec/nested elements gate on a later slice"),
+            "`queue<{elem}>` must stay explicitly unsupported: {msg}"
+        );
+    }
+}
+
+/// A source-level type annotation on `queue.pop()` is an assignment slot.
+/// Narrowing or changing signedness is a program error, so it must be
+/// reported by lowering rather than surfacing as an internal verifier error.
+#[test]
+fn scalar_queue_pop_type_changes_are_source_diagnostics() {
+    let program = |queue_ty: &str, local_ty: &str| {
+        format!(
+            r#"
+testbench QueueDiagTb
+    dut    : Top
+    values : queue<{queue_ty}>
+end testbench QueueDiagTb
+
+impl QueueDiagTest for QueueDiagTb
+    run
+        let got : {local_ty} = values.pop()
+    end run
+end impl QueueDiagTest
+"#
+        )
+    };
+
+    let narrowing = assert_invalid(
+        &lower_src(&program("uint<65>", "uint<64>"))
+            .expect_err("a 65-bit queue pop must not narrow into 64 bits"),
+    );
+    assert!(
+        narrowing.contains("testbench queue `values`")
+            && narrowing.contains("65-bit")
+            && narrowing.contains("64-bit")
+            && narrowing.contains("narrows"),
+        "narrowing diagnostic must name the queue and both widths: {narrowing}"
+    );
+
+    let signedness = assert_invalid(
+        &lower_src(&program("sint<129>", "uint<129>"))
+            .expect_err("a signed queue pop must not relabel into unsigned storage"),
+    );
+    assert!(
+        signedness.contains("testbench queue `values`")
+            && signedness.contains("signed 129-bit")
+            && signedness.contains("unsigned 129-bit")
+            && signedness.contains("Signedness must match"),
+        "signedness diagnostic must name the queue and both types: {signedness}"
+    );
+}
+
+/// A scalar value entering a queue is an ordinary directional assignment.
+/// Width loss and signedness changes are source errors, not malformed IR for
+/// the verifier to report through the compiler-bug channel.
+#[test]
+fn scalar_queue_push_type_changes_are_source_diagnostics() {
+    let program = |queue_ty: &str, value_ty: &str| {
+        format!(
+            r#"
+testbench QueuePushDiagTb
+    dut    : Top
+    values : queue<{queue_ty}>
+end testbench QueuePushDiagTb
+
+impl QueuePushDiagTest for QueuePushDiagTb
+    run
+        let value : {value_ty} = 1
+        values.push(value)
+    end run
+end impl QueuePushDiagTest
+"#
+        )
+    };
+
+    let narrowing = assert_invalid(
+        &lower_src(&program("uint<64>", "uint<65>"))
+            .expect_err("a 65-bit value must not narrow into a 64-bit queue"),
+    );
+    assert!(
+        narrowing.contains("testbench queue `values`")
+            && narrowing.contains("65-bit")
+            && narrowing.contains("64-bit")
+            && narrowing.contains("narrows"),
+        "narrowing diagnostic must name the queue and both widths: {narrowing}"
+    );
+
+    let signedness = assert_invalid(
+        &lower_src(&program("uint<129>", "sint<129>"))
+            .expect_err("a signed value must not enter an unsigned queue implicitly"),
+    );
+    assert!(
+        signedness.contains("testbench queue `values`")
+            && signedness.contains("signed 129-bit")
+            && signedness.contains("unsigned 129-bit")
+            && signedness.contains("Signedness must match"),
+        "signedness diagnostic must name the queue and both types: {signedness}"
+    );
+}
+
+/// `QueueElem::Scalar` is an internal schema contract, not a general-purpose
+/// wrapper around arbitrary `IrType`s. The verifier protects every owner table
+/// because later display/emission code assumes a resolved, nonzero scalar.
+#[test]
+fn queue_elem_scalar_schema_requires_resolved_nonzero_integer_or_bool() {
+    let src = r#"
+testbench QueueSchemaTb
+    dut    : Top
+    values : queue<uint<8>>
+end testbench QueueSchemaTb
+
+impl QueueSchemaTest for QueueSchemaTb
+    run
+        wait 1 cycle
+    end run
+end impl QueueSchemaTest
+"#;
+    let prog = lower_src(src).expect("valid queue schema lowers");
+    for ty in [
+        ir::IrType::Unknown,
+        ir::IrType::UInt(None),
+        ir::IrType::SInt(None),
+        ir::IrType::UInt(Some(0)),
+        ir::IrType::SInt(Some(0)),
+        ir::IrType::Record(ir::RecordId(0)),
+    ] {
+        let mut broken = prog.clone();
+        let elem = ir::QueueElem::Scalar { ty: ty.clone() };
+        let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0]
+        else {
+            panic!("fixture state field is a queue");
+        };
+        field.elem = elem.clone();
+        broken.testbenches[0].queue_fields[0].elem = elem;
+        let rendered = verify::verify_program(&broken)
+            .expect_err("invalid scalar queue schema is rejected")
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("tb0 queue field `values` has invalid scalar element type")
+                && rendered.contains(&format!("{ty:?}")),
+            "invalid schema must identify the owner, field, and type: {rendered}"
+        );
+    }
+
+    let owner_prog = lower_src(&fixture("scoreboard_component_wide_queue_test.harc"))
+        .expect("owner fixture lowers");
+    let mut broken = owner_prog.clone();
+    let ir::ScoreboardFieldKind::Queue { elem } = &mut broken.scoreboards[0].fields[0].kind else {
+        panic!("fixture scoreboard field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid scoreboard queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `wide_values` has invalid scalar element type"),
+        "scoreboard queue schema is audited: {rendered}"
+    );
+
+    let mut broken = owner_prog;
+    let ir::ComponentFieldKind::Queue { elem } = &mut broken.components[0].fields[0].kind else {
+        panic!("fixture component field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid component queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("component c0 field `wide_values` has invalid scalar element type"),
+        "component queue schema is audited: {rendered}"
+    );
+
+    let mut broken =
+        lower_src(&fixture("target_wide_queue_state_test.harc")).expect("target fixture lowers");
+    let ir::StateFieldKind::Queue { elem } = &mut broken.transactors[0].state_fields[0].kind else {
+        panic!("fixture target-state field is a queue");
+    };
+    *elem = ir::QueueElem::Scalar {
+        ty: ir::IrType::Unknown,
+    };
+    let rendered = verify::verify_program(&broken)
+        .expect_err("invalid target-state queue schema is rejected")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered
+            .contains("transactor x0 state field `wide_values` has invalid scalar element type"),
+        "target-state queue schema is audited: {rendered}"
+    );
+}
+
+/// A data-only scoreboard queue uses the same exact scalar descriptor as a
+/// direct testbench queue. This pins inferred, assigned, and discarded pop
+/// destinations plus verifier assignment direction at the owner-specific IR
+/// operation.
+#[test]
+fn scoreboard_queue_wide_scalar_behavior_is_exact() {
+    let src = fixture("scoreboard_component_wide_queue_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide scoreboard queue lowers");
+    verify::verify_program(&prog).expect("wide scoreboard queue verifies");
+
+    let scoreboard = prog
+        .scoreboards
+        .iter()
+        .find(|schema| schema.name == "WideDataScoreboard")
+        .expect("fixture has the data-only scoreboard");
+    assert!(matches!(
+        scoreboard.field("wide_values").map(|field| &field.kind),
+        Some(ir::ScoreboardFieldKind::Queue {
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(256))
+            }
+        })
+    ));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("sb_inferred", ir::IrType::UInt(Some(256))),
+        ("sb_typed", ir::IrType::UInt(Some(256))),
+        ("sb_assigned", ir::IrType::UInt(Some(256))),
+        ("sb_signed", ir::IrType::SInt(Some(8))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "scoreboard pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, dest },
+                ..
+            } if queue == "wide_values" && run.local(*dest).name.starts_with("__t") => {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded scoreboard pop");
+    assert_eq!(discarded.ty, ir::IrType::UInt(Some(256)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide scoreboard queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide scoreboard queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let run_id = bad_push.tests[0].run.index();
+    let value = bad_push.functions[run_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePush { queue, value },
+                ..
+            } if queue == "wide_values" => Some(value),
+            _ => None,
+        })
+        .expect("fixture has a scoreboard push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit scoreboard queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, dest },
+                ..
+            } if queue == "wide_values"
+                && bad_pop.functions[run_id].local(*dest).name == "sb_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an inferred scoreboard pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 256-bit scoreboard queue cannot pop into a 128-bit local"
+    );
+}
+
+/// A composite-component queue has the same exact scalar semantics as the
+/// scoreboard owner, including assignment into an existing local.
+#[test]
+fn component_queue_wide_scalar_behavior_is_exact() {
+    let src = fixture("scoreboard_component_wide_queue_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide component queue lowers");
+    verify::verify_program(&prog).expect("wide component queue verifies");
+
+    let component = prog
+        .components
+        .iter()
+        .find(|schema| schema.name == "WideQueueComponent")
+        .expect("fixture has the composite component");
+    assert!(matches!(
+        component.field("wide_values").map(|field| &field.kind),
+        Some(ir::ComponentFieldKind::Queue {
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(256))
+            }
+        })
+    ));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("comp_inferred", ir::IrType::UInt(Some(256))),
+        ("comp_typed", ir::IrType::UInt(Some(256))),
+        ("comp_assigned", ir::IrType::UInt(Some(256))),
+        ("comp_signed", ir::IrType::SInt(Some(8))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "component pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let discarded = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. }
+                if queue == "wide_values" && run.local(*dest).name.starts_with("__t") =>
+            {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a discarded component pop");
+    assert_eq!(discarded.ty, ir::IrType::UInt(Some(256)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide component queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "wide component queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let run_id = bad_push.tests[0].run.index();
+    let value = bad_push.functions[run_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePush { queue, value, .. } if queue == "wide_values" => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("fixture has a component push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit component queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. }
+                if queue == "wide_values"
+                    && bad_pop.functions[run_id].local(*dest).name == "comp_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an inferred component pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(128));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 256-bit component queue cannot pop into a 128-bit local"
+    );
+}
+
 /// A queue pop defines its destination for every successor block, just like
 /// scoreboard/component queue pops. This source puts the read after a branch
 /// so the verifier must propagate the definition through its dataflow `gens`.
@@ -4750,13 +5455,13 @@ end test BadFieldTest
 /// The five record-assignment arms, split on whether the program is
 /// well typed — and the sixth spelling, which had no arm at all.
 ///
-/// Each of these rejected a whole family under one `Unsupported`, so
+/// Each of these once rejected a whole family under one `Unsupported`, so
 /// each promised `--codegen v1` for programs v1 cannot compile. Only
-/// one of the families contains a well-typed program:
+/// one family contains a well-typed program, and that row now lowers:
 ///
 /// | assignment | v1 emits | |
 /// |---|---|---|
-/// | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | a real escape hatch |
+/// | `b = sb.q.pop()`, `q : queue<Beat>` | `b = _tb.sb.q.pop();` — compiles | lowers |
 /// | `b = sb.q.pop()`, `q : queue<uint<8>>` | the same line — "operand types are 'Beat' and 'long unsigned int'" | `Invalid` |
 /// | `b = drv.get()` | `b = Drv_get(_tb.drv);` — "'Beat' and 'uint64_t'" | `Invalid` |
 /// | `b = o` / `b = 5` | "'Beat' and 'Other'" / "'Beat' and 'int'" | `Invalid` |
@@ -4789,6 +5494,7 @@ end transaction Other
 
 scoreboard Sb
     q : queue<{elem}>
+    scalar_q : queue<uint<8>>
 end scoreboard Sb
 
 transactor Drv
@@ -4827,11 +5533,67 @@ end impl T"#
     lower_src(&run("        let b : Beat\n        drv.rec = b")).expect("same-typed copy lowers");
     lower_src(&run("        drv.st = 5")).expect("a scalar state field takes a scalar");
 
-    // The one well-typed member of the pop family — v1 compiles it, so
-    // the suggestion is honest.
+    // The one well-typed member of the pop family lowers as the same
+    // struct assignment v1 emits.
     let pop_ok = run("        let b : Beat\n        b = sb.q.pop()");
-    let msg = assert_unsupported(&lower_src(&pop_ok).unwrap_err());
-    assert!(msg.contains("scoreboard `pop()` result"), "{msg}");
+    let lowered = lower_src(&pop_ok).expect("record pop into an existing local lowers");
+    verify::verify_program(&lowered).expect("record pop assignment verifies");
+    let tbir_cpp = tbir::emit(&lowered, &merged_src(&pop_ok), &cpp_tb::EmitOpts::default())
+        .expect("tbir emits the record pop assignment");
+    assert!(tbir_cpp.contains("b = _tb.sb.q.pop();"), "{tbir_cpp}");
+    let mut corrupted = lowered.clone();
+    let run_idx = corrupted.tests[0].run.index();
+    let pop_dest = corrupted.functions[run_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { dest, .. },
+                ..
+            } => Some(*dest),
+            _ => None,
+        })
+        .expect("record queue pop has a destination");
+    corrupted.functions[run_idx].locals[pop_dest.index()].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&corrupted).is_err(),
+        "a scoreboard record pop into a scalar destination must not verify"
+    );
+    let mut wrong_queue = lowered.clone();
+    let pop_queue = wrong_queue.functions[run_idx]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, .. },
+                ..
+            } => Some(queue),
+            _ => None,
+        })
+        .expect("record queue pop has a queue reference");
+    *pop_queue = "scalar_q".to_string();
+    assert!(
+        verify::verify_program(&wrong_queue).is_err(),
+        "a record destination redirected to a scalar queue must not verify"
+    );
+    // Scalar queue assignment keeps the queue's exact signedness contract;
+    // record identity remains the separate invariant for record elements.
+    let scalar_convert = prog(
+        "sint<8>",
+        "        let x : uint<8>\n        x = sb.q.pop()",
+        "",
+    );
+    let scalar_err = lower_src(&scalar_convert)
+        .expect_err("scalar queue signedness conversion must be rejected");
+    let scalar_msg = assert_invalid(&scalar_err);
+    assert!(
+        scalar_msg.contains("scoreboard queue `q`")
+            && scalar_msg.contains("SInt(Some(8))")
+            && scalar_msg.contains("UInt(Some(8))"),
+        "signedness diagnostic must identify the scoreboard queue and both types: {scalar_msg}"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&pop_ok))
             .expect("v1 emits")
@@ -5903,13 +6665,14 @@ end impl T"#
         )
     };
 
-    // A same-typed RHS: v1 emits the struct copy and g++ ACCEPTS it, so
-    // the suggestion is honest. It had been `SilentlyMisLowers` —
-    // "`--codegen v1` accepts it but silently emits something else" —
-    // which withheld a hatch that works.
+    // A same-typed RHS lowers as a shared-record assignment. TBIR's
+    // synthetic local names the one test-scope record cell.
     let ok = prog("        let b : Beat\n        tbrec = b");
-    let msg = assert_unsupported(&lower_src(&ok).unwrap_err());
-    assert!(msg.contains("testbench record field"), "{msg}");
+    let lowered = lower_src(&ok).expect("whole testbench record copy lowers");
+    verify::verify_program(&lowered).expect("whole testbench record copy verifies");
+    let tbir_cpp = tbir::emit(&lowered, &merged_src(&ok), &cpp_tb::EmitOpts::default())
+        .expect("tbir emits the shared record copy");
+    assert!(tbir_cpp.contains("tbrec = b;"), "{tbir_cpp}");
     assert!(
         cpp_tb::emit(&merged_src(&ok))
             .expect("v1 emits")
@@ -10615,15 +11378,15 @@ end test T"#
 /// | `keep` in a struct | `_s.add(z3::ult(_z_a, …10…))` — it reaches the solver | a real escape hatch |
 /// | `default` on a nested-record field | `Inner i = 0;` — g++ rejects the conversion | `EmitsUncompilable` |
 /// | `default` on a `Vec` field | `std::array<T, N> v = 0;` — same | `EmitsUncompilable` |
-/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | a real escape hatch |
+/// | `default 4'd3`, `8'hFF`, `4'b1010` | folds to the same value | lowers |
 /// | `default 128'hFF…`, `0xFF…`, `999…` | folds past 64 bits and truncates | `SilentlyMisLowers` |
 ///
 /// The literal rows do not split on the apostrophe — the width prefix
 /// is not the value. `4'd3` folds to `3` and `128'hFF…` folds to a
 /// `_harc_u128` composite that the 64-bit member truncates, and an
 /// unsized decimal past `u64` does the same thing with a different
-/// diagnostic. The guard normalizes through `cpp_tb`'s own folder and
-/// asks whether the result fits.
+/// diagnostic. TBIR accepts the fitting value and keeps the over-wide
+/// cases classified as silent v1 truncations.
 ///
 /// Compiled with `-std=gnu++20`, the standard `src/main.rs` passes.
 #[test]
@@ -10666,19 +11429,31 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         assert!(v1.contains(needle), "v1 emits `{needle}`: {v1}");
     }
 
-    // A literal whose VALUE fits the 64-bit member folds correctly,
-    // whatever its spelling — a real escape hatch.
-    for (lit, folded) in [
-        ("4'd3", "uint64_t a = 3;"),
-        ("8'hFF", "uint64_t a = 0xFF;"),
-        ("4'b1010", "uint64_t a = 0b1010;"),
+    // A sized literal whose VALUE fits the 64-bit member now lowers to
+    // the same record default as v1, whatever its spelling.
+    for (lit, value, v1_folded) in [
+        ("4'd3", 3, "uint64_t a = 3;"),
+        ("8'hFF", 255, "uint64_t a = 0xFF;"),
+        ("4'b1010", 10, "uint64_t a = 0b1010;"),
     ] {
         let src = prog(&format!(
             "struct Rec\n    a : uint<8> default {lit}\nend struct Rec\n"
         ));
-        assert_unsupported(&lower_src(&src).unwrap_err());
+        let lowered = lower_src(&src).expect("fitting sized record default lowers");
+        verify::verify_program(&lowered).expect("sized record default verifies");
+        assert_eq!(lowered.records[0].fields[0].default, Some(value));
+        let tbir = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("tbir emits fitting sized record default");
+        let tbir_folded = format!("uint64_t a = {value};");
+        assert!(
+            tbir.contains(&tbir_folded),
+            "`{lit}` folds to `{tbir_folded}`: {tbir}"
+        );
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
-        assert!(v1.contains(folded), "`{lit}` folds to `{folded}`: {v1}");
+        assert!(
+            v1.contains(v1_folded),
+            "`{lit}` folds to `{v1_folded}`: {v1}"
+        );
     }
     // One that does not fit truncates into the member with only a
     // warning — and a SIZED literal is on this side of the line too,
@@ -15122,11 +15897,10 @@ fn transactor_method_sync_only_waits() {
     );
 }
 
-/// Bus calls suspend, so they are statement-level only: nesting one in
-/// an expression is a precise rejection, not the generic method-call
-/// message.
+/// A nested blocking bus call is rejected by v1 as well, so this is not
+/// a TB-IR subset gap and must not advertise v1 as an escape hatch.
 #[test]
-fn bus_call_in_expression_position_is_unsupported() {
+fn bus_call_in_expression_position_is_rejected_by_v1_too() {
     let src = r#"
 bus MemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
@@ -15144,10 +15918,14 @@ impl ExprTest for ExprTb
 end impl ExprTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
     assert!(
         msg.contains("bus method calls in expression position"),
         "{msg}"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(src)).is_err(),
+        "v1 must reject the nested bus call too"
     );
 }
 
@@ -15467,7 +16245,9 @@ fn target_nonscalar_queue_state_lowers() {
     assert!(matches!(
         &x.state_fields[1].kind,
         ir::StateFieldKind::Queue {
-            elem: ir::QueueElem::Scalar { signed: false }
+            elem: ir::QueueElem::Scalar {
+                ty: ir::IrType::UInt(Some(8))
+            }
         }
     ));
     // The responder body's state-queue push/pop are instance-filled to
@@ -15528,6 +16308,169 @@ fn target_nonscalar_queue_state_emits_harcqueue() {
     assert!(
         cpp.contains("responder.log_addrs.pop()"),
         "test-scope scalar-queue pop; got:\n{cpp}"
+    );
+}
+
+/// Wide scalar target-state queues use their declared element type at every
+/// owner-specific seam: declaration, responder-local operations,
+/// instance-qualified operations, inferred/typed/assigned/discarded pops,
+/// verifier transfers, and generated per-instance storage.
+#[test]
+fn target_nonscalar_queue_wide_scalar_behavior_is_exact() {
+    let src = fixture("target_wide_queue_state_test.harc");
+    let merged = merged_src(&src);
+    let prog = lower::lower_program(&merged).expect("wide target-state queues lower");
+    verify::verify_program(&prog).expect("wide target-state queues verify");
+
+    let transactor = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "WideQueueResponder")
+        .expect("fixture has the target responder");
+    for (field, ty) in [
+        ("wide_values", ir::IrType::UInt(Some(256))),
+        ("odd_values", ir::IrType::UInt(Some(65))),
+        ("signed_values", ir::IrType::SInt(Some(8))),
+    ] {
+        assert!(matches!(
+            transactor
+                .state_fields
+                .iter()
+                .find(|state| state.name == field)
+                .map(|state| &state.kind),
+            Some(ir::StateFieldKind::Queue {
+                elem: ir::QueueElem::Scalar { ty: actual }
+            }) if *actual == ty
+        ));
+    }
+
+    let responder = prog.function(transactor.target_methods[0].function);
+    for (name, ty) in [
+        ("bare_inferred", ir::IrType::UInt(Some(256))),
+        ("bare_typed", ir::IrType::UInt(Some(256))),
+        ("bare_assigned", ir::IrType::UInt(Some(256))),
+        ("signed_first", ir::IrType::SInt(Some(8))),
+        ("signed_second", ir::IrType::SInt(Some(8))),
+    ] {
+        assert_eq!(
+            responder
+                .locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "responder-local pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let bare_discard = responder
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop { field, dest, .. }
+                if field == "wide_values" && responder.local(*dest).name.starts_with("__t") =>
+            {
+                Some(responder.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has a responder-local discarded pop");
+    assert_eq!(bare_discard.ty, ir::IrType::UInt(Some(256)));
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, ty) in [
+        ("instance_inferred", ir::IrType::UInt(Some(65))),
+        ("instance_typed", ir::IrType::UInt(Some(65))),
+        ("instance_assigned", ir::IrType::UInt(Some(65))),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .unwrap_or_else(|| panic!("fixture has `{name}`"))
+                .ty,
+            ty,
+            "instance-qualified pop destination `{name}` keeps the queue element type"
+        );
+    }
+    let instance_discard = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop {
+                instance,
+                field,
+                dest,
+            } if instance == "responder"
+                && field == "odd_values"
+                && run.local(*dest).name.starts_with("__t") =>
+            {
+                Some(run.local(*dest))
+            }
+            _ => None,
+        })
+        .expect("fixture has an instance-qualified discarded pop");
+    assert_eq!(instance_discard.ty, ir::IrType::UInt(Some(65)));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("wide target-state queues emit");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<harc_rt::HarcWide<8>> wide_values;"),
+        "256-bit per-instance queue storage must be exact: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<_harc_u128> odd_values;"),
+        "65-bit per-instance queue storage must be exact: {cpp}"
+    );
+
+    let mut bad_push = prog.clone();
+    let responder_id = transactor.target_methods[0].function.index();
+    let value = bad_push.functions[responder_id]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePush { field, value, .. } if field == "wide_values" => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("fixture has a responder-local target-state push");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(512)),
+    };
+    assert!(
+        verify::verify_program(&bad_push).is_err(),
+        "a 512-bit value cannot enter a 256-bit target-state queue"
+    );
+
+    let mut bad_pop = prog;
+    let run_id = bad_pop.tests[0].run.index();
+    let dest = bad_pop.functions[run_id]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateQueuePop {
+                instance,
+                field,
+                dest,
+            } if instance == "responder"
+                && field == "odd_values"
+                && bad_pop.functions[run_id].local(*dest).name == "instance_inferred" =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("fixture has an instance-qualified inferred pop");
+    bad_pop.functions[run_id].locals[dest.index()].ty = ir::IrType::UInt(Some(64));
+    assert!(
+        verify::verify_program(&bad_pop).is_err(),
+        "a 65-bit target-state queue cannot pop into a 64-bit local"
     );
 }
 
@@ -16079,7 +17022,11 @@ end impl EvTest
     assert_eq!(xs.state_fields[0].name, "count");
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
-        vec![("ev".to_string(), ir::TransactorId(0))],
+        vec![ir::UnboundStateActorSchema {
+            field: "ev".to_string(),
+            transactor: ir::TransactorId(0),
+            storage: "ev".to_string(),
+        }],
         "stateful instance recorded for per-instance materialization",
     );
 
@@ -16095,8 +17042,16 @@ end impl EvTest
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
         vec![
-            ("ev".to_string(), ir::TransactorId(0)),
-            ("ev2".to_string(), ir::TransactorId(0)),
+            ir::UnboundStateActorSchema {
+                field: "ev".to_string(),
+                transactor: ir::TransactorId(0),
+                storage: "ev".to_string(),
+            },
+            ir::UnboundStateActorSchema {
+                field: "ev2".to_string(),
+                transactor: ir::TransactorId(0),
+                storage: "ev2".to_string(),
+            },
         ],
         "both active stateful instances recorded for per-instance materialization",
     );
@@ -16639,7 +17594,8 @@ end impl TbRecordHookShadowTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("Driver_observe_pre = [&](Txn cur_2) -> void"),
+        cpp.contains("std::function<void(Txn)> _on_method_hook_")
+            && cpp.contains("= [&](Txn cur_2) -> void"),
         "hook parameter should remain first and be renamed away from shared cur:\n{cpp}"
     );
     assert!(
@@ -17409,7 +18365,11 @@ fn bound_initiator_transactor_with_state_lowers() {
     // state materialization (the same table the unbound form uses).
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
-        vec![("helper".to_string(), ir::TransactorId(0))],
+        vec![ir::UnboundStateActorSchema {
+            field: "helper".to_string(),
+            transactor: ir::TransactorId(0),
+            storage: "helper".to_string(),
+        }],
         "stateful bound-initiator instance recorded for materialization",
     );
 
@@ -18971,12 +19931,11 @@ end test T"#,
     );
 }
 
-/// The two `on` shapes that need machinery a statement position cannot
-/// provide are rejected with messages that say what to do instead.
+/// Statement-position method hooks register at their runtime position;
+/// unsupported periodic periods still fail precisely.
 #[test]
 fn unsupported_on_shapes_are_rejected_precisely() {
-    let hook = lower_src(
-        r#"transactor Drv
+    let hook_src = r#"transactor Drv
     dut : Top
     when active
         hookable send(v: uint<8>)
@@ -18997,13 +19956,11 @@ impl T for Tb
         end on
         wait 1 cycle
     end run
-end impl T"#,
-    )
-    .expect_err("a statement-position method hook must be rejected");
+end impl T"#;
+    let hook_cpp = emit_cpp_src(hook_src);
     assert!(
-        assert_unsupported(&hook).contains("pre/post` hook in statement position"),
-        "got: {}",
-        assert_unsupported(&hook)
+        hook_cpp.contains("Drv_send_post.push_back"),
+        "statement-position hook must emit a runtime registration"
     );
 
     let period = lower_src(
@@ -19208,28 +20165,14 @@ end test T"#
 #[test]
 fn constructs_v1_implements_still_suggest_v1() {
     let err = lower_src(
-        r#"transactor Drv
-    dut : Top
-    when active
-        hookable send(v: uint<8>)
-            dut.a = v
-        end send
-    end when
-end transactor Drv
+        r#"const BAD : uint<32> = some_call()
 
-testbench Tb
-    dut : Top
-    drv : Drv active
-end testbench Tb
-
-impl T for Tb
+test T
+    let dut : Top
     run
-        on drv.send post
-            log(info, "sent")
-        end on
-        wait 1 cycle
+        assert BAD == 0
     end run
-end impl T"#,
+end test T"#,
     )
     .unwrap_err();
     assert_unsupported(&err);
@@ -22636,7 +23579,7 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
 
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert!(lanes.contains(LANE), "lane fixture shape changed");
     let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
 
@@ -22691,8 +23634,9 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
 
     // Two more shapes, two more verdicts, from the same helper.
     let runtime = slice("dut.count_out[dut.en:0]");
-    let msg = assert_unsupported(&lower_src(&runtime).unwrap_err());
-    assert!(msg.contains("not a compile-time constant"), "{msg}");
+    let prog = lower_src(&runtime).expect("a runtime slice bound lowers");
+    verify::verify_program(&prog).expect("a runtime slice bound verifies");
+    assert!(emit_cpp_src(&runtime).contains("harc_rt::harc_bits"));
     let v1 = cpp_tb::emit(&merged_src(&runtime)).expect("v1 emits a dynamic bound");
     assert!(
         v1.contains("(uint32_t)(harc_rt::harc_read(dut->en))"),
@@ -22707,8 +23651,8 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
     assert!(msg.contains("over-wide literal"), "{msg}");
 
     let sized = slice("dut.count_out[4'd3:0]");
-    let msg = assert_unsupported(&lower_src(&sized).unwrap_err());
-    assert!(msg.contains("sized literal"), "{msg}");
+    let prog = lower_src(&sized).expect("a sized slice bound lowers");
+    verify::verify_program(&prog).expect("a sized slice bound verifies");
 
     // NESTED, both kinds. The walk that finds a name or a literal
     // inside `[K + N:0]` is what makes any of the above work on a
@@ -22739,12 +23683,28 @@ fn a_coverpoint_constant_is_classified_by_what_it_stands_for() {
         );
         assert!(msg.contains("over-wide literal"), "`{t}`: {msg}");
     }
-    // …and the reason that one keeps the suggestion: v1 folds it.
+    // …and the reason lowering it is exact: v1 folds it to the same bound.
     let v1 = cpp_tb::emit(&merged_src(&sized)).expect("v1 emits");
     assert!(
         v1.contains("(uint32_t)(3)"),
         "v1 folds `4'd3` to 3, so `--codegen v1` really is a way out: {v1}"
     );
+
+    // Sized tokens are values, not legal width arguments. v1 rejects a
+    // width method and silently drops a cast width, so neither is a
+    // remaining escape hatch.
+    let sized_method = slice("dut.count_out[3:0].zext<8'd8>()");
+    assert_not_implemented(
+        &lower_src(&sized_method).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    cpp_tb::emit(&merged_src(&sized_method)).expect_err("v1 rejects a sized method width");
+    let sized_cast = slice("(dut.count_out as uint<8'd8>)");
+    assert_not_implemented(
+        &lower_src(&sized_cast).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    cpp_tb::emit(&merged_src(&sized_cast)).expect("v1 silently falls back to a 64-bit cast");
 }
 
 /// A coverpoint bound is a constant EXPRESSION, not just a literal or a
@@ -22778,7 +23738,7 @@ fn a_constant_expression_coverpoint_bound_folds() {
     }
     // The lane-index role folds through the same helper.
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert_eq!(
         emit_cpp_src(&lanes.replacen(LANE, "cover dut.lane_id_out[2 - 2]", 1)),
         emit_cpp_src(&lanes),
@@ -22786,17 +23746,13 @@ fn a_constant_expression_coverpoint_bound_folds() {
     );
 }
 
-/// The built-in predicates on a TRANSACTOR receiver. v1 resolves them
-/// there as well as on a component — `resolve_component_idle_predicate`
-/// walks `self.transactors` through `synth_component_from_transactor`,
-/// and both backends stamp `_last_in_cycle`/`_last_out_cycle` on
-/// transactor state structs — so a flat `Invalid` was calling twelve
-/// working programs (4 names x assert / bare statement / `let`) errors.
-///
-/// The carve-out that fixed it shipped with no test: `&& false` on it
-/// left the whole suite green.
+/// The built-in predicates on a direct TRANSACTOR receiver. This is one
+/// typed IR seam but twelve positive-v1 source positions (four names x
+/// assert / bare statement / `let`). A stateless transactor is important:
+/// TB-IR must materialize its activity-stamp object on demand instead of
+/// emitting a predicate against an undeclared C++ receiver.
 #[test]
-fn a_built_in_predicate_on_a_transactor_is_a_gap_not_an_error() {
+fn a_built_in_predicate_on_a_transactor_lowers_and_verifies() {
     let src = |stmt: &str| {
         format!(
             r#"domain SysDomain
@@ -22834,27 +23790,102 @@ end impl TT"#
             format!("let v = d.{name}(2)"),
         ] {
             let s = src(&stmt);
-            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-            assert!(
-                msg.contains(&format!("`d.{name}` on a transactor")),
-                "`{stmt}`: {msg}"
-            );
-            // The half that makes the suggestion honest: v1 emits the
-            // heartbeat against the transactor's own stamps.
+            let prog = lower_src(&s).unwrap_or_else(|e| panic!("`{stmt}` lowers: {e:?}"));
+            verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{stmt}` verifies: {e:?}"));
+            let tbir = emit_cpp_src(&s);
+            let storage =
+                &prog.testbenches[prog.tests[0].testbench.index()].unbound_state_actors[0].storage;
+            // Both emitters read the transactor's own stamps. TB-IR uses
+            // collision-proof generated storage; v1 retains `_tb.d`.
             let v1 = cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
-            // `idle_out` reads only the out stamp; the other three read
-            // the in stamp (`idle` and `quiesced` read both).
             let stamp = if name == "idle_out" {
-                "_tb.d._last_out_cycle"
+                "_last_out_cycle"
             } else {
-                "_tb.d._last_in_cycle"
+                "_last_in_cycle"
             };
             assert!(
-                v1.contains(stamp),
-                "`{stmt}`: v1 resolves the predicate on the transactor (`{stamp}`)"
+                tbir.contains(&format!("{storage}.{stamp}")),
+                "`{stmt}`: TB-IR resolves the predicate on `{storage}.{stamp}`: {tbir}"
+            );
+            assert!(
+                v1.contains(&format!("_tb.d.{stamp}")),
+                "`{stmt}`: v1 resolves the predicate on `_tb.d.{stamp}`"
             );
         }
     }
+
+    // One argument binds by position, including a name v1 ignores.
+    lower_src(&src("let v = d.idle_in(any_name = 2)"))
+        .expect("a named threshold lowers by position");
+
+    // A test-scope `let d : Drv active` uses the bare receiver spelling
+    // rather than the impl-for `_tb.d` spelling.
+    let bare = src("assert d.idle(2) else fail(\"bare\")")
+        .replace(
+            "testbench Tb\n    dut : Top\n    d   : Drv active\nend testbench Tb\n\nimpl TT for Tb",
+            "test TT\n    let dut : Top\n    let d : Drv active",
+        )
+        .replace("end impl TT", "end test TT");
+    let prog = lower_src(&bare).expect("bare transactor heartbeat lowers");
+    verify::verify_program(&prog).expect("bare transactor heartbeat verifies");
+    let storage =
+        &prog.testbenches[prog.tests[0].testbench.index()].unbound_state_actors[0].storage;
+    assert!(
+        emit_cpp_src(&bare).contains(&format!("{storage}._last_in_cycle")),
+        "bare receiver must map to generated storage `{storage}`"
+    );
+
+    // Bound target-side TLM responders live in a separate binding table,
+    // but v1 exposes the same four predicates on their existing state
+    // object. Exercise every name through that receiver namespace.
+    let target_fixture = fixture("tlm_target_thread_test.harc");
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let target_src = target_fixture.replace("target.idle(2)", &format!("target.{name}(2)"));
+        let prog = lower_src(&target_src)
+            .unwrap_or_else(|e| panic!("target responder `{name}` lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("target responder `{name}` verifies: {e:?}"));
+        let stamp = if name == "idle_out" {
+            "_last_out_cycle"
+        } else {
+            "_last_in_cycle"
+        };
+        assert!(
+            emit_cpp_src(&target_src).contains(&format!("target.{stamp}")),
+            "target responder `{name}` must use its existing stamp object"
+        );
+    }
+
+    // A source method declaration wins over the built-in spelling. This
+    // guards the resolver order: `idle` is a default, not a reserved word.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let declared = src(&format!("assert d.{name}(2) == 7 else fail(\"override\")")).replacen(
+            "hookable go()\n            wait 1 cycle\n        end go",
+            &format!(
+                "hookable {name}(n: uint<8>) -> uint<32>\n            return 7\n        end {name}"
+            ),
+            1,
+        );
+        let cpp = emit_cpp_src(&declared);
+        assert!(
+            cpp.contains(&format!("Drv_{name}(2)")),
+            "declared `{name}` method must win over heartbeat lowering: {cpp}"
+        );
+    }
+
+    // Wrong arity is not a retirement gap: v1 rejects idle predicates
+    // itself and emits uncompilable C++ for quiesced.
+    let msg = assert_not_implemented(
+        &lower_src(&src("assert d.idle() else fail(\"arity\")")).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("exactly one cycle-count"), "{msg}");
+    let msg = assert_not_implemented(
+        &lower_src(&src("assert d.quiesced() else fail(\"arity\")")).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("exactly one cycle-count"), "{msg}");
+
     // …and a name nothing implements is still the program error the
     // surrounding arm was written for.
     let s = src("assert d.nosuch(2) else fail(\"o\")");
@@ -22864,6 +23895,168 @@ end impl TT"#
     assert!(
         v1.contains("_tb.d.nosuch(2)"),
         "v1 emits a call `Drv` has no member for: {v1}"
+    );
+}
+
+#[test]
+fn transactor_heartbeat_storage_and_references_are_verified() {
+    fn first_idle(prog: &mut ir::TbProgram) -> &mut ir::Expr {
+        for func in &mut prog.functions {
+            for block in &mut func.blocks {
+                for stmt in &mut block.stmts {
+                    let ir::Stmt::AssertCheck { cond, .. } = stmt else {
+                        continue;
+                    };
+                    let ir::Expr::Unary(_, inner) = cond else {
+                        continue;
+                    };
+                    if matches!(&**inner, ir::Expr::TransactorIdle { .. }) {
+                        return inner;
+                    }
+                }
+            }
+        }
+        panic!("fixture has no negated transactor heartbeat assertion")
+    }
+
+    let src = fixture("transactor_heartbeat_predicates_test.harc");
+    let prog = lower_src(&src).expect("transactor heartbeat fixture lowers");
+    verify::verify_program(&prog).expect("transactor heartbeat fixture verifies");
+
+    // Both otherwise-stateless instances need stamp storage, and the late
+    // discovery is rebuilt in testbench declaration order.
+    let tb = &prog.testbenches[prog.tests[0].testbench.index()];
+    let actors: Vec<&str> = tb
+        .unbound_state_actors
+        .iter()
+        .map(|actor| actor.field.as_str())
+        .collect();
+    assert_eq!(
+        actors,
+        vec![
+            "PulseDrv_pulse",
+            "pas",
+            "StatefulPulseDrv_pulse_pre",
+            "__harc_transactor_state_tb0_f0",
+            "HeartbeatEmptyAgent_ping",
+        ]
+    );
+    assert_eq!(
+        tb.unbound_state_actors[0].storage, "__harc_transactor_state_tb0_f0_1",
+        "generated stateless storage must be fresh against source fields"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[1].storage, "__harc_transactor_state_tb0_f1_1",
+        "generated stateless storage must be fresh against test-scope component locals"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[2].storage, "__harc_transactor_state_tb0_f2",
+        "an already-stateful field colliding with a hook vector must use the same explicit remap"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[3].storage, "__harc_transactor_state_tb0_f0",
+        "an ordinary stateful actor retains its source-name storage ABI"
+    );
+    assert_eq!(
+        tb.unbound_state_actors[4].storage, "__harc_transactor_state_tb0_f4",
+        "stateful storage must be remapped away from component callable slots"
+    );
+
+    let mut missing_field = prog.clone();
+    let ir::Expr::TransactorIdle { field, .. } = first_idle(&mut missing_field) else {
+        unreachable!()
+    };
+    *field = "missing".to_string();
+    let errs = verify::verify_program(&missing_field)
+        .expect_err("a heartbeat field absent from the owning testbench must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("heartbeat field `missing`")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut dangling_schema = prog.clone();
+    let ir::Expr::TransactorIdle { transactor, .. } = first_idle(&mut dangling_schema) else {
+        unreachable!()
+    };
+    *transactor = ir::TransactorId(u32::MAX);
+    let errs = verify::verify_program(&dangling_schema)
+        .expect_err("a dangling heartbeat transactor id must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("references missing x")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut missing_storage = prog.clone();
+    missing_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors
+        .retain(|actor| actor.field != "PulseDrv_pulse");
+    let errs = verify::verify_program(&missing_storage)
+        .expect_err("a heartbeat expression without its stamp storage must fail verification");
+    assert!(
+        errs.iter().any(|e| e
+            .to_string()
+            .contains("heartbeat field `PulseDrv_pulse` has no matching stamp storage")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut duplicate_storage = prog.clone();
+    let duplicate = duplicate_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors[0]
+        .clone();
+    duplicate_storage.testbenches[prog.tests[0].testbench.index()]
+        .unbound_state_actors
+        .push(duplicate);
+    let errs = verify::verify_program(&duplicate_storage)
+        .expect_err("duplicate heartbeat stamp storage must fail verification");
+    assert!(
+        errs.iter().any(|e| e
+            .to_string()
+            .contains("stamp storage `PulseDrv_pulse` more than once")),
+        "unexpected verifier errors: {errs:?}"
+    );
+}
+
+#[test]
+fn transactor_heartbeat_cycle_service_is_verified() {
+    let src = r#"transactor CycDrv
+    dut : Top
+end transactor CycDrv
+
+testbench CycTb
+    dut : Top
+    d : CycDrv passive
+    hit : uint<32> default 0
+    on d.idle(2) == true
+        hit = hit + 1
+    end on
+end testbench CycTb
+
+impl CycTest for CycTb
+    run
+        wait 3 cycles
+    end run
+end impl CycTest"#;
+    let prog = lower_src(src).expect("heartbeat cycle-service trigger lowers");
+    verify::verify_program(&prog).expect("heartbeat cycle-service trigger verifies");
+    assert_eq!(prog.testbenches[0].cycle_services.len(), 1);
+    assert_eq!(prog.testbenches[0].unbound_state_actors.len(), 1);
+
+    let mut corrupt = prog.clone();
+    let ir::Expr::Binary(_, left, _) = &mut corrupt.testbenches[0].cycle_services[0].trigger else {
+        panic!("cycle-service trigger is not the expected comparison")
+    };
+    let ir::Expr::TransactorIdle { storage, .. } = &mut **left else {
+        panic!("cycle-service trigger is not a transactor heartbeat")
+    };
+    *storage = "missing_storage".to_string();
+    let errs = verify::verify_program(&corrupt)
+        .expect_err("a corrupted standalone cycle-service heartbeat must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("schema requires")),
+        "unexpected verifier errors: {errs:?}"
     );
 }
 
@@ -23029,8 +24222,8 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
     cpp_tb::emit(&merged_src(&eq_trunc)).expect_err("v1 refuses a no-op trunc");
     emit_cpp_src(&slice("dut.count_out[7:0].zext<8>()"));
 
-    // Wide receivers and wide widths alike keep the suggestion: v1
-    // builds all of them under `-std=gnu++20`, which is what
+    // Wide receivers and wide widths alike now lower: v1 builds all of
+    // them under `-std=gnu++20`, which is what
     // `src/main.rs` passes to the emitted testbench. An
     // `EmitsUncompilable` split at 128 used to live here and in
     // `cover_cast_width`, measured with `-std=c++20`, where
@@ -23044,7 +24237,10 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
         // cast" when there is no cast at all.
         "dut.count_out[200:0].trunc<65>()",
     ] {
-        assert_unsupported(&lower_src(&slice(t)).unwrap_err());
+        let src = slice(t);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{t}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{t}` verifies: {e:?}"));
+        emit_cpp_src(&src);
         cpp_tb::emit(&merged_src(&slice(t))).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
     }
 
@@ -23061,14 +24257,15 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
         emit_cpp_src(&src);
         cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{t}`: v1 builds it: {e}"));
     }
-    // A folded bound with a width ABOVE 64 is still refused, but for
-    // the 64-bit model rather than for direction — `Unsupported`, not
-    // the `Invalid` the folding inference used to produce.
+    // A folded bound with a width above 64 is still not a direction
+    // error; the wide expression model now lowers it.
     let folded_wide = format!(
         "const HI = 100\n\n{}",
         slice("dut.count_out[HI:0].zext<70>()")
     );
-    assert_unsupported(&lower_src(&folded_wide).unwrap_err());
+    let prog = lower_src(&folded_wide).expect("a folded wide receiver lowers");
+    verify::verify_program(&prog).expect("a folded wide receiver verifies");
+    emit_cpp_src(&folded_wide);
     cpp_tb::emit(&merged_src(&folded_wide)).expect("v1 builds it");
     // …while the literal spelling of the same program stays `Invalid`
     // under both backends.
@@ -23088,7 +24285,7 @@ fn the_width_direction_rule_reaches_wide_and_nested_receivers() {
 ///
 /// | coverpoint | v1 | verdict |
 /// |---|---|---|
-/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | `Unsupported` |
+/// | `cmd.ticks[k:0]` | `harc_bits(cmd.ticks, (uint32_t)(k), 0)` — correct | lowered |
 /// | `cmd.ticks.trunc<k>()` | refuses: "requires a constant integer width" | `Rejects` |
 /// | `cmd.ticks.zext<k>()` | same refusal | `Rejects` |
 /// | `(cmd.ticks as uint<k>)` | `(uint64_t)(cmd.ticks)` — width dropped | `SilentlyMisLowers` |
@@ -23122,21 +24319,22 @@ fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
         )
     };
 
-    // The role v1 gets right keeps the suggestion…
+    // The dynamic role v1 gets right lowers through `BitSliceDyn`…
     let slice = point("cmd.ticks[k:0]");
-    let msg = assert_unsupported(&lower_src(&slice).unwrap_err());
-    assert!(msg.contains("bit-slice bound `k`"), "{msg}");
+    let prog = lower_src(&slice).expect("a hook-parameter slice bound lowers");
+    verify::verify_program(&prog).expect("a hook-parameter slice bound verifies");
+    assert!(emit_cpp_src(&slice).contains("(uint32_t)(k)"));
     let v1 = cpp_tb::emit(&merged_src(&slice)).expect("v1 emits the per-call bound");
     assert!(
         v1.contains("harc_bits(cmd.ticks, (uint32_t)(k)"),
         "v1 emits the hook ARGUMENT as the bound: {v1}"
     );
-    // …and it is a real hazard, not a hypothetical: an unrelated const
-    // of the same name must not capture it.
-    let msg = assert_unsupported(&lower_src(&format!("const k = 7\n\n{slice}")).unwrap_err());
+    // …and an unrelated const of the same name must not capture it.
+    let shadowed = format!("const k = 7\n\n{slice}");
+    let cpp = emit_cpp_src(&shadowed);
     assert!(
-        msg.contains("is a hook parameter"),
-        "a file-scope `const k` must not fold the bound to [7:0]: {msg}"
+        cpp.contains("(uint32_t)(k)") && !cpp.contains("(uint32_t)(7)"),
+        "a file-scope `const k` must not fold the hook argument to [7:0]: {cpp}"
     );
 
     // The two roles v1 refuses…
@@ -23177,7 +24375,7 @@ fn a_hook_parameter_bound_is_classified_by_role_like_any_other() {
 #[test]
 fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
     let lanes = fixture("packed_vec_lane_test.harc");
-    const LANE: &str = "cover dut.lane_id_out[0]";
+    const LANE: &str = "cover dut.lane_id_out[2'd0]";
     assert!(lanes.contains(LANE), "fixture shape changed");
     let lane = |t: &str| lanes.replacen(LANE, &format!("cover {t}"), 1);
 
@@ -23238,8 +24436,8 @@ fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
     );
 }
 
-/// A width above 64 bits is REFUSED, not clamped — and an earlier
-/// version of this test asserted the clamp, on the argument that "a
+/// A width above 64 bits keeps its real intermediate width — an earlier
+/// version clamped it, on the argument that "a
 /// coverpoint samples 64 bits, so widening past it is the identity".
 ///
 /// That holds only when the widened value is sampled DIRECTLY. Slice
@@ -23258,43 +24456,39 @@ fn a_negative_folded_bound_is_classified_like_its_macro_spelling() {
 /// turned an accurate `--codegen v1` suggestion into a silently wrong
 /// sample, which is the one outcome this sweep exists to prevent.
 ///
-/// The refusals split where v1 stops working:
-///
-/// | construct | v1 | verdict |
-/// |---|---|---|
-/// | `.sext<128>()`, `as uint<128>` | `_harc_u128`, compiles | `Unsupported` |
-/// | `as uint<200>` | `HarcWide<7>`, g++ rejects the ctor | `EmitsUncompilable` |
 #[test]
-fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
+fn a_coverpoint_width_above_64_keeps_the_extra_bits() {
     let cov = fixture("cov_expr_targets_test.harc");
     const CP: &str = "cover dut.count_out[3:0]\n";
     let slice = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
 
-    // The identity claim, falsified: v1's sliced form reads bits the
-    // 64-bit model does not have.
+    // The identity claim, falsified: the sliced form reads bits that a
+    // clamped 64-bit intermediate would not have.
     let sliced = slice("dut.count_out[3:0].sext<128>()[70:65]");
-    let msg = assert_unsupported(&lower_src(&sliced).unwrap_err());
-    assert!(msg.contains("`.sext<128>()`"), "{msg}");
+    let prog = lower_src(&sliced).expect("a sliced 128-bit intermediate lowers");
+    verify::verify_program(&prog).expect("a sliced 128-bit intermediate verifies");
+    assert!(emit_cpp_src(&sliced).contains("harc_sext_u128"));
     let v1 = cpp_tb::emit(&merged_src(&sliced)).expect("v1 emits the 128-bit slice");
     assert!(
         v1.contains("harc_sext_u128") && v1.contains("(uint32_t)(70), (uint32_t)(65)"),
         "v1 slices bits 70:65 of a real 128-bit value: {v1}"
     );
 
-    // Every widening form refuses, and each names itself.
-    for (t, want) in [
-        ("dut.count_out[3:0].sext<128>()", "`.sext<128>()`"),
-        ("dut.count_out[3:0].zext<128>()", "`.zext<128>()`"),
-        ("dut.count_out[3:0].resize<128>()", "`.resize<128>()`"),
-        ("(dut.count_out as uint<128>)", "cast to 128 bits"),
-        ("(dut.count_out as sint<128>)", "cast to 128 bits"),
-        ("(dut.count_out as uint<65>)", "cast to 65 bits"),
+    // Every widening form lowers and verifies.
+    for t in [
+        "dut.count_out[3:0].sext<128>()",
+        "dut.count_out[3:0].zext<128>()",
+        "dut.count_out[3:0].resize<128>()",
+        "(dut.count_out as uint<128>)",
+        "(dut.count_out as sint<128>)",
+        "(dut.count_out as uint<65>)",
     ] {
-        let msg = assert_unsupported(&lower_src(&slice(t)).unwrap_err());
-        assert!(msg.contains(want), "`{t}`: {msg}");
-        // …and the claim behind the suggestion: v1 builds it.
-        cpp_tb::emit(&merged_src(&slice(t)))
-            .unwrap_or_else(|e| panic!("`{t}`: v1 must emit it for the suggestion to hold: {e}"));
+        let src = slice(t);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{t}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{t}` verifies: {e:?}"));
+        emit_cpp_src(&src);
+        cpp_tb::emit(&merged_src(&src))
+            .unwrap_or_else(|e| panic!("`{t}`: v1 parity oracle must emit it: {e}"));
     }
 
     // `trunc` is the exception: it NARROWS, so whether v1 accepts it
@@ -23327,8 +24521,9 @@ fn a_coverpoint_width_above_64_is_refused_because_v1_keeps_the_extra_bits() {
     // testbench with `CFG_CXXFLAGS_STD=-std=gnu++20`.
     // `tests/wide_cast_cpp.rs` already said so in a comment.
     let wide = slice("(dut.count_out as uint<200>)");
-    let msg = assert_unsupported(&lower_src(&wide).unwrap_err());
-    assert!(msg.contains("cast to 200 bits"), "{msg}");
+    let prog = lower_src(&wide).expect("a 200-bit coverpoint cast lowers");
+    verify::verify_program(&prog).expect("a 200-bit coverpoint cast verifies");
+    assert!(emit_cpp_src(&wide).contains("harc_wide_"));
     let v1 = cpp_tb::emit(&merged_src(&wide)).expect("v1 emits it");
     assert!(v1.contains("HarcWide<7>"), "{v1}");
 
@@ -24031,17 +25226,18 @@ fn an_unknown_bare_name_in_a_bin_keeps_its_precise_diagnostic() {
 ///
 /// | spec | v1 emits | verdict |
 /// |---|---|---|
-/// | `4'd0` | folds to `_v == 0` — correct | `Unsupported`: v1 really is a way out |
+/// | `4'd0` | folds to `_v == 0` — correct | lowered |
 /// | `99999999999999999999999` | verbatim; g++ warns and truncates | `SilentlyMisLowers` |
 #[test]
 fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     let fixture = fixture("cov_runtime_bound_test.harc");
     let spec = |b: &str| fixture.replace("en0 = {0}", &format!("en0 = {{{b}}}"));
 
-    let msg = assert_unsupported(&lower_src(&spec("4'd0")).unwrap_err());
-    assert!(msg.contains("sized literal"), "{msg}");
-    // …and the claim behind that suggestion: v1 folds it to the same
-    // comparison the plain literal produces.
+    let sized = spec("4'd0");
+    let prog = lower_src(&sized).expect("a sized exact bin lowers");
+    verify::verify_program(&prog).expect("a sized exact bin verifies");
+    assert_eq!(emit_cpp_src(&sized), emit_cpp_src(&spec("0")));
+    // v1 folds it to the same comparison the plain literal produces.
     assert_eq!(
         cpp_tb::emit(&merged_src(&spec("4'd0"))).expect("v1 emits"),
         cpp_tb::emit(&merged_src(&spec("0"))).expect("v1 emits"),
@@ -24062,7 +25258,16 @@ fn an_unfoldable_bin_literal_splits_on_which_kind_it_is() {
     // Both landings — a member and a range end — share one
     // implementation, so both are checked.
     let range = fixture.replace("sel_lo   = [dut.en .. 7]", "sel_lo   = [4'd1 .. 7]");
-    assert!(assert_unsupported(&lower_src(&range).unwrap_err()).contains("sized literal"));
+    let prog = lower_src(&range).expect("a sized range end lowers");
+    verify::verify_program(&prog).expect("a sized range end verifies");
+
+    let compound = spec("4'd1 + 1");
+    let prog = lower_src(&compound).expect("a sized literal inside a bin expression lowers");
+    verify::verify_program(&prog).expect("a sized literal inside a bin expression verifies");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&compound)).expect("v1 emits compound sized bin"),
+        cpp_tb::emit(&merged_src(&spec("1 + 1"))).expect("v1 emits plain compound bin")
+    );
 }
 
 /// A bin spec is a constant EXPRESSION, not just a literal or a name.
@@ -24456,32 +25661,104 @@ fn parentheses_do_not_hide_the_failing_node_from_the_classifier() {
     );
 }
 
-/// A Verilog-sized literal in a coverpoint target keeps pointing at v1,
-/// which lowers a bare one correctly — the same split the addrmap and
-/// regblock address folds carry.
+/// Coverpoint values use expression capabilities the general TB-IR path
+/// already owns: validated sized literals, runtime slice/lane indices and
+/// wide intermediates.  Keep a positive v1 control for every spelling so
+/// this stays a retirement-gap test rather than an inferred enhancement.
 #[test]
-fn a_sized_literal_coverpoint_target_still_points_at_v1() {
-    let fixture = fixture("cov_runtime_bound_test.harc");
-    let src = fixture.replace("cp_en : cover dut.en", "cp_en : cover 32'h7");
+fn v1_working_coverpoint_value_forms_lower_and_verify() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    const TARGET: &str = "cp_en : cover dut.en";
+    let target = |expr: &str| base.replace(TARGET, &format!("cp_en : cover {expr}"));
 
-    let err = lower_src(&src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("sampling the sized literal"), "{msg}");
+    for (what, expr, tbir_needle, v1_needle) in [
+        (
+            "sized literal",
+            "32'h7",
+            "uint64_t _v = (uint64_t)(7)",
+            "(uint64_t)(0x7)",
+        ),
+        (
+            "sized slice bounds",
+            "dut.count_out[4'd3:4'd0]",
+            "harc_bits",
+            "(uint32_t)(3), (uint32_t)(0)",
+        ),
+        (
+            "runtime slice bounds",
+            "dut.count_out[dut.en + 2:0]",
+            "harc_rt::harc_bits",
+            "(uint32_t)(harc_rt::harc_read(dut->en) + 2)",
+        ),
+        (
+            "128-bit intermediate",
+            "dut.count_out[3:0].sext<128>()[70:65]",
+            "harc_sext_u128",
+            "harc_sext_u128",
+        ),
+        (
+            "wide intermediate",
+            "(dut.count_out as uint<200>)[70:65]",
+            "harc_wide_trunc<7>",
+            "harc_bits",
+        ),
+    ] {
+        let src = target(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        let tbir = emit_cpp_src(&src);
+        assert!(
+            tbir.contains(tbir_needle),
+            "{what}: missing `{tbir_needle}`:\n{tbir}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+        assert!(
+            v1.contains(v1_needle),
+            "{what}: missing v1 `{v1_needle}`:\n{v1}"
+        );
+    }
 
-    // v1's evidence: it lowers the sized literal to the right value.
-    assert!(
-        cpp_tb::emit(&merged_src(&src))
-            .expect("v1 emits a sized literal")
-            .contains("(uint64_t)(0x7)"),
-        "v1 lowers a bare sized literal correctly, which is why this points at it"
-    );
+    for (what, from, to) in [
+        ("sized exact bin", "en0 = {0}", "en0 = {4'd0}"),
+        (
+            "sized range bounds",
+            "const_hi = [8 .. 15]",
+            "const_hi = [8'd8 .. 8'd15]",
+        ),
+    ] {
+        let src = base.replace(from, to);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+    }
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    for (what, expr, needle) in [
+        (
+            "sized lane index",
+            "dut.lane_id_out[2'd0]",
+            "lane_id_out[0]",
+        ),
+        (
+            "runtime lane index",
+            "dut.lane_id_out[dut.lane_valid_out[0]]",
+            "lane_id_out[dut->lane_valid_out[0]]",
+        ),
+    ] {
+        let src = lanes.replace("cover dut.lane_id_out[2'd0]", &format!("cover {expr}"));
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        let tbir = emit_cpp_src(&src);
+        assert!(tbir.contains(needle), "{what}: missing `{needle}`: {tbir}");
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1: {e}"));
+    }
 
     // An OVER-WIDE literal shares the same `ExprKind::Int` arm and gets
     // the opposite classification: v1 emits a `_harc_u128` composite
     // that narrows, so the coverpoint would sample a truncated value.
     // Pointing there would be the misdirection this sweep exists to
     // remove.
-    let wide = fixture.replace("cp_en : cover dut.en", "cp_en : cover 0x10000000000000000");
+    let wide = base.replace("cp_en : cover dut.en", "cp_en : cover 0x10000000000000000");
     let msg = assert_not_implemented(
         &lower_src(&wide).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
@@ -24492,6 +25769,513 @@ fn a_sized_literal_coverpoint_target_still_points_at_v1() {
             .expect("v1 emits an over-wide literal")
             .contains("_harc_u128"),
         "v1 emits the narrowing composite"
+    );
+
+    let wide_sized = base.replace(
+        "cp_en : cover dut.en",
+        "cp_en : cover 128'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    );
+    assert_not_implemented(
+        &lower_src(&wide_sized).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+
+    // Retain the DECLARED width, not only the numeric value. A later
+    // signed extension needs to know that 4'hF has a four-bit sign bit.
+    let signed_sized = target("(4'hF).sext<8>()");
+    let prog = lower_src(&signed_sized).expect("a sized literal receiver lowers");
+    let ir::Expr::WidthCast {
+        src_width: Some(4),
+        inner,
+        ..
+    } = &prog.covgroups[0].points[1].target
+    else {
+        panic!("sized receiver width was not retained: {prog}")
+    };
+    assert!(matches!(
+        &**inner,
+        ir::Expr::Literal {
+            ty: ir::IrType::UInt(Some(4)),
+            ..
+        }
+    ));
+    emit_cpp_src(&signed_sized);
+}
+
+#[test]
+fn coverpoint_compositions_preserve_wide_and_wrapping_widths() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    let source =
+        |expr: &str| base.replace("cp_en : cover dut.en", &format!("cp_en : cover {expr}"));
+
+    let activity_cpp = emit_fixture_cpp("cov_expr_targets_test.harc");
+    assert!(
+        activity_cpp.contains("harc_u64_shift_count((uint64_t)(1), 64), 64)"),
+        "narrow cover shifts must preserve v1's 64-bit host-carrier semantics: {activity_cpp}"
+    );
+    let wide_cpp = emit_fixture_cpp("cov_wide_port_expr_test.harc");
+    assert!(
+        wide_cpp.contains("harc_wide_zext<7>") && wide_cpp.contains(", 64)"),
+        "nested narrow shifts must retain their effective carrier width when widened: {wide_cpp}"
+    );
+
+    // A sized literal by itself still has no wrapping width in v1's
+    // cover-expression path, so the migration classifier remains pinned.
+    let wrapping = source("4'd15 +% 1");
+    let msg = assert_not_implemented(&lower_src(&wrapping).unwrap_err(), lower::V1Status::Rejects);
+    assert!(msg.contains("wrapping operator `+%`"), "{msg}");
+    cpp_tb::emit(&merged_src(&wrapping)).expect_err("v1 cannot infer the sized wrap width");
+
+    // A cast supplies the missing width. TB-IR retains it as an explicit
+    // truncation around the ordinary arithmetic node, exactly as the
+    // general expression path does for wrapping operators.
+    let cast_wrapping = source("(4'd1 as uint<8>) +% 1");
+    let prog = lower_src(&cast_wrapping).expect("known-width cover wrap lowers");
+    let ir::Expr::WidthCast {
+        kind: ir::WidthCastKind::Trunc,
+        width: 8,
+        inner,
+        ..
+    } = &prog.covgroups[0].points[1].target
+    else {
+        panic!("cover wrap lost its width: {prog}")
+    };
+    assert!(matches!(&**inner, ir::Expr::Binary(ir::BinOp::Add, _, _)));
+    let cpp = emit_cpp_src(&cast_wrapping);
+    assert!(cpp.contains("& 0xFFULL"), "{cpp}");
+    cpp_tb::emit(&merged_src(&cast_wrapping))
+        .expect("v1 uses the enclosing cast to establish an 8-bit wrap width");
+
+    let wide_wrap = source("(dut.en as uint<200>) +% (1 as uint<200>)");
+    let msg = assert_not_implemented(
+        &lower_src(&wide_wrap).expect_err("v1 rejects wide wrapping arithmetic"),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("at width 200"), "{msg}");
+
+    // Wide operands are coerced to a common carrier before applying C++
+    // operators. The sample still observes only the low 64 bits, but every
+    // nested intermediate retains its declared width until that boundary.
+    for expr in [
+        "(dut.en as uint<200>) + 1",
+        "-(dut.en as uint<200>)",
+        "dut.en ? (dut.en as uint<200>) : 0",
+        "(dut.en as uint<200>) + (dut.en as uint<128>)",
+    ] {
+        let src = source(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{expr}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}` verifies: {e:?}"));
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains("HarcWide<7>") || cpp.contains("harc_wide_zext<7>"),
+            "`{expr}`: {cpp}"
+        );
+    }
+    for (expr, helper) in [
+        ("(dut.en as sint<200>) < (1 as sint<200>)", "harc_wide_slt"),
+        ("dut.count_out[3:0].sext<200>() >> 1", "harc_wide_ashr"),
+        ("!(dut.en as uint<200>)", "harc_wide_is_zero"),
+        ("(dut.en as uint<200>) << 130", "harc_wide_mask_bits"),
+        ("(dut.en as sint<200>) / (1 as sint<200>)", "harc_wide_sdiv"),
+        ("(dut.en as sint<200>) % (1 as sint<200>)", "harc_wide_smod"),
+        ("(dut.en as sint<65>) / (1 as sint<65>)", "harc_sdiv_u128"),
+        ("(dut.en as sint<65>) % (1 as sint<65>)", "harc_smod_u128"),
+    ] {
+        let src = source(expr);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{expr}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}` verifies: {e:?}"));
+        let cpp = emit_cpp_src(&src);
+        assert!(cpp.contains(helper), "`{expr}`: {cpp}");
+    }
+    let mixed_signed = source("(dut.en as sint<65>) < (1 as sint<128>)");
+    let cpp = emit_cpp_src(&mixed_signed);
+    assert!(cpp.contains("harc_slt_u128"), "{cpp}");
+    assert!(
+        cpp.contains("harc_sext_u128") && cpp.contains(", 65, 128)"),
+        "{cpp}"
+    );
+
+    // A wide RHS is still a scalar C++ shift count. Without the explicit
+    // conversion this emitted `HarcWide<N>` as the count and failed in the
+    // host compiler despite lowering and verification succeeding.
+    let wide_shift_count = source("(dut.en as uint<200>) << (dut.en as uint<200>)");
+    let cpp = emit_cpp_src(&wide_shift_count);
+    assert!(cpp.contains("harc_wide_shift_count"), "{cpp}");
+
+    // Mixed signed/unsigned operands use the unsigned common type in the
+    // verifier, hook metadata pass, and emitter alike.
+    let mixed_sign = source("(dut.en as sint<200>) < (1 as uint<300>)");
+    let prog = lower_src(&mixed_sign).expect("mixed-sign cover expression lowers");
+    verify::verify_program(&prog).expect("mixed-sign cover expression verifies");
+    let cpp = emit_cpp_src(&mixed_sign);
+    assert!(cpp.contains("harc_wide_zext<10>"), "{cpp}");
+    assert!(!cpp.contains("harc_wide_slt"), "{cpp}");
+
+    // Logical not produces a one-bit unsigned boolean even when its operand
+    // is signed. Treating it as signed sign-extended true (1) into all ones.
+    let nested_not = source("!(dut.en as sint<200>) + (dut.en as sint<200>)");
+    let cpp = emit_cpp_src(&nested_not);
+    assert!(cpp.contains("harc_wide_zext<7>(!"), "{cpp}");
+    assert!(!cpp.contains("harc_wide_sext<7>(!"), "{cpp}");
+
+    // A widthless `sint` helper still has the 64-bit host ABI and must be
+    // sign-extended when composed with a declared wide signed value.
+    let widthless_helper = format!(
+        "function neg_one() -> sint\n    return -1\nend function\n\n{}",
+        source("neg_one() + (dut.en as sint<200>)")
+    );
+    let prog = lower_src(&widthless_helper).expect("widthless signed helper composition lowers");
+    verify::verify_program(&prog).expect("widthless signed helper composition verifies");
+    let cpp = emit_cpp_src(&widthless_helper);
+    assert!(
+        cpp.contains("harc_wide_sext<7>(harc_helper_neg_one(), 64, 200)"),
+        "{cpp}"
+    );
+
+    let wide_selector = source("dut.count_out[(dut.en as uint<200>):0]");
+    let msg = assert_unsupported(&lower_src(&wide_selector).unwrap_err());
+    assert!(msg.contains("runtime bit-slice selector"), "{msg}");
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    let wide_lane = lanes.replace(
+        "cover dut.lane_id_out[2'd0]",
+        "cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<200>)]",
+    );
+    let msg = assert_unsupported(&lower_src(&wide_lane).unwrap_err());
+    assert!(msg.contains("runtime lane selector"), "{msg}");
+
+    // A raw DUT port's actual packed width arrives with the SV emit
+    // options, after schema lowering. Pin the late guard too.
+    let raw = source("dut.en + 1");
+    let merged = merged_src(&raw);
+    let prog = lower::lower_program(&merged).expect("widthless raw port lowers");
+    verify::verify_program(&prog).expect("widthless raw port verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths.insert("en".to_string(), 1024);
+    let cpp = tbir::emit(&prog, &merged, &opts)
+        .expect("known-wide raw DUT port composition uses the late width metadata");
+    assert!(cpp.contains("harc_wide_zext<32>"), "{cpp}");
+
+    opts.dut_port_widths.insert("en".to_string(), u32::MAX);
+    let err = tbir::emit(&prog, &merged, &opts)
+        .expect_err("an unresolved native ARCH width must not allocate an enormous carrier");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
+    // Direct low-64-bit sampling and an explicitly narrowed sample do not
+    // need the unresolved source width to choose an intermediate carrier.
+    for expr in ["dut.en", "dut.en.trunc<8>()"] {
+        let direct = format!(
+            r#"
+covergroup DirectCov @(posedge dut.clk)
+    cp : cover {expr}
+        bins
+            zero = {{0}}
+        end bins
+end covergroup DirectCov
+
+testbench DirectTb
+    dut : Top
+    cov : DirectCov
+end testbench DirectTb
+
+impl DirectTest for DirectTb
+    run
+        wait 1 cycle
+    end run
+end impl DirectTest
+"#
+        );
+        let merged = merged_src(&direct);
+        let prog = lower::lower_program(&merged).unwrap_or_else(|e| panic!("`{expr}`: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{expr}`: {e:?}"));
+        tbir::emit(&prog, &merged, &opts)
+            .unwrap_or_else(|e| panic!("safe unresolved-width sample `{expr}` rejected: {e:?}"));
+    }
+
+    // Aggregate source paths use the same underscore flattening as emitted
+    // DUT member access (`dut.send.rsp_data` → `send_rsp_data`).
+    let aggregate = source("dut.send.rsp_data + 1");
+    let merged = merged_src(&aggregate);
+    let prog = lower::lower_program(&merged).expect("aggregate raw port lowers");
+    verify::verify_program(&prog).expect("aggregate raw port verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths
+        .insert("send_rsp_data".to_string(), 1024);
+    let cpp = tbir::emit(&prog, &merged, &opts)
+        .expect("known-wide aggregate DUT port composition uses the late width metadata");
+    assert!(cpp.contains("harc_wide_zext<32>"), "{cpp}");
+
+    // Packed-vector metadata is keyed by the flattened physical member too.
+    // A qualified source path must still use logical lane extraction rather
+    // than indexing Verilator's packed storage representation directly.
+    let aggregate_lane = source("dut.send.rsp_data[0]");
+    let merged = merged_src(&aggregate_lane);
+    let prog = lower::lower_program(&merged).expect("aggregate lane lowers");
+    verify::verify_program(&prog).expect("aggregate lane verifies structurally");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.vec_lane_widths.insert("send_rsp_data".to_string(), 32);
+    let cpp = tbir::emit(&prog, &merged, &opts).expect("aggregate packed lane emits");
+    assert!(
+        cpp.contains("harc_vec_lane_read<32>(dut->send_rsp_data"),
+        "{cpp}"
+    );
+}
+
+#[test]
+fn coverpoint_hook_fields_carry_late_width_and_signedness_into_codegen() {
+    let src = fixture("covergroup_hook_param_test.harc")
+        .replace(
+            "    expect : uint<32> default 0",
+            "    expect : uint<32> default 0\n    wide_a : uint<200> default 0\n    wide_b : uint<300> default 0\n    signed_a : sint<200> default 0\n    signed_b : sint<300> default 0",
+        )
+        .replace(
+            "    cross cp_ticks, cp_expect",
+            "    cp_wide : cover cmd.wide_a + cmd.wide_b\n    cp_signed : cover cmd.signed_a < cmd.signed_b\n    cross cp_ticks, cp_expect",
+        );
+    let prog = lower_src(&src).expect("wide hook-field expressions lower");
+    verify::verify_program(&prog).expect("wide hook-field expressions verify");
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("harc_wide_zext<10>(cmd.wide_a, 200)"),
+        "differently sized hook fields must share a 300-bit carrier: {cpp}"
+    );
+    assert!(
+        cpp.contains("harc_wide_slt") && cpp.contains("cmd.signed_a"),
+        "signed hook fields must use signed comparison semantics: {cpp}"
+    );
+}
+
+#[test]
+fn clocked_covergroups_apply_helper_types_and_verifier_metadata() {
+    let source = |arg: &str| {
+        format!(
+            r#"
+function id8(x: uint<8>) -> uint<8>
+    return x
+end function id8
+
+covergroup TypedCov @(posedge dut.clk)
+    cp : cover id8({arg})
+        bins
+            zero = {{0}}
+        end bins
+end covergroup TypedCov
+
+testbench Tb
+    dut : Top
+    cov : TypedCov
+end testbench Tb
+
+impl TypedCoverTest for Tb
+    run
+        wait 1 cycle
+    end run
+end impl TypedCoverTest
+"#
+        )
+    };
+
+    let msg = assert_invalid(
+        &lower_src(&source("dut.en as uint<200>"))
+            .expect_err("a wide argument must not truncate into uint<8>"),
+    );
+    assert!(msg.contains("argument 1 expects uint<8>"), "{msg}");
+
+    let literal = source("1");
+    let prog = lower_src(&literal).expect("unsized helper argument lowers");
+    verify::verify_program(&prog).expect("unsized helper argument verifies as a scalar wildcard");
+
+    // A parameter-dependent native ARCH port remains unsafe as a raw helper
+    // argument, but explicit low-bit narrowing establishes the helper's
+    // concrete uint<8> carrier without knowing the source's full width.
+    let mut unresolved_opts = cpp_tb::EmitOpts::default();
+    unresolved_opts
+        .dut_port_widths
+        .insert("en".to_string(), u32::MAX);
+    for arg in [
+        "dut.en.trunc<8>()",
+        "dut.en.resize<8>()",
+        "dut.en as uint<8>",
+        "dut.en[7:0]",
+    ] {
+        let narrowed = source(arg);
+        let merged = merged_src(&narrowed);
+        let prog = lower::lower_program(&merged)
+            .unwrap_or_else(|e| panic!("narrowed helper argument `{arg}` lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("narrowed helper argument `{arg}` verifies: {e:?}"));
+        tbir::emit(&prog, &merged, &unresolved_opts)
+            .unwrap_or_else(|e| panic!("safe narrowed helper argument `{arg}` rejected: {e:?}"));
+    }
+    let signed_helper = |arg: &str| {
+        source(arg).replace(
+            "function id8(x: uint<8>) -> uint<8>",
+            "function id8(x: sint<8>) -> sint<8>",
+        )
+    };
+    let signed_relabel = signed_helper("dut.en as sint<8>");
+    let merged = merged_src(&signed_relabel);
+    let prog = lower::lower_program(&merged).expect("signed relabel helper argument lowers");
+    verify::verify_program(&prog).expect("signed relabel helper argument verifies");
+    tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect("signed fixed-width relabel must bound an unresolved source");
+
+    let true_sext = signed_helper("dut.en.sext<8>()");
+    let merged = merged_src(&true_sext);
+    let prog = lower::lower_program(&merged).expect("true sext helper argument lowers");
+    verify::verify_program(&prog).expect("true sext helper argument verifies");
+    let err = tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect_err("true sext still needs the unresolved source width");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
+    let raw = source("dut.en");
+    let merged = merged_src(&raw);
+    let prog = lower::lower_program(&merged).expect("raw unresolved helper argument lowers");
+    let err = tbir::emit(&prog, &merged, &unresolved_opts)
+        .expect_err("raw unresolved helper argument must stay rejected");
+    assert!(
+        err.0.contains("parameter-dependent ARCH DUT port width"),
+        "{err:?}"
+    );
+
+    let valid = source("dut.en");
+    let mut bad_arity = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(_, args) = &mut bad_arity.covgroups[0].points[0].target else {
+        panic!("expected helper call")
+    };
+    args.clear();
+    let errs = verify::verify_program(&bad_arity).expect_err("helper arity corruption must fail");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("arity mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_return = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(ir::CallTarget::Helper { ret, .. }, _) =
+        &mut bad_return.covgroups[0].points[0].target
+    else {
+        panic!("expected helper call")
+    };
+    *ret = ir::IrType::UInt(Some(16));
+    let errs = verify::verify_program(&bad_return).expect_err("helper return corruption must fail");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("return metadata mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_ternary = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(_, args) = &mut bad_ternary.covgroups[0].points[0].target else {
+        panic!("expected helper call")
+    };
+    args[0] = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(16)),
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(8)),
+        }),
+    );
+    let errs = verify::verify_program(&bad_ternary)
+        .expect_err("mixed-width ternary must retain its promoted uint<16> metadata");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("argument 1 type mismatch")),
+        "unexpected verifier errors: {errs:?}"
+    );
+}
+
+/// A wide helper parameter supplies the exact type-directed carrier that the
+/// cover sampler needs. This is distinct from (and adjacent to) the rejected
+/// wide-to-narrow call above.
+#[test]
+fn clocked_covergroup_passes_matching_wide_helper_argument() {
+    let src = fixture("wide_cover_helper_test.harc");
+    let prog = lower_src(&src).expect("matching wide helper call lowers");
+    verify::verify_program(&prog).expect("matching wide helper call verifies");
+
+    let merged = merged_src(&src);
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths.insert("wide".to_string(), 200);
+    let tbir = tbir::emit(&prog, &merged, &opts).expect("tbir emits matching wide helper call");
+    let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits matching wide helper call");
+    for cpp in [&tbir, &v1] {
+        assert!(
+            cpp.contains("HarcWide<7>"),
+            "wide carrier is retained:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("classify_wide(harc_rt::harc_read(dut->wide))"),
+            "wide DUT value reaches the typed helper:\n{cpp}"
+        );
+    }
+}
+
+#[test]
+fn coverpoint_value_expression_corruption_is_rejected_before_codegen() {
+    let base = fixture("cov_runtime_bound_test.harc");
+    let source =
+        |expr: &str| base.replace("cp_en : cover dut.en", &format!("cp_en : cover {expr}"));
+
+    let mut wrong_kind =
+        lower_src(&source("dut.count_out[dut.en:0]")).expect("dynamic slice lowers");
+    wrong_kind.covgroups[0].points[1].target = ir::Expr::Local(ir::LocalId(u32::MAX));
+    let errs = verify::verify_program(&wrong_kind)
+        .expect_err("a function local is not valid in a covergroup schema");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("outside the cover subset")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let mut bad_width = lower_src(&source("(dut.count_out as uint<200>)[70:65]"))
+        .expect("wide cover expression lowers");
+    let ir::Expr::BitSlice { target, .. } = &mut bad_width.covgroups[0].points[1].target else {
+        panic!("expected outer constant slice")
+    };
+    let ir::Expr::WidthCast { width, .. } = &mut **target else {
+        panic!("expected wide cast below the slice")
+    };
+    *width = 0;
+    let errs = verify::verify_program(&bad_width)
+        .expect_err("a zero-width coverpoint cast must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("invalid destination 0")),
+        "unexpected verifier errors: {errs:?}"
+    );
+
+    let lanes = fixture("packed_vec_lane_test.harc");
+    let mut bad_lane = lower_src(&lanes.replace(
+        "cover dut.lane_id_out[2'd0]",
+        "cover dut.lane_id_out[dut.lane_valid_out[0]]",
+    ))
+    .expect("runtime lane index lowers");
+    let ir::Expr::Port(port) = &mut bad_lane.covgroups[0].points[0].target else {
+        panic!("expected port-backed coverpoint")
+    };
+    port.lane = Some(ir::LaneIndex::Var(Box::new(ir::Expr::Local(ir::LocalId(
+        u32::MAX,
+    )))));
+    let errs = verify::verify_program(&bad_lane)
+        .expect_err("a local hidden in a runtime lane index must fail verification");
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("outside the cover subset")),
+        "unexpected verifier errors: {errs:?}"
     );
 }
 
@@ -25000,59 +26784,250 @@ fn a_thread_in_a_component_is_silently_dropped_by_v1() {
     );
 }
 
-/// The same arm also catches a `thread` on a transactor that IS
-/// bus-bound: `transactor_is_component` routes one down the component
-/// path when it additionally has a non-periodic `on` handler.
-///
-/// There the construct works — `emit_bound_tlm_target_actors` emits the
-/// target actor regardless of the `on` handler — so v1 is a genuine
-/// escape hatch and the arm keeps `Unsupported`. The first version of
-/// the split reclassified the whole arm from a probe that only ever put
-/// a `thread` on an env.
+/// A bus-bound transactor may combine event/cycle handlers with a target
+/// responder thread. The declaration intentionally has two IR views:
+/// component IR owns the handlers, component-only fields, and state object,
+/// while the existing target transactor IR owns the responder body. The target
+/// actor records the component host explicitly so codegen shares one instance
+/// instead of declaring a second state object.
 #[test]
-fn a_thread_on_a_bound_transactor_still_points_at_v1() {
-    let bound = fixture("tlm_target_thread_test.harc");
-    emit_cpp_src(&bound);
+fn bound_transactor_thread_and_monitor_share_component_host() {
+    let prog = lower_src(&fixture("tlm_target_thread_monitor_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
 
-    // Add a non-periodic `on` handler, which is what routes this
-    // transactor down the component path.
-    // `bus.read` is a tlm_method, so the `on` handler needs a real
-    // handshake channel — the bus is given one here. No fixture in the
-    // corpus has this shape (bound transactor + `on` + `thread`), which
-    // is why it went unprobed the first time.
-    let via_component = bound
-        .replacen(
-            "    tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
-            r#"    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
-    handshake_channel obs: receive kind: valid_ready
-        data: UInt<8>;
-    end handshake_channel obs"#,
-            1,
-        )
-        .replacen(
-            "transactor TlmMemTarget bound to TlmMemBus",
-            "transactor TlmMemTarget bound to TlmMemBus\n    sink : uint<8> default 0",
-            1,
-        )
-        .replacen(
-            "    thread bus.read(addr: uint<8>)",
-            "    on bus.obs.handshake(v)\n        sink = v\n    end on\n\n    thread bus.read(addr: uint<8>)",
-            1,
-        );
-    let err = lower_src(&via_component).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("bound transactor"), "{msg}");
+    assert_eq!(prog.transactors.len(), 1, "target responder IR view");
+    assert_eq!(prog.components.len(), 1, "monitor component IR view");
+    assert_eq!(prog.transactors[0].target_methods.len(), 1);
+    assert_eq!(
+        prog.transactors[0].target_methods[0].activation,
+        ir::Activation::ActiveOnly
+    );
+    assert_eq!(prog.components[0].cycle_handlers.len(), 1);
+    assert_eq!(prog.components[0].on_handlers.len(), 1);
+    assert!(prog.components[0]
+        .fields
+        .iter()
+        .any(|field| matches!(field.kind, ir::ComponentFieldKind::Event { .. })));
+    assert!(prog.transactors[0]
+        .state_fields
+        .iter()
+        .all(|field| field.name != "in_ev"));
 
-    // v1's evidence: the target actor is still emitted, so pointing the
-    // user at v1 is accurate rather than a dead end.
-    let v1 = cpp_tb::emit(&merged_src(&via_component)).expect("v1 emits");
+    let actor = &prog.testbenches[0].target_tlm_actors[0];
+    assert_eq!(actor.instance, "target");
+    assert_eq!(actor.host_component, Some(ir::ComponentId(0)));
+    assert!(actor.active);
+    assert!(prog.testbenches[0]
+        .component_fields
+        .iter()
+        .any(|f| f.field == "target" && f.component == ir::ComponentId(0)));
+
+    let cpp = emit_fixture_cpp("tlm_target_thread_monitor_test.harc");
+    assert!(cpp.contains("TlmMemTarget target;"));
     assert!(
-        v1.matches("harc_rt::ThreadSlot").count()
-            > cpp_tb::emit(&merged_src(&bound))
-                .expect("v1 emits")
-                .matches("harc_rt::ThreadSlot")
-                .count(),
-        "the `on` handler adds slots and the thread's actor survives"
+        !cpp.contains("_TlmMemTarget_target_state"),
+        "a component-hosted target actor must not declare duplicate state"
+    );
+
+    let passive_src = fixture("tlm_target_thread_monitor_test.harc").replacen(
+        "TlmMemTarget active = bind mem",
+        "TlmMemTarget passive = bind mem",
+        1,
+    );
+    let passive = lower_src(&passive_src).expect("passive monitor lowers");
+    verify::verify_program(&passive).expect("passive monitor verifies");
+    assert!(!passive.testbenches[0].target_tlm_actors[0].active);
+    let passive_tbir = emit_cpp_src(&passive_src);
+    let passive_v1 = cpp_tb::emit(&merged_src(&passive_src)).expect("v1 emits passive control");
+    assert!(
+        !passive_tbir.contains("_target_read_target_slot")
+            && !passive_v1.contains("_target_read_target_slot"),
+        "neither backend may schedule a `when active` responder for a passive binding"
+    );
+}
+
+/// A target responder in the always-present half is itself useful passive
+/// behavior. The mixed component gate must not require an unrelated cycle
+/// monitor before it discovers and binds that responder.
+#[test]
+fn passive_mixed_target_with_always_responder_is_not_inert() {
+    let src = fixture("tlm_target_always_mixed_passive_test.harc");
+    let prog = lower_src(&src).expect("passive mixed target lowers");
+    verify::verify_program(&prog).expect("passive mixed target verifies");
+
+    let method = &prog.transactors[0].target_methods[0];
+    assert_eq!(method.activation, ir::Activation::Always);
+    let actor = &prog.testbenches[0].target_tlm_actors[0];
+    assert!(!actor.active);
+    assert!(actor.host_component.is_some());
+
+    for cpp in [
+        emit_fixture_cpp("tlm_target_always_mixed_passive_test.harc"),
+        cpp_tb::emit(&merged_src(&src)).expect("v1 emits passive always responder"),
+    ] {
+        assert!(
+            cpp.contains("_target_read_target_slot"),
+            "the always responder must remain scheduled for a passive instance:\n{cpp}"
+        );
+    }
+}
+
+/// An always target body cannot see storage declared inside `when active`.
+/// Passive elaboration removes those fields, so every access kind must be an
+/// invalid-source diagnostic rather than a generic "try v1" subset error.
+#[test]
+fn always_target_rejects_active_only_state_references() {
+    let base = r#"
+struct Beat
+    addr : uint<8>
+end struct Beat
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    handshake_channel observed_req: receive kind: valid_ready
+        addr: uint<8>
+    end handshake_channel observed_req
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    observed : uint<8> default 0
+    on bus.observed_req.handshake(req)
+        observed = req.addr
+    end on
+    thread bus.read(addr: uint<8>)
+        __TARGET_BODY__
+    end thread
+    when active
+        active_only : uint<32> default 256
+        pending : queue<uint<8>>
+        last : Beat
+        in_ev : in event<uint<8>>
+        on in_ev(v)
+            active_only = active_only + v
+        end on
+    end when
+end transactor TlmMemTarget
+
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+
+    for (body, field) in [
+        (
+            "active_only = active_only + 1\n        return active_only + addr",
+            "active_only",
+        ),
+        ("pending.push(addr)\n        return addr", "pending"),
+        ("return pending.size()", "pending"),
+        ("last.addr = addr\n        return last.addr", "last"),
+    ] {
+        let src = base.replace("__TARGET_BODY__", body);
+        let msg = assert_invalid(
+            &lower_src(&src).expect_err("always target must not see active-only state"),
+        );
+        assert!(
+            msg.contains("always-present target thread")
+                && msg.contains(&format!("active-only state field `{field}`")),
+            "{msg}"
+        );
+    }
+
+    // A responder-local declaration still shadows a same-named active-only
+    // field. The structural check follows normal name resolution rather than
+    // banning an identifier spelling globally.
+    let shadow = base.replace(
+        "__TARGET_BODY__",
+        "let pending : uint<32> = addr\n        return pending",
+    );
+    lower_src(&shadow).expect("local shadows inactive target state");
+}
+
+/// The mixed target/component seam is an explicit IR relation, not a
+/// codegen naming convention. Missing, out-of-range, duplicate, and
+/// state-incompatible host metadata must all fail verification.
+#[test]
+fn bound_transactor_thread_component_host_corruption_is_rejected() {
+    let fresh =
+        || lower_src(&fixture("tlm_target_thread_monitor_test.harc")).expect("fixture lowers");
+
+    let mut missing = fresh();
+    missing.testbenches[0].target_tlm_actors[0].host_component = None;
+    assert!(
+        format!("{:?}", verify::verify_program(&missing).unwrap_err())
+            .contains("stores no host component")
+    );
+
+    let mut out_of_range = fresh();
+    out_of_range.testbenches[0].target_tlm_actors[0].host_component = Some(ir::ComponentId(99));
+    assert!(
+        format!("{:?}", verify::verify_program(&out_of_range).unwrap_err())
+            .contains("references missing host c99")
+    );
+
+    let mut duplicate = fresh();
+    let actor = duplicate.testbenches[0].target_tlm_actors[0].clone();
+    duplicate.testbenches[0].target_tlm_actors.push(actor);
+    assert!(
+        format!("{:?}", verify::verify_program(&duplicate).unwrap_err()).contains("more than once")
+    );
+
+    let mut wrong_kind = fresh();
+    wrong_kind.components[0].fields[0].kind = ir::ComponentFieldKind::Queue {
+        elem: ir::QueueElem::Scalar {
+            ty: ir::IrType::UInt(Some(32)),
+        },
+    };
+    assert!(
+        format!("{:?}", verify::verify_program(&wrong_kind).unwrap_err())
+            .contains("is not state-compatible")
+    );
+
+    let mut wrong_host_kind = fresh();
+    wrong_host_kind.components[0].kind = ir::ComponentKindTag::Agent;
+    assert!(format!(
+        "{:?}",
+        verify::verify_program(&wrong_host_kind).unwrap_err()
+    )
+    .contains("is not state-compatible"));
+
+    let mut duplicate_state = fresh();
+    let state = duplicate_state.transactors[0].state_fields[0].clone();
+    duplicate_state.transactors[0].state_fields[1] = state;
+    assert!(format!(
+        "{:?}",
+        verify::verify_program(&duplicate_state).unwrap_err()
+    )
+    .contains("is not state-compatible"));
+
+    let mut wrong_mode = fresh();
+    wrong_mode.testbenches[0].target_tlm_actors[0].active = false;
+    assert!(
+        format!("{:?}", verify::verify_program(&wrong_mode).unwrap_err()).contains("active=false")
+    );
+
+    let passive_src = fixture("tlm_target_thread_monitor_test.harc").replacen(
+        "TlmMemTarget active = bind mem",
+        "TlmMemTarget passive = bind mem",
+        1,
+    );
+    let mut missing_mode = lower_src(&passive_src).expect("passive control lowers");
+    missing_mode.testbenches[0]
+        .component_fields
+        .iter_mut()
+        .find(|field| field.field == "target")
+        .expect("target component binding")
+        .mode = None;
+    assert!(
+        format!("{:?}", verify::verify_program(&missing_mode).unwrap_err()).contains("mode None")
     );
 }
 
@@ -25400,16 +27375,16 @@ fn a_testbench_scoped_handler_hook_is_dropped_by_v1() {
     );
 }
 
-/// A hook in STATEMENT position, by contrast, v1 really does implement:
-/// it emits the same `Sender_send_pre.push_back` registration the
-/// working test-scope placement gets. So this one keeps `Unsupported` —
-/// and its suggestion must name a destination that works, which the two
-/// obvious readings of "the component or testbench" do not.
+/// A hook in STATEMENT position registers at that exact runtime point in
+/// both backends.
 #[test]
-fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination() {
+fn a_statement_position_hook_registers_at_its_runtime_position() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send", "        "));
-    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
-    assert!(msg.contains("statement position"), "{msg}");
+    let tbir_stmt = emit_cpp_src(&stmt);
+    assert!(
+        tbir_stmt.contains("Sender_send_pre.push_back"),
+        "tbir registers the statement-position hook"
+    );
 
     // v1 is a real escape hatch: it emits the same registration the
     // test-scope placement gets, which tbir itself lowers. Not
@@ -25438,14 +27413,7 @@ fn a_statement_position_hook_keeps_its_v1_suggestion_and_a_working_destination()
         );
     }
 
-    // The destination the message names must be the one that works. It
-    // used to say "the component or testbench"; a hook in a component
-    // body and a hook in a `testbench` declaration BOTH fail.
-    assert!(
-        msg.contains("test scope") && msg.contains("transactor"),
-        "the suggestion must name the placement that actually lowers: {msg}"
-    );
-    // Each rejected placement is checked against ITS OWN hook-free
+    // Each still-rejected placement is checked against ITS OWN hook-free
     // control. Asserting only `is_err()` would pass on a source that
     // fails for an unrelated reason, which is how a placement gets
     // recommended by accident.
@@ -25570,14 +27538,16 @@ fn a_phase_modifier_on_a_method_hook_is_refused_by_v1() {
     }
 }
 
-/// The same split at test scope, where the target resolver takes only
-/// `<field>.<method>`. A DEEPER path is a subset gap — v1 walks the
-/// whole path and wires it — while a non-path trigger is refused by v1.
+/// At test scope a nested path is wired, while a non-path trigger is
+/// refused by both backends.
 #[test]
-fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
+fn a_nested_hook_path_registers_but_a_non_path_trigger_is_refused() {
     let nested = hook_positions("", &pre_hook_on("e.inner.note", "    "), "");
-    let msg = assert_unsupported(&lower_src(&nested).unwrap_err());
-    assert!(msg.contains("nested component path"), "{msg}");
+    let tbir = emit_cpp_src(&nested);
+    assert!(
+        tbir.contains("Watcher_note_pre.push_back"),
+        "tbir registers the nested component hook"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&nested))
             .expect("v1 emits")
@@ -25609,14 +27579,11 @@ fn a_nested_hook_path_is_a_gap_but_a_non_path_trigger_is_refused() {
     }
 }
 
-/// The hook-target resolver used to answer every non-transactor field
-/// with `Invalid` — "your program is broken under every backend". That
-/// is false for an agent / env / method-bearing scoreboard field, which
-/// v1 wires into a working `<Type>_<method>_pre` vector. The site now
-/// splits on v1's own condition, and only the half v1 also refuses
-/// stays `Invalid`.
+/// Agent / env / method-bearing scoreboard fields are valid hook targets,
+/// just like direct transactor fields. Only paths v1 also refuses remain
+/// invalid.
 #[test]
-fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
+fn a_hook_on_a_non_transactor_field_registers() {
     let hook = |target: &str| hook_positions("", &pre_hook_on(target, "    "), "");
 
     // v1 wires these, so they are subset gaps and `--codegen v1` is honest.
@@ -25628,9 +27595,12 @@ fn a_hook_on_a_non_transactor_field_is_a_subset_gap_not_a_program_error() {
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         assert!(v1.contains(vector), "v1 must register `{target}`");
     }
-    let msg = assert_unsupported(&lower_src(&hook("w.note")).unwrap_err());
-    assert!(msg.contains("non-transactor component field"), "{msg}");
-    // The transactor case is the control: it is not a gap at all.
+    let component_cpp = emit_cpp_src(&hook("w.note"));
+    assert!(
+        component_cpp.contains("Watcher_note_pre.push_back"),
+        "component hook must register on its type-scoped vector"
+    );
+    // The transactor case remains the control.
     lower_src(&hook("s.send")).expect("a transactor field lowers");
 
     // A bare field with no method: the desugarer rewrites it to
@@ -25901,8 +27871,11 @@ fn a_transactor_held_scoreboard_has_its_wiring_dropped_by_v1() {
 #[test]
 fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send cycles", "        "));
-    let msg = assert_unsupported(&lower_src(&stmt).unwrap_err());
-    assert!(msg.contains("statement position"), "{msg}");
+    let tbir = emit_cpp_src(&stmt);
+    assert!(
+        tbir.contains("Sender_send_pre.push_back"),
+        "tbir wires the statement-position spelling"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&stmt))
             .expect("v1 emits")
@@ -28294,11 +30267,13 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         )
     };
 
-    // The one that resolves: v1 EMITS, so `--codegen v1` is a real
-    // escape hatch and the arm keeps its suggestion.
+    // The one that resolves emits a runtime registration in both backends.
     cpp_tb::emit(&merged_src(&with("drv.send"))).expect("v1 emits a resolving hook path");
-    let msg = assert_unsupported(&lower_src(&with("drv.send")).unwrap_err());
-    assert!(msg.contains("hook in statement position"), "{msg}");
+    let tbir = emit_cpp_src(&with("drv.send"));
+    assert!(
+        tbir.contains("HookXactor_send_pre.push_back"),
+        "tbir emits the resolving runtime hook"
+    );
 
     // The four that do not. Same SHAPE, and v1 refuses each one, so a
     // suggestion would send the user to a second error.
@@ -28526,59 +30501,42 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     // positive rows above with only the TRIGGER changed, so what moves
     // it is the gate and nothing else.
     let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
-    // `lowers` says which branch the row is expected to take. Without
-    // it a row could silently switch branches — if the target row's
-    // `thread`-through-the-component-path arm were later implemented it
-    // would start lowering, take the `Ok` branch, and quietly stop
-    // asserting anything about where it went.
-    for (what, lowers, src) in [
+    // Every row routes the non-periodic handler to component IR. The target
+    // row additionally retains its responder in transactor IR and joins both
+    // views at the bound instance; the two initiator rows need only the
+    // component view.
+    for (what, target, src) in [
         (
             "target",
-            false,
+            true,
             base.replacen(THREAD, &format!("{non_periodic}\n{THREAD}"), 1),
         ),
-        ("initiator items", true, active(initiator(non_periodic))),
+        ("initiator items", false, active(initiator(non_periodic))),
         (
             "initiator when active",
-            true,
+            false,
             active(initiator(&format!(
                 "    when active\n{non_periodic}    end when\n"
             ))),
         ),
     ] {
-        let got = lower_src(&src);
-        assert_eq!(
-            got.is_ok(),
-            lowers,
-            "{what}: expected lowers={lowers}, got the other branch"
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what}: must lower: {e}"));
+        let c = prog
+            .components
+            .iter()
+            .find(|c| c.name == "TlmMemTarget")
+            .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
+        assert!(
+            !c.cycle_handlers.is_empty(),
+            "{what}: the composite table must carry the trigger"
         );
-        match got {
-            // The two initiator rows go further than "not here": the
-            // composite table LOWERS them, and the trigger lands as a
-            // cycle handler on the component. That is the positive
-            // witness for where they went.
-            Ok(prog) => {
-                let c = prog
-                    .components
-                    .iter()
-                    .find(|c| c.name == "TlmMemTarget")
-                    .unwrap_or_else(|| panic!("{what}: lowered, but not as a component"));
-                assert!(
-                    !c.cycle_handlers.is_empty(),
-                    "{what}: the composite table must carry the trigger"
-                );
-            }
-            // The target row still has its `thread`, which the
-            // composite path does not lower — but it fails THERE, and
-            // says so.
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("reached through the component path"),
-                    "{what}: a non-periodic `on` must route to the composite table: {msg}"
-                );
-                assert!(!msg.contains("periodic `on <N> cycles`"), "{what}: {msg}");
-            }
+        if target {
+            assert_eq!(prog.transactors[0].target_methods.len(), 1);
+            assert_eq!(prog.testbenches[0].target_tlm_actors.len(), 1);
+            assert_eq!(
+                prog.testbenches[0].target_tlm_actors[0].host_component,
+                Some(ir::ComponentId(0))
+            );
         }
     }
 }
@@ -29654,18 +31612,16 @@ end test PTest"#;
     }
 }
 
-/// Two statement-position `on <event>(...)` subscription arms, side by
-/// side in one function, and they take opposite verdicts.
+/// Statement-position subscriptions accept both a test-scope event local
+/// and a component event field. Unknown names remain program errors.
 ///
 /// | subscription | v1 |
 /// |---|---|
 /// | `on s.obs(v)` — a component's `event` field, by path | `_tb.s.obs.push_back(...)` against a real member — **compiles and runs** |
 /// | `on nosuch(v)` — a name that resolves to nothing | `nosuch.push_back(...)` — "'nosuch' was not declared in this scope" |
 ///
-/// The first row was built and RUN, not just emitted: `seen=3`. So v1
-/// implements it and the suggestion is honest — the arm's advice
-/// ("subscribe from the component that owns the `event` field") is
-/// about TB-IR's subset, not about v1 being broken.
+/// The component-path row was built and RUN under v1 (`seen=3`) before
+/// the TB-IR implementation was added.
 ///
 /// The second is an undefined identifier, which is a program error
 /// under both backends. That it IS only that was checked rather than
@@ -29673,7 +31629,7 @@ end test PTest"#;
 /// reaching here, and a local that is not an event falls to the
 /// `Invalid` immediately below.
 #[test]
-fn a_statement_position_subscription_splits_on_whether_the_channel_exists() {
+fn a_statement_position_subscription_accepts_component_event_paths() {
     let src = |on: &str| {
         format!(
             r#"domain SysDomain
@@ -29712,8 +31668,7 @@ end impl SubTest"#
     // The control: subscribing to the test-scope channel lowers.
     lower_src(&src("ch")).expect("the in-scope channel lowers");
 
-    // A component's event field by path: TB-IR's subset gap, and v1
-    // really is the way out.
+    // A component's event field by path now lowers too.
     //
     // The stimulus matters, and an earlier version of this test got it
     // wrong: it subscribed to `s.obs` and then emitted on `ch`, so the
@@ -29726,10 +31681,12 @@ end impl SubTest"#
         path.contains("s.fire(3)"),
         "the stimulus must actually fire"
     );
-    let msg = assert_unsupported(&lower_src(&path).unwrap_err());
+    let prog = lower_src(&path).expect("component event subscription lowers");
+    verify::verify_program(&prog).expect("component event subscription verifies");
+    let tbir = emit_cpp_src(&path);
     assert!(
-        msg.contains("`on <path>.<event>(arg)` subscription"),
-        "{msg}"
+        tbir.contains("s.obs.push_back(") && tbir.contains("Src_fire("),
+        "TB-IR registers against the component member and emits the stimulus: {tbir}"
     );
     let v1 = cpp_tb::emit(&merged_src(&path)).expect("v1 emits the path form");
     assert!(
@@ -29805,6 +31762,365 @@ end impl SubTest"#
     );
 }
 
+/// Event-subscription metadata is consumed directly by C++ emission. The
+/// verifier must reject stale path/schema/payload links introduced by a later
+/// IR pass, and signed handler parameters must stay signed end-to-end.
+#[test]
+fn component_event_subscription_metadata_is_verified() {
+    fn assert_event_corruption_rejected<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::EventChannelRef),
+    {
+        let event = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::EventSubscribe { event, .. } => Some(event),
+                _ => None,
+            })
+            .expect("fixture has an event subscription");
+        mutate(event);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted component-event metadata must not verify"
+        );
+    }
+
+    let src = fixture("component_event_subscription_test.harc");
+    let prog = lower_src(&src).expect("signed nested component event lowers");
+    verify::verify_program(&prog).expect("signed nested component event verifies");
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("env.source.obs.push_back([&](int64_t _p)")
+            && cpp.contains("std::function<void(int64_t)>")
+            && cpp.contains("int64_t v"),
+        "signed event payload and hook parameter remain signed:\n{cpp}"
+    );
+
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { component, .. } => *component = ir::ComponentId(999),
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { base, .. } => *base = ir::ComponentBase::SelfField,
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { event, .. } => *event = "missing".to_string(),
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { payload, .. } => {
+            *payload = ir::EventPayload::Scalar { signed: false }
+        }
+        _ => panic!("fixture subscription must target a component event"),
+    });
+    assert_event_corruption_rejected(prog.clone(), |event| match event {
+        ir::EventChannelRef::Component { payload, .. } => {
+            *payload = ir::EventPayload::Record(ir::RecordId(999))
+        }
+        _ => panic!("fixture subscription must target a component event"),
+    });
+
+    let mut bad_owner = prog.clone();
+    let owner_handler = bad_owner
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has an event subscriber");
+    bad_owner.functions[owner_handler.index()].owner = None;
+    assert!(
+        verify::verify_program(&bad_owner).is_err(),
+        "an event handler owned by a different flow must not verify"
+    );
+
+    let mut bad_handler = prog.clone();
+    let handler = bad_handler
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::EventSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has an event subscriber");
+    bad_handler.functions[handler.index()].params[0].ty = ir::IrType::UInt(Some(8));
+    bad_handler.functions[handler.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "a handler parameter with the wrong signedness must not verify"
+    );
+}
+
+/// Method-hook subscriptions carry backend-critical target and signature
+/// metadata. Later IR passes must not be able to leave a stale component path,
+/// method id, or signed handler ABI undetected.
+#[test]
+fn method_hook_subscription_metadata_is_verified() {
+    fn assert_target_corruption_rejected<F>(mut prog: ir::TbProgram, mutate: F)
+    where
+        F: FnOnce(&mut ir::MethodHookTarget),
+    {
+        let target = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::MethodHookSubscribe { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("fixture has a method-hook subscription");
+        mutate(target);
+        assert!(
+            verify::verify_program(&prog).is_err(),
+            "corrupted method-hook metadata must not verify"
+        );
+    }
+
+    let src = fixture("method_hook_family_test.harc");
+    let prog = lower_src(&src).expect("nested component method hooks lower");
+    verify::verify_program(&prog).expect("nested component method hooks verify");
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("std::function<void(int64_t)>")
+            && cpp.contains("MethodHookWatcher_note_pre.push_back([&](int64_t _h0)")
+            && cpp.contains("MethodHookWatcher_note_post.push_back([&](int64_t _h0)")
+            && cpp.contains("std::function<void(int64_t, int64_t&)> _on_method_hook_")
+            && cpp.contains("(_h0, __harc_hook_capture_fn"),
+        "signed method-hook parameters remain signed:\n{cpp}"
+    );
+
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { component, .. } => *component = ir::ComponentId(999),
+        _ => panic!("fixture hook must target a component"),
+    });
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { base, .. } => *base = ir::ComponentBase::SelfField,
+        _ => panic!("fixture hook must target a component"),
+    });
+    assert_target_corruption_rejected(prog.clone(), |target| match target {
+        ir::MethodHookTarget::Component { method, .. } => *method = "missing".to_string(),
+        _ => panic!("fixture hook must target a component"),
+    });
+
+    let mut bad_handler = prog.clone();
+    let handler = bad_handler
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::MethodHookSubscribe { handler, .. } => Some(*handler),
+            _ => None,
+        })
+        .expect("fixture has a method-hook subscriber");
+    bad_handler.functions[handler.index()].params[0].ty = ir::IrType::UInt(Some(8));
+    bad_handler.functions[handler.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&bad_handler).is_err(),
+        "a method-hook parameter with the wrong signedness must not verify"
+    );
+
+    let mut bad_capture = lower_src(&src).expect("capture fixture lowers twice");
+    let (handler, capture) = bad_capture
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::MethodHookSubscribe {
+                handler, captures, ..
+            } if !captures.is_empty() => Some((*handler, captures[0])),
+            _ => None,
+        })
+        .expect("fixture has a captured method-hook local");
+    let last = bad_capture.functions[handler.index()].params.len() - 1;
+    bad_capture.functions[handler.index()].params[last].ty = ir::IrType::UInt(Some(32));
+    bad_capture.functions[handler.index()].locals[last].ty = ir::IrType::UInt(Some(32));
+    assert!(
+        verify::verify_program(&bad_capture).is_err(),
+        "a capture parameter that disagrees with source local %{} must not verify",
+        capture.0
+    );
+
+    let method = prog
+        .functions
+        .iter()
+        .find(|func| {
+            !func.implicit_returns.is_empty()
+                && func
+                    .blocks
+                    .iter()
+                    .any(|block| !matches!(block.terminator, ir::Terminator::Return))
+        })
+        .expect("fixture has a transactor method with natural completion");
+    let method_id = method.id;
+    let non_return = method
+        .blocks
+        .iter()
+        .position(|block| !matches!(block.terminator, ir::Terminator::Return))
+        .expect("early-return fixture method has a branch");
+
+    let mut bad_return_id = prog.clone();
+    bad_return_id.functions[method_id.index()]
+        .implicit_returns
+        .push(ir::BlockId(999));
+    assert!(
+        verify::verify_program(&bad_return_id).is_err(),
+        "an out-of-range implicit-return block must not verify"
+    );
+
+    let mut bad_return_kind = prog;
+    bad_return_kind.functions[method_id.index()].implicit_returns =
+        vec![ir::BlockId(non_return as u32)];
+    assert!(
+        verify::verify_program(&bad_return_kind).is_err(),
+        "implicit-return metadata naming a non-Return block must not verify"
+    );
+}
+
+#[test]
+fn method_hook_vectors_preserve_sequence_and_component_parameter_abis() {
+    let src = r#"
+tseq One() -> TSeq<uint<8>>
+    yield 1
+end tseq One
+
+transactor Provider
+    hookable touch()
+        log(info, "touch")
+    end touch
+end transactor Provider
+
+scoreboard HookShapes
+    hookable feed(xs: TSeq<uint<8>>)
+        log(info, "seq")
+    end feed
+
+    hookable comp(model: Provider)
+        model.touch()
+    end comp
+end scoreboard HookShapes
+
+testbench ShapeTb
+    dut  : Top
+    sink : HookShapes
+end testbench ShapeTb
+
+impl ShapeTest for ShapeTb
+    run
+        on sink.feed pre
+            log(info, "seq hook")
+        end on
+        on sink.comp pre
+            log(info, "component hook")
+        end on
+        let xs = One()
+        sink.feed(xs)
+    end run
+end impl ShapeTest
+"#;
+    let prog = lower_src(src).expect("sequence/component method hooks lower");
+    verify::verify_program(&prog).expect("sequence/component method hooks verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::function<void(std::vector<uint64_t>)>> HookShapes_feed_pre")
+            && cpp.contains("std::vector<std::function<void(Provider)>> HookShapes_comp_pre")
+            && cpp.contains("std::function<void(std::vector<uint64_t>)> _on_method_hook_")
+            && cpp.contains("std::function<void(Provider)> _on_method_hook_"),
+        "hook vector and handler signatures must match aggregate method ABIs:\n{cpp}"
+    );
+}
+
+#[test]
+fn method_hook_subscriptions_do_not_leak_between_tests_sharing_a_schema() {
+    let src = r#"
+agent SharedHookAgent
+    hookable ping()
+        log(info, "ping")
+    end ping
+end agent SharedHookAgent
+
+testbench SharedHookTb
+    dut  : Top
+    node : SharedHookAgent
+end testbench SharedHookTb
+
+impl HookedTest for SharedHookTb
+    on node.ping pre
+        log(info, "hooked")
+    end on
+    run
+        node.ping()
+    end run
+end impl HookedTest
+
+impl PlainTest for SharedHookTb
+    run
+        node.ping()
+    end run
+end impl PlainTest
+"#;
+    let cpp = emit_cpp_src(src);
+    assert_eq!(
+        cpp.matches("std::vector<std::function<void()>> SharedHookAgent_ping_pre;")
+            .count(),
+        1,
+        "only the owning test should declare the type-scoped hook vector:\n{cpp}"
+    );
+    assert_eq!(
+        cpp.matches("for (auto& _h : SharedHookAgent_ping_pre) _h();")
+            .count(),
+        1,
+        "only the owning test should fan out the hook vector:\n{cpp}"
+    );
+}
+
+#[test]
+fn hoisted_method_hook_capture_cannot_shadow_a_check_phase_component() {
+    let src = fixture("method_hook_family_test.harc");
+    let merged = merged_src(&src);
+    let mut prog = lower::lower_program(&merged).expect("method-hook fixture lowers");
+    let (run_id, capture) = prog
+        .functions
+        .iter()
+        .find_map(|func| {
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::MethodHookSubscribe { captures, .. } if !captures.is_empty() => {
+                        Some((func.id, captures[0]))
+                    }
+                    _ => None,
+                })
+        })
+        .expect("fixture has a captured run local");
+    // Mutation pins the backend invariant directly: regardless of what
+    // front-end shadowing rules currently admit, an IR local name must not
+    // collide with the enclosing component instance used by Check.
+    prog.functions[run_id.index()].locals[capture.index()].name = "env".to_string();
+    verify::verify_program(&prog).expect("local spelling does not invalidate IR");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    assert!(
+        cpp.contains("int64_t __harc_hook_capture_fn")
+            && cpp.contains("MethodHookWatcher_note(env.watcher, 3)")
+            && !cpp.contains("uint64_t env = 0"),
+        "capture storage must not shadow the check-phase component instance:\n{cpp}"
+    );
+}
+
 /// A queue method in STATEMENT position that is neither `push` nor
 /// `pop`. Five arms — testbench-owned field, scoreboard queue,
 /// component queue, bare target-state field, instance-qualified
@@ -29819,8 +32135,8 @@ end impl SubTest"#
 /// | `sb.q.clear()` | `_tb.sb.q.clear();` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
 /// | `sb.q.front()` | `_tb.sb.q.front();` | same, no `front` |
 ///
-/// So `size`/`empty` keep the suggestion — v1 runs those programs — and
-/// everything else is a program error no backend runs.
+/// TB-IR now accepts the `size`/`empty` no-ops; everything else remains a
+/// program error no backend runs.
 ///
 /// All FIVE landings were probed independently rather than four
 /// inferred from one — testbench-owned field, scoreboard queue,
@@ -29832,7 +32148,7 @@ end impl SubTest"#
 /// `model.pending.size()` emits `_tb.model.pending.size();`, and g++
 /// compiles all three.
 #[test]
-fn a_queue_method_in_statement_position_splits_on_the_runtime_api() {
+fn a_queue_method_in_statement_position_tracks_the_runtime_api() {
     let sb = |method: &str| {
         format!(
             r#"domain SysDomain
@@ -29928,14 +32244,13 @@ end impl TbQTest"#
         ("bare target-state field", &bare_state),
         ("instance-qualified target-state field", &inst_state),
     ] {
-        // `size`/`empty` — v1 emits a legal no-op and runs the program.
+        // `size`/`empty` — both backends accept the legal no-op.
         for method in ["size", "empty"] {
             let s = src(method);
-            let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-            assert!(
-                msg.contains("in statement position"),
-                "{what}/{method}: {msg}"
-            );
+            let prog = lower_src(&s)
+                .unwrap_or_else(|e| panic!("{what}/{method}: TB-IR lowers the no-op: {e}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("{what}/{method}: TB-IR verifies: {e:?}"));
             let v1 = cpp_tb::emit(&merged_src(&s))
                 .unwrap_or_else(|e| panic!("{what}/{method}: v1 emits: {e}"));
             assert!(
@@ -30223,7 +32538,7 @@ end impl T"#;
 
     let err = lower_src(src).expect_err("TB-IR must also refuse a hook on `function`");
     assert!(
-        assert_invalid(&err).contains("does not name a `hookable`"),
+        assert_invalid(&err).contains("names no `hookable`"),
         "the diagnostic must distinguish a plain function from a hookable: {err}"
     );
 }

@@ -1,0 +1,39 @@
+// A passive mixed transactor still has useful behavior when its always-on
+// half serves a target TLM method. The active-only event half must be elided,
+// while the target responder remains scheduled.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor TlmMemTarget bound to TlmMemBus
+    thread bus.read(addr: uint<8>)
+        return 256 + addr
+    end thread
+
+    when active
+        in_ev : in event<uint<8>>
+        on in_ev(v)
+            log(info, "active event ${v}")
+        end on
+    end when
+end transactor TlmMemTarget
+
+testbench TlmTargetThreadTb
+    dut : TlmReadInitiator
+end testbench TlmTargetThreadTb
+
+impl TlmTargetAlwaysMixedPassiveTest for TlmTargetThreadTb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait until dut.done == 1 timeout 40 cycles
+            fail("target did not respond")
+        assert dut.result == 261
+            else fail("unexpected result ${dut.result}")
+    end run
+end impl TlmTargetAlwaysMixedPassiveTest

@@ -45,6 +45,7 @@
 # This is inherent to the parallel model and affects v1 too — v1-mt is
 # itself run-to-run order-nondeterministic and differs from v1's own
 # cooperative trace. The actor-exercising rows — `tlm_target_thread_test`,
+# `tlm_target_thread_monitor_test` (target actor + shared-host monitor),
 # `axilite_bound_mon_test` (active bound DRIVER + bound monitor),
 # `tlm_target_ooo_lanes_test` (OOO lanes), `tlm_pairing_arch_initiator_test`
 # (multi same-bus actors) — are the load-bearing ones for the MT sweep.
@@ -106,6 +107,8 @@ cov_cross_bins_test | Top | top_counter.sv | top_counter.arch | pass
 cov_runtime_bound_test | Top | top_counter.sv | top_counter.arch | pass
 cov_runtime_bin_value_test | Top | top_counter.sv | top_counter.arch | pass
 cov_expr_targets_test | Top | top_counter.sv | top_counter.arch | pass
+wide_cover_helper_test | WideCoverHelperTop | wide_cover_helper.sv | - | pass
+cov_wide_port_expr_test | WideCoverExprTop | wide_cover_expr.sv | - | pass
 covergroup_hook_trigger_test | Top | top_counter.sv | - | pass
 covergroup_hook_param_test | Top | top_counter.sv | - | pass
 wait_any_of_test | Top | top_counter.sv | top_counter.arch | pass
@@ -155,13 +158,18 @@ regblock_subset_test | Top | top_counter.sv | - | pass
 struct_basic_test | Top | top_counter.sv | - | pass
 struct_nested_test | Top | top_counter.sv | - | pass
 tlm_target_thread_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+tlm_target_thread_monitor_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+tlm_target_always_mixed_passive_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 target_nonscalar_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
+target_wide_queue_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 tlm_target_thread_if_test | TlmReadInitiatorPair | TlmReadInitiatorPair.sv | - | pass
 tlm_target_thread_runtime_loop_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 tlm_target_thread_early_return_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 analysis_sink_connect_test | Top | top_counter.sv | - | pass
 testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectTest
 testbench_owned_state_connect_test | Top | top_counter.sv | - | pass | - | - | OwnedStateConnectFreshTest
+testbench_wide_queue_test | Top | top_counter.sv | - | pass | - | - | WideQueueTest
+scoreboard_component_wide_queue_test | Top | top_counter.sv | - | pass | - | - | ScoreboardComponentWideQueueTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorTest
 passive_analysis_monitor_test | Top | top_counter.sv | - | pass | - | - | PassiveAnalysisMonitorFreshTest
 analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - | - | AnalysisSourceModeTest
@@ -170,6 +178,8 @@ keep_constraints_test | Top | top_counter.sv | top_counter.arch | pass
 wrapping_keep_constraint_test | Top | top_counter.sv | - | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest
 agent_on_handler_test | Top | top_counter.sv | - | pass
+component_event_subscription_test | Top | top_counter.sv | - | pass
+method_hook_family_test | Top | top_counter.sv | top_counter.arch | pass
 component_method_randomize_test | Top | top_counter.sv | - | pass
 regblock_access_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_basic_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
@@ -254,3 +264,4 @@ backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
 soft_constraint_randomize_test | Top | top_counter.sv | - | pass
 target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 uint64_unique_randomize_test | Top | top_counter.sv | - | pass | - | uint64_unique_randomize_ref.cpp
+transactor_heartbeat_predicates_test | Top | top_counter.sv | top_counter.arch | pass

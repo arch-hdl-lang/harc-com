@@ -44,7 +44,7 @@ use crate::ast::{
     TypeArg, TypeExpr,
 };
 use crate::ir::{
-    self, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
+    self, Activation, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
     TargetTlmMethodSchema, TbFunction, Terminator, TransactorId, TransactorMethodSchema,
     TransactorSchema, TypedParam,
 };
@@ -435,8 +435,11 @@ pub(crate) fn lower_transactor(
         bus_bindings: HashMap::new(),
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         // Method bodies see no scoreboards either — scoreboards are
         // test-scope testbench fields, structurally invisible here.
         scoreboard_fields: HashMap::new(),
@@ -539,9 +542,9 @@ pub(crate) fn lower_transactor(
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
-        if !b.is_terminated() {
-            b.terminate(Terminator::Return);
-        }
+        // Leave natural completion unterminated so `finish` records the
+        // synthesized return in `implicit_returns`. Post hooks fire there,
+        // but must bypass an explicit source `return`.
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
@@ -557,8 +560,6 @@ pub(crate) fn lower_transactor(
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
-            pre_hooks: Vec::new(),
-            post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
@@ -590,6 +591,11 @@ fn lower_bound_target_transactor(
     side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
+    let component_hosted = t
+        .items
+        .iter()
+        .chain(t.when_active.iter().flatten())
+        .any(|item| matches!(item, ComponentItem::OnHandler(handler) if !handler.periodic));
     // Resolve the bound bus.
     let bus_name = match t.bound_to.as_ref() {
         Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
@@ -620,11 +626,41 @@ fn lower_bound_target_transactor(
     // target threads; reject the out-of-subset shapes precisely.
     let mut state_fields: Vec<StateFieldSchema> = Vec::new();
     let mut state_names: HashMap<String, StateFieldKind> = HashMap::new();
-    let mut threads_ast: Vec<&TargetTlmThread> = Vec::new();
-    let all_items = t.items.iter().chain(t.when_active.iter().flatten());
-    for ci in all_items {
+    let mut state_activations: HashMap<String, Activation> = HashMap::new();
+    let mut threads_ast: Vec<(&TargetTlmThread, Activation)> = Vec::new();
+    let all_items = t.items.iter().map(|item| (item, Activation::Always)).chain(
+        t.when_active
+            .iter()
+            .flatten()
+            .map(|item| (item, Activation::ActiveOnly)),
+    );
+    for (ci, activation) in all_items {
         match ci {
             ComponentItem::Field(f) => {
+                // A mixed responder/handler declaration has two IR views.
+                // Component IR owns event ports, DUT handles, fixed vectors,
+                // and nested components; responder IR needs only the state
+                // kinds its target-thread expression lowering can address.
+                // The component pass still validates every skipped field.
+                let target_state_field = f.direction.is_none()
+                    && (matches!(
+                        f.ty,
+                        TypeExpr::Builtin {
+                            name: crate::ast::BuiltinTy::Queue,
+                            ..
+                        }
+                    ) || super::tb_scalar_field_ir_type(&f.ty).is_some()
+                        || matches!(
+                            &f.ty,
+                            TypeExpr::Named { name, .. }
+                                if name
+                                    .segments
+                                    .last()
+                                    .is_some_and(|name| record_ctx.record_ids.contains_key(&name.name))
+                        ));
+                if component_hosted && !target_state_field {
+                    continue;
+                }
                 let sf = lower_state_field(
                     tname,
                     f,
@@ -641,9 +677,10 @@ fn lower_bound_target_transactor(
                         sf.name
                     )));
                 }
+                state_activations.insert(sf.name.clone(), activation);
                 state_fields.push(sf);
             }
-            ComponentItem::TargetTlmThread(th) => threads_ast.push(th),
+            ComponentItem::TargetTlmThread(th) => threads_ast.push((th, activation)),
             ComponentItem::Hookable(h) => {
                 return Err(unsupported(
                     &format!(
@@ -654,6 +691,11 @@ fn lower_bound_target_transactor(
                      hookable bodies — is a follow-up slice; only target-side `thread \
                      bus.<m>(...)` responders are lowered",
                 ));
+            }
+            ComponentItem::OnHandler(h) if !h.periodic => {
+                // The component IR view lowers and schedules non-periodic
+                // handlers. This target view keeps only responder metadata so
+                // its actor can share the component-hosted instance.
             }
             ComponentItem::OnHandler(_) => {
                 // Reachable ONLY for a PERIODIC handler. `transactor_is_
@@ -841,8 +883,11 @@ fn lower_bound_target_transactor(
         // applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
@@ -876,7 +921,7 @@ fn lower_bound_target_transactor(
     };
 
     let mut funcs = Vec::new();
-    for th in threads_ast {
+    for (th, activation) in threads_ast {
         // `thread bus.<method>(...)`: the method path is `bus.<method>`.
         let segs: Vec<&str> = th.method.segments.iter().map(|s| s.name.as_str()).collect();
         if segs.len() != 2 || segs[0] != "bus" {
@@ -983,7 +1028,29 @@ fn lower_bound_target_transactor(
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&body_ctx, helper_registry, side_tables);
-        b.target_state_fields = state_names.clone();
+        b.current_body_name = Some(format!(
+            "transactor `{tname}` {} target thread `bus.{mname}`",
+            if matches!(activation, Activation::Always) {
+                "always-present"
+            } else {
+                "active-only"
+            }
+        ));
+        b.target_state_fields = state_names
+            .iter()
+            .filter(|(name, _)| {
+                matches!(activation, Activation::ActiveOnly)
+                    || matches!(state_activations[*name], Activation::Always)
+            })
+            .map(|(name, kind)| (name.clone(), kind.clone()))
+            .collect();
+        if matches!(activation, Activation::Always) {
+            b.inactive_target_state_fields = state_activations
+                .iter()
+                .filter(|(_, activation)| matches!(activation, Activation::ActiveOnly))
+                .map(|(name, _)| name.clone())
+                .collect();
+        }
         let mut params = Vec::with_capacity(th.params.len());
         for p in &th.params {
             let ty = helpers::ir_type_of(p.ty.as_ref());
@@ -1026,6 +1093,7 @@ fn lower_bound_target_transactor(
         schema.target_methods.push(TargetTlmMethodSchema {
             name: mname.to_string(),
             function: fid,
+            activation,
             args: method.args.iter().map(|(n, _)| n.name.clone()).collect(),
             has_ret,
             ooo_tags,
@@ -1397,8 +1465,11 @@ fn lower_bound_initiator_transactor(
         // remaps are applied at bind time by `fill_initiator_bus_prefix`.
         bus_remaps: HashMap::new(),
         transactor_fields: HashMap::new(),
+        target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
         transactors: Vec::new(),
+        heartbeat_transactor_fields: Default::default(),
+        heartbeat_transactor_storage: HashMap::new(),
         scoreboard_fields: HashMap::new(),
         scoreboards: Vec::new(),
         consts: record_ctx.consts.clone(),
@@ -1493,9 +1564,8 @@ fn lower_bound_initiator_transactor(
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
-        if !b.is_terminated() {
-            b.terminate(Terminator::Return);
-        }
+        // Preserve natural-vs-explicit return provenance for post-hook
+        // fan-out (same contract as unbound/component hookable methods).
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
@@ -1516,8 +1586,6 @@ fn lower_bound_initiator_transactor(
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
-            pre_hooks: Vec::new(),
-            post_hooks: Vec::new(),
             cov_hook_subs: Vec::new(),
         });
         funcs.push(f);
@@ -1558,7 +1626,7 @@ impl StateFieldOwner {
 /// the machinery scoreboards and composite components already carry:
 ///   * a scalar `<=64`-bit counter/latch (`read_count : uint<32>
 ///     default 0`) with a plain-integer/bool default (or none -> 0);
-///   * a typed FIFO `queue<scalar <=64 bits>` / `queue<Record>`, whose
+///   * a typed FIFO `queue<scalar>` / `queue<Record>`, whose
 ///     element type resolves through the shared `lower_queue_elem` seam.
 ///
 /// `record_ids` resolves `queue<Record>` element names. It is NOT a
@@ -1723,9 +1791,10 @@ fn lower_state_field(
         ));
     }
     // A `queue<T>` state field → the shared queue-element machinery
-    // (scalar ≤ 64 bits or a value-record), reused verbatim from the
-    // scoreboard/component queue seam so all three lower `queue<Record>`
-    // through the identical `harc_rt::HarcQueue<Rec>` shape.
+    // (an exact scalar type or a value-record), reused verbatim from the
+    // direct-testbench/scoreboard/component queue seam. This call opts
+    // persistent transactor state into that already-shipped scalar policy;
+    // non-queue state and event/field policies remain unchanged.
     if let TypeExpr::Builtin {
         name: crate::ast::BuiltinTy::Queue,
         args,
@@ -1837,7 +1906,7 @@ fn lower_state_field(
         return Err(not_implemented(
             &format!("{who} `{tname}` state field `{fname}` with a non-scalar type"),
             "transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (<=64 bits), \
-             a whole value-record, or a `queue<scalar <=64 bits>` / `queue<Record>`; v1 \
+             a whole value-record, or a `queue<scalar>` / `queue<Record>`; v1 \
              emits a bare `uint64_t` member for a `stream`/`buffer` field, which compiles \
              and means something else (for a `uint<N>` wider than 64 bits v1 is correct, \
              so `--codegen v1` does work for that one)"
