@@ -335,7 +335,7 @@ fn emit_selected_tests(
         covergroup::covgroup_struct(&mut out, cg);
     }
     for h in &helpers {
-        func::emit_helper_function(&mut out, h)?;
+        func::emit_helper_function(&mut out, prog, h)?;
         writeln!(out).ok();
     }
 

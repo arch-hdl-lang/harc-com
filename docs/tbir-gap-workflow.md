@@ -50,6 +50,7 @@ family of rejections over a one-site exception. Current implementation order:
   self-relative component spellings.
 - [x] Persistent data-scoreboard unsigned scalar state through 1024 bits,
   including cross-phase reads/writes and width-checked IR assignments.
+- [x] Default-constructed record locals inside scalar-valued pure helpers.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -58,7 +59,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 152 remaining constructor call sites (153 textual matches including
+Treat the 151 remaining constructor call sites (152 textual matches including
 the `unsupported` helper definition) as an inventory, not 152 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
@@ -102,9 +103,10 @@ and rejects width-losing writes; the existing scoreboard fixture proves a bit
 above 128 survives from `run` into `check` under both emitters and trace-diffs
 clean. Wide signed scoreboard state remains excluded until the wide carrier
 has signed value semantics. This source-shape family shares the
-generic unsupported field-type constructor with non-scalar fields, so the raw
-inventory remains 153 textual matches (152 constructors plus the helper) even
-though the migration blocker is removed.
+generic unsupported field-type constructor with non-scalar fields, so that
+batch left the raw inventory at 153 textual matches. The pure-helper
+record-local batch below removes one constructor, leaving 152 textual matches
+(151 constructors plus the helper).
 
 ## Review-derived semantic gates
 
@@ -167,11 +169,11 @@ not applicable before requesting review:
    The completed event, queue-query, method-hook, transactor-heartbeat, and
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
-   state slices reduce the count from 174 to 153 textual matches (152
-   constructors plus the helper definition). The scoreboard source family did
-   not remove a constructor because unsupported non-scalar fields share it.
-   Nested bus expressions and sized cover widths were also reclassified because
-   v1 rejects or silently mis-lowers them.
+   state, and pure-helper record-local slices reduce the count from 174 to 152
+   textual matches (151 constructors plus the helper definition). The
+   scoreboard source family did not remove a constructor because unsupported
+   non-scalar fields share it. Nested bus expressions and sized cover widths
+   were also reclassified because v1 rejects or silently mis-lowers them.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

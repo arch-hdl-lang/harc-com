@@ -1833,6 +1833,63 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         return Err(errs); // nothing else is meaningful
     }
 
+    // Pure helpers emit as file-scope C++ functions whose params and return
+    // use the scalar helper ABI. Internal record locals are permitted, but a
+    // pass must not drift a parameter's mirrored local type or route a record
+    // through the signature/return slot: codegen deliberately maps only the
+    // ABI boundary through `local_scalar_cty`.
+    if func.kind == FunctionKind::Helper {
+        if func.params.len() > func.locals.len() {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} helper `{}` has {} params but only {} locals",
+                    fid.0,
+                    func.name,
+                    func.params.len(),
+                    func.locals.len()
+                ),
+            });
+        }
+        for (index, param) in func.params.iter().enumerate() {
+            match func.locals.get(index) {
+                Some(local) if local.ty != param.ty => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} helper `{}` param {} metadata {:?} does not match mirrored local {:?}",
+                        fid.0, func.name, index, param.ty, local.ty
+                    ),
+                }),
+                Some(local) if !cover_scalar_type(&local.ty) => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} helper `{}` param {} must use the scalar helper ABI, got {:?}",
+                            fid.0, func.name, index, local.ty
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let Some(ret) = func.ret {
+            match func.locals.get(ret.index()) {
+                Some(local) if !cover_scalar_type(&local.ty) => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} helper `{}` return %{} must use the scalar helper ABI, got {:?}",
+                            fid.0, func.name, ret.0, local.ty
+                        ),
+                    });
+                }
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} helper `{}` return %{} does not resolve",
+                        fid.0, func.name, ret.0
+                    ),
+                }),
+                _ => {}
+            }
+        }
+    }
+
     // Invariant 6 — successors resolve (checked before reachability so
     // the walk below can't index out of bounds).
     for (bi, b) in func.blocks.iter().enumerate() {

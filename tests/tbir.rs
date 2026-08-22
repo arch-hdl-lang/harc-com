@@ -12455,36 +12455,227 @@ end test WhenTest
     );
 }
 
-/// Record locals cannot live in *pure* helpers (they emit as
-/// scalar-only file-scope C++ functions in the tbir backend). Note the
-/// body must stay inside the pure scan subset to reach this gate — a
-/// field access would classify the helper impure and CFG-inline it,
-/// where record locals are legal.
+/// A pure helper may hold a record local while keeping its scalar ABI. v1
+/// emits the same default-constructed C++ record and compiles; record-typed
+/// helper returns are a different shape that v1 mis-types as a module pointer,
+/// so the negative control below must not suggest v1.
 #[test]
-fn record_let_in_pure_helper_is_unsupported() {
+fn record_local_in_pure_helper_lowers_and_emits() {
     let src = r#"
 transaction Req
     addr : uint<32> default 9
 end transaction Req
 
-function mk() -> uint<32>
-    let t : Req
-    return 1
+function mk(seed: uint<32>) -> uint<32>
+    let Req : Req
+    return seed
 end function mk
 
 test PureHelperTest
     let dut : Top
     run
-        let x = mk()
+        let x = mk(1)
+        assert x == 1 else fail("pure helper record local")
     end run
 end test PureHelperTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("a record local in a pure helper lowers");
+    verify::verify_program(&prog).expect("pure-helper record local verifies");
+    let helpers: Vec<_> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    assert_eq!(helpers.len(), 1, "the helper stays out of line");
     assert!(
-        msg.contains("pure helper"),
-        "names the helper context: {msg}"
+        helpers[0].blocks.iter().any(|block| block
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt, ir::Stmt::RecordInit(_, ir::RecordId(0))))),
+        "mk default-constructs its record local:\n{}",
+        helpers[0]
     );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    let init = helper
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::RecordInit(_, record) => Some(record),
+            _ => None,
+        })
+        .expect("helper has RecordInit");
+    *init = ir::RecordId(99);
+    let errs = verify::verify_program(&broken).expect_err("bad helper record id is rejected");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadRecord { .. })),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.locals[0].ty = ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("helper param/local drift is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("param 0 metadata")
+        )),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.params[0].ty = ir::IrType::Record(ir::RecordId(0));
+    helper.locals[0].ty = ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("record helper param ABI is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("param 0 must use the scalar helper ABI")
+        )),
+        "{errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|f| f.kind == ir::FunctionKind::Helper)
+        .expect("helper exists");
+    helper.locals[helper.ret.expect("return slot").index()].ty =
+        ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&broken).expect_err("record helper return ABI is rejected");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("return") && what.contains("scalar helper ABI")
+        )),
+        "{errs:?}"
+    );
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("static uint64_t harc_helper_mk(uint64_t seed);")
+            && cpp.contains("::Req Req{};")
+            && cpp.contains("Req = decltype(Req){};")
+            && cpp.contains("return __ret;"),
+        "the helper declares and initializes its record local:\n{cpp}"
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the positive control");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("Req Req;"),
+        "v1 emits the same record-local helper shape:\n{v1}"
+    );
+
+    let record_return = src
+        .replace(
+            "function mk(seed: uint<32>) -> uint<32>",
+            "function mk(seed: uint<32>) -> Req",
+        )
+        .replace("return seed", "return Req")
+        .replace("let x = mk(1)", "let x : Req = mk(1)")
+        .replace("assert x == 1", "assert x.addr == 9");
+    let msg = assert_not_implemented(
+        &lower_src(&record_return).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("record return from pure helper `mk`"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&record_return)).expect("v1 emits the broken control");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> VReq*") && v1.contains("return Req;"),
+        "v1 returns a record through a module-pointer ABI:\n{v1}"
+    );
+
+    let record_into_scalar_return = src.replace("return seed", "return Req");
+    let msg = assert_not_implemented(
+        &lower_src(&record_into_scalar_return).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("record value returned from a scalar-valued pure helper"),
+        "{msg}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(&record_into_scalar_return))
+        .expect("v1 emits the broken scalar return");
+    assert!(
+        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("return Req;"),
+        "v1 returns a record through a scalar ABI:\n{v1}"
+    );
+
+    let untyped_record_arg = r#"
+transaction Req
+    addr : uint<32>
+end transaction Req
+
+function accept_untyped(x) -> uint<8>
+    return 1
+end function accept_untyped
+
+function outer() -> uint<8>
+    let value : Req
+    return accept_untyped(value)
+end function outer
+
+test PureHelperUntypedRecordArgTest
+    let dut : Top
+    run
+        let x = outer()
+    end run
+end test PureHelperUntypedRecordArgTest
+"#;
+    let declared_unknown_record_arg = untyped_record_arg
+        .replace("accept_untyped(x)", "accept_string(x: String)")
+        .replace("accept_untyped(value)", "accept_string(value)")
+        .replace("end function accept_untyped", "end function accept_string");
+    for (label, source, helper, v1_signature) in [
+        (
+            "untyped",
+            untyped_record_arg.to_string(),
+            "accept_untyped",
+            "auto accept_untyped = [&](int64_t x)",
+        ),
+        (
+            "declared String",
+            declared_unknown_record_arg,
+            "accept_string",
+            "auto accept_string = [&](const char* x)",
+        ),
+    ] {
+        let msg = assert_not_implemented(
+            &lower_src(&source).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(
+            msg.contains("record argument passed to scalar-ABI parameter `x`")
+                && msg.contains(&format!("pure helper `{helper}`")),
+            "{label}: {msg}"
+        );
+        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits the broken call");
+        assert!(
+            v1.contains(v1_signature) && v1.contains(&format!("{helper}(value)")),
+            "{label}: v1 passes a record to the non-record parameter:\n{v1}"
+        );
+    }
 }
 
 #[test]
