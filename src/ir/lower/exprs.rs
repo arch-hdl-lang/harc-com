@@ -11,6 +11,76 @@ use crate::ir::{
     BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind,
 };
 
+fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs),
+        (lhs, rhs) => return lhs.or(rhs),
+    };
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    if matches!(lhs, IrType::Unknown) {
+        return Some(rhs);
+    }
+    if matches!(rhs, IrType::Unknown) {
+        return Some(lhs);
+    }
+    let scalar = |ty: &IrType| match ty {
+        IrType::UInt(width) => Some((*width, false)),
+        IrType::SInt(width) => Some((*width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        _ => None,
+    };
+    let (Some((lw, ls)), Some((rw, rs))) = (scalar(&lhs), scalar(&rhs)) else {
+        return Some(lhs);
+    };
+    // Widthless integers use a 64-bit host ABI. Identical widthless types
+    // returned above retain their source-level `None`; once composed with a
+    // different scalar, their concrete contribution is 64 bits.
+    let width = Some(lw.unwrap_or(64).max(rw.unwrap_or(64)));
+    Some(if ls && rs {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
+fn narrowest_scalar_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let scalar = |ty: IrType| match ty {
+        IrType::UInt(width) => Some((width, false)),
+        IrType::SInt(width) => Some((width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        IrType::Unknown => None,
+        _ => None,
+    };
+    let (lhs, rhs) = (lhs.and_then(&scalar), rhs.and_then(scalar));
+    let (width, signed) = match (lhs, rhs) {
+        (Some((lw, ls)), Some((rw, rs))) => {
+            let (lhs_width, rhs_width) = (lw.unwrap_or(64), rw.unwrap_or(64));
+            let selected = if lhs_width < rhs_width && !ls {
+                lhs_width
+            } else if rhs_width < lhs_width && !rs {
+                rhs_width
+            } else {
+                lhs_width.max(rhs_width)
+            };
+            let width = if lw.is_none() && rw.is_none() {
+                None
+            } else {
+                Some(selected)
+            };
+            (width, ls && rs)
+        }
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => return None,
+    };
+    Some(if signed {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
 /// Resolution of a (possibly nested) record field-access chain
 /// `ident.f1.f2...fn` rooted at a record-typed local. `field` is the
 /// first-level field (`f1`) on the local's record; `path` is the further
@@ -2118,10 +2188,12 @@ impl FuncBuilder<'_> {
                 | BinOp::Ge
                 | BinOp::And
                 | BinOp::Or => Some(IrType::Bool),
-                _ => self.expr_type(a).or_else(|| self.expr_type(b)),
+                BinOp::Shl | BinOp::Shr => self.expr_type(a),
+                _ => common_expr_type(self.expr_type(a), self.expr_type(b)),
             },
+            Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
             Expr::Unary(_, inner) => self.expr_type(inner),
-            Expr::Ternary(_, t, e) => self.expr_type(t).or_else(|| self.expr_type(e)),
+            Expr::Ternary(_, t, e) => common_expr_type(self.expr_type(t), self.expr_type(e)),
             Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
             // Runtime bounds: the width is not known here. The helper
             // returns `uint64_t`, so the value is unsigned of unknown
@@ -2137,6 +2209,19 @@ impl FuncBuilder<'_> {
                 | crate::ir::CallTarget::ExternFn { ret, .. },
                 _,
             ) => Some(ret.clone()),
+            Expr::ScoreboardQuery { sb, query, .. } => match query {
+                crate::ir::ScoreboardQuery::Scalar { scalar } => self
+                    .ctx
+                    .scoreboards
+                    .get(sb.index())?
+                    .field(scalar)
+                    .and_then(|field| match &field.kind {
+                        crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                        _ => None,
+                    }),
+                crate::ir::ScoreboardQuery::QueueSize { .. } => Some(IrType::UInt(None)),
+                crate::ir::ScoreboardQuery::QueueEmpty { .. } => Some(IrType::Bool),
+            },
             // A record-field chain types as its leaf: the leaf field's own
             // scalar/record type, or the element type when the leaf `Vec`
             // is indexed. A whole (unindexed) `Vec` leaf is an array — it
@@ -2198,6 +2283,39 @@ impl FuncBuilder<'_> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Conservative scalar result type for assignment compatibility. Unlike
+    /// ordinary expression typing, an `&` literal mask provides a real upper
+    /// bound, and shifts retain that bounded LHS width. This admits
+    /// `(wide & 0xFF) >> 4` into uint<8> without exempting unrelated binary
+    /// expressions such as `wide + 1` from narrowing checks.
+    pub(crate) fn scalar_assignment_type(&self, e: &Expr) -> Option<IrType> {
+        match e {
+            Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
+                let bounded = |e: &Expr| {
+                    if let Expr::Literal { value, ty } = e {
+                        if matches!(ty, IrType::Unknown) {
+                            return Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1))));
+                        }
+                    }
+                    self.scalar_assignment_type(e)
+                };
+                narrowest_scalar_type(bounded(lhs), bounded(rhs))
+            }
+            Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => self.scalar_assignment_type(lhs),
+            Expr::Binary(_, lhs, rhs) => common_expr_type(
+                self.scalar_assignment_type(lhs),
+                self.scalar_assignment_type(rhs),
+            ),
+            Expr::Ternary(_, then_expr, else_expr) => common_expr_type(
+                self.scalar_assignment_type(then_expr),
+                self.scalar_assignment_type(else_expr),
+            ),
+            Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+            Expr::Unary(_, inner) => self.scalar_assignment_type(inner),
+            _ => self.expr_type(e),
         }
     }
 
@@ -3769,7 +3887,7 @@ fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {
     }
 }
 
-fn wide_literal_bits(words: &[u32]) -> u32 {
+pub(crate) fn wide_literal_bits(words: &[u32]) -> u32 {
     let Some((idx, word)) = words.iter().enumerate().rev().find(|(_, w)| **w != 0) else {
         return 1;
     };

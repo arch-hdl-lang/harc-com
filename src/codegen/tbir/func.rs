@@ -21,9 +21,10 @@
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
 use super::expr::{
-    comp_base_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp, fmt_arg_cpp, helper_cpp_name,
-    lane_index_cpp, lane_width, port_read, port_signal, probe_read_accessor, wide_words_over_128,
-    ECx,
+    bounded_count_expr_cpp, comp_base_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp,
+    expr_static_width, fmt_arg_cpp, helper_cpp_name, lane_index_cpp, lane_width, port_read,
+    port_signal, probe_read_accessor, scalar_assignment_expr_cpp, truthy_expr_cpp,
+    wide_words_over_128, ECx,
 };
 use crate::ast::ExprKind;
 use crate::codegen::cpp_tb::EmitError;
@@ -253,6 +254,7 @@ pub(super) fn emit_function(
         dut_type,
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
@@ -275,7 +277,7 @@ pub(super) fn emit_function(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -284,9 +286,9 @@ pub(super) fn emit_function(
                 .ok();
             }
             Terminator::WaitCycles(n, clock, b) => {
-                let n = expr_cpp(&cx, n)?;
                 match clock {
                     None => {
+                        let n = bounded_count_expr_cpp(&cx, n, u32::MAX as u64)?;
                         writeln!(
                             out,
                             "{pad3}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));"
@@ -294,6 +296,7 @@ pub(super) fn emit_function(
                         .ok();
                     }
                     Some(c) => {
+                        let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                         // `wait N cycles on <clock>` — mirror v1's
                         // inline eval_clocks_until loop (cpp_tb.rs,
                         // StmtKind::Wait with a clock): advance
@@ -335,7 +338,7 @@ pub(super) fn emit_function(
                 // v1's non-coroutine wait path (helper / testbench-
                 // method lambda bodies): synchronous tick loop, no
                 // scheduler yield.
-                let n = expr_cpp(&cx, n)?;
+                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(out, "{pad3}for (int _w = 0; _w < {n}; _w++) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
@@ -379,7 +382,7 @@ pub(super) fn emit_function(
                 // rides the timeout edge here so the `on_timeout`
                 // block carries only the diagnostic text (FailDiag).
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                let n = expr_cpp(&cx, cycles)?;
+                let n = bounded_count_expr_cpp(&cx, cycles, u32::MAX as u64)?;
                 writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
                 writeln!(
                     out,
@@ -456,6 +459,7 @@ pub(super) fn emit_tseq(
         dut_type: "",
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -516,7 +520,7 @@ pub(super) fn emit_tseq(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -526,7 +530,7 @@ pub(super) fn emit_tseq(
             }
             Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
                 // v1's synchronous lambda wait: one tick() per cycle.
-                let n = expr_cpp(&cx, n)?;
+                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
                     "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
@@ -668,6 +672,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
         dut_type: "",
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
     let nparams = func.params.len();
 
@@ -715,7 +720,7 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -770,16 +775,50 @@ fn emit_temporal_latches(
     cx: &ECx<'_>,
     temporals: &[crate::ir::TemporalSlot],
     depth: usize,
-) -> Result<(), EmitError> {
+) -> Result<Vec<Option<u32>>, EmitError> {
     let pad = INDENT.repeat(depth);
-    for (i, _) in temporals.iter().enumerate() {
-        writeln!(out, "{pad}static int64_t _harc_ps{i} = 0;").ok();
+    let widths: Vec<_> = temporals
+        .iter()
+        .map(|slot| expr_static_width(cx, &slot.inner))
+        .collect();
+    for (i, width) in widths.iter().enumerate() {
+        match width {
+            Some(width) if *width > 128 => {
+                let words = width.div_ceil(32);
+                writeln!(
+                    out,
+                    "{pad}static harc_rt::HarcWide<{words}> _harc_ps{i}{{}};"
+                )
+                .ok();
+            }
+            Some(width) if *width > 64 => {
+                writeln!(out, "{pad}static _harc_u128 _harc_ps{i} = 0;").ok();
+            }
+            _ => {
+                writeln!(out, "{pad}static int64_t _harc_ps{i} = 0;").ok();
+            }
+        }
     }
     for (i, slot) in temporals.iter().enumerate() {
         let inner = expr_cpp(cx, &slot.inner)?;
-        writeln!(out, "{pad}int64_t _harc_cur{i} = (int64_t)({inner});").ok();
+        match widths[i] {
+            Some(width) if width > 128 => {
+                let words = width.div_ceil(32);
+                writeln!(
+                    out,
+                    "{pad}harc_rt::HarcWide<{words}> _harc_cur{i} = {inner};"
+                )
+                .ok();
+            }
+            Some(width) if width > 64 => {
+                writeln!(out, "{pad}_harc_u128 _harc_cur{i} = (_harc_u128)({inner});").ok();
+            }
+            _ => {
+                writeln!(out, "{pad}int64_t _harc_cur{i} = (int64_t)({inner});").ok();
+            }
+        }
     }
-    Ok(())
+    Ok(widths)
 }
 
 /// Copy each latch's current value into its `static` cell, so the next
@@ -809,7 +848,12 @@ fn emit_property_check(
     let label = escape_c(&schema.label);
 
     writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
-    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let temporal_widths = emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let temporal_cx = ECx {
+        temporal_widths: &temporal_widths,
+        ..*cx
+    };
+    let cx = &temporal_cx;
 
     // The failure arm is identical across shapes apart from the operator
     // suffix in the generic message, so build it once. An `else fail(...)`
@@ -836,8 +880,8 @@ fn emit_property_check(
         // `a |=> b` — the antecedent is remembered for one cycle, so the
         // check fires on the cycle AFTER `a` held.
         PropertyShape::ImpliesNext { ante, cons } => {
-            let a = expr_cpp(cx, ante)?;
-            let b = expr_cpp(cx, cons)?;
+            let a = truthy_expr_cpp(cx, ante)?;
+            let b = truthy_expr_cpp(cx, cons)?;
             writeln!(out, "{pad1}static bool _harc_prev = false;").ok();
             writeln!(out, "{pad1}bool _harc_a = (bool)({a});").ok();
             writeln!(out, "{pad1}bool _harc_b = (bool)({b});").ok();
@@ -847,14 +891,14 @@ fn emit_property_check(
             writeln!(out, "{pad1}_harc_prev = _harc_a;").ok();
         }
         PropertyShape::Implies { ante, cons } => {
-            let a = expr_cpp(cx, ante)?;
-            let b = expr_cpp(cx, cons)?;
+            let a = truthy_expr_cpp(cx, ante)?;
+            let b = truthy_expr_cpp(cx, cons)?;
             writeln!(out, "{pad1}if ((bool)({a}) && !(bool)({b})) {{").ok();
             fail_arm(out, " (|->)")?;
             writeln!(out, "{pad1}}}").ok();
         }
         PropertyShape::Invariant(e) => {
-            let c = expr_cpp(cx, e)?;
+            let c = truthy_expr_cpp(cx, e)?;
             writeln!(out, "{pad1}if (!({c})) {{").ok();
             fail_arm(out, "")?;
             writeln!(out, "{pad1}}}").ok();
@@ -880,8 +924,12 @@ fn emit_cover_check(
     let pad1 = INDENT.repeat(depth + 1);
     let counter = cover_counter_name(&schema.tag);
     writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
-    emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
-    let cond = expr_cpp(cx, &schema.cond)?;
+    let temporal_widths = emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let temporal_cx = ECx {
+        temporal_widths: &temporal_widths,
+        ..*cx
+    };
+    let cond = truthy_expr_cpp(&temporal_cx, &schema.cond)?;
     writeln!(out, "{pad1}if ((bool)({cond})) {counter}++;").ok();
     emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
     writeln!(out, "{pad}}});").ok();
@@ -937,7 +985,7 @@ fn emit_cycle_handler(
             writeln!(out, "{pad1}}}").ok();
         }
         CycleHandlerKind::Trigger { trigger, edge } => {
-            let t = expr_cpp(cx, trigger)?;
+            let t = truthy_expr_cpp(cx, trigger)?;
             match edge {
                 crate::ir::CycleEdge::Level => {
                     writeln!(out, "{pad1}if ((bool)({t})) {{").ok();
@@ -1343,7 +1391,7 @@ fn emit_stmt(
             }
         }
         Stmt::AssertCheck { cond, on_fail } => {
-            let cond = expr_cpp(cx, cond)?;
+            let cond = truthy_expr_cpp(cx, cond)?;
             writeln!(out, "{pad}if (!({cond})) {{").ok();
             emit_log_call(out, cx, "FAIL", None, on_fail, depth + 1)?;
             writeln!(out, "{pad}{INDENT}ctx.errors++;").ok();
@@ -1352,7 +1400,7 @@ fn emit_stmt(
         // Same guard shape as `AssertCheck`, minus the error bump — an
         // assumption bounds the inputs, it does not fail the test.
         Stmt::AssumeCheck { cond, on_fail } => {
-            let cond = expr_cpp(cx, cond)?;
+            let cond = truthy_expr_cpp(cx, cond)?;
             writeln!(out, "{pad}if (!({cond})) {{").ok();
             emit_log_call(out, cx, "ASSUME", None, on_fail, depth + 1)?;
             writeln!(out, "{pad}}}").ok();
@@ -1518,7 +1566,7 @@ fn emit_stmt(
             // No errors++ — the WaitUntilTimeout terminator already
             // bumped it once on the timeout edge.
             Some(g) => {
-                let g = expr_cpp(cx, g)?;
+                let g = truthy_expr_cpp(cx, g)?;
                 writeln!(out, "{pad}if (!({g})) {{").ok();
                 emit_log_call(out, cx, "FAIL", None, args, depth + 1)?;
                 writeln!(out, "{pad}}}").ok();
@@ -1526,10 +1574,10 @@ fn emit_stmt(
             None => emit_log_call(out, cx, "FAIL", None, args, depth)?,
         },
         Stmt::ScoreboardOp {
+            sb,
             field,
             op,
             nested_path,
-            ..
         } => {
             use crate::ir::ScoreboardOp;
             // `None` → testbench field (`_tb.<field>`); `Some(path)` →
@@ -1550,7 +1598,20 @@ fn emit_stmt(
             };
             match op {
                 ScoreboardOp::QueuePush { queue, value } => {
-                    let e = expr_cpp(cx, value)?;
+                    let elem_ty = prog
+                        .scoreboards
+                        .get(sb.index())
+                        .and_then(|schema| schema.fields.iter().find(|f| f.name == *queue))
+                        .and_then(|field| match &field.kind {
+                            crate::ir::ScoreboardFieldKind::Queue {
+                                elem: crate::ir::QueueElem::Scalar { ty },
+                            } => Some(ty),
+                            _ => None,
+                        });
+                    let e = match elem_ty {
+                        Some(ty) => scalar_assignment_expr_cpp(cx, value, ty)?,
+                        None => expr_cpp(cx, value)?,
+                    };
                     writeln!(out, "{pad}{base}.{queue}.push({e});").ok();
                 }
                 ScoreboardOp::QueuePop { queue, dest } => {
@@ -1558,7 +1619,21 @@ fn emit_stmt(
                     writeln!(out, "{pad}{name} = {base}.{queue}.pop();").ok();
                 }
                 ScoreboardOp::ScalarWrite { scalar, value } => {
-                    let e = expr_cpp(cx, value)?;
+                    let ty = prog
+                        .scoreboards
+                        .get(sb.index())
+                        .and_then(|schema| schema.fields.iter().find(|f| f.name == *scalar))
+                        .and_then(|field| match &field.kind {
+                            crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: scoreboard {} scalar `{scalar}` has no scalar schema",
+                                sb.0
+                            ))
+                        })?;
+                    let e = scalar_assignment_expr_cpp(cx, value, ty)?;
                     writeln!(out, "{pad}{base}.{scalar} = {e};").ok();
                 }
             }
@@ -2410,6 +2485,7 @@ pub(super) fn emit_method(
         dut_type: &schema.dut_type,
         trace_component: "",
         state_receiver: has_state.then_some("self_state"),
+        temporal_widths: &[],
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -2491,7 +2567,7 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -2501,7 +2577,7 @@ pub(super) fn emit_method(
             }
             Terminator::WaitCycles(n, None, b) => {
                 // v1's synchronous wait: one tick() per cycle.
-                let n = expr_cpp(&cx, n)?;
+                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
                     "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
@@ -2583,7 +2659,7 @@ pub(super) fn emit_method(
                 // the coroutine path, so the `on_timeout` block carries
                 // only the diagnostic text.
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                let n = expr_cpp(&cx, cycles)?;
+                let n = bounded_count_expr_cpp(&cx, cycles, i64::MAX as u64)?;
                 writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
                 writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
                 writeln!(
@@ -2795,12 +2871,9 @@ pub(super) fn watchdog_lambda_name(
     format!("{}_watchdog{}", comp.name, w.function.0)
 }
 
-/// Render a watchdog/periodic clause expr (`period` / `max_idle`) for
-/// emission inside a per-instance `_checkers` closure. The clause was
-/// lowered in `function`'s self-component context, so a field read is a
-/// `ComponentField { SelfField }`; `instance` substitutes for `self`
-/// since the closure has no `self` in scope.
-pub(super) fn clause_expr_cpp(
+/// Render a component lifecycle predicate in per-instance scope. Wide
+/// scalar predicates need an explicit zero test.
+pub(super) fn clause_predicate_cpp(
     prog: &TbProgram,
     function: crate::ir::FunctionId,
     instance: &str,
@@ -2809,7 +2882,6 @@ pub(super) fn clause_expr_cpp(
     let func = prog.function(function);
     let names = cpp_local_names(func);
     let empty_lanes = HashMap::new();
-    // Component clause exprs read component fields, not DUT probes.
     let cx = ECx {
         prog: Some(prog),
         func,
@@ -2819,13 +2891,38 @@ pub(super) fn clause_expr_cpp(
         dut_type: "",
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
-    expr_cpp(&cx, e)
+    truthy_expr_cpp(&cx, e)
+}
+
+/// Numeric counterpart for component periodic/watchdog timing clauses.
+pub(super) fn clause_count_cpp(
+    prog: &TbProgram,
+    function: crate::ir::FunctionId,
+    instance: &str,
+    e: &Expr,
+) -> Result<String, EmitError> {
+    let func = prog.function(function);
+    let names = cpp_local_names(func);
+    let empty_lanes = HashMap::new();
+    let cx = ECx {
+        prog: Some(prog),
+        func,
+        names: &names,
+        lanes: &empty_lanes,
+        self_subst: Some(instance),
+        dut_type: "",
+        trace_component: "",
+        state_receiver: None,
+        temporal_widths: &[],
+    };
+    bounded_count_expr_cpp(&cx, e, i64::MAX as u64)
 }
 
 /// Render a testbench-scoped cycle-trigger predicate (issue #494 P2b) as
-/// standalone C++ text. Unlike `clause_expr_cpp` (component-self scope),
-/// this uses the TEST-scope ECx: `self_subst: None` and a real `dut_type`
+/// standalone C++ text. This uses the TEST-scope ECx (`self_subst: None`)
+/// and a real `dut_type`
 /// so `dut.<sig>` reads route to the shared `dut` handle and `_tb.<field>`
 /// reads resolve to the captured host struct — matching `emit_test_hook`.
 pub(super) fn tb_service_expr_cpp(
@@ -2846,8 +2943,9 @@ pub(super) fn tb_service_expr_cpp(
         dut_type,
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
-    expr_cpp(&cx, e)
+    truthy_expr_cpp(&cx, e)
 }
 
 /// Shared lambda emission for component methods and on-handlers: a free
@@ -2882,6 +2980,7 @@ fn emit_component_fn_lambda(
         dut_type: "",
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -2961,7 +3060,7 @@ fn emit_component_fn_lambda(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -2970,7 +3069,7 @@ fn emit_component_fn_lambda(
                 .ok();
             }
             Terminator::WaitCycles(n, None, b) => {
-                let n = expr_cpp(&cx, n)?;
+                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
                     "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
@@ -3072,7 +3171,7 @@ fn emit_component_fn_lambda(
                 on_timeout,
             } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                let n = expr_cpp(&cx, cycles)?;
+                let n = bounded_count_expr_cpp(&cx, cycles, i64::MAX as u64)?;
                 writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
                 writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
                 writeln!(
@@ -3168,6 +3267,7 @@ pub(super) fn emit_target_actor(
             dut_type: "",
             trace_component: instance,
             state_receiver: None,
+            temporal_widths: &[],
         };
         let wire = |sig: &str| match binding {
             Some(b) => format!("dut->{}", b.wire_name(method, sig)),
@@ -3372,7 +3472,7 @@ fn emit_responder_loop_switch(
                 writeln!(out, "{pad_body}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(cx, c)?;
+                let cond = truthy_expr_cpp(cx, c)?;
                 writeln!(
                     out,
                     "{pad_body}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -3381,7 +3481,7 @@ fn emit_responder_loop_switch(
                 .ok();
             }
             Terminator::WaitCycles(n, None, b) => {
-                let n = expr_cpp(cx, n)?;
+                let n = bounded_count_expr_cpp(cx, n, u32::MAX as u64)?;
                 writeln!(
                     out,
                     "{pad_body}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));"
@@ -3471,6 +3571,7 @@ pub(super) fn emit_active_bound_driver_actor(
             dut_type: "",
             trace_component: inst_path,
             state_receiver: None,
+            temporal_widths: &[],
         };
         let payload_ty =
             crate::codegen::tbir::runtime::event_payload_cty(&oh.arg_payload, &prog.records);
@@ -3863,7 +3964,7 @@ fn preds_cpp(cx: &ECx<'_>, preds: &[PredSrc], mode: WaitMode) -> Result<String, 
         )));
     }
     if preds.len() == 1 {
-        return expr_cpp(cx, &preds[0].expr);
+        return truthy_expr_cpp(cx, &preds[0].expr);
     }
     let joiner = match mode {
         WaitMode::Single | WaitMode::AllOf => " && ",
@@ -3871,7 +3972,7 @@ fn preds_cpp(cx: &ECx<'_>, preds: &[PredSrc], mode: WaitMode) -> Result<String, 
     };
     let parts = preds
         .iter()
-        .map(|p| expr_cpp(cx, &p.expr))
+        .map(|p| truthy_expr_cpp(cx, &p.expr))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(parts
         .iter()
@@ -3944,6 +4045,7 @@ pub(super) fn emit_test_hook(
         dut_type,
         trace_component: "",
         state_receiver: None,
+        temporal_widths: &[],
     };
     let nparams = func.params.len();
     let capture_count = prog
@@ -4005,7 +4107,7 @@ pub(super) fn emit_test_hook(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Branch(c, t, f) => {
-                let cond = expr_cpp(&cx, c)?;
+                let cond = truthy_expr_cpp(&cx, c)?;
                 writeln!(
                     out,
                     "{pad3}if ({cond}) {{ __bb = {}; }} else {{ __bb = {}; }}",
@@ -4014,7 +4116,7 @@ pub(super) fn emit_test_hook(
                 .ok();
             }
             Terminator::WaitCycles(n, None, b) => {
-                let n = expr_cpp(&cx, n)?;
+                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
                     "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"

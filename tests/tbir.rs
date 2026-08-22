@@ -453,8 +453,8 @@ test T
 end test T"#;
     let cpp = emit_cpp_src(masked);
     assert!(
-        cpp.contains(">> 4"),
-        "masked wide operand must emit a plain 64-bit shift; got:\n{cpp}"
+        cpp.contains("harc_rt::harc_shr_u128"),
+        "masked uint<128> operands must use the defined-width shift helper; got:\n{cpp}"
     );
 
     for (expr, helper) in [
@@ -466,7 +466,7 @@ end test T"#;
     let dut : Top
     run
         let wide : uint<128> = 1
-        let x : uint<64> = {expr}
+        let x : uint<128> = {expr}
         assert x == 2 else fail("x")
     end run
 end test T"#
@@ -2112,6 +2112,335 @@ fn scoreboard_basic_emitted_cpp_snapshot() {
     insta::assert_snapshot!(
         "scoreboard_basic_emitted_cpp",
         emit_fixture_cpp("scoreboard_basic_test.harc")
+    );
+}
+
+/// Persistent scoreboard scalars have a closed storage subset, and writes
+/// obey the same no-narrowing rule as local assignments and queue pushes.
+#[test]
+fn scoreboard_scalar_schema_and_write_width_are_verified() {
+    let prog = lower_src(&fixture("scoreboard_basic_test.harc")).expect("fixture lowers");
+    verify::verify_program(&prog).expect("fixture verifies");
+    for name in ["seeded", "sized"] {
+        let seeded = prog.scoreboards[0]
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .expect("fixture has seeded scalar");
+        assert!(matches!(
+            &seeded.kind,
+            ir::ScoreboardFieldKind::Scalar {
+                ty: ir::IrType::UInt(Some(128)),
+                default: ir::ScoreboardScalarDefault::Wide(words),
+            } if words == &[0, 0, 1]
+        ));
+    }
+
+    for bad_ty in [
+        ir::IrType::UInt(Some(0)),
+        ir::IrType::UInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
+        ir::IrType::SInt(Some(65)),
+        ir::IrType::Record(ir::RecordId(0)),
+    ] {
+        let mut broken = prog.clone();
+        let field = broken.scoreboards[0]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "wide")
+            .expect("fixture has wide scalar");
+        let ir::ScoreboardFieldKind::Scalar { ty, .. } = &mut field.kind else {
+            panic!("wide field is scalar");
+        };
+        *ty = bad_ty.clone();
+        let rendered = verify::verify_program(&broken)
+            .expect_err("invalid scoreboard scalar schema is rejected")
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("scoreboard sb0 field `wide` has invalid scalar type")
+                && rendered.contains(&format!("{bad_ty:?}")),
+            "schema error identifies the field and type: {rendered}"
+        );
+    }
+
+    let mut broken_default = prog.clone();
+    let seeded = broken_default.scoreboards[0]
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "seeded")
+        .expect("fixture has seeded scalar");
+    let ir::ScoreboardFieldKind::Scalar { default, .. } = &mut seeded.kind else {
+        panic!("seeded field is scalar");
+    };
+    *default = ir::ScoreboardScalarDefault::Wide(vec![0, 0, 0, 0, 1]);
+    let rendered = verify::verify_program(&broken_default)
+        .expect_err("a 129-bit default cannot enter a 128-bit field")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `seeded` has invalid scalar default"),
+        "default corruption is rejected before codegen: {rendered}"
+    );
+
+    let mut broken_signed_default = prog.clone();
+    let seeded = broken_signed_default.scoreboards[0]
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "seeded")
+        .expect("fixture has seeded scalar");
+    seeded.kind = ir::ScoreboardFieldKind::Scalar {
+        ty: ir::IrType::SInt(Some(8)),
+        default: ir::ScoreboardScalarDefault::Narrow(128),
+    };
+    let rendered = verify::verify_program(&broken_signed_default)
+        .expect_err("positive 128 is outside sint<8>")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("scoreboard sb0 field `seeded` has invalid scalar default"),
+        "signed default corruption is rejected before codegen: {rendered}"
+    );
+
+    let mut broken = prog;
+    let run = broken.tests[0].run.index();
+    let write = broken.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                ..
+            } if scalar == "writes" => Some(value),
+            _ => None,
+        })
+        .expect("fixture writes the 32-bit counter");
+    *write = ir::Expr::WideLiteral(vec![0, 0, 1]);
+    let rendered = verify::verify_program(&broken)
+        .expect_err("a 65-bit value cannot enter a 32-bit scalar")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains(
+            "writes UInt(Some(65)) into scoreboard scalar `writes` declared UInt(Some(32))"
+        ),
+        "write error records assignment direction: {rendered}"
+    );
+
+    let read_types = r#"
+scoreboard Sb
+    wide : uint<256>
+    narrow : uint<8>
+    narrowq : queue<uint<8>>
+    signed : sint<8>
+    signedq : queue<sint<8>>
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    sb  : Sb
+end testbench Tb
+
+impl NarrowingTest for Tb
+    run
+        let wide_copy = sb.wide
+        assert wide_copy[207:193] == 128
+    end run
+end impl NarrowingTest
+"#;
+    let inferred = lower_src(read_types).expect("untyped scoreboard read lowers");
+    verify::verify_program(&inferred).expect("untyped scoreboard read verifies");
+    assert!(
+        inferred
+            .function(inferred.tests[0].run)
+            .locals
+            .iter()
+            .any(|local| local.name == "wide_copy" && local.ty == ir::IrType::UInt(Some(256))),
+        "an untyped scoreboard read inherits the scalar field's width"
+    );
+    let emitted = tbir::emit(
+        &inferred,
+        &merged_src(read_types),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("untyped scoreboard read emits");
+    assert!(
+        emitted.contains("harc_rt::HarcWide<8> wide_copy = 0;")
+            && emitted.contains("wide_copy = _tb.sb.wide;"),
+        "the inferred local retains all 256 bits in C++: {emitted}"
+    );
+
+    let masked_write = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = (sb.wide & 0xFF) >> 4\n        sb.narrowq.push((sb.wide & 0xFF) >> 4)\n        let signed_a : sint<8> = -2\n        let signed_b : sint<8> = -1\n        sb.signed = signed_a & signed_b\n        sb.signedq.push(signed_a & signed_b)\n        sb.wide = sb.wide + 1",
+    );
+    let masked = lower_src(&masked_write).expect("a masked wide read can enter a narrow scalar");
+    verify::verify_program(&masked).expect("the masked scalar write verifies");
+    let emitted = tbir::emit(
+        &masked,
+        &merged_src(&masked_write),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("mixed-carrier wide expressions emit");
+    assert!(
+        emitted.contains("harc_rt::harc_wide_zext<8>(255, 8)")
+            && emitted.contains("harc_rt::harc_wide_zext<8>(1, 1)"),
+        "wide/scalar operators promote the scalar to HarcWide<8>:\n{emitted}"
+    );
+
+    let wide_read = ir::Expr::ScoreboardQuery {
+        sb: ir::ScoreboardId(0),
+        field: "sb".to_string(),
+        query: ir::ScoreboardQuery::Scalar {
+            scalar: "wide".to_string(),
+        },
+        nested_path: None,
+    };
+    let corruptions = [
+        ir::Expr::Literal {
+            value: 256,
+            ty: ir::IrType::Unknown,
+        },
+        ir::Expr::Binary(
+            ir::BinOp::Add,
+            Box::new(wide_read.clone()),
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Unknown,
+            }),
+        ),
+        ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(wide_read.clone()),
+            Box::new(ir::Expr::Literal {
+                value: 0,
+                ty: ir::IrType::Unknown,
+            }),
+        ),
+        ir::Expr::Unary(ir::UnOp::BitNot, Box::new(wide_read)),
+    ];
+    for corruption in corruptions {
+        let mut broken = masked.clone();
+        for block in &mut broken.functions[0].blocks {
+            for stmt in &mut block.stmts {
+                match stmt {
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::ScalarWrite { scalar, value },
+                        ..
+                    } if scalar == "narrow" => *value = corruption.clone(),
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePush { queue, value },
+                        ..
+                    } if queue == "narrowq" => *value = corruption.clone(),
+                    _ => {}
+                }
+            }
+        }
+        let errors = verify::verify_program(&broken)
+            .expect_err("verifier rejects a pass-corrupted narrowing expression");
+        assert!(
+            errors.len() >= 2,
+            "both scalar write and queue push corruption must be rejected: {errors:?}"
+        );
+    }
+
+    let literal_writes = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.wide = 1\n        sb.narrow = 1",
+    );
+    let literals = lower_src(&literal_writes).expect("literal scoreboard writes lower");
+    verify::verify_program(&literals).expect("literal scoreboard writes verify");
+
+    let fitting_literals = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = 255\n        sb.narrowq.push(255)",
+    );
+    let fitting = lower_src(&fitting_literals).expect("fitting storage literals lower");
+    verify::verify_program(&fitting).expect("fitting storage literals verify");
+
+    for statement in ["sb.narrow = 256", "sb.narrowq.push(256)"] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            statement,
+        );
+        let err = lower_src(&narrowing).expect_err("storage literals must fit their declaration");
+        assert!(
+            err.to_string().contains("narrows"),
+            "an over-width literal must identify storage narrowing: {err}"
+        );
+    }
+
+    let narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "let narrow : uint<32> = sb.wide",
+    );
+    let err = lower_src(&narrowing).expect_err("narrowing is a source diagnostic");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && err.to_string().contains("assignment of a 256-bit value")
+            && err.to_string().contains("`narrow`, declared 32 bits"),
+        "scoreboard reads use the ordinary narrowing diagnostic: {err}"
+    );
+
+    let write_narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrow = sb.wide",
+    );
+    let err = lower_src(&write_narrowing).expect_err("scalar write narrowing is diagnosed");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && err.to_string().contains("assignment of a 256-bit value")
+            && err
+                .to_string()
+                .contains("scoreboard field `narrow`, declared 8 bits"),
+        "scoreboard writes use a source diagnostic: {err}"
+    );
+
+    for rhs in ["sb.wide + 1", "false ? sb.narrow : sb.wide"] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            &format!("sb.narrow = {rhs}"),
+        );
+        let err = lower_src(&narrowing).expect_err("complex scalar narrowing is diagnosed");
+        assert!(
+            err.to_string().contains("narrows"),
+            "`{rhs}` must not bypass scoreboard narrowing checks: {err}"
+        );
+    }
+
+    for statement in [
+        "let neg : sint<8> = -1\n        sb.narrow = sb.wide & neg",
+        "let neg : sint<8> = -1\n        sb.narrowq.push(sb.wide & neg)",
+    ] {
+        let narrowing = read_types.replace(
+            "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+            statement,
+        );
+        let err = lower_src(&narrowing).expect_err("a signed mask cannot narrow a wide value");
+        assert!(
+            err.to_string().contains("narrows"),
+            "signed masks retain the wide operand's bound: {err}"
+        );
+    }
+    let queue_narrowing = read_types.replace(
+        "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
+        "sb.narrowq.push(sb.wide + 1)",
+    );
+    let err = lower_src(&queue_narrowing).expect_err("complex queue narrowing is diagnosed");
+    assert!(
+        err.to_string().contains("narrows"),
+        "queue arithmetic must not bypass narrowing checks: {err}"
     );
 }
 
@@ -11140,7 +11469,8 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
 /// | `bound to` on a field | byte-identical likewise | `SilentlyMisLowers` |
 /// | a directional (port) field | `uint64_t p;` — uninitialized, direction dropped | `SilentlyMisLowers` |
 /// | a `default` on a queue field | `HarcQueue<uint64_t> q = 0;` — no such constructor | `EmitsUncompilable` |
-/// | `list<uint<8>>` / `uint<128>` field | `std::vector<uint64_t> l;` / `_harc_u128 l;` | a real escape hatch |
+/// | `list<uint<8>>` field | `std::vector<uint64_t> l;` | a real escape hatch |
+/// | unsigned scalar through 1024 bits | width-aware scalar member | supported by TBIR |
 /// | `list<Vec<uint<8>, 2>>` field | `std::vector<std::array<uint64_t, 2>> l;` | likewise — no randomize body to break |
 /// | `string` / `event<T>` field | `int64_t s;` / `uint64_t e;` — uninitialized | `SilentlyMisLowers` |
 ///
@@ -11263,7 +11593,6 @@ end impl T"#
     // body is what stops compiling keeps a correct member here.
     for (ty, shape) in [
         ("list<uint<8>>", "std::vector<uint64_t> l;"),
-        ("uint<128>", "_harc_u128 l;"),
         (
             "list<Vec<uint<8>, 2>>",
             "std::vector<std::array<uint64_t, 2>> l;",
@@ -11281,6 +11610,28 @@ end impl T"#
                 .expect("v1 emits")
                 .contains(shape),
             "`{ty}`: v1 emits `{shape}`, which is what keeps the suggestion honest"
+        );
+    }
+    // Unsigned scalar state now uses the same width-aware carriers as
+    // locals and queue elements. Pin both sides of the 128-bit boundary.
+    for (ty, shape) in [
+        ("uint<65>", "_harc_u128 l = 0;"),
+        ("uint<128>", "_harc_u128 l = 0;"),
+        ("uint<256>", "harc_rt::HarcWide<8> l = 0;"),
+        ("uint<1024>", "harc_rt::HarcWide<32> l = 0;"),
+    ] {
+        let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
+        let lowered = lower_src(&src).expect("wide unsigned scoreboard scalar lowers");
+        verify::verify_program(&lowered).expect("wide unsigned scoreboard scalar verifies");
+        let emitted = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("TBIR emits wide unsigned scoreboard scalar");
+        assert!(
+            emitted.contains(shape),
+            "`{ty}`: TBIR emits `{shape}` in:\n{emitted}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "`{ty}` remains accepted by v1 during retirement"
         );
     }
     for (ty, shape) in [("string", "int64_t s;"), ("event<uint<8>>", "uint64_t s;")] {

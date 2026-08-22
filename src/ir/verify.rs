@@ -586,6 +586,53 @@ fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<Verif
     }
 }
 
+fn verify_scoreboard_scalar_schema(
+    ty: &IrType,
+    default: &crate::ir::ScoreboardScalarDefault,
+    what: String,
+    errs: &mut Vec<VerifyError>,
+) {
+    let valid = match ty {
+        IrType::Bool | IrType::UInt(None) | IrType::SInt(None) => true,
+        IrType::UInt(Some(width)) => (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width),
+        IrType::SInt(Some(width)) => (1..=64).contains(width),
+        _ => false,
+    };
+    if !valid {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!(
+                "{what} has invalid scalar type {ty:?}; expected bool, unsigned width 1..={}, \
+                 or signed width 1..=64",
+                crate::MAX_WIDTH_METHOD_BITS
+            ),
+        });
+    }
+    let default_valid = match default {
+        crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
+            IrType::Bool => *value <= 1,
+            IrType::UInt(Some(width)) if *width < 64 => *value < (1u64 << width),
+            IrType::UInt(_) => true,
+            IrType::SInt(Some(width)) if (1..64).contains(width) => {
+                let signed = *value as i64;
+                let limit = 1i64 << (*width - 1);
+                (-limit..limit).contains(&signed)
+            }
+            IrType::SInt(Some(64)) | IrType::SInt(None) => true,
+            _ => false,
+        },
+        crate::ir::ScoreboardScalarDefault::Wide(words) => {
+            !words.is_empty()
+                && words.last().is_some_and(|word| *word != 0)
+                && matches!(ty, IrType::UInt(Some(width)) if wide_literal_bits(words) > 64 && wide_literal_bits(words) <= *width)
+        }
+    };
+    if !default_valid {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!("{what} has invalid scalar default {default:?} for {ty:?}"),
+        });
+    }
+}
+
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
     for t in &prog.tests {
@@ -821,12 +868,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     }
     for (si, scoreboard) in prog.scoreboards.iter().enumerate() {
         for field in &scoreboard.fields {
-            if let ScoreboardFieldKind::Queue { elem } = &field.kind {
-                verify_queue_elem_schema(
+            match &field.kind {
+                ScoreboardFieldKind::Queue { elem } => verify_queue_elem_schema(
                     elem,
                     format!("scoreboard sb{si} field `{}`", field.name),
                     &mut errs,
-                );
+                ),
+                ScoreboardFieldKind::Scalar { ty, default } => verify_scoreboard_scalar_schema(
+                    ty,
+                    default,
+                    format!("scoreboard sb{si} field `{}`", field.name),
+                    &mut errs,
+                ),
             }
         }
     }
@@ -2315,7 +2368,7 @@ impl Checker<'_> {
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
                         let expected = &self.func.local(*l).ty;
-                        if let Some(actual) = expr_type(self.func, e) {
+                        if let Some(actual) = expr_type(self.prog, self.func, e) {
                             if *expected != IrType::Unknown
                                 && actual != IrType::Unknown
                                 && !assign_compatible(expected, &actual)
@@ -2395,9 +2448,10 @@ impl Checker<'_> {
                 Stmt::TbQueuePush { field, value } => {
                     self.check_tb_queue(field);
                     self.check_expr(value, false, "TbQueuePush value");
-                    if let (Some(elem), Some(actual)) =
-                        (self.tb_queue_elem(field), expr_type(self.func, value))
-                    {
+                    if let (Some(elem), Some(actual)) = (
+                        self.tb_queue_elem(field),
+                        expr_type(self.prog, self.func, value),
+                    ) {
                         if !queue_elem_accepts_type(elem, &actual) {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
@@ -2459,7 +2513,7 @@ impl Checker<'_> {
                         field,
                     ) {
                         Ok(elem) => {
-                            if let Some(actual) = expr_type(self.func, value) {
+                            if let Some(actual) = expr_type(self.prog, self.func, value) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
@@ -2832,7 +2886,7 @@ impl Checker<'_> {
                             self.check_expr(value, false, "ScoreboardOp push value");
                             if let (Some(elem), Some(actual)) = (
                                 self.scoreboard_queue_elem(*sb, queue),
-                                expr_type(self.func, value),
+                                assignment_expr_type(self.prog, self.func, value),
                             ) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
                                     self.errs.push(VerifyError::BadProgramRef {
@@ -2864,6 +2918,20 @@ impl Checker<'_> {
                         crate::ir::ScoreboardOp::ScalarWrite { scalar, value } => {
                             self.check_scoreboard_scalar(*sb, scalar);
                             self.check_expr(value, false, "ScoreboardOp scalar value");
+                            if let (Some(expected), Some(actual)) = (
+                                self.scoreboard_scalar_type(*sb, scalar),
+                                assignment_expr_type(self.prog, self.func, value),
+                            ) {
+                                if !assign_compatible(&expected, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} writes {:?} into scoreboard scalar \
+                                             `{scalar}` declared {:?}",
+                                            self.fid.0, self.bid.0, actual, expected
+                                        ),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -2914,7 +2982,7 @@ impl Checker<'_> {
                     self.check_expr(value, false, "ComponentQueuePush value");
                     match resolve_component_queue_elem(self.prog, self.func, base, queue) {
                         Ok(elem) => {
-                            if let Some(actual) = expr_type(self.func, value) {
+                            if let Some(actual) = expr_type(self.prog, self.func, value) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
@@ -3139,6 +3207,17 @@ impl Checker<'_> {
                 detail: format!("scoreboard sb{} has no scalar field `{scalar}`", sb.0),
             });
         }
+    }
+
+    fn scoreboard_scalar_type(&self, sb: crate::ir::ScoreboardId, scalar: &str) -> Option<IrType> {
+        self.prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|s| s.field(scalar))
+            .and_then(|f| match &f.kind {
+                crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                _ => None,
+            })
     }
 
     fn check_scoreboard_queue(&mut self, sb: crate::ir::ScoreboardId, queue: &str) {
@@ -3831,7 +3910,123 @@ impl Checker<'_> {
 
 /// Best-effort expression typing for invariant 15. Returns `None` when
 /// the expression's type cannot be locally determined.
-fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
+fn common_scalar_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs),
+        (lhs, rhs) => return lhs.or(rhs),
+    };
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    if matches!(lhs, IrType::Unknown) {
+        return Some(rhs);
+    }
+    if matches!(rhs, IrType::Unknown) {
+        return Some(lhs);
+    }
+    let scalar = |ty: &IrType| match ty {
+        IrType::UInt(width) => Some((*width, false)),
+        IrType::SInt(width) => Some((*width, true)),
+        IrType::Bool => Some((Some(1), false)),
+        _ => None,
+    };
+    let (Some((lw, ls)), Some((rw, rs))) = (scalar(&lhs), scalar(&rhs)) else {
+        return Some(lhs);
+    };
+    let width = Some(lw.unwrap_or(64).max(rw.unwrap_or(64)));
+    Some(if ls && rs {
+        IrType::SInt(width)
+    } else {
+        IrType::UInt(width)
+    })
+}
+
+fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
+    match e {
+        Expr::Literal {
+            value,
+            ty: IrType::Unknown,
+        } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+        Expr::Binary(BinOp::BitAnd, lhs, rhs) => {
+            let bounded = |e: &Expr| {
+                if let Expr::Literal { value, ty } = e {
+                    if matches!(ty, IrType::Unknown) {
+                        return Some(IrType::UInt(Some(
+                            (64 - value.leading_zeros()).max(1),
+                        )));
+                    }
+                }
+                assignment_expr_type(prog, func, e)
+            };
+            let (lhs, rhs) = (bounded(lhs), bounded(rhs));
+            let shape = |ty: IrType| match ty {
+                IrType::UInt(width) => Some((width, false)),
+                IrType::SInt(width) => Some((width, true)),
+                IrType::Bool => Some((Some(1), false)),
+                _ => None,
+            };
+            match (lhs.and_then(&shape), rhs.and_then(shape)) {
+                (Some((lhs_width, ls)), Some((rhs_width, rs))) => {
+                    let (lhs_abi, rhs_abi) =
+                        (lhs_width.unwrap_or(64), rhs_width.unwrap_or(64));
+                    let selected = if lhs_abi < rhs_abi && !ls {
+                        lhs_abi
+                    } else if rhs_abi < lhs_abi && !rs {
+                        rhs_abi
+                    } else {
+                        lhs_abi.max(rhs_abi)
+                    };
+                    let width = if lhs_width.is_none() && rhs_width.is_none() {
+                        None
+                    } else {
+                        Some(selected)
+                    };
+                    Some(if ls && rs {
+                        IrType::SInt(width)
+                    } else {
+                        IrType::UInt(width)
+                    })
+                }
+                (Some((width, signed)), None) | (None, Some((width, signed))) => {
+                    Some(if signed {
+                        IrType::SInt(width)
+                    } else {
+                        IrType::UInt(width)
+                    })
+                }
+                _ => None,
+            }
+        }
+        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => {
+            assignment_expr_type(prog, func, lhs)
+        }
+        Expr::Binary(
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        ) => Some(IrType::Bool),
+        Expr::Binary(_, lhs, rhs) => common_scalar_expr_type(
+            assignment_expr_type(prog, func, lhs),
+            assignment_expr_type(prog, func, rhs),
+        ),
+        Expr::Ternary(_, then_expr, else_expr) => common_scalar_expr_type(
+            assignment_expr_type(prog, func, then_expr),
+            assignment_expr_type(prog, func, else_expr),
+        ),
+        Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+        Expr::Unary(_, inner) => assignment_expr_type(prog, func, inner),
+        _ => expr_type(prog, func, e),
+    }
+}
+
+fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
     match e {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
@@ -3848,6 +4043,26 @@ fn expr_type(func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             Some(ret.clone())
         }
+        Expr::ScoreboardQuery {
+            sb,
+            query: ScoreboardQuery::Scalar { scalar },
+            ..
+        } => prog
+            .scoreboards
+            .get(sb.index())
+            .and_then(|schema| schema.field(scalar))
+            .and_then(|field| match &field.kind {
+                ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                _ => None,
+            }),
+        Expr::ScoreboardQuery {
+            query: ScoreboardQuery::QueueSize { .. },
+            ..
+        } => Some(IrType::UInt(None)),
+        Expr::ScoreboardQuery {
+            query: ScoreboardQuery::QueueEmpty { .. },
+            ..
+        } => Some(IrType::Bool),
         _ => None,
     }
 }
@@ -3867,6 +4082,13 @@ fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
 }
 
 fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
+    // Ordinary integer literals carry `Unknown` until a destination gives
+    // them a width. Treat that as the same conservative wildcard used by
+    // queue transfers; source lowering has already rejected literals that do
+    // not fit their destination.
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
     if expected == actual {
         return true;
     }

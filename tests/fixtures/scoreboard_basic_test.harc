@@ -29,6 +29,9 @@ scoreboard CountSb
     expected : queue<uint<32>>
     writes   : uint<32> default 0
     reads    : uint<32> default 0
+    wide     : uint<256>
+    seeded   : uint<128> default 0x10000000000000000
+    sized    : uint<128> default 128'h00000000000000010000000000000000
 end scoreboard CountSb
 
 testbench ScoreboardBasicTb
@@ -41,6 +44,18 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
 
     run
         log(info, "scoreboard basic: queue + counters on counter DUT")
+
+        // Persistent scoreboard scalars use the same width-aware host
+        // carrier as standalone values; exercise bits above 128 and keep
+        // the value live into check phase.
+        let one : uint<256> = 1
+        sb.wide = one << 200
+        assert sb.wide[207:193] == 128
+            else fail("wide scoreboard state lost its high bit")
+        assert sb.seeded == 0x10000000000000000
+            else fail("wide scoreboard default lost its high bit")
+        assert sb.sized == 0x10000000000000000
+            else fail("sized wide scoreboard default lost its high bit")
 
         // Reset for 3 cycles.
         dut.rst = 1
@@ -93,6 +108,12 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             else fail("counter drift: writes=${sb.writes} reads=${sb.reads}")
         assert sb.writes == 3
             else fail("expected 3 writes, got ${sb.writes}")
+        assert sb.wide[207:193] == 128
+            else fail("wide scoreboard state did not persist into check")
+        assert sb.seeded == 0x10000000000000000
+            else fail("wide scoreboard default did not persist into check")
+        assert sb.sized == 0x10000000000000000
+            else fail("sized wide scoreboard default did not persist into check")
         log(info, "PASS: scoreboard drained, ${sb.reads} reads matched ${sb.writes} writes")
     end check
 end impl ScoreboardBasicTest

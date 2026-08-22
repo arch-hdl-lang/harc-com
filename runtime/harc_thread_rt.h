@@ -83,6 +83,15 @@ struct HarcWide {
         }
     }
 
+    // libstdc++ does not classify its `unsigned __int128` extension as an
+    // integral type under every C++20 dialect. Keep the carrier conversion
+    // available independently of that implementation-defined type trait.
+    HarcWide(_harc_u128 v) {
+        for (std::size_t i = 0; i < N; ++i) {
+            words[i] = (i < 4) ? static_cast<uint32_t>(v >> (32 * i)) : 0u;
+        }
+    }
+
     HarcWide(std::initializer_list<uint32_t> init) {
         std::size_t i = 0;
         for (uint32_t w : init) {
