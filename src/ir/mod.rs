@@ -677,11 +677,22 @@ pub struct ScoreboardFieldSchema {
 pub enum ScoreboardFieldKind {
     /// `writes : uint<32> default 0` — a scalar host counter. The
     /// `default` is the declared initializer literal (0 fallback, v1).
-    Scalar { ty: IrType, default: u64 },
+    Scalar {
+        ty: IrType,
+        default: ScoreboardScalarDefault,
+    },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is an exact scalar type through the 1024-bit
     /// language ceiling or a value-record.
     Queue { elem: QueueElem },
+}
+
+/// Width-preserving initializer for persistent scoreboard scalar state.
+#[derive(Debug, Clone)]
+pub enum ScoreboardScalarDefault {
+    Narrow(u64),
+    /// LSB-first 32-bit words, matching `Expr::WideLiteral`.
+    Wide(Vec<u32>),
 }
 
 /// The element type of a `queue<T>` field: an exact scalar IR type, or a

@@ -2011,7 +2011,7 @@ fn emit_lifecycle_checkers(
             continue;
         }
         let lambda = func::periodic_handler_lambda_name(comp, ph);
-        let period = func::clause_expr_cpp(prog, ph.function, inst_path, &ph.period)?;
+        let period = func::clause_count_cpp(prog, ph.function, inst_path, &ph.period)?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
         let svc = ph.phase.service_vec();
         writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
@@ -2045,7 +2045,7 @@ fn emit_lifecycle_checkers(
             continue;
         }
         let lambda = func::cycle_handler_lambda_name(comp, ch);
-        let trigger = func::clause_expr_cpp(prog, ch.function, inst_path, &ch.trigger)?;
+        let trigger = func::clause_predicate_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
         if ch.monitor_channel.is_some() {
             // Bound-bus handshake monitor (v1's `emit_bound_monitor_actors`).
@@ -2120,11 +2120,11 @@ fn emit_lifecycle_checkers(
         } else {
             let lambda = func::watchdog_lambda_name(comp, w);
             let period = match &w.period {
-                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
                 None => WATCHDOG_DEFAULT_PERIOD.to_string(),
             };
             let max_idle = match &w.max_idle {
-                Some(e) => func::clause_expr_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
                 None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
             };
             let tag = format!("_wdog_{inst_tag}_{}", w.function.0);

@@ -362,14 +362,18 @@ pub(super) fn scoreboard_struct(
     for f in &sb.fields {
         match &f.kind {
             crate::ir::ScoreboardFieldKind::Scalar { ty, default } => {
-                let (cty, init) = match ty {
-                    crate::ir::IrType::Bool => (
-                        "bool",
-                        if *default != 0 { "true" } else { "false" }.to_string(),
-                    ),
-                    crate::ir::IrType::SInt(_) => ("int64_t", default.to_string()),
-                    _ => ("uint64_t", default.to_string()),
+                let init = match default {
+                    crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
+                        crate::ir::IrType::Bool => {
+                            if *value != 0 { "true" } else { "false" }.to_string()
+                        }
+                        _ => value.to_string(),
+                    },
+                    crate::ir::ScoreboardScalarDefault::Wide(words) => {
+                        super::expr::wide_literal_cpp(words)
+                    }
                 };
+                let cty = super::field_scalar_cty(ty);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::ScoreboardFieldKind::Queue { elem } => {

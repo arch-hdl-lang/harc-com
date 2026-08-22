@@ -1599,29 +1599,6 @@ impl FuncBuilder<'_> {
         e: &Expr,
         name: &str,
     ) -> Result<(), LowerError> {
-        // Only the expression shapes invariant 15's own `expr_type`
-        // resolves — exactly the set that would otherwise reach the
-        // internal-error channel, so this adds no rejection the verifier
-        // was not already making. A binary/ternary RHS is deliberately
-        // excluded: lowering's `expr_type` over-approximates one as its
-        // left operand's declared width, which would reject a provably
-        // narrowed value such as `(wide & 0xFF) >> 4`. Pure-helper and
-        // extern calls are included because their CallTarget carries the
-        // exact declared return type.
-        if !matches!(
-            e,
-            Expr::Literal { .. }
-                | Expr::WideLiteral(_)
-                | Expr::Local(_)
-                | Expr::BitSlice { .. }
-                | Expr::WidthCast { .. }
-                | Expr::Call(
-                    crate::ir::CallTarget::Helper { .. } | crate::ir::CallTarget::ExternFn { .. },
-                    _,
-                )
-        ) {
-            return Ok(());
-        }
         // Signedness, not just width: invariant 15's `assign_compatible`
         // also requires the two to agree, so `let s : sint<8> = a +% b`
         // (a wrap's residue is unsigned per spec §2.4) reached the
@@ -1631,7 +1608,7 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(w)) => (*w, true),
             _ => return Ok(()),
         };
-        let (aw, a_signed) = match self.expr_type(e) {
+        let (aw, a_signed) = match self.scalar_assignment_type(e) {
             Some(IrType::UInt(Some(w))) => (w, false),
             Some(IrType::SInt(Some(w))) => (w, true),
             _ => return Ok(()),
@@ -1912,7 +1889,14 @@ impl FuncBuilder<'_> {
         let crate::ir::QueueElem::Scalar { ty: expected } = elem else {
             return Ok(());
         };
-        let Some(actual) = self.expr_type(value) else {
+        let actual = match value {
+            crate::ir::Expr::Literal {
+                value,
+                ty: IrType::Unknown,
+            } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+            _ => self.scalar_assignment_type(value),
+        };
+        let Some(actual) = actual else {
             return Ok(());
         };
         if queue_scalar_assignment_compatible(expected, &actual) {
@@ -1947,6 +1931,56 @@ impl FuncBuilder<'_> {
         }
         Err(LowerError::Invalid(format!(
             "{what} holds {expected:?}, but the pushed value is {actual:?}"
+        )))
+    }
+
+    fn check_scoreboard_scalar_write(
+        &self,
+        value: &crate::ir::Expr,
+        expected: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let actual = match value {
+            crate::ir::Expr::Literal {
+                value,
+                ty: IrType::Unknown,
+            } => Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1)))),
+            _ => self.scalar_assignment_type(value),
+        };
+        let Some(actual) = actual else {
+            return Ok(());
+        };
+        if queue_scalar_assignment_compatible(expected, &actual) {
+            return Ok(());
+        }
+        let scalar_shape = |ty: &IrType| match ty {
+            IrType::UInt(Some(width)) => Some((*width, false)),
+            IrType::SInt(Some(width)) => Some((*width, true)),
+            _ => None,
+        };
+        if let (Some((dest_width, dest_signed)), Some((src_width, src_signed))) =
+            (scalar_shape(expected), scalar_shape(&actual))
+        {
+            if dest_signed != src_signed {
+                return Err(LowerError::Invalid(format!(
+                    "{what} is {} {dest_width}-bit state, but the assigned value is {} \
+                     {src_width}-bit. Signedness must match — relabel the value explicitly with \
+                     `as {}<{src_width}>`.",
+                    if dest_signed { "signed" } else { "unsigned" },
+                    if src_signed { "signed" } else { "unsigned" },
+                    if dest_signed { "sint" } else { "uint" },
+                )));
+            }
+            if src_width > dest_width {
+                return Err(LowerError::Invalid(format!(
+                    "assignment of a {src_width}-bit value to {what}, declared {dest_width} \
+                     bits, narrows. Widths must not shrink implicitly — truncate the value \
+                     explicitly or widen the scoreboard field."
+                )));
+            }
+        }
+        Err(LowerError::Invalid(format!(
+            "{what} is declared {expected:?}, but the assigned value is {actual:?}"
         )))
     }
 
@@ -2271,6 +2305,12 @@ impl FuncBuilder<'_> {
                 let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                 let e = self.lower_expr_no_ports(value)?;
                 self.reject_record_into_scalar(&e, &format!("scoreboard field `{}`", name.name))?;
+                let expected = self.scoreboard_scalar_type(sb, &name.name)?;
+                self.check_scoreboard_scalar_write(
+                    &e,
+                    &expected,
+                    &format!("scoreboard field `{}`", name.name),
+                )?;
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -3299,6 +3339,24 @@ impl FuncBuilder<'_> {
             },
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
+                schema.name
+            ))),
+        }
+    }
+
+    fn scoreboard_scalar_type(
+        &self,
+        sb: crate::ir::ScoreboardId,
+        field: &str,
+    ) -> Result<IrType, LowerError> {
+        let schema = &self.ctx.scoreboards[sb.index()];
+        match schema.field(field) {
+            Some(crate::ir::ScoreboardFieldSchema {
+                kind: crate::ir::ScoreboardFieldKind::Scalar { ty, .. },
+                ..
+            }) => Ok(ty.clone()),
+            _ => Err(LowerError::Invalid(format!(
+                "scoreboard `{}` has no scalar field `{field}`",
                 schema.name
             ))),
         }
