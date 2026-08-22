@@ -15,6 +15,16 @@
 // runnable via the standard run_fixtures.sh sentinel check — see
 // tests/run_negative_fixtures.sh.
 //
+// It is deliberately NOT in tests/tbir_equiv_fixtures.txt either, even
+// though the other negative fixture (`regblock_record_recursion_test`)
+// is registered there with `expect=fail`. That row works because the
+// RAL guard reports FATAL and lets the sim tear down normally, so both
+// codegens still write a semantic trace to diff. `abort()` does not:
+// the run dies with SIGABRT before any trace is emitted, and the
+// harness scores the row "broke before reaching a test verdict" under
+// both backends. Verified by hand that v1 and TB-IR abort identically
+// with the same message, which is the equivalence that matters here.
+//
 // `tests/queue_pop_guard_cpp.rs` pins the same guard at the C++ level,
 // so a regression fails in `cargo test` too, not only in the Verilator
 // fixture job.
