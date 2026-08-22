@@ -81,7 +81,11 @@ enum V1Behaviour {
 /// What TB-IR says about the same program.
 #[derive(Debug)]
 enum TbVerdict {
+    /// Lowered, and its own emitted C++ typechecks.
     Lowers,
+    /// Lowered into C++ the compiler rejects. Always a defect: the
+    /// backend produced something no one can build, with no diagnostic.
+    LowersUncompilable(String),
     Unsupported(String),
     NotImplemented(lower::V1Status, #[allow(dead_code)] String),
     Invalid(String),
@@ -104,14 +108,24 @@ fn manifest(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-fn tb_verdict(src: &str) -> TbVerdict {
+fn tb_verdict(cc: &str, src: &str, dir: &Path, stem: &str) -> TbVerdict {
     let parsed = match parse_source(src) {
         Ok(p) => p,
         Err(e) => panic!("probe does not parse — fix the template, not the compiler: {e}"),
     };
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     match lower::lower_program(&merged) {
-        Ok(_) => TbVerdict::Lowers,
+        // Lowering is only half of it. A backend that lowers into C++
+        // nobody can compile has produced a defect with no diagnostic,
+        // so the emitted output is typechecked too — the suite had no
+        // way to notice that before this harness existed.
+        Ok(prog) => match harc::codegen::tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()) {
+            Err(e) => TbVerdict::LowersUncompilable(format!("tbir emitter refused: {e}")),
+            Ok(cpp) => match compile(cc, &cpp, dir, &format!("{stem}-tbir")) {
+                None => TbVerdict::Lowers,
+                Some(err) => TbVerdict::LowersUncompilable(err),
+            },
+        },
         Err(lower::LowerError::Unsupported { construct, .. }) => TbVerdict::Unsupported(construct),
         Err(lower::LowerError::NotImplemented { construct, v1, .. }) => {
             TbVerdict::NotImplemented(v1, construct)
@@ -127,8 +141,17 @@ fn v1_behaviour(cc: &str, src: &str, dir: &Path, stem: &str) -> V1Behaviour {
         Ok(c) => c,
         Err(_) => return V1Behaviour::Refuses,
     };
+    match compile(cc, &cpp, dir, stem) {
+        None => V1Behaviour::Compiles,
+        Some(err) => V1Behaviour::EmitsUncompilable(err),
+    }
+}
+
+/// `None` when the emitted C++ typechecks; the first `error:` line
+/// otherwise.
+fn compile(cc: &str, cpp: &str, dir: &Path, stem: &str) -> Option<String> {
     let path = dir.join(format!("{stem}.cpp"));
-    std::fs::write(&path, &cpp).expect("write v1 output");
+    std::fs::write(&path, cpp).expect("write emitted C++");
     let out = Command::new(cc)
         .args(["-std=gnu++20", "-fcoroutines", "-fsyntax-only"])
         .arg("-I")
@@ -139,15 +162,15 @@ fn v1_behaviour(cc: &str, src: &str, dir: &Path, stem: &str) -> V1Behaviour {
         .output()
         .expect("spawn compiler");
     if out.status.success() {
-        V1Behaviour::Compiles
-    } else {
-        let msg = String::from_utf8_lossy(&out.stderr)
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stderr)
             .lines()
             .find(|l| l.contains("error:"))
             .unwrap_or("(no error: line)")
-            .to_string();
-        V1Behaviour::EmitsUncompilable(msg)
-    }
+            .to_string(),
+    )
 }
 
 /// Run every substitution through both backends and hold TB-IR's
@@ -166,7 +189,7 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
     // and every row is meaningless if the control does not pass.
     let control = template.replace(hole, "");
     assert!(
-        matches!(tb_verdict(&control), TbVerdict::Lowers),
+        matches!(tb_verdict(cc, &control, &dir, "control"), TbVerdict::Lowers),
         "{label}: the control must lower — the template is broken, not the compiler"
     );
     assert_eq!(
@@ -180,13 +203,14 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
     let mut gaps: Vec<String> = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
         let src = template.replace(hole, sub);
-        let tb = tb_verdict(&src);
+        let tb = tb_verdict(cc, &src, &dir, &format!("row{i}"));
         let v1 = v1_behaviour(cc, &src, &dir, &format!("row{i}"));
         table.push_str(&format!(
             "  {:<34} tbir={:<22} v1={:?}\n",
             sub.trim(),
             match &tb {
                 TbVerdict::Lowers => "LOWERS".to_string(),
+                TbVerdict::LowersUncompilable(_) => "LOWERS-BROKEN".to_string(),
                 TbVerdict::Unsupported(_) => "Unsupported".to_string(),
                 TbVerdict::NotImplemented(s, _) => format!("{s:?}"),
                 TbVerdict::Invalid(_) => "Invalid".to_string(),
@@ -209,6 +233,12 @@ fn check_space(label: &str, template: &str, hole: &str, subs: &[&str]) -> String
             )),
             (TbVerdict::Invalid(m), V1Behaviour::Compiles) => failures.push(format!(
                 "`{}`: tbir says `Invalid` ({m}), but v1 compiles it",
+                sub.trim()
+            )),
+            // TB-IR lowered into C++ that does not build. Always a
+            // defect, whatever v1 does — no diagnostic, no output.
+            (TbVerdict::LowersUncompilable(e), _) => failures.push(format!(
+                "`{}`: tbir lowers it and its own emitted C++ does not compile: {e}",
                 sub.trim()
             )),
             (TbVerdict::Lowers, V1Behaviour::EmitsUncompilable(e)) => failures.push(format!(
@@ -322,4 +352,66 @@ end impl T
         ],
     );
     eprintln!("{table}");
+}
+
+/// `tb_scalar_field_ir_type` is one function deciding for FOUR call
+/// sites: a testbench field, a test-scope `let`, and a transactor state
+/// field (twice). Widening its `w > 64` gate to close one gap changes
+/// the answer at all of them, so each gets its own template here before
+/// anything is widened.
+#[test]
+fn the_shared_scalar_width_gate_across_its_call_sites() {
+    let widths = &[
+        "    w : uint<64>",
+        "    w : uint<65>",
+        "    w : uint<128>",
+        "    w : sint<128>",
+        "    w : uint<1024>",
+    ];
+
+    // Call site 1: a testbench field.
+    let tb_field = r#"
+testbench Tb
+    dut : Top
+@@FIELD@@
+end testbench Tb
+
+impl T for Tb
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T
+"#;
+    eprintln!("{}", check_space("tb-field", tb_field, "@@FIELD@@", widths));
+
+    // Call site 2: a test-scope `let`. Spelled as a statement, so the
+    // hole sits in the run body rather than the field list.
+    let scope_let = r#"
+testbench Tb2
+    dut : Top
+end testbench Tb2
+
+impl T2 for Tb2
+    run
+@@FIELD@@
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T2
+"#;
+    eprintln!(
+        "{}",
+        check_space(
+            "scope-let",
+            scope_let,
+            "@@FIELD@@",
+            &[
+                "        let w : uint<64> = 1",
+                "        let w : uint<65> = 1",
+                "        let w : uint<128> = 1",
+                "        let w : sint<128> = 1",
+            ],
+        )
+    );
 }
