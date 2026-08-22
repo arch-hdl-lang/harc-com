@@ -965,15 +965,6 @@ impl FuncBuilder<'_> {
         if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
             if let Some(&rid) = self.ctx.record_ids.get(simple) {
-                if self.in_pure_helper {
-                    return Err(unsupported(
-                        &format!(
-                            "transaction-typed local `let {}` in a pure helper function",
-                            l.name.name
-                        ),
-                        "pure helpers emit as scalar-only file-scope functions",
-                    ));
-                }
                 // `let r : ReadResponse = model.predict_read(addr)` — a
                 // record-typed local bound from a component-method call that
                 // returns that record. The dest local is record-typed and

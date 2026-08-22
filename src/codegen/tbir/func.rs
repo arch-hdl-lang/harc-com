@@ -657,14 +657,18 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 /// not re-declared in the body. Parameters, internal locals, and the
 /// return slot use the ordinary TBIR scalar mapping so declared
 /// signedness and widths are preserved across the helper ABI.
-pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Result<(), EmitError> {
+pub(super) fn emit_helper_function(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    // Pure helpers are scalar-only: no DUT access, so no lane table, no
-    // probe access (`dut_type` unused → `""`), and no record fields
-    // (`records` empty).
+    // Pure helpers have no DUT access, so no lane table or probe access
+    // (`dut_type` unused → `""`). Record locals use the program's
+    // already-emitted record structs.
     let empty_lanes = HashMap::new();
     let cx = ECx {
-        prog: None,
+        prog: Some(prog),
         func,
         names: &names,
         lanes: &empty_lanes,
@@ -684,13 +688,24 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
         helper_cpp_name(&func.name)
     )
     .ok();
-    for (i, n) in names.iter().enumerate().skip(nparams) {
-        let cty = func
-            .locals
-            .get(i)
-            .map(|l| helper_local_cty(&l.ty))
-            .unwrap_or_else(|| "uint64_t".to_string());
-        writeln!(out, "{INDENT}{cty} {n} = 0; (void){n};").ok();
+    for (local, name) in func.locals.iter().zip(&names).skip(nparams) {
+        match local.ty {
+            IrType::Record(record) => {
+                let schema = prog.records.get(record.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: local `{name}` in pure helper {} references missing record r{}",
+                        func.name, record.0
+                    ))
+                })?;
+                // A scalar parameter or another local may hide the record
+                // type name before this hoisted declaration.
+                writeln!(out, "{INDENT}::{} {name}{{}}; (void){name};", schema.name).ok();
+            }
+            _ => {
+                let cty = helper_local_cty(&local.ty);
+                writeln!(out, "{INDENT}{cty} {name} = 0; (void){name};").ok();
+            }
+        }
     }
     writeln!(out, "{INDENT}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{INDENT}while (true) {{").ok();
@@ -701,10 +716,22 @@ pub(super) fn emit_helper_function(out: &mut String, func: &TbFunction) -> Resul
         writeln!(out, "{pad2}case {bi}: {{").ok();
         for s in &block.stmts {
             match s {
-                Stmt::Assign(l, e) => {
-                    let name = &names[l.index()];
-                    let e = expr_cpp(&cx, e)?;
-                    writeln!(out, "{pad3}{name} = {e};").ok();
+                Stmt::Assign(..) => {
+                    emit_stmt(out, prog, &cx, &prog.records, &[], s, 3)?;
+                }
+                Stmt::RecordInit(local, record) => {
+                    let name = &names[local.index()];
+                    prog.records.get(record.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: RecordInit of `{name}` in pure helper {} references missing record r{}",
+                            func.name, record.0
+                        ))
+                    })?;
+                    // The local may legally have the same source name as its
+                    // record type (`let Req : Req`). After declaration that
+                    // identifier hides the type, so `Req = Req{};` is invalid
+                    // C++. Construct through the local's declared type.
+                    writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
                 }
                 other => {
                     return Err(EmitError(format!(

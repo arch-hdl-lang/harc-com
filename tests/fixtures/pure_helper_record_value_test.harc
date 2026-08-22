@@ -1,0 +1,21 @@
+// A file-scope pure helper may hold a default-constructed record local while
+// retaining its scalar ABI. C++ shape tests prove the RecordInit is emitted;
+// this runtime fixture proves the helper remains callable in both backends.
+
+transaction PureHelperRecord
+    value : uint<8> default 41
+end transaction PureHelperRecord
+
+function helper_with_record(expected: uint<8>) -> uint<8>
+    let PureHelperRecord : PureHelperRecord
+    return expected
+end function helper_with_record
+
+test PureHelperRecordValueTest
+    let dut : Top
+    run
+        let result = helper_with_record(41)
+        assert result == 41 else fail("pure helper record local ${result}")
+        log(info, "pure helper record local ok ${result}")
+    end run
+end test PureHelperRecordValueTest

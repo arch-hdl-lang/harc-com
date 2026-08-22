@@ -1882,8 +1882,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
     // Eagerly lower pure helpers (declaration order) so call sites can
     // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
-    // Records are visible (for precise rejection messages), but pure
-    // helpers cannot hold record locals — see `lower_let`.
+    // Records are visible so scalar-valued pure helpers can hold host-side
+    // record locals in their file-scope C++ bodies.
     let helper_ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: None,
@@ -1928,8 +1928,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         components: Vec::new(),
         component_fields: HashMap::new(),
         component_modes: HashMap::new(),
-        // Pure helpers cannot hold record locals, so `randomize` can
-        // never fire in one — these maps stay inert here.
+        // Pure helpers cannot randomize records (that statement is outside
+        // the pure scan subset), so these maps stay inert here.
         txn_keeps: HashMap::new(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
@@ -6639,10 +6639,9 @@ pub(crate) struct FuncBuilder<'a> {
     tb_record_locals: HashMap<String, LocalId>,
     /// Return slot when lowering a standalone pure-helper body.
     pub(crate) helper_ret: Option<LocalId>,
-    /// True while lowering a standalone pure-helper body — record
-    /// locals are rejected there (pure helpers emit as file-scope
-    /// uint64-only C++ functions in the tbir backend).
-    pub(crate) in_pure_helper: bool,
+    /// True only for an out-of-line file helper, whose generated C++ ABI is
+    /// scalar even when source type metadata is otherwise unknown.
+    pub(crate) scalar_helper_abi: bool,
     /// True while lowering `${...}` captures of a log/fail message —
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
@@ -7104,7 +7103,7 @@ impl<'a> FuncBuilder<'a> {
             inline_frames: Vec::new(),
             tb_record_locals: HashMap::new(),
             helper_ret: None,
-            in_pure_helper: false,
+            scalar_helper_abi: false,
             in_fmt_args: false,
             vec_read_ok: false,
             vec_read_span: None,
