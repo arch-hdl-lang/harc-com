@@ -34,6 +34,7 @@ impl FuncBuilder<'_> {
     ) -> Result<(), LowerError> {
         // Condition (DUT reads hoisted into the current block).
         let cond_ir = self.lower_expr_no_ports(cond)?;
+        self.validate_truth_expr(&cond_ir, "if/elsif condition")?;
         let then_b = self.new_block();
         let else_b = self.new_block();
         self.terminate(Terminator::Branch(cond_ir, then_b, else_b));
@@ -482,6 +483,7 @@ impl FuncBuilder<'_> {
         // every iteration.
         self.start_block(header);
         let cond_ir = self.lower_expr_no_ports(cond)?;
+        self.validate_truth_expr(&cond_ir, "while condition")?;
         self.terminate(Terminator::Branch(cond_ir, body_b, exit));
 
         self.loop_stack.push(LoopFrame {
@@ -559,6 +561,7 @@ impl FuncBuilder<'_> {
             // text rides along for the timeout breakdown, rendered by
             // the same pretty-printer v1's diagnostics use.
             let expr = self.lower_expr(c)?;
+            self.validate_truth_expr(&expr, "wait-until predicate")?;
             // A transactor method call cannot live in a `wait until`
             // predicate: the scheduler re-evaluates the predicate every
             // cycle, but the call advances simulated time (and may have

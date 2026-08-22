@@ -1191,6 +1191,7 @@ impl FuncBuilder<'_> {
                 // DUT port read is side-effect-free and untraced, so
                 // the difference is unobservable.)
                 let c = self.lower_expr(cond)?;
+                self.validate_truth_expr(&c, "ternary condition")?;
                 let t = self.lower_expr(then_branch)?;
                 let e = self.lower_expr(else_branch)?;
                 Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
@@ -1981,6 +1982,19 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
+            Expr::ScoreboardQuery {
+                sb,
+                query: crate::ir::ScoreboardQuery::Scalar { scalar },
+                ..
+            } => self
+                .ctx
+                .scoreboards
+                .get(sb.index())?
+                .field(scalar)
+                .and_then(|field| match field.kind {
+                    crate::ir::ScoreboardFieldKind::Record { record } => Some(record),
+                    _ => None,
+                }),
             // One element of a component-record `Vec<Record, N>` leaf
             // (`a.kids[i]`) is a whole record value, exactly as
             // `tbl.entries[i]` is on a record local. Answered through
@@ -2066,6 +2080,69 @@ impl FuncBuilder<'_> {
             Expr::ComponentField { base, field } => self.component_field_record(base, field),
             _ => None,
         }
+    }
+
+    /// Boolean-producing operators hide their operand type from `expr_type`.
+    /// Same-record equality/inequality is supported by the generated record
+    /// operators; every other record operand in a scalar boolean expression is
+    /// invalid and must be diagnosed before TB-IR verification.
+    pub(crate) fn bool_expr_has_invalid_record_operand(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Unary(_, inner) => {
+                self.record_id_of_expr(inner).is_some()
+                    || self.bool_expr_has_invalid_record_operand(inner)
+            }
+            Expr::Binary(op, lhs, rhs) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+                match (self.record_id_of_expr(lhs), self.record_id_of_expr(rhs)) {
+                    (Some(lhs), Some(rhs)) => lhs != rhs,
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => {
+                        self.bool_expr_has_invalid_record_operand(lhs)
+                            || self.bool_expr_has_invalid_record_operand(rhs)
+                    }
+                }
+            }
+            Expr::Binary(_, lhs, rhs) => {
+                self.record_id_of_expr(lhs).is_some()
+                    || self.record_id_of_expr(rhs).is_some()
+                    || self.bool_expr_has_invalid_record_operand(lhs)
+                    || self.bool_expr_has_invalid_record_operand(rhs)
+            }
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                self.record_id_of_expr(cond).is_some()
+                    || self.record_id_of_expr(then_expr).is_some()
+                    || self.record_id_of_expr(else_expr).is_some()
+                    || self.bool_expr_has_invalid_record_operand(cond)
+                    || self.bool_expr_has_invalid_record_operand(then_expr)
+                    || self.bool_expr_has_invalid_record_operand(else_expr)
+            }
+            Expr::WidthCast { inner, .. } | Expr::BitSlice { target: inner, .. } => {
+                self.record_id_of_expr(inner).is_some()
+                    || self.bool_expr_has_invalid_record_operand(inner)
+            }
+            Expr::BitSliceDyn { target, hi, lo } => [target.as_ref(), hi.as_ref(), lo.as_ref()]
+                .iter()
+                .any(|inner| {
+                    self.record_id_of_expr(inner).is_some()
+                        || self.bool_expr_has_invalid_record_operand(inner)
+                }),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn validate_truth_expr(&self, e: &Expr, context: &str) -> Result<(), LowerError> {
+        if let Some(record) = self.record_id_of_expr(e) {
+            let name = &self.ctx.records[record.index()].name;
+            return Err(LowerError::Invalid(format!(
+                "{context} must be a scalar value, not record `{name}`"
+            )));
+        }
+        if self.bool_expr_has_invalid_record_operand(e) {
+            return Err(LowerError::Invalid(format!(
+                "{context} applies a scalar operator to a record value"
+            )));
+        }
+        Ok(())
     }
 
     /// The record type of a component field access, or `None` if the
@@ -2473,6 +2550,9 @@ impl FuncBuilder<'_> {
                     .field(scalar)
                     .and_then(|field| match &field.kind {
                         crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                        crate::ir::ScoreboardFieldKind::Record { record } => {
+                            Some(IrType::Record(*record))
+                        }
                         _ => None,
                     }),
                 crate::ir::ScoreboardQuery::QueueSize { .. } => Some(IrType::UInt(None)),
@@ -2561,6 +2641,18 @@ impl FuncBuilder<'_> {
                 narrowest_scalar_type(bounded(lhs), bounded(rhs))
             }
             Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => self.scalar_assignment_type(lhs),
+            Expr::Binary(
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or,
+                _,
+                _,
+            ) => Some(IrType::Bool),
             Expr::Binary(_, lhs, rhs) => common_expr_type(
                 self.scalar_assignment_type(lhs),
                 self.scalar_assignment_type(rhs),

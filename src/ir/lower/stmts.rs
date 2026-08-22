@@ -1346,6 +1346,14 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         let e = self.lower_expr_no_ports(value)?;
+        if self.record_id_of_expr(&e).is_none()
+            && self.bool_expr_has_invalid_record_operand(&e)
+        {
+            return Err(LowerError::Invalid(format!(
+                "`let {}` is initialised from an invalid record composition",
+                l.name.name
+            )));
+        }
         // Record-valued RHS with no `: T` annotation — the bare copy form
         // `let t2 = t1`. v1's untyped fallback would mis-declare it as
         // `int64_t t2 = t1;` (broken for a struct); typing the dest as the
@@ -1674,6 +1682,9 @@ impl FuncBuilder<'_> {
                 "{what} is a scalar and the value assigned to it is a `{}`",
                 self.ctx.records[rid.index()].name
             ))),
+            None if self.bool_expr_has_invalid_record_operand(e) => Err(LowerError::Invalid(
+                format!("{what} is scalar but its value contains an invalid record composition"),
+            )),
             None => Ok(()),
         }
     }
@@ -1793,7 +1804,7 @@ impl FuncBuilder<'_> {
         // ternary "operands to `?:` have different types `Beat` and
         // `Other`", from v1 and tbir alike. No backend runs it.
         if self.record_id_of_expr(value).is_none()
-            && matches!(self.expr_type(value), Some(IrType::Record(_)))
+            && self.bool_expr_has_invalid_record_operand(value)
         {
             return Err(LowerError::Invalid(format!(
                 "{what} was given a record-valued operand in a position that does not \
@@ -2326,19 +2337,36 @@ impl FuncBuilder<'_> {
         if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
-        // Scoreboard scalar-counter write: `sb.writes = sb.writes + 1`
-        // (classic) / `_tb.sb.writes = ...` (impl-form, post-desugar).
+        // Scoreboard scalar/whole-record write: `sb.writes = sb.writes + 1`
+        // or `sb.last = item` (classic), plus `_tb.sb...` after impl desugar.
         if let ExprKind::Field { target: ft, name } = &*target.kind {
             if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
                 let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                 let e = self.lower_expr_no_ports(value)?;
-                self.reject_record_into_scalar(&e, &format!("scoreboard field `{}`", name.name))?;
                 let expected = self.scoreboard_scalar_type(sb, &name.name)?;
-                self.check_scoreboard_scalar_write(
-                    &e,
-                    &expected,
-                    &format!("scoreboard field `{}`", name.name),
-                )?;
+                match expected {
+                    IrType::Record(record) => {
+                        if self.record_id_of_expr(&e) != Some(record) {
+                            return Err(self.record_assign_mismatch(
+                                &e,
+                                record,
+                                format!("scoreboard record field `{}`", name.name),
+                                "assign a value of the same record type",
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.reject_record_into_scalar(
+                            &e,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                        self.check_scoreboard_scalar_write(
+                            &e,
+                            &expected,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                    }
+                }
                 self.push(Stmt::ScoreboardOp {
                     sb,
                     field,
@@ -3395,7 +3423,8 @@ impl FuncBuilder<'_> {
         let schema = &self.ctx.scoreboards[sb.index()];
         match schema.field(field) {
             Some(f) => match &f.kind {
-                crate::ir::ScoreboardFieldKind::Scalar { .. } => Ok(field.to_string()),
+                crate::ir::ScoreboardFieldKind::Scalar { .. }
+                | crate::ir::ScoreboardFieldKind::Record { .. } => Ok(field.to_string()),
                 crate::ir::ScoreboardFieldKind::Queue { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a queue, not a scalar — assign via \
                      `push`/`pop`",
@@ -3420,6 +3449,10 @@ impl FuncBuilder<'_> {
                 kind: crate::ir::ScoreboardFieldKind::Scalar { ty, .. },
                 ..
             }) => Ok(ty.clone()),
+            Some(crate::ir::ScoreboardFieldSchema {
+                kind: crate::ir::ScoreboardFieldKind::Record { record },
+                ..
+            }) => Ok(IrType::Record(*record)),
             _ => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no scalar field `{field}`",
                 schema.name
@@ -3445,6 +3478,10 @@ impl FuncBuilder<'_> {
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
                     schema.name
                 ))),
+                crate::ir::ScoreboardFieldKind::Record { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a record, not a queue",
+                    schema.name
+                ))),
             },
             None => Err(LowerError::Invalid(format!(
                 "scoreboard `{}` has no field `{field}`",
@@ -3466,6 +3503,10 @@ impl FuncBuilder<'_> {
                 crate::ir::ScoreboardFieldKind::Queue { .. } => Ok(()),
                 crate::ir::ScoreboardFieldKind::Scalar { .. } => Err(LowerError::Invalid(format!(
                     "scoreboard `{}` field `{field}` is a scalar, not a queue",
+                    schema.name
+                ))),
+                crate::ir::ScoreboardFieldKind::Record { .. } => Err(LowerError::Invalid(format!(
+                    "scoreboard `{}` field `{field}` is a record, not a queue",
                     schema.name
                 ))),
             },
@@ -4380,6 +4421,7 @@ impl FuncBuilder<'_> {
             let trigger = self.with_check_body(&[], "an `on <bool-expr>` trigger", |b| {
                 b.lower_expr(&h.event)
             })?;
+            self.validate_truth_expr(&trigger, "cycle-handler trigger")?;
             CycleHandlerKind::Trigger {
                 trigger,
                 edge: crate::ir::CycleEdge::from_ast(h.edge),
@@ -4549,6 +4591,7 @@ impl FuncBuilder<'_> {
         let mut out = Vec::with_capacity(temporals.len());
         for t in temporals {
             let inner = self.with_check_body(&[], construct, |b| b.lower_expr(&t.inner))?;
+            self.validate_truth_expr(&inner, "temporal operand")?;
             out.push(crate::ir::TemporalSlot { inner });
         }
         Ok(out)
@@ -4585,15 +4628,20 @@ impl FuncBuilder<'_> {
                 let (ante, cons) = self.with_check_body(&temporals, construct, |b| {
                     Ok((b.lower_expr(lhs)?, b.lower_expr(rhs)?))
                 })?;
+                self.validate_truth_expr(&ante, "property antecedent")?;
+                self.validate_truth_expr(&cons, "property consequent")?;
                 if next {
                     PropertyShape::ImpliesNext { ante, cons }
                 } else {
                     PropertyShape::Implies { ante, cons }
                 }
             }
-            _ => PropertyShape::Invariant(
-                self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?,
-            ),
+            _ => {
+                let invariant =
+                    self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+                self.validate_truth_expr(&invariant, "property condition")?;
+                PropertyShape::Invariant(invariant)
+            }
         };
 
         // `assert <temporal> else fail("...")` — the clause names what
@@ -4667,6 +4715,7 @@ impl FuncBuilder<'_> {
         let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
         let slots = self.lower_temporal_slots(&temporals, construct)?;
         let cond = self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
+        self.validate_truth_expr(&cond, "cover condition")?;
 
         let id = {
             let mut tables = self.side_tables.borrow_mut();
@@ -4702,6 +4751,7 @@ impl FuncBuilder<'_> {
         // transactor call edge hoists ahead of the check.
         let cond = self.lower_expr(expr)?;
         let cond = self.hoist_transactor_calls(cond);
+        self.validate_truth_expr(&cond, "assume condition")?;
         let msg = match v.else_fail.as_ref() {
             Some(e) => self.else_fail_literal(e)?,
             None => "assumption failed".to_string(),
@@ -4761,6 +4811,7 @@ impl FuncBuilder<'_> {
         // advance simulated time). `(helper.read(0) & 1) == 1`.
         let cond = self.lower_expr(expr)?; // ports allowed in assert conditions
         let cond = self.hoist_transactor_calls(cond);
+        self.validate_truth_expr(&cond, "assert condition")?;
         let msg = match v.else_fail.as_ref() {
             Some(e) => self.else_fail_literal(e)?,
             None => "assertion failed".to_string(),

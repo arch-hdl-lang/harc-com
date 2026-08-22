@@ -1779,6 +1779,7 @@ fn lower_cycle_body(
     // checker's test-scope `dut` pointer; field reads resolve self-
     // relatively and re-root at the instance path at emission.
     let trigger = b.lower_expr(&h.event)?;
+    b.validate_truth_expr(&trigger, "component cycle-handler trigger")?;
     b.lower_block_stmts(&h.body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -4517,26 +4518,17 @@ impl super::FuncBuilder<'_> {
                         )));
                     }
                     let lowered = self.lower_component_call_args(args, None)?;
-                    // Shape must agree: the channel renders as
-                    // `std::function<void(uint64_t)>` or
-                    // `std::function<void(<Record>)>`, and passing one
-                    // where the other is expected is a hard C++ error.
-                    // Signedness is left alone — both backends widen a
-                    // scalar payload to a 64-bit slot, so `sint` into an
-                    // `event<uint<8>>` is the same benign conversion v1
-                    // performs.
-                    // `record_id_of_expr`, not `expr_type`: the latter
-                    // has no arm for a record-valued component field,
-                    // transactor-state field or ternary, and this match
-                    // waved `Unknown` straight through — so exactly the
-                    // shapes divergence 108 taught the compiler to type
-                    // were the ones this check could not see.
-                    let got = self.record_id_of_expr(&lowered[0]);
-                    let shape_ok = match payload {
-                        EventPayload::Record(want) => got == Some(want),
-                        EventPayload::Scalar { .. } => got.is_none(),
-                    };
-                    if !shape_ok {
+                    if self
+                        .check_slot_type(
+                            &lowered[0],
+                            match payload {
+                                EventPayload::Record(r) => Some(r),
+                                EventPayload::Scalar { .. } => None,
+                            },
+                            &format!("event `{}`", segs[0]),
+                        )
+                        .is_err()
+                    {
                         let want = match payload {
                             EventPayload::Scalar { signed: true } => "sint".to_string(),
                             EventPayload::Scalar { signed: false } => "uint".to_string(),

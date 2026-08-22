@@ -253,6 +253,7 @@ wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
+scoreboard_record_state_test | Top | top_counter.sv | top_counter.arch | pass
 
 # Added by the harc#551 coverage audit. These ran under run_fixtures.sh
 # (default backend only) and were never trace-diffed across the two

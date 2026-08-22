@@ -644,17 +644,19 @@ impl RecordSchema {
 }
 
 /// One `scoreboard` declaration, lowered to its structural shape: a
-/// host-state record of scalar counters and typed FIFO queues, in
+/// host-state record of scalar counters, value-records, and typed FIFO queues, in
 /// declaration order. Both backends emit this as a C++ struct (v1's
 /// `emit_scoreboard` shape is the behavior reference): scalar fields as
 /// `uint64_t`/`int64_t`/`bool` members with their declared defaults,
+/// value-record fields as default-constructed record members, and
 /// `queue<T>` fields as `harc_rt::HarcQueue<T>` members.
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
-/// Scalar fields and `queue<T>` fields where `T` is `bool`, an explicitly
-/// sized `uint`/`sint` in the language range 1..=1024, or a value-record
-/// lower; the test body manipulates them through `Stmt::ScoreboardOp`
-/// (scalar read/write, queue push/pop/size/empty). Scoreboard
+/// Scalar fields, whole value-record fields, and `queue<T>` fields where `T`
+/// is `bool`, an explicitly sized `uint`/`sint` in the language range
+/// 1..=1024, or a value-record lower; the test body manipulates them through
+/// `Stmt::ScoreboardOp` (scalar/record read/write, queue push/pop/size/empty).
+/// Scoreboard
 /// `hookable`/`function` methods — which mutate scoreboard instance
 /// state and therefore need per-instance materialization — are NOT
 /// lowered in this subset and are rejected at the call site with a
@@ -672,7 +674,8 @@ pub struct ScoreboardFieldSchema {
     pub kind: ScoreboardFieldKind,
 }
 
-/// A scoreboard field is either a scalar counter or a typed FIFO queue.
+/// A scoreboard field is a scalar counter, a whole value-record, or a typed
+/// FIFO queue.
 #[derive(Debug, Clone)]
 pub enum ScoreboardFieldKind {
     /// `writes : uint<32> default 0` — a scalar host counter. The
@@ -681,6 +684,10 @@ pub enum ScoreboardFieldKind {
         ty: IrType,
         default: ScoreboardScalarDefault,
     },
+    /// `last : CheckerState` — a value-record held directly in the
+    /// scoreboard struct. Whole-record reads/writes use the existing
+    /// scoreboard query/op seam; the record is default-constructed.
+    Record { record: RecordId },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is an exact scalar type through the 1024-bit
     /// language ceiling or a value-record.
@@ -2427,7 +2434,9 @@ pub enum ScoreboardOp {
     /// destination; for a discarded `sb.q.pop()` that is an unread temp,
     /// so the store is dead but the pop is not (see `Stmt::TbQueuePop`).
     QueuePop { queue: String, dest: LocalId },
-    /// `sb.<scalar> = value` — write a scalar counter field.
+    /// `sb.<value> = value` — write a scalar counter or whole-record field.
+    /// The historical variant name remains to avoid duplicating the common
+    /// scoreboard receiver/path machinery.
     ScalarWrite { scalar: String, value: Expr },
 }
 
@@ -2677,8 +2686,9 @@ pub enum Expr {
         /// `_tb.<field>`. `Some(path)` → a data-only scoreboard held as
         /// an ENV sub-component (`top.sb`), accessed by the full dotted
         /// `path` (e.g. `["top","sb"]`) against the run-scope env local.
-        /// Validation skips the testbench-field binding check for the
-        /// nested form (the board lives inside the env, not on `_tb`).
+        /// Verification replays the component path and requires its terminal
+        /// leaf to reference the carried scoreboard id (the board lives
+        /// inside the env, not on `_tb`).
         nested_path: Option<Vec<String>>,
     },
     /// Read a composite-component scalar/record field, or a whole fixed
@@ -2897,7 +2907,7 @@ pub enum WidthCastKind {
 /// A value-producing scoreboard read (see `Expr::ScoreboardQuery`).
 #[derive(Debug, Clone)]
 pub enum ScoreboardQuery {
-    /// `sb.<scalar>` — read a scalar counter field.
+    /// `sb.<value>` — read a scalar counter or whole-record field.
     Scalar { scalar: String },
     /// `sb.<queue>.size()` — element count (lowers to `uint64_t`).
     QueueSize { queue: String },
