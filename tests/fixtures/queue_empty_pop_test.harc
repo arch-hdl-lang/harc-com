@@ -1,4 +1,4 @@
-// Queue empty-pop guard — end-to-end exercise of the runtime abort.
+// Queue empty-pop guard — end-to-end exercise of the FATAL report.
 //
 // `harc_rt::HarcQueue<T>::pop()` used to call `std::deque::front()`
 // with no emptiness check (#644), so popping an empty scoreboard queue
@@ -8,26 +8,27 @@
 // waits on `!queue.empty()` first, but `sb.expected.pop()` calls the
 // helper straight through.
 //
-// Pass criterion: the run aborts with
-//   "HARC-ERROR: pop() on an empty queue"
+// The failure is reported through the sim's own FATAL path — the
+// reporter that `run_<Test>()` installs on the queue helper bumps
+// `ctx.errors` and sets `_fatal`, exactly like `log(fatal, ...)`. So
+// the run records the failure and unwinds normally instead of aborting,
+// which is why the emitted log and trace survive and why this fixture
+// can sit in the v1-vs-TB-IR equivalence registry: both codegens must
+// report it identically. `_fatal` is a loop-exit condition, so the run
+// stops at the next scheduler tick rather than at the pop itself; the
+// statements after the pop still execute, with the poisoned value.
+//
+// Pass criterion: the run reports
+//   "FATAL] pop() on an empty queue"
 // and never reports "ALL TESTS PASSED". Like
 // `regblock_record_recursion_test`, this fixture is therefore NOT
 // runnable via the standard run_fixtures.sh sentinel check — see
 // tests/run_negative_fixtures.sh.
 //
-// It is deliberately NOT in tests/tbir_equiv_fixtures.txt either, even
-// though the other negative fixture (`regblock_record_recursion_test`)
-// is registered there with `expect=fail`. That row works because the
-// RAL guard reports FATAL and lets the sim tear down normally, so both
-// codegens still write a semantic trace to diff. `abort()` does not:
-// the run dies with SIGABRT before any trace is emitted, and the
-// harness scores the row "broke before reaching a test verdict" under
-// both backends. Verified by hand that v1 and TB-IR abort identically
-// with the same message, which is the equivalence that matters here.
-//
-// `tests/queue_pop_guard_cpp.rs` pins the same guard at the C++ level,
-// so a regression fails in `cargo test` too, not only in the Verilator
-// fixture job.
+// `tests/queue_pop_guard_cpp.rs` pins the helper's own two paths at the
+// C++ level — reporter installed, and the abort backstop for a caller
+// with no sim context — so a regression fails in `cargo test` too, not
+// only in the Verilator fixture job.
 
 domain SysDomain
   freq_mhz: 100
@@ -50,7 +51,7 @@ impl QueueEmptyPopTest for QueueEmptyPopTb
 
         // A normal round-trip first, so a guard that fired on a
         // NON-empty queue would fail here rather than looking like the
-        // abort under test.
+        // report under test.
         sb.expected.push(7)
         let first = sb.expected.pop()
         assert first == 7
@@ -58,8 +59,14 @@ impl QueueEmptyPopTest for QueueEmptyPopTb
         assert sb.expected.empty()
             else fail("queue not drained: ${sb.expected.size()} value(s) left")
 
-        // Nothing left to return: the runtime must abort here.
+        // Nothing left to return: the runtime must report FATAL here.
         let boom = sb.expected.pop()
-        fail("pop() on an empty queue returned ${boom} instead of aborting")
+
+        // Reached, because `_fatal` stops the run at the next tick
+        // rather than at the pop. The value handed back must be the
+        // deterministic zero, not whatever `front()` used to read off
+        // the end of the deque.
+        assert boom == 0
+            else fail("empty pop returned ${boom}, expected a zero-filled value")
     end run
 end impl QueueEmptyPopTest
