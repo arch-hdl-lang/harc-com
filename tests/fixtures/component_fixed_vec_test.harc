@@ -1,11 +1,25 @@
+struct TableKid
+    value : uint<8>
+end struct TableKid
+
+struct TableBundle
+    kids : Vec<TableKid, 4>
+end struct TableBundle
+
 scoreboard FixedTable
     words  : Vec<uint<64>, 4>
     valids : Vec<uint<1>, 4>
+    bundle : TableBundle
 
     hookable store(index: uint<32>, value: uint<64>)
         words[index] = value
         valids[index] = 1
     end store
+
+
+    hookable store_nested(index: uint<32>, value: uint<8>)
+        bundle.kids[index].value = value
+    end store_nested
 end scoreboard FixedTable
 
 testbench ComponentVecTb
@@ -24,6 +38,10 @@ impl ComponentVecTest for ComponentVecTb
         assert right.valids[2] == 0 else fail("left write aliased right validity")
         assert right.words[2] == 0 else fail("left write aliased right value")
         right.store(2, 0x5678)
+        left.store_nested(1, 0x5a)
+        right.store_nested(1, 0xa5)
+        assert left.bundle.kids[1].value == 0x5a else fail("left nested record-vector write failed")
+        assert right.bundle.kids[1].value == 0xa5 else fail("right nested record-vector write failed")
         assert left.words[2] == 0x1234 else fail("right write aliased left value")
         assert right.words[2] == 0x5678 else fail("right value changed")
         assert left.words != right.words else fail("distinct vectors compared equal")

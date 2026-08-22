@@ -308,11 +308,19 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             instance,
             field,
             path,
-        } => format!(
-            "{}.{field}.{}",
-            resolve_state_instance(cx, instance)?,
-            path.join(".")
-        ),
+            mid_indices,
+            index,
+        } => {
+            let recv = format!("{}.{field}", resolve_state_instance(cx, instance)?);
+            record_access_cpp(
+                cx,
+                &recv,
+                &path[0],
+                &path[1..],
+                mid_indices,
+                index.as_deref(),
+            )?
+        }
         // Bound-to target transactor `queue<T>` state field size/empty
         // read — a `harc_rt::HarcQueue<T>` member of the per-instance
         // struct. Mirrors the scoreboard/component queue-query shapes.
@@ -577,9 +585,18 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::ComponentField { base, field } => {
             format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
         }
-        Expr::ComponentVecElement { base, field, index } => {
+        Expr::ComponentVecElement {
+            base,
+            field,
+            index_pos,
+            index,
+        } => {
             let index = expr_cpp(cx, index)?;
-            format!("{}.{field}[{index}]", comp_base_cpp_subst_cx(cx, base))
+            format!(
+                "{}.{}",
+                comp_base_cpp_subst_cx(cx, base),
+                indexed_member_cpp(field, *index_pos, &index)
+            )
         }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
@@ -1154,6 +1171,7 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             instance,
             field,
             path,
+            ..
         } => state_transactor(cx, instance)
             .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
             .and_then(|f| match f.kind {
@@ -1328,6 +1346,7 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             instance,
             field,
             path,
+            ..
         } => state_transactor(cx, instance)
             .and_then(|t| t.state_fields.iter().find(|f| f.name == *field))
             .is_some_and(|f| match f.kind {
@@ -1678,4 +1697,19 @@ pub(super) fn record_access_cpp(
         s.push(']');
     }
     Ok(s)
+}
+
+pub(super) fn indexed_member_cpp(field: &str, index_pos: usize, index: &str) -> String {
+    field
+        .split('.')
+        .enumerate()
+        .map(|(pos, seg)| {
+            if pos == index_pos {
+                format!("{seg}[{index}]")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }

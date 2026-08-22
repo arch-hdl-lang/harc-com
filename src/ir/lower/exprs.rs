@@ -118,6 +118,8 @@ pub(crate) struct TransactorStateRecordChain {
     pub instance: String,
     pub field: String,
     pub path: Vec<String>,
+    pub mid_indices: Vec<(usize, Expr)>,
+    pub leaf_index: Option<Expr>,
     /// `Some(N)` when the leaf is a `Vec<T, N>` field. Only the
     /// `==`/`!=` landing reads one; see `vec_read_ok`.
     pub leaf_vec_len: Option<usize>,
@@ -126,7 +128,195 @@ pub(crate) struct TransactorStateRecordChain {
     pub leaf_ty: IrType,
 }
 
+pub(crate) struct IndexedComponentRecordChain {
+    pub base: crate::ir::ComponentBase,
+    pub field: String,
+    pub index_pos: usize,
+    pub index: Expr,
+    pub leaf_ty: IrType,
+}
+
+/// Flatten a record-shaped path into its root, declaration-order field
+/// segments, and the index attached to each segment. The index position is
+/// relative to `segs` (not including the root).
+fn indexed_path_parts<'a>(
+    e: &'a AstExpr,
+) -> Option<(
+    &'a crate::ast::Ident,
+    Vec<String>,
+    Vec<(usize, &'a AstExpr)>,
+)> {
+    let mut segs = Vec::new();
+    let mut raw_indices = Vec::new();
+    let mut pending_index = None;
+    let mut cur = e;
+    let root = loop {
+        match &*cur.kind {
+            ExprKind::Field { target, name } => {
+                if let Some(idx) = pending_index.take() {
+                    raw_indices.push((segs.len(), idx));
+                }
+                segs.push(name.name.clone());
+                cur = target;
+            }
+            ExprKind::Index { target, index } => {
+                if pending_index.is_some() || segs.is_empty() {
+                    return None;
+                }
+                pending_index = Some(index);
+                cur = target;
+            }
+            ExprKind::Ident(root) if pending_index.is_none() => break root,
+            _ => return None,
+        }
+    };
+    if segs.is_empty() {
+        return None;
+    }
+    let total = segs.len();
+    segs.reverse();
+    let mut indices = Vec::with_capacity(raw_indices.len());
+    for (raw_pos, idx) in raw_indices.into_iter().rev() {
+        indices.push((total - 1 - raw_pos, idx));
+    }
+    Some((root, segs, indices))
+}
+
 impl super::FuncBuilder<'_> {
+    pub(crate) fn as_indexed_component_record_field(
+        &mut self,
+        e: &AstExpr,
+    ) -> Result<Option<IndexedComponentRecordChain>, LowerError> {
+        let Some((root, segs, raw_indices)) = indexed_path_parts(e) else {
+            return Ok(None);
+        };
+        if raw_indices.len() != 1 || self.lookup(&root.name).is_some() {
+            return Ok(None);
+        }
+        let mut full: Vec<String> = std::iter::once(root.name.clone()).chain(segs).collect();
+        let mut indexed_full_pos = raw_indices[0].0 + 1;
+        if self.ctx.tb_field.as_deref() == Some(root.name.as_str()) {
+            full.remove(0);
+            indexed_full_pos = indexed_full_pos.saturating_sub(1);
+        }
+
+        let resolve_record_path = |this: &Self,
+                                   record: RecordId,
+                                   suffix: &[String],
+                                   index_pos: usize|
+         -> Result<(IrType, usize), LowerError> {
+            let mut rid = record;
+            let mut selected_len = None;
+            for (pos, seg) in suffix.iter().enumerate() {
+                let schema = &this.ctx.records[rid.index()];
+                let fld = schema.field(seg).ok_or_else(|| {
+                    LowerError::Invalid(format!("record `{}` has no field `{seg}`", schema.name))
+                })?;
+                let indexed = pos == index_pos;
+                if indexed {
+                    selected_len = Some(fld.vec_len.ok_or_else(|| {
+                        not_implemented(
+                            &format!(
+                                "indexing the non-`Vec` record field `{}.{seg}`",
+                                schema.name
+                            ),
+                            "only `Vec<T, N>` record fields are indexable",
+                            V1Status::EmitsUncompilable,
+                        )
+                    })?);
+                }
+                if pos + 1 == suffix.len() {
+                    let len = selected_len.ok_or_else(|| {
+                        LowerError::Invalid("indexed component path has no selection".into())
+                    })?;
+                    return Ok((fld.ty.clone(), len));
+                }
+                match fld.ty {
+                    IrType::Record(next) if fld.vec_len.is_none() && !indexed => rid = next,
+                    IrType::Record(next) if fld.vec_len.is_some() && indexed => rid = next,
+                    IrType::Record(_) if fld.vec_len.is_some() => {
+                        return Err(not_implemented(
+                            &format!(
+                                "traversing the `Vec` record field `{}.{seg}` without an element index",
+                                schema.name
+                            ),
+                            format!("select one element first (`{seg}[i]`)"),
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    _ => {
+                        return Err(not_implemented(
+                            &format!(
+                                "field access on `{}.{seg}`, which is not a nested record",
+                                schema.name
+                            ),
+                            "only nested struct/transaction fields can be traversed further",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
+            }
+            Err(LowerError::Invalid(
+                "indexed component record path has no field".into(),
+            ))
+        };
+
+        if let Some(cid) = self.self_component {
+            if let Some(schema) = self.ctx.components[cid.index()].field(&full[0]) {
+                if let crate::ir::ComponentFieldKind::Record { record } = schema.kind {
+                    let suffix = &full[1..];
+                    if indexed_full_pos >= 1 && indexed_full_pos < full.len() {
+                        let index_pos = indexed_full_pos;
+                        let (leaf_ty, len) =
+                            resolve_record_path(self, record, suffix, index_pos - 1)?;
+                        let index = self.lower_expr(raw_indices[0].1)?;
+                        check_literal_vec_index_bounds(&full.join("."), &index, len)?;
+                        return Ok(Some(IndexedComponentRecordChain {
+                            base: crate::ir::ComponentBase::SelfField,
+                            field: full.join("."),
+                            index_pos,
+                            index,
+                            leaf_ty,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let Some((head_cid, mut base, tail, _)) = self.component_path_head(&full) else {
+            return Ok(None);
+        };
+        for recv_len in 0..tail.len() {
+            let Ok(cid) = self.resolve_component_recv(head_cid, &tail[..recv_len]) else {
+                break;
+            };
+            let Some(schema) = self.ctx.components[cid.index()].field(&tail[recv_len]) else {
+                continue;
+            };
+            let crate::ir::ComponentFieldKind::Record { record } = schema.kind else {
+                continue;
+            };
+            let suffix = &tail[recv_len + 1..];
+            let suffix_start = full.len() - tail.len() + recv_len;
+            if indexed_full_pos <= suffix_start || indexed_full_pos >= full.len() {
+                continue;
+            }
+            let index_pos = indexed_full_pos - suffix_start;
+            let (leaf_ty, len) = resolve_record_path(self, record, suffix, index_pos - 1)?;
+            base.extend_from_slice(&tail[..recv_len]);
+            let index = self.lower_expr(raw_indices[0].1)?;
+            check_literal_vec_index_bounds(&full.join("."), &index, len)?;
+            return Ok(Some(IndexedComponentRecordChain {
+                base: crate::ir::ComponentBase::Path(base),
+                field: tail[recv_len..].join("."),
+                index_pos,
+                index,
+                leaf_ty,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Whether `e` is the exact whole-vector operand/RHS currently granted
     /// access. Parentheses are transparent, but nested expressions have a
     /// different span and therefore cannot inherit the permission.
@@ -377,7 +567,12 @@ impl super::FuncBuilder<'_> {
                 instance,
                 field,
                 path,
+                mid_indices,
+                index,
             } => {
+                if index.is_some() || !mid_indices.is_empty() {
+                    return None;
+                }
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
                 } else {
@@ -748,6 +943,8 @@ impl FuncBuilder<'_> {
                         instance: chain.instance,
                         field: chain.field,
                         path: chain.path,
+                        mid_indices: chain.mid_indices,
+                        index: chain.leaf_index.map(Box::new),
                     });
                 }
                 // Test-scope read of a bound-to target responder's
@@ -792,6 +989,14 @@ impl FuncBuilder<'_> {
                 }
                 self.reject_out_of_subset_regblock_access(e, "read")?;
                 self.reject_out_of_subset_addrmap_access(e, "read")?;
+                if let Some(chain) = self.as_indexed_component_record_field(e)? {
+                    return Ok(Expr::ComponentVecElement {
+                        base: chain.base,
+                        field: chain.field,
+                        index_pos: chain.index_pos,
+                        index: Box::new(chain.index),
+                    });
+                }
                 // Composite-component scalar field read via a test-scope
                 // path (`env.sb.count`).
                 if let Some(ce) = self.as_component_field_read(e)? {
@@ -1207,12 +1412,31 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::Index { target, index } => {
+                if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+                    if let Some(len) = chain.leaf_vec_len {
+                        let idx = self.lower_expr(index)?;
+                        check_literal_vec_index_bounds(
+                            &format!("{}.{}", chain.field, chain.path.join(".")),
+                            &idx,
+                            len,
+                        )?;
+                        chain.leaf_index = Some(idx);
+                        return Ok(Expr::TransactorStateRecordField {
+                            instance: chain.instance,
+                            field: chain.field,
+                            path: chain.path,
+                            mid_indices: chain.mid_indices,
+                            index: chain.leaf_index.map(Box::new),
+                        });
+                    }
+                }
                 if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
                     let index = self.lower_expr(index)?;
                     check_literal_component_vec_index_bounds(&base, &field, &index, vec.len)?;
                     return Ok(Expr::ComponentVecElement {
                         base,
                         field,
+                        index_pos: 0,
                         index: Box::new(index),
                     });
                 }
@@ -1232,9 +1456,11 @@ impl FuncBuilder<'_> {
                         check_literal_component_vec_index_bounds(
                             &rf.base, &rf.dotted, &index, len,
                         )?;
+                        let index_pos = rf.field.split('.').count() - 1;
                         return Ok(Expr::ComponentVecElement {
                             base: rf.base,
                             field: rf.field,
+                            index_pos,
                             index: Box::new(index),
                         });
                     }
@@ -1786,6 +2012,8 @@ impl FuncBuilder<'_> {
                 instance,
                 field,
                 path,
+                mid_indices,
+                index,
             } => {
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
@@ -1799,8 +2027,16 @@ impl FuncBuilder<'_> {
                 let last = path.len().checked_sub(1)?;
                 for (i, seg) in path.iter().enumerate() {
                     let fld = self.ctx.records.get(cur.index())?.field(seg)?;
+                    let indexed =
+                        mid_indices.iter().any(|(p, _)| *p == i) || (i == last && index.is_some());
                     match fld.ty {
-                        IrType::Record(r) if fld.vec_len.is_none() => {
+                        IrType::Record(r) if fld.vec_len.is_none() && !indexed => {
+                            if i == last {
+                                return Some(r);
+                            }
+                            cur = r;
+                        }
+                        IrType::Record(r) if fld.vec_len.is_some() && indexed => {
                             if i == last {
                                 return Some(r);
                             }
@@ -2100,9 +2336,29 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            Expr::ComponentVecElement { base, field, index } => {
+            Expr::ComponentVecElement { base, field, index_pos, index } => {
                 let index = self.hoist_ports_with_hint(*index, None);
-                Expr::ComponentVecElement { base, field, index: Box::new(index) }
+                Expr::ComponentVecElement { base, field, index_pos, index: Box::new(index) }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } if index.is_some() || !mid_indices.is_empty() => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_ports_with_hint(idx, None)))
+                    .collect();
+                let index = index.map(|idx| Box::new(self.hoist_ports_with_hint(*idx, None)));
+                Expr::TransactorStateRecordField {
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
+                }
             }
             // An indexed `Vec`-field read carries index sub-exprs (the
             // leaf `[i]` and any mid-chain `entries[i].…` selections),
@@ -2440,12 +2696,38 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            Expr::ComponentVecElement { base, field, index } => {
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                index,
+            } => {
                 let index = self.hoist_transactor_calls(*index);
                 Expr::ComponentVecElement {
                     base,
                     field,
+                    index_pos,
                     index: Box::new(index),
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_transactor_calls(idx)))
+                    .collect();
+                let index = index.map(|idx| Box::new(self.hoist_transactor_calls(*idx)));
+                Expr::TransactorStateRecordField {
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
                 }
             }
             Expr::Call(t, args) => {
@@ -3261,26 +3543,12 @@ impl FuncBuilder<'_> {
     /// The returned `path` is length ≥ 1 (a whole-record access, path
     /// empty, is handled by the scalar `TransactorState` lane).
     pub(crate) fn as_transactor_state_record_field(
-        &self,
+        &mut self,
         e: &AstExpr,
     ) -> Result<Option<TransactorStateRecordChain>, LowerError> {
-        let ExprKind::Field { .. } = &*e.kind else {
+        let Some((root, segs, raw_indices)) = indexed_path_parts(e) else {
             return Ok(None);
         };
-        // Flatten `a.b.c…` → root ident + segments (declaration order).
-        let mut segs: Vec<String> = Vec::new();
-        let mut cur = e;
-        let root = loop {
-            match &*cur.kind {
-                ExprKind::Field { target, name } => {
-                    segs.push(name.name.clone());
-                    cur = target;
-                }
-                ExprKind::Ident(root) => break root,
-                _ => return Ok(None),
-            }
-        };
-        segs.reverse();
         // A local shadows a same-named state field / instance (the
         // established convention throughout this lowerer). Fall through
         // to the record-local field-chain lane in that case.
@@ -3291,30 +3559,36 @@ impl FuncBuilder<'_> {
         // Bare responder-body form: root IS the record state field, so
         // the instance is a placeholder. Otherwise root/`_tb`-prefix
         // names the bound test-scope instance and its state field.
-        let (instance, state_field, sub) = if self.target_state_fields.contains_key(&root.name) {
-            // `last.addr` — root is the state field, segs are the subfields.
-            (String::new(), root.name.clone(), segs)
-        } else {
-            // Test-scope: `responder.last.addr` (instance=root) or
-            // `_tb.xact.last.addr` (instance=segs[0]).
-            let (instance, rest_start) = if Some(root.name.as_str()) == self.ctx.tb_field.as_deref()
-            {
-                match segs.first() {
-                    Some(mid) => (mid.clone(), 1usize),
-                    None => return Ok(None),
-                }
+        let (instance, state_field, sub, sub_start) =
+            if self.target_state_fields.contains_key(&root.name) {
+                // `last.addr` — root is the state field, segs are the subfields.
+                (String::new(), root.name.clone(), segs, 0usize)
             } else {
-                (root.name.clone(), 0usize)
+                // Test-scope: `responder.last.addr` (instance=root) or
+                // `_tb.xact.last.addr` (instance=segs[0]).
+                let (instance, rest_start) =
+                    if Some(root.name.as_str()) == self.ctx.tb_field.as_deref() {
+                        match segs.first() {
+                            Some(mid) => (mid.clone(), 1usize),
+                            None => return Ok(None),
+                        }
+                    } else {
+                        (root.name.clone(), 0usize)
+                    };
+                if !self.ctx.target_state.contains_key(&instance) {
+                    return Ok(None);
+                }
+                let rest = &segs[rest_start..];
+                let Some(state_field) = rest.first() else {
+                    return Ok(None);
+                };
+                (
+                    instance,
+                    state_field.clone(),
+                    rest[1..].to_vec(),
+                    rest_start + 1,
+                )
             };
-            if !self.ctx.target_state.contains_key(&instance) {
-                return Ok(None);
-            }
-            let rest = &segs[rest_start..];
-            let Some(state_field) = rest.first() else {
-                return Ok(None);
-            };
-            (instance, state_field.clone(), rest[1..].to_vec())
-        };
         // The named state field must exist and be a whole-record field.
         let kind = if instance.is_empty() {
             self.target_state_fields.get(&state_field)
@@ -3327,6 +3601,7 @@ impl FuncBuilder<'_> {
         let Some(crate::ir::StateFieldKind::Record { record }) = kind else {
             return Ok(None);
         };
+        let record = *record;
         // A bare whole-record access (no subfield) is the scalar
         // `TransactorState` lane's job, not this one.
         if sub.is_empty() {
@@ -3334,7 +3609,14 @@ impl FuncBuilder<'_> {
         }
         // Type-check the subfield chain against the record schema,
         // descending through nested records to the leaf.
-        let mut cur_rid = *record;
+        if raw_indices.iter().any(|(p, _)| *p < sub_start) {
+            return Ok(None);
+        }
+        let mut indices = Vec::with_capacity(raw_indices.len());
+        for (pos, idx) in raw_indices {
+            indices.push((pos - sub_start, self.lower_expr(idx)?));
+        }
+        let mut cur_rid = record;
         let last = sub.len() - 1;
         let mut leaf_vec_len = None;
         let mut leaf_ty = IrType::Unknown;
@@ -3346,13 +3628,20 @@ impl FuncBuilder<'_> {
                     schema.name
                 )));
             };
+            let indexed = indices.iter().any(|(p, _)| *p == i);
             if i == last {
                 leaf_vec_len = fld.vec_len;
                 leaf_ty = fld.ty.clone();
                 break;
             }
             match fld.ty {
-                IrType::Record(next) if fld.vec_len.is_none() => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_none() && !indexed => cur_rid = next,
+                IrType::Record(next) if fld.vec_len.is_some() && indexed => {
+                    if let Some((_, idx)) = indices.iter().find(|(p, _)| *p == i) {
+                        check_literal_vec_index_bounds(seg, idx, fld.vec_len.unwrap_or(0))?;
+                    }
+                    cur_rid = next;
+                }
                 // The THIRD lane's copy of the mid-segment split. The
                 // record-LOCAL walk (`try_record_field_chain`) and the
                 // COMPONENT walk (`as_component_record_field`) already
@@ -3392,6 +3681,11 @@ impl FuncBuilder<'_> {
             instance,
             field: state_field,
             path: sub,
+            mid_indices: indices.iter().filter(|(p, _)| *p < last).cloned().collect(),
+            leaf_index: indices
+                .into_iter()
+                .find(|(p, _)| *p == last)
+                .map(|(_, idx)| idx),
             leaf_vec_len,
             leaf_ty,
         }))

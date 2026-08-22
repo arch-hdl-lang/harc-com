@@ -2214,6 +2214,81 @@ impl Checker<'_> {
         }
     }
 
+    fn component_indexed_field_type(
+        &self,
+        base: &ComponentBase,
+        field: &str,
+        index_pos: usize,
+    ) -> Result<(IrType, usize), String> {
+        let cid = self.component_base_id(base)?;
+        let component = self
+            .prog
+            .components
+            .get(cid.index())
+            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+        let segments: Vec<&str> = field.split('.').collect();
+        let root = component
+            .field(segments.first().copied().unwrap_or_default())
+            .ok_or_else(|| {
+                format!(
+                    "component `{}` has no field `{}`",
+                    component.name,
+                    segments.first().copied().unwrap_or_default()
+                )
+            })?;
+        match &root.kind {
+            ComponentFieldKind::FixedVec(vec) if segments.len() == 1 && index_pos == 0 => {
+                Ok((vec.elem.clone(), vec.len))
+            }
+            ComponentFieldKind::Record { record } if index_pos > 0 => {
+                let mut rid = *record;
+                let mut selected_len = None;
+                for (offset, segment) in segments[1..].iter().enumerate() {
+                    let pos = offset + 1;
+                    let schema = self
+                        .prog
+                        .records
+                        .get(rid.index())
+                        .ok_or_else(|| format!("record r{} does not resolve", rid.0))?;
+                    let member = schema.field(segment).ok_or_else(|| {
+                        format!("record `{}` has no field `{segment}`", schema.name)
+                    })?;
+                    let indexed = pos == index_pos;
+                    if indexed {
+                        selected_len = Some(member.vec_len.ok_or_else(|| {
+                            format!(
+                                "indexed component field `{field}` selects non-vector `{segment}`"
+                            )
+                        })?);
+                    }
+                    if offset + 1 == segments.len() - 1 {
+                        let len = selected_len.ok_or_else(|| {
+                            format!(
+                                "indexed component field `{field}` has no selection at position {index_pos}"
+                            )
+                        })?;
+                        return Ok((member.ty.clone(), len));
+                    }
+                    match member.ty {
+                        IrType::Record(next) if member.vec_len.is_none() && !indexed => rid = next,
+                        IrType::Record(next) if member.vec_len.is_some() && indexed => rid = next,
+                        _ => {
+                            return Err(format!(
+                            "indexed component path `{field}` has invalid selection at `{segment}`"
+                        ))
+                        }
+                    }
+                }
+                Err(format!(
+                    "indexed component path `{field}` has no record leaf"
+                ))
+            }
+            _ => Err(format!(
+                "indexed component field `{field}` does not select a fixed vector"
+            )),
+        }
+    }
+
     fn record_path_vec_shape(
         &self,
         mut record: RecordId,
@@ -2278,7 +2353,11 @@ impl Checker<'_> {
         self.record_path_vec_shape(record, &segments, &positions)
     }
 
-    fn transactor_state_record(&self, instance: &str, field: &str) -> Result<RecordId, String> {
+    fn transactor_state_field(
+        &self,
+        instance: &str,
+        field: &str,
+    ) -> Result<&StateFieldSchema, String> {
         let body_transactor = match self.func.kind {
             FunctionKind::TransactorBody { transactor } => Some(transactor),
             _ => None,
@@ -2321,18 +2400,142 @@ impl Checker<'_> {
             .transactors
             .get(transactor.index())
             .ok_or_else(|| format!("transactor x{} does not resolve", transactor.0))?;
-        match schema.state_fields.iter().find(|state| state.name == field) {
-            Some(StateFieldSchema {
-                kind: StateFieldKind::Record { record },
-                ..
-            }) => Ok(*record),
-            Some(_) => Err(format!(
+        schema
+            .state_fields
+            .iter()
+            .find(|state| state.name == field)
+            .ok_or_else(|| format!("transactor `{}` has no state field `{field}`", schema.name))
+    }
+
+    fn transactor_state_record(&self, instance: &str, field: &str) -> Result<RecordId, String> {
+        match &self.transactor_state_field(instance, field)?.kind {
+            StateFieldKind::Record { record } => Ok(*record),
+            _ => Err(format!(
                 "transactor state field `{instance}.{field}` is not record-typed"
             )),
-            None => Err(format!(
-                "transactor `{}` has no state field `{field}`",
-                schema.name
-            )),
+        }
+    }
+
+    fn record_path_leaf_type(
+        &self,
+        mut record: RecordId,
+        segments: &[&str],
+        mid_positions: &[usize],
+    ) -> Option<IrType> {
+        for (position, segment) in segments.iter().enumerate() {
+            let member = self.prog.records.get(record.index())?.field(segment)?;
+            if position + 1 == segments.len() {
+                return Some(member.ty.clone());
+            }
+            let indexed = mid_positions.contains(&position);
+            match member.ty {
+                IrType::Record(next) if member.vec_len.is_none() == !indexed => record = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn component_field_type(&self, base: &ComponentBase, field: &str) -> Option<IrType> {
+        let component = self
+            .prog
+            .components
+            .get(self.component_base_id(base).ok()?.index())?;
+        let segments: Vec<&str> = field.split('.').collect();
+        let root = component.field(*segments.first()?)?;
+        if segments.len() == 1 {
+            return match &root.kind {
+                ComponentFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                ComponentFieldKind::FixedVec(vec) => Some(vec.elem.clone()),
+                ComponentFieldKind::Record { record } => Some(IrType::Record(*record)),
+                _ => None,
+            };
+        }
+        let ComponentFieldKind::Record { record } = root.kind else {
+            return None;
+        };
+        self.record_path_leaf_type(record, &segments[1..], &[])
+    }
+
+    /// Type record-bearing RHS forms that the general scalar expression
+    /// classifier intentionally does not understand. Indexed component writes
+    /// must enforce the aggregate boundary even after another pass rewrites a
+    /// valid local RHS into a component/state/record-field expression.
+    fn component_write_value_type(&self, value: &Expr) -> Option<IrType> {
+        match value {
+            Expr::Ternary(_, then_expr, else_expr) => {
+                let then_ty = self.component_write_value_type(then_expr);
+                let else_ty = self.component_write_value_type(else_expr);
+                match (then_ty, else_ty) {
+                    (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) if lhs == rhs => {
+                        Some(IrType::Record(lhs))
+                    }
+                    // A record mixed with another record identity, a scalar,
+                    // or an unclassifiable arm is never a sound record value.
+                    (Some(IrType::Record(_)), _) | (_, Some(IrType::Record(_))) => {
+                        Some(IrType::Unknown)
+                    }
+                    (lhs, rhs) => common_scalar_expr_type(lhs, rhs).or(Some(IrType::Unknown)),
+                }
+            }
+            Expr::ComponentField { base, field } => self
+                .component_field_type(base, field)
+                .or(Some(IrType::Unknown)),
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                ..
+            } => self
+                .component_indexed_field_type(base, field, *index_pos)
+                .ok()
+                .map(|(ty, _)| ty)
+                .or(Some(IrType::Unknown)),
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                ..
+            } => {
+                let Some(IrType::Record(record)) =
+                    self.func.locals.get(local.index()).map(|local| local.ty.clone())
+                else {
+                    return Some(IrType::Unknown);
+                };
+                let segments: Vec<&str> = std::iter::once(field.as_str())
+                    .chain(path.iter().map(String::as_str))
+                    .collect();
+                let positions: Vec<usize> = mid_indices.iter().map(|(pos, _)| *pos).collect();
+                self.record_path_leaf_type(record, &segments, &positions)
+                    .or(Some(IrType::Unknown))
+            }
+            Expr::TransactorState { instance, field } => {
+                let Ok(state) = self.transactor_state_field(instance, field) else {
+                    return Some(IrType::Unknown);
+                };
+                match &state.kind {
+                    StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                    StateFieldKind::Record { record } => Some(IrType::Record(*record)),
+                    StateFieldKind::Queue { .. } => Some(IrType::Unknown),
+                }
+            }
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                ..
+            } => {
+                let Ok(record) = self.transactor_state_record(instance, field) else {
+                    return Some(IrType::Unknown);
+                };
+                let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                let positions: Vec<usize> = mid_indices.iter().map(|(pos, _)| *pos).collect();
+                self.record_path_leaf_type(record, &segments, &positions)
+                    .or(Some(IrType::Unknown))
+            }
+            _ => assignment_expr_type(self.prog, self.func, value).or(Some(IrType::Unknown)),
         }
     }
 
@@ -2341,10 +2544,67 @@ impl Checker<'_> {
         instance: &str,
         field: &str,
         path: &[String],
+        mid_indices: &[(usize, Expr)],
+        index: Option<&Expr>,
     ) -> Result<Option<(usize, String)>, String> {
+        if path.is_empty() {
+            return Err(format!(
+                "transactor state record field `{instance}.{field}` has an empty path"
+            ));
+        }
         let record = self.transactor_state_record(instance, field)?;
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-        self.record_path_vec_shape(record, &segments, &[])
+        if mid_indices.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || mid_indices
+                .iter()
+                .any(|(position, _)| *position + 1 >= segments.len())
+        {
+            return Err(format!(
+                "transactor state path `{instance}.{field}` has malformed index positions"
+            ));
+        }
+        let mut rid = record;
+        for (position, segment) in segments.iter().enumerate() {
+            let schema = self
+                .prog
+                .records
+                .get(rid.index())
+                .ok_or_else(|| format!("record r{} does not resolve", rid.0))?;
+            let member = schema
+                .field(segment)
+                .ok_or_else(|| format!("record `{}` has no field `{segment}`", schema.name))?;
+            let idx = mid_indices
+                .iter()
+                .find(|(p, _)| *p == position)
+                .map(|(_, e)| e)
+                .or_else(|| (position + 1 == segments.len()).then_some(index).flatten());
+            if let Some(idx) = idx {
+                let len = member
+                    .vec_len
+                    .ok_or_else(|| format!("indexed state path selects non-vector `{segment}`"))?;
+                if matches!(idx, Expr::Literal { value, .. } if *value as usize >= len) {
+                    return Err(format!(
+                        "indexed state path selects `{segment}` out of bounds for length {len}"
+                    ));
+                }
+            }
+            if position + 1 < segments.len() {
+                let indexed = idx.is_some();
+                match member.ty {
+                    IrType::Record(next) if member.vec_len.is_none() && !indexed => rid = next,
+                    IrType::Record(next) if member.vec_len.is_some() && indexed => rid = next,
+                    _ => return Err(format!("indexed state path cannot traverse `{segment}`")),
+                }
+            }
+        }
+        let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        let shape = self.record_path_vec_shape(record, &segments, &positions)?;
+        if index.is_some() {
+            shape.ok_or_else(|| format!("indexed state path leaf is not a vector"))?;
+            Ok(None)
+        } else {
+            Ok(shape)
+        }
     }
 
     fn expr_whole_vec_shape(&self, expr: &Expr) -> Result<Option<(usize, String)>, String> {
@@ -2361,7 +2621,15 @@ impl Checker<'_> {
                 instance,
                 field,
                 path,
-            } => self.transactor_state_field_vec_shape(instance, field, path),
+                mid_indices,
+                index,
+            } => self.transactor_state_field_vec_shape(
+                instance,
+                field,
+                path,
+                mid_indices,
+                index.as_deref(),
+            ),
             _ => Ok(None),
         }
     }
@@ -2546,9 +2814,23 @@ impl Checker<'_> {
                     instance,
                     field,
                     path,
+                    mid_indices,
+                    index,
                     value,
                 } => {
-                    let dst_shape = self.transactor_state_field_vec_shape(instance, field, path);
+                    for (_, idx) in mid_indices {
+                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite mid index");
+                    }
+                    if let Some(idx) = index {
+                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite index");
+                    }
+                    let dst_shape = self.transactor_state_field_vec_shape(
+                        instance,
+                        field,
+                        path,
+                        mid_indices,
+                        index.as_ref(),
+                    );
                     self.check_whole_vec_write_value(
                         dst_shape,
                         value,
@@ -2563,12 +2845,8 @@ impl Checker<'_> {
                     // Target-state queue host state — the pushed value
                     // follows the no-inline-port rule like any Assign value.
                     self.check_expr(value, false, "TransactorStateQueuePush value");
-                    match resolve_transactor_state_queue_elem(
-                        self.prog,
-                        self.func,
-                        instance,
-                        field,
-                    ) {
+                    match resolve_transactor_state_queue_elem(self.prog, self.func, instance, field)
+                    {
                         Ok(elem) => {
                             if let Some(actual) = expr_type(self.prog, self.func, value) {
                                 if !queue_elem_accepts_type(&elem, &actual) {
@@ -2591,12 +2869,8 @@ impl Checker<'_> {
                     dest,
                 } => {
                     self.check_local(*dest);
-                    match resolve_transactor_state_queue_elem(
-                        self.prog,
-                        self.func,
-                        instance,
-                        field,
-                    ) {
+                    match resolve_transactor_state_queue_elem(self.prog, self.func, instance, field)
+                    {
                         Ok(elem) => {
                             if let Some(local) = self.func.locals.get(dest.index()) {
                                 if !queue_elem_fits_dest(&elem, &local.ty) {
@@ -2605,11 +2879,7 @@ impl Checker<'_> {
                                             "fn{} b{} pops target-state queue \
                                              `{instance}.{field}` with element {:?} into local \
                                              %{} declared {:?}",
-                                            self.fid.0,
-                                            self.bid.0,
-                                            elem,
-                                            dest.0,
-                                            local.ty
+                                            self.fid.0, self.bid.0, elem, dest.0, local.ty
                                         ),
                                     });
                                 }
@@ -3001,16 +3271,46 @@ impl Checker<'_> {
                 Stmt::ComponentVecElementWrite {
                     base,
                     field,
+                    index_pos,
                     index,
                     value,
                 } => {
                     self.check_expr(index, false, "ComponentVecElementWrite index");
                     self.check_expr(value, false, "ComponentVecElementWrite value");
-                    match self.component_field_vec_shape(base, field) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => self.report_bad_component_field(format!(
-                            "element write `{field}` does not name a fixed-vector field"
-                        )),
+                    match self.component_indexed_field_type(base, field, *index_pos) {
+                        Ok((expected, len)) => {
+                            if matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
+                            {
+                                self.report_bad_component_field(format!(
+                                    "indexed component field `{field}` is out of bounds for length {len}"
+                                ));
+                            }
+                            let actual = match value {
+                                Expr::Literal {
+                                    ty: IrType::Unknown,
+                                    ..
+                                } => Some(IrType::Unknown),
+                                _ => self.component_write_value_type(value),
+                            };
+                            if let Some(actual) = actual {
+                                let compatible = match (&expected, &actual) {
+                                    (IrType::Record(expected), IrType::Record(actual)) => {
+                                        expected == actual
+                                    }
+                                    (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
+                                    // Scalar element coercions are already an established
+                                    // lowering contract (including positive literals into
+                                    // signed slots). This verifier guard is the aggregate
+                                    // boundary: record-vs-scalar and record identity.
+                                    _ => true,
+                                };
+                                if !compatible {
+                                    self.report_bad_component_field(format!(
+                                        "indexed component field `{field}` of type {expected:?} is written from incompatible type {actual:?}"
+                                    ));
+                                }
+                            }
+                        }
                         Err(detail) => self.report_bad_component_field(detail),
                     }
                 }
@@ -3597,19 +3897,44 @@ impl Checker<'_> {
             // Transactor-instance state — host state, resolved at
             // lowering against the bound instance; nothing to verify
             // structurally here (no local/port dependency).
-            Expr::TransactorState { .. } => {}
+            Expr::TransactorState { instance, field } => {
+                if let Err(detail) = self.transactor_state_field(instance, field) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} transactor-state read `{instance}.{field}`: {detail}",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+            }
             Expr::TransactorStateRecordField {
                 instance,
                 field,
                 path,
-            } => match self.transactor_state_field_vec_shape(instance, field, path) {
+                mid_indices,
+                index,
+            } => {
+                for (_, idx) in mid_indices {
+                    self.check_expr(idx, ports_ok, context);
+                }
+                if let Some(idx) = index {
+                    self.check_expr(idx, ports_ok, context);
+                }
+                match self.transactor_state_field_vec_shape(
+                    instance,
+                    field,
+                    path,
+                    mid_indices,
+                    index.as_deref(),
+                ) {
                 Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
                     "transactor-state vector `{instance}.{field}.{}` with shape {shape:?} appears outside matching equality/copy",
                     path.join(".")
                 )),
                 Ok(_) => {}
                 Err(detail) => self.report_bad_whole_vec_use(detail),
-            },
+                }
+            }
             Expr::TransactorStateQueueQuery { .. } => {}
             Expr::Port(_) => {
                 if !ports_ok {
@@ -3750,13 +4075,21 @@ impl Checker<'_> {
                     Err(detail) => self.report_bad_component_field(detail),
                 }
             }
-            Expr::ComponentVecElement { base, field, index } => {
+            Expr::ComponentVecElement {
+                base,
+                field,
+                index_pos,
+                index,
+            } => {
                 self.check_expr(index, ports_ok, context);
-                match self.component_field_vec_shape(base, field) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => self.report_bad_component_field(format!(
-                        "element read `{field}` does not name a fixed-vector field"
-                    )),
+                match self.component_indexed_field_type(base, field, *index_pos) {
+                    Ok((_, len)) if matches!(index.as_ref(), Expr::Literal { value, .. } if *value as usize >= len) =>
+                    {
+                        self.report_bad_component_field(format!(
+                            "indexed component field `{field}` is out of bounds for length {len}"
+                        ));
+                    }
+                    Ok(_) => {}
                     Err(detail) => self.report_bad_component_field(detail),
                 }
             }
@@ -4031,9 +4364,7 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
             let bounded = |e: &Expr| {
                 if let Expr::Literal { value, ty } = e {
                     if matches!(ty, IrType::Unknown) {
-                        return Some(IrType::UInt(Some(
-                            (64 - value.leading_zeros()).max(1),
-                        )));
+                        return Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1))));
                     }
                 }
                 assignment_expr_type(prog, func, e)
@@ -4047,8 +4378,7 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
             };
             match (lhs.and_then(&shape), rhs.and_then(shape)) {
                 (Some((lhs_width, ls)), Some((rhs_width, rs))) => {
-                    let (lhs_abi, rhs_abi) =
-                        (lhs_width.unwrap_or(64), rhs_width.unwrap_or(64));
+                    let (lhs_abi, rhs_abi) = (lhs_width.unwrap_or(64), rhs_width.unwrap_or(64));
                     let selected = if lhs_abi < rhs_abi && !ls {
                         lhs_abi
                     } else if rhs_abi < lhs_abi && !rs {
@@ -4067,19 +4397,15 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
                         IrType::UInt(width)
                     })
                 }
-                (Some((width, signed)), None) | (None, Some((width, signed))) => {
-                    Some(if signed {
-                        IrType::SInt(width)
-                    } else {
-                        IrType::UInt(width)
-                    })
-                }
+                (Some((width, signed)), None) | (None, Some((width, signed))) => Some(if signed {
+                    IrType::SInt(width)
+                } else {
+                    IrType::UInt(width)
+                }),
                 _ => None,
             }
         }
-        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => {
-            assignment_expr_type(prog, func, lhs)
-        }
+        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => assignment_expr_type(prog, func, lhs),
         Expr::Binary(
             BinOp::Eq
             | BinOp::Ne
@@ -4394,7 +4720,18 @@ fn check_def_before_use(
                 }
                 Stmt::TbQueuePop { dest, .. } => bit_set(&mut defined, dest.index()),
                 Stmt::TransactorStateWrite { value, .. } => check_e(value, &defined, errs),
-                Stmt::TransactorStateRecordFieldWrite { value, .. } => {
+                Stmt::TransactorStateRecordFieldWrite {
+                    mid_indices,
+                    index,
+                    value,
+                    ..
+                } => {
+                    for (_, idx) in mid_indices {
+                        check_e(idx, &defined, errs);
+                    }
+                    if let Some(idx) = index {
+                        check_e(idx, &defined, errs);
+                    }
                     check_e(value, &defined, errs)
                 }
                 Stmt::TransactorStateQueuePush { value, .. } => check_e(value, &defined, errs),
@@ -4612,12 +4949,21 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::TemporalSlot { .. }
         | Expr::TbQueueQuery { .. }
         | Expr::TransactorState { .. }
-        | Expr::TransactorStateRecordField { .. }
         | Expr::TransactorStateQueueQuery { .. }
         | Expr::ComponentField { .. }
         | Expr::ScoreboardQuery { .. }
         | Expr::ComponentQueueQuery { .. }
         | Expr::CovHookArg { .. } => {}
+        Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            for (_, idx) in mid_indices {
+                for_each_local(idx, f);
+            }
+            if let Some(idx) = index {
+                for_each_local(idx, f);
+            }
+        }
         Expr::ComponentVecElement { index, .. } => for_each_local(index, f),
         Expr::ComponentValue { base } => {
             if let crate::ir::ComponentBase::Local(l) = base {

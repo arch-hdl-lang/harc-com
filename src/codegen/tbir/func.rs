@@ -1285,6 +1285,8 @@ fn emit_stmt(
             instance,
             field,
             path,
+            mid_indices,
+            index,
             value,
         } => {
             // Through the same receiver resolver the READ side and the
@@ -1293,7 +1295,16 @@ fn emit_stmt(
             // self-reference — emitted a leading-dot `.cur.tag = 5;`.
             let recv = super::expr::resolve_state_instance(cx, instance)?;
             let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{recv}.{field}.{} = {e};", path.join(".")).ok();
+            let recv = format!("{recv}.{field}");
+            let dst = super::expr::record_access_cpp(
+                cx,
+                &recv,
+                &path[0],
+                &path[1..],
+                mid_indices,
+                index.as_ref(),
+            )?;
+            writeln!(out, "{pad}{dst} = {e};").ok();
         }
         // `pending.push(value)` on a bound-to target transactor `queue<T>`
         // state field — a `harc_rt::HarcQueue<T>` member of the per-
@@ -1683,14 +1694,16 @@ fn emit_stmt(
         Stmt::ComponentVecElementWrite {
             base,
             field,
+            index_pos,
             index,
             value,
         } => {
             let index = expr_cpp(cx, index)?;
             let value = expr_cpp(cx, value)?;
+            let field = super::expr::indexed_member_cpp(field, *index_pos, &index);
             writeln!(
                 out,
-                "{pad}{}.{field}[{index}] = {value};",
+                "{pad}{}.{field} = {value};",
                 comp_base_cpp_subst_cx(cx, base)
             )
             .ok();

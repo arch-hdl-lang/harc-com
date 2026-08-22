@@ -54,6 +54,10 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] `keep` constraints on randomized `struct` values, including nested
   record prefixing and component-only solver sites, merged through the same
   typed constraint site and Z3 path as transaction keeps.
+- [x] A fixed-vector selection inside component and bound-responder record
+  state (`bundle.data[i]`, `bundle.records[i].field`), with verifier-checked
+  path/index metadata and v1/TBIR runtime parity. Component paths with
+  multiple selections remain classified by the shared unsupported diagnostic.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -111,6 +115,9 @@ batch left the raw inventory at 153 textual matches. The pure-helper
 record-local batch below removes one constructor, leaving 152 textual matches
 (151 constructors plus the helper). The struct-keep batch removes the dedicated
 rejection and leaves 151 textual matches (150 constructors plus the helper).
+The indexed record-state batch removes a proven migration blocker but shares
+its diagnostic constructor with still-excluded malformed and multi-selection
+component-path shapes, so the raw textual count remains 151.
 
 ## Review-derived semantic gates
 

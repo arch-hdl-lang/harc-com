@@ -10078,7 +10078,7 @@ end test T
 /// else, so the answer comes before them rather than by relabelling
 /// them.
 #[test]
-fn an_index_inside_a_component_or_state_record_path_says_so() {
+fn indexed_component_and_state_record_paths_lower() {
     let state = |body: &str| {
         format!(
             r#"
@@ -10119,21 +10119,366 @@ end impl T
 "#
         )
     };
-    for bad in [
-        "let z = ba.data[0]",
-        "ba.data[0] = 1",
-        "let z = ba.kids[0].p",
+    for (body, rendered) in [
+        ("let z = ba.data[0]", ".ba.data[0]"),
+        ("ba.data[0] = 1", ".ba.data[0] = 1"),
+        ("let z = ba.kids[0].p", ".ba.kids[0].p"),
     ] {
-        let src = state(bad);
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        let src = state(body);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{body}` verifies: {e:?}"));
+        let ir = format!("{prog}");
+        let rendered_path = rendered.split(" =").next().unwrap();
         assert!(
-            msg.contains("an element selection inside"),
-            "`{bad}`: {msg}"
+            ir.contains(rendered_path),
+            "`{body}` preserves the indexed path in IR display as `{rendered_path}`:\n{ir}"
+        );
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("`{body}` emits: {e:?}"));
+        assert!(
+            cpp.contains(rendered),
+            "`{body}` renders `{rendered}`:\n{cpp}"
         );
         // The `--codegen v1` this offers is a real one: v1 emits
         // `target.ba.data[0]` / `target.ba.kids[0].p` and g++ accepts.
-        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{bad}`: v1 emits: {e:?}"));
+        cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{body}`: v1 emits: {e:?}"));
     }
+
+    let component = |body: &str| {
+        format!(
+            r#"
+struct Child
+    q : uint<8>
+end struct Child
+struct Other
+    q : uint<8>
+end struct Other
+struct Kid
+    p : uint<8>
+    child : Child
+end struct Kid
+struct Bundle
+    data : Vec<uint<8>, 4>
+    kids : Vec<Kid, 4>
+end struct Bundle
+agent Cmp
+    ba : Bundle
+    hookable step()
+        {body}
+    end step
+end agent Cmp
+test T
+    let dut : Top
+    let c : Cmp
+    run
+        c.step()
+        wait 1 cycle
+    end run
+end test T
+"#
+        )
+    };
+    for (body, rendered) in [
+        ("let z = ba.data[0]", "self.ba.data[0]"),
+        ("ba.data[0] = 6", "self.ba.data[0] = 6"),
+        ("let z = ba.kids[0].p", "self.ba.kids[0].p"),
+        ("ba.kids[0].p = 7", "self.ba.kids[0].p = 7"),
+    ] {
+        let src = component(body);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{body}` lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{body}` verifies: {e:?}"));
+        let ir = format!("{prog}");
+        let rendered_path = rendered.split(" =").next().unwrap();
+        assert!(
+            ir.contains(rendered_path),
+            "`{body}` preserves the indexed path in IR display as `{rendered_path}`:\n{ir}"
+        );
+        let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("`{body}` emits: {e:?}"));
+        assert!(
+            cpp.contains(rendered),
+            "`{body}` renders `{rendered}`:\n{cpp}"
+        );
+        cpp_tb::emit(&merged_src(&src)).expect("v1 emits the indexed component path");
+    }
+
+    let err = lower_src(&component("let z = ba.kids[4].p"))
+        .expect_err("a literal component-record index must be in bounds");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)) && err.to_string().contains("length 4"),
+        "mid-path component bounds are a source diagnostic: {err:?}"
+    );
+
+    let non_vec = component("let z = ba.kids[0].p").replace("kids : Vec<Kid, 4>", "kids : Kid");
+    let err = lower_src(&non_vec).expect_err("a non-vector mid-path selection must not lower");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+
+    let mut bad_state = lower_src(&state("let z = ba.kids[0].p")).expect("control lowers");
+    let state_expr = bad_state
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::TransactorStateRecordField { mid_indices, .. })
+                if !mid_indices.is_empty() =>
+            {
+                Some(mid_indices)
+            }
+            _ => None,
+        })
+        .expect("indexed state read exists");
+    state_expr[0].0 = 99;
+    assert!(
+        verify::verify_program(&bad_state).is_err(),
+        "out-of-range state index metadata must fail verification"
+    );
+
+    let mut empty_state_path =
+        lower_src(&state("let z = ba.kids[0].p")).expect("state-path control lowers");
+    let (path, mid_indices) = empty_state_path
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::TransactorStateRecordField {
+                    path, mid_indices, ..
+                },
+            ) => Some((path, mid_indices)),
+            _ => None,
+        })
+        .expect("state read exists");
+    path.clear();
+    mid_indices.clear();
+    assert!(
+        verify::verify_program(&empty_state_path).is_err(),
+        "an empty responder-state read path must fail verification"
+    );
+
+    let mut empty_state_write_path =
+        lower_src(&state("ba.kids[0].p = 1")).expect("state-write control lowers");
+    let (path, mid_indices) = empty_state_write_path
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorStateRecordFieldWrite {
+                path, mid_indices, ..
+            } => Some((path, mid_indices)),
+            _ => None,
+        })
+        .expect("state write exists");
+    path.clear();
+    mid_indices.clear();
+    assert!(
+        verify::verify_program(&empty_state_write_path).is_err(),
+        "an empty responder-state write path must fail verification"
+    );
+
+    let mut bad_component = lower_src(&component("let z = ba.kids[0].p")).expect("control lowers");
+    let index_pos = bad_component
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index_pos, .. }) => Some(index_pos),
+            _ => None,
+        })
+        .expect("indexed component read exists");
+    *index_pos = 99;
+    assert!(
+        verify::verify_program(&bad_component).is_err(),
+        "out-of-range component index metadata must fail verification"
+    );
+
+    let mut bad_component_leaf =
+        lower_src(&component("let z = ba.data[0]")).expect("leaf-vector control lowers");
+    let index_pos = bad_component_leaf
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index_pos, .. }) => Some(index_pos),
+            _ => None,
+        })
+        .expect("indexed component leaf read exists");
+    *index_pos = 99;
+    assert!(
+        verify::verify_program(&bad_component_leaf).is_err(),
+        "a leaf-vector index position beyond the path must fail verification"
+    );
+
+    let mut bad_component_literal =
+        lower_src(&component("let z = ba.kids[0].p")).expect("literal-index control lowers");
+    let index = bad_component_literal
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentVecElement { index, .. }) => Some(index),
+            _ => None,
+        })
+        .expect("indexed component read exists");
+    *index = Box::new(ir::Expr::Literal {
+        value: 4,
+        ty: ir::IrType::Unknown,
+    });
+    assert!(
+        verify::verify_program(&bad_component_literal).is_err(),
+        "a corrupted literal component index must fail verification"
+    );
+
+    let record_write = component(
+        r#"
+        let child : Child
+        let other : Other
+        ba.kids[0].child = child
+"#,
+    );
+    let mut scalar_record_write = lower_src(&record_write).expect("record-write control lowers");
+    let value = scalar_record_write
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&scalar_record_write).is_err(),
+        "a scalar write into an indexed record field must fail verification"
+    );
+
+    let mut mismatched_record_write = lower_src(&record_write).expect("record control lowers");
+    let other = mismatched_record_write
+        .functions
+        .iter()
+        .flat_map(|f| f.locals.iter().enumerate())
+        .find_map(|(index, local)| (local.name == "other").then_some(ir::LocalId(index as u32)))
+        .expect("other record local exists");
+    let value = mismatched_record_write
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Local(other);
+    assert!(
+        verify::verify_program(&mismatched_record_write).is_err(),
+        "a mismatched record write into an indexed record field must fail verification"
+    );
+
+    let indexed_record = |field: &str| ir::Expr::ComponentVecElement {
+        base: ir::ComponentBase::SelfField,
+        field: field.to_string(),
+        index_pos: 1,
+        index: Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::Unknown,
+        }),
+    };
+    let mut mismatched_component_record =
+        lower_src(&record_write).expect("component-record RHS control lowers");
+    let value = mismatched_component_record
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = indexed_record("ba.kids");
+    assert!(
+        verify::verify_program(&mismatched_component_record).is_err(),
+        "a mismatched component-record expression must fail verification"
+    );
+
+    let mut matching_component_record =
+        lower_src(&record_write).expect("matching component-record RHS control lowers");
+    let value = matching_component_record
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = indexed_record("ba.kids.child");
+    verify::verify_program(&matching_component_record)
+        .expect("a matching component-record expression remains valid");
+
+    let mut mismatched_record_ternary =
+        lower_src(&record_write).expect("record-ternary control lowers");
+    let child = mismatched_record_ternary
+        .functions
+        .iter()
+        .flat_map(|f| f.locals.iter().enumerate())
+        .find_map(|(index, local)| (local.name == "child").then_some(ir::LocalId(index as u32)))
+        .expect("child record local exists");
+    let value = mismatched_record_ternary
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Local(child)),
+        Box::new(indexed_record("ba.kids")),
+    );
+    assert!(
+        verify::verify_program(&mismatched_record_ternary).is_err(),
+        "a ternary with mismatched record arms must fail verification"
+    );
+
+    let mut missing_state_rhs =
+        lower_src(&record_write).expect("transactor-state RHS control lowers");
+    let value = missing_state_rhs
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed component record write exists");
+    *value = ir::Expr::TransactorState {
+        instance: "missing".to_string(),
+        field: "missing".to_string(),
+    };
+    assert!(
+        verify::verify_program(&missing_state_rhs).is_err(),
+        "an unresolved transactor-state RHS must fail verification"
+    );
 
     // A record LOCAL is unaffected — it carries mid-path selections and
     // always has.
@@ -16759,9 +17104,9 @@ fn target_record_state_lowers() {
     verify::verify_program(&prog).expect("verifies");
     let x = &prog.transactors[0];
     assert_eq!(x.bound_bus.as_deref(), Some("TlmMemBus"));
-    // One whole-record state field.
+    // Both whole-record state fields.
     let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["last"]);
+    assert_eq!(names, ["last", "bundle"]);
     assert!(matches!(
         &x.state_fields[0].kind,
         ir::StateFieldKind::Record { .. }
@@ -16863,6 +17208,14 @@ fn target_record_state_emits_value_record() {
     assert!(
         cpp.contains("responder.last.data"),
         "record-subfield read; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.bundle.data[slot]"),
+        "indexed scalar state path; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("responder.bundle.kids[slot].value"),
+        "indexed record state path; got:\n{cpp}"
     );
     // Guard against the v1 miscompile shape leaking into tbir.
     assert!(
