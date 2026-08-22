@@ -200,6 +200,18 @@ int run_SyncFifoTest(int argc, char** argv) {
         HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);
     };
 
+    // Route an empty-queue pop through the sim's own FATAL path instead
+    // of the runtime header's abort backstop: the run records the
+    // failure, unwinds normally, and still writes its log and trace.
+    // `_fatal` is a loop-exit condition, so the run stops at the next
+    // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
+    // verbatim by both codegens so the two traces stay diffable.
+    harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
+        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        ctx.errors++;
+        _fatal = true;
+    });
+
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
     harc_rt::ThreadScheduler sched;

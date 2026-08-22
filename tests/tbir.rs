@@ -31238,15 +31238,17 @@ fn logf_takes_its_path_by_position_not_by_value() {
              \x20       {stmt}\n        wait 1 cycle\n    end run\nend test T\n"
         )
     };
-    // The emitted log call, for whichever backend. The `seed=` line is
-    // the harness preamble every test emits, not the statement under
-    // test — dropping it by name rather than by position so a change in
+    // The emitted log call, for whichever backend. The `seed=` line and
+    // the empty-queue-pop reporter installed by the prologue (#644) are
+    // harness preamble every test emits, not the statement under test —
+    // dropping them by name rather than by position so a change in
     // preamble ordering fails loudly instead of silently selecting the
     // wrong line.
     let line = |out: &str| -> String {
         out.lines()
             .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
             .filter(|l| !l.contains("seed="))
+            .filter(|l| !l.contains("pop() on an empty queue"))
             .map(|l| l.trim().to_string())
             .collect::<Vec<_>>()
             .join(" ;; ")
@@ -33669,8 +33671,14 @@ end impl TbQTest"#
     // as a program error for a statement v1 compiles and runs. Enumerate
     // what the struct declares and compare the whole set instead.
     let body = {
+        // Anchor on the opening brace, not the bare name. The header
+        // also declares `struct HarcQueueFatalScope` — the RAII
+        // installer for the empty-pop reporter (#644) — and it sorts
+        // BEFORE `struct HarcQueue` in the file, so a bare-name search
+        // silently scanned the wrong struct and reported its
+        // constructor as `HarcQueue`'s entire member set.
         let start = hdr
-            .find("struct HarcQueue")
+            .find("struct HarcQueue {")
             .expect("struct HarcQueue present");
         let open = hdr[start..].find('{').expect("struct body opens") + start;
         let end = hdr[open..].find("\n};").expect("struct body closes") + open;
