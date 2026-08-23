@@ -38052,3 +38052,78 @@ impl T for Tb
 end impl T"#;
     lower_src(src).expect("an unambiguous variant in a covergroup bin must still lower");
 }
+
+/// A signed scalar STATE field wider than 64 bits is refused WITHOUT
+/// offering `--codegen v1` as a way out — the point of #657's precondition.
+///
+/// The generic subset rejection uses `unsupported`, which appends
+/// "re-run with `--codegen v1`". For a signed wide field that is a false
+/// promise: v1 stores the same unsigned `HarcWide<N>`/`_harc_u128`
+/// carrier and either fails to compile the comparison or answers by
+/// magnitude (measured — `sint<129>` `a < b` with `a = -8, b = 2` says
+/// `-8 >= 2` under `--codegen v1`). So the grade must be
+/// `SilentlyMisLowers`, and `assert_not_implemented` checks the message
+/// does not send the user to v1.
+///
+/// Both owners: a data-only scoreboard field and a method-bearing
+/// component field reach the refusal through different call sites
+/// (`scoreboards.rs` and `components_impl.rs`), and both must give the
+/// same verdict — one language, one rule.
+#[test]
+fn a_signed_wide_state_field_is_refused_without_a_false_v1_promise() {
+    let scoreboard = r#"scoreboard SignedSb
+    v : sint<129> default 0
+end scoreboard SignedSb
+
+testbench STb
+    dut : Top
+    sb  : SignedSb
+end testbench STb
+
+impl STest for STb
+    run
+        wait 1 cycle
+    end run
+end impl STest
+"#;
+    let component = r#"scoreboard SignedComp
+    v : sint<129> default 0
+
+    hookable refresh()
+        v = v
+    end refresh
+end scoreboard SignedComp
+
+testbench CTb
+    dut : Top
+    c   : SignedComp
+end testbench CTb
+
+impl CTest for CTb
+    run
+        wait 1 cycle
+    end run
+end impl CTest
+"#;
+    for (owner, src) in [("scoreboard", scoreboard), ("component", component)] {
+        let err = lower_src(src).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            msg.contains("signed scalar wider than 64 bits") && msg.contains("by magnitude"),
+            "{owner}: the reason must name the signed-carrier problem, got: {msg}"
+        );
+    }
+
+    // The neighbours the arm must NOT have started refusing: a signed
+    // field AT the 64-bit boundary, and an UNSIGNED wide field.
+    for ok_src in [
+        "scoreboard Ok1\n    v : sint<64> default 0\nend scoreboard Ok1\n\n\
+         testbench T1\n    dut : Top\n    sb : Ok1\nend testbench T1\n\n\
+         impl I1 for T1\n    run\n        wait 1 cycle\n    end run\nend impl I1\n",
+        "scoreboard Ok2\n    v : uint<129> default 0\nend scoreboard Ok2\n\n\
+         testbench T2\n    dut : Top\n    sb : Ok2\nend testbench T2\n\n\
+         impl I2 for T2\n    run\n        wait 1 cycle\n    end run\nend impl I2\n",
+    ] {
+        lower_src(ok_src).expect("a signed <=64 or unsigned wide field must still lower");
+    }
+}
