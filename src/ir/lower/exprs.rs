@@ -4715,7 +4715,7 @@ pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
         Some(_) => return None,
         None => 64,
     };
-    (width > 0 && width <= 128).then_some(width)
+    (width > 0 && width <= super::BUILTIN_SCALAR_BITS).then_some(width)
 }
 
 /// Constant width argument of a width method (v1's `eval_const_width`:

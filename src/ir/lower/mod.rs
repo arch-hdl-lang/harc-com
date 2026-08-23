@@ -21,17 +21,23 @@
 ///
 /// It lived on `FuncBuilder` until the `connect` payload-width rule
 /// needed it too. Every site in `lower` shares it now —
-/// `exprs.rs::wide_scalar_words`, `stmts.rs::reject_wide_narrowing_into`
-/// and `components_impl.rs::scalar_storage_rank`, the last two of which
-/// had hand-rolled `*w > 128` with the same `div_ceil(32)` beside it.
+/// `exprs.rs::wide_scalar_words`, `exprs.rs::cast_relabel_width`,
+/// `stmts.rs::reject_wide_narrowing_into` and
+/// `components_impl.rs::scalar_storage_rank`. Three of those had
+/// hand-rolled the boundary, two with the same `div_ceil(32)` beside
+/// it — and "every site shares it now" was written one commit before
+/// `cast_relabel_width` turned up still holding its own copy.
 ///
-/// `codegen/tbir/mod.rs` still spells 128 itself, in
-/// `wide_scalar_words` and two casts. That copy is NOT folded in here:
+/// `codegen/tbir/mod.rs` still spells 128 itself, in FOUR places:
+/// `wide_scalar_words` and three cast/decl sites. (An earlier version
+/// of this comment said three; the `w <= 128` at `mod.rs:1579` was
+/// missed — a small demonstration of why counting copies by hand is
+/// not a substitute for sharing one.) Those are NOT folded in here:
 /// lowering deliberately does not depend on the emitter, which is the
 /// reason this constant exists rather than an import. It is a real
-/// remaining duplication and the rule it duplicates is the one
+/// remaining duplication, and the rule it duplicates is the one
 /// `scalar_storage_rank` is defined against, so a move on the codegen
-/// side would make the connect rule stale with no compile error.
+/// side would make the `connect` rule stale with no compile error.
 pub(crate) const BUILTIN_SCALAR_BITS: u32 = 128;
 
 mod addrmap;

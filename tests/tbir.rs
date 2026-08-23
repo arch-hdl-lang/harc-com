@@ -37493,9 +37493,133 @@ end impl TDump
     // would show a manufactured width if `scalar_ir_type()` invented
     // one for a `None`.
     let bare = prog("uint").replace("out event<uint>", "out event");
+    // Without this the row is a no-op that still passes: the assertion
+    // below is the same string `prog("uint")` already prints, so a
+    // template edit that stopped matching the replace pattern would
+    // silently degrade this into a duplicate of the row above — the
+    // "looks like coverage" failure mode this file keeps finding.
+    assert_ne!(
+        bare,
+        prog("uint"),
+        "the bare-`event` substitution must actually change the source"
+    );
     let dump = format!("{}", lower_src(&bare).expect("a bare `event` field lowers"));
     assert!(
         dump.contains("field observed : out event<uint>"),
         "a bare `event` must not acquire a width:\n{dump}"
     );
+}
+
+/// The verifier backstops the `connect` payload-width rule at BOTH
+/// sink kinds — by asking lowering's predicate, not by restating it.
+///
+/// A backstop only earns its name against an IR lowering would not
+/// produce, so this builds one: lower a valid connect, then widen the
+/// SOURCE payload in the schema and hand the result to the verifier.
+/// That is what a lowering site which forgot to call
+/// `connect_delivery_verdict` would emit — and one did: with that call
+/// deleted, `event<uint<1024>> -> observe(v: uint<8>)` lowered,
+/// verified clean, and emitted a
+/// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
+/// parameter, dropping 960 bits per notification with no diagnostic.
+///
+/// Testbench scope on purpose. `verify.rs` walks `tb.connects` only,
+/// so the same edge inside an `env` — the majority shape in the
+/// fixture corpus — reaches no verifier at all. That hole is real and
+/// is NOT closed here; this test pins the scope that is covered so the
+/// coverage claim stays honest about which one it is.
+#[test]
+fn the_verifier_backstops_the_connect_payload_width_rule() {
+    let widen_source_payload = |prog: &mut ir::TbProgram| {
+        let payload = prog
+            .components
+            .iter_mut()
+            .flat_map(|c| c.fields.iter_mut())
+            .find_map(|f| match &mut f.kind {
+                ir::ComponentFieldKind::Event { payload } => Some(payload),
+                _ => None,
+            })
+            .expect("the source declares an event field");
+        *payload = ir::EventPayload::Scalar {
+            signed: false,
+            width: Some(1024),
+        };
+    };
+
+    // Sink kind 1: a hookable METHOD parameter.
+    let method_sink = r#"transactor BackstopSrc
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor BackstopSrc
+
+scoreboard BackstopSb
+    seen : uint<32> default 0
+    hookable observe(v: uint<8>)
+        seen = seen + 1
+    end observe
+end scoreboard BackstopSb
+
+testbench BackstopTb
+    dut : Top
+    source : BackstopSrc passive
+    sb     : BackstopSb
+    connect
+        source.observed -> sb.observe
+    end connect
+end testbench BackstopTb
+
+impl BackstopTest for BackstopTb
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl BackstopTest
+"#;
+
+    // Sink kind 2: another component's EVENT field.
+    let event_sink = r#"transactor BackstopSrc2
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor BackstopSrc2
+
+transactor BackstopRelay
+    inev : event<uint<8>>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor BackstopRelay
+
+testbench BackstopTb2
+    dut : Top
+    source : BackstopSrc2 passive
+    relay  : BackstopRelay passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench BackstopTb2
+
+impl BackstopTest2 for BackstopTb2
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl BackstopTest2
+"#;
+
+    for (kind, src) in [("method sink", method_sink), ("event sink", event_sink)] {
+        let mut prog = lower_src(src).unwrap_or_else(|e| panic!("{kind} lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("{kind} verifies before the widening: {e:?}"));
+        widen_source_payload(&mut prog);
+        verify::verify_program(&prog).expect_err(&format!(
+            "{kind}: a 1024-bit payload cannot be delivered to a 64-bit subscriber"
+        ));
+    }
 }

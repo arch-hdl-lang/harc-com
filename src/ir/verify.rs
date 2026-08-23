@@ -1579,7 +1579,7 @@ fn verify_testbench_connect(
                     "sink method `{method}` is not a one-argument void hookable"
                 ));
             }
-            if !event_payload_matches_type(payload, &m.param_tys[0]) {
+            if !connect_payload_reaches_param(payload, &m.param_tys[0]) {
                 return Err(format!(
                     "sink method `{method}` has an incompatible payload type"
                 ));
@@ -1767,6 +1767,26 @@ fn resolve_component_queue_elem(
             "component c{} has no queue field `{queue}`",
             component.0
         )),
+    }
+}
+
+/// The METHOD-sink half of the same rule, and for the same reason.
+///
+/// `event_payload_matches_type` compares signedness and record
+/// identity and ignores width entirely, while lowering applies
+/// `connect_delivery_verdict` here too. Leaving this arm restated is
+/// exactly the mistake the arm fourteen lines below was fixed for: a
+/// lowering site that forgot the call would emit
+/// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
+/// parameter, verify clean, and truncate 960 bits per notification.
+/// Measured by deleting that call and watching `dump-ir` exit 0.
+fn connect_payload_reaches_param(payload: EventPayload, ty: &IrType) -> bool {
+    if !event_payload_matches_type(payload, ty) {
+        return false;
+    }
+    match payload.scalar_ir_type() {
+        Some(src) => crate::ir::lower::components::connect_delivery_is_faithful(&src, ty),
+        None => true,
     }
 }
 

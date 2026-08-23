@@ -1117,6 +1117,14 @@ end impl TCF2
 /// widening; the narrowing rows are refused on purpose and are pinned
 /// by `a_connect_that_narrows_its_payload_is_refused` with the v1
 /// grade each one measured.
+///
+/// TESTBENCH scope, and an EVENT sink. The first version of this space
+/// probed a METHOD sink inside an `env` — neither the branch that
+/// broke nor the scope where verification runs, since `verify.rs`
+/// walks `tb.connects` only. `tb_verdict` runs the verifier, so this
+/// space would have caught the follow-on defect (lowering emitting an
+/// edge the verifier then rejected) at the right scope and did not at
+/// the wrong one. Being in the right place is most of what a space is.
 #[test]
 fn a_connect_delivering_into_a_wider_subscriber_lowers_at_every_width() {
     let widening = r#"
@@ -1129,31 +1137,28 @@ transactor NarrowSrc
     end bump
 end transactor NarrowSrc
 
-scoreboard WideSink
+transactor WideSink
+    observe : event<uint<1024>>
     seen : uint<32> default 0
 
-    hookable observe(v: uint<1024>)
+    hookable note(v: uint<8>)
         seen = seen + 1
-    end observe
-end scoreboard WideSink
+    end note
+end transactor WideSink
 
-env WidenEnv
+testbench TbWiden
+    dut : Top
     src  : NarrowSrc passive
-    sink : WideSink
+    sink : WideSink passive
 
     connect
         src.ev -> sink.observe
     end connect
-end env WidenEnv
-
-testbench TbWiden
-    dut : Top
-    e : WidenEnv
 end testbench TbWiden
 
 impl TWiden for TbWiden
     run
-        e.src.bump(1)
+        src.bump(1)
         wait 1 cycle
     end run
 end impl TWiden

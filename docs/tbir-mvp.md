@@ -8968,6 +8968,51 @@ former `transaction` group lives in
      recording it is a schema change, not a renderer fix. Named in the
      test that measured it.
 
+141. **Three passes to fix one `==`, and what is still open
+     (2026-08-23).**
+
+     Divergence 140's fix was itself incomplete, in the same shape a
+     third time. `verify.rs` has TWO connect sink arms; 140 fixed the
+     event one and left the method one calling
+     `event_payload_matches_type`, which compares signedness and
+     ignores width. Delete lowering's `connect_delivery_verdict` call
+     and `event<uint<1024>> -> observe(v: uint<8>)` lowers, verifies
+     clean, and emits a `std::function<void(harc_rt::HarcWide<32>)>`
+     feeding a `uint64_t` parameter — 960 bits dropped per
+     notification, silently. Both arms ask the shared predicate now,
+     and a test builds the IR a forgetful lowering site would emit and
+     watches each arm refuse it.
+
+     The scale was also understated. 140 said "twelve shapes"; that was
+     the row count of a test table, three rows of which `main` does not
+     lower anyway. Measured against a rebuilt pre-fix binary over a
+     15-type alphabet: 30 shapes regressed, 72 internal errors. The
+     true set is every pair of distinct declared widths at the same
+     storage class with matching signedness, which is unbounded.
+     Counting a defect's blast radius from the test that found it
+     reports the test, not the defect.
+
+     **Two holes this branch surfaced and does NOT close**, recorded
+     here rather than left implicit:
+
+     - `verify.rs` walks `TestbenchSchema::connects` only.
+       `ComponentSchema::connects` (an `env` `connect` block) and
+       `TbComponentBinding::connects` are never verified — and the env
+       form is the MAJORITY shape, 6 of the 10 connect-using fixtures.
+       Every backstop in this divergence therefore covers one scope of
+       three. The tests say which one.
+     - the boundary constant is shared across all four sites in
+       `lower` now, but `codegen/tbir/mod.rs` still spells 128 in four
+       places of its own. Crossing that needs a home for the constant
+       that neither module owns, which is a bigger change than this
+       branch should carry.
+
+     A rule that is one function in one place is worth the refactor
+     that gets it there. This branch spent three review passes proving
+     it by not doing it: the payload width lived in a derived
+     `PartialEq`, two verifier arms and a lowering arm, and each pass
+     found the copy the previous one had not thought to look for.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
