@@ -8920,6 +8920,54 @@ former `transaction` group lives in
      delivery guard, collapsing the two v1 grades into one, ranking
      every wide width alike, and refusing on any width difference.
 
+140. **The same rule, one level down (2026-08-23).**
+
+     Divergence 139 said a derived `PartialEq` makes every `==` in the
+     tree a silent participant in a field addition, then fixed ONE of
+     the two. `verify.rs` compared whole `EventPayload` values in the
+     `connect` sink arm as well, so lowering emitted a
+     `ConnectSink::Event` edge for two payloads of different declared
+     widths and the verifier rejected it.
+
+     That is worse than what it replaced. Before 139 these programs got
+     a clean `Unsupported` with a wrong message; after it they got
+     `internal error: TB-IR failed verification after lowering`. Twelve
+     shapes `main` lowers were affected, including
+     `event<uint<8>> -> event<uint<16>>` — verbatim the program named
+     in 139's own commit subject — and the widening capability 139 was
+     built to add was unreachable on that path.
+
+     THREE independent reasons nothing caught it, all inside 139:
+
+     - its new test called `lower_src`, which stops at lowering. The
+       assertion that names this exact hazard — "the verifier must not
+       reject what lowering deliberately accepts" — sits twenty lines
+       above it in the same file.
+     - the test wired the connect inside an `env`, and `verify.rs`
+       walks only `tb.connects`. An `env` connect reaches no verifier
+       at all, so adding the verify call alone would still have passed.
+     - its differential space DOES run the verifier, but probes a
+       METHOD sink inside an `env` — neither the branch that broke nor
+       the scope where verification happens.
+
+     Three ways of missing one thing, each of which looks like
+     coverage. The harness fix in divergence 137 was about a tool that
+     skipped the verifier; this is the same omission committed by hand,
+     in a test written after that fix, by the person who wrote it.
+
+     The verifier ASKS lowering's predicates now rather than restating
+     them, and both tests run at both scopes through
+     `verify_program`. A verifier that re-derives a rule is a second
+     place for it to be wrong — and this one was wrong in the direction
+     that produces an internal error rather than a refusal.
+
+     **Measured and left alone.** The dump prints `out` for every event
+     field, so an input `inev : event<uint<16>>` renders as
+     `out event<uint<16>>`. `ComponentFieldKind::Event { payload }`
+     records no direction, so the renderer has nothing to consult;
+     recording it is a schema change, not a renderer fix. Named in the
+     test that measured it.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

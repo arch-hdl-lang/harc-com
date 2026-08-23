@@ -37157,11 +37157,21 @@ end impl SmallTest
 /// is false about a program whose signedness agrees.
 ///
 /// The rows are the ones measured against `origin/main`'s own binary:
-/// all four lower there. Signedness disagreement is the rule that arm
-/// really enforces, so it stays refused.
+/// all of them lower there. Signedness disagreement is the rule that
+/// arm really enforces, so it stays refused.
+///
+/// TESTBENCH scope, and `verify_program`, both deliberately. The first
+/// version of this test wired the connect inside an `env` and called
+/// `lower_src`, which stops at lowering — and `verify.rs` walks only
+/// `tb.connects`, so an `env` connect reaches no verifier at all. That
+/// combination missed the twin of the very bug this test exists for:
+/// `verify.rs` compared whole `EventPayload` values too, so lowering
+/// emitted the edge and the verifier rejected it, one `internal error:
+/// TB-IR failed verification after lowering` per row. Both scopes run
+/// here now, both through the verifier.
 #[test]
 fn a_connect_between_two_scalar_event_widths_still_lowers() {
-    let prog = |src: &str, sink: &str| {
+    let env_prog = |src: &str, sink: &str| {
         format!(
             r#"transactor SrcT
     observed : out event<{src}>
@@ -37198,22 +37208,76 @@ end test ConnTest
 "#
         )
     };
+    let tb_prog = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcTb
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcTb
+
+transactor RelayTb
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayTb
+
+testbench TbConn
+    dut : Top
+    source : SrcTb passive
+    relay  : RelayTb passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench TbConn
+
+impl TConn for TbConn
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl TConn
+"#
+        )
+    };
     for (src, sink) in [
         ("uint<8>", "uint<8>"),
         ("uint<8>", "uint<16>"),
         ("uint<8>", "uint"),
         ("uint", "uint<8>"),
+        ("uint", "uint<64>"),
+        ("bool", "uint<1>"),
+        ("uint<1>", "bool"),
+        ("sint<8>", "sint<64>"),
+        ("sint<64>", "sint<8>"),
         ("uint<128>", "uint<128>"),
         ("uint<160>", "uint<1024>"),
         ("uint<8>", "uint<1024>"),
     ] {
-        lower_src(&prog(src, sink)).unwrap_or_else(|e| {
-            panic!("`event<{src}> -> event<{sink}>` must lower: {e:?}");
-        });
+        for (scope, src_text) in [
+            ("env", env_prog(src, sink)),
+            ("testbench", tb_prog(src, sink)),
+        ] {
+            let prog = lower_src(&src_text).unwrap_or_else(|e| {
+                panic!("`event<{src}> -> event<{sink}>` must lower at {scope} scope: {e:?}");
+            });
+            // The verifier is where the twin of this bug lived. A
+            // program that lowers and fails verification is an
+            // `internal error` from the CLI, which is strictly worse
+            // than the refusal it replaced.
+            verify::verify_program(&prog).unwrap_or_else(|e| {
+                panic!("`event<{src}> -> event<{sink}>` must VERIFY at {scope} scope: {e:?}");
+            });
+        }
     }
     // The rule that arm DOES enforce. Without it the assertions above
     // would also pass with the whole check deleted.
-    let err = lower_src(&prog("uint<8>", "sint<8>")).expect_err("signedness must still disagree");
+    let err =
+        lower_src(&env_prog("uint<8>", "sint<8>")).expect_err("signedness must still disagree");
     let msg = assert_unsupported(&err);
     assert!(
         msg.contains("agree in signedness"),
@@ -37279,6 +37343,46 @@ end test NarrowTest
 "#
         )
     };
+    // TESTBENCH scope as well as `env` scope: `verify.rs` walks only
+    // `tb.connects`, so an `env` connect never reaches the verifier and
+    // a verdict measured only there says nothing about the path the
+    // CLI takes.
+    let tb_event_sink = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcWTb
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcWTb
+
+transactor RelayWTb
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayWTb
+
+testbench NarrowTb
+    dut : Top
+    source : SrcWTb passive
+    relay  : RelayWTb passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench NarrowTb
+
+impl NarrowTbTest for NarrowTb
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl NarrowTbTest
+"#
+        )
+    };
     let method_sink = |src: &str, sink: &str| {
         fixture("analysis_sink_connect_test.harc")
             .replace("out event<uint<8>>", &format!("out event<{src}>"))
@@ -37301,7 +37405,8 @@ end test NarrowTest
         ),
     ] {
         for (label, src_text) in [
-            ("event sink", event_sink(src, sink)),
+            ("env event sink", event_sink(src, sink)),
+            ("testbench event sink", tb_event_sink(src, sink)),
             ("method sink", method_sink(src, sink)),
         ] {
             let err = lower_src(&src_text).err().unwrap_or_else(|| {
@@ -37316,8 +37421,7 @@ end test NarrowTest
     }
 }
 
-/// The IR dump names an event payload's EXACT type, at both renderers
-/// that print one.
+/// The IR dump names an event payload's EXACT type.
 ///
 /// `field observed : out event<uint>` was what a `uint<8>` payload and
 /// a `uint<1024>` payload both printed — right beside a scalar field
@@ -37326,6 +37430,20 @@ end test NarrowTest
 /// few lines up. It also meant the `*_dump_ir` snapshot corpus was
 /// structurally incapable of catching a payload-width regression: the
 /// only line that could move was an `on` handler's parameter.
+///
+/// The COMPONENT-FIELD renderer is what this pins. `type_str`'s
+/// `IrType::Event` arm was changed the same way and is NOT covered:
+/// no probe here and no snapshot in `tests/snapshots/` renders an
+/// `IrType::Event` through it. Saying so is better than a doc comment
+/// claiming "both renderers" over one of them, which is what the first
+/// version of this said.
+///
+/// The dump also prints `out` for EVERY event field, including an
+/// input one — `inev : event<uint<16>>` dumps as `out
+/// event<uint<16>>`. That is not this test's subject and not fixable
+/// here: `ComponentFieldKind::Event { payload }` records no direction
+/// at all, so the renderer has nothing to consult. Measured and left
+/// alone rather than papered over.
 #[test]
 fn the_ir_dump_names_an_event_payloads_exact_type() {
     let prog = |ty: &str| {
@@ -37357,8 +37475,7 @@ end impl TDump
         ("uint<8>", "field observed : out event<uint<8>>"),
         ("sint<32>", "field observed : out event<sint<32>>"),
         ("uint<1024>", "field observed : out event<uint<1024>>"),
-        // A bare `event` really is widthless, and must keep printing
-        // as one rather than acquiring a manufactured width.
+        // `event<uint>` — a scalar payload with no declared width.
         ("uint", "field observed : out event<uint>"),
     ] {
         let dump = format!(
@@ -37370,4 +37487,15 @@ end impl TDump
             "`event<{ty}>` must dump as `{want}`:\n{dump}"
         );
     }
+
+    // A genuinely BARE `event`, with no type argument at all — a
+    // different source shape from `event<uint>`, and the one that
+    // would show a manufactured width if `scalar_ir_type()` invented
+    // one for a `None`.
+    let bare = prog("uint").replace("out event<uint>", "out event");
+    let dump = format!("{}", lower_src(&bare).expect("a bare `event` field lowers"));
+    assert!(
+        dump.contains("field observed : out event<uint>"),
+        "a bare `event` must not acquire a width:\n{dump}"
+    );
 }

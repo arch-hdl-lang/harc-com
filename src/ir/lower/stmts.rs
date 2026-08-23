@@ -1704,7 +1704,11 @@ impl FuncBuilder<'_> {
         what: &str,
     ) -> Result<(), LowerError> {
         let words = |ty: Option<&IrType>| match ty {
-            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if *w > 128 => Some(w.div_ceil(32)),
+            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w)))
+                if *w > super::BUILTIN_SCALAR_BITS =>
+            {
+                Some(w.div_ceil(32))
+            }
             _ => None,
         };
         let (Some(dw), Some(sw)) = (words(dest.as_ref()), self.wide_scalar_words(e)) else {

@@ -20,8 +20,18 @@
 /// step with `wide_scalar_words`.
 ///
 /// It lived on `FuncBuilder` until the `connect` payload-width rule
-/// needed it too; a second copy in `components_impl.rs` would have
-/// been the fourth place this file's dominant failure mode has bitten.
+/// needed it too. Every site in `lower` shares it now —
+/// `exprs.rs::wide_scalar_words`, `stmts.rs::reject_wide_narrowing_into`
+/// and `components_impl.rs::scalar_storage_rank`, the last two of which
+/// had hand-rolled `*w > 128` with the same `div_ceil(32)` beside it.
+///
+/// `codegen/tbir/mod.rs` still spells 128 itself, in
+/// `wide_scalar_words` and two casts. That copy is NOT folded in here:
+/// lowering deliberately does not depend on the emitter, which is the
+/// reason this constant exists rather than an import. It is a real
+/// remaining duplication and the rule it duplicates is the one
+/// `scalar_storage_rank` is defined against, so a move on the codegen
+/// side would make the connect rule stale with no compile error.
 pub(crate) const BUILTIN_SCALAR_BITS: u32 = 128;
 
 mod addrmap;

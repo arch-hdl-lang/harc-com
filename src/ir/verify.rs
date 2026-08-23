@@ -1593,7 +1593,8 @@ fn verify_testbench_connect(
                     },
                 activation,
                 ..
-            }) if *sink_payload == payload && *activation == edge.sink_activation => {}
+            }) if connect_payloads_bridge(payload, *sink_payload)
+                && *activation == edge.sink_activation => {}
             _ => {
                 return Err(format!(
                     "sink event `{event}` does not resolve or has a mismatched payload"
@@ -1766,6 +1767,33 @@ fn resolve_component_queue_elem(
             "component c{} has no queue field `{queue}`",
             component.0
         )),
+    }
+}
+
+/// The verifier's copy of the `connect` payload rule — which is to
+/// say, not a copy: it ASKS lowering's two predicates.
+///
+/// This arm was `*sink_payload == payload`, the exact twin of the
+/// `*payload != src_payload` in `components_impl.rs`. `EventPayload`
+/// derives `PartialEq`, so when the payload grew a `width` BOTH
+/// comparisons silently became width checks. Fixing only the lowering
+/// one made this the worse of the two failures: lowering emitted a
+/// `ConnectSink::Event` edge for two payloads of different declared
+/// widths and the verifier then rejected it, turning a graceful
+/// diagnostic into `internal error: TB-IR failed verification after
+/// lowering`.
+///
+/// Asking rather than restating is the point. A verifier that
+/// re-derives a rule is a second place for it to be wrong, and this
+/// one was wrong in the direction that produces an internal error
+/// rather than a refusal.
+fn connect_payloads_bridge(src: EventPayload, sink: EventPayload) -> bool {
+    if !crate::ir::lower::components::event_payloads_agree_in_shape(src, sink) {
+        return false;
+    }
+    match (src.scalar_ir_type(), sink.scalar_ir_type()) {
+        (Some(s), Some(k)) => crate::ir::lower::components::connect_delivery_is_faithful(&s, &k),
+        _ => true,
     }
 }
 

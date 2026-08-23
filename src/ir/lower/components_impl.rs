@@ -2873,12 +2873,19 @@ fn scalar_storage_rank(ty: &IrType) -> u32 {
 ///
 /// Both failing rows became reachable only when the payload gate
 /// opened past 64 bits, so both are this batch's to answer for.
+pub(crate) fn connect_delivery_is_faithful(src: &IrType, sink: &IrType) -> bool {
+    scalar_storage_rank(src) <= scalar_storage_rank(sink)
+}
+
+/// The same question, with the diagnostic lowering owes the user when
+/// the answer is no. The verifier asks the predicate instead: its job
+/// is to accept exactly what lowering produces, and re-deriving the
+/// rule beside it is how the two drift.
 fn connect_delivery_verdict(src: &IrType, sink: &IrType) -> Option<LowerError> {
-    let (s, k) = (scalar_storage_rank(src), scalar_storage_rank(sink));
-    if s <= k {
+    if connect_delivery_is_faithful(src, sink) {
         return None;
     }
-    Some(if k > 1 {
+    Some(if scalar_storage_rank(sink) > 1 {
         // Both wide, sink narrower: `HarcWide<A>` has no conversion to
         // a shorter `HarcWide<B>`, so v1's bridge does not compile.
         not_implemented(
@@ -2915,7 +2922,7 @@ const CONNECT_NARROWING_CONSTRUCT: &str =
 /// with its own diagnostic. Folding the two together is what made a
 /// legal program report "must agree in signedness" when signedness
 /// agreed.
-fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
+pub(crate) fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
     match (src, sink) {
         (EventPayload::Scalar { signed: a, .. }, EventPayload::Scalar { signed: b, .. }) => a == b,
         (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
@@ -3138,8 +3145,13 @@ pub(crate) fn lower_event_payload(
                 }
             }
             // The DECLARED width travels into the schema now. `Bool`
-            // is width 1 and carries no width of its own, matching the
-            // `bool` member both backends emit for it.
+            // collapses to `width: None`, which is right but not for
+            // the reason this comment first gave ("matching the `bool`
+            // member both backends emit"): measured, tbir emits
+            // `std::function<void(uint64_t)>` for an `event<bool>` and
+            // only v1 emits `void(bool)`. `width: Some(1)` would mean
+            // `uint<1>`, which is a different declared type, so `None`
+            // is the only honest thing the pair can say here.
             match event_payload_scalar_ir_type(ty) {
                 Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
                     signed: true,
