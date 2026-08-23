@@ -7985,6 +7985,16 @@ fn v1_cpp(src: &str) -> String {
     cpp_tb::emit(&merged).expect("emit")
 }
 
+/// The v1 emitter's diagnostic for a source it refuses. Same path as
+/// `v1_cpp`, asserting the emit FAILS rather than succeeds.
+fn v1_cpp_err(src: &str) -> String {
+    let parsed = parse_source(src).expect("parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    cpp_tb::emit(&merged)
+        .expect_err("emit should have been rejected")
+        .0
+}
+
 /// The constraint text the **TB-IR** backend emits for each randomize
 /// site. The §2.4 wrap mask lives in a randomize emitter both backends
 /// call, but they construct it differently — the TB-IR one is built
@@ -9296,6 +9306,387 @@ end test T"#,
     assert!(
         tbir.contains("harc_z3_bv_value(_ctx, (uint64_t)0x000000000000ffffULL, 64)"),
         "the default backend must size the const identically; got:\n{tbir}"
+    );
+}
+
+/// An enum is a value type, not a DUT module. `local_value_c_type` used
+/// to short-circuit only on records, so `let c : Color = BLUE` fell
+/// through to the "Named type means Verilator handle" rule and declared
+/// `VColor* c` — a handle type for a module that does not exist, so the
+/// generated C++ failed to compile (`unknown type name 'VColor'`).
+///
+/// The declaration alone is not the whole fix: the initializer is a bare
+/// variant name, which `emit_expr` writes through verbatim, so the
+/// variant needs a file-scope definition too. Both halves are asserted
+/// here because either one alone still yields C++ that does not build.
+#[test]
+fn enum_typed_local_lowers_to_an_integer_with_a_defined_variant() {
+    let cpp = v1_cpp(
+        r#"enum Color { RED, GREEN, BLUE }
+test T
+    let dut : Top
+    run
+        let c : Color = BLUE
+        log(info, "${c}")
+    end run
+end test T"#,
+    );
+    assert!(
+        !cpp.contains("VColor"),
+        "an enum-typed local must not become a Verilator DUT handle; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("int64_t c = BLUE;"),
+        "an enum-typed local takes the same integer type an enum-typed \
+         record field does; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static constexpr int64_t RED = 0;")
+            && cpp.contains("static constexpr int64_t GREEN = 1;")
+            && cpp.contains("static constexpr int64_t BLUE = 2;"),
+        "enum variants need file-scope definitions to be usable outside a \
+         `keep`; got:\n{cpp}"
+    );
+}
+
+/// A `const` of the same name outranks a variant. That resolution is
+/// v1's own — the `Ident` arm consults `self.consts` before
+/// `self.enum_variants` — and it is also what TB-IR does, folding both
+/// into one table with the `const` winning. Emitting the variant anyway
+/// would give one C++ name two definitions.
+#[test]
+fn a_const_outranks_a_same_named_enum_variant() {
+    let cpp = v1_cpp(
+        r#"const GREEN : uint<8> = 42
+enum Color { RED, GREEN, BLUE }
+test T
+    let dut : Top
+    run
+        log(info, "${GREEN} ${RED}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("static constexpr uint64_t GREEN = 42;")
+            && !cpp.contains("static constexpr int64_t GREEN ="),
+        "a `const` outranks a same-named variant, and only one definition \
+         may be emitted; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static constexpr int64_t RED = 0;"),
+        "the other variants of that enum are unaffected; got:\n{cpp}"
+    );
+}
+
+/// A variant name that another top-level type already owns cannot become
+/// a file-scope `constexpr`: a variable declaration hides a class name in
+/// the same C++ scope, so defining `Pkt` would turn every later `Pkt p;`
+/// into "must use 'struct' tag to refer to type 'Pkt'" — breaking a
+/// program that compiles today and never mentions the variant.
+///
+/// So the definition is suppressed. DECLARING the clash stays legal,
+/// because constraint position resolves variants through `enum_variants`
+/// and is unaffected; only USING the name as a value is diagnosed.
+#[test]
+fn a_variant_colliding_with_a_type_name_is_suppressed_and_diagnosed_at_use() {
+    let declared_only = r#"transaction Pkt
+    addr : uint<8>
+end transaction Pkt
+enum Kind { Pkt, OTHER }
+test T
+    let dut : Top
+    run
+        let p : Pkt
+        p.addr = 3
+        log(info, "${p.addr}")
+    end run
+end test T"#;
+    let cpp = v1_cpp(declared_only);
+    assert!(
+        !cpp.contains("constexpr int64_t Pkt ="),
+        "a variant colliding with a record name must not be defined; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static constexpr int64_t OTHER = 1;"),
+        "the enum's other variants are still defined; got:\n{cpp}"
+    );
+
+    let used_as_value = r#"transaction Pkt
+    addr : uint<8>
+end transaction Pkt
+enum Kind { Pkt, OTHER }
+test T
+    let dut : Top
+    run
+        let k : Kind = Pkt
+        log(info, "${k}")
+    end run
+end test T"#;
+    let err = v1_cpp_err(used_as_value);
+    assert!(
+        err.contains("`Kind.Pkt`") && err.contains("a type of the same name"),
+        "using the suppressed variant as a value must be diagnosed; got:\n{err}"
+    );
+}
+
+/// One variant name declared by two enums has no correct index, so it
+/// gets no definition either. `enum_variants` resolves this first-wins
+/// because v0 assumes variant names are globally unique — tolerable for a
+/// solver token, but as a value it would silently compile
+/// `let w : WrResp = OKAY` to 0 when `WrResp.OKAY` is 1. A diagnostic
+/// beats a wrong number.
+#[test]
+fn a_variant_declared_by_two_enums_is_suppressed_and_diagnosed_at_use() {
+    let src = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+test T
+    let dut : Top
+    run
+        let w : WrResp = OKAY
+        log(info, "${w}")
+    end run
+end test T"#;
+    let err = v1_cpp_err(src);
+    assert!(
+        err.contains("declared by 2 different enums"),
+        "an ambiguous variant used as a value must be diagnosed; got:\n{err}"
+    );
+    // Not "qualify the use" — HARC has no `Enum.VARIANT` form, and
+    // suggesting one sends the reader at a parse error.
+    assert!(
+        !err.contains("qualify"),
+        "the message must not suggest syntax the language lacks; got:\n{err}"
+    );
+}
+
+/// A `const` initialised from a variant does NOT compile under v1, and
+/// that is deliberate. spec.md's `const` paragraph admits references to
+/// *earlier* const/enum-variant names only ("forward and cyclic
+/// references are compile errors") and names "enum-variant references in
+/// initializers" among the corners TB-IR alone defines — TB-IR rejects a
+/// forward reference by declaration order.
+///
+/// Emitting the variant block ABOVE the consts would make v1 accept both
+/// orders, so v1 would take a program the spec calls an error while the
+/// default backend refuses it. The variant block therefore stays BELOW,
+/// and this test pins the emission order that keeps the two agreeing.
+#[test]
+fn enum_variants_emit_after_consts_so_v1_does_not_outrun_the_const_subset() {
+    let cpp = v1_cpp(
+        r#"enum Color { RED, GREEN, BLUE }
+const LIMIT : uint<8> = BLUE
+test T
+    let dut : Top
+    run
+        log(info, "${LIMIT}")
+    end run
+end test T"#,
+    );
+    // The const names the variant, so it is the case the rule is about:
+    // the initializer emits above `BLUE` and v1 fails to compile, exactly
+    // as the spec says a forward reference must.
+    let konst = cpp
+        .find("static constexpr uint64_t LIMIT = BLUE;")
+        .unwrap_or_else(|| panic!("no LIMIT definition; got:\n{cpp}"));
+    let variant = cpp
+        .find("static constexpr int64_t BLUE = 2;")
+        .unwrap_or_else(|| panic!("no BLUE definition; got:\n{cpp}"));
+    assert!(
+        konst < variant,
+        "consts must be emitted before enum variants, so a `const` cannot \
+         name a variant; got:\n{cpp}"
+    );
+}
+
+/// One enum repeating a name is a malformed enum, not an ambiguity
+/// between two of them, so `collect_unsafe_enum_variants` counts it once
+/// and does NOT suppress it. That makes the emission loop the only thing
+/// standing between `enum E { A, B, A }` and two `constexpr A` definitions
+/// — a C++ redefinition error for a program that merely DECLARES the enum
+/// and never uses it.
+#[test]
+fn a_name_repeated_inside_one_enum_is_defined_once() {
+    let cpp = v1_cpp(
+        r#"enum E { A, B, A }
+test T
+    let dut : Top
+    run
+        log(info, "hi")
+    end run
+end test T"#,
+    );
+    assert_eq!(
+        cpp.matches("static constexpr int64_t A = ").count(),
+        1,
+        "a name repeated inside one enum must be defined once; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static constexpr int64_t A = 0;"),
+        "the first occurrence fixes the index, matching `enum_variants`; got:\n{cpp}"
+    );
+}
+
+/// Names the backend writes into every generated file are not declared by
+/// anything in the user's program, so they cannot be found by inspecting
+/// its items. `main` is the one an ordinary program hits — `enum Phase {
+/// setup, main, teardown }` is unremarkable naming, and a file-scope
+/// `constexpr main` is rejected outright by C++.
+#[test]
+fn a_variant_named_like_a_symbol_the_backend_always_emits_is_suppressed() {
+    let cpp = v1_cpp(
+        r#"enum Kind { main, OTHER }
+test T
+    let dut : Top
+    run
+        log(info, "hi")
+    end run
+end test T"#,
+    );
+    assert!(
+        !cpp.contains("constexpr int64_t main"),
+        "a variant named `main` must not be defined at file scope; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("static constexpr int64_t OTHER = 1;"),
+        "the enum's other variants are unaffected; got:\n{cpp}"
+    );
+}
+
+/// A local or a parameter named like a suppressed variant is a perfectly
+/// good program — C++ scoping hides the file-scope name, which is the same
+/// shadowing the whole `constexpr` approach relies on — and it compiled
+/// before this feature existed. Diagnosing it would reject working code,
+/// so `declared_value_names` gates the diagnostic.
+#[test]
+fn a_local_or_param_named_like_a_suppressed_variant_is_not_diagnosed() {
+    let local = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+test T
+    let dut : Top
+    run
+        let OKAY : uint<8> = 7
+        log(info, "${OKAY}")
+    end run
+end test T"#;
+    let cpp = v1_cpp(local);
+    assert!(
+        cpp.contains("uint64_t OKAY = 7;"),
+        "the local must still be emitted; got:\n{cpp}"
+    );
+
+    let param = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+function twice(OKAY: uint<8>) -> uint<8>
+    return OKAY + OKAY
+end function twice
+test T
+    let dut : Top
+    run
+        log(info, "${twice(3)}")
+    end run
+end test T"#;
+    let cpp = v1_cpp(param);
+    assert!(
+        cpp.contains("OKAY + OKAY"),
+        "the param must still be referenced by name in the body; got:\n{cpp}"
+    );
+}
+
+/// The binder forms that build their C++ name inline rather than through
+/// `emit_let` or `cpp_param_names`: a `for` variable and an `on`-handler
+/// argument (both the test-scope and component-body spellings). Each hides
+/// a file-scope name exactly as a `let` does, so none may draw the
+/// suppressed-variant diagnostic. All three compiled on the backend before
+/// this feature existed, and all three run green on the default backend.
+#[test]
+fn for_and_on_handler_binders_named_like_a_suppressed_variant_are_not_diagnosed() {
+    let dup = "enum RdResp { OKAY, SLVERR }\nenum WrResp { SLVERR, OKAY }\n";
+
+    let for_var = format!(
+        r#"{dup}test T
+    let dut : Top
+    run
+        for OKAY in 0 .. 3
+            log(info, "i=${{OKAY}}")
+        end for
+    end run
+end test T"#
+    );
+    let cpp = v1_cpp(&for_var);
+    assert!(
+        cpp.contains("for (int64_t OKAY = "),
+        "the loop variable must still be emitted by name; got:\n{cpp}"
+    );
+
+    let on_test_scope = format!(
+        r#"{dup}test T
+    let dut : Top
+    run
+        let ev : event<uint<8>>
+        on ev(OKAY)
+            log(info, "got ${{OKAY}}")
+        end on
+        emit ev(5)
+        wait 1 cycle
+    end run
+end test T"#
+    );
+    let cpp = v1_cpp(&on_test_scope);
+    assert!(
+        cpp.contains("ev.push_back([&](uint64_t OKAY) {"),
+        "the handler argument must still be emitted by name; got:\n{cpp}"
+    );
+
+    let on_component = format!(
+        r#"{dup}agent Tagger
+    in_ev : event<uint<8>>
+    last  : uint<8> default 0
+    on in_ev(OKAY)
+        last = OKAY
+    end on
+end agent Tagger
+test T
+    let dut : Top
+    run
+        let tg : Tagger
+        log(info, "ok")
+    end run
+end test T"#
+    );
+    let cpp = v1_cpp(&on_component);
+    assert!(
+        cpp.contains("uint64_t OKAY) {"),
+        "the component handler argument must still be emitted by name; got:\n{cpp}"
+    );
+}
+
+/// The argument for diagnosing at the use site rather than the enum
+/// declaration: constraint position resolves variants through
+/// `enum_variants`, not through the emitted `constexpr`, so a program that
+/// only ever uses an ambiguous name inside a `keep` keeps working under
+/// the documented first-wins rule. Erroring at the declaration would have
+/// rejected it.
+#[test]
+fn a_duplicate_variant_used_only_in_a_keep_is_still_accepted() {
+    let cpp = v1_cpp(
+        r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+transaction Req
+    r : RdResp
+    keep r == OKAY
+end transaction Req
+test T
+    let dut : Top
+    run
+        let t : Req
+        randomize(t)
+        log(info, "${t.r}")
+    end run
+end test T"#,
+    );
+    assert!(
+        cpp.contains("_z_r == _ctx.bv_val((uint64_t)0, 64)"),
+        "constraint position must still resolve the variant index; got:\n{cpp}"
     );
 }
 

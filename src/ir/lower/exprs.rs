@@ -1011,6 +1011,25 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
+                // A bare enum-variant name declared by more than one
+                // enum has no correct index as a value: `consts` folded it
+                // first-wins, so substituting would silently pick one enum's
+                // numbering (harc#666). Reject instead. This is value
+                // position only — constraint lowering resolves variants
+                // through its own path, so a use inside a `keep` still
+                // lowers under the documented first-wins rule. A local of
+                // the same name shadowed this above, so a shadowing binder
+                // is unaffected.
+                if let Some(owners) = self.ctx.ambiguous_variants.get(&id.name) {
+                    return Err(LowerError::Invalid(format!(
+                        "enum variant `{name}`: it is declared by more than one \
+                         enum (`{owners}`), so no single index is correct for a \
+                         bare `{name}`. HARC has no qualified `Enum.VARIANT` form, \
+                         so rename one of them.",
+                        name = id.name,
+                        owners = owners,
+                    )));
+                }
                 // File-scope `const` / enum-variant substitution
                 // (locals shadow — checked above; v1's constexpr /
                 // variant-index emission is value-identical).
@@ -1345,6 +1364,7 @@ impl FuncBuilder<'_> {
                 self.vec_read_ok = saved;
                 self.vec_read_span = saved_span;
                 let (l, r) = (l?, r?);
+                let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
                 // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
@@ -4435,6 +4455,77 @@ impl FuncBuilder<'_> {
     /// The label is `EmitsUncompilable` because that is measured: v1
     /// emits the same `HarcWide<32> < int` and g++ refuses it too, so
     /// `--codegen v1` is not a way out and must not be offered.
+    /// Zero-extend the narrower operand of a mixed-width UNSIGNED
+    /// comparison or division so the two reach `HarcWide`'s homogeneous
+    /// operators at one width.
+    ///
+    /// Implicit widening is how every other width pair in the language
+    /// already compares: `uint<16> > uint<8>` and `uint<128> > uint<64>`
+    /// both lower. Only a pair that crosses into `HarcWide<N>` was
+    /// refused, because `HarcWide`'s six ordered/division operators are
+    /// homogeneous and nothing widened the narrow side for them. That
+    /// made `uint<256> > uint<128>` a hole in an otherwise uniform rule,
+    /// not a rule of its own — and it is a REGRESSION: harc#647 shipped
+    /// a fixture asserting that comparison and harc#653 started refusing
+    /// it (harc#662).
+    ///
+    /// UNSIGNED both sides, and both widths statically known. That is
+    /// the whole precondition, and it is exactly what the refusal's own
+    /// text says is missing: "widening the narrower side needs its
+    /// signedness, which the C++ type does not carry (zero-extending a
+    /// negative `sint` turns -1 into 2^W-1)". The C++ type does not
+    /// carry it, but the IR does — for an unsigned operand
+    /// zero-extension is the value-preserving widening, so the compare
+    /// is exact. A signed operand keeps the refusal, because the wide
+    /// carriers are unsigned and the answer would be by magnitude;
+    /// that is harc#657's to fix, not this one's.
+    ///
+    /// `Expr::WidthCast` with `Zext` is the same node `.zext<N>()`
+    /// lowers to, and the same one the emitter already builds
+    /// `HarcWide<N>` from — measured before writing this: the explicit
+    /// spelling `sb.wide > sb.mid.zext<256>()` compiles and runs
+    /// correctly today. This inserts what the user would otherwise
+    /// have to write.
+    fn zext_mixed_width_unsigned_operands(&self, ir_op: BinOp, l: Expr, r: Expr) -> (Expr, Expr) {
+        // The homogeneous six, and only those. `== !=` already carry a
+        // cross-width `<A, B>` form; `+ - * & | ^` are defined for the
+        // mixed shapes; `<< >>` take an integral count and are judged
+        // by their own arm.
+        if !matches!(
+            ir_op,
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Div | BinOp::Mod
+        ) {
+            return (l, r);
+        }
+        // At least one side must be `HarcWide`. Below that boundary the
+        // pair already lowers, and inserting a cast would churn output
+        // for no reason.
+        if !self.is_wide_scalar(&l) && !self.is_wide_scalar(&r) {
+            return (l, r);
+        }
+        let unsigned_width = |e: &Expr| match self.scalar_assignment_type(e) {
+            Some(IrType::UInt(Some(w))) => Some(w),
+            _ => None,
+        };
+        let (Some(lw), Some(rw)) = (unsigned_width(&l), unsigned_width(&r)) else {
+            return (l, r);
+        };
+        if lw == rw {
+            return (l, r);
+        }
+        let zext = |inner: Expr, from: u32, to: u32| Expr::WidthCast {
+            kind: WidthCastKind::Zext,
+            width: to,
+            src_width: Some(from),
+            inner: Box::new(inner),
+        };
+        if lw < rw {
+            (zext(l, lw, rw), r)
+        } else {
+            (l, zext(r, rw, lw))
+        }
+    }
+
     fn reject_unbuildable_wide_operator(
         &self,
         op: BinaryOp,
@@ -4486,23 +4577,21 @@ impl FuncBuilder<'_> {
                 ));
             }
         }
-        // A wide SHIFT COUNT is its own shape: `HarcWide`'s `<<`/`>>`
-        // take an integral count, so a `HarcWide` on the right SFINAEs
-        // out of them and converts to both `uint64_t` and `_harc_u128`
-        // — ambiguous, at any width including two equal ones. The
-        // shifted value may be as wide as it likes.
+        // A wide SHIFT COUNT lowers. The emitter narrows it to the
+        // integral count `HarcWide`'s `<<`/`>>` take, and the result is
+        // the one C++ gives for an out-of-range shift, which is what
+        // harc#647's fixture asserts (`1 << sb.wide` with `wide = 3` is
+        // 8; a count past the value's width is 0).
+        //
+        // This USED to be refused, on the grounds that a `HarcWide` on
+        // the right SFINAEs out of the shift operators and converts to
+        // both `uint64_t` and `_harc_u128` — ambiguous. That is a
+        // statement about v1's emission, and TB-IR does not emit the
+        // ambiguous shape: measured, its C++ compiles and every
+        // assertion in that fixture passes. Refusing it made TB-IR
+        // lower LESS than v1, which is the wrong direction — TB-IR may
+        // exceed v1, never trail it (harc#662).
         if matches!(ir_op, BinOp::Shl | BinOp::Shr) {
-            if self.is_wide_scalar(r) {
-                return Err(not_implemented(
-                    "a shift COUNT that is a scalar wider than 128 bits",
-                    "`harc_rt::HarcWide<N>` shifts by an ordinary integer, so the count \
-                     must be one; narrow it with `.trunc<32>()`. The shifted value may be \
-                     any width. v1 emits the same expression and its C++ does not compile \
-                     either, so `--codegen v1` is not a way out"
-                        .to_string(),
-                    V1Status::EmitsUncompilable,
-                ));
-            }
             return Ok(());
         }
         let sym = match ir_op {

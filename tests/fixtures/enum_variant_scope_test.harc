@@ -1,0 +1,155 @@
+// Enum variants as ordinary VALUES, and the binder forms that must keep
+// working beside them.
+//
+// The v1 emitter gives each variant a file-scope `static constexpr`, and
+// two variant names cannot have one: a name another emitted C++ symbol
+// owns, and a name more than one enum declares (no single index is
+// right). Those are suppressed and diagnosed at the use site, which is
+// what lets a program merely DECLARE the clash and still build — this
+// file is that program.
+//
+// The declaration/use split is the whole design, and it is invisible to
+// the unit tests, which assert on emitted text and never run a compiler.
+// It is also invisible to every other fixture: this is the only one in
+// the corpus that declares a duplicate variant, so without it the
+// suppression logic and the binder gate ship untested by anything that
+// compiles or executes.
+//
+// Registered in the TB-IR equivalence set, so v1 and the default backend
+// must agree on all of it.
+
+// `SLVERR` and `OKAY` are each declared by BOTH enums, so neither has a
+// single correct index as a value: a bare use is rejected on BOTH
+// backends (v1 in harc#662, TB-IR in harc#666 — before which TB-IR
+// folded it first-wins and silently returned the wrong number). This
+// file therefore never uses one as a value. Constraint position is the
+// exception: it resolves through the solver's own first-wins table, so
+// the `keep resp == OKAY` below is legal and both backends agree on it —
+// which is exactly why the value-position rejection stops at values.
+enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+
+// Unambiguous variants are unaffected and usable as values. An
+// ambiguous one is NOT usable as a value at all — it has no definition —
+// so every value-position use below names one of these.
+enum Color { RED, GREEN, BLUE }
+enum Sev { LOW, MID, HIGH }
+
+// The other three suppression rules, each present as a DECLARATION only.
+// Every one of these is legal and must build: that is the whole point of
+// diagnosing at the use site. Each also breaks the C++ compile the moment
+// its rule regresses, which is what makes them worth carrying here —
+// `A`/`Pkt`/`main` would then get file-scope definitions and collide,
+// and nothing in the unit tests would notice because none of them
+// compiles what it asserts on.
+//
+//   * `Dup` repeats `A` inside ONE enum. Suppression does not apply (one
+//     enum, so an index IS well defined); the emission loop dedups it.
+//     Regression → `redefinition of 'A'`.
+enum Dup { A, B, A }
+//   * `Named` collides with the `Pkt` transaction below, which emits a
+//     `struct Pkt`. Regression → "must use 'struct' tag to refer to
+//     type 'Pkt'" at the `let p : Pkt` further down.
+enum Named { Pkt, ELSEWHERE }
+//   * `Stage` collides with `main`, which the backend emits into every
+//     file. Regression → "main cannot be declared as a variable in the
+//     global scope". (`setup`/`teardown` would be the natural siblings
+//     but are reserved words, hence `alpha`/`omega`.)
+enum Stage { alpha, main, omega }
+
+transaction Pkt
+    addr : uint<8>
+end transaction Pkt
+
+transaction Req
+    sev  : Sev
+    resp : RdResp
+    // Uses an ambiguous name in constraint position only. Must solve to
+    // RdResp's index for `OKAY` (0) under the documented first-wins rule.
+    keep resp == OKAY
+end transaction Req
+
+// A covergroup bin naming an UNAMBIGUOUS variant (`GREEN`, declared only
+// by `Color`) still lowers on both backends — the harc#666 rejection of a
+// bin like `{OKAY}` keys on multiple-declaration, not on a variant
+// appearing in a bin. The ambiguous case cannot live in a passing fixture
+// (it is rejected and does not compile), so it is pinned by the tbir unit
+// tests; this is its accepting complement, exercised end-to-end.
+covergroup ColorCov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            g = {GREEN}
+        end bins
+end covergroup ColorCov
+
+testbench EnumScopeTb
+    dut : Top
+    cov : ColorCov
+end testbench EnumScopeTb
+
+impl EnumVariantScopeTest for EnumScopeTb
+    run
+        // An enum-typed local with an initializer — the shape that used
+        // to emit `VColor* c = BLUE`, a Verilator handle for a module
+        // that does not exist.
+        let picked : Color = BLUE
+        assert picked == BLUE
+            else fail("enum-typed local lost its initializer")
+        assert picked != RED
+            else fail("bare variant compared wrong in expression position")
+
+        // A bare variant assigned into an enum-typed record field.
+        let r : Req
+        r.sev = HIGH
+        assert r.sev == 2
+            else fail("record field assignment from a bare variant is wrong")
+
+        // Binder forms named after a SUPPRESSED variant. Each hides the
+        // file-scope name in C++, so each is a legal program and none may
+        // draw the suppressed-variant diagnostic. Every one of these was
+        // a spurious rejection at some point while this landed.
+        //
+        // Note these names may not ALSO appear in value position anywhere
+        // in this file: the binder set is collected file-globally and is
+        // deliberately permissive, so a binder here suppresses the
+        // diagnostic everywhere. That costs a missed diagnostic, never a
+        // wrong value — the cheap direction, by design.
+        let OKAY : uint<8> = 7
+        assert OKAY == 7
+            else fail("a local named like a suppressed variant was mangled")
+
+        for SLVERR in 0 .. 2
+            assert SLVERR >= 0
+                else fail("a for-variable named like a suppressed variant broke")
+        end for
+
+        // Constraint position over the ambiguous names still resolves.
+        for i in 0 .. 4
+            let t : Req
+            randomize(t)
+            assert t.resp == 0
+                else fail("iter ${i}: `keep resp == OKAY` did not hold")
+        end for
+
+        // `Pkt` the TYPE still resolves, even though `Pkt` is also a
+        // variant of `Named`. This is the line that fails to compile if
+        // the type-collision rule regresses.
+        let p : Pkt
+        p.addr = 9
+        assert p.addr == 9
+            else fail("a record whose name is also a variant broke")
+
+        // The third binder form: an `on` handler argument named after a
+        // suppressed variant. `let` and `for` are covered above; the `on`
+        // argument had two separate lowerings that each went missing.
+        let ev : event<uint<8>>
+        on ev(SLVERR)
+            assert SLVERR == 3
+                else fail("an on-handler arg named like a suppressed variant broke")
+        end on
+        emit ev(3)
+        wait 1 cycle
+
+        log(info, "PASS: enum variants, suppression, and binder shadowing")
+    end run
+end impl EnumVariantScopeTest

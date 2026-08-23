@@ -55,6 +55,17 @@ impl KeepConstraintsTest for KeepConstraintsTb
     clock clk = SysDomain
 
     run
+        // An enum-typed local with an initializer, and a bare variant
+        // used as an ordinary value rather than inside a `keep`. v1 used
+        // to declare the local as `VColor* c` — a Verilator handle for a
+        // module that does not exist — and to emit `BLUE` with nothing
+        // defining it, so the generated C++ did not compile. That is why
+        // every enum use in this file used to be confined to constraint
+        // position.
+        let default_color : Color = BLUE
+        assert default_color == BLUE
+            else fail("enum-typed local lost its initializer")
+
         dut.rst = 1
         dut.en = 0
         wait 2 cycles
@@ -74,8 +85,10 @@ impl KeepConstraintsTest for KeepConstraintsTb
             assert t.addr % 4 == 0
                 else fail("iter ${i}: addr=0x${t.addr:08x} not 4-aligned")
             // RED = 0 (first variant). The codegen translates
-            // `color != RED` to `_z_color != bv_val(0)`.
-            assert t.color != 0
+            // `color != RED` to `_z_color != bv_val(0)`. Spelled `RED`
+            // rather than `0` now that a variant also resolves in
+            // expression position, not only inside a `keep`.
+            assert t.color != RED
                 else fail("iter ${i}: color=RED violates `keep color != RED`")
             // `keep ready` coerces to `ready != 0`, so on one bit the only
             // satisfying value is 1.
