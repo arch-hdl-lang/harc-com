@@ -12037,8 +12037,7 @@ end impl T"#;
     let double_negative = indexed_local.replace("rows[0]", "rows[-(-1)]");
     let double_negative_prog =
         lower_src(&double_negative).expect("an even negation chain preserves a positive index");
-    verify::verify_program(&double_negative_prog)
-        .expect("double-negative indexed lists verify");
+    verify::verify_program(&double_negative_prog).expect("double-negative indexed lists verify");
     let triple_negative = indexed_local.replace("rows[0]", "rows[-(-(-1))]");
     let msg = assert_invalid(
         &lower_src(&triple_negative)
@@ -36888,4 +36887,64 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
                  wait 2 cycles\n    end run\n\
          end test T\n";
     lower_src(counter).expect("`seen = seen + t` on a widthless payload param stays legal");
+}
+
+/// A fixed-vector ELEMENT wider than 64 bits keeps its width in the
+/// emitted member.
+///
+/// The differential harness typechecks both backends, and
+/// `std::array<uint64_t, 4>` for a `Vec<uint<1024>, 4>` compiles
+/// perfectly — it just keeps a sixteenth of each element. Only the
+/// member TEXT distinguishes the fix from the bug it replaced, so it is
+/// asserted here, against v1's own answer.
+#[test]
+fn a_wide_fixed_vector_element_keeps_its_width() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor SrcV
+    v : Vec<{ty}, 4>
+    n : uint<32> default 0
+
+    hookable bump(x: uint<8>)
+        v[0] = 1
+        n = n + 1
+    end bump
+end transactor SrcV
+
+testbench TbWv
+    dut : Top
+    src : SrcV passive
+end testbench TbWv
+
+impl TWv for TbWv
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TWv
+"#
+        )
+    };
+    for (ty, member) in [
+        ("uint<8>", "std::array<uint64_t, 4> v{};"),
+        ("uint<64>", "std::array<uint64_t, 4> v{};"),
+        ("uint<128>", "std::array<_harc_u128, 4> v{};"),
+        ("uint<1024>", "std::array<harc_rt::HarcWide<32>, 4> v{};"),
+        ("sint<64>", "std::array<int64_t, 4> v{};"),
+        ("bool", "std::array<bool, 4> v{};"),
+    ] {
+        let src = prog(ty);
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(member),
+            "`Vec<{ty}, 4>`: tbir must emit `{member}`, got:\n{cpp}"
+        );
+        // v1 is the oracle for the member, not this test's memory of it.
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(member),
+            "`Vec<{ty}, 4>`: v1 emits `{member}` too — the two agree"
+        );
+    }
 }

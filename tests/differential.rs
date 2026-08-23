@@ -121,11 +121,21 @@ fn tb_verdict(cc: &str, src: &str, dir: &Path, stem: &str) -> TbVerdict {
         // nobody can compile has produced a defect with no diagnostic,
         // so the emitted output is typechecked too — the suite had no
         // way to notice that before this harness existed.
-        Ok(prog) => match harc::codegen::tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()) {
-            Err(e) => TbVerdict::LowersUncompilable(format!("tbir emitter refused: {e}")),
-            Ok(cpp) => match compile(cc, &cpp, dir, &format!("{stem}-tbir")) {
-                None => TbVerdict::Lowers,
-                Some(err) => TbVerdict::LowersUncompilable(err),
+        // VERIFY, then emit. `harc dump-ir` and `harc sim` both run the
+        // verifier between the two, and this harness did not — so a
+        // program that lowered and failed verification scored as
+        // `Lowers`, which is how a wide fixed-vector element read as
+        // "already works" while the real pipeline rejected it. Measure
+        // the pipeline the compiler runs, not a prefix of it.
+        Ok(prog) => match harc::ir::verify::verify_program(&prog) {
+            Err(e) => TbVerdict::LowersUncompilable(format!("tbir verifier refused: {e:?}")),
+            Ok(()) => match harc::codegen::tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+            {
+                Err(e) => TbVerdict::LowersUncompilable(format!("tbir emitter refused: {e}")),
+                Ok(cpp) => match compile(cc, &cpp, dir, &format!("{stem}-tbir")) {
+                    None => TbVerdict::Lowers,
+                    Some(err) => TbVerdict::LowersUncompilable(err),
+                },
             },
         },
         Err(lower::LowerError::Unsupported { construct, .. }) => TbVerdict::Unsupported(construct),
@@ -1086,6 +1096,111 @@ end impl TCF2
     );
 }
 
+/// The 64-bit cap on `scalar_ir_type`, which gates exactly two things:
+/// an event PAYLOAD type and a fixed-vector ELEMENT type.
+///
+/// The declared-field width work deliberately did not touch this
+/// function, and said why in its doc comment: "an event payload is a
+/// `std::function` parameter type and a fixed-vector element is an
+/// `std::array` element, and neither emitter has been shown to carry a
+/// width past 64". Both still render through a hardcoded
+/// `(bool | int64_t | uint64_t)` triple, so opening the gate without
+/// fixing them would trade a refusal for a silently truncated member.
+///
+/// This space is what "has been shown" means. It measures each site at
+/// each width against v1, on both hosts, and separately from the other,
+/// because there is no reason the two must move together.
+#[test]
+fn the_event_payload_and_vector_element_width_gate() {
+    let widths = &["uint<8>", "uint<64>", "uint<65>", "uint<128>", "uint<1024>"];
+
+    // Event payload, on an unbound transactor with an emit site and a
+    // subscriber — the shape that exercises the `std::function`
+    // parameter type rather than just declaring the member.
+    let payload = r#"
+transactor Src
+    ev : out event<@@TY@@>
+    n  : uint<32> default 0
+
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor Src
+
+scoreboard Sink
+    seen : uint<32> default 0
+
+    hookable observe(v: @@TY@@)
+        seen = seen + 1
+    end observe
+end scoreboard Sink
+
+env EvEnv
+    src  : Src passive
+    sink : Sink
+
+    connect
+        src.ev -> sink.observe
+    end connect
+end env EvEnv
+
+testbench TbEv
+    dut : Top
+    e : EvEnv
+end testbench TbEv
+
+impl TEv for TbEv
+    run
+        e.src.bump(1)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TEv
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control("event-payload-width", payload, "@@TY@@", "uint<8>", widths)
+    );
+
+    // Fixed-vector element, declared and INDEXED — a declaration that
+    // widens while its element access does not would be worse than the
+    // refusal it replaced.
+    let vec_elem = r#"
+transactor Src2
+    v : Vec<@@TY@@, 4>
+    n : uint<32> default 0
+
+    hookable bump(x: uint<8>)
+        v[0] = 1
+        n = n + 1
+    end bump
+end transactor Src2
+
+testbench TbVec
+    dut : Top
+    src : Src2 passive
+end testbench TbVec
+
+impl TVec for TbVec
+    run
+        src.bump(1)
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl TVec
+"#;
+    eprintln!(
+        "{}",
+        check_space_with_control(
+            "vector-element-width",
+            vec_elem,
+            "@@TY@@",
+            "uint<8>",
+            widths
+        )
+    );
+}
+
 /// Shapes the wide-operator guard must NOT fire on.
 ///
 /// A guard that refuses a program v1 builds is as wrong as one that
@@ -1410,6 +1525,85 @@ end impl T7
                     "{site}: `default {lit}` does not fit a `u64` slot; it must be refused \
                      as NotImplemented{{SilentlyMisLowers}}, got {other:?}"
                 ),
+            }
+        }
+    }
+}
+
+/// What v1 actually EMITS at the two gated sites, past 64 bits.
+///
+/// `check_space` reports v1 as "compiles", which is not the same as
+/// "correct". A member v1 declares as `uint64_t` for a `uint<1024>`
+/// element compiles perfectly and drops fifteen sixteenths of the
+/// value; that is `SilentlyMisLowers`, and it makes the honest fix a
+/// re-grade rather than an implementation. Printed, not asserted —
+/// this is the measurement that decides which of the two it is.
+#[test]
+fn what_v1_emits_for_a_wide_payload_or_vector_element() {
+    for (label, src) in [
+        (
+            "Vec<uint<1024>, 4> element",
+            r#"
+transactor Src2
+    v : Vec<uint<1024>, 4>
+    n : uint<32> default 0
+    hookable bump(x: uint<8>)
+        v[0] = 1
+        n = n + 1
+    end bump
+end transactor Src2
+
+testbench TbVec
+    dut : Top
+    src : Src2 passive
+end testbench TbVec
+
+impl TVec for TbVec
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TVec
+"#,
+        ),
+        (
+            "event<uint<1024>> payload",
+            r#"
+transactor Src
+    ev : out event<uint<1024>>
+    n  : uint<32> default 0
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor Src
+
+testbench TbEv
+    dut : Top
+    src : Src passive
+end testbench TbEv
+
+impl TEv for TbEv
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TEv
+"#,
+        ),
+    ] {
+        let parsed = parse_source(src).expect("parses");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+        let cpp = cpp_tb::emit(&merged).expect("v1 emits");
+        eprintln!("\n=== v1 for {label}");
+        for line in cpp.lines() {
+            let t = line.trim();
+            if t.contains(" v;")
+                || t.contains(" v{")
+                || t.contains("std::array")
+                || t.contains("std::function")
+                || t.starts_with("std::vector<std::function")
+            {
+                eprintln!("    {t}");
             }
         }
     }

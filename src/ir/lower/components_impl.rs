@@ -1491,7 +1491,7 @@ fn lower_field(
                 ));
             }
             let elem = match args.first() {
-                Some(TypeArg::Type(ty)) => scalar_ir_type(ty),
+                Some(TypeArg::Type(ty)) => vec_elem_scalar_ir_type(ty),
                 _ => None,
             }
             .filter(|ty| matches!(ty,
@@ -3004,7 +3004,7 @@ pub(crate) fn lower_event_payload(
                     return Ok(EventPayload::Record(*rid));
                 }
             }
-            match scalar_ir_type(ty) {
+            match event_payload_scalar_ir_type(ty) {
                 Some(IrType::SInt(_)) => Ok(EventPayload::Scalar { signed: true }),
                 Some(IrType::UInt(_)) | Some(IrType::Bool) => {
                     Ok(EventPayload::Scalar { signed: false })
@@ -3071,20 +3071,40 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
-/// The component EVENT-payload and FIXED-VECTOR scalar subset, capped at
-/// 64 bits. Queue elements call `decoded_scalar_ir_type` directly
-/// because their shared storage path already supports `_harc_u128` and
-/// `HarcWide<N>`; declared scalar FIELDS go through
-/// `scalar_field_ir_type` below for the same reason.
+/// The component EVENT-payload scalar subset, capped at 64 bits.
 ///
-/// The three subsets are separate on purpose. An event payload is a
-/// `std::function` parameter type and a fixed-vector element is an
-/// `std::array` element, and neither emitter has been shown to carry a
-/// width past 64 — widening the field sites through this one function
-/// would have widened both of those unmeasured.
-fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+/// This function used to gate the fixed-vector ELEMENT type as well,
+/// and its comment said the two were "separate on purpose … neither
+/// emitter has been shown to carry a width past 64". Measured: v1
+/// emits `std::array<harc_rt::HarcWide<32>, 4>` for a
+/// `Vec<uint<1024>, 4>` and
+/// `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for an
+/// `event<uint<1024>>`, so BOTH are real gaps rather than mislabels.
+///
+/// They are still separate, for a reason that outlived the comment:
+/// `FixedVecSchema` carries a full `IrType` and only its emitter
+/// truncated, while `EventPayload::Scalar { signed: bool }` has NO
+/// width field at all. The vector half is a one-line emitter fix; the
+/// payload half needs the IR to be able to say the width first. Only
+/// the vector half has moved.
+fn event_payload_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t)
         .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
+}
+
+/// The fixed-vector ELEMENT subset. `FixedVecSchema` carries a full
+/// `IrType` and every consumer of it already reads one —
+/// `ir_vec_elem_class` has always rendered `_harc_u128` past 64 bits
+/// and `HarcWide<N>` past 128 — so the only thing that capped a `Vec`
+/// element at 64 was this gate plus a hardcoded
+/// `(bool | int64_t | uint64_t)` triple in the emitter. Both moved
+/// together; opening the gate alone would have turned a refusal into a
+/// silently truncated `std::array` element.
+///
+/// Same width policy as any declared scalar field, so a `Vec` element
+/// and a plain field agree about what a width means.
+fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
 }
 
 /// The scalar subset of a DECLARED component/scoreboard/testbench
@@ -3133,7 +3153,7 @@ pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {
-    match scalar_ir_type(t) {
+    match event_payload_scalar_ir_type(t) {
         Some(IrType::UInt(Some(w))) | Some(IrType::SInt(Some(w))) => Some(w),
         Some(IrType::Bool) => Some(1),
         _ => None,

@@ -13,7 +13,7 @@
 
 mod addrmap;
 mod bus;
-mod components;
+pub(crate) mod components;
 pub(crate) use components::endpoint_label;
 mod control;
 mod covergroups;

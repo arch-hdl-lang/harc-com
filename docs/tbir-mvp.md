@@ -8771,6 +8771,56 @@ former `transaction` group lives in
      pairing is outside the harness's three falsifiable directions, so
      it is reported here rather than asserted.
 
+137. **The harness was measuring a prefix of the compiler
+     (2026-08-23).**
+
+     `scalar_ir_type` gated two things — an event PAYLOAD type and a
+     fixed-vector ELEMENT type — and divergence 134 deliberately left
+     it alone, recording why: "neither emitter has been shown to carry
+     a width past 64 — widening the field sites through this one
+     function would have widened both of those unmeasured."
+
+     Measured now. v1 emits
+     `std::array<harc_rt::HarcWide<32>, 4>` for a `Vec<uint<1024>, 4>`
+     and `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for
+     an `event<uint<1024>>`. Both are real gaps, not mislabels.
+
+     Only the VECTOR half moved, and the reason the two are still
+     separate outlived the comment that separated them:
+     `FixedVecSchema` carries a full `IrType`, so its width was
+     representable and only the emitter truncated;
+     `EventPayload::Scalar { signed: bool }` has no width field at all,
+     so the payload half needs the IR to be able to say a width before
+     anything else can happen.
+
+     **The finding is about the harness, not the feature.** Opening the
+     vector gate, `differential.rs` reported every width as `LOWERS` —
+     and the real pipeline rejected them. `tb_verdict` ran
+     `lower_program` then `emit`, and `harc dump-ir` / `harc sim` both
+     run `verify_program` BETWEEN those two. A program that lowered and
+     failed verification scored as "works". The tool built to stop
+     exactly this class of self-deception had a hole of the same
+     shape, and what caught the defect was an ordinary assertion in
+     `tests/tbir.rs`.
+
+     It runs the verifier now. Re-running every space produced zero
+     other verifier refusals, so the hole was hiding exactly one
+     defect — one this batch had just created. A paired mutation
+     records the hole itself: revert the verifier's cap AND the
+     harness's verify step, and `--test differential` passes a program
+     the compiler rejects.
+
+     **Third site, again.** `verify.rs` carried its own hardcoded
+     `*w <= 64` for fixed-vector elements, the lowering gate and the
+     emitter being the other two. It asks `field_scalar_width_ok` now.
+     That makes three consecutive divergences whose central defect was
+     one rule living in three places — the enum grade (134-136), the
+     scalar decoder (adopted from `main` at a merge), and now this. It
+     is the dominant failure mode in this file, not an incidental one.
+
+     The FixedVec emitter held the fifth and last copy of the
+     `(bool | int64_t | uint64_t)` triple.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

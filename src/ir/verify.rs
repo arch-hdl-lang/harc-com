@@ -893,10 +893,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 );
             }
             if let ComponentFieldKind::FixedVec(vec) = &field.kind {
+                // The THIRD site of one width policy — the lowering
+                // gate and the emitter were the other two. A
+                // hardcoded `<= 64` here rejected a program lowering
+                // had just accepted, which is an internal error rather
+                // than a diagnostic. It asks
+                // `components::field_scalar_width_ok` now, the same
+                // function the gate uses.
                 let valid_elem = matches!(
                     &vec.elem,
-                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w))
-                        if *w > 0 && *w <= 64
+                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w)) if *w > 0
+                ) && crate::ir::lower::components::field_scalar_width_ok(
+                    &vec.elem,
                 ) || matches!(&vec.elem, crate::ir::IrType::Bool);
                 if vec.len == 0 || !valid_elem {
                     errs.push(VerifyError::BadProgramRef {
