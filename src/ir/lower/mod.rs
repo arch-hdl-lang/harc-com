@@ -3768,12 +3768,20 @@ fn lower_test(
                     ));
                 }
                 if l.value.is_some() {
-                    return Err(unsupported(
+                    // Not `unsupported`: v1 is no escape hatch here. It
+                    // types the local through `c_type_for`'s "Verilator
+                    // DUT handle" rule and emits `V<Name>* x = ...` for
+                    // a type no DUT defines, so pointing at `--codegen
+                    // v1` sent the user to a clang error about generated
+                    // code. v1 now rejects the form outright.
+                    return Err(not_implemented(
                         &format!(
                             "component instance `let {}` with an initializer",
                             l.name.name
                         ),
-                        "components default-construct",
+                        "components default-construct — drop the initializer, or use \
+                         `= bind <bus-binding>` for a bound component/transactor",
+                        V1Status::Rejects,
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
