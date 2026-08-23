@@ -2756,6 +2756,8 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
     Emitter {
         out: String::new(),
         errors: Vec::new(),
+        unsafe_variants: Default::default(),
+        declared_value_names: Default::default(),
         txn_fields,
         record_fields,
         txn_keeps: std::collections::HashMap::new(),
@@ -3498,6 +3500,7 @@ fn emitter_from_seed(seed: EmitterSeed) -> Emitter {
     Emitter {
         out: String::new(),
         errors: Vec::new(),
+        declared_value_names: Default::default(),
         pointer_vars: std::collections::HashSet::new(),
         let_types: std::collections::HashMap::new(),
         let_widths: std::collections::HashMap::new(),
@@ -3512,6 +3515,7 @@ fn emitter_from_seed(seed: EmitterSeed) -> Emitter {
         record_fields: seed.record_fields,
         enums: seed.enums,
         enum_variants: seed.enum_variants,
+        unsafe_variants: Default::default(),
         consts: seed.consts,
         const_widths: seed.const_widths,
         properties: seed.properties,
@@ -6044,6 +6048,35 @@ struct Emitter {
     /// constraint translator to resolve bare references to enum
     /// variants (e.g. `keep op != WRAP`) into their numeric encoding.
     enum_variants: std::collections::HashMap<String, i64>,
+    /// Variant names that could NOT be given a file-scope `constexpr`
+    /// definition, mapped to why. Two things disqualify a name: another
+    /// emitted top-level C++ symbol already claims it (a transaction,
+    /// struct, component, bus, ... or an `extern function`), or more than
+    /// one enum declares it, so no single index is the right answer.
+    ///
+    /// Emitting anyway is not an option in either case. A `constexpr` that
+    /// shadows a struct name makes every later `Foo f;` a hard C++ error
+    /// ("must use 'struct' tag"), and an ambiguous variant would silently
+    /// resolve to the first enum's index — `enum WrResp { SLVERR, OKAY }`
+    /// reading `OKAY` as 0. Silence is the worse failure of the two, so
+    /// the definition is suppressed and a use of the name is diagnosed.
+    ///
+    /// Consulted at the USE site rather than the declaration: constraint
+    /// position resolves variants through `enum_variants` under its own
+    /// documented first-wins rule and keeps working, so merely DECLARING
+    /// a duplicate or a collision stays legal, as it is today.
+    unsafe_variants: std::collections::HashMap<String, String>,
+    /// Every name the emitter has bound as a local or a parameter so far.
+    /// Consulted ONLY to suppress the `unsafe_variants` diagnostic: a
+    /// `let OKAY : uint<8> = 7` beside an ambiguous variant `OKAY` is a
+    /// perfectly good program — C++ scoping hides the file-scope name, and
+    /// on `main` it compiled — so diagnosing it would reject working code.
+    ///
+    /// Deliberately permissive and never scope-popped. A stale entry costs
+    /// a MISSED diagnostic (the user still gets the C++ error this backend
+    /// produced before), while a missing entry costs a REJECTED working
+    /// program. Those are not symmetric, so the set errs toward silence.
+    declared_value_names: std::collections::HashSet<String>,
     /// File-scope integer constants. Randomize constraints may reference
     /// these by source name; emission lowers them to literal Z3 values.
     consts: std::collections::HashMap<String, String>,
@@ -7498,6 +7531,11 @@ impl Emitter {
             StmtKind::For(f) => {
                 self.pad(depth);
                 let var = &f.var.name;
+                // A `for` variable binds a C++ name that hides any
+                // file-scope one, exactly as a `let` does — register it so a
+                // loop variable named like a suppressed enum variant is not
+                // diagnosed. (`emit_let` does the same for `let`.)
+                self.declared_value_names.insert(var.clone());
                 if let ExprKind::RangeLit {
                     lo: Some(lo),
                     hi: Some(hi),
@@ -8762,6 +8800,9 @@ impl Emitter {
                     .cloned()
                     .unwrap_or_else(|| "int64_t".into());
                 self.pad(depth);
+                // The handler argument is a lambda parameter — another
+                // binder that hides a file-scope name.
+                self.declared_value_names.insert(arg_name.clone());
                 writeln!(
                     self.out,
                     "{instance}.{event_name}.push_back([&]({arg_ty} {arg_name}) {{",
@@ -9186,6 +9227,7 @@ impl Emitter {
             HookSide::Post => "post",
         };
         let param_names = cpp_param_names(&params);
+        self.declared_value_names.extend(param_names.iter().cloned());
         let arg_decls: Vec<String> = params
             .iter()
             .enumerate()
@@ -11669,6 +11711,7 @@ impl Emitter {
         let comp_ty = &c.name.name;
         let m_name = &h.name.name;
         let param_names = cpp_param_names(&h.params);
+        self.declared_value_names.extend(param_names.iter().cloned());
         let ret = h
             .return_ty
             .as_ref()
@@ -12257,6 +12300,347 @@ impl Emitter {
         writeln!(self.out, "").ok();
     }
 
+    /// File-scope C++ names this backend writes into EVERY generated file,
+    /// which therefore cannot also be an enum variant's `constexpr`.
+    /// Unlike a record or component name, nothing in the user's program
+    /// declares these, so `collect_unsafe_enum_variants` cannot discover
+    /// them by inspection.
+    ///
+    /// `main` is the only one an ordinary program is likely to hit — `enum
+    /// Stage { alpha, main, omega }` is unremarkable naming, and lowercase
+    /// variants are spec-sanctioned (`enum Severity { debug, info, ... }`).
+    /// That example would read more naturally as `{ setup, main, teardown
+    /// }`, but `setup` and `teardown` are reserved words and do not parse.
+    ///
+    /// The rest are cheap to cover and cost nothing to list.
+    const RESERVED_EMITTED_NAMES: &[&str] = &[
+        "main",
+        "HarcTestContext",
+        "HarcTraceC",
+        "harc_rng",
+        "harc_rng_next",
+    ];
+
+    /// Seed `declared_value_names` from the AST, once, before any emission.
+    ///
+    /// This replaces registering each binder at its own emission site.
+    /// Five such sites surfaced across three review passes — two `for`
+    /// flavors, the synchronous and actor lowerings of `on <event>(arg)`,
+    /// and `on bus.<ch>.handshake(arg)` — each found only by reading a
+    /// different emission path. The set is not closable by inspection,
+    /// because one HARC binder can have several lowerings and a new one
+    /// can be added without touching anything this feature owns.
+    ///
+    /// A walker is the right tool HERE and the wrong tool for emission,
+    /// but NOT because a gap here is harmless — read the consumer before
+    /// concluding that. It diagnoses when the name is ABSENT
+    /// (`if !declared_value_names.contains(..)`), so the two directions
+    /// cost:
+    ///
+    ///   * missing a name  → the diagnostic fires → a WORKING PROGRAM IS
+    ///     REJECTED. This is the expensive direction, and it is the exact
+    ///     false-positive class that took three review passes to close.
+    ///   * over-collecting → the diagnostic stays silent → a missed
+    ///     diagnostic, leaving the user the same raw C++ error this
+    ///     backend produced before the feature existed. Cheap.
+    ///
+    /// What makes a walker safe here is the opposite property from the one
+    /// that makes an emission walker dangerous: over-collection is free,
+    /// so the walker can be as liberal as it likes, and a gap is backed by
+    /// the per-site registrations below. It collects every `Ident`
+    /// argument of an `on` handler's event expression, whatever the
+    /// handler's eventual lowering, rather than mirroring
+    /// `extract_event_subscription` / `extract_bus_handshake_event` and
+    /// drifting from them later.
+    ///
+    /// The per-emission-site registrations are KEPT alongside this and are
+    /// LOAD-BEARING, not redundancy — do not delete them as cleanup. Both
+    /// mechanisms only ever INSERT into the same set, so their result is a
+    /// union and neither can contradict the other, and the union is what
+    /// covers the arms this walker does not descend into. Two are known
+    /// and verified: a binder inside a `phase <name>` block
+    /// (`TestItem::Phase`) and one inside a `watchdog` body
+    /// (`ComponentItem::Watchdog`) reach emission with only the per-site
+    /// insert to register them. Conversely, the two sites with NO per-site
+    /// registration — the `on bus.<ch>.handshake(arg)` argument and the
+    /// actor lowering of `on <event>(arg)` — depend entirely on this
+    /// walker. Each mechanism covers what the other misses.
+    fn seed_declared_value_names(&mut self, file: &SourceFile) {
+        fn from_block(out: &mut std::collections::HashSet<String>, b: &Block) {
+            for st in &b.stmts {
+                from_stmt(out, st);
+            }
+        }
+        fn from_on(out: &mut std::collections::HashSet<String>, h: &OnHandler) {
+            // `on ev(arg)`, `on bus.w.handshake(arg)`, `on drv.req(arg)` —
+            // every spelling puts the binder in the call's argument list.
+            if let ExprKind::Call { args, .. } = &*h.event.kind {
+                for a in args {
+                    if let CallArg::Expr(e) = a {
+                        if let ExprKind::Ident(id) = &*e.kind {
+                            out.insert(id.name.clone());
+                        }
+                    }
+                }
+            }
+            from_block(out, &h.body);
+        }
+        fn from_stmt(out: &mut std::collections::HashSet<String>, st: &Stmt) {
+            match &st.kind {
+                StmtKind::Let(l) => {
+                    out.insert(l.name.name.clone());
+                }
+                StmtKind::For(f) => {
+                    out.insert(f.var.name.clone());
+                    from_block(out, &f.body);
+                }
+                StmtKind::Repeat(r) => from_block(out, &r.body),
+                StmtKind::Loop(b) => from_block(out, b),
+                StmtKind::While { body, .. } => from_block(out, body),
+                StmtKind::If(i) => {
+                    from_block(out, &i.then_block);
+                    for (_, b) in &i.elsifs {
+                        from_block(out, b);
+                    }
+                    if let Some(b) = &i.else_block {
+                        from_block(out, b);
+                    }
+                }
+                StmtKind::Fork(f) => {
+                    for b in &f.branches {
+                        from_block(out, b);
+                    }
+                }
+                StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => {
+                    for b in bs {
+                        from_block(out, b);
+                    }
+                }
+                StmtKind::Select(arms) => {
+                    for a in arms {
+                        from_block(out, &a.action);
+                    }
+                }
+                StmtKind::On(h) => from_on(out, h),
+                StmtKind::After { body, .. } => from_block(out, body),
+                _ => {}
+            }
+        }
+
+        let mut out = std::mem::take(&mut self.declared_value_names);
+        for it in &file.items {
+            match it {
+                Item::Function(f) => {
+                    out.extend(cpp_param_names(&f.params));
+                    from_block(&mut out, &f.body);
+                }
+                Item::Tseq(t) => {
+                    out.extend(cpp_param_names(&t.params));
+                    from_block(&mut out, &t.body);
+                }
+                Item::ExternFn(f) => out.extend(cpp_param_names(&f.params)),
+                _ => {}
+            }
+        }
+
+        // Component-shaped declarations: their items carry handler
+        // arguments, hookable/method params, and lifecycle-phase blocks.
+        fn from_component_items(
+            out: &mut std::collections::HashSet<String>,
+            items: &[ComponentItem],
+        ) {
+            for ci in items {
+                match ci {
+                    ComponentItem::OnHandler(h) => from_on(out, h),
+                    ComponentItem::Hookable(h) => {
+                        out.extend(cpp_param_names(&h.params));
+                        from_block(out, &h.body);
+                    }
+                    ComponentItem::TargetTlmThread(t) => {
+                        out.extend(cpp_param_names(&t.params));
+                        from_block(out, &t.body);
+                    }
+                    ComponentItem::Lifecycle(_, b) => from_block(out, b),
+                    ComponentItem::Watchdog(w) => from_block(out, &w.body),
+                    _ => {}
+                }
+            }
+        }
+
+        for it in &file.items {
+            match it {
+                Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
+                    out.extend(cpp_param_names(&c.params));
+                    from_component_items(&mut out, &c.items);
+                }
+                Item::Transactor(t) => {
+                    out.extend(cpp_param_names(&t.params));
+                    from_component_items(&mut out, &t.items);
+                    if let Some(active) = &t.when_active {
+                        from_component_items(&mut out, active);
+                    }
+                }
+                Item::Test(t) => {
+                    out.extend(cpp_param_names(&t.params));
+                    for ti in &t.items {
+                        match ti {
+                            TestItem::Let(l) => {
+                                out.insert(l.name.name.clone());
+                            }
+                            TestItem::Stmt(st) => from_stmt(&mut out, st),
+                            TestItem::Phase(_, b) => from_block(&mut out, b),
+                            TestItem::Scope(sc) => {
+                                for b in [&sc.setup, &sc.run, &sc.check, &sc.teardown]
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    from_block(&mut out, b);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.declared_value_names = out;
+    }
+
+    /// Variant names that must NOT get a file-scope `constexpr`, mapped to
+    /// the reason, for the diagnostic a use of one produces.
+    ///
+    /// Three disqualifiers, each a case where emitting the definition is
+    /// worse than not having one:
+    ///
+    /// * **A declared type already owns the name.** Transactions, structs,
+    ///   scoreboards, components, transactors and covergroups emit a
+    ///   `struct <Name>`, and `extern function`s emit C-linkage
+    ///   declarations. A variable declaration hides a class name in the
+    ///   same scope, so `enum Kind { Pkt }` beside `transaction Pkt` turns
+    ///   every later `Pkt p;` into "must use 'struct' tag to refer to type
+    ///   'Pkt'" — a program that compiles today.
+    ///
+    ///   Only those kinds. Enums emit no C++ symbol at all, buses emit
+    ///   only `<Bus>_<chan>_payload`, and regblocks/addrmaps emit
+    ///   `<Name>_Mirror` and friends — none claims the bare name, so
+    ///   listing them would reject working programs on a false premise.
+    ///   An earlier revision did list them; the branch below records it.
+    /// * **The backend always emits the name.** `RESERVED_EMITTED_NAMES`.
+    ///   Nothing in the user's program declares these, so no amount of
+    ///   inspecting its items will find them.
+    /// * **More than one enum declares it.** No single index is right:
+    ///   `enum RdResp { OKAY, SLVERR }` and `enum WrResp { SLVERR, OKAY }`
+    ///   disagree about both names. The `enum_variants` map resolves this
+    ///   first-wins because v0 assumes variant names are globally unique
+    ///   (see its construction), which is tolerable for a solver token but
+    ///   not for a value: `let w : WrResp = OKAY` would compile to 0.
+    ///
+    /// A name repeated inside ONE enum is NOT here — that is a malformed
+    /// enum rather than an ambiguity between two, so an index is still
+    /// well defined and the emission loop dedups it instead.
+    ///
+    /// A `const` of the same name is NOT here either: that one has a
+    /// defined answer (the `const` wins, as in constraint lowering), so it
+    /// is skipped silently by the caller rather than diagnosed.
+    fn collect_unsafe_enum_variants(
+        &self,
+        file: &SourceFile,
+        const_names: &std::collections::HashSet<String>,
+    ) -> std::collections::HashMap<String, String> {
+        // How many enums declare each variant name, and one owning enum to
+        // name in the message.
+        let mut decl_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut first_owner: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for it in &file.items {
+            if let Item::Enum(e) = it {
+                // A variant repeated WITHIN one enum counts once — that is
+                // a malformed enum, not an ambiguity between two of them,
+                // and it is not this function's error to report.
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for v in &e.variants {
+                    if !seen.insert(v.name.as_str()) {
+                        continue;
+                    }
+                    *decl_count.entry(v.name.as_str()).or_insert(0) += 1;
+                    first_owner.entry(v.name.as_str()).or_insert(&e.name.name);
+                }
+            }
+        }
+
+        let extern_fns: std::collections::HashSet<&str> = file
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::ExternFn(f) => Some(f.name.name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let mut out = std::collections::HashMap::new();
+        for (name, count) in decl_count {
+            if const_names.contains(name) {
+                continue;
+            }
+            let reason = if count > 1 {
+                Some(format!(
+                    "it is declared by {count} different enums, so no single \
+                     index is correct for a bare `{name}`. HARC has no \
+                     qualified `Enum.VARIANT` form, so rename one of them"
+                ))
+            } else if Self::RESERVED_EMITTED_NAMES.contains(&name) {
+                // A symbol the backend writes into every file, so no
+                // declaration in the user's program marks the clash. `main`
+                // is the one a real program hits — `enum Phase { setup,
+                // main, teardown }` is ordinary naming — and a file-scope
+                // `constexpr main` is rejected outright by C++.
+                Some(format!(
+                    "the generated C++ always defines `{name}` itself, so a \
+                     variant of that name cannot also be defined. Rename the \
+                     variant, or build with the default backend, which \
+                     substitutes the index at the use site and is unaffected"
+                ))
+            } else if self.is_record_type(name)
+                || self.scoreboards.contains(name)
+                || self.components.contains_key(name)
+                || self.transactors.contains_key(name)
+                || self.covergroups.contains_key(name)
+            {
+                // Exactly the declarations that emit a `struct <Name>`; see
+                // the three `struct {}` emission sites. Enums emit no C++
+                // symbol at all, buses emit none of their own name, and
+                // regblocks/addrmaps emit `<Name>_Mirror` — none of those
+                // claims the bare name, so listing them here would reject
+                // working programs while telling the reader something untrue
+                // about why.
+                Some(format!(
+                    "a type of the same name is declared in this program, and \
+                     the C++ this backend emits gives both the one identifier \
+                     `{name}`. Rename the variant or the type, or build with \
+                     the default backend, which substitutes the index at the \
+                     use site and is unaffected"
+                ))
+            } else if extern_fns.contains(name) {
+                Some(format!(
+                    "an `extern function {name}` is declared in this program, \
+                     and the C++ this backend emits gives both the one \
+                     identifier `{name}`. Rename the variant or the function, \
+                     or build with the default backend, which substitutes the \
+                     index at the use site and is unaffected"
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let owner = first_owner.get(name).copied().unwrap_or("");
+                out.insert(name.to_string(), format!("`{owner}.{name}`: {reason}"));
+            }
+        }
+        out
+    }
+
     fn is_record_type(&self, name: &str) -> bool {
         self.transactions.contains(name) || self.structs.contains(name)
     }
@@ -12645,6 +13029,18 @@ impl Emitter {
             if let Some(last) = name.segments.last().map(|s| s.name.as_str()) {
                 if self.is_record_type(last) {
                     return last.to_string();
+                }
+                // An enum is a value type, not a DUT module — falling
+                // through to `c_type_for` below would declare
+                // `VColor* c = RED;` for `let c : Color = RED`, and
+                // `VColor` is a Verilator handle for a module that does
+                // not exist. Route it through the SAME mapping an
+                // enum-typed record FIELD gets (`int64_t`), so a local
+                // and a field of one enum type are the same C++ type
+                // and `p.c = d` / `d = p.c` both compile. TB-IR agrees:
+                // it lowers an enum-typed local to `int64_t` too.
+                if self.enums.contains_key(last) {
+                    return self.record_field_c_type(t);
                 }
             }
             return c_type_for(t);
@@ -17668,6 +18064,21 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
     // closures. constexpr also folds into expressions used at struct
     // field defaults if any future fixture goes there.
     let mut emitted_const = false;
+    // Const names come from a pre-pass, not from the emission loop below,
+    // so `unsafe_variants` can be resolved and installed BEFORE the first
+    // `emit_expr` call. A const initializer naming a suppressed variant
+    // then gets the HARC diagnostic rather than a raw C++ error.
+    let const_names: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Const(c) => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    self.unsafe_variants = self.collect_unsafe_enum_variants(file, &const_names);
+    self.seed_declared_value_names(file);
+
     for it in &file.items {
         if let Item::Const(c) = it {
             let cty =
@@ -17678,6 +18089,61 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
             self.emit_expr(&c.value);
             writeln!(self.out, ";").ok();
             emitted_const = true;
+        }
+    }
+
+    // ── Enum variants ───────────────────────────────────────────────────
+    // A variant name is a file-scope value, not just a constraint-solver
+    // token: `let c : Color = RED` and `p.color = GREEN` are ordinary
+    // expressions, and `emit_expr`'s `Ident` arm writes the name through
+    // verbatim. Without a definition the C++ compiler rejects every such
+    // use ("use of undeclared identifier 'RED'"), which is why the only
+    // fixture exercising an enum until now used one exclusively inside a
+    // `keep`, where `self.enum_variants` substitutes the index directly
+    // and never reaches this path.
+    //
+    // Emitting `constexpr` rather than substituting at use sites is what
+    // gets shadowing right for free: a `let RED = 3` in a run body is an
+    // inner-scope C++ declaration that hides the file-scope one, which is
+    // exactly TB-IR's documented lookup order (local, then const).
+    //
+    // Type and value match TB-IR, which folds a variant into its index as
+    // a signed constant, and a `const` of the same name outranks a variant
+    // exactly as it does in constraint lowering, where the `Ident` arm
+    // consults `self.consts` before `self.enum_variants`. Skipping the
+    // variant is also what keeps one C++ name from getting two
+    // definitions.
+    //
+    // Emitted AFTER the `const` block, so `const LIMIT : uint<8> = BLUE`
+    // names something not yet defined and v1 fails to compile. That is
+    // deliberate: spec.md §"`const NAME : Ty = expr`" admits references to
+    // *earlier* const/variant names only — "forward and cyclic references
+    // are compile errors" — and lists "enum-variant references in
+    // initializers" among the corners defined by TB-IR alone, which
+    // rejects them by declaration order. Hoisting this block above the
+    // consts would make v1 accept a program the spec calls an error and
+    // that TB-IR refuses, so the two backends would disagree.
+    //
+    // `emitted_variants` is what keeps ONE enum repeating a name
+    // (`enum E { A, B, A }`) from emitting two definitions of `A`.
+    // `collect_unsafe_enum_variants` deliberately counts a within-enum
+    // repeat once — that is a malformed enum, not an ambiguity between two
+    // of them — so it does NOT suppress the name, and this loop is the
+    // only thing standing between that program and a C++ redefinition
+    // error. First occurrence wins, matching `enum_variants`.
+    let mut emitted_variants: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for it in &file.items {
+        if let Item::Enum(e) = it {
+            for (i, v) in e.variants.iter().enumerate() {
+                if const_names.contains(&v.name)
+                    || self.unsafe_variants.contains_key(&v.name)
+                    || !emitted_variants.insert(v.name.as_str())
+                {
+                    continue;
+                }
+                writeln!(self.out, "static constexpr int64_t {} = {};", v.name, i).ok();
+                emitted_const = true;
+            }
         }
     }
     if emitted_const {
@@ -19061,6 +19527,7 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
         }
         let mut added: Vec<String> = Vec::new();
         let param_names = cpp_param_names(&t.params);
+        self.declared_value_names.extend(param_names.iter().cloned());
         for (i, p) in t.params.iter().enumerate() {
             if i > 0 {
                 write!(self.out, ", ").ok();
@@ -19118,6 +19585,7 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
         // siblings don't leak each other's params.
         let mut added: Vec<String> = Vec::new();
         let param_names = cpp_param_names(&f.params);
+        self.declared_value_names.extend(param_names.iter().cloned());
         for (i, p) in f.params.iter().enumerate() {
             if i > 0 {
                 write!(self.out, ", ").ok();
@@ -19178,6 +19646,11 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
             StmtKind::For(f) => {
                 self.pad(depth);
                 let var = &f.var.name;
+                // A `for` variable binds a C++ name that hides any
+                // file-scope one, exactly as a `let` does — register it so a
+                // loop variable named like a suppressed enum variant is not
+                // diagnosed. (`emit_let` does the same for `let`.)
+                self.declared_value_names.insert(var.clone());
                 if let ExprKind::RangeLit {
                     lo: Some(lo),
                     hi: Some(hi),
@@ -19634,6 +20107,7 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                             HookSide::Post => "post",
                         };
                         let param_names = cpp_param_names(&params);
+        self.declared_value_names.extend(param_names.iter().cloned());
                         let arg_decls: Vec<String> = params
                             .iter()
                             .enumerate()
@@ -19741,6 +20215,9 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                         .cloned()
                         .unwrap_or_else(|| "int64_t".into());
                     self.pad(depth);
+                    // Same lambda-parameter binder as the component-body
+                    // `on` handler above.
+                    self.declared_value_names.insert(arg.clone());
                     writeln!(self.out, "{event_ref}.push_back([&]({arg_ty} {arg}) {{").ok();
                     self.emit_block(&h.body, depth + 1);
                     self.pad(depth);
@@ -19831,6 +20308,10 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
             }
             return;
         }
+        // Every `let` binds a C++ name that hides any file-scope one, so
+        // record it before anything else: a local named like a suppressed
+        // enum variant must not draw that variant's diagnostic.
+        self.declared_value_names.insert(l.name.name.clone());
         // Track let-binding type for randomize(t) resolution. Done first
         // (before the dut shortcut) so even nested lets register.
         if let Some(s) = type_simple_name(l.ty.as_ref()) {
@@ -21279,6 +21760,21 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                 if let Some(s) = self.field_subs.get(&id.name) {
                     write!(self.out, "{s}").ok();
                 } else {
+                    // An enum variant that could not be given a file-scope
+                    // definition (`unsafe_variants`). Writing the name would
+                    // emit C++ naming a type or an ambiguous symbol; the
+                    // diagnostic lands HERE rather than at the enum
+                    // declaration so that merely declaring the clash stays
+                    // legal and constraint position, which resolves variants
+                    // through `enum_variants` instead, keeps working.
+                    if !self.declared_value_names.contains(&id.name) {
+                        if let Some(reason) = self.unsafe_variants.get(&id.name) {
+                            let msg = format!("enum variant {reason}");
+                            if !self.errors.contains(&msg) {
+                                self.errors.push(msg);
+                            }
+                        }
+                    }
                     write!(self.out, "{}", id.name).ok();
                 }
             }
