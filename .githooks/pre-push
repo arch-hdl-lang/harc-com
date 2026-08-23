@@ -4,12 +4,71 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-branch="$(git branch --show-current)"
+# The pre-PR review gate applies to EVERY feature branch, regardless of
+# name prefix — `codex/*`, `claude/*`, and anything else. It used to fire
+# only for `codex/*`, so review-less pushes from other prefixes sailed
+# through silently.
+#
+# `main`/`master` are merge targets, governed by branch protection rather
+# than this hook, and a branch deletion has nothing to review — both are
+# skipped.
+skip_branch() {
+  case "$1" in
+    "" | main | master) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-case "$branch" in
-  codex/*)
-    scripts/pre_pr_review.sh check
-    ;;
-  *)
-    ;;
-esac
+# Guard one branch at the ref it is being pushed to. The branch name and
+# reviewed revision are passed to the checker explicitly rather than read
+# from the checked-out `HEAD`: worktrees are routinely on a detached HEAD
+# (or on a different branch than the one being pushed), and deriving the
+# branch from `git branch --show-current` there is exactly the fragile
+# assumption that lets an unreviewed push slip past — or, once the gate is
+# broadened, wrongly blocks a detached-HEAD push that has a valid marker.
+guard_branch() {
+  local branch="$1" rev="$2"
+  skip_branch "$branch" && return 0
+  # `</dev/null` keeps the checker off this hook's stdin — the `while
+  # read` loop below owns it, and a child that read even one line would
+  # drop the remaining refs of a multi-ref push (skipping their gate).
+  # The checker reads no stdin today; this makes that independent of it.
+  PRE_PR_REVIEW_BRANCH="$branch" PRE_PR_REVIEW_HEAD="$rev" \
+    scripts/pre_pr_review.sh check </dev/null
+}
+
+# pre-push feeds one line per pushed ref on stdin:
+#   <local ref> <local oid> <remote ref> <remote oid>
+# This is the authoritative statement of what is being pushed — use it
+# instead of the checked-out branch.
+saw_ref=0
+while read -r _local_ref local_oid remote_ref _remote_oid; do
+  saw_ref=1
+  # Only branch pushes are gated; tags and other refs are not PRs.
+  case "$remote_ref" in
+    refs/heads/*) ;;
+    *) continue ;;
+  esac
+  # An all-zero local oid is a deletion (length varies with the hash
+  # algorithm, so strip zeros rather than compare to a fixed constant).
+  [ -z "${local_oid//0/}" ] && continue
+  # Keyed by the REMOTE branch name (the ref the PR opens for). For the
+  # ordinary `git push [origin] <branch>` this equals the marked local
+  # branch; a rename push (`git push origin local:other`) whose marker
+  # was recorded under the local name will report a missing marker.
+  guard_branch "${remote_ref#refs/heads/}" "$local_oid"
+done
+
+# Fallback for push paths that provide no ref lines on stdin (older git,
+# or unusual invocations): guard the checked-out branch. If HEAD is
+# detached there is no branch to identify, so the gate cannot run —
+# say so loudly rather than skipping in silence.
+if [ "$saw_ref" -eq 0 ]; then
+  fallback_branch="$(git branch --show-current || true)"
+  if [ -z "$fallback_branch" ]; then
+    echo "pre-pr-review: no ref info on stdin and HEAD is detached —" \
+         "cannot identify the branch being pushed; review gate NOT enforced" >&2
+  else
+    guard_branch "$fallback_branch" "HEAD"
+  fi
+fi
