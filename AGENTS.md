@@ -43,7 +43,7 @@ database, `refs/heads`, `refs/remotes` and `refs/stash` all live in the common
 
 ```
 .git/refs/stash                                 <- shared: one stack per repo
-.git/worktrees/<name>/refs/                     <- empty; no per-worktree stash exists
+.git/worktrees/<name>/refs/                     <- holds per-worktree refs, but no stash
 ```
 
 So there is exactly one stash stack for all worktrees, and `git stash pop` from
@@ -98,7 +98,9 @@ any restore can go wrong.
 
 For the common case — "is this test failure pre-existing on `main`?" — do not
 dirty the tree in the first place. Commit your work, or `git checkout <ref>`
-and back from an already-clean tree. Neither touches shared state.
+and back from an already-clean tree. Neither touches the shared stash, and a
+commit only advances your own session's branch — no other session collides with
+it (unlike a `pop`, which reaches into shared state you did not write).
 
 ### Branches are shared too
 
