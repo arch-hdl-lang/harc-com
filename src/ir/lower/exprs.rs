@@ -1005,6 +1005,25 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
+                // A bare enum-variant name declared by more than one
+                // enum has no correct index as a value: `consts` folded it
+                // first-wins, so substituting would silently pick one enum's
+                // numbering (harc#666). Reject instead. This is value
+                // position only — constraint lowering resolves variants
+                // through its own path, so a use inside a `keep` still
+                // lowers under the documented first-wins rule. A local of
+                // the same name shadowed this above, so a shadowing binder
+                // is unaffected.
+                if let Some(owners) = self.ctx.ambiguous_variants.get(&id.name) {
+                    return Err(LowerError::Invalid(format!(
+                        "enum variant `{name}`: it is declared by more than one \
+                         enum (`{owners}`), so no single index is correct for a \
+                         bare `{name}`. HARC has no qualified `Enum.VARIANT` form, \
+                         so rename one of them.",
+                        name = id.name,
+                        owners = owners,
+                    )));
+                }
                 // File-scope `const` / enum-variant substitution
                 // (locals shadow — checked above; v1's constexpr /
                 // variant-index emission is value-identical).

@@ -1105,6 +1105,57 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 .or_insert_with(|| pd.body.clone());
         }
     }
+    // Variant names more than one `enum` declares. `const_vals` folds every
+    // variant into one flat, name-keyed table with `or_insert`, so the first
+    // enum to declare a name wins and the second silently inherits its
+    // index: given `enum RdResp { OKAY, SLVERR }` and
+    // `enum WrResp { SLVERR, OKAY }`, a bare `OKAY` substitutes 0 when
+    // `WrResp.OKAY` is 1. That first-wins rule is inherited from v1's
+    // `enum_variants` map and its v0 "variant names are globally unique"
+    // assumption, which is tolerable for a constraint-solver token — the
+    // constraint is at least self-consistent — but not for a VALUE, where
+    // it is a wrong number with no diagnostic (harc#666).
+    //
+    // The owning enum is known here and thrown away by the flat table, so
+    // record the ambiguity instead and reject a value use of one of these
+    // names. Only value position: constraint lowering resolves through its
+    // own path and keeps the documented first-wins behaviour, so a program
+    // whose only use of an ambiguous name is inside a `keep` still lowers,
+    // and both backends still agree about it.
+    //
+    // A name a `const` claims is NOT ambiguous — `Item::Const` uses a plain
+    // `insert` while variants use `or_insert`, so the `const` wins whatever
+    // the source order, and that is a defined answer rather than a guess.
+    let mut variant_owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    for it in &file.items {
+        if let Item::Enum(e) = it {
+            // A name repeated WITHIN one enum is a malformed enum, not an
+            // ambiguity between two of them; an index is still well defined.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for v in &e.variants {
+                if seen.insert(v.name.as_str()) {
+                    variant_owners
+                        .entry(v.name.as_str())
+                        .or_default()
+                        .push(e.name.name.as_str());
+                }
+            }
+        }
+    }
+    let const_names: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Const(c) => Some(c.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let ambiguous_variants: HashMap<String, String> = variant_owners
+        .into_iter()
+        .filter(|(name, owners)| owners.len() > 1 && !const_names.contains(name))
+        .map(|(name, owners)| (name.to_string(), owners.join("`, `")))
+        .collect();
+
     // The lowering contexts only need the substituted bit pattern —
     // use sites emit the 64-bit literal either way.
     let consts: HashMap<String, u64> = const_vals
@@ -1154,7 +1205,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for it in &file.items {
         if let Item::Covergroup(g) = it {
             let schema =
-                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &const_vals)?;
+                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &const_vals, &ambiguous_variants)?;
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }
@@ -1963,6 +2014,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
@@ -2035,6 +2087,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
@@ -2250,6 +2303,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         properties: properties.clone(),
         owner: None,
         const_signed: const_signed.clone(),
+        ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
         tb_queue_fields: HashMap::new(),
@@ -2393,6 +2447,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &enum_names,
             &consts,
             &const_signed,
+            &ambiguous_variants,
             &properties,
             &extern_fns,
             &helper_registry,
@@ -3197,6 +3252,7 @@ fn lower_test(
     enum_names: &HashSet<String>,
     consts: &HashMap<String, u64>,
     const_signed: &HashMap<String, bool>,
+    ambiguous_variants: &HashMap<String, String>,
     properties: &HashMap<String, crate::ast::Expr>,
     extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
@@ -5427,6 +5483,7 @@ fn lower_test(
         properties: properties.clone(),
         owner: Some(tb_id),
         const_signed: const_signed.clone(),
+        ambiguous_variants: ambiguous_variants.clone(),
         tb_scalar_fields: scalar_fields
             .iter()
             .map(|f| (f.name.clone(), f.ty.clone()))
@@ -6421,6 +6478,13 @@ pub(crate) struct LowerCtx {
     /// substituted bit patterns so TB-IR preserves signed operators at
     /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
     pub const_signed: HashMap<String, bool>,
+    /// Enum-variant names declared by more than one `enum`, mapped to the
+    /// owning enum names for the diagnostic. `consts` folds variants into
+    /// one flat name-keyed table, so an ambiguous name would silently
+    /// resolve to whichever enum was declared first (harc#666). A VALUE use
+    /// of one is rejected; constraint position resolves through its own
+    /// path and keeps the documented first-wins behaviour.
+    pub ambiguous_variants: HashMap<String, String>,
     /// Scalar testbench fields (`TestbenchSchema::scalar_fields`), for
     /// `_tb.<field>` access lowering, with each field's declared IR
     /// type. The type is what tells a binary-operator guard whether an

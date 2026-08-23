@@ -18,10 +18,14 @@
 // Registered in the TB-IR equivalence set, so v1 and the default backend
 // must agree on all of it.
 
-// `SLVERR` and `OKAY` are each declared by BOTH enums. Neither gets a
-// file-scope definition. Constraint position resolves them through the
-// solver's own first-wins table instead, so a `keep` over them is still
-// legal — that is exactly why the diagnostic waits for a use as a value.
+// `SLVERR` and `OKAY` are each declared by BOTH enums, so neither has a
+// single correct index as a value: a bare use is rejected on BOTH
+// backends (v1 in harc#662, TB-IR in harc#666 — before which TB-IR
+// folded it first-wins and silently returned the wrong number). This
+// file therefore never uses one as a value. Constraint position is the
+// exception: it resolves through the solver's own first-wins table, so
+// the `keep resp == OKAY` below is legal and both backends agree on it —
+// which is exactly why the value-position rejection stops at values.
 enum RdResp { OKAY, SLVERR }
 enum WrResp { SLVERR, OKAY }
 
@@ -65,8 +69,22 @@ transaction Req
     keep resp == OKAY
 end transaction Req
 
+// A covergroup bin naming an UNAMBIGUOUS variant (`GREEN`, declared only
+// by `Color`) still lowers on both backends — the harc#666 rejection of a
+// bin like `{OKAY}` keys on multiple-declaration, not on a variant
+// appearing in a bin. The ambiguous case cannot live in a passing fixture
+// (it is rejected and does not compile), so it is pinned by the tbir unit
+// tests; this is its accepting complement, exercised end-to-end.
+covergroup ColorCov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            g = {GREEN}
+        end bins
+end covergroup ColorCov
+
 testbench EnumScopeTb
     dut : Top
+    cov : ColorCov
 end testbench EnumScopeTb
 
 impl EnumVariantScopeTest for EnumScopeTb
