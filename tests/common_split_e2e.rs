@@ -852,3 +852,78 @@ fn common_layout_dual_clock_builds_and_passes() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// Emitter-level diagnostics must reach the user under the common
+/// layout. `Emitter::errors` is a side-channel — emission continues past
+/// a diagnostic so one bad statement does not mask the rest, and the
+/// caller must drain the vector when it finishes. The legacy single-TU
+/// path does that at the end of `emit_with_opts`; `emit_common_split`
+/// drives three separate emitters (interface header, common impl,
+/// one capsule per test) and checked none of them.
+///
+/// The result was worse than a bad error message: the offending
+/// statement was dropped from the generated capsule and emission
+/// reported SUCCESS. A `let drv : Drv = drv()` produced a capsule with
+/// no `drv` at all, so the failure only appeared later — or not at all,
+/// if nothing downstream referenced the name.
+///
+/// Both halves are asserted deliberately. A silent swallow has no
+/// failing test by construction, so the check has to be that emission
+/// *fails*, not merely that some text appears somewhere.
+#[test]
+fn common_layout_surfaces_emitter_diagnostics_instead_of_dropping_statements() {
+    let dir = fresh_outdir("diag");
+    let sv = dir.join("dut.sv");
+    fs::write(&sv, ADDER_SV).unwrap();
+    let tb_path = dir.join("tb.harc");
+    fs::write(
+        &tb_path,
+        "\
+transactor Helper
+    n : uint<8>
+end transactor Helper
+
+test BadInstantiation
+    let dut : SplitAdder
+    let h : Helper = mk()
+    run
+        wait 1 cycle
+    end run
+end test BadInstantiation
+",
+    )
+    .unwrap();
+
+    let (ok, out) = run_common_split(&tb_path, &sv, &dir, &["--emit-only"]);
+    assert!(
+        !ok,
+        "common layout must FAIL on an emitter diagnostic, not emit a capsule \
+         with the offending statement quietly dropped; got:\n{out}"
+    );
+    // miette hard-wraps the rendered diagnostic into a box, so a phrase
+    // that fits on one source line can arrive split across two with a
+    // `│` gutter in between. Match against the flattened text or the
+    // assertion becomes a test of the terminal width.
+    let flat = out
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("transactor `Helper` has no value form"),
+        "the diagnostic itself must reach the user; got:\n{out}"
+    );
+    assert!(
+        flat.contains("test `BadInstantiation`"),
+        "the diagnostic must name which test's capsule produced it — the common \
+         layout drives one emitter per test and the source line alone does not \
+         say which; got:\n{out}"
+    );
+
+    // The capsule must not exist in a state that silently omits the let.
+    let capsule = dir.join("tb__test_BadInstantiation.cpp");
+    if capsule.exists() {
+        let body = fs::read_to_string(&capsule).unwrap();
+        panic!("a capsule was written despite the diagnostic:\n{body}");
+    }
+}

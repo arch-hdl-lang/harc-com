@@ -1354,6 +1354,30 @@ const CPP_SUITE_SCHEMA: u32 = 1;
 /// verbatim — no capture rewriting — while all mutable state lives on
 /// the per-run `HarcSuiteRuntime`, so two sequential runs in one
 /// process start fresh.
+/// Drain an emitter's accumulated diagnostics into an `EmitError`.
+///
+/// `Emitter::errors` is a side-channel: emission keeps going after a
+/// diagnostic so one bad statement does not mask the rest, and the
+/// caller is responsible for checking the vector when it finishes. The
+/// legacy single-TU path does that at the end of `emit_with_opts`; the
+/// common-object layout drives three separate emitters (header, common
+/// impl, one per capsule) and checked NONE of them, so every
+/// emitter-level diagnostic was discarded and emission reported success
+/// over C++ that was missing the offending statement entirely.
+///
+/// `context` names which emitter produced the diagnostic, since "the
+/// capsule for test T" and "the shared implementation TU" fail for
+/// different reasons and the source line alone does not say which.
+fn take_emitter_errors(e: &mut Emitter, context: &str) -> Result<(), EmitError> {
+    if e.errors.is_empty() {
+        return Ok(());
+    }
+    Err(EmitError(format!(
+        "{context}: {}",
+        std::mem::take(&mut e.errors).join("\n")
+    )))
+}
+
 pub fn emit_common_split(
     file: &SourceFile,
     opts: EmitOpts,
@@ -1429,6 +1453,7 @@ pub fn emit_common_split(
 
     emit_glue_definitions(&mut e_common, &prep)?;
     emit_shared_callables(&mut e_common, &prep)?;
+    take_emitter_errors(&mut e_common, "common-object shared implementation")?;
 
     let common_cpp = e_common.out;
 
@@ -1442,6 +1467,7 @@ pub fn emit_common_split(
         ec.flavor = Flavor::Capsule;
         ec.glue_callees = glue_callees.clone();
         ec.emit_test_run(&prep, test)?;
+        take_emitter_errors(&mut ec, &format!("test `{}`", test.name.name))?;
         // Merge this capsule's per-run cells into the suite set
         // (tags are span-derived and unique across the suite).
         for cell in std::mem::take(&mut ec.per_run_cells) {
@@ -1609,6 +1635,7 @@ pub fn emit_common_split(
     // identical records/components/RAL/covergroup types.
     std::mem::swap(&mut eh.out, &mut header);
     eh.emit_file_scope_scaffolding(&prep)?;
+    take_emitter_errors(&mut eh, "common-object suite interface")?;
     std::mem::swap(&mut eh.out, &mut header);
     // Scaffolding registers no per-run cells today; merge anyway so a
     // future cell registered during type emission cannot be dropped.
