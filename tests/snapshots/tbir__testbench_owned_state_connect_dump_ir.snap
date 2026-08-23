@@ -13,8 +13,8 @@ tb-ir program
     field observed : out event<uint>
     method publish(1 arg) = fn0
   component c1 TbSink (scoreboard)
-    field count : scalar = 0
-    field sum : scalar = 0
+    field count : uint<32> = 0
+    field sum : uint<32> = 0
     method accept(1 arg) = fn1
   component c2 TbNested (env)
     field sink : sub c1

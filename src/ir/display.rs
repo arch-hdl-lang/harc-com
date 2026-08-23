@@ -249,8 +249,24 @@ impl Display for TbProgram {
             for fld in &c.fields {
                 use crate::ir::ComponentFieldKind;
                 let desc = match &fld.kind {
-                    ComponentFieldKind::Scalar { default, .. } => {
-                        format!("scalar = {default}")
+                    // The field's EXACT declared type, not the word
+                    // "scalar". Every other kind here already prints
+                    // what it holds — `queue<uint<256>>`,
+                    // `fixed-vec<..>`, `record Beat` — and the one kind
+                    // whose width can now differ from 64 was the one
+                    // printing least. A `uint<256>` field and a
+                    // `uint<8>` field rendered identically, so a dump
+                    // could not distinguish the storage class the
+                    // emitter picks (`uint64_t` / `_harc_u128` /
+                    // `HarcWide<N>`) — the exact question every seam in
+                    // issue #642 turned on.
+                    //
+                    // `= {default}` stays. The schema holds a plain
+                    // `u64` with no absent/present distinction (an
+                    // absent default folds to 0 at lowering), so the
+                    // display must not claim one it cannot see.
+                    ComponentFieldKind::Scalar { ty, default } => {
+                        format!("{} = {default}", type_str(ty))
                     }
                     ComponentFieldKind::FixedVec(vec) => {
                         format!("fixed-vec<{:?}, {}>", vec.elem, vec.len)

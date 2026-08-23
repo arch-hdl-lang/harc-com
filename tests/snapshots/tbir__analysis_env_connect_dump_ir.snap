@@ -9,12 +9,12 @@ tb-ir program
     field observed : out event<uint>
     method publish(1 arg) = fn0
   component c1 AnalysisSb (scoreboard)
-    field count : scalar = 0
-    field sum : scalar = 0
+    field count : uint<32> = 0
+    field sum : uint<32> = 0
     method write_obs(1 arg) = fn1
   component c2 AnalysisCovCollector (scoreboard)
-    field samples : scalar = 0
-    field sum : scalar = 0
+    field samples : uint<32> = 0
+    field sum : uint<32> = 0
     method sample_obs(1 arg) = fn2
   component c3 AnalysisEnv (env)
     field source : sub c0 passive
