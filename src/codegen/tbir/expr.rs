@@ -406,6 +406,74 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             }
             let a_signed = expr_is_signed(cx, a);
             let a_width = shift_lhs_width(cx, a);
+            // A SIGNED wide ordered-comparison / division / modulo must
+            // use the two's-complement helpers, not the carriers' native
+            // operators (which are unsigned — `HarcWide<N>` and
+            // `_harc_u128` both answer by magnitude). The runtime already
+            // has them; this routes to them. Gated on BOTH operands
+            // signed: a signed-vs-unsigned mix is a type error upstream,
+            // and the mixed case is not this path's to guess at.
+            let b_signed = expr_is_signed(cx, b);
+            let signed_wide_cmp_or_div = a_signed
+                && b_signed
+                && matches!(
+                    op,
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Div | BinOp::Mod
+                )
+                && expr_binary_operand_width(cx, a)
+                    .max(expr_binary_operand_width(cx, b))
+                    .is_some_and(|w| w > 64);
+            if signed_wide_cmp_or_div {
+                return Ok(signed_wide_binary_cpp(cx, *op, a, b)?);
+            }
+            // Width-aware `==`/`!=` for WIDE operands. Two values are
+            // equal iff their low-`width` bits are — the bits above the
+            // declared width are padding, not value. The carriers do not
+            // agree on that padding (a `harc_wide_sdiv` result masks it
+            // to zero; the converting constructor `HarcWide<N>(-4)`
+            // sign-extends it to ones), so a plain `operator==` over all
+            // N words answered `q != -4` for a `q` that equals `-4`
+            // (harc#657). Masking both sides to the width makes the
+            // padding irrelevant, which is why signed wide storage does
+            // not also need normalizing at every store site. The
+            // >128-bit LITERAL case is already handled above by
+            // `wide_eq_cpp`.
+            // Width-aware `==`/`!=` ONLY when a genuinely signed-typed
+            // wide operand is involved. A signed value's padding above
+            // the declared width is inconsistent between producers — a
+            // `harc_wide_sdiv` result masks it to zero, the converting
+            // constructor `HarcWide<N>(-4)` sign-extends it to ones — so
+            // a raw `operator==` over all carrier words answered
+            // `q != -4` for a `q` that equals `-4` (harc#657). Masking
+            // both sides to the width makes the padding irrelevant.
+            //
+            // UNSIGNED wide equality is left exactly as it was: unsigned
+            // stores truncate and unsigned ops mask, so no producer
+            // leaves stray high bits, and the carriers' own `==`
+            // (word-wise, zero-extending the narrower) is already
+            // correct — masking it would only churn output. A widthless
+            // literal is not "signed-typed" here even though it promotes
+            // as signed, so `u == 1` on an unsigned `u` keeps its form.
+            let sint_typed = |e: &Expr| !matches!(e, Expr::Literal { .. }) && expr_is_signed(cx, e);
+            if matches!(op, BinOp::Eq | BinOp::Ne) && (sint_typed(a) || sint_typed(b)) {
+                let aw = expr_binary_operand_width(cx, a);
+                let bw = expr_binary_operand_width(cx, b);
+                if let Some(width) = aw.max(bw).filter(|w| *w > 64) {
+                    // Each operand is brought to the common width on its
+                    // own carrier — sign-extended if signed, zero-extended
+                    // if not — which also masks off the padding above the
+                    // width. A bare literal (`q == 4`) is coerced the same
+                    // way, so no helper ever sees a raw `int`.
+                    let a_cpp = wide_operand_to_width(cx, a, aw, width)?;
+                    let b_cpp = wide_operand_to_width(cx, b, bw, width)?;
+                    let eq = format!("({a_cpp} == {b_cpp})");
+                    return Ok(if matches!(op, BinOp::Ne) {
+                        format!("(!{eq})")
+                    } else {
+                        eq
+                    });
+                }
+            }
             let mut a_cpp = expr_cpp(cx, a)?;
             let mut b_cpp = expr_cpp(cx, b)?;
 
@@ -987,6 +1055,157 @@ fn wide_operand_cpp(
             format!("harc_rt::harc_wide_sext<{words}>({value}, 64, {target_width})")
         }
         None => format!("harc_rt::harc_wide_zext<{words}>({value})"),
+    }
+}
+
+/// A signed wide ordered-comparison (`< <= > >=`) or `/` `%`, routed to
+/// the two's-complement runtime helpers.
+///
+/// The carriers are unsigned — `HarcWide<N>` and `_harc_u128` define the
+/// six by magnitude, so the plain operator answers `-1 > 0` — but the
+/// runtime already carries `harc_wide_slt`/`sdiv`/`smod` and their
+/// `_u128` twins (proven by `wide_cast_cpp.rs`). Only `slt`/`sdiv`/`smod`
+/// exist; the other three comparisons derive from `slt`:
+///   `a <= b` == `!(b < a)`, `a > b` == `b < a`, `a >= b` == `!(a < b)`.
+///
+/// Both operands are sign-extended to their common width first — the
+/// same normalization the unsigned pair does with zero-extension —
+/// because the helpers compare at one declared `width`. Same-width
+/// operands (the common case) sign-extend to themselves, i.e. unchanged.
+fn signed_wide_binary_cpp(
+    cx: &ECx<'_>,
+    op: BinOp,
+    a: &Expr,
+    b: &Expr,
+) -> Result<String, EmitError> {
+    let aw = expr_binary_operand_width(cx, a);
+    let bw = expr_binary_operand_width(cx, b);
+    let width = aw.max(bw).expect("caller gated on a wide operand width");
+    let a_cpp = wide_operand_to_width(cx, a, aw, width)?;
+    let b_cpp = wide_operand_to_width(cx, b, bw, width)?;
+    // `harc_wide_*` for a `HarcWide<N>` carrier (>128), the `_u128`
+    // twin for the 65..=128 tier.
+    let (lt, div, rem) = if width > 128 {
+        (
+            format!("harc_rt::harc_wide_slt({a_cpp}, {b_cpp}, {width})"),
+            format!("harc_rt::harc_wide_sdiv({a_cpp}, {b_cpp}, {width})"),
+            format!("harc_rt::harc_wide_smod({a_cpp}, {b_cpp}, {width})"),
+        )
+    } else {
+        let a_u = format!("(_harc_u128)({a_cpp})");
+        let b_u = format!("(_harc_u128)({b_cpp})");
+        (
+            format!("harc_rt::harc_slt_u128({a_u}, {b_u}, {width})"),
+            format!("harc_rt::harc_sdiv_u128({a_u}, {b_u}, {width})"),
+            format!("harc_rt::harc_smod_u128({a_u}, {b_u}, {width})"),
+        )
+    };
+    // `lt(x, y)` is `x < y`; the reversed and negated spellings give the
+    // other three comparisons.
+    let lt_of = |x: &str, y: &str| {
+        if width > 128 {
+            format!("harc_rt::harc_wide_slt({x}, {y}, {width})")
+        } else {
+            format!("harc_rt::harc_slt_u128((_harc_u128)({x}), (_harc_u128)({y}), {width})")
+        }
+    };
+    Ok(match op {
+        BinOp::Lt => lt,
+        BinOp::Gt => lt_of(&b_cpp, &a_cpp),
+        BinOp::Le => format!("(!{})", lt_of(&b_cpp, &a_cpp)),
+        BinOp::Ge => format!("(!{})", lt_of(&a_cpp, &b_cpp)),
+        BinOp::Div => div,
+        BinOp::Mod => rem,
+        _ => unreachable!("signed_wide_binary_cpp called for a non-signed-wide operator"),
+    })
+}
+
+/// Sign-extend one operand of a signed wide comparison/division to the
+/// pair's common width. Same width → unchanged; narrower → `sext` on the
+/// carrier tier the common width selects.
+/// Bring one operand of a signed wide comparison / division / width-aware
+/// equality to the pair's common width, on the carrier that width
+/// selects — sign-extending a genuinely signed operand, zero-extending
+/// otherwise. Both spellings mask off the bits above the width, so the
+/// results compare and divide by value.
+///
+/// The sign decision is NOT `expr_is_signed` alone: that reports a
+/// widthless POSITIVE literal as signed (it promotes as `int64_t` in C++
+/// arithmetic), but such a literal's minimal width puts a 1 in its top
+/// bit — `4` is `0b100`, width 3 — so sign-extending it from that width
+/// would read it as negative and turn `q == 4` into `q == -4`. A bare
+/// non-negative literal, and a logical-not (always 0/1), zero-extend.
+/// The same carve-out `scalar_assignment_expr_cpp` makes for the store
+/// side.
+fn wide_operand_to_width(
+    cx: &ECx<'_>,
+    e: &Expr,
+    source_width: Option<u32>,
+    target_width: u32,
+) -> Result<String, EmitError> {
+    let cpp = expr_cpp(cx, e)?;
+    let signed = match e {
+        Expr::Literal {
+            ty: crate::ir::IrType::Unknown,
+            ..
+        }
+        | Expr::Unary(UnOp::Not, _) => false,
+        _ => expr_is_signed(cx, e),
+    };
+    Ok(if signed {
+        signed_wide_operand_cpp(cpp, source_width, target_width)
+    } else {
+        unsigned_wide_operand_cpp(cpp, source_width, target_width)
+    })
+}
+
+/// Zero-extend one operand of a width-aware `==`/`!=` to the pair's
+/// common width, on the carrier that width selects. The mirror of
+/// `signed_wide_operand_cpp` for an unsigned operand — both mask off the
+/// bits above the width, so the resulting carriers compare by value.
+fn unsigned_wide_operand_cpp(
+    value: String,
+    source_width: Option<u32>,
+    target_width: u32,
+) -> String {
+    if target_width > 128 {
+        let words = target_width.div_ceil(32);
+        return match source_width {
+            Some(w) if w == target_width => {
+                format!("harc_rt::harc_wide_mask_bits({value}, {target_width})")
+            }
+            Some(w) => format!("harc_rt::harc_wide_zext<{words}>({value}, {w})"),
+            None => format!("harc_rt::harc_wide_zext<{words}>({value})"),
+        };
+    }
+    format!("(((_harc_u128)({value})) & harc_rt::harc_mask_u128({target_width}))")
+}
+
+fn signed_wide_operand_cpp(value: String, source_width: Option<u32>, target_width: u32) -> String {
+    match source_width {
+        // Same width still MASKS to the width, not a pass-through: the
+        // operand may carry unmasked padding above the width (an
+        // unmasked `0 - q` subtraction, or the full-carrier sign
+        // extension of the converting constructor), and a raw
+        // `operator==` over all carrier words would see it. `slt`/`sdiv`
+        // mask internally so this is only redundant, never wrong, on
+        // that path.
+        Some(w) if w == target_width && target_width > 128 => {
+            format!("harc_rt::harc_wide_mask_bits({value}, {target_width})")
+        }
+        Some(w) if w == target_width => {
+            format!("(((_harc_u128)({value})) & harc_rt::harc_mask_u128({target_width}))")
+        }
+        Some(w) if target_width > 128 => {
+            let words = target_width.div_ceil(32);
+            format!("harc_rt::harc_wide_sext<{words}>({value}, {w}, {target_width})")
+        }
+        Some(w) => format!("harc_rt::harc_sext_u128((_harc_u128)({value}), {w}, {target_width})"),
+        None if target_width > 128 => {
+            let words = target_width.div_ceil(32);
+            format!("harc_rt::harc_wide_sext<{words}>({value}, 64, {target_width})")
+        }
+        None => format!("harc_rt::harc_sext_u128((_harc_u128)({value}), 64, {target_width})"),
     }
 }
 

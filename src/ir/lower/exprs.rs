@@ -4652,6 +4652,36 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// Whether a wide `< <= > >= / %` pair is a SIGNED one the emitter
+    /// can now build (harc#657), and so must not be refused here.
+    ///
+    /// Matches the emitter's gate (`expr_is_signed` on both operands): a
+    /// strictly-signed operand, or a widthless integer literal — which
+    /// sign-extends the same either way and is how `a >> 1 < 0` and
+    /// `x < 5` are spelled. At least one side must be strictly signed,
+    /// so a plain unsigned wide pair keeps the unsigned zero-extension
+    /// path; a signed-vs-unsigned-TYPED mix, which the carriers still
+    /// cannot answer, keeps the refusal.
+    fn signed_wide_pair_ok(&self, l: &Expr, r: &Expr) -> bool {
+        let signed = |e: &Expr| {
+            matches!(
+                self.scalar_assignment_type(e),
+                Some(IrType::SInt(Some(_)) | IrType::SInt(None))
+            )
+        };
+        let signed_ok = |e: &Expr| {
+            signed(e)
+                || matches!(
+                    e,
+                    Expr::Literal {
+                        ty: IrType::Unknown | IrType::UInt(None),
+                        ..
+                    }
+                )
+        };
+        (signed(l) || signed(r)) && signed_ok(l) && signed_ok(r)
+    }
+
     fn reject_unbuildable_wide_operator(
         &self,
         op: BinaryOp,
@@ -4675,13 +4705,15 @@ impl FuncBuilder<'_> {
         // well — a refusal of something that worked, under a label the
         // measurement contradicts.
         //
-        // NAMED and not fixed: that `<A, B>` equality compares raw
-        // words, so two SIGNED values of different widths compare
-        // unequal when they are both -1 (`sint<160>` fills 5 words,
-        // `sint<256>` fills 8). Both backends agree on the wrong
-        // answer, which predates the declared-field widening and is
-        // not this seam's to change.
-        let cross_width_ok = matches!(ir_op, BinOp::Eq | BinOp::Ne);
+        // Different-width SIGNED pairs lower now (harc#657): the emitter
+        // sign-extends the narrower operand to the wider width before
+        // `harc_wide_slt`/`sdiv`/`smod`, and the width-aware `==`/`!=`
+        // path does the same — which also fixes the raw-word equality
+        // bug this block's comment used to call "NAMED and not fixed"
+        // (`-1` as `sint<160>` vs `sint<256>` compared unequal). `==`/
+        // `!=` were already let through for the unsigned case.
+        let cross_width_ok =
+            matches!(ir_op, BinOp::Eq | BinOp::Ne) || self.signed_wide_pair_ok(l, r);
         if let (Some(a), Some(b)) = (self.wide_scalar_words(l), self.wide_scalar_words(r)) {
             if a != b && !cross_width_ok {
                 return Err(not_implemented(
@@ -4737,12 +4769,13 @@ impl FuncBuilder<'_> {
         // those, and no row covered same-width wide-vs-wide for these
         // six, so two review rounds passed over it.
         //
-        // NAMED and not fixed: the homogeneous six are UNSIGNED, so
-        // `x < y` on two negative `sint<1024>`s answers by magnitude in
-        // both backends. That predates the declared-field widening and
-        // is not this seam's to change — refusing it here would refuse
-        // a program v1 builds.
         if self.is_wide_scalar(l) == self.is_wide_scalar(r) {
+            return Ok(());
+        }
+        // A SIGNED wide comparison lowers now (harc#657): the emitter
+        // routes `< <= > >=` to `harc_wide_slt` and the `_u128` twin,
+        // sign-extending the narrower operand to the wide side's width.
+        if self.signed_wide_pair_ok(l, r) {
             return Ok(());
         }
         Err(not_implemented(
