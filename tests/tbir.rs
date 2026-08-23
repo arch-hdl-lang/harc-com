@@ -13895,14 +13895,14 @@ end test T"#
     );
 }
 
-/// The four `helpers.rs` arms, and two of them were right already —
-/// which is worth a test precisely because it was measured rather than
-/// assumed.
+/// The four former `helpers.rs` arms. Calls in conditionally evaluated
+/// diagnostics now lower into a dedicated failure CFG arm; the two module-
+/// parameter mismatches remain measured v1 compile failures.
 ///
 /// | arm | v1 | verdict |
 /// |---|---|---|
-/// | a DUT/sync-touching helper call in a message | compiles; calls it at the failure site | `Unsupported` |
-/// | a testbench method call in a message | compiles; same | `Unsupported` |
+/// | a DUT/sync-touching helper call in a message | compiles; calls it at the failure site | lowered lazily |
+/// | a testbench method call in a message | compiles; same | lowered lazily |
 /// | a helper param of module type, non-DUT arg | `no match for call to <lambda(VTop*)> (Model&)` | `EmitsUncompilable` |
 /// | a testbench method param of module type, non-DUT arg | `no match for call to <lambda(Tb&, VTop*)> (Tb&, Model&)` | `EmitsUncompilable` |
 ///
@@ -13912,7 +13912,7 @@ end test T"#
 /// `log` measures nothing at all; the routing gate is `lower_fmt` vs
 /// `lower_fmt_hoisting`, not the arm.
 #[test]
-fn the_helper_arms_split_between_a_real_hatch_and_an_uncompilable_call() {
+fn lazy_helper_messages_lower_while_bad_module_arguments_still_reject() {
     let base = fixture("msg_call_hoist_test.harc");
     const LOG: &str = "        log(info, \"dbl=${dbl(v)}\")";
     assert!(base.contains(LOG), "fixture shape changed");
@@ -13933,8 +13933,28 @@ fn the_helper_arms_split_between_a_real_hatch_and_an_uncompilable_call() {
     ] {
         let src = base.replacen(LOG, &format!("        {msg}"), 1);
         assert_ne!(src, base, "{what}: the message must actually change");
-        let m = assert_unsupported(&lower_src(&src).unwrap_err());
-        assert!(m.contains("inside a message"), "{what}: {m}");
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("{what} lowers lazily: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what} verifies: {e:?}"));
+        let run = prog.function(prog.tests[0].run);
+        assert!(
+            run.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, ir::Terminator::Branch(..))),
+            "{what}: conditional diagnostic gets a failure branch:\n{run}"
+        );
+        assert!(
+            run.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(
+                s,
+                ir::Stmt::AssertCheck {
+                    cond: ir::Expr::Literal {
+                        value: 0,
+                        ty: ir::IrType::Bool,
+                    },
+                    ..
+                }
+            )),
+            "{what}: failure arm emits one unconditional diagnostic:\n{run}"
+        );
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
         assert!(
             v1.contains(&format!("sim_log_line(\"FAIL\"")) && v1.contains(needle),
@@ -14583,10 +14603,11 @@ end test MutRecTest
     verify::verify_program(&prog).expect("verifies");
 }
 
-/// An impure helper call inside a `${...}` message capture cannot be
-/// inlined (messages evaluate lazily at the failure site).
+/// An impure helper call inside a `${...}` message capture is inlined only
+/// into the failure branch. Its wait and DUT read must not run on the passing
+/// path.
 #[test]
-fn helper_impure_call_in_message_is_unsupported() {
+fn helper_impure_call_in_message_lowers_into_failure_branch() {
     let src = r#"
 function peek(d: Top) -> uint<8>
     wait 1 cycle
@@ -14600,10 +14621,768 @@ test FmtTest
     end run
 end test FmtTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("peek"), "names the helper: {msg}");
-    assert!(msg.contains("--codegen v1"), "suggests v1: {msg}");
+    let prog = lower_src(src).expect("impure diagnostic helper lowers lazily");
+    verify::verify_program(&prog).expect("lazy diagnostic CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, ir::Terminator::WaitCyclesSync(..))),
+        "helper wait is inside the failure-side CFG:\n{run}"
+    );
+    assert!(
+        run.blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(
+            s,
+            ir::Stmt::AssertCheck {
+                cond: ir::Expr::Literal { value: 0, .. },
+                ..
+            }
+        )),
+        "failure arm retains the diagnostic:\n{run}"
+    );
+}
+
+/// A dynamic packed-port selector may itself be an impure call. The packed
+/// target is a value operand, so it must be sampled before that call can write
+/// the same DUT signal.
+#[test]
+fn message_index_target_is_sampled_before_mutating_selector() {
+    let src = r#"
+function set_en(dut: Top, value: uint<8>) -> uint<8>
+    dut.en = value
+    return value
+end function set_en
+
+test FmtIndexOrderTest
+    let dut : Top
+    run
+        assert false else fail("bit=${dut.en[set_en(dut, 0)]}")
+    end run
+end test FmtIndexOrderTest
+"#;
+    let prog = lower_src(src).expect("mutating index selector lowers lazily");
+    verify::verify_program(&prog).expect("ordered packed-port snapshot verifies");
+    let run = prog.function(prog.tests[0].run);
+    let mut found = false;
+    for block in &run.blocks {
+        let read = block.stmts.iter().position(|stmt| {
+            matches!(stmt, ir::Stmt::DutRead(_, port)
+                if port.port_path == ["en"] && port.lane.is_none())
+        });
+        let write = block.stmts.iter().position(|stmt| {
+            matches!(stmt, ir::Stmt::DutWrite(port, _)
+                if port.port_path == ["en"] && port.lane.is_none())
+        });
+        if let (Some(read), Some(write)) = (read, write) {
+            assert!(
+                read < write,
+                "target sample must precede selector write:\n{run}"
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "expected target read and selector write in one ordered block:\n{run}"
+    );
+    let sampled_lane = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::PortSnapshotLane {
+                    snapshot,
+                    port,
+                    index,
+                },
+            ) => Some((*snapshot, port, index.as_ref())),
+            _ => None,
+        })
+        .expect("ordered lane read retains the original port shape");
+    assert!(matches!(
+        run.locals[sampled_lane.0.index()].ty,
+        ir::IrType::PortSnapshot
+    ));
+    assert_eq!(sampled_lane.1.port_path, ["en"]);
+    assert!(matches!(sampled_lane.2, ir::Expr::Local(_)));
+
+    // Late SV metadata, not lowering, knows whether this is a packed Vec
+    // lane. The sampled-lane IR must retain that routing and must not regress
+    // to a one-bit `harc_bits` slice.
+    let merged = merged_src(src);
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.vec_lane_widths.insert("en".to_string(), 5);
+    let cpp = tbir::emit(&prog, &merged, &opts).expect("sampled packed lane emits");
+    assert!(
+        cpp.contains("harc_rt::harc_vec_lane_read<5>("),
+        "packed lane width survives ordered sampling:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("harc_bits("),
+        "lane is not a one-bit slice:\n{cpp}"
+    );
+    let decl = cpp
+        .find("decltype(harc_rt::harc_port_snapshot(dut->en))")
+        .expect("snapshot has a function-scope exact carrier");
+    let first_case = cpp.find("case 0:").expect("loop-switch body");
+    assert!(
+        decl < first_case,
+        "snapshot must outlive CFG case edges:\n{cpp}"
+    );
+
+    let mut broken = prog.clone();
+    let run_id = broken.tests[0].run;
+    let run = &mut broken.functions[run_id.index()];
+    let wrong_port = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::PortSnapshotLane { port, .. }) => Some(port),
+            _ => None,
+        })
+        .expect("sampled lane");
+    wrong_port.port_path = vec!["count_out".to_string()];
+    verify::verify_program(&broken)
+        .expect_err("sampled lane metadata must match its defining DutRead");
+
+    let mut broken = prog.clone();
+    let run = &mut broken.functions[run_id.index()];
+    let snapshot = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::DutRead(dest, _)
+                if run.locals[dest.index()].ty == ir::IrType::PortSnapshot =>
+            {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .expect("snapshot definition");
+    run.blocks[0].stmts.push(ir::Stmt::Assign(
+        snapshot,
+        ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::Unknown,
+        },
+    ));
+    verify::verify_program(&broken)
+        .expect_err("an ordered snapshot must have exactly one definition");
+
+    let mut broken = prog.clone();
+    let run = &mut broken.functions[run_id.index()];
+    let lane = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, lane @ ir::Expr::PortSnapshotLane { .. }) => Some(lane.clone()),
+            _ => None,
+        })
+        .expect("sampled lane expression");
+    let cond = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { cond, .. } => Some(cond),
+            _ => None,
+        })
+        .expect("assert condition");
+    *cond = lane;
+    verify::verify_program(&broken)
+        .expect_err("sampled lanes outside Assign values must be rejected");
+}
+
+#[test]
+fn method_message_snapshot_has_function_scope_storage() {
+    let src = r#"
+function set_en(dut: Top, value: uint<8>) -> uint<8>
+    dut.en = value
+    return value
+end function set_en
+
+transactor SnapshotDriver
+    dut : Top
+    hookable report()
+        fail("lane=${dut.count_out[set_en(dut, 0)]}")
+    end report
+end transactor SnapshotDriver
+
+testbench SnapshotTb
+    dut : Top
+    drv : SnapshotDriver passive
+end testbench SnapshotTb
+
+impl SnapshotTest for SnapshotTb
+    run
+        drv.report()
+    end run
+end impl SnapshotTest
+"#;
+    let prog = lower_src(src).expect("method diagnostic snapshot lowers");
+    verify::verify_program(&prog).expect("method diagnostic snapshot verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.vec_lane_widths.insert("count_out".to_string(), 8);
+    let cpp = tbir::emit(&prog, &merged_src(src), &opts)
+        .expect("method diagnostic snapshot emits with declared storage");
+    let method = cpp
+        .find("SnapshotDriver_report =")
+        .expect("method lambda emitted");
+    let decl = cpp[method..]
+        .find("decltype(harc_rt::harc_port_snapshot(dut->count_out))")
+        .expect("method-local snapshot declaration");
+    let first_case = cpp[method..].find("case 0:").expect("method switch");
+    assert!(
+        decl < first_case,
+        "snapshot must outlive method CFG cases:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_transactor_result_in_message_retains_declared_type() {
+    let src = r#"
+transactor SignedFmtDriver
+    dut : Top
+    when active
+        hookable negative() -> sint<8>
+            return 0 - 8
+        end negative
+    end when
+end transactor SignedFmtDriver
+
+testbench SignedFmtTb
+    dut : Top
+    drv : SignedFmtDriver active
+end testbench SignedFmtTb
+
+impl SignedFmtTest for SignedFmtTb
+    run
+        drv.dut = dut
+        assert false else fail("half=${drv.negative() >> 1}")
+    end run
+end impl SignedFmtTest
+"#;
+    let prog = lower_src(src).expect("signed transactor capture lowers");
+    verify::verify_program(&prog).expect("signed transactor capture verifies");
+    let schema = &prog.transactors[0];
+    assert_eq!(schema.methods[0].ret_ty, Some(ir::IrType::SInt(Some(8))));
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("signed transactor capture emits");
+    assert!(
+        cpp.contains("std::function<int64_t()> SignedFmtDriver_negative"),
+        "{cpp}"
+    );
+    assert!(cpp.contains(">> 1"), "{cpp}");
+
+    let mut broken = prog.clone();
+    let run_id = broken.tests[0].run;
+    let dest = broken.functions[run_id.index()]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                dest: Some(dest), ..
+            } => Some(*dest),
+            _ => None,
+        })
+        .expect("captured transactor result");
+    broken.functions[run_id.index()].locals[dest.index()].ty = ir::IrType::Bool;
+    verify::verify_program(&broken)
+        .expect_err("transactor result destination must match declared return type");
+    broken.functions[run_id.index()].locals[dest.index()].ty = ir::IrType::Unknown;
+    verify::verify_program(&broken)
+        .expect_err("a known transactor return must not use an unknown destination");
+
+    let sibling = r#"
+transactor SignedSelfFmtDriver
+    dut : Top
+    when active
+        hookable negative() -> sint<8>
+            return 0 - 8
+        end negative
+        hookable report()
+            fail("self=${negative()}")
+        end report
+    end when
+end transactor SignedSelfFmtDriver
+
+testbench SignedSelfFmtTb
+    dut : Top
+    drv : SignedSelfFmtDriver active
+end testbench SignedSelfFmtTb
+
+impl SignedSelfFmtTest for SignedSelfFmtTb
+    run
+        drv.dut = dut
+        drv.report()
+    end run
+end impl SignedSelfFmtTest
+"#;
+    let prog = lower_src(sibling).expect("sibling method capture lowers");
+    verify::verify_program(&prog).expect("sibling method capture verifies");
+    let captured_ty = prog
+        .functions
+        .iter()
+        .flat_map(|func| {
+            func.blocks.iter().flat_map(move |block| {
+                block.stmts.iter().filter_map(move |stmt| match stmt {
+                    ir::Stmt::TransactorSelfCall {
+                        dest: Some(dest), ..
+                    } => Some(func.locals[dest.index()].ty.clone()),
+                    _ => None,
+                })
+            })
+        })
+        .next()
+        .expect("sibling capture destination");
+    assert_eq!(captured_ty, ir::IrType::SInt(Some(8)));
+
+    let widthless_sibling = sibling.replace("negative() -> sint<8>", "negative() -> int");
+    let prog = lower_src(&widthless_sibling).expect("widthless sibling capture lowers");
+    verify::verify_program(&prog).expect("widthless sibling capture verifies");
+    assert!(prog.functions.iter().any(|func| {
+        func.blocks.iter().any(|block| {
+            block.stmts.iter().any(|stmt| match stmt {
+                ir::Stmt::TransactorSelfCall {
+                    dest: Some(dest), ..
+                } => matches!(func.locals[dest.index()].ty, ir::IrType::Unknown),
+                _ => false,
+            })
+        })
+    }));
+
+    let lazy_arg = r#"
+function set_en(dut: Top, value: uint<8>) -> bool
+    dut.en = value
+    return true
+end function set_en
+
+transactor LazyArgDriver
+    dut : Top
+    when active
+        hookable identity(value: bool) -> bool
+            return value
+        end identity
+        hookable report()
+            fail("lazy=${identity(false && set_en(dut, 1))}")
+        end report
+    end when
+end transactor LazyArgDriver
+
+testbench LazyArgTb
+    dut : Top
+    drv : LazyArgDriver active
+end testbench LazyArgTb
+
+impl LazyArgTest for LazyArgTb
+    run
+        drv.dut = dut
+        drv.report()
+    end run
+end impl LazyArgTest
+"#;
+    let msg = assert_unsupported(&lower_src(lazy_arg).expect_err(
+        "a statement-producing call in a lazy outer-call argument must not be made eager",
+    ));
+    assert!(
+        msg.contains("conditionally evaluated call argument"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn expression_transactor_results_retain_type_and_allow_widening() {
+    let direct = r#"
+transactor SignedDriver
+    dut : Top
+    when active
+        hookable negative() -> sint<8>
+            return 0 - 8
+        end negative
+        hookable is_negative() -> bool
+            return negative() < 0
+        end is_negative
+    end when
+end transactor SignedDriver
+
+testbench SignedTb
+    dut : Top
+    drv : SignedDriver active
+end testbench SignedTb
+
+impl SignedTest for SignedTb
+    run
+        drv.dut = dut
+        assert drv.negative() < 0
+        assert drv.is_negative()
+    end run
+end impl SignedTest
+"#;
+    let prog = lower_src(direct).expect("signed expression calls lower");
+    verify::verify_program(&prog).expect("signed expression calls verify");
+    let captured: Vec<_> = prog
+        .functions
+        .iter()
+        .flat_map(|func| {
+            func.blocks.iter().flat_map(move |block| {
+                block.stmts.iter().filter_map(move |stmt| match stmt {
+                    ir::Stmt::TransactorCall {
+                        dest: Some(dest), ..
+                    }
+                    | ir::Stmt::TransactorSelfCall {
+                        dest: Some(dest), ..
+                    } => Some(func.locals[dest.index()].ty.clone()),
+                    _ => None,
+                })
+            })
+        })
+        .collect();
+    assert!(
+        captured.contains(&ir::IrType::SInt(Some(8))),
+        "{captured:?}"
+    );
+
+    let widening = direct.replace(
+        "assert drv.negative() < 0\n        assert drv.is_negative()",
+        "let value : sint<16> = 0\n        value = drv.negative()\n        assert value < 0",
+    );
+    let prog = lower_src(&widening).expect("widening method assignment lowers");
+    verify::verify_program(&prog).expect("widening method assignment verifies");
+
+    let widthless = direct
+        .replace("negative() -> sint<8>", "negative() -> int")
+        .replace(
+            "assert drv.negative() < 0\n        assert drv.is_negative()",
+            "let value = drv.negative()\n        assert value < 0\n        assert false else fail(\"value=${drv.negative()}\")",
+        );
+    let prog = lower_src(&widthless).expect("widthless method results lower");
+    verify::verify_program(&prog).expect("widthless method results verify");
+    let captured: Vec<_> = prog
+        .functions
+        .iter()
+        .flat_map(|func| {
+            func.blocks.iter().flat_map(move |block| {
+                block.stmts.iter().filter_map(move |stmt| match stmt {
+                    ir::Stmt::TransactorCall {
+                        dest: Some(dest), ..
+                    }
+                    | ir::Stmt::TransactorSelfCall {
+                        dest: Some(dest), ..
+                    } => Some(func.locals[dest.index()].ty.clone()),
+                    _ => None,
+                })
+            })
+        })
+        .collect();
+    assert!(captured.contains(&ir::IrType::Unknown), "{captured:?}");
+}
+
+/// Interpolation formatting has a scalar ABI even when a call itself can
+/// return an aggregate. Lowering must diagnose that source shape, and the IR
+/// verifier must reject a pass that corrupts a valid scalar capture into a
+/// record capture before C++ emission.
+#[test]
+fn aggregate_message_capture_is_rejected_by_lowering_and_verifier() {
+    let valid = r#"
+transaction Cmd
+    value : uint<8> default 0
+end transaction Cmd
+
+function mutate_and_copy(dut: Top, cmd: Cmd) -> Cmd
+    dut.en = 0
+    return cmd
+end function mutate_and_copy
+
+agent FmtHolder
+    cur : Cmd
+end agent FmtHolder
+
+testbench FmtAggregateTb
+    dut : Top
+    holder : FmtHolder
+
+    function id_cmd(cmd: Cmd) -> Cmd
+        return cmd
+    end function id_cmd
+end testbench FmtAggregateTb
+
+impl FmtAggregateTest for FmtAggregateTb
+    run
+        let cmd : Cmd
+        assert false else fail("value=${cmd.value}")
+    end run
+end impl FmtAggregateTest
+"#;
+
+    let aggregate = valid.replace("${cmd.value}", "${id_cmd(cmd)}");
+    let err = lower_src(&aggregate).expect_err("a whole record has no scalar printf ABI");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("scalar field or lane"), "{msg}");
+    let component_aggregate = valid.replace("${cmd.value}", "${holder.cur}");
+    let err = lower_src(&component_aggregate)
+        .expect_err("a whole component record has no scalar printf ABI");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    let comparison = valid.replace("${cmd.value}", "${holder.cur == mutate_and_copy(dut, cmd)}");
+    let comparison_prog =
+        lower_src(&comparison).expect("same-record comparison remains a scalar capture");
+    verify::verify_program(&comparison_prog).expect("ordered record comparison verifies");
+    let mixed_comparison = comparison.replace(
+        "holder.cur == mutate_and_copy(dut, cmd)",
+        "cmd == holder.cur",
+    );
+    // The control above uses one record identity. A distinct identity hidden
+    // under the Bool-producing equality must fail at source lowering, not as
+    // an internal verifier error.
+    let mixed_comparison = mixed_comparison
+        .replacen("transaction Cmd", "transaction Other\n    value : uint<8> default 0\nend transaction Other\n\ntransaction Cmd", 1)
+        .replace("agent FmtHolder\n    cur : Cmd", "agent FmtHolder\n    cur : Other");
+    let err = lower_src(&mixed_comparison).expect_err("mixed record comparison is invalid");
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+
+    let prog = lower_src(valid).expect("scalar record-field capture lowers");
+    verify::verify_program(&prog).expect("control verifies");
+    let mut broken = prog.clone();
+    let run_id = broken.tests[0].run;
+    let run = &mut broken.functions[run_id.index()];
+    let record = run
+        .locals
+        .iter()
+        .position(|local| local.name == "cmd")
+        .map(|i| ir::LocalId(i as u32))
+        .expect("record local");
+    let capture = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::Local(record);
+    let errs = verify::verify_program(&broken).expect_err("aggregate format arg must not verify");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadFormatArg { .. })),
+        "{errs:?}"
+    );
+
+    let mut broken_component = prog.clone();
+    let run_id = broken_component.tests[0].run;
+    let capture = broken_component.functions[run_id.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::ComponentField {
+        base: ir::ComponentBase::Path(vec!["holder".to_string()]),
+        field: "cur".to_string(),
+    };
+    let errs = verify::verify_program(&broken_component)
+        .expect_err("component aggregate format arg must not verify");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadFormatArg { .. })),
+        "{errs:?}"
+    );
+
+    let mut broken_component_value = prog.clone();
+    let run_id = broken_component_value.tests[0].run;
+    let capture = broken_component_value.functions[run_id.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::ComponentValue {
+        base: ir::ComponentBase::Path(vec!["holder".to_string()]),
+    };
+    let errs = verify::verify_program(&broken_component_value)
+        .expect_err("by-value component format arg must not verify");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadFormatArg { .. })),
+        "{errs:?}"
+    );
+    let mut malformed_component_value = broken_component_value.clone();
+    let run_id = malformed_component_value.tests[0].run;
+    let capture = malformed_component_value.functions[run_id.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::ComponentValue {
+        base: ir::ComponentBase::Path(vec!["missing".to_string()]),
+    };
+    verify::verify_program(&malformed_component_value)
+        .expect_err("unresolved component value must not verify as Unknown scalar");
+
+    let mut broken_seq_element = prog.clone();
+    let run_id = broken_seq_element.tests[0].run;
+    let run = &mut broken_seq_element.functions[run_id.index()];
+    let record = run
+        .locals
+        .iter()
+        .position(|local| local.name == "cmd")
+        .map(|i| ir::LocalId(i as u32))
+        .expect("record local");
+    run.locals[record.index()].ty = ir::IrType::RecordSeq(ir::RecordId(0));
+    let capture = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::SeqIndex {
+        seq: record,
+        index: Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::Unknown,
+        }),
+    };
+    let errs = verify::verify_program(&broken_seq_element)
+        .expect_err("record sequence element format arg must not verify");
+    assert!(
+        errs.iter()
+            .any(|err| matches!(err, verify::VerifyError::BadFormatArg { .. })),
+        "{errs:?}"
+    );
+    let mut malformed_seq = prog.clone();
+    let run_id = malformed_seq.tests[0].run;
+    let run = &mut malformed_seq.functions[run_id.index()];
+    let scalar = run
+        .locals
+        .iter()
+        .position(|local| local.name == "cmd")
+        .map(|i| ir::LocalId(i as u32))
+        .expect("local used for corruption");
+    run.locals[scalar.index()].ty = ir::IrType::UInt(Some(8));
+    let capture = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck { on_fail, .. } => on_fail.args.first_mut(),
+            _ => None,
+        })
+        .expect("diagnostic capture");
+    capture.expr = ir::Expr::SeqIndex {
+        seq: scalar,
+        index: Box::new(ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::Unknown,
+        }),
+    };
+    verify::verify_program(&malformed_seq)
+        .expect_err("SeqIndex over scalar must not verify as Unknown scalar");
+}
+
+/// Ordered interpolation snapshots retain the exact type of non-local host
+/// state. In particular, a component field wider than the native host scalar
+/// must not fall back to an Unknown/u64 temporary before a later call.
+#[test]
+fn ordered_component_message_capture_retains_wide_type() {
+    let src = r#"
+transaction WideFmtValue
+    cur : uint<128>
+end transaction WideFmtValue
+
+agent WideFmtHolder
+    state : WideFmtValue
+end agent WideFmtHolder
+
+testbench WideFmtTb
+    dut : Top
+    holder : WideFmtHolder
+    calls : uint<8> default 0
+
+    function bump(x: uint<8>) -> uint<8>
+        calls = calls + 1
+        return x
+    end function bump
+end testbench WideFmtTb
+
+impl WideFmtTest for WideFmtTb
+    run
+        assert false else fail("before=${holder.state.cur:032x} bump=${bump(1)}")
+    end run
+end impl WideFmtTest
+"#;
+    let prog = lower_src(src).expect("wide component capture lowers in order");
+    verify::verify_program(&prog).expect("wide ordered capture verifies");
+    let run = prog.function(prog.tests[0].run);
+    let dest = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                dest,
+                ir::Expr::ComponentField {
+                    field,
+                    base: ir::ComponentBase::Path(_),
+                },
+            ) if field == "state.cur" => Some(*dest),
+            _ => None,
+        })
+        .expect("component read is snapshotted before bump");
+    assert_eq!(
+        run.locals[dest.index()].ty,
+        ir::IrType::UInt(Some(128)),
+        "ordered snapshot retains the component field width:\n{run}"
+    );
+}
+
+#[test]
+fn ordered_raw_dut_capture_uses_exact_host_carrier() {
+    let src = r#"
+function clear_en(dut: Top) -> uint<8>
+    dut.en = 0
+    return 0
+end function clear_en
+
+test RawPortFmtTest
+    let dut : Top
+    run
+        assert false else fail("value=${dut.count_out + clear_en(dut):032x}")
+    end run
+end test RawPortFmtTest
+"#;
+    let prog = lower_src(src).expect("ordered raw DUT capture lowers");
+    verify::verify_program(&prog).expect("ordered raw DUT capture verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .any(|local| matches!(local.ty, ir::IrType::PortSnapshot)),
+        "late-width port value must not fall back to uint64 IR storage:\n{run}"
+    );
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("ordered raw DUT capture emits");
+    assert!(
+        cpp.contains("decltype(harc_rt::harc_read(dut->count_out))"),
+        "raw value carrier derives its exact scalarized C++ type from the signal:\n{cpp}"
+    );
 }
 
 /// `break` inside an inlined helper body must not bind to a loop open
@@ -17512,13 +18291,26 @@ fn assert_no_record_zero_assign(func: &ir::TbFunction) {
     }
 }
 
-/// ...and not inside lazily-evaluated log/fail messages either.
+/// A result-bearing transactor call uses the same lazy failure-arm seam.
 #[test]
-fn transactor_call_in_message_rejected() {
+fn transactor_call_in_message_lowers_into_failure_branch() {
     let src = XACTOR_SRC.replace("fail(\"v=${v}\")", "fail(\"v=${xt.readv()}\")");
-    let err = lower_src(&src).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("inside a message"), "{msg}");
+    let prog = lower_src(&src).expect("transactor diagnostic call lowers lazily");
+    verify::verify_program(&prog).expect("lazy transactor diagnostic verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::TransactorCall {
+                    dest: Some(_),
+                    call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _),
+                } if method == "readv"
+            )),
+        "failure arm contains the result-bearing transactor call:\n{run}"
+    );
 }
 
 /// Mode rules at the instance field: a `passive` instance is accepted

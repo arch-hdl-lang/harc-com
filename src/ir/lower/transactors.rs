@@ -499,7 +499,9 @@ pub(crate) fn lower_transactor(
                             )
                         })
                         .collect::<Vec<_>>(),
-                    h.return_ty.is_some(),
+                    h.return_ty.as_ref().map(|ty| {
+                        super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
+                    }),
                     *active_only,
                 ),
             )
@@ -537,8 +539,13 @@ pub(crate) fn lower_transactor(
                 ty,
             });
         }
-        if h.return_ty.is_some() {
+        let ret_ty = h
+            .return_ty
+            .as_ref()
+            .map(|ty| super::helpers::ir_type_of(Some(ty)));
+        if let Some(ty) = ret_ty.clone() {
             let ret = b.declare("__ret");
+            b.set_local_type(ret, ty);
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
@@ -557,6 +564,7 @@ pub(crate) fn lower_transactor(
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+            ret_ty,
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,
@@ -1524,7 +1532,9 @@ fn lower_bound_initiator_transactor(
                             )
                         })
                         .collect::<Vec<_>>(),
-                    h.return_ty.is_some(),
+                    h.return_ty.as_ref().map(|ty| {
+                        super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
+                    }),
                     *active_only,
                 ),
             )
@@ -1562,8 +1572,13 @@ fn lower_bound_initiator_transactor(
                 ty,
             });
         }
-        if h.return_ty.is_some() {
+        let ret_ty = h
+            .return_ty
+            .as_ref()
+            .map(|ty| super::helpers::ir_type_of(Some(ty)));
+        if let Some(ty) = ret_ty.clone() {
             let ret = b.declare("__ret");
+            b.set_local_type(ret, ty);
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&h.body)?;
@@ -1586,6 +1601,7 @@ fn lower_bound_initiator_transactor(
             function: fid,
             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
             param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+            ret_ty,
             has_ret: f.ret.is_some(),
             hookable: h.is_hookable,
             active_only,

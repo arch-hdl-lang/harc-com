@@ -76,6 +76,7 @@ call_return_type_test | Top | top_counter.sv | - | pass | - | call_return_type_r
 signed_host_state_test | Top | top_counter.sv | top_counter.arch | pass
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv | - | pass
 msg_call_hoist_test | Top | top_counter.sv | top_counter.arch | pass
+lazy_message_calls_fail_test | Top | top_counter.sv | top_counter.arch | fail
 sync_fifo_test | TxQueue | sync_fifo.sv | sync_fifo.arch | pass
 lz4_block_decoder_test | Lz4BlockDecoder | lz4_block_decoder.sv | lz4_block_decoder.arch | pass
 bus_arbiter_test | BusArbiter | bus_arbiter.sv | bus_arbiter.arch | pass

@@ -1,0 +1,61 @@
+// Executed half of lazy diagnostic-call parity. A failing immediate assert
+// and an actual wait timeout must evaluate their interpolation calls inside
+// the failure path, once and in source order. This fixture deliberately
+// finishes with errors and is registered as expect=fail.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+function cur_plus(dut: Top, extra: uint<8>) -> uint<8>
+    return dut.count_out + extra
+end function cur_plus
+
+function pick(dut: Top) -> uint<8>
+    return dut.count_out & 0x7
+end function pick
+
+function set_en(dut: Top, value: uint<8>) -> uint<8>
+    dut.en = value
+    return value
+end function set_en
+
+transaction WideFmtValue
+    cur : uint<128>
+end transaction WideFmtValue
+
+agent WideFmtHolder
+    state : WideFmtValue
+end agent WideFmtHolder
+
+testbench LazyMessageTb
+    dut : Top
+    holder : WideFmtHolder
+    calls : uint<8> default 0
+
+    function bump(x: uint<8>) -> uint<8>
+        calls = calls + 1
+        return x + calls
+    end bump
+end testbench LazyMessageTb
+
+impl LazyMessageCallsFailTest for LazyMessageTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        holder.state.cur = 0x80000000000000000000000000000001
+        wait 2 cycles
+        dut.rst = 0
+
+        // Captures and always-evaluated operands must snapshot left-to-right,
+        // and a call used as an index selector must take the same lazy path.
+        assert false else fail("lazy before=${calls} bit=${dut.count_out[pick(dut)]} wide=${holder.state.cur:032x} bump=${bump(3)} en_before=${dut.en} nested=${dut.en + set_en(dut, 1)} en_after=${dut.en} after=${calls} count=${cur_plus(dut, 0)}")
+        assert calls == 1 else fail("assert message called bump ${calls} times")
+
+        wait until false timeout 1 cycles fail("timeout bump=${bump(3)}")
+        assert calls == 2 else fail("timeout message called bump ${calls} times")
+        wait 1 cycle
+    end run
+end impl LazyMessageCallsFailTest

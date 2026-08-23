@@ -263,6 +263,7 @@ pub(super) fn emit_function(
 
     writeln!(out, "{pad}{{ // {} (TB-IR loop-switch)", func.name).ok();
     declare_locals_except(out, prog, func, &names, 0, predeclared, depth + 1)?;
+    declare_port_snapshots(out, &cx, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}bool __done = false;").ok();
     writeln!(out, "{pad1}while (!__done) {{").ok();
@@ -1389,7 +1390,16 @@ fn emit_stmt(
         }
         Stmt::DutRead(l, p) => {
             let name = &names[l.index()];
-            writeln!(out, "{pad}{name} = {};", port_read(cx, p)?).ok();
+            if matches!(cx.func.locals[l.index()].ty, IrType::PortSnapshot) {
+                let sampled = if snapshot_preserves_port_shape(cx.func, *l) {
+                    format!("harc_rt::harc_port_snapshot({})", port_signal(cx, p))
+                } else {
+                    port_read(cx, p)?
+                };
+                writeln!(out, "{pad}{name} = {sampled};").ok();
+            } else {
+                writeln!(out, "{pad}{name} = {};", port_read(cx, p)?).ok();
+            }
         }
         Stmt::ProbeRelease(p) => {
             // `release dut.<force_probe>` → clear the enable wire so the
@@ -1800,6 +1810,141 @@ fn emit_stmt(
         Stmt::TlmJoinAll(pending) => emit_tlm_join_all(out, cx, records, bindings, pending, depth)?,
     }
     Ok(())
+}
+
+/// Function-scope exact C++ carriers used by ordered message capture.
+/// Definitions are discovered from the unique Assign/DutRead that initializes
+/// each internal `PortSnapshot` local. Declaring after ordinary locals and in
+/// LocalId order makes every name referenced by `decltype(rhs)` visible while
+/// keeping the carrier alive across loop-switch case edges.
+fn declare_port_snapshots(out: &mut String, cx: &ECx<'_>, depth: usize) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    for (index, local) in cx.func.locals.iter().enumerate() {
+        if !matches!(local.ty, IrType::PortSnapshot) {
+            continue;
+        }
+        let id = LocalId(index as u32);
+        let mut init = None;
+        for stmt in cx.func.blocks.iter().flat_map(|block| &block.stmts) {
+            match stmt {
+                Stmt::DutRead(dest, port) if *dest == id => {
+                    let candidate = if snapshot_preserves_port_shape(cx.func, id) {
+                        format!("harc_rt::harc_port_snapshot({})", port_signal(cx, port))
+                    } else {
+                        port_read(cx, port)?
+                    };
+                    if init.replace(candidate).is_some() {
+                        return Err(EmitError(format!(
+                            "tbir: ordered snapshot local `{}` has multiple definitions",
+                            cx.names[index]
+                        )));
+                    }
+                }
+                Stmt::Assign(dest, expr) if *dest == id => {
+                    let candidate = expr_cpp(cx, expr)?;
+                    if init.replace(candidate).is_some() {
+                        return Err(EmitError(format!(
+                            "tbir: ordered snapshot local `{}` has multiple definitions",
+                            cx.names[index]
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let init = init.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: ordered snapshot local `{}` has no defining read/assignment",
+                cx.names[index]
+            ))
+        })?;
+        writeln!(
+            out,
+            "{pad}decltype({init}) {}{{}}; (void){};",
+            cx.names[index], cx.names[index]
+        )
+        .ok();
+    }
+    Ok(())
+}
+
+fn snapshot_preserves_port_shape(func: &TbFunction, snapshot: LocalId) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| match stmt {
+            Stmt::Assign(_, expr) => expr_uses_snapshot_lane(expr, snapshot),
+            _ => false,
+        })
+}
+
+fn expr_uses_snapshot_lane(expr: &Expr, snapshot: LocalId) -> bool {
+    match expr {
+        Expr::PortSnapshotLane {
+            snapshot: used,
+            index,
+            ..
+        } => *used == snapshot || expr_uses_snapshot_lane(index, snapshot),
+        Expr::Binary(_, lhs, rhs) => {
+            expr_uses_snapshot_lane(lhs, snapshot) || expr_uses_snapshot_lane(rhs, snapshot)
+        }
+        Expr::Unary(_, inner)
+        | Expr::BitSlice { target: inner, .. }
+        | Expr::WidthCast { inner, .. }
+        | Expr::ComponentIdle { n: inner, .. }
+        | Expr::TransactorIdle { n: inner, .. } => expr_uses_snapshot_lane(inner, snapshot),
+        Expr::Ternary(cond, then_expr, else_expr) => {
+            expr_uses_snapshot_lane(cond, snapshot)
+                || expr_uses_snapshot_lane(then_expr, snapshot)
+                || expr_uses_snapshot_lane(else_expr, snapshot)
+        }
+        Expr::BitSliceDyn { target, hi, lo } => {
+            expr_uses_snapshot_lane(target, snapshot)
+                || expr_uses_snapshot_lane(hi, snapshot)
+                || expr_uses_snapshot_lane(lo, snapshot)
+        }
+        Expr::RecordField {
+            mid_indices, index, ..
+        }
+        | Expr::TransactorStateRecordField {
+            mid_indices, index, ..
+        } => {
+            mid_indices
+                .iter()
+                .any(|(_, value)| expr_uses_snapshot_lane(value, snapshot))
+                || index
+                    .as_deref()
+                    .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot))
+        }
+        Expr::ComponentVecElement { index, .. } | Expr::SeqIndex { index, .. } => {
+            expr_uses_snapshot_lane(index, snapshot)
+        }
+        Expr::CovHookParam { index, .. } => index
+            .as_deref()
+            .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot)),
+        Expr::Call(_, args) => args
+            .iter()
+            .any(|value| expr_uses_snapshot_lane(value, snapshot)),
+        Expr::Literal { .. }
+        | Expr::WideLiteral(_)
+        | Expr::Local(_)
+        | Expr::Port(_)
+        | Expr::TbField(_)
+        | Expr::TemporalSlot { .. }
+        | Expr::TbQueueQuery { .. }
+        | Expr::TransactorState { .. }
+        | Expr::TransactorStateQueueQuery { .. }
+        | Expr::ScoreboardQuery { .. }
+        | Expr::ComponentField { .. }
+        | Expr::ComponentValue { .. }
+        | Expr::ComponentQueueQuery { .. }
+        | Expr::CycleCount
+        | Expr::ErrorCount
+        | Expr::CovBin { .. }
+        | Expr::CovHookArg { .. }
+        | Expr::SeqLen(_)
+        | Expr::RegRead { .. } => false,
+    }
 }
 
 /// Expand one `fork bus.<method>(args)` request issue (v1's
@@ -2334,6 +2479,9 @@ fn declare_locals_except(
         if shared.contains(n) {
             continue;
         }
+        if matches!(l.ty, IrType::PortSnapshot) {
+            continue;
+        }
         match l.ty {
             IrType::Record(r) => {
                 let rec = prog.records.get(r.index()).ok_or_else(|| {
@@ -2458,10 +2606,14 @@ pub(super) fn declare_method_slot(
     depth: usize,
 ) -> Result<(), EmitError> {
     let func = prog.function(m.function);
-    let ret_ty = if func.ret.is_some() {
-        "uint64_t"
-    } else {
-        "void"
+    let ret_ty = match func.ret.and_then(|ret| func.locals.get(ret.index())) {
+        Some(local) => match &local.ty {
+            IrType::Record(r) => prog.records[r.index()].name.clone(),
+            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+            ty => super::local_scalar_cty(ty).to_string(),
+        },
+        None => "void".to_string(),
     };
     let mut param_tys: Vec<String> = Vec::new();
     // State-receiver ABI (#494 P1b): an unbound stateful transactor's
@@ -2547,10 +2699,14 @@ pub(super) fn emit_method(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
 
-    let ret_ty = if func.ret.is_some() {
-        "uint64_t"
-    } else {
-        "void"
+    let ret_ty = match func.ret.and_then(|ret| func.locals.get(ret.index())) {
+        Some(local) => match &local.ty {
+            IrType::Record(r) => prog.records[r.index()].name.clone(),
+            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
+            IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+            ty => super::local_scalar_cty(ty).to_string(),
+        },
+        None => "void".to_string(),
     };
     // A record-typed param (`send(t: RegOp)`) is taken by value as the
     // record struct — the body binds it and reads its fields, mirroring
@@ -2587,6 +2743,7 @@ pub(super) fn emit_method(
     )
     .ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    declare_port_snapshots(out, &cx, depth + 1)?;
     let hook_args = names[..nparams].join(", ");
     // Fan out covergroup and user-hook subscriptions before/after the body.
     // Vectors are type-scoped, matching v1, while declaration is restricted
@@ -3074,6 +3231,7 @@ fn emit_component_fn_lambda(
     let params = params.join(", ");
     writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    declare_port_snapshots(out, &cx, depth + 1)?;
     let hook_args = names[..nparams].join(", ");
     let has_instance_hooks = hook_ctx
         .as_ref()
@@ -3502,6 +3660,7 @@ fn emit_responder_loop_switch(
     depth: usize,
 ) -> Result<(), EmitError> {
     declare_locals(out, prog, func, names, nparams, depth)?;
+    declare_port_snapshots(out, cx, depth)?;
     writeln!(out, "{}int __bb = {};", INDENT.repeat(depth), func.entry.0).ok();
     writeln!(out, "{}bool __done = false;", INDENT.repeat(depth)).ok();
     writeln!(out, "{}while (!__done) {{", INDENT.repeat(depth)).ok();
@@ -4148,6 +4307,7 @@ pub(super) fn emit_test_hook(
     writeln!(out, "{pad}std::function<void({sig_params})> {};", func.name).ok();
     writeln!(out, "{pad}{} = [&]({params}) -> void {{", func.name).ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    declare_port_snapshots(out, &cx, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
     writeln!(out, "{pad2}switch (__bb) {{").ok();

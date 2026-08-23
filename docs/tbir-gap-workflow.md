@@ -65,6 +65,12 @@ family of rejections over a one-site exception. Current implementation order:
   one-dimensional fixed-vector elements, using exact `std::vector` storage
   with verifier-checked element and vector-length metadata plus read-only
   `size()`/`empty()` queries.
+- [x] Lazy interpolation calls in immediate assert/assume diagnostics and
+  wait-timeout messages. Safely hoistable, unconditionally evaluated calls
+  lower inside the failure or timeout CFG arm, preserving non-evaluation on
+  success and source order on failure. Statement-producing calls beneath a
+  short-circuit or ternary branch and concurrent property messages remain
+  outside this CFG-based slice.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -73,8 +79,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 150 remaining constructor call sites (151 textual matches including
-the `unsupported` helper definition) as an inventory, not 151 separate tasks.
+Treat the 139 remaining constructor call sites (140 textual matches including
+the `unsupported` helper definition) as an inventory, not 140 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -131,6 +137,12 @@ migration family while leaving the raw textual count at 151.
 The scoreboard-list batch closes those measured scalar and fixed-vector list
 declarations. It shares the same field-type diagnostic with unsupported list
 element shapes, so the raw textual count remains unchanged.
+The event-routing batch then removes ten dedicated routing rejections, leaving
+141 textual matches (140 constructors plus the helper).
+The lazy diagnostic-call batch closes the immediate-check and wait-timeout
+source families and consolidates two transactor message-context rejections into
+one lazy-call diagnostic, leaving 140 textual matches (139 constructors plus
+the helper).
 
 ## Review-derived semantic gates
 
@@ -193,8 +205,9 @@ not applicable before requesting review:
    The completed event, queue-query, method-hook, transactor-heartbeat, and
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
-   state, pure-helper record-local, and struct-keep slices reduce the count
-   from 174 to 151 textual matches (150 constructors plus the helper
+   state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
+   diagnostic-call slices reduce the count
+   from 174 to 140 textual matches (139 constructors plus the helper
    definition). The
    scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths

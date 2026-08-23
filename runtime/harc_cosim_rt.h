@@ -249,6 +249,35 @@ struct UnpackedSigProxy {
 
 } // namespace cosim
 
+// Ordered diagnostic captures must materialize proxy VALUES. Copying a DPI
+// proxy only copies its compile-time signal id; every later conversion or
+// subscript would call back into the simulator and observe post-side-effect
+// state instead of the source-order sample.
+template <int ID>
+inline uint64_t harc_port_snapshot(const cosim::SigProxy<ID>& sig) {
+    return static_cast<uint64_t>(sig);
+}
+
+template <int ID, int NWORDS>
+inline HarcWide<NWORDS> harc_port_snapshot(
+    const cosim::WideSigProxy<ID, NWORDS>& sig) {
+    HarcWide<NWORDS> out{};
+    for (int i = 0; i < NWORDS; ++i) {
+        out.words[static_cast<std::size_t>(i)] = static_cast<uint32_t>(sig[i]);
+    }
+    return out;
+}
+
+template <int ID, int NELEMS>
+inline std::array<uint64_t, NELEMS> harc_port_snapshot(
+    const cosim::UnpackedSigProxy<ID, NELEMS>& sig) {
+    std::array<uint64_t, NELEMS> out{};
+    for (int i = 0; i < NELEMS; ++i) {
+        out[static_cast<std::size_t>(i)] = static_cast<uint64_t>(sig[i]);
+    }
+    return out;
+}
+
 // Scalar accessor proxies are <= 64-bit scalars for the signal helpers
 // in harc_thread_rt.h (harc_read / harc_vec_lane_write). Wide and
 // unpacked proxies are deliberately NOT marked: they go through the

@@ -557,6 +557,9 @@ pub struct TransactorMethodSchema {
     /// emitted `AxilXactor_step(_tb.drv, <Beat>)` — "no match for call
     /// to" in both backends.
     pub param_tys: Vec<IrType>,
+    /// Declared return type, retained at call sites so signed and wide
+    /// results use the same local/C++ ABI as the method body.
+    pub ret_ty: Option<IrType>,
     /// True for `-> T` methods (the function carries a `ret` slot).
     pub has_ret: bool,
     /// True only when the source declaration used `hookable` rather than
@@ -1941,6 +1944,10 @@ pub enum IrType {
     /// Only ever a parameter local in this subset — never a `let` body
     /// local — so it has no value-construction or randomize support.
     Component(ComponentId),
+    /// Internal carrier for a whole DUT port sampled before an impure lane
+    /// selector. Codegen declares it with `auto` at the `DutRead` site so
+    /// packed-wide and native-array port shapes retain their exact C++ type.
+    PortSnapshot,
     /// A TEST-SCOPE event channel local (`let e : event<uint<8>>`,
     /// spec §3.4). Emitted as v1 emits it: a
     /// `std::vector<std::function<void(<payload>)>>` local in the
@@ -2810,6 +2817,14 @@ pub enum Expr {
         target: Box<Expr>,
         hi: Box<Expr>,
         lo: Box<Expr>,
+    },
+    /// Lane read from a previously sampled whole DUT port. `port` retains
+    /// the original signal identity solely for packed-lane width metadata;
+    /// the runtime value is read from `snapshot`, never from the DUT again.
+    PortSnapshotLane {
+        snapshot: LocalId,
+        port: PortRef,
+        index: Box<Expr>,
     },
     /// Width-method intrinsic (`.trunc<N>()` / `.zext<N>()` /
     /// `.sext<N>()` / `.resize<N>()`), with destinations through the

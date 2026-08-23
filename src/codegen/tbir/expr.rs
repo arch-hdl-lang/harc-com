@@ -549,6 +549,20 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let lo = expr_cpp(cx, lo)?;
             format!("harc_rt::harc_bits({t}, (uint32_t)({hi}), (uint32_t)({lo}))")
         }
+        Expr::PortSnapshotLane {
+            snapshot,
+            port,
+            index,
+        } => {
+            let sampled = &cx.names[snapshot.index()];
+            let idx = expr_cpp(cx, index)?;
+            match lane_width(cx, port) {
+                Some(w) => {
+                    format!("harc_rt::harc_vec_lane_read<{w}>({sampled}, (std::size_t)({idx}))")
+                }
+                None => format!("{sampled}[(std::size_t)({idx})]"),
+            }
+        }
         Expr::WidthCast {
             kind,
             width,

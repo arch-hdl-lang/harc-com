@@ -675,6 +675,24 @@ inline auto harc_read(const Sig& sig) {
     }
 }
 
+// Preserve the exact host-side shape of a DUT port sampled before an
+// interpolation subexpression with side effects. Arithmetic scalars,
+// Verilator VlWide/VlUnpacked wrappers, and other copyable proxy objects copy
+// by value. A native C array needs an explicit std::array copy so it can live
+// across loop-switch CFG cases without decaying to a pointer.
+template<typename Sig>
+    requires (!std::is_array_v<Sig>)
+inline auto harc_port_snapshot(const Sig& sig) {
+    return sig;
+}
+
+template<typename Elem, std::size_t N>
+inline auto harc_port_snapshot(const Elem (&sig)[N]) {
+    std::array<Elem, N> out{};
+    for (std::size_t i = 0; i < N; ++i) out[i] = sig[i];
+    return out;
+}
+
 inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
     if (hi < lo) return 0;
     if (lo >= 128) return 0;

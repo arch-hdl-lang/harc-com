@@ -34,10 +34,16 @@ end function cur_plus
 
 testbench MsgCallHoistTb
     dut : Top
+    calls : uint<8> default 0
     // Testbench method — CFG-inlined, must be hoisted out of a message.
     function dbl(x: uint<8>) -> uint<8>
         return x + x
     end dbl
+
+    function bump(x: uint<8>) -> uint<8>
+        calls = calls + 1
+        return x + calls
+    end bump
 end testbench MsgCallHoistTb
 
 impl MsgCallHoistTest for MsgCallHoistTb
@@ -77,6 +83,15 @@ impl MsgCallHoistTest for MsgCallHoistTb
         if v > 100
             fail("unreachable: cur_plus=${cur_plus(dut, 1)}")
         end if
+
+        // (5) Conditional diagnostics keep call evaluation inside their
+        //     failure path. The passing assert and successful wait must not
+        //     call bump. The executed failure paths live in the companion
+        //     expected-failure parity fixture.
+        assert v == 3 else fail("must stay lazy: bump=${bump(v)}")
+        assert calls == 0 else fail("passing assert evaluated its message")
+        wait until v == 3 timeout 1 cycles fail("must stay lazy: bump=${bump(v)}")
+        assert calls == 0 else fail("successful wait evaluated timeout message")
 
         log(info, "ALL TESTS PASSED")
         wait 1 cycle

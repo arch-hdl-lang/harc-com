@@ -92,6 +92,13 @@ pub enum VerifyError {
         expected: IrType,
         actual: IrType,
     },
+    /// A printf-style interpolation capture must use the scalar formatting
+    /// ABI; aggregate values cannot be converted by `harc_printf_ll`.
+    BadFormatArg {
+        func: FunctionId,
+        block: BlockId,
+        actual: IrType,
+    },
     /// WidthCast nodes carry language-level bit widths even when they are
     /// constructed by a compiler pass rather than source lowering.
     BadWidthCast {
@@ -216,6 +223,15 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "fn{}: b{} assigns {:?} into local %{} declared {:?}",
                 func.0, block.0, actual, local.0, expected
+            ),
+            VerifyError::BadFormatArg {
+                func,
+                block,
+                actual,
+            } => write!(
+                f,
+                "fn{}: b{} uses aggregate {:?} as a scalar format argument",
+                func.0, block.0, actual
             ),
             VerifyError::BadWidthCast {
                 func,
@@ -1007,6 +1023,23 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     format!("transactor x{xi} state field `{}`", field.name),
                     &mut errs,
                 );
+            }
+        }
+        for method in &x.methods {
+            let Some(function) = prog.functions.get(method.function.index()) else {
+                continue;
+            };
+            let function_ret = function
+                .ret
+                .and_then(|ret| function.locals.get(ret.index()))
+                .map(|local| local.ty.clone());
+            if method.has_ret != method.ret_ty.is_some() || method.ret_ty != function_ret {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` return schema {:?} disagrees with fn{} return {:?}",
+                        method.name, method.ret_ty, method.function.0, function_ret
+                    ),
+                });
             }
         }
         for (name, function) in x
@@ -2027,6 +2060,8 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         ck.check_block(b);
     }
 
+    check_port_snapshot_definitions(func, fid, &mut errs);
+
     // Invariant 4 — forward dataflow: a local must be defined on every
     // path from entry before its first read. Params count as defined.
     check_def_before_use(prog, func, fid, &reachable, &mut errs);
@@ -2633,6 +2668,23 @@ impl Checker<'_> {
                     (lhs, rhs) => common_scalar_expr_type(lhs, rhs).or(Some(IrType::Unknown)),
                 }
             }
+            Expr::TbField(field) => self
+                .func
+                .owner
+                .and_then(|owner| self.prog.testbenches.get(owner.index()))
+                .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
+                .map(|field| field.ty.clone())
+                .or(Some(IrType::Unknown)),
+            Expr::SeqIndex { seq, .. } => match self.func.locals.get(seq.index()).map(|l| &l.ty) {
+                Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
+                Some(IrType::Seq(scalar)) => Some((**scalar).clone()),
+                _ => Some(IrType::Unknown),
+            },
+            Expr::ComponentValue { base } => self
+                .component_base_id(base)
+                .ok()
+                .map(IrType::Component)
+                .or(Some(IrType::Unknown)),
             Expr::ComponentField { base, field } => self
                 .component_field_type(base, field)
                 .or(Some(IrType::Unknown)),
@@ -3452,7 +3504,7 @@ impl Checker<'_> {
                     if let Some(d) = dest {
                         self.check_local(*d);
                     }
-                    self.check_transactor_call(call);
+                    self.check_transactor_call(*dest, call);
                 }
                 Stmt::TransactorSelfCall { dest, call } => {
                     if let Some(d) = dest {
@@ -3774,6 +3826,28 @@ impl Checker<'_> {
     fn check_fmt_args(&mut self, args: &FmtArgs) {
         for a in &args.args {
             self.check_expr(&a.expr, true, "format arg");
+            if self.contains_invalid_record_composition(&a.expr) {
+                self.errs.push(VerifyError::BadFormatArg {
+                    func: self.fid,
+                    block: self.bid,
+                    actual: IrType::Unknown,
+                });
+            } else if let Some(actual) = self.aggregate_assignment_expr_type(&a.expr) {
+                if !matches!(
+                    actual,
+                    IrType::UInt(_)
+                        | IrType::SInt(_)
+                        | IrType::Bool
+                        | IrType::Unknown
+                        | IrType::PortSnapshot
+                ) {
+                    self.errs.push(VerifyError::BadFormatArg {
+                        func: self.fid,
+                        block: self.bid,
+                        actual,
+                    });
+                }
+            }
         }
     }
 
@@ -4191,7 +4265,7 @@ impl Checker<'_> {
     /// call edge whose `bus_field`/`method` resolve through the owner
     /// testbench's transactor fields. Args follow the no-inline-ports
     /// rule (they are hoisted at lowering, like `Assign` values).
-    fn check_transactor_call(&mut self, call: &Expr) {
+    fn check_transactor_call(&mut self, dest: Option<LocalId>, call: &Expr) {
         let (fid, bid) = (self.fid, self.bid);
         let bad = move |detail: String| VerifyError::BadTransactorCall {
             func: fid,
@@ -4238,11 +4312,30 @@ impl Checker<'_> {
                 .push(bad(format!("transactor x{} does not resolve", xid.0)));
             return;
         };
-        if schema.method(method).is_none() {
+        let Some(resolved) = schema.method(method) else {
             self.errs.push(bad(format!(
                 "transactor `{}` has no method `{method}`",
                 schema.name
             )));
+            return;
+        };
+        if let Some(dest) = dest {
+            let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);
+            match (&resolved.ret_ty, actual) {
+                (Some(IrType::Unknown), Some(IrType::Unknown)) => {}
+                (Some(expected), Some(actual))
+                    if !matches!(actual, IrType::Unknown)
+                        && assign_compatible(actual, expected) => {}
+                (Some(expected), Some(actual)) => self.errs.push(bad(format!(
+                    "transactor method `{}.{method}` returns {expected:?}, but destination is {actual:?}",
+                    schema.name
+                ))),
+                (None, _) => self.errs.push(bad(format!(
+                    "void transactor method `{}.{method}` captured into a destination",
+                    schema.name
+                ))),
+                _ => {}
+            }
         }
     }
 
@@ -4408,6 +4501,70 @@ impl Checker<'_> {
                 self.check_expr(hi, ports_ok, context);
                 self.check_expr(lo, ports_ok, context);
             }
+            Expr::PortSnapshotLane {
+                snapshot,
+                port,
+                index,
+            } => {
+                if context != "Assign value" {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} sampled-port lane is only valid beneath an Assign value",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                self.check_local(*snapshot);
+                if !matches!(
+                    self.func.locals.get(snapshot.index()).map(|l| &l.ty),
+                    Some(IrType::PortSnapshot)
+                ) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} sampled-port lane references a non-snapshot local",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                if port.lane.is_some() {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} sampled-port lane carries an already-indexed port",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                let mut definition_count = 0usize;
+                let mut defined_port = None;
+                for stmt in self.func.blocks.iter().flat_map(|block| &block.stmts) {
+                    match stmt {
+                        Stmt::DutRead(dest, defined) if dest == snapshot => {
+                            definition_count += 1;
+                            defined_port = Some(defined);
+                        }
+                        Stmt::Assign(dest, _) if dest == snapshot => definition_count += 1,
+                        _ => {}
+                    }
+                }
+                let same_port = |defined: &crate::ir::PortRef| {
+                    defined.testbench_field == port.testbench_field
+                        && defined.port_path == port.port_path
+                        && defined.aggregate_path == port.aggregate_path
+                        && defined.direction == port.direction
+                        && defined.width == port.width
+                        && defined.access == port.access
+                        && defined.lane.is_none()
+                };
+                if definition_count != 1 || !defined_port.is_some_and(same_port) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} sampled-port lane metadata does not match its unique defining DutRead",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                self.check_expr(index, ports_ok, context);
+            }
             Expr::Ternary(c, t, e2) => {
                 self.check_expr(c, ports_ok, context);
                 self.check_expr(t, ports_ok, context);
@@ -4524,11 +4681,23 @@ impl Checker<'_> {
             // A by-value component passed as a method arg. A `Local` base
             // is a method-param local (verify it is defined); a
             // `SelfField`/`Path` base is resolved at lowering.
-            Expr::ComponentValue { base } => {
-                if let crate::ir::ComponentBase::Local(l) = base {
+            Expr::ComponentValue { base } => match base {
+                crate::ir::ComponentBase::Local(l) => {
                     self.check_local(*l);
+                    if !matches!(
+                        self.func.locals.get(l.index()).map(|local| &local.ty),
+                        Some(IrType::Component(_))
+                    ) {
+                        self.report_bad_component_field(
+                            "component value local is not component-typed".to_string(),
+                        );
+                    }
                 }
-            }
+                _ if self.component_base_id(base).is_err() => self.report_bad_component_field(
+                    "component value base does not resolve".to_string(),
+                ),
+                _ => {}
+            },
             // Component-queue size/empty read — host state resolved at
             // lowering against the component schema; nothing to verify.
             Expr::ComponentQueueQuery { .. } => {}
@@ -4570,6 +4739,17 @@ impl Checker<'_> {
             // context.
             Expr::SeqIndex { seq, index } => {
                 self.check_local(*seq);
+                if !matches!(
+                    self.func.locals.get(seq.index()).map(|local| &local.ty),
+                    Some(IrType::RecordSeq(_) | IrType::Seq(_))
+                ) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} sequence index receiver %{} is not sequence-typed",
+                            self.fid.0, self.bid.0, seq.0
+                        ),
+                    });
+                }
                 self.check_expr(index, ports_ok, context);
             }
             Expr::Call(target, args) => {
@@ -4661,11 +4841,23 @@ impl Checker<'_> {
                 args.len()
             )));
         }
-        if dest.is_some() && !m.has_ret {
-            self.errs.push(bad(format!(
-                "void transactor method `{}.{method}` captured into a destination",
-                schema.name
-            )));
+        if let Some(dest) = dest {
+            let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);
+            match (&m.ret_ty, actual) {
+                (Some(IrType::Unknown), Some(IrType::Unknown)) => {}
+                (Some(expected), Some(actual))
+                    if !matches!(actual, IrType::Unknown)
+                        && assign_compatible(actual, expected) => {}
+                (Some(expected), Some(actual)) => self.errs.push(bad(format!(
+                    "transactor method `{}.{method}` returns {expected:?}, but destination is {actual:?}",
+                    schema.name
+                ))),
+                (None, _) => self.errs.push(bad(format!(
+                    "void transactor method `{}.{method}` captured into a destination",
+                    schema.name
+                ))),
+                _ => {}
+            }
         }
     }
 
@@ -4745,6 +4937,35 @@ impl Checker<'_> {
         }
         for a in args {
             self.check_expr(a, false, "TransactorMethod arg");
+        }
+    }
+}
+
+fn check_port_snapshot_definitions(
+    func: &TbFunction,
+    fid: FunctionId,
+    errs: &mut Vec<VerifyError>,
+) {
+    for (index, local) in func.locals.iter().enumerate() {
+        if !matches!(local.ty, IrType::PortSnapshot) {
+            continue;
+        }
+        let snapshot = LocalId(index as u32);
+        let definitions = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| {
+                matches!(stmt, Stmt::DutRead(dest, _) | Stmt::Assign(dest, _) if *dest == snapshot)
+            })
+            .count();
+        if definitions != 1 {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} ordered snapshot l{} must have exactly one Assign/DutRead definition (found {definitions})",
+                    fid.0, snapshot.0
+                ),
+            });
         }
     }
 }
@@ -5436,6 +5657,12 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(target, f);
             for_each_local(hi, f);
             for_each_local(lo, f);
+        }
+        Expr::PortSnapshotLane {
+            snapshot, index, ..
+        } => {
+            f(*snapshot);
+            for_each_local(index, f);
         }
         Expr::Ternary(c, t, e) => {
             for_each_local(c, f);
