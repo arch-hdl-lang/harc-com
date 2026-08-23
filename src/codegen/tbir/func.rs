@@ -1045,11 +1045,13 @@ fn emit_cycle_handler(
 /// struct by value.
 fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<String, EmitError> {
     match cx.func.locals.get(event.index()).map(|l| &l.ty) {
-        Some(IrType::Event(crate::ir::EventPayload::Scalar { signed })) => Ok(if *signed {
-            "int64_t".to_string()
-        } else {
-            "uint64_t".to_string()
-        }),
+        // `field_scalar_cty` on the payload's own `IrType`, so a wide
+        // payload becomes `_harc_u128` / `harc_rt::HarcWide<N>` rather
+        // than a 64-bit parameter that silently truncates every
+        // notification. v1 emits the same.
+        Some(IrType::Event(p @ crate::ir::EventPayload::Scalar { .. })) => Ok(
+            super::field_scalar_cty(&p.scalar_ir_type().expect("a scalar payload types")),
+        ),
         Some(IrType::Event(crate::ir::EventPayload::Record(r))) => {
             Ok(prog.records[r.index()].name.clone())
         }
@@ -2522,8 +2524,9 @@ fn declare_locals_except(
             // A test-scope event channel — v1's subscriber vector.
             IrType::Event(payload) => {
                 let cty = match payload {
-                    crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
-                    crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+                    crate::ir::EventPayload::Scalar { .. } => super::field_scalar_cty(
+                        &payload.scalar_ir_type().expect("a scalar payload types"),
+                    ),
                     crate::ir::EventPayload::Record(r) => prog
                         .records
                         .get(r.index())

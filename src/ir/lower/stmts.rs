@@ -4599,8 +4599,13 @@ impl FuncBuilder<'_> {
 
         let pending_id = self.reserve_pending_function();
         let param_ty = match payload {
-            crate::ir::EventPayload::Scalar { signed: true } => IrType::SInt(None),
-            crate::ir::EventPayload::Scalar { signed: false } => IrType::UInt(None),
+            // `scalar_ir_type()`, which keeps the DECLARED width. This
+            // arm open-coded the conversion with `None` — the comment
+            // above it said the param "IS widthless" — and that is what
+            // made a wide payload unrepresentable downstream.
+            crate::ir::EventPayload::Scalar { .. } => {
+                payload.scalar_ir_type().expect("a scalar payload types")
+            }
             crate::ir::EventPayload::Record(r) => IrType::Record(r),
         };
         let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);

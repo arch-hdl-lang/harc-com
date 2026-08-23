@@ -2112,8 +2112,14 @@ fn lower_on_handler_body(
     // the body resolve against the record schema).
     let arg_name = on_handler_arg_name(h);
     let ty = match oh.arg_payload {
-        EventPayload::Scalar { signed: true } => IrType::SInt(None),
-        EventPayload::Scalar { signed: false } => IrType::UInt(None),
+        // `scalar_ir_type()`, which keeps the DECLARED width. This
+        // pair open-coded the conversion with `None`, which is what
+        // made a wide payload unrepresentable downstream even once the
+        // schema could hold one.
+        EventPayload::Scalar { .. } => oh
+            .arg_payload
+            .scalar_ir_type()
+            .expect("a scalar payload types"),
         EventPayload::Record(rid) => IrType::Record(rid),
     };
     let local = b.declare(&arg_name);
@@ -2788,8 +2794,8 @@ pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
 fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }
@@ -3004,11 +3010,22 @@ pub(crate) fn lower_event_payload(
                     return Ok(EventPayload::Record(*rid));
                 }
             }
+            // The DECLARED width travels into the schema now. `Bool`
+            // is width 1 and carries no width of its own, matching the
+            // `bool` member both backends emit for it.
             match event_payload_scalar_ir_type(ty) {
-                Some(IrType::SInt(_)) => Ok(EventPayload::Scalar { signed: true }),
-                Some(IrType::UInt(_)) | Some(IrType::Bool) => {
-                    Ok(EventPayload::Scalar { signed: false })
-                }
+                Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
+                    signed: true,
+                    width,
+                }),
+                Some(IrType::UInt(width)) => Ok(EventPayload::Scalar {
+                    signed: false,
+                    width,
+                }),
+                Some(IrType::Bool) => Ok(EventPayload::Scalar {
+                    signed: false,
+                    width: None,
+                }),
                 _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
         }
@@ -3028,9 +3045,13 @@ pub(crate) fn lower_event_payload(
         // `TypeArg::Named` is a keyword-style arg (`depth=16`), never a
         // payload type reference — reject it precisely.
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
-        // A bare `event` with no payload defaults to an unsigned scalar
-        // (matches the prior behavior).
-        None => Ok(EventPayload::Scalar { signed: false }),
+        // A bare `event` with no payload defaults to an unsigned
+        // scalar of unspecified width — the `uint64_t` both backends
+        // have always given it.
+        None => Ok(EventPayload::Scalar {
+            signed: false,
+            width: None,
+        }),
     }
 }
 
@@ -3071,7 +3092,7 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
-/// The component EVENT-payload scalar subset, capped at 64 bits.
+/// The component EVENT-payload scalar subset.
 ///
 /// This function used to gate the fixed-vector ELEMENT type as well,
 /// and its comment said the two were "separate on purpose … neither
@@ -3081,15 +3102,14 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for an
 /// `event<uint<1024>>`, so BOTH are real gaps rather than mislabels.
 ///
-/// They are still separate, for a reason that outlived the comment:
-/// `FixedVecSchema` carries a full `IrType` and only its emitter
-/// truncated, while `EventPayload::Scalar { signed: bool }` has NO
-/// width field at all. The vector half is a one-line emitter fix; the
-/// payload half needs the IR to be able to say the width first. Only
-/// the vector half has moved.
+/// The payload half needed the IR to be able to SAY a width first:
+/// `EventPayload::Scalar` held a lone `signed: bool`, so `uint64_t`
+/// and `int64_t` were the only two things it could mean. It carries a
+/// width now, and this gate uses the same policy as any declared
+/// scalar field, so a payload and a field agree about what a width
+/// means.
 fn event_payload_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
-    decoded_scalar_ir_type(t)
-        .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
 }
 
 /// The fixed-vector ELEMENT subset. `FixedVecSchema` carries a full
@@ -4812,8 +4832,8 @@ impl super::FuncBuilder<'_> {
                         .is_err()
                     {
                         let want = match payload {
-                            EventPayload::Scalar { signed: true } => "sint".to_string(),
-                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
                             EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),
                         };
                         return Err(LowerError::Invalid(format!(

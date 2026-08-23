@@ -430,8 +430,13 @@ pub(super) fn event_payload_cty(
     records: &[crate::ir::RecordSchema],
 ) -> String {
     match p {
-        crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
-        crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+        // The subscriber's parameter type. `field_scalar_cty` carries
+        // the declared width; the pair this replaced could only say
+        // 64 bits, so an `event<uint<1024>>` had nowhere to put the
+        // other fifteen sixteenths.
+        crate::ir::EventPayload::Scalar { .. } => {
+            super::field_scalar_cty(&p.scalar_ir_type().expect("a scalar payload types"))
+        }
         crate::ir::EventPayload::Record(r) => records[r.index()].name.clone(),
     }
 }

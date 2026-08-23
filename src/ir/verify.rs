@@ -1772,8 +1772,8 @@ fn resolve_component_queue_elem(
 fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }
@@ -1790,8 +1790,8 @@ fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool 
 
 fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }

@@ -269,8 +269,8 @@ impl Display for TbProgram {
                     ComponentFieldKind::Event { payload } => {
                         use crate::ir::EventPayload;
                         let inner = match payload {
-                            EventPayload::Scalar { signed: true } => "sint".to_string(),
-                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
                             EventPayload::Record(r) => self.records[r.index()].name.clone(),
                         };
                         format!("out event<{inner}>")
@@ -573,8 +573,8 @@ fn type_str(t: &IrType) -> String {
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
         IrType::Event(p) => match p {
-            EventPayload::Scalar { signed: true } => "event<sint>".to_string(),
-            EventPayload::Scalar { signed: false } => "event<uint>".to_string(),
+            EventPayload::Scalar { signed: true, .. } => "event<sint>".to_string(),
+            EventPayload::Scalar { signed: false, .. } => "event<uint>".to_string(),
             EventPayload::Record(r) => format!("event<r{}>", r.0),
         },
         IrType::Bool => "bool".to_string(),

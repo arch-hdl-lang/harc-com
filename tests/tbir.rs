@@ -35042,7 +35042,10 @@ fn component_event_subscription_metadata_is_verified() {
     });
     assert_event_corruption_rejected(prog.clone(), |event| match event {
         ir::EventChannelRef::Component { payload, .. } => {
-            *payload = ir::EventPayload::Scalar { signed: false }
+            *payload = ir::EventPayload::Scalar {
+                signed: false,
+                width: None,
+            }
         }
         _ => panic!("fixture subscription must target a component event"),
     });
@@ -36945,6 +36948,93 @@ end impl TWv
                 .expect("v1 emits")
                 .contains(member),
             "`Vec<{ty}, 4>`: v1 emits `{member}` too — the two agree"
+        );
+    }
+}
+
+/// A wide event PAYLOAD keeps its width in the subscriber's parameter
+/// type, at both emitters that render one.
+///
+/// `EventPayload::Scalar` carried a lone `signed: bool` until this
+/// batch, so `uint64_t` and `int64_t` were the only two things it could
+/// mean and a `std::function<void(uint64_t)>` for an
+/// `event<uint<1024>>` would have compiled while dropping fifteen
+/// sixteenths of every notification. Only the member TEXT tells the fix
+/// from that bug, so it is asserted against v1's own answer.
+#[test]
+fn a_wide_event_payload_keeps_its_width() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor SrcE
+    ev : out event<{ty}>
+    n  : uint<32> default 0
+
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor SrcE
+
+testbench TbWe
+    dut : Top
+    src : SrcE passive
+end testbench TbWe
+
+impl TWe for TbWe
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TWe
+"#
+        )
+    };
+    // (payload, what tbir emits, what v1 emits). The two agree
+    // everywhere except `bool`, which is NOT this batch's doing and is
+    // recorded rather than quietly asserted away: v1 gives a bool
+    // payload `std::function<void(bool)>` and tbir gives
+    // `void(uint64_t)`. Both compile, so no differential space can see
+    // it; the observable difference is that `emit ev(2)` notifies with
+    // `true` under v1 and `2` here. Closing it needs the payload
+    // schema to be able to SAY bool — `{ signed, width }` cannot, since
+    // `width: Some(1)` means `uint<1>`, which v1 renders `uint64_t`.
+    for (ty, member, v1_member) in [
+        (
+            "uint<8>",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+        ),
+        (
+            "sint<32>",
+            "std::vector<std::function<void(int64_t)>> ev;",
+            "std::vector<std::function<void(int64_t)>> ev;",
+        ),
+        (
+            "bool",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+            "std::vector<std::function<void(bool)>> ev;",
+        ),
+        (
+            "uint<128>",
+            "std::vector<std::function<void(_harc_u128)>> ev;",
+            "std::vector<std::function<void(_harc_u128)>> ev;",
+        ),
+        (
+            "uint<1024>",
+            "std::vector<std::function<void(harc_rt::HarcWide<32>)>> ev;",
+            "std::vector<std::function<void(harc_rt::HarcWide<32>)>> ev;",
+        ),
+    ] {
+        let src = prog(ty);
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(member),
+            "`event<{ty}>`: tbir must emit `{member}`, got:\n{cpp}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_member),
+            "`event<{ty}>`: v1 must emit `{v1_member}`"
         );
     }
 }

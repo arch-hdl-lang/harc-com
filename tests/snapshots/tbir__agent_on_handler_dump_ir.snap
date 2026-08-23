@@ -12,9 +12,9 @@ tb-ir program
 
 fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   params:
-    t : uint
+    t : uint<8>
   locals:
-    %0 t : uint
+    %0 t : uint<8>
   entry = b0
 
   b0:

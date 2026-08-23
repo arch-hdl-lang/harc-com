@@ -8821,6 +8821,46 @@ former `transaction` group lives in
      The FixedVec emitter held the fifth and last copy of the
      `(bool | int64_t | uint64_t)` triple.
 
+138. **A schema that could only say sixty-four (2026-08-23).**
+
+     The other half of divergence 137. `event<uint<1024>>` was refused
+     while v1 emitted
+     `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for it,
+     and the reason was not a gate but a representation:
+     `EventPayload::Scalar { signed: bool }` could say `int64_t` or
+     `uint64_t` and nothing else. Widening the gate alone would have
+     produced a 64-bit subscriber parameter for a 1024-bit payload.
+
+     The obvious fix — carry an `IrType`, like every sibling slot
+     (`QueueElem::Scalar { ty }`, `StateFieldKind::Scalar { ty }`,
+     `FixedVecSchema { elem }`) — does not compile, and the tree says
+     why: `IrType::Event(EventPayload)` makes the two mutually
+     recursive, so an `IrType` inside the payload is a type of infinite
+     size and costs `IrType` its `Copy`. That is exactly why the
+     siblings can carry one and this cannot. It carries
+     `{ signed, width }` instead, and the doc comment records the
+     constraint so the next person does not spend the same twenty
+     minutes discovering it.
+
+     Two call sites had already open-coded payload → `IrType` with a
+     `None` width to talk to the rest of lowering, one of them
+     commenting that the param "IS widthless". They call
+     `EventPayload::scalar_ir_type()` now and keep the declared width —
+     which is visible in a snapshot: an `on` handler's parameter for
+     `event<uint<8>>` types as `uint<8>` rather than a bare `uint`.
+
+     **A pre-existing divergence the measurement surfaced.** v1 emits
+     `std::function<void(bool)>` for an `event<bool>`; TB-IR emits
+     `void(uint64_t)`. Both compile, so no differential space can see
+     it — the observable difference is that `emit ev(2)` notifies with
+     `true` under v1 and `2` here. Closing it needs the payload schema
+     to be able to SAY bool, which `{ signed, width }` cannot:
+     `width: Some(1)` means `uint<1>`, which v1 renders `uint64_t`.
+     Named in the test that measured it, not asserted away.
+
+     Three mutations: re-capping the gate, restoring the emitter's
+     64-bit pair, and dropping the width on the way into the schema.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
