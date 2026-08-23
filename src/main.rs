@@ -51,6 +51,19 @@ enum CppSplit {
     Tests,
 }
 
+/// Layout for generated C++ split shards (`--cpp-split-layout`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CppSplitLayout {
+    /// Historical behavior: every shard is a self-contained translation
+    /// unit (shared scaffolding re-emitted per shard, internal linkage).
+    #[default]
+    SelfContained,
+    /// Common-object layout: reusable infra compiled once into common
+    /// objects; one stable capsule per test; explicit registry +
+    /// dispatcher; interface-ABI link anchor (issue #643).
+    Common,
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Parse and type-check HARC source file(s). Exits 0 on success.
@@ -139,9 +152,19 @@ enum Cmd {
         cpp_split: CppSplit,
         /// Number of tests per generated split C++ shard. Higher values
         /// reduce compiler startup/header parse overhead; lower values
-        /// improve per-test incremental granularity.
+        /// improve per-test incremental granularity. Ignored (rejected)
+        /// under `--cpp-split-layout common`, which always emits one
+        /// stable capsule per test.
         #[arg(long, default_value_t = 4)]
         cpp_split_group_size: usize,
+        /// Generated C++ split layout for `--cpp-split tests` with
+        /// `--codegen v1`. `self-contained` keeps the historical
+        /// per-shard self-contained translation units; `common` compiles
+        /// the shared runtime/testbench/component infrastructure once
+        /// and emits one small stable capsule per test plus an explicit
+        /// registry (issue #643).
+        #[arg(long, value_enum, default_value_t = CppSplitLayout::SelfContained)]
+        cpp_split_layout: CppSplitLayout,
         /// Parallel workers for HARC's OWN split C++ emission (the
         /// frontend). `1` is the deterministic serial path; `0` picks
         /// `min(available CPUs, shard count, 4)`. The cap is a memory
@@ -520,6 +543,7 @@ fn main() -> Result<()> {
             sv,
             vlt,
             params,
+            cpp_split_layout,
             top,
             test,
             compile_scope,
@@ -617,6 +641,7 @@ fn main() -> Result<()> {
                         SplitOpts {
                             mode: cpp_split,
                             group_size: cpp_split_group_size,
+                            layout: cpp_split_layout,
                             emit_jobs,
                         },
                         outdir.clone(),
@@ -793,6 +818,7 @@ struct WaveOpts {
 struct SplitOpts {
     mode: CppSplit,
     group_size: usize,
+    layout: CppSplitLayout,
     /// Requested frontend emission workers; `0` means automatic. Resolved
     /// against the actual shard count by `tbir::resolve_emit_jobs`.
     emit_jobs: usize,
@@ -803,6 +829,7 @@ impl Default for SplitOpts {
         SplitOpts {
             mode: CppSplit::Off,
             group_size: 1,
+            layout: CppSplitLayout::SelfContained,
             emit_jobs: 1,
         }
     }
@@ -819,6 +846,24 @@ struct Z3PathOpts {
 struct Z3Paths {
     include_dir: Option<PathBuf>,
     lib_dir: Option<PathBuf>,
+}
+
+/// Extract the `artifacts` filename list from a schema-1 common-split
+/// manifest. Returns `None` when the manifest is absent or malformed so
+/// callers can skip cleanup instead of guessing.
+fn parse_manifest_artifacts(manifest: &str) -> Option<Vec<String>> {
+    const KEY: &str = "\"artifacts\":[";
+    let start = manifest.find(KEY)? + KEY.len();
+    let end = manifest[start..].find(']')? + start;
+    let body = &manifest[start..end];
+    let mut names = Vec::new();
+    for part in body.split(',') {
+        let trimmed = part.trim().trim_matches('"');
+        if !trimmed.is_empty() {
+            names.push(trimmed.to_string());
+        }
+    }
+    Some(names)
 }
 
 fn validate_param_overrides(params: &[String]) -> Result<()> {
@@ -2316,6 +2361,28 @@ fn cmd_sim(
             "--cpp-split tests is currently supported only with --sv / Verilator builds"
         ));
     }
+    if split.layout == CppSplitLayout::Common {
+        if split.mode != CppSplit::Tests {
+            return Err(miette::miette!(
+                "--cpp-split-layout common requires --cpp-split tests"
+            ));
+        }
+        if codegen != CodegenKind::V1 {
+            return Err(miette::miette!(
+                "--cpp-split-layout common is v1-only for now; pass --codegen v1"
+            ));
+        }
+        if split.group_size != 4 {
+            return Err(miette::miette!(
+                "--cpp-split-group-size does not apply to --cpp-split-layout common                  (it always emits one stable capsule per test); drop the flag"
+            ));
+        }
+        if cosim.is_some() {
+            return Err(miette::miette!(
+                "--cpp-split-layout common does not support split DPI co-simulation yet"
+            ));
+        }
+    }
 
     // Parse every input file, then fold `extend test T` blocks into their
     // matching base test before codegen.
@@ -2519,6 +2586,119 @@ fn cmd_sim(
             cpp_paths.push(cpp_path);
         }
         CppSplit::Tests => match codegen {
+            CodegenKind::V1 if split.layout == CppSplitLayout::Common => {
+                // Common-object layout (issue #643): reusable infra
+                // compiles once; each test is a small stable capsule;
+                // an explicit registry dispatches by name. Artifacts
+                // are written via write_if_changed in deterministic
+                // order so Verilator's incremental Make path stays
+                // exact.
+                let mut profile_extra: Vec<String> = Vec::new();
+                profile_extra.push(format!("top={}", top.clone().unwrap_or_default()));
+                profile_extra.push(format!("mt={}", mt));
+                profile_extra.push(format!("coverage={}", coverage));
+                profile_extra.push(format!(
+                    "waves={}",
+                    waves.waves.then(|| waves.format.clone()).unwrap_or_default()
+                ));
+                for p in &params {
+                    profile_extra.push(format!("param:{p}"));
+                }
+                // Toolchain-visible knobs that reach the compiler/linker.
+                // Z3 paths matter because they become -I/-L/-rpath flags;
+                // HARC_CXX selects the compiler binary itself.
+                if let Ok(cxx) = std::env::var("HARC_CXX") {
+                    profile_extra.push(format!("cxx={cxx}"));
+                }
+                if let Ok(inc) = std::env::var("HARC_Z3_INCLUDE_DIR") {
+                    profile_extra.push(format!("z3_inc={inc}"));
+                }
+                if let Ok(lib) = std::env::var("HARC_Z3_LIB_DIR") {
+                    profile_extra.push(format!("z3_lib={lib}"));
+                }
+                let started = Instant::now();
+                let prefix = format!("{stem}__");
+                let suite = harc::codegen::cpp_tb::emit_common_split(
+                    &codegen_source,
+                    emit_opts.clone(),
+                    &prefix,
+                    &profile_extra,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+
+                // Manifest-owned stale cleanup (issue #643): read the
+                // previous manifest, and remove ONLY files it owned that
+                // the new plan no longer contains — e.g. a deleted
+                // test's capsule. Never clean by glob. Deletion happens
+                // before the new writes: an interrupted run may briefly
+                // leave no manifest covering the on-disk set, but the
+                // next regeneration self-heals (the stale file is then
+                // still absent from the plan and removed here again).
+                let manifest_path = outdir.join(format!("{prefix}artifacts.json"));
+                if let Ok(prev) = fs::read_to_string(&manifest_path) {
+                    if let Some(items) = parse_manifest_artifacts(&prev) {
+                        for name in items {
+                            if !suite.files.iter().any(|f| &f.filename == &name) {
+                                let stale = outdir.join(&name);
+                                match fs::remove_file(&stale) {
+                                    Ok(()) => eprintln!("removed stale {}", stale.display()),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        return Err(miette::miette!(
+                                            "failed to remove stale artifact {}: {e}",
+                                            stale.display()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut emitted_count = 0usize;
+                for generated in &suite.files {
+                    let cpp_path = outdir.join(&generated.filename);
+                    let changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;
+                    if changed {
+                        emitted_count += 1;
+                        eprintln!("emitted {}", cpp_path.display());
+                    } else {
+                        eprintln!("reused {} (unchanged)", cpp_path.display());
+                    }
+                    if cpp_path.extension().is_some_and(|ext| ext == "cpp") {
+                        cpp_paths.push(cpp_path);
+                    }
+                }
+                // Manifest: schema version + fingerprints + exact
+                // artifact list, written last so an interrupted run
+                // never leaves a manifest claiming incomplete artifacts.
+                let manifest = format!(
+                    "{{\"schema_version\":1,\"interface_abi\":\"{}\",\"build_profile\":\"{}\",\"tests\":[{}],\"artifacts\":[{}]}}\n",
+                    suite.interface_abi,
+                    suite.build_profile,
+                    suite
+                        .test_names
+                        .iter()
+                        .map(|t| format!("\"{t}\""))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    suite
+                        .files
+                        .iter()
+                        .map(|f| format!("\"{}\"", f.filename))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                write_if_changed(&manifest_path, manifest.as_bytes())?;
+                eprintln!(
+                    "HARC common split: {} artifacts ({} rewritten), interface abi {}, profile {}, in {:?}",
+                    suite.files.len(),
+                    emitted_count,
+                    suite.interface_abi,
+                    suite.build_profile,
+                    started.elapsed()
+                );
+            }
             CodegenKind::V1 => {
                 let batch = harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
                     &codegen_source,

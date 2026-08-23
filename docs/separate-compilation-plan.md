@@ -227,6 +227,47 @@ already exist as the natural unit boundary — they just move to their
 own translation units, and the test-scope state they capture today via
 locals gets re-shaped into testbench struct members.
 
+## Common-object split layout (shipped, experimental)
+
+Issue #643 added a v1-first common-object layout behind
+`--cpp-split-layout common` (with `--codegen v1 --cpp-split tests`):
+
+```text
+<outdir>/
+  <stem>__suite_api.hpp    # types + HarcSuiteRuntime + HarcSuiteGlue + ABI anchor
+  <stem>__runtime.cpp      # glue member definitions + shared callables (compiled ONCE)
+  <stem>__test_<Name>.cpp  # one stable capsule per test: scenario-only run_<Test>
+  <stem>__registry.cpp     # descriptor table + dispatching main()
+  <stem>__artifacts.json   # manifest: fingerprints + exact artifact list
+```
+
+Ownership model: every shared callable becomes a member of the generated
+per-run glue object `HarcSuiteGlue`, whose reference members mirror the
+historical run-scope names (`dut`, `tick`, `_checkers`, hook vectors,
+...), so callable bodies compile verbatim with no capture rewriting.
+Mutable state moved out of function-local statics and TU statics into the
+per-run `HarcSuiteRuntime` (`rng`, `_cells` block for property slots /
+edge history / watchdog bookkeeping / coverage counters / unique-random
+histories, and instance-owned hook registries) — two sequential runs in
+one process share nothing mutable.
+
+Incremental contract (enforced by `tests/common_split_e2e.rs`):
+
+- edit one test body -> that capsule rewrites; header/runtime/registry
+  and all other capsules stay byte-identical;
+- add a test -> new capsule + registry only;
+- delete a test -> registry updates and the stale capsule is removed via
+  manifest-owned cleanup;
+- seed/test-selection changes rewrite nothing;
+- every artifact embeds a build-profile fingerprint comment, and each TU
+  references an interface-ABI anchor symbol whose name hashes the public
+  surface, so stale objects fail to link instead of mis-running.
+
+`self-contained` remains the default and the semantic oracle during
+qualification. The suspending shared-method conversion (composable child
+task ABI) is intentionally NOT in this first slice: bus-transactor actor
+bodies stay capsule-local until then — correct, just less deduplicated.
+
 ## Decision log
 
 - 2026-05-15: User asked for separate `.so` per testbench / DUT / test.
