@@ -1323,8 +1323,24 @@ impl FuncBuilder<'_> {
                 // as having no known shape. `method_schema_ir_type`
                 // resolves the sequence into `ret_ty`; this arm just has
                 // to stop discarding it.
+                //
+                // A WIDE scalar return is the same argument once more.
+                // `function read() -> uint<256>` handed an untyped
+                // `let got = r.read()` a `uint64_t` local and the
+                // assignment kept the low word — the call-destination
+                // half of issue #642's return seam, which survives
+                // fixing the lambda's own return type. The filter
+                // matches `wide_scalar_ty`'s in the untyped-`let` tail
+                // below (`> 64`, where `local_scalar_cty` stops using a
+                // builtin integer); a ≤64-bit scalar return keeps the
+                // `uint64_t` default it has always had, since widening
+                // that would re-type every existing untyped getter
+                // local at once.
                 let inferred = declared_scalar_ty.clone().or_else(|| match &m.ret_ty {
                     Some(ty @ (IrType::Record(_) | IrType::RecordSeq(_) | IrType::Seq(_))) => {
+                        Some(ty.clone())
+                    }
+                    Some(ty @ (IrType::UInt(Some(w)) | IrType::SInt(Some(w)))) if *w > 64 => {
                         Some(ty.clone())
                     }
                     _ => None,
@@ -1432,15 +1448,27 @@ impl FuncBuilder<'_> {
         // silently clamping to `uint64_t`. Mirrors v1's `auto t96 = ...`,
         // whose deduced type is `_harc_u128`. ≤64-bit RHS keeps the existing
         // `uint64_t` default untouched.
+        //
+        // `host_state_scalar_type`, not `expr_type`: the latter answers
+        // `None` for every HOST-STATE read — a testbench field, a
+        // scoreboard/component field, a transactor state field — and
+        // those are exactly the leaves a declared WIDE field made
+        // reachable. `let observed = state.value` off a `uint<256>`
+        // component field therefore declared `uint64_t observed` and
+        // the read truncated to the low word with no diagnostic (issue
+        // #642's minimal reproducer; clang says "shift count >= width
+        // of type" on the use site and nothing at all on the copy).
+        // The fallthrough of `host_state_scalar_type` IS `expr_type`,
+        // so every non-host-state shape keeps the type it had.
         let wide_scalar_ty = self
-            .expr_type(&e)
+            .host_state_scalar_type(&e)
             .filter(|t| matches!(t, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64));
         // Untyped signed-scalar RHS (`let d = NEG` where NEG is a `sint`
         // const): v1's `auto` deduces `int64_t` from the signed
         // expression, so the local must carry signedness or `d >> 1` /
         // `d / 2` silently go unsigned (#524 adversarial-review finding
         // 6). A declared type still wins via the `.or` chain below.
-        let signed_scalar_ty = self.expr_type(&e).filter(|t| {
+        let signed_scalar_ty = self.host_state_scalar_type(&e).filter(|t| {
             matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64)
         });
         let id = self.declare(&l.name.name);
@@ -1997,7 +2025,27 @@ impl FuncBuilder<'_> {
         )))
     }
 
-    fn check_scoreboard_scalar_write(
+    /// Directional assignment compatibility for a write into a
+    /// DECLARED SCALAR STATE FIELD, whoever owns it.
+    ///
+    /// Written for data-only scoreboard fields and now shared with
+    /// method-bearing component fields, which reached no width or
+    /// signedness check at all. `value : uint<65>` written from a
+    /// `uint<129>` shares the `_harc_u128` carrier, so C++ accepted the
+    /// assignment and the bits above 65 stayed live in storage with no
+    /// diagnostic anywhere — issue #642's "required negative
+    /// assignment". `reject_wide_narrowing_into` cannot see that pair:
+    /// it only judges `HarcWide<N>` operands past 128 bits.
+    ///
+    /// Sharing the function rather than copying its policy is the
+    /// point. A `sint<8>` refused on a scoreboard field and accepted on
+    /// a component field is one language with two rules, and the
+    /// over-width LITERAL arm below (`f = 256` into `uint<8>`) is
+    /// exactly the kind of case a second copy forgets.
+    ///
+    /// `what` is rendered verbatim and names the destination
+    /// ("scoreboard field `narrow`", "component field `state.value`").
+    fn check_owner_scalar_field_write(
         &self,
         value: &crate::ir::Expr,
         expected: &IrType,
@@ -2038,7 +2086,7 @@ impl FuncBuilder<'_> {
                 return Err(LowerError::Invalid(format!(
                     "assignment of a {src_width}-bit value to {what}, declared {dest_width} \
                      bits, narrows. Widths must not shrink implicitly — truncate the value \
-                     explicitly or widen the scoreboard field."
+                     explicitly or widen the field declaration."
                 )));
             }
         }
@@ -2386,7 +2434,56 @@ impl FuncBuilder<'_> {
                 // record. Both directions of one rule; only the first
                 // had a guard.
                 None => {
-                    self.reject_record_into_scalar(&e, &format!("component field `{field}`"))?
+                    self.reject_record_into_scalar(&e, &format!("component field `{field}`"))?;
+                    // …and then the SCALAR-to-scalar direction, which
+                    // had no guard at all. `host_state_scalar_type`
+                    // resolves both a direct scalar field and a dotted
+                    // record LEAF (`cur.w`) off the component schema —
+                    // the same resolver the READ side uses, so a write
+                    // cannot disagree with a read about what the
+                    // destination holds. An unresolvable shape stays
+                    // `Unknown`, which the check passes.
+                    let dest = self
+                        .host_state_scalar_type(&Expr::ComponentField {
+                            base: base.clone(),
+                            field: field.clone(),
+                        })
+                        .unwrap_or(IrType::Unknown);
+                    // Only a destination PAST 64 BITS is judged, and
+                    // the bound is what makes the check sound rather
+                    // than merely strict.
+                    //
+                    // `common_expr_type` gives a WIDTHLESS operand the
+                    // 64-bit host ABI, so `seen + t` types as 64 bits
+                    // whatever `seen` is — and an `on ev(t)` payload
+                    // param IS widthless: `EventPayload::Scalar`
+                    // records signedness only, so `event<uint<8>>`
+                    // binds `t : uint`. Judging a ≤64-bit destination
+                    // would therefore refuse `seen = seen + t`, the
+                    // ordinary counting idiom, on every agent and
+                    // transactor in the repo (5 of them in `tbir.rs`
+                    // alone) — and `.trunc<32>()` is no answer when the
+                    // source width was never real. A destination past
+                    // 64 bits cannot be narrowed by that manufactured
+                    // 64, so the verdict there rests only on widths
+                    // somebody declared.
+                    //
+                    // Past 64 is also exactly the territory issue #642
+                    // opened: `uint<129>` into `uint<65>` shares the
+                    // `_harc_u128` carrier, so C++ took the assignment
+                    // and left the bits above 65 live in storage. The
+                    // ≤64-bit half needs the payload-width gap closed
+                    // first and is filed separately; data-only
+                    // scoreboards keep the rule they already had, which
+                    // is stricter here and is not changed by this
+                    // branch.
+                    if matches!(dest, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if w > 64) {
+                        self.check_owner_scalar_field_write(
+                            &e,
+                            &dest,
+                            &format!("component field `{}`", tgt.dotted),
+                        )?;
+                    }
                 }
             }
             self.push(Stmt::ComponentFieldWrite {
@@ -2426,7 +2523,7 @@ impl FuncBuilder<'_> {
                             &e,
                             &format!("scoreboard field `{}`", name.name),
                         )?;
-                        self.check_scoreboard_scalar_write(
+                        self.check_owner_scalar_field_write(
                             &e,
                             &expected,
                             &format!("scoreboard field `{}`", name.name),
