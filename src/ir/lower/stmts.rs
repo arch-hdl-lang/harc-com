@@ -2208,6 +2208,29 @@ impl FuncBuilder<'_> {
                 .map(|(position, index)| (position, self.hoist_ports(index)))
                 .collect();
             chain.leaf_index = chain.leaf_index.map(|index| self.hoist_ports(index));
+            if let IrType::Seq(elem) = &chain.leaf_ty {
+                let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                    .transpose()?
+                    .flatten();
+                let Some(rhs) = rhs else {
+                    return Err(not_implemented(
+                        &format!("a whole-list write of record state field `{dotted}` with a non-matching RHS"),
+                        "assign a whole dynamic list with the same element ABI",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                self.push(Stmt::TransactorStateRecordFieldWrite {
+                    instance: chain.instance,
+                    field: chain.field,
+                    path: chain.path,
+                    mid_indices: chain.mid_indices,
+                    index: chain.leaf_index,
+                    value: rhs,
+                });
+                return Ok(());
+            }
             if let Some(len) = chain.leaf_vec_len {
                 let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                 // A matching-shape copy lowers, as it does in the other
@@ -2352,6 +2375,30 @@ impl FuncBuilder<'_> {
         // otherwise that resolver mistakes `current` for a `Sub` receiver.
         if let Some(chain) = self.as_indexed_component_record_field(target)? {
             let index = self.hoist_ports(chain.index);
+            if let IrType::Seq(elem) = &chain.leaf_ty {
+                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                    .transpose()?
+                    .flatten();
+                let Some(value) = rhs else {
+                    return Err(not_implemented(
+                        &format!(
+                            "a whole-list write of indexed component record field `{}` with a non-matching RHS",
+                            chain.field
+                        ),
+                        "assign a whole dynamic list with the same element ABI",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                self.push(Stmt::ComponentVecElementWrite {
+                    base: chain.base,
+                    field: chain.field,
+                    index_pos: chain.index_pos,
+                    index,
+                    value,
+                });
+                return Ok(());
+            }
             let value = self.lower_expr_no_ports(value)?;
             if let IrType::Record(record) = chain.leaf_ty {
                 if self.record_id_of_expr(&value) != Some(record) {
@@ -2379,6 +2426,25 @@ impl FuncBuilder<'_> {
         }
         if let Some(tgt) = self.as_component_field_target(target)? {
             let (base, field) = (tgt.base, tgt.field);
+            if let Some(IrType::Seq(elem)) = &tgt.leaf_ty {
+                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                    .transpose()?
+                    .flatten();
+                let Some(rhs) = rhs else {
+                    return Err(not_implemented(
+                        &format!("a whole-list write of component record field `{}` with a non-matching RHS", tgt.dotted),
+                        "assign a whole dynamic list with the same element ABI",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                self.push(Stmt::ComponentFieldWrite {
+                    base,
+                    field,
+                    value: rhs,
+                });
+                return Ok(());
+            }
             // A whole-`Vec` component record field takes a whole-`Vec`
             // read of the same `std::array<elem, N>` shape — the third
             // spelling of the copy the record-local and responder-state
@@ -2958,6 +3024,10 @@ impl FuncBuilder<'_> {
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
             if let Some(mut chain) = self.as_transactor_state_record_field(it)? {
+                if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                    let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                    return Err(super::exprs::dynamic_record_list_index(&dotted));
+                }
                 if let Some(len) = chain.leaf_vec_len {
                     chain.mid_indices = chain
                         .mid_indices
@@ -3018,6 +3088,9 @@ impl FuncBuilder<'_> {
             // `SilentlyMisLowers` — the loudest verdict in the enum, and
             // false: v1 emits `self.a.data[0] = 1;` and g++ accepts it.
             if let Some(rf) = self.as_component_record_field(it)? {
+                if matches!(rf.leaf_ty, IrType::Seq(_)) {
+                    return Err(super::exprs::dynamic_record_list_index(&rf.dotted));
+                }
                 if let Some((len, elem)) = rf.leaf_vec.clone() {
                     let index = self.lower_expr_no_ports(index)?;
                     super::exprs::check_literal_component_vec_index_bounds(
@@ -3062,6 +3135,9 @@ impl FuncBuilder<'_> {
                 }
             }
             if let Some(chain) = self.try_record_field_chain(it)? {
+                if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                    return Err(super::exprs::dynamic_record_list_index(&chain.spelled));
+                }
                 if chain.leaf_vec_len.is_none() {
                     // v1 emits `b.v[1] = 3;` — a subscript on a
                     // `uint64_t` member.
@@ -3126,6 +3202,31 @@ impl FuncBuilder<'_> {
         // `s.a.b = v`). Resolve the destination field chain to its leaf.
         if let ExprKind::Field { .. } = &*target.kind {
             if let Some(chain) = self.try_record_field_chain(target)? {
+                if let IrType::Seq(elem) = &chain.leaf_ty {
+                    let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                        .map(|class| self.whole_seq_copy_rhs(&class, value))
+                        .transpose()?
+                        .flatten();
+                    let Some(rhs) = rhs else {
+                        return Err(not_implemented(
+                            &format!(
+                                "a whole-list write of record field `{}` with a non-matching RHS",
+                                chain.dotted
+                            ),
+                            "assign a whole dynamic list with the same element ABI",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    };
+                    self.push(Stmt::RecordFieldWrite {
+                        local: chain.local,
+                        field: chain.field,
+                        path: chain.path,
+                        mid_indices: chain.mid_indices,
+                        index: None,
+                        value: rhs,
+                    });
+                    return Ok(());
+                }
                 // A whole-`Vec` field write (`dst.data = src.data`) lowers
                 // to `Stmt::RecordFieldWrite { index: None }` — the tbir
                 // backend renders it as `name.field = e`, a plain

@@ -136,6 +136,29 @@ pub(crate) struct IndexedComponentRecordChain {
     pub leaf_ty: IrType,
 }
 
+pub(crate) fn dynamic_record_list_query(path: &str) -> LowerError {
+    unsupported(
+        &format!("a query on dynamic record list `{path}`"),
+        "this batch models list declaration and randomization constraints; use --codegen v1 for .len(), .size(), or .empty() in an ordinary body",
+    )
+}
+
+pub(crate) fn dynamic_record_list_value(path: &str) -> LowerError {
+    not_implemented(
+        &format!("a dynamic record list `{path}` used as an ordinary scalar value"),
+        "use the list only as a whole-list copy/equality operand, or query it with --codegen v1",
+        V1Status::EmitsUncompilable,
+    )
+}
+
+pub(crate) fn dynamic_record_list_index(path: &str) -> LowerError {
+    not_implemented(
+        &format!("indexing dynamic record list `{path}` in an ordinary body"),
+        "record lists are default-constructed empty; unchecked v1 indexing can access outside the list",
+        V1Status::SilentlyMisLowers,
+    )
+}
+
 /// Flatten a record-shaped path into its root, declaration-order field
 /// segments, and the index attached to each segment. The index position is
 /// relative to `segs` (not including the root).
@@ -182,7 +205,76 @@ fn indexed_path_parts<'a>(
     Some((root, segs, indices))
 }
 
+fn record_path_index_is_static_literal(e: &AstExpr) -> bool {
+    let mut e = e;
+    while let ExprKind::Paren(inner) = &*e.kind {
+        e = inner;
+    }
+    match &*e.kind {
+        ExprKind::Int(text) => {
+            parse_int_literal(text).is_some()
+                || parse_sized_int_literal(text).is_some()
+                || sized_int_literal_overflows_u64(text)
+                || matches!(parse_int_literal_checked(text), Err(IntLiteralErr::Overflows))
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => record_path_index_is_static_literal(expr),
+        _ => false,
+    }
+}
+
 impl super::FuncBuilder<'_> {
+    /// Lower an index carried by a record path. Sized integer literals are
+    /// already validated by the parser and are side-effect-free, so retain
+    /// their declared width here without enabling them in general value
+    /// positions (where sized-literal inference remains a separate gap).
+    fn lower_record_path_index(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
+        let mut terminal = e;
+        let mut negative = false;
+        loop {
+            match &*terminal.kind {
+                ExprKind::Paren(inner) => terminal = inner,
+                ExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    expr,
+                } => {
+                    negative = !negative;
+                    terminal = expr;
+                }
+                _ => break,
+            }
+        }
+        if let ExprKind::Int(text) = &*terminal.kind {
+            let fitting = parse_int_literal(text)
+                .map(|value| (None, value))
+                .or_else(|| {
+                    parse_sized_int_literal_with_width(text)
+                        .map(|(width, value)| (Some(width), value))
+                });
+            if let Some((width, value)) = fitting {
+                if negative && value != 0 {
+                    return Err(LowerError::Invalid(format!(
+                        "negative record `Vec` index ending in `{text}` is out of bounds"
+                    )));
+                }
+                return Ok(Expr::Literal {
+                    value,
+                    ty: width.map_or(IrType::Unknown, |width| IrType::UInt(Some(width))),
+                });
+            }
+            if sized_int_literal_overflows_u64(text)
+                || matches!(parse_int_literal_checked(text), Err(IntLiteralErr::Overflows))
+            {
+                return Err(LowerError::Invalid(format!(
+                    "record `Vec` index `{text}` exceeds the supported host index range and is out of bounds"
+                )));
+            }
+        }
+        self.lower_expr(e)
+    }
+
     pub(crate) fn as_indexed_component_record_field(
         &mut self,
         e: &AstExpr,
@@ -269,7 +361,7 @@ impl super::FuncBuilder<'_> {
                         let index_pos = indexed_full_pos;
                         let (leaf_ty, len) =
                             resolve_record_path(self, record, suffix, index_pos - 1)?;
-                        let index = self.lower_expr(raw_indices[0].1)?;
+                        let index = self.lower_record_path_index(raw_indices[0].1)?;
                         check_literal_vec_index_bounds(&full.join("."), &index, len)?;
                         return Ok(Some(IndexedComponentRecordChain {
                             base: crate::ir::ComponentBase::SelfField,
@@ -304,7 +396,7 @@ impl super::FuncBuilder<'_> {
             let index_pos = indexed_full_pos - suffix_start;
             let (leaf_ty, len) = resolve_record_path(self, record, suffix, index_pos - 1)?;
             base.extend_from_slice(&tail[..recv_len]);
-            let index = self.lower_expr(raw_indices[0].1)?;
+            let index = self.lower_record_path_index(raw_indices[0].1)?;
             check_literal_vec_index_bounds(&full.join("."), &index, len)?;
             return Ok(Some(IndexedComponentRecordChain {
                 base: crate::ir::ComponentBase::Path(base),
@@ -387,6 +479,71 @@ impl super::FuncBuilder<'_> {
         // (`stmts.rs`) had already written this rule down; it is called
         // from there now rather than restated.
         Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&ty)?))
+    }
+
+    /// The C++ element class of a whole dynamic-list record-field read.
+    /// Resolution stays policy-free because whole-list copies and Eq/Ne
+    /// are valid C++; scalar consumption, indexing, and queries make
+    /// different v1-safety promises and diagnose at their own sinks.
+    pub(crate) fn whole_seq_leaf(&mut self, e: &crate::ast::Expr) -> Option<String> {
+        let dotted = super::components::dotted_path(e).is_some();
+        if !dotted {
+            let (_, _, indices) = indexed_path_parts(e)?;
+            if indices
+                .iter()
+                .any(|(_, index)| !record_path_index_is_static_literal(index))
+            {
+                return None;
+            }
+        }
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &*e.kind {
+            e = inner;
+        }
+        let ty = if !dotted {
+            if let Ok(Some(c)) = self.as_indexed_component_record_field(e) {
+                c.leaf_ty
+            } else if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
+                c.leaf_ty
+            } else if let Ok(Some(l)) = self.try_record_field_chain(e) {
+                l.leaf_ty
+            } else {
+                return None;
+            }
+        } else if let Ok(Some(c)) = self.as_transactor_state_record_field(e) {
+            c.leaf_ty
+        } else if let Ok(Some(rf)) = self.as_component_record_field(e) {
+            rf.leaf_ty
+        } else if let Ok(Some(l)) = self.try_record_field_chain(e) {
+            l.leaf_ty
+        } else {
+            return None;
+        };
+        let IrType::Seq(elem) = ty else {
+            return None;
+        };
+        crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+    }
+
+    pub(crate) fn whole_seq_copy_rhs(
+        &mut self,
+        dst_elem_class: &str,
+        value: &crate::ast::Expr,
+    ) -> Result<Option<Expr>, LowerError> {
+        if !path_expr(value) {
+            return Ok(None);
+        }
+        let saved = self.vec_read_ok;
+        let saved_span = self.vec_read_span;
+        self.vec_read_ok = true;
+        self.vec_read_span = Some(unparen_expr(value).span);
+        let value = self.lower_expr_no_ports(value);
+        self.vec_read_ok = saved;
+        self.vec_read_span = saved_span;
+        let value = value?;
+        let is_matching_seq = matches!(self.expr_type(&value), Some(IrType::Seq(ref elem))
+            if crate::codegen::cpp_tb::ir_vec_elem_class(elem).as_deref() == Some(dst_elem_class));
+        Ok(is_matching_seq.then_some(value))
     }
 
     /// Lower the RHS of a whole-`Vec` field WRITE, or `None` when it is
@@ -607,6 +764,13 @@ impl super::FuncBuilder<'_> {
     /// rejected one.
     fn same_whole_vec_shape(&mut self, lhs: &crate::ast::Expr, rhs: &crate::ast::Expr) -> bool {
         match (self.whole_vec_leaf(lhs), self.whole_vec_leaf(rhs)) {
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        }
+    }
+
+    fn same_whole_seq_shape(&mut self, lhs: &crate::ast::Expr, rhs: &crate::ast::Expr) -> bool {
+        match (self.whole_seq_leaf(lhs), self.whole_seq_leaf(rhs)) {
             (Some(l), Some(r)) => l == r,
             _ => false,
         }
@@ -923,6 +1087,10 @@ impl FuncBuilder<'_> {
                 // whole-record `as_transactor_state` lane, which only fires
                 // when there is NO further subfield.
                 if let Some(chain) = self.as_transactor_state_record_field(e)? {
+                    if matches!(chain.leaf_ty, IrType::Seq(_)) && !self.whole_vec_read_allowed(e) {
+                        let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                        return Err(dynamic_record_list_value(&dotted));
+                    }
                     // Same allow-list as the other two whole-`Vec` read
                     // lanes: only an `==`/`!=` against a matching shape
                     // gets through, and only because both backends emit
@@ -990,6 +1158,9 @@ impl FuncBuilder<'_> {
                 self.reject_out_of_subset_regblock_access(e, "read")?;
                 self.reject_out_of_subset_addrmap_access(e, "read")?;
                 if let Some(chain) = self.as_indexed_component_record_field(e)? {
+                    if matches!(chain.leaf_ty, IrType::Seq(_)) && !self.whole_vec_read_allowed(e) {
+                        return Err(dynamic_record_list_value(&chain.field));
+                    }
                     return Ok(Expr::ComponentVecElement {
                         base: chain.base,
                         field: chain.field,
@@ -1029,6 +1200,9 @@ impl FuncBuilder<'_> {
                 // `t.field` read on a record-typed local (and nested
                 // `t.a.b`). Resolve the field chain to its leaf schema.
                 if let Some(chain) = self.try_record_field_chain(e)? {
+                    if matches!(chain.leaf_ty, IrType::Seq(_)) && !self.whole_vec_read_allowed(e) {
+                        return Err(dynamic_record_list_value(&chain.spelled));
+                    }
                     // A whole-`Vec` leaf read has no SCALAR value: in a
                     // scalar/format context the emitter would put the raw
                     // `std::array` member where an integer is expected,
@@ -1146,7 +1320,7 @@ impl FuncBuilder<'_> {
                 // itself, so the permission had to carry the pairing
                 // check the read no longer does.
                 let eq = matches!(op, BinaryOp::Eq | BinaryOp::Ne)
-                    && self.same_whole_vec_shape(lhs, rhs);
+                    && (self.same_whole_vec_shape(lhs, rhs) || self.same_whole_seq_shape(lhs, rhs));
                 let saved = self.vec_read_ok;
                 let saved_span = self.vec_read_span;
                 self.vec_read_ok = eq;
@@ -1242,6 +1416,32 @@ impl FuncBuilder<'_> {
                         // `.zext<N>()` / `.sext<N>()` / `.resize<N>()`.
                         if let Some(kind) = width_cast_kind(&name.name) {
                             return self.lower_width_method(kind, &name.name, target, args);
+                        }
+                        // Keep the declaration/randomization-only record-list
+                        // boundary precise for method-shaped queries too.
+                        // Direct `r.items` and `r.items[i]` already route
+                        // through `try_record_field_chain`; without this
+                        // probe `r.items.len()` fell through to the unrelated
+                        // generic transactor/method diagnostic.
+                        if args.is_empty() && matches!(name.name.as_str(), "len" | "size" | "empty")
+                        {
+                            if let Some(chain) = self.try_record_field_chain(target)? {
+                                if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                                    return Err(dynamic_record_list_query(&chain.spelled));
+                                }
+                            }
+                            if let Some(rf) = self.as_component_record_field(target)? {
+                                if matches!(rf.leaf_ty, IrType::Seq(_)) {
+                                    return Err(dynamic_record_list_query(&rf.dotted));
+                                }
+                            }
+                            if let Some(chain) = self.as_transactor_state_record_field(target)? {
+                                if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                                    let dotted =
+                                        format!("{}.{}", chain.field, chain.path.join("."));
+                                    return Err(dynamic_record_list_query(&dotted));
+                                }
+                            }
                         }
                         // Component heartbeat-idle predicates:
                         // `agent.idle_in(N)`, `.idle_out(N)`, `.idle(N)`.
@@ -1415,6 +1615,10 @@ impl FuncBuilder<'_> {
             }
             ExprKind::Index { target, index } => {
                 if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+                    if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                        let dotted = format!("{}.{}", chain.field, chain.path.join("."));
+                        return Err(dynamic_record_list_index(&dotted));
+                    }
                     if let Some(len) = chain.leaf_vec_len {
                         let idx = self.lower_expr(index)?;
                         check_literal_vec_index_bounds(
@@ -1453,6 +1657,9 @@ impl FuncBuilder<'_> {
                 // FIELD uses; the only difference is that `field` is a
                 // dotted member suffix (`a.data`) rather than one name.
                 if let Some(rf) = self.as_component_record_field(target)? {
+                    if matches!(rf.leaf_ty, IrType::Seq(_)) {
+                        return Err(dynamic_record_list_index(&rf.dotted));
+                    }
                     if let Some((len, _)) = rf.leaf_vec {
                         let index = self.lower_expr(index)?;
                         check_literal_component_vec_index_bounds(
@@ -1819,7 +2026,7 @@ impl FuncBuilder<'_> {
         let mut mid_indices: Vec<(usize, Expr)> = Vec::with_capacity(raw_indices.len());
         for (raw_pos, idx_ast) in raw_indices.iter().rev() {
             let pos = (total - 1 - raw_pos) - field_start;
-            let idx = self.lower_expr(idx_ast)?;
+            let idx = self.lower_record_path_index(idx_ast)?;
             mid_indices.push((pos, idx));
         }
         let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
@@ -2256,6 +2463,9 @@ impl FuncBuilder<'_> {
         let Some(chain) = self.try_record_field_chain(target)? else {
             return Ok(None);
         };
+        if matches!(chain.leaf_ty, IrType::Seq(_)) {
+            return Err(dynamic_record_list_index(&chain.spelled));
+        }
         if chain.leaf_vec_len.is_none() {
             // v1 emits the subscript verbatim (`_tb.cur.v[1]`), which
             // subscripts a `uint64_t`.
@@ -3840,7 +4050,7 @@ impl FuncBuilder<'_> {
         }
         let mut indices = Vec::with_capacity(raw_indices.len());
         for (pos, idx) in raw_indices {
-            indices.push((pos - sub_start, self.lower_expr(idx)?));
+            indices.push((pos - sub_start, self.lower_record_path_index(idx)?));
         }
         let mut cur_rid = record;
         let last = sub.len() - 1;
@@ -4794,6 +5004,34 @@ pub(crate) fn parse_int_literal_checked(s: &str) -> Result<u64, IntLiteralErr> {
 /// use this value parser without erasing width semantics elsewhere.
 pub(crate) fn parse_sized_int_literal(s: &str) -> Option<u64> {
     parse_sized_int_literal_with_width(s).map(|(_, value)| value)
+}
+
+/// A syntactically valid sized h/d/b literal whose value cannot fit the
+/// scalar index carrier. Such a value is necessarily outside every host
+/// `Vec` length, so record-path selection diagnoses it instead of suggesting
+/// v1's unchecked `std::array::operator[]` emission.
+fn sized_int_literal_overflows_u64(s: &str) -> bool {
+    let t = s.replace('_', "");
+    let Some(tick) = t.find('\'') else {
+        return false;
+    };
+    if t[..tick].parse::<u32>().is_err() {
+        return false;
+    }
+    let rest = &t[tick + 1..];
+    let Some(radix_ch) = rest.chars().next() else {
+        return false;
+    };
+    let radix = match radix_ch {
+        'h' | 'H' => 16,
+        'd' | 'D' => 10,
+        'b' | 'B' => 2,
+        _ => return false,
+    };
+    let digits = &rest[radix_ch.len_utf8()..];
+    !digits.is_empty()
+        && digits.chars().all(|ch| ch.is_digit(radix))
+        && u64::from_str_radix(digits, radix).is_err()
 }
 
 /// Parse both the declared width and value of a sized literal. Coverpoint

@@ -8927,6 +8927,7 @@ test EscapeHatch
     run
         let t : Txn
         randomize(t)
+        let count = t.items.len()
         log(info, "x")
     end run
 end test EscapeHatch"#;

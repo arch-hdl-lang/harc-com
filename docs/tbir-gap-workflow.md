@@ -71,6 +71,12 @@ family of rejections over a one-site exception. Current implementation order:
   success and source order on failure. Statement-producing calls beneath a
   short-circuit or ternary branch and concurrent property messages remain
   outside this CFG-based slice.
+- [x] Scalar-element dynamic `list<T>` fields in transaction/struct records,
+  including unconstrained draws and bounded `len()`/`sum(...)` constraint
+  solving through the shared randomize runtime. Ordinary body-position list
+  indexing and queries remain a separate slice. List field `range`, `dist`,
+  and `unique` modifiers are rejected as silent v1 mis-lowerings until the
+  element-wise modifier semantics are modeled.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -143,6 +149,10 @@ The lazy diagnostic-call batch closes the immediate-check and wait-timeout
 source families and consolidates two transactor message-context rejections into
 one lazy-call diagnostic, leaving 140 textual matches (139 constructors plus
 the helper).
+The record-list randomize batch closes the scalar-element declaration and
+constraint family. Its explicit source boundary for ordinary body-position
+list queries reuses the consolidated boundary diagnostic, leaving 140 textual
+matches (139 constructors plus the helper).
 
 ## Review-derived semantic gates
 

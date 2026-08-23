@@ -583,6 +583,15 @@ impl FuncBuilder<'_> {
             // 'static_cast' from type 'Beat'"). No backend runs it, so
             // it is `Invalid` like the rest of the family.
             let want = super::helpers::slot_ir_type(Some(decl_ty), &self.ctx.record_ids);
+            if let crate::ir::IrType::Record(record) = want {
+                self.ctx.reject_dynamic_list_record_wire(
+                    record,
+                    &format!(
+                        "record parameter `{}` of bus method `{}` crossing a TLM request wire",
+                        aname.name, m.name.name
+                    ),
+                )?;
+            }
             self.check_slot_ir(
                 &v,
                 &want,
@@ -605,6 +614,15 @@ impl FuncBuilder<'_> {
         // local at the right width (`_harc_u128` / `HarcWide<N>`) instead
         // of truncating to the default u64.
         let ret_record = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t));
+        if let Some(record) = ret_record {
+            self.ctx.reject_dynamic_list_record_wire(
+                record,
+                &format!(
+                    "record return from bus method `{}` crossing a TLM response wire",
+                    m.name.name
+                ),
+            )?;
+        }
         match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
@@ -755,6 +773,15 @@ impl FuncBuilder<'_> {
             // request port, so a slot that is wrong in one is wrong in
             // the other.
             let want = super::helpers::slot_ir_type(Some(decl_ty), &self.ctx.record_ids);
+            if let crate::ir::IrType::Record(record) = want {
+                self.ctx.reject_dynamic_list_record_wire(
+                    record,
+                    &format!(
+                        "record parameter `{}` of forked bus method `{}` crossing a TLM request wire",
+                        aname.name, m.name.name
+                    ),
+                )?;
+            }
             self.check_slot_ir(
                 &v,
                 &want,
@@ -768,6 +795,16 @@ impl FuncBuilder<'_> {
         // The response destination is declared + zero-init at the fork
         // site (v1 emits `T x = {};`), so reads between fork and join_all
         // see a defined-but-zero local. `Discard` carries no dest.
+        let ret_record = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t));
+        if let Some(record) = ret_record {
+            self.ctx.reject_dynamic_list_record_wire(
+                record,
+                &format!(
+                    "record return from forked bus method `{}` crossing a TLM response wire",
+                    m.name.name
+                ),
+            )?;
+        }
         let dest_local = match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
@@ -781,7 +818,7 @@ impl FuncBuilder<'_> {
                 // backends silently computed DIFFERENT values — worse
                 // than the uncompilable emissions elsewhere in this
                 // family, because nothing fails.
-                if let Some(rid) = m.ret.as_ref().and_then(|t| self.tlm_ret_record_id(t)) {
+                if let Some(rid) = ret_record {
                     self.set_local_type(id, crate::ir::IrType::Record(rid));
                 } else if let Some(ret) = m.ret.as_ref() {
                     self.set_local_type(id, super::helpers::ir_type_of(Some(ret)));

@@ -651,6 +651,44 @@ fn verify_scoreboard_scalar_schema(
 
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
+    for (ri, record) in prog.records.iter().enumerate() {
+        let mut names = std::collections::HashSet::new();
+        for field in &record.fields {
+            let what = format!("record r{ri} `{}` field `{}`", record.name, field.name);
+            if !names.insert(field.name.as_str()) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "record r{ri} `{}` repeats field `{}`",
+                        record.name, field.name
+                    ),
+                });
+            }
+            match &field.ty {
+                IrType::Seq(elem) => {
+                    let valid_elem = matches!(
+                        elem.as_ref(),
+                        IrType::Bool
+                            | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
+                            | IrType::SInt(Some(1..=64))
+                    );
+                    if field.vec_len.is_some() || field.default.is_some() || !valid_elem {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "{what} has invalid dynamic-list schema {:?}; lists require a scalar element, no fixed length, and no scalar default",
+                                field.ty
+                            ),
+                        });
+                    }
+                }
+                IrType::Record(rid) if rid.index() >= prog.records.len() => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!("{what} references missing record r{}", rid.0),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
     for t in &prog.tests {
         if t.testbench.index() >= prog.testbenches.len() {
             errs.push(VerifyError::BadProgramRef {
@@ -1040,6 +1078,37 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         method.name, method.ret_ty, method.function.0, function_ret
                     ),
                 });
+            }
+        }
+        for method in &x.target_methods {
+            let Some(function) = prog.functions.get(method.function.index()) else {
+                continue;
+            };
+            let ret_record = function
+                .ret
+                .and_then(|ret| function.locals.get(ret.index()))
+                .and_then(|local| match local.ty {
+                    IrType::Record(record) => Some(record),
+                    _ => None,
+                });
+            if ret_record.is_some_and(|record| record_contains_dynamic_list(prog, record)) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} target method `{}` returns a dynamic-list record over a fixed TLM response wire",
+                        method.name
+                    ),
+                });
+            }
+            for param in &function.params {
+                if matches!(param.ty, IrType::Record(record) if record_contains_dynamic_list(prog, record))
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} target method `{}` receives a dynamic-list record over a fixed TLM request wire",
+                            method.name
+                        ),
+                    });
+                }
             }
         }
         for (name, function) in x
@@ -2085,11 +2154,19 @@ struct Checker<'a> {
     temporal_slots_ok: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WholeCollectionShape {
+    FixedVec(usize, String),
+    DynamicSeq(String),
+}
+
 impl Checker<'_> {
     fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
         self.check_expr(expr, ports_ok, context);
         let ty = self.aggregate_assignment_expr_type(expr);
-        if matches!(ty, Some(IrType::Record(_))) || self.contains_invalid_record_composition(expr) {
+        if matches!(ty, Some(IrType::Record(_) | IrType::Seq(_)))
+            || self.contains_invalid_record_composition(expr)
+        {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} {context} is not a scalar truth value",
@@ -2103,7 +2180,7 @@ impl Checker<'_> {
         self.check_expr(expr, ports_ok, context);
         if matches!(
             self.aggregate_assignment_expr_type(expr),
-            Some(IrType::Record(_))
+            Some(IrType::Record(_) | IrType::Seq(_))
         ) || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
@@ -2529,9 +2606,6 @@ impl Checker<'_> {
         mid_indices: &[(usize, Expr)],
         leaf_indexed: bool,
     ) -> Result<Option<(usize, String)>, String> {
-        if leaf_indexed {
-            return Ok(None);
-        }
         let record = match self.func.locals.get(local.index()).map(|local| &local.ty) {
             Some(IrType::Record(record)) => *record,
             _ => return Err(format!("local %{} is not record-typed", local.0)),
@@ -2540,7 +2614,36 @@ impl Checker<'_> {
             .chain(path.iter().map(String::as_str))
             .collect();
         let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        if leaf_indexed {
+            if matches!(
+                self.record_path_leaf_type(record, &segments, &positions),
+                Some(IrType::Seq(_))
+            ) {
+                return Err(
+                    "a dynamic-list record leaf cannot carry a fixed-vector element index"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
         self.record_path_vec_shape(record, &segments, &positions)
+    }
+
+    fn record_field_type(
+        &self,
+        local: LocalId,
+        field: &str,
+        path: &[String],
+        mid_indices: &[(usize, Expr)],
+    ) -> Option<IrType> {
+        let IrType::Record(record) = self.func.locals.get(local.index())?.ty else {
+            return None;
+        };
+        let segments: Vec<&str> = std::iter::once(field)
+            .chain(path.iter().map(String::as_str))
+            .collect();
+        let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        self.record_path_leaf_type(record, &segments, &positions)
     }
 
     fn transactor_state_field(
@@ -2891,6 +2994,19 @@ impl Checker<'_> {
         }
     }
 
+    fn transactor_state_record_field_type(
+        &self,
+        instance: &str,
+        field: &str,
+        path: &[String],
+        mid_indices: &[(usize, Expr)],
+    ) -> Option<IrType> {
+        let record = self.transactor_state_record(instance, field).ok()?;
+        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
+        self.record_path_leaf_type(record, &segments, &positions)
+    }
+
     fn expr_whole_vec_shape(&self, expr: &Expr) -> Result<Option<(usize, String)>, String> {
         match expr {
             Expr::ComponentField { base, field } => self.component_field_vec_shape(base, field),
@@ -2918,6 +3034,33 @@ impl Checker<'_> {
         }
     }
 
+    fn whole_collection_shape(
+        &self,
+        vec_shape: Result<Option<(usize, String)>, String>,
+        ty: Option<IrType>,
+    ) -> Result<Option<WholeCollectionShape>, String> {
+        match vec_shape? {
+            Some((len, elem)) => Ok(Some(WholeCollectionShape::FixedVec(len, elem))),
+            None => match ty {
+                Some(IrType::Seq(elem)) => crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+                    .map(WholeCollectionShape::DynamicSeq)
+                    .map(Some)
+                    .ok_or_else(|| "dynamic list has an invalid element type".to_string()),
+                _ => Ok(None),
+            },
+        }
+    }
+
+    fn expr_whole_collection_shape(
+        &self,
+        expr: &Expr,
+    ) -> Result<Option<WholeCollectionShape>, String> {
+        self.whole_collection_shape(
+            self.expr_whole_vec_shape(expr),
+            self.aggregate_assignment_expr_type(expr),
+        )
+    }
+
     fn report_bad_whole_vec_use(&mut self, detail: String) {
         self.errs.push(VerifyError::BadProgramRef {
             what: format!(
@@ -2930,10 +3073,12 @@ impl Checker<'_> {
     fn check_whole_vec_write_value(
         &mut self,
         dst_shape: Result<Option<(usize, String)>, String>,
+        dst_ty: Option<IrType>,
         value: &Expr,
         context: &'static str,
     ) {
-        let rhs_shape = self.expr_whole_vec_shape(value);
+        let dst_shape = self.whole_collection_shape(dst_shape, dst_ty);
+        let rhs_shape = self.expr_whole_collection_shape(value);
         match (dst_shape, rhs_shape) {
             (Ok(Some(dst)), Ok(Some(rhs))) if dst == rhs => {
                 self.check_expr_inner(value, false, context, true);
@@ -2970,7 +3115,7 @@ impl Checker<'_> {
                     // `check_expr` rejects the target everywhere else.
                     if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e
                     {
-                        self.check_bus_call_edge(bus_field, method, args);
+                        self.check_bus_call_edge(Some(*l), bus_field, method, args);
                         continue;
                     }
                     self.check_expr(e, false, "Assign value");
@@ -3067,7 +3212,13 @@ impl Checker<'_> {
                         mid_indices,
                         index.is_some(),
                     );
-                    self.check_whole_vec_write_value(dst_shape, value, "RecordFieldWrite value");
+                    let dst_ty = self.record_field_type(*local, field, path, mid_indices);
+                    self.check_whole_vec_write_value(
+                        dst_shape,
+                        dst_ty,
+                        value,
+                        "RecordFieldWrite value",
+                    );
                 }
                 Stmt::RecordWriteCb {
                     local,
@@ -3144,8 +3295,11 @@ impl Checker<'_> {
                         mid_indices,
                         index.as_ref(),
                     );
+                    let dst_ty =
+                        self.transactor_state_record_field_type(instance, field, path, mid_indices);
                     self.check_whole_vec_write_value(
                         dst_shape,
+                        dst_ty,
                         value,
                         "TransactorStateRecordFieldWrite value",
                     );
@@ -3588,7 +3742,13 @@ impl Checker<'_> {
                     // Component host state — the value follows the
                     // no-inline-port rule like any Assign value.
                     let dst_shape = self.component_field_vec_shape(base, field);
-                    self.check_whole_vec_write_value(dst_shape, value, "ComponentFieldWrite value");
+                    let dst_ty = self.component_field_type(base, field);
+                    self.check_whole_vec_write_value(
+                        dst_shape,
+                        dst_ty,
+                        value,
+                        "ComponentFieldWrite value",
+                    );
                 }
                 Stmt::ComponentVecElementWrite {
                     base,
@@ -3598,7 +3758,6 @@ impl Checker<'_> {
                     value,
                 } => {
                     self.check_expr(index, false, "ComponentVecElementWrite index");
-                    self.check_expr(value, false, "ComponentVecElementWrite value");
                     match self.component_indexed_field_type(base, field, *index_pos) {
                         Ok((expected, len)) => {
                             if matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
@@ -3607,6 +3766,16 @@ impl Checker<'_> {
                                     "indexed component field `{field}` is out of bounds for length {len}"
                                 ));
                             }
+                            if matches!(expected, IrType::Seq(_)) {
+                                self.check_whole_vec_write_value(
+                                    Ok(None),
+                                    Some(expected),
+                                    value,
+                                    "ComponentVecElementWrite value",
+                                );
+                                continue;
+                            }
+                            self.check_expr(value, false, "ComponentVecElementWrite value");
                             let actual = match value {
                                 Expr::Literal {
                                     ty: IrType::Unknown,
@@ -3741,14 +3910,14 @@ impl Checker<'_> {
                     // as a blocking Assign-RHS edge (Run/Check only, binding
                     // resolves on the owner tb, method exists, arg arity +
                     // purity). The args are no-inline-port.
-                    self.check_bus_call_edge(&desc.bus_field, &desc.method, &desc.args);
+                    self.check_bus_call_edge(desc.dest, &desc.bus_field, &desc.method, &desc.args);
                 }
                 Stmt::TlmJoinAll(pending) => {
                     for p in pending {
                         if let Some(d) = p.dest {
                             self.check_local(d);
                         }
-                        self.check_bus_call_edge(&p.bus_field, &p.method, &p.args);
+                        self.check_bus_call_edge(p.dest, &p.bus_field, &p.method, &p.args);
                     }
                 }
             }
@@ -4441,15 +4610,18 @@ impl Checker<'_> {
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
-                match self.transactor_state_field_vec_shape(
+                let vec_shape = self.transactor_state_field_vec_shape(
                     instance,
                     field,
                     path,
                     mid_indices,
                     index.as_deref(),
-                ) {
+                );
+                let ty =
+                    self.transactor_state_record_field_type(instance, field, path, mid_indices);
+                match self.whole_collection_shape(vec_shape, ty) {
                 Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
-                    "transactor-state vector `{instance}.{field}.{}` with shape {shape:?} appears outside matching equality/copy",
+                    "transactor-state collection `{instance}.{field}.{}` with shape {shape:?} appears outside matching equality/copy",
                     path.join(".")
                 )),
                 Ok(_) => {}
@@ -4467,8 +4639,8 @@ impl Checker<'_> {
                 }
             }
             Expr::Binary(op, a, b) => {
-                let lhs_shape = self.expr_whole_vec_shape(a);
-                let rhs_shape = self.expr_whole_vec_shape(b);
+                let lhs_shape = self.expr_whole_collection_shape(a);
+                let rhs_shape = self.expr_whole_collection_shape(b);
                 match (lhs_shape, rhs_shape) {
                     (Ok(Some(lhs)), Ok(Some(rhs)))
                         if matches!(op, BinOp::Eq | BinOp::Ne) && lhs == rhs =>
@@ -4482,7 +4654,7 @@ impl Checker<'_> {
                     }
                     (Ok(lhs), Ok(rhs)) => {
                         self.report_bad_whole_vec_use(format!(
-                            "binary operator {op:?} has incompatible whole-vector operands {lhs:?} and {rhs:?}"
+                            "binary operator {op:?} has incompatible whole-collection operands {lhs:?} and {rhs:?}"
                         ));
                         self.check_expr_inner(a, ports_ok, context, lhs.is_some());
                         self.check_expr_inner(b, ports_ok, context, rhs.is_some());
@@ -4613,15 +4785,12 @@ impl Checker<'_> {
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
-                match self.record_field_vec_shape(
-                    *local,
-                    field,
-                    path,
-                    mid_indices,
-                    index.is_some(),
-                ) {
+                let vec_shape =
+                    self.record_field_vec_shape(*local, field, path, mid_indices, index.is_some());
+                let ty = self.record_field_type(*local, field, path, mid_indices);
+                match self.whole_collection_shape(vec_shape, ty) {
                     Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
-                        "record vector `%{}.{}` with shape {shape:?} appears outside matching equality/copy",
+                        "record collection `%{}.{}` with shape {shape:?} appears outside matching equality/copy",
                         local.0,
                         std::iter::once(field.as_str())
                             .chain(path.iter().map(String::as_str))
@@ -4652,9 +4821,11 @@ impl Checker<'_> {
             }
             Expr::CovHookArg { .. } => {}
             Expr::ComponentField { base, field } => {
-                match self.component_field_vec_shape(base, field) {
+                let vec_shape = self.component_field_vec_shape(base, field);
+                let ty = self.component_field_type(base, field);
+                match self.whole_collection_shape(vec_shape, ty) {
                     Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(
-                        "component vector `{field}` with shape {shape:?} appears outside matching equality/copy"
+                        "component collection `{field}` with shape {shape:?} appears outside matching equality/copy"
                     )),
                     Ok(_) => {}
                     Err(detail) => self.report_bad_component_field(detail),
@@ -4668,13 +4839,27 @@ impl Checker<'_> {
             } => {
                 self.check_expr(index, ports_ok, context);
                 match self.component_indexed_field_type(base, field, *index_pos) {
-                    Ok((_, len)) if matches!(index.as_ref(), Expr::Literal { value, .. } if *value as usize >= len) =>
-                    {
-                        self.report_bad_component_field(format!(
-                            "indexed component field `{field}` is out of bounds for length {len}"
-                        ));
+                    Ok((ty, len)) => {
+                        if matches!(index.as_ref(), Expr::Literal { value, .. } if *value as usize >= len)
+                        {
+                            self.report_bad_component_field(format!(
+                                "indexed component field `{field}` is out of bounds for length {len}"
+                            ));
+                        }
+                        if let IrType::Seq(elem) = ty {
+                            let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+                                .map(WholeCollectionShape::DynamicSeq);
+                            match shape {
+                                Some(shape) if !whole_vec_ok => self.report_bad_whole_vec_use(
+                                    format!("indexed component collection `{field}` with shape {shape:?} appears outside matching equality/copy"),
+                                ),
+                                Some(_) => {}
+                                None => self.report_bad_component_field(
+                                    "indexed component dynamic list has an invalid element type".to_string(),
+                                ),
+                            }
+                        }
                     }
-                    Ok(_) => {}
                     Err(detail) => self.report_bad_component_field(detail),
                 }
             }
@@ -4875,7 +5060,13 @@ impl Checker<'_> {
     /// purity (no ports, no nesting). Transactor-field edges never take
     /// this position — they ride `Stmt::TransactorCall` and are checked
     /// by `check_transactor_call`.
-    fn check_bus_call_edge(&mut self, bus_field: &str, method: &str, args: &[Expr]) {
+    fn check_bus_call_edge(
+        &mut self,
+        dest: Option<LocalId>,
+        bus_field: &str,
+        method: &str,
+        args: &[Expr],
+    ) {
         // A `TransactorBody` function may carry a downstream blocking
         // bus-call edge when it is a bound-to target responder
         // re-issuing a TLM call (nested forwarding). The responder body
@@ -4937,8 +5128,53 @@ impl Checker<'_> {
         }
         for a in args {
             self.check_expr(a, false, "TransactorMethod arg");
+            if self
+                .aggregate_assignment_expr_type(a)
+                .and_then(|ty| match ty {
+                    IrType::Record(record) => Some(record),
+                    _ => None,
+                })
+                .is_some_and(|record| record_contains_dynamic_list(self.prog, record))
+            {
+                self.bad_transactor(format!(
+                    "`{bus_field}.{method}` carries a dynamic-list record over a fixed TLM request wire"
+                ));
+            }
+        }
+        if dest
+            .and_then(|local| self.func.locals.get(local.index()))
+            .and_then(|local| match local.ty {
+                IrType::Record(record) => Some(record),
+                _ => None,
+            })
+            .is_some_and(|record| record_contains_dynamic_list(self.prog, record))
+        {
+            self.bad_transactor(format!(
+                "`{bus_field}.{method}` returns a dynamic-list record over a fixed TLM response wire"
+            ));
         }
     }
+}
+
+fn record_contains_dynamic_list(prog: &TbProgram, record: RecordId) -> bool {
+    let mut pending = vec![record];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(next) = pending.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        let Some(schema) = prog.records.get(next.index()) else {
+            continue;
+        };
+        for field in &schema.fields {
+            match field.ty {
+                IrType::Seq(_) => return true,
+                IrType::Record(inner) => pending.push(inner),
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 fn check_port_snapshot_definitions(

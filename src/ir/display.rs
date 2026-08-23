@@ -137,9 +137,10 @@ impl Display for TbProgram {
         for (i, r) in self.records.iter().enumerate() {
             writeln!(f, "  record r{} {}", i, r.name)?;
             for fld in &r.fields {
-                let ty = match fld.vec_len {
-                    Some(n) => format!("Vec<{}, {n}>", type_str(&fld.ty)),
-                    None => type_str(&fld.ty),
+                let ty = match (&fld.ty, fld.vec_len) {
+                    (IrType::Seq(elem), None) => format!("list<{}>", type_str(elem)),
+                    (_, Some(n)) => format!("Vec<{}, {n}>", type_str(&fld.ty)),
+                    (_, None) => type_str(&fld.ty),
                 };
                 write!(
                     f,

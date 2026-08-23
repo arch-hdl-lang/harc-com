@@ -257,16 +257,30 @@ fn emit_selected_tests(
 
     // Transaction value-record structs, in declaration order. Mirrors
     // v1's `emit_record_struct` shape (field defaults as member
-    // initializers, `operator==`/`!=`). v1's other record companions
-    // — `randomize_<T>` and the pack/unpack helpers — are NOT emitted:
-    // every construct that could reach them (`randomize`, bus sends)
-    // is rejected at lowering, so they would be dead text here. They
-    // land with their constructs.
+    // initializers, `operator==`/`!=`). Pack/unpack helpers follow the
+    // structural schema below. Legacy `randomize_<T>` helpers are emitted
+    // only when a dynamic-list record is present: constrained sites use the
+    // shared solver, while an unconstrained list can legitimately fall back
+    // to v1's field-draw helper.
     // Emit in TOPOLOGICAL order (a record after every record it nests) so
     // an inner struct's definition and `harc_pack_*` precede any outer
     // struct that holds it by value — C++ needs the complete inner type.
-    for i in record_emit_order(&prog.records) {
+    let record_order = record_emit_order(&prog.records);
+    for &i in &record_order {
         record_struct(&mut out, &prog.records[i], &prog.records);
+    }
+    if prog.records.iter().any(|record| {
+        record
+            .fields
+            .iter()
+            .any(|field| matches!(field.ty, ir::IrType::Seq(_)))
+    }) {
+        out.push_str(&crate::codegen::cpp_tb::emit_record_randomize_helpers(
+            file,
+            opts,
+            &prog.records,
+            &record_order,
+        )?);
     }
 
     // RAL per-register write-callback recursion-depth limit — emitted once
@@ -1377,6 +1391,11 @@ fn record_packed_width(r: &ir::RecordSchema, records: &[ir::RecordSchema]) -> Op
 fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
     writeln!(out, "struct {} {{", r.name).ok();
     for f in &r.fields {
+        if let ir::IrType::Seq(elem) = &f.ty {
+            let elem_cty = field_scalar_cty(elem);
+            writeln!(out, "{INDENT}std::vector<{elem_cty}> {}{{}};", f.name).ok();
+            continue;
+        }
         // A nested-record field is a real C++ struct member (v1 parity):
         // `<Inner> field{};` value-initializes it, so it picks up the inner
         // struct's own member-initializer defaults. Copy / `==` / pack all

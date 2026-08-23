@@ -11660,9 +11660,9 @@ test T
 end test T"#
         )
     };
-    // v1 gives the leaf a member that means what was written AND a
-    // draw that fills it — a working escape hatch. A scalar row is
-    // width-correct at any width; a container row keeps its shape.
+    // Scalar-element lists are now part of the TBIR record model. The shared
+    // randomize snippet gives them the same storage and draw v1 has always
+    // emitted.
     for (ty, shape, draw) in [
         ("list<uint<8>>", "std::vector<uint64_t> data", "data[_i] = harc_rt::random::harc_rng_uint"),
         (
@@ -11677,10 +11677,533 @@ end test T"#
             "data[_i] = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << 7), (1LL << 7) - 1)",
         ),
         (
+            "list<sint<63>>",
+            "std::vector<int64_t> data",
+            "data[_i] = static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::random::harc_rng_uint(harc_rng_next, 63)), 63, 64))",
+        ),
+        (
             "list<sint<64>>",
             "std::vector<int64_t> data",
             "data[_i] = harc_rt::random::harc_rng_uint(harc_rng_next, 64)",
         ),
+    ] {
+        let src = field(ty);
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{ty}` lowers: {e}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{ty}` verifies: {e:?}"));
+        let tbir = emit_cpp_src(&src);
+        assert!(tbir.contains(shape), "`{ty}`: TBIR emits `{shape}`: {tbir}");
+        assert!(tbir.contains(draw), "`{ty}`: TBIR emits `{draw}`: {tbir}");
+    }
+    let signed_list_solver = field("list<sint<63>, max=1>").replace(
+        "transaction Resp\n    data",
+        "transaction Resp\n    signed_value : sint<63>\n    data",
+    );
+    let signed_list_cpp = emit_cpp_src(&signed_list_solver);
+    assert!(
+        signed_list_cpp.contains("int64_t _pref_")
+            && signed_list_cpp.contains("harc_prefer_uint(_harc_rt_seed")
+            && signed_list_cpp.contains("harc_sext_u128"),
+        "signed scalar preferences must use the same int64_t carrier as auto-coverage values: {signed_list_cpp}"
+    );
+
+    let control = lower_src(&field("list<uint<8>>")).expect("list control lowers");
+    let mut bad_elem = control.clone();
+    bad_elem.records[0].fields[0].ty =
+        ir::IrType::Seq(Box::new(ir::IrType::Record(ir::RecordId(0))));
+    verify::verify_program(&bad_elem)
+        .expect_err("a record element cannot corrupt a scalar-list schema");
+    let mut fixed_and_dynamic = control.clone();
+    fixed_and_dynamic.records[0].fields[0].vec_len = Some(2);
+    verify::verify_program(&fixed_and_dynamic)
+        .expect_err("a record field cannot be both a dynamic list and fixed Vec");
+    let control_src = field("list<uint<8>>");
+    let control_file = merged_src(&control_src);
+    let mut source_mismatch = lower::lower_program(&control_file).expect("control lowers");
+    source_mismatch.records[1].fields[0].name = "renamed".to_string();
+    verify::verify_program(&source_mismatch)
+        .expect("the standalone verifier has no source provenance to compare");
+    let err = tbir::emit(
+        &source_mismatch,
+        &control_file,
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect_err("AST helper replay must reject a mismatched verified schema");
+    assert!(err.0.contains("source/schema mismatch"), "{err:?}");
+    let defaulted =
+        field("list<uint<8>>").replace("data : list<uint<8>>", "data : list<uint<8>> default 0");
+    assert_not_implemented(
+        &lower_src(&defaulted).expect_err("a list cannot take a scalar default"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    for modifier in [
+        "with [range(1, 2)]",
+        "with [dist {[1] :/ 100}]",
+        "with [unique within test]",
+    ] {
+        let attributed = field("list<uint<8>, max=3>").replace(
+            "data : list<uint<8>, max=3>",
+            &format!("data : list<uint<8>, max=3> {modifier}"),
+        );
+        assert_not_implemented(
+            &lower_src(&attributed)
+                .expect_err(&format!("list modifier `{modifier}` must not be ignored")),
+            lower::V1Status::SilentlyMisLowers,
+        );
+    }
+    let body_access = field("list<uint<8>>").replace(
+        "randomize(r)",
+        "randomize(r)\n        let first = r.data[0]",
+    );
+    let err = lower_src(&body_access).expect_err("ordinary list indexing remains a separate slice");
+    assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(
+        format!("{err:?}").contains("dynamic record list"),
+        "{err:?}"
+    );
+    let body_len = field("list<uint<8>>").replace(
+        "randomize(r)",
+        "randomize(r)\n        let count = r.data.len()",
+    );
+    let msg = assert_unsupported(
+        &lower_src(&body_len).expect_err("ordinary list queries remain a separate slice"),
+    );
+    assert!(msg.contains("dynamic record list"), "{msg}");
+
+    let whole_value =
+        field("list<uint<8>>").replace("randomize(r)", "randomize(r)\n        let scalar = r.data");
+    assert_not_implemented(
+        &lower_src(&whole_value).expect_err("a list is not a scalar value"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let local_copy_eq = field("list<uint<8>>").replace(
+        "randomize(r)",
+        "randomize(r)\n        r.data = r.data\n        let equal = r.data == r.data",
+    );
+    let local_prog = lower_src(&local_copy_eq).expect("whole local list copy/equality lowers");
+    verify::verify_program(&local_prog).expect("whole local list copy/equality verifies");
+
+    let component = r#"struct Sample
+    items : list<uint<8>, max=2>
+    other : list<sint<8>, max=2>
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current : Sample
+    when active
+        hookable publish()
+            current.items = current.items
+            let equal = current.items == current.items
+            emit observed(equal)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish()
+        wait 1 cycle
+    end run
+end test T"#;
+    let component_prog = lower_src(component).expect("whole component list copy/equality lowers");
+    verify::verify_program(&component_prog).expect("whole component list copy/equality verifies");
+    let component_cpp = emit_cpp_src(component);
+    assert!(
+        component_cpp.contains("self.current.items = self.current.items"),
+        "{component_cpp}"
+    );
+    assert!(
+        component_cpp.contains("self.current.items == self.current.items"),
+        "{component_cpp}"
+    );
+    let corrupt_component_write = |mut prog: ir::TbProgram, rhs: ir::Expr| {
+        let value = prog
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ComponentFieldWrite { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("component fixture contains a whole-list write");
+        *value = rhs;
+        verify::verify_program(&prog).expect_err("a corrupted whole-list write must not verify");
+    };
+    corrupt_component_write(
+        component_prog.clone(),
+        ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(None),
+        },
+    );
+    corrupt_component_write(
+        component_prog.clone(),
+        ir::Expr::ComponentField {
+            base: ir::ComponentBase::SelfField,
+            field: "current.other".to_string(),
+        },
+    );
+    let mut bad_operator = component_prog.clone();
+    let arg = bad_operator
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .flat_map(|block| block.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, value @ ir::Expr::Binary(_, _, _)) => Some(value),
+            _ => None,
+        })
+        .expect("component fixture assigns the list equality result");
+    let ir::Expr::Binary(op, _, _) = arg else {
+        panic!("list equality did not lower to Binary: {arg:?}")
+    };
+    *op = ir::BinOp::Add;
+    verify::verify_program(&bad_operator)
+        .expect_err("a dynamic list beneath a scalar operator must not verify");
+
+    let component_truth = component.replace(
+        "current.items = current.items\n            let equal = current.items == current.items\n            emit observed(equal)",
+        "if current.items == current.items\n                emit observed(1)\n            end if",
+    );
+    let mut bad_truth = lower_src(&component_truth).expect("list equality is a valid condition");
+    let cond = bad_truth
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .find_map(|block| match &mut block.terminator {
+            ir::Terminator::Branch(cond, _, _) => Some(cond),
+            _ => None,
+        })
+        .expect("component truth fixture contains a branch");
+    let ir::Expr::Binary(_, lhs, _) = cond else {
+        panic!("list equality condition did not lower to Binary: {cond:?}")
+    };
+    let lhs = lhs.as_ref().clone();
+    *cond = lhs;
+    verify::verify_program(&bad_truth)
+        .expect_err("a direct dynamic-list truth value must not verify");
+    for (replacement, status) in [
+        ("let n = current.items", lower::V1Status::EmitsUncompilable),
+        (
+            "let n = current.items[0]",
+            lower::V1Status::SilentlyMisLowers,
+        ),
+    ] {
+        let src = component.replace("current.items = current.items", replacement);
+        assert_not_implemented(
+            &lower_src(&src).expect_err("component list sink is classified"),
+            status,
+        );
+    }
+    let component_query = component.replace(
+        "current.items = current.items",
+        "let n = current.items.len()",
+    );
+    assert_unsupported(
+        &lower_src(&component_query).expect_err("component list query keeps the v1 escape"),
+    );
+
+    let indexed_component = r#"struct Sample
+    items : list<uint<8>, max=2>
+end struct Sample
+
+struct Outer
+    rows : Vec<Sample, 2>
+end struct Outer
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current : Outer
+    when active
+        hookable publish()
+            current.rows[0].items = current.rows[1].items
+            let equal = current.rows[0].items == current.rows[1].items
+            emit observed(equal)
+        end publish
+    end when
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let src : RecordSource active
+    run
+        src.publish()
+        wait 1 cycle
+    end run
+end test T"#;
+    let indexed_prog = lower_src(indexed_component)
+        .expect("matching whole lists beneath a component Vec element lower");
+    verify::verify_program(&indexed_prog)
+        .expect("matching whole lists beneath a component Vec element verify");
+
+    let indexed_local = r#"struct Sample
+    items : list<uint<8>, max=2>
+end struct Sample
+
+struct Outer
+    rows : Vec<Sample, 2>
+end struct Outer
+
+test T
+    let dut : Top
+    run
+        let a : Outer
+        let b : Outer
+        a.rows[0].items = b.rows[1].items
+        let equal = a.rows[0].items == b.rows[1].items
+        wait 1 cycle
+    end run
+end test T"#;
+    let indexed_local_prog =
+        lower_src(indexed_local).expect("matching indexed record-local lists lower");
+    verify::verify_program(&indexed_local_prog)
+        .expect("matching indexed record-local lists verify");
+    let sized_indexed_local = indexed_local
+        .replace("rows[0]", "rows[8'd0]")
+        .replace("rows[1]", "rows[8'd1]");
+    let sized_indexed_local_prog = lower_src(&sized_indexed_local)
+        .expect("matching sized-literal indexed record-local lists lower");
+    verify::verify_program(&sized_indexed_local_prog)
+        .expect("matching sized-literal indexed record-local lists verify");
+
+    let indexed_target = r#"struct Sample
+    items : list<uint<8>, max=2>
+end struct Sample
+
+struct Outer
+    rows : Vec<Sample, 2>
+end struct Outer
+
+bus B
+    tlm_method read(addr: uint<8>) -> uint<8>: blocking;
+end bus B
+
+transactor Target bound to B
+    cache : Outer
+    thread bus.read(addr: uint<8>)
+        cache.rows[0].items = cache.rows[1].items
+        let equal = cache.rows[0].items == cache.rows[1].items
+        return addr
+    end thread
+end transactor Target
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let bus : B = bind dut
+    let target : Target passive = bind bus
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let indexed_target_prog =
+        lower_src(indexed_target).expect("matching indexed target-state lists lower");
+    verify::verify_program(&indexed_target_prog)
+        .expect("matching indexed target-state lists verify");
+    let sized_indexed_target = indexed_target
+        .replace("rows[0]", "rows[8'd0]")
+        .replace("rows[1]", "rows[8'd1]");
+    let sized_indexed_target_prog = lower_src(&sized_indexed_target)
+        .expect("matching sized-literal indexed target-state lists lower");
+    verify::verify_program(&sized_indexed_target_prog)
+        .expect("matching sized-literal indexed target-state lists verify");
+    for src in [indexed_local, indexed_component, indexed_target] {
+        for literal in [
+            "128'h10000000000000000",
+            "0x10000000000000000",
+            "18446744073709551616",
+        ] {
+            let oversized = src.replace("rows[0]", &format!("rows[{literal}]"));
+            let msg = assert_invalid(
+                &lower_src(&oversized)
+                    .expect_err("an over-u64 literal Vec selector is statically out of bounds"),
+            );
+            assert!(msg.contains("out of bounds"), "{literal}: {msg}");
+        }
+        let negative = src.replace("rows[0]", "rows[-1]");
+        let msg = assert_invalid(
+            &lower_src(&negative).expect_err("a negative literal Vec selector is out of bounds"),
+        );
+        assert!(msg.contains("out of bounds"), "{msg}");
+    }
+    let negative_zero = indexed_local.replace("rows[0]", "rows[-0]");
+    let negative_zero_prog = lower_src(&negative_zero).expect("negative zero is index zero");
+    verify::verify_program(&negative_zero_prog).expect("negative-zero indexed lists verify");
+    let double_negative = indexed_local.replace("rows[0]", "rows[-(-1)]");
+    let double_negative_prog =
+        lower_src(&double_negative).expect("an even negation chain preserves a positive index");
+    verify::verify_program(&double_negative_prog)
+        .expect("double-negative indexed lists verify");
+    let triple_negative = indexed_local.replace("rows[0]", "rows[-(-(-1))]");
+    let msg = assert_invalid(
+        &lower_src(&triple_negative)
+            .expect_err("an odd negation chain ending in nonzero is out of bounds"),
+    );
+    assert!(msg.contains("out of bounds"), "{msg}");
+
+    for replacement in ["current.rows[0].items = 1", "let n = current.rows[0].items"] {
+        let src =
+            indexed_component.replace("current.rows[0].items = current.rows[1].items", replacement);
+        assert_not_implemented(
+            &lower_src(&src).expect_err("an indexed dynamic-list leaf is not a scalar value"),
+            lower::V1Status::EmitsUncompilable,
+        );
+    }
+    let mut corrupt_indexed_write = indexed_prog.clone();
+    let value = corrupt_indexed_write
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .flat_map(|block| block.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentVecElementWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("indexed fixture contains a whole-list write");
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(None),
+    };
+    verify::verify_program(&corrupt_indexed_write)
+        .expect_err("an indexed dynamic-list leaf cannot be rewritten from a scalar");
+
+    let mut corrupt_local_index = local_prog.clone();
+    let leaf_index = corrupt_local_index
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .flat_map(|block| block.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::RecordFieldWrite {
+                value: ir::Expr::RecordField { index, .. },
+                ..
+            } => Some(index),
+            _ => None,
+        })
+        .expect("local fixture contains a whole-list copy");
+    *leaf_index = Some(Box::new(ir::Expr::Literal {
+        value: 0,
+        ty: ir::IrType::UInt(None),
+    }));
+    verify::verify_program(&corrupt_local_index)
+        .expect_err("a dynamic-list RecordField cannot carry a fixed-Vec leaf index");
+
+    let target = r#"struct Sample
+    items : list<uint<8>, max=2>
+end struct Sample
+
+bus B
+    tlm_method read(addr: uint<8>) -> uint<8>: blocking;
+end bus B
+
+transactor Target bound to B
+    cache : Sample
+    thread bus.read(addr: uint<8>)
+        let n = cache.items
+        return addr
+    end thread
+end transactor Target
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let bus : B = bind dut
+    let target : Target passive = bind bus
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    assert_not_implemented(
+        &lower_src(target).expect_err("target record-list scalar use is rejected at source"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let target_copy_eq = target.replace(
+        "let n = cache.items",
+        "cache.items = cache.items\n        let equal = cache.items == cache.items",
+    );
+    let target_prog = lower_src(&target_copy_eq).expect("whole target list copy/equality lowers");
+    verify::verify_program(&target_prog).expect("whole target list copy/equality verifies");
+    let target_query = target.replace("let n = cache.items", "let n = cache.items.len()");
+    assert_unsupported(
+        &lower_src(&target_query).expect_err("target record-list query keeps the v1 escape"),
+    );
+
+    let list_reply = r#"struct Reply
+    items : list<uint<8>, max=2>
+end struct Reply
+
+bus B
+    tlm_method read(addr: uint<8>) -> Reply: blocking;
+end bus B
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let mem : B = bind dut
+    run
+        let reply = mem.read(0)
+        wait 1 cycle
+    end run
+end impl T"#;
+    assert_not_implemented(
+        &lower_src(list_reply).expect_err("a dynamic list has no TLM wire layout"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let scalar_reply = list_reply.replace("items : list<uint<8>, max=2>", "items : uint<8>");
+    let mut corrupt_wire = lower_src(&scalar_reply).expect("scalar record TLM control lowers");
+    corrupt_wire.records[0].fields[0].ty = ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))));
+    verify::verify_program(&corrupt_wire)
+        .expect_err("a pass cannot put a dynamic-list record onto a TLM response wire");
+
+    let target_reply = r#"struct Reply
+    items : list<uint<8>, max=2>
+end struct Reply
+
+bus B
+    tlm_method read(addr: uint<8>) -> Reply: blocking;
+end bus B
+
+transactor Target bound to B
+    thread bus.read(addr: uint<8>)
+        let reply : Reply
+        return reply
+    end thread
+end transactor Target
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let bus : B = bind dut
+    let target : Target passive = bind bus
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    assert_not_implemented(
+        &lower_src(target_reply).expect_err("a target cannot drive a dynamic list record"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    let scalar_target = target_reply.replace("items : list<uint<8>, max=2>", "items : uint<8>");
+    let mut corrupt_target = lower_src(&scalar_target).expect("scalar target control lowers");
+    corrupt_target.records[0].fields[0].ty = ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))));
+    verify::verify_program(&corrupt_target)
+        .expect_err("a pass cannot make a target drive a dynamic-list record");
+
+    // The other container shapes remain outside this batch. v1 preserves
+    // these particular declarations, so they retain the honest Unsupported
+    // classification.
+    for (ty, shape, draw) in [
         ("Vec<uint, 4>", "std::array<uint64_t, 4> data", "data = {}"),
         // `int` is 32-bit signed in HARC and this backend maps it
         // through the UNSIGNED width helper, so a `Vec<int, N>` member
@@ -32445,16 +32968,9 @@ fn v1_no_longer_aborts_on_a_relation_that_expands_forever() {
 /// diagnostic that sends the reader looking for a `relation`
 /// declaration they never meant to write.
 ///
-/// Only the FALSE-REFUSAL case is latent — an earlier version of this
-/// doc said the whole thing was. TB-IR refuses any transaction carrying
-/// a `list<T>` field before constraint lowering runs, and every `sum`
-/// v1 ACCEPTS needs a list field, so no v1-compiling program reaches
-/// the fix today. That is why the list-bearing cases are asserted on
-/// the constraint table: end-to-end there would pass for the wrong
-/// reason, since the list-field gate fires first and would keep passing
-/// however this were classified.
-///
-/// But `sum` over a SCALAR reaches the fixed line today, with no list
+/// Scalar-element transaction lists now reach this path end to end; the
+/// bounded control below lowers, verifies, and emits the typed list solver.
+/// `sum` over a SCALAR also reaches the fixed line, with no list
 /// field anywhere, and that case is asserted end to end — because the
 /// predicate checks NAME and ARITY only, deliberately wider than v1,
 /// which also requires a range-sliced list field. What keeps the
@@ -32487,31 +33003,20 @@ fn a_v1_constraint_builtin_is_not_reported_as_an_unknown_relation() {
             .collect()
     };
 
-    // The list-field gate really does fire first, for every one of
-    // these — including the clause with no call in it at all. That is
-    // the masking, stated as a measurement rather than assumed.
-    for clause in [
-        "sum(items[0 .. items.len()]) == 100",
-        "NoSuchRel(p)",
-        "p.n > 3",
-    ] {
-        let err = lower_src(&src(clause)).unwrap_err();
-        assert!(
-            format!("{err}").contains("`P.items` with an unsupported (non-scalar) leaf type"),
-            "{clause}: expected the list-field gate, got {err}"
-        );
-    }
-
-    // And that gate's `--codegen v1` suggestion is honest, which is
-    // what makes this worth fixing rather than filing as unreachable:
-    // give the list a bound and v1 emits the whole thing, `sum` call
-    // included. So the false `UnknownRelation` sat directly in front of
-    // a form v1 compiles.
+    // A bounded list with `sum` is the positive migration control: both
+    // backends emit the typed length and element model.
     let bounded = src("items.len() <= 4\n            sum(items[0 .. items.len()]) == 100");
     cpp_tb::emit(&merged_src(&bounded)).expect("v1 emits a bounded list with a `sum` constraint");
+    let prog = lower_src(&bounded).expect("TBIR lowers the bounded list constraint");
+    verify::verify_program(&prog).expect("bounded list constraint verifies");
+    let cpp = tbir::emit(&prog, &merged_src(&bounded), &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits the bounded list solver");
+    assert!(
+        cpp.contains("_z_items_len") && cpp.contains("_z_items_3"),
+        "{cpp}"
+    );
 
-    // `sum` is a v1 builtin: not a relation error, so it is discarded
-    // and the program would lower once list fields do.
+    // `sum` is a v1 builtin: not a relation error.
     for clause in [
         "sum(items[0 .. items.len()]) == 100",
         "sum(items[0 .. items.len()])",

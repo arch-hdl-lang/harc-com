@@ -1030,6 +1030,14 @@ fn lower_bound_target_transactor(
             .ret
             .as_ref()
             .and_then(|t| record_id_of_type(&body_ctx, t));
+        if let Some(record) = ret_record {
+            body_ctx.reject_dynamic_list_record_wire(
+                record,
+                &format!(
+                    "record return from target responder `bus.{mname}` crossing a TLM response wire"
+                ),
+            )?;
+        }
         if let Some(ret) = method.ret.as_ref() {
             if ret_record.is_none() {
                 check_scalar_ty(tname, mname, "return type", Some(ret))?;
