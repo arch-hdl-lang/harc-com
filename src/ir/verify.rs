@@ -1903,6 +1903,21 @@ fn verify_component_event_ref(
             },
             activation,
             ..
+        // The THIRD `EventPayload` struct equality in the tree, and
+        // the only one that should stay one. The other two compared a
+        // SOURCE payload against a SINK's — two independently declared
+        // types that a C++ conversion has to bridge — so widening the
+        // struct silently turned each into a width check and refused
+        // legal programs (divergences 139-141). This one compares an
+        // op's stored payload against THE SAME FIELD it was copied
+        // from, so the question is identity, not bridging: a
+        // difference means the IR is internally inconsistent, which is
+        // exactly what a verifier is for. It stays correct if a fourth
+        // field is added, for the same reason the others did not.
+        //
+        // Swept across `uint`, `bool`, `uint<1|8|64|65|128|160|1024>`
+        // and `sint<8|64>` after the payload grew a width: no arm of
+        // this match fires on any of them.
         }) if *field_payload == payload => {
             if !component_mode_includes_activation(resolved.effective_mode, *activation) {
                 return Err(format!(
