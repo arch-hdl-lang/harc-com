@@ -211,6 +211,37 @@ int main() {{
                 == harc_rt::harc_sext_u128(0xFF, 8, 65))
             && harc_rt::harc_slt_u128(neg65, 1, 65);
     }}
+    {{  // harc#662: `harc_wide_sext` must start from the SIGN-AWARE
+        // conversion, not `harc_wide_zext`.
+        //
+        // `source_width` is what the CALLER declares; the C++ argument is
+        // routinely narrower. A source-level `-1` arrives as a 32-bit
+        // `int` under `source_width = 64`, and `harc_wide_zext` converts a
+        // signed T through `make_unsigned_t<T>` — correct zero-extension
+        // of a 32-bit source, but it leaves bit 63 CLEAR, so sext's sign
+        // probe reads the value as positive and skips extending. That is
+        // exactly what `sb.wide = -1` on a `uint<256>` field hit: it
+        // stored 2^32-1 instead of all-ones, with no diagnostic anywhere.
+        //
+        // Both spellings below must agree. The 64-bit one is the shape
+        // the emitter actually produces for a negative literal; the
+        // 8-bit one pins that a genuinely narrow source still sees its
+        // own sign bit, so a fix cannot be "always sign-extend".
+        auto from_int_at_64 = harc_rt::harc_wide_sext<8>(-(1), 64, 256);
+        auto from_int_at_8 = harc_rt::harc_wide_sext<8>(0xFF, 8, 256);
+        auto positive_stays_positive = harc_rt::harc_wide_sext<8>(1, 64, 256);
+        bool all_ones_64 = true;
+        bool all_ones_8 = true;
+        for (std::size_t i = 0; i < 8; ++i) {{
+            all_ones_64 = all_ones_64 && (from_int_at_64.words[i] == 0xFFFFFFFFu);
+            all_ones_8 = all_ones_8 && (from_int_at_8.words[i] == 0xFFFFFFFFu);
+        }}
+        ok += all_ones_64 && all_ones_8
+            && (positive_stays_positive == 1)
+            // …and the neighbour it must NOT have broken: a function
+            // named zero-extend still introduces no sign bits.
+            && (harc_rt::harc_wide_zext<8>(-(1)).words[7] == 0u);
+    }}
     printf("%d\n", ok);
     return 0;
 }}
@@ -248,7 +279,7 @@ int main() {{
     assert!(run.status.success(), "probe exited non-zero");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout).trim(),
-        "3",
+        "4",
         "wide-cast shapes compiled but computed the wrong values",
     );
     let _ = std::fs::remove_dir_all(&dir);

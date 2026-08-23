@@ -17,8 +17,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Z3 (needed by harc's Z3 bindings at link time)
-        run: sudo apt-get update && sudo apt-get install -y libz3-dev
+      - name: Install Z3 (needed by harc's Z3 bindings at link time) and ccache
+        # ccache is not optional here, even though nothing in this job
+        # asks for it directly. `/opt/verilator` is restored from the
+        # cache the FIXTURE jobs populate, and Verilator bakes the object
+        # cache it detected at configure time into every makefile it
+        # generates — so the binary this job restores emits
+        # `OBJCACHE = ccache` and the build dies with
+        # `make: ccache: No such file or directory` if the package is
+        # absent. It also earns its keep: this job now runs the
+        # Verilator-backed end-to-end tests, which share most of their
+        # object code.
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev ccache
 
       - name: Cache cargo registry + target
         uses: actions/cache@v6
@@ -30,11 +40,48 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Verilator, for the end-to-end tests in the suite
+      # (`tbir_wide_scoreboard_e2e`, `tlm_wait_timeout_e2e`, ...). They
+      # skip themselves when `verilator` is absent from PATH, and this
+      # job had no Verilator — so they reported `ok` in 0.00s having
+      # never run. harc#662: a genuine regression sat behind that green
+      # check for weeks. Same pinned version and cache key as the
+      # fixture jobs, so this is a cache hit after their first build.
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator from source (cache miss)
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: |
+          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          /opt/verilator/bin/verilator --version
+
       - name: cargo build
         run: cargo build --release --all-targets
 
       - name: cargo test
+        # HARC_REQUIRE_VERILATOR turns a Verilator-less skip into a hard
+        # failure. Installing Verilator above is what makes these tests
+        # run; this is what keeps them running — without it, a future
+        # change to the steps above would put them straight back to
+        # passing in 0.00s without ever executing.
         run: cargo test --release
+        env:
+          HARC_REQUIRE_VERILATOR: "1"
 
   parse-fixtures:
     # Every fixture must round-trip parse + check cleanly. This catches

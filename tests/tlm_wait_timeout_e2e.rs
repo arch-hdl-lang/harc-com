@@ -34,11 +34,23 @@ fn harc_bin() -> PathBuf {
 /// True if a `verilator` binary is on PATH and runnable. The test needs a
 /// plain `--binary` build (no `--trace-vcd`), so any v5 is sufficient.
 fn verilator_present() -> bool {
-    Command::new("verilator")
+    let present = Command::new("verilator")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // See the same guard in `tbir_wide_scoreboard_e2e.rs`. A skipped
+    // end-to-end test reports `ok`, and an `ok` in 0.00s for a test that
+    // builds a Verilator model reads exactly like a real pass in a CI
+    // log — which is how harc#662 stayed hidden. CI installs Verilator
+    // for the `cargo test` job and sets this variable, so the silent
+    // skip cannot come back unnoticed.
+    assert!(
+        present || std::env::var_os("HARC_REQUIRE_VERILATOR").is_none(),
+        "HARC_REQUIRE_VERILATOR is set but `verilator` is not on PATH: this \
+         end-to-end test would have skipped itself and reported success"
+    );
+    present
 }
 
 fn fresh_outdir(tag: &str) -> PathBuf {

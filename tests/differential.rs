@@ -260,6 +260,7 @@ fn check_space_with_control(
     let mut table = format!("\n{label}: control lowers and compiles\n");
     let mut failures = Vec::new();
     let mut gaps: Vec<String> = Vec::new();
+    let mut ahead: Vec<String> = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
         let src = template.replace(hole, sub);
         let tb = tb_verdict(cc, &src, &dir, &format!("row{i}"));
@@ -300,10 +301,22 @@ fn check_space_with_control(
                 "`{}`: tbir lowers it and its own emitted C++ does not compile: {e}",
                 sub.trim()
             )),
-            (TbVerdict::Lowers, V1Behaviour::EmitsUncompilable(e)) => failures.push(format!(
-                "`{}`: tbir lowers it, but v1 — the documented escape hatch — cannot build it: {e}",
-                sub.trim()
-            )),
+            // TB-IR ahead of v1. REPORTED, not asserted: TB-IR may
+            // lower more than v1, never less. v1 is the floor, not the
+            // ceiling — it is slated for deprecation, and holding TB-IR
+            // down to what v1's C++ happens to compile is what produced
+            // harc#662, where five refusals were added against shapes
+            // TB-IR builds correctly and a passing fixture broke
+            // unnoticed.
+            //
+            // The escape-hatch promise this used to police is a real
+            // rule, but it belongs to the arms above: it is broken when
+            // TB-IR REFUSES and points at `--codegen v1` that cannot
+            // build the program. TB-IR lowering it itself promises
+            // nothing about v1.
+            (TbVerdict::Lowers, V1Behaviour::EmitsUncompilable(_)) => {
+                ahead.push(sub.trim().to_string())
+            }
             // An OVER-refusal: v1 handles the program and TB-IR does
             // not. Not falsifiable per-landing (the label belongs to
             // the arm, whose worst landing may be genuinely bad), so
@@ -319,6 +332,15 @@ fn check_space_with_control(
                 gaps.push(sub.trim().to_string())
             }
             _ => {}
+        }
+    }
+    if !ahead.is_empty() {
+        table.push_str(&format!(
+            "  -- TB-IR handles these {} and v1 does not (TB-IR ahead, the allowed direction):\n",
+            ahead.len()
+        ));
+        for a in &ahead {
+            table.push_str(&format!("       {a}\n"));
         }
     }
     if !gaps.is_empty() {

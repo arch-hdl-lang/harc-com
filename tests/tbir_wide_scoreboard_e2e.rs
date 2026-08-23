@@ -129,10 +129,25 @@ end impl WideScoreboardTest
 "#;
 
 fn verilator_present() -> bool {
-    Command::new("verilator")
+    let present = Command::new("verilator")
         .arg("--version")
         .output()
-        .is_ok_and(|output| output.status.success())
+        .is_ok_and(|output| output.status.success());
+    // A skipped end-to-end test reports `ok`, and an `ok` in 0.00s for a
+    // test that builds a Verilator model is indistinguishable from a
+    // real pass in a CI log. harc#662: this file's test had been failing
+    // since harc#653 and CI called it green the whole time, because the
+    // `cargo test` job had no Verilator on PATH.
+    //
+    // CI now installs Verilator for that job AND sets this variable, so
+    // the skip can never silently come back — if the install step
+    // regresses, this fails loudly instead of passing instantly.
+    assert!(
+        present || std::env::var_os("HARC_REQUIRE_VERILATOR").is_none(),
+        "HARC_REQUIRE_VERILATOR is set but `verilator` is not on PATH: this \
+         end-to-end test would have skipped itself and reported success"
+    );
+    present
 }
 
 #[test]

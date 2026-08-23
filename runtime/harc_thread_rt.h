@@ -285,9 +285,27 @@ inline HarcWide<N> harc_wide_trunc(const HarcWide<M>& value, unsigned width) {
     return harc_wide_mask_bits(harc_wide_zext<N>(value), width);
 }
 
+// The starting value is the CONVERTING CONSTRUCTOR, not `harc_wide_zext`.
+//
+// `source_width` is the width the CALLER declares, and the C++ argument
+// is usually narrower than it: a source-level `-1` arrives as a 32-bit
+// `int` under `source_width = 64`. `harc_wide_zext` converts a signed T
+// through `make_unsigned_t<T>`, so `int(-1)` becomes 0x0000'0000'FFFF'FFFF
+// — correct zero-extension of a 32-bit source, but it leaves bit 63
+// CLEAR, so the sign probe below reads a negative value as positive and
+// skips the extension entirely. `sb.wide = -1` on a `uint<256>` field
+// then stored 2^32-1 instead of all-ones, silently.
+//
+// The constructor sign-extends a signed operand across every word, which
+// is exactly the raw two's-complement pattern this function must mask to
+// `source_width`. `harc_wide_zext` is still right for its own callers —
+// a function named "zero-extend" must not introduce sign bits (that is
+// what harc#653 fixed) — but sign-extension cannot be built on top of
+// it. The two were the same function until then, which is why splitting
+// them moved this bug here.
 template<std::size_t N, typename T>
 inline HarcWide<N> harc_wide_sext(T value, unsigned source_width, unsigned dest_width) {
-    HarcWide<N> out = harc_wide_zext<N>(value);
+    HarcWide<N> out = HarcWide<N>(value);
     out = harc_wide_mask_bits(out, source_width);
     if (source_width == 0 || dest_width == 0) return HarcWide<N>();
     const unsigned sign_bit = source_width - 1;

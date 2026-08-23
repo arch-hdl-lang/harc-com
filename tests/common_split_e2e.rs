@@ -24,11 +24,23 @@ fn harc_bin() -> PathBuf {
 }
 
 fn verilator_present() -> bool {
-    Command::new("verilator")
+    let present = Command::new("verilator")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // See the same guard in `tbir_wide_scoreboard_e2e.rs`. A skipped
+    // end-to-end test reports `ok`, and an `ok` in 0.00s for a test that
+    // builds a Verilator model reads exactly like a real pass in a CI
+    // log — which is how harc#662 hid a regression for weeks. CI
+    // installs Verilator for the `cargo test` job and sets this
+    // variable, so the silent skip cannot come back unnoticed.
+    assert!(
+        present || std::env::var_os("HARC_REQUIRE_VERILATOR").is_none(),
+        "HARC_REQUIRE_VERILATOR is set but `verilator` is not on PATH: this \
+         end-to-end test would have skipped itself and reported success"
+    );
+    present
 }
 
 fn fresh_outdir(tag: &str) -> PathBuf {
@@ -92,12 +104,7 @@ fn write_suite(dir: &Path, tb: &str) -> PathBuf {
 
 /// Run `harc sim --sv … --codegen v1 --cpp-split tests
 /// --cpp-split-layout common` and return (success, combined output).
-fn run_common_split(
-    tb: &Path,
-    sv: &Path,
-    outdir: &Path,
-    extra_args: &[&str],
-) -> (bool, String) {
+fn run_common_split(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(harc_bin());
     cmd.arg("sim")
         .arg(tb)
@@ -281,10 +288,16 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
         .next()
         .unwrap()
         .to_string();
-    assert!(runtime.contains(&format!("const char {anchor}[] =")), "common TU defines the anchor");
+    assert!(
+        runtime.contains(&format!("const char {anchor}[] =")),
+        "common TU defines the anchor"
+    );
     for t in ["T1Add", "T2Add", "T3Add"] {
         let capsule = fs::read_to_string(outdir.join(format!("tb__test_{t}.cpp"))).unwrap();
-        assert!(capsule.contains(&anchor), "{t} capsule references the ABI anchor");
+        assert!(
+            capsule.contains(&anchor),
+            "{t} capsule references the ABI anchor"
+        );
     }
 
     fs::remove_dir_all(&dir).ok();
@@ -359,7 +372,11 @@ fn seed_changes_nothing_on_disk() {
     );
     assert!(out.status.success(), "{text}");
     // 6 suite artifacts (manifest write is silent when unchanged).
-    assert_eq!(text.matches("(unchanged)").count(), 6, "expected all artifacts reused: {text}");
+    assert_eq!(
+        text.matches("(unchanged)").count(),
+        6,
+        "expected all artifacts reused: {text}"
+    );
     for (n, bytes) in snap_before {
         assert_eq!(bytes, fs::read(outdir.join(&n)).unwrap(), "{n}");
     }
@@ -385,8 +402,7 @@ fn common_layout_builds_links_and_dispatches() {
 
     // Every explicit selection passes against the same binary.
     for t in ["T1Add", "T2Add", "T3Add"] {
-        let (ok, msg) =
-            run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--test", t]);
+        let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--test", t]);
         assert!(ok, "{t} failed: {msg}");
         assert!(msg.contains("ALL TESTS PASSED"), "{t}: {msg}");
     }
@@ -394,7 +410,11 @@ fn common_layout_builds_links_and_dispatches() {
     // Unknown selection fails clearly without falling through to a
     // different test.
     let bin = outdir.join("obj_dir").join("VSplitAdder");
-    let unknown = Command::new(&bin).arg("--test").arg("NoSuch").output().unwrap();
+    let unknown = Command::new(&bin)
+        .arg("--test")
+        .arg("NoSuch")
+        .output()
+        .unwrap();
     assert!(!unknown.status.success());
     let text = String::from_utf8_lossy(&unknown.stderr);
     assert!(text.contains("unknown test: NoSuch"), "{text}");
@@ -435,7 +455,11 @@ fn common_layout_incremental_rewrites_only_required_artifacts() {
 
     // 1) Edit ONE test body → only that capsule changes.
     // Same-sum operand change: bytes must shift, verdict must not.
-    let edited = TB_THREE_TESTS.replacen("dut.a = 10\n        dut.b = 20", "dut.a = 12\n        dut.b = 18", 1);
+    let edited = TB_THREE_TESTS.replacen(
+        "dut.a = 10\n        dut.b = 20",
+        "dut.a = 12\n        dut.b = 18",
+        1,
+    );
     assert_ne!(edited, TB_THREE_TESTS);
     fs::write(&tb_path, &edited).unwrap();
     let (ok, msg) = run_common_split(&tb_path, &sv, &outdir, &[]);
@@ -445,12 +469,19 @@ fn common_layout_incremental_rewrites_only_required_artifacts() {
         if n == "tb__test_T2Add.cpp" {
             assert_ne!(before, &after, "{n} should have been rewritten");
         } else {
-            assert_eq!(before, &after, "{n} must stay byte-identical after a T2 edit");
+            assert_eq!(
+                before, &after,
+                "{n} must stay byte-identical after a T2 edit"
+            );
         }
     }
     // And the edited suite still passes end to end.
     let bin = outdir.join("obj_dir").join("VSplitAdder");
-    let run = Command::new(&bin).arg("--test").arg("T2Add").output().unwrap();
+    let run = Command::new(&bin)
+        .arg("--test")
+        .arg("T2Add")
+        .output()
+        .unwrap();
     assert!(run.status.success());
     // Restore baseline for the next mutation.
     fs::write(&tb_path, TB_THREE_TESTS).unwrap();
@@ -472,7 +503,11 @@ fn common_layout_incremental_rewrites_only_required_artifacts() {
         }
     }
     // New test dispatches from the same binary.
-    let run = Command::new(&bin).arg("--test").arg("A0First").output().unwrap();
+    let run = Command::new(&bin)
+        .arg("--test")
+        .arg("A0First")
+        .output()
+        .unwrap();
     assert!(run.status.success());
     // Restore baseline.
     fs::write(&tb_path, TB_THREE_TESTS).unwrap();
@@ -491,13 +526,24 @@ fn common_layout_incremental_rewrites_only_required_artifacts() {
     fs::write(&tb_path, &removed).unwrap();
     let (ok, msg) = run_common_split(&tb_path, &sv, &outdir, &[]);
     assert!(ok, "{msg}");
-    assert!(!outdir.join("tb__test_T3Add.cpp").exists(), "stale capsule must be cleaned up");
+    assert!(
+        !outdir.join("tb__test_T3Add.cpp").exists(),
+        "stale capsule must be cleaned up"
+    );
     let manifest = read("tb__artifacts.json");
     assert!(!manifest.contains("T3Add"));
     assert!(manifest.contains("T1Add"));
-    let run = Command::new(&bin).arg("--test").arg("T1Add").output().unwrap();
+    let run = Command::new(&bin)
+        .arg("--test")
+        .arg("T1Add")
+        .output()
+        .unwrap();
     assert!(run.status.success(), "remaining suite still runs");
-    let unknown = Command::new(&bin).arg("--test").arg("T3Add").output().unwrap();
+    let unknown = Command::new(&bin)
+        .arg("--test")
+        .arg("T3Add")
+        .output()
+        .unwrap();
     // The relinked binary no longer contains T3Add's descriptor or
     // object, so selection fails clearly instead of falling through.
     let text = String::from_utf8_lossy(&unknown.stderr);
@@ -574,7 +620,10 @@ end test TCompose
     assert_eq!(runtime.matches("uint64_t HarcSuiteGlue::inner(").count(), 1);
     assert_eq!(runtime.matches("uint64_t HarcSuiteGlue::outer(").count(), 1);
     assert_eq!(runtime.matches("void HarcSuiteGlue::Drv_send(").count(), 1);
-    assert_eq!(runtime.matches("void HarcSuiteGlue::Drv_watchdog(").count(), 1);
+    assert_eq!(
+        runtime.matches("void HarcSuiteGlue::Drv_watchdog(").count(),
+        1
+    );
     // `outer` calls `inner` WITHOUT a _glue prefix inside the member body.
     assert!(
         !runtime.contains("_glue.inner("),
@@ -599,7 +648,10 @@ end test TCompose
         !header.contains("VRegOp"),
         "record hook param must not render as a Verilator handle:\n{header}"
     );
-    assert!(header.contains("void Drv_send(Drv& self, RegOp t);"), "{header}");
+    assert!(
+        header.contains("void Drv_send(Drv& self, RegOp t);"),
+        "{header}"
+    );
 
     // The emit-only assertions above cannot catch a suite that emits
     // cleanly and then fails to compile, which is the failure mode this
@@ -745,7 +797,10 @@ end test TCells
         "harc_auto_cov_apply_point_preference(_auto_cov_plan",
     ] {
         if let Some(pos) = capsule.find(needle) {
-            let line_end = capsule[pos..].find('\n').map(|e| pos + e).unwrap_or(capsule.len());
+            let line_end = capsule[pos..]
+                .find('\n')
+                .map(|e| pos + e)
+                .unwrap_or(capsule.len());
             let line = &capsule[pos..line_end];
             assert!(
                 line.contains("ctx._cells."),
@@ -847,7 +902,12 @@ fn common_layout_dual_clock_builds_and_passes() {
     let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
     assert!(ok, "{msg}");
     for (p, t) in before {
-        assert_eq!(t, mtime(&p), "{} was recompiled on an unchanged rerun", p.display());
+        assert_eq!(
+            t,
+            mtime(&p),
+            "{} was recompiled on an unchanged rerun",
+            p.display()
+        );
     }
 
     fs::remove_dir_all(&dir).ok();
