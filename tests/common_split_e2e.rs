@@ -540,7 +540,7 @@ end function outer
 
 test TCompose
     let dut : SplitAdder
-    let drv : Drv = drv()
+    let drv : Drv active
     on drv.send pre
         log(info, "pre-send")
     end on
@@ -580,6 +580,219 @@ end test TCompose
     assert!(header.contains("Drv_watchdog_pre"));
     let capsule = fs::read_to_string(outdir.join("tb__test_TCompose.cpp")).unwrap();
     assert!(capsule.contains("_glue.Drv_send(drv") || capsule.contains("_glue.Drv_send("));
+
+    // A record-typed hook parameter must render with the SAME type in the
+    // header as in the definition. Rendering it through the free
+    // `c_type_for` yields `VRegOp*` — a Verilator DUT handle for a type
+    // that is not a DUT — and the suite stops compiling. Asserting on the
+    // text alone is not enough (that is exactly what this test used to
+    // do), so the build below is the real gate; this keeps the failure
+    // legible when it regresses.
+    assert!(
+        !header.contains("VRegOp"),
+        "record hook param must not render as a Verilator handle:\n{header}"
+    );
+    assert!(header.contains("void Drv_send(Drv& self, RegOp t);"), "{header}");
+
+    // The emit-only assertions above cannot catch a suite that emits
+    // cleanly and then fails to compile, which is the failure mode this
+    // whole layout is prone to. Build and run it.
+    if !verilator_present() {
+        eprintln!("skipping build half: verilator not on PATH");
+        fs::remove_dir_all(&dir).ok();
+        return;
+    }
+    let built = dir.join("built");
+    let (ok, msg) = run_common_split(&tb, &sv, &built, &[]);
+    assert!(ok, "compose suite failed to build/run: {msg}");
+    assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Bus-bound transactor hookables cannot become glue members: `bus.<ch>`
+/// resolves at codegen time against a PER-TEST bind, and the common TU is
+/// per-suite. They stay capsule-local (one copy per test) and must still
+/// build and run. Regression for the `use of undeclared identifier 'bus'`
+/// class.
+#[test]
+fn common_layout_bus_bound_hookables_stay_capsule_local() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("busbound");
+    let sv = dir.join("dut.sv");
+    fs::write(
+        &sv,
+        "module BusDut(input logic clk, input logic p_cmd_valid, output logic p_cmd_ready,\n\
+         input logic [7:0] p_cmd_addr, output logic [7:0] q);\n\
+         assign p_cmd_ready = 1'b1;\n\
+         always_ff @(posedge clk) if (p_cmd_valid) q <= p_cmd_addr + 8'd1;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let tb = dir.join("tb.harc");
+    fs::write(
+        &tb,
+        r#"bus PokeBus
+    handshake_channel cmd: send kind: valid_ready
+        addr: uint<8>
+    end handshake_channel cmd
+end bus PokeBus
+
+transactor Poker bound to PokeBus
+    when active
+        hookable poke(a: uint<8>)
+            bus.cmd.send(a)
+        end poke
+    end when
+end transactor Poker
+
+test TBusBound
+    let dut : BusDut
+    let p : PokeBus = bind dut
+    let drv : Poker active = bind p
+    run
+        drv.poke(7)
+        wait 2 cycles
+        assert dut.q == 8 else fail("bus-bound hookable drove nothing")
+    end run
+end test TBusBound
+"#,
+    )
+    .unwrap();
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
+    assert!(ok, "bus-bound suite failed: {msg}");
+    assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+
+    // The body must live in the capsule, resolved to concrete DUT ports —
+    // NOT in the shared runtime, where `bus` has no meaning.
+    let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
+    // (the runtime legitimately mentions `Poker_poke_pre`/`_post` — those
+    // registries stay on the per-run runtime. What must NOT exist is a
+    // shared DEFINITION of the callable itself.)
+    assert!(
+        !runtime.contains("HarcSuiteGlue::Poker_poke("),
+        "bus-bound hookable must not be promoted to the common TU:\n{runtime}"
+    );
+    let capsule = fs::read_to_string(outdir.join("tb__test_TBusBound.cpp")).unwrap();
+    assert!(capsule.contains("auto Poker_poke = [&]"), "{capsule}");
+    // ...and the capsule must call it WITHOUT the glue prefix.
+    assert!(!capsule.contains("_glue.Poker_poke"), "{capsule}");
+    // The bus path must have been resolved to a real DUT port.
+    assert!(capsule.contains("p_cmd_addr"), "{capsule}");
+    // Its hook registries still live on the runtime, so per-run ownership
+    // is unaffected by the capsule-local carve-out.
+    let header = fs::read_to_string(outdir.join("tb__suite_api.hpp")).unwrap();
+    assert!(header.contains("Poker_poke_pre"), "{header}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `randomize` state that used to be function-local statics (auto-coverage
+/// state, `[unique]` history) moved into the per-run `_cells` block. Every
+/// reader must follow — a single missed site is an undeclared identifier.
+#[test]
+fn common_layout_randomize_cells_are_fully_migrated() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("cells");
+    let sv = dir.join("dut.sv");
+    fs::write(&sv, ADDER_SV).unwrap();
+    let tb = dir.join("tb.harc");
+    fs::write(
+        &tb,
+        r#"transaction Stim
+    token : uint<2> with [unique within test]
+end transaction Stim
+
+test TCells
+    let dut : SplitAdder
+    run
+        let s : Stim
+        for i in 1 .. 6
+            randomize(s)
+            dut.a = s.token
+            dut.b = 1
+            wait 1 cycle
+        end for
+    end run
+end test TCells
+"#,
+    )
+    .unwrap();
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
+    assert!(ok, "randomize suite failed: {msg}");
+    assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+
+    let capsule = fs::read_to_string(outdir.join("tb__test_TCells.cpp")).unwrap();
+    // No reader may name a migrated cell without the `ctx._cells.` path.
+    for needle in [
+        "harc_unique_clear(_",
+        "harc_unique_remember(_",
+        "harc_auto_cov_apply_point_preference(_auto_cov_plan",
+    ] {
+        if let Some(pos) = capsule.find(needle) {
+            let line_end = capsule[pos..].find('\n').map(|e| pos + e).unwrap_or(capsule.len());
+            let line = &capsule[pos..line_end];
+            assert!(
+                line.contains("ctx._cells."),
+                "migrated cell referenced without the per-run path: {line}"
+            );
+        }
+    }
+    // No function-local statics survive in a capsule.
+    assert!(
+        !capsule.contains("static harc_rt::random::HarcUniqueHistory"),
+        "unique history must live on the per-run runtime:\n{capsule}"
+    );
+    assert!(
+        !capsule.contains("static harc_rt::random::HarcAutoCovState"),
+        "auto-cov state must live on the per-run runtime:\n{capsule}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `--waves` under the common layout must produce a real trace. The dump
+/// helpers are glue members reading `ctx.tfp`, so a run prologue that
+/// COPIES the tracer pointer instead of aliasing it leaves that member
+/// null and every dump silently no-ops — exit 0, header-only VCD.
+#[test]
+fn common_layout_waves_actually_dump() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("waves");
+    let sv = dir.join("dut.sv");
+    fs::write(
+        &sv,
+        "module WaveDut(input logic clk, input logic [7:0] d, output logic [7:0] q);\n         always_ff @(posedge clk) q <= d;\nendmodule\n",
+    )
+    .unwrap();
+    let tb = dir.join("tb.harc");
+    fs::write(
+        &tb,
+        "test TWave\n    let dut : WaveDut\n    run\n        dut.d = 5\n        wait 3 cycles\n        assert dut.q == 5\n    end run\nend test TWave\n",
+    )
+    .unwrap();
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &["--waves", "--wave-format", "vcd"]);
+    assert!(ok, "waves run failed: {msg}");
+
+    let vcd = fs::read_to_string(outdir.join("waves.vcd")).expect("waves.vcd");
+    let timestamps = vcd.lines().filter(|l| l.starts_with('#')).count();
+    assert!(
+        timestamps > 0,
+        "common-layout --waves produced a header-only VCD ({} bytes, 0 timestamps)",
+        vcd.len()
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

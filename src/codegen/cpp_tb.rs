@@ -1390,7 +1390,14 @@ pub fn emit_common_split(
         glue_callees.insert(t.name.name.clone());
     }
     let hook_regs = collect_hook_registries(prep.file, &prep.component_order);
+    // Bus-bound hookables resolve `bus.<ch>.<sig>` against per-test bind
+    // state the shared TU cannot see, so they are NOT glue members —
+    // each capsule emits its own copy (see `bus_bound_component_types`).
+    let bus_bound = bus_bound_component_types(prep.file);
     for reg in &hook_regs {
+        if bus_bound.contains(&reg.comp_ty) {
+            continue;
+        }
         if !reg.watchdog {
             glue_callees.insert(format!("{}_{}", reg.comp_ty, reg.method));
         } else {
@@ -1610,7 +1617,7 @@ pub fn emit_common_split(
             all_cells.push(cell);
         }
     }
-    emit_runtime_decls(&mut header, &prep, &all_cells, &hook_regs)?;
+    emit_runtime_decls(&mut header, &eh, &prep, &all_cells, &hook_regs)?;
     let iface_start = header
         .find("// === iface-begin ===")
         .map(|i| i + "// === iface-begin ===".len())
@@ -1674,6 +1681,7 @@ pub fn emit_common_split(
 /// hashed into the link-time ABI anchor.
 fn emit_runtime_decls(
     out: &mut String,
+    e: &Emitter,
     prep: &SuitePrep,
     cells: &[PerRunCell],
     hooks: &[HookRegistryDesc],
@@ -1733,7 +1741,7 @@ fn emit_runtime_decls(
         let arg_csv = if reg.watchdog {
             String::new()
         } else {
-            hook_registry_arg_csv(prep, reg)
+            hook_registry_arg_csv(e, prep, reg)
         };
         writeln!(
             o,
@@ -1800,7 +1808,7 @@ fn emit_runtime_decls(
         let arg_csv = if reg.watchdog {
             String::new()
         } else {
-            hook_registry_arg_csv(prep, reg)
+            hook_registry_arg_csv(e, prep, reg)
         };
         writeln!(
             o,
@@ -1852,6 +1860,7 @@ fn emit_runtime_decls(
         write_glue_params(&mut o, &t.params);
         writeln!(o, ");").ok();
     }
+    let bus_bound = bus_bound_component_types(prep.file);
     for reg in hooks {
         // One prototype per callable (see emit_shared_callables).
         if !reg.watchdog && !reg.pre {
@@ -1860,8 +1869,12 @@ fn emit_runtime_decls(
         if reg.watchdog {
             continue;
         }
-        let args = hook_registry_arg_csv(prep, reg);
-        let ret = hook_registry_ret_ty(prep, reg);
+        // Bus-bound hookables are capsule-local, not glue members.
+        if bus_bound.contains(&reg.comp_ty) {
+            continue;
+        }
+        let args = hook_registry_arg_csv(e, prep, reg);
+        let ret = hook_registry_ret_ty(e, prep, reg);
         writeln!(
             o,
             "{INDENT}{ret} {ty}_{m}({ty}& self{csv});",
@@ -1878,6 +1891,16 @@ fn emit_runtime_decls(
     }
     for reg in hooks {
         if !reg.watchdog {
+            continue;
+        }
+        // `collect_hook_registries` records one entry per SIDE (pre and
+        // post) for each watchdog, but there is only ONE callable. Without
+        // this the prototype is emitted twice and the header fails to
+        // compile with "class member cannot be redeclared".
+        if !reg.pre {
+            continue;
+        }
+        if bus_bound.contains(&reg.comp_ty) {
             continue;
         }
         writeln!(
@@ -1902,7 +1925,54 @@ fn emit_runtime_decls(
 }
 
 
-fn hook_registry_arg_csv(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
+/// Parameter list for one hook registry, rendered with the SAME type
+/// mapping `emit_component_method` uses for the definition
+/// (`c_type_for_param`). Going through the free `c_type_for` here
+/// instead renders a declared transaction/struct/enum as `V<Name>*` —
+/// a Verilator DUT handle that does not exist — so the header and the
+/// out-of-line definition disagree and the suite does not compile.
+/// Component / transactor types whose hookable bodies must stay
+/// capsule-local under the common layout.
+///
+/// `bus.<ch>.<sig>` never survives into C++: the emitter resolves it at
+/// codegen time into a concrete DUT port write (`dut->axil_aw_addr`)
+/// using the binding that `emit_component_method` installs from
+/// `driver_bus_for_hookables`. That table is PER-TEST — it is built in
+/// `emit_test_run` from this test's `let x : Drv = bind <bus>` — and the
+/// resolved port name embeds the test's own let-name as the signal
+/// prefix. A single shared definition in the per-SUITE common TU can
+/// therefore bake in only one test's binding, and two tests that name
+/// their bus binding differently would silently drive different DUT
+/// ports through the same shared body.
+///
+/// Rather than analyse cross-test agreement (whose failure mode is a
+/// silently wrong simulation, not a build error), these keep the legacy
+/// per-test `[&]` lambda emission — one copy per capsule. Their pre/post
+/// hook registries still live on the runtime, so per-run state ownership
+/// is unaffected; only the dedup is given up. The predicate is
+/// deliberately conservative: every hookable on a `bound to` decl stays
+/// local, not just the ones whose body happens to mention `bus`.
+fn bus_bound_component_types(file: &SourceFile) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for it in &file.items {
+        match it {
+            Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
+                if c.bound_to.is_some() {
+                    out.insert(c.name.name.clone());
+                }
+            }
+            Item::Transactor(t) => {
+                if t.bound_to.is_some() {
+                    out.insert(t.name.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn hook_registry_arg_csv(e: &Emitter, prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
     for &idx in &prep.component_order {
         match &prep.file.items[idx] {
             Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
@@ -1911,7 +1981,7 @@ fn hook_registry_arg_csv(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
                         if h.name.name == reg.method {
-                            return hook_param_csv(h);
+                            return hook_param_csv(e, h);
                         }
                     }
                 }
@@ -1921,7 +1991,7 @@ fn hook_registry_arg_csv(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
                 for ci in &synth.items {
                     if let ComponentItem::Hookable(h) = ci {
                         if h.name.name == reg.method {
-                            return hook_param_csv(&h);
+                            return hook_param_csv(e, &h);
                         }
                     }
                 }
@@ -1932,14 +2002,14 @@ fn hook_registry_arg_csv(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
     String::new()
 }
 
-fn hook_param_csv(h: &HookableMethod) -> String {
+fn hook_param_csv(e: &Emitter, h: &HookableMethod) -> String {
     let names = cpp_param_names(&h.params);
     let mut parts = Vec::new();
     for (i, p) in h.params.iter().enumerate() {
         let pty = p
             .ty
             .as_ref()
-            .map(c_type_for)
+            .map(|t| e.c_type_for_param(t))
             .unwrap_or_else(|| "int64_t".to_string());
         parts.push(format!("{pty} {}", names[i]));
     }
@@ -1947,7 +2017,10 @@ fn hook_param_csv(h: &HookableMethod) -> String {
 }
 
 
-fn hook_registry_ret_ty(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
+/// Return type for one hookable, matching `emit_component_method`'s
+/// `c_type_for_value` (see `hook_registry_arg_csv` for why the free
+/// `c_type_for` is wrong here).
+fn hook_registry_ret_ty(e: &Emitter, prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
     for &idx in &prep.component_order {
         match &prep.file.items[idx] {
             Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c)
@@ -1959,7 +2032,7 @@ fn hook_registry_ret_ty(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
                             return h
                                 .return_ty
                                 .as_ref()
-                                .map(c_type_for)
+                                .map(|t| e.c_type_for_value(t))
                                 .unwrap_or_else(|| "void".to_string());
                         }
                     }
@@ -1973,7 +2046,7 @@ fn hook_registry_ret_ty(prep: &SuitePrep, reg: &HookRegistryDesc) -> String {
                             return h
                                 .return_ty
                                 .as_ref()
-                                .map(c_type_for)
+                                .map(|t| e.c_type_for_value(t))
                                 .unwrap_or_else(|| "void".to_string());
                         }
                     }
@@ -2011,15 +2084,20 @@ fn emit_glue_definitions(e: &mut Emitter, prep: &SuitePrep) -> Result<(), EmitEr
     // Reference bindings mirror the legacy prologue aliases exactly.
     // Per-hook registries are reference members too — C++ requires
     // them in every initializer list.
-    let mut init_list = String::from(
-        ": ctx(r), dut(r.dut), harc_rng(r.rng), cycle_count(r.cycle_count), errors(r.errors),",
-    );
-    for reg in &hooks {
-        init_list.push_str(&format!("
-{INDENT}{INDENT}{}(r.{}),", reg.vector(), reg.vector()));
-    }
+    // Mem-initializer order MUST match the member declaration order in
+    // `emit_runtime_decls` (ctx, dut, harc_rng, cycle_count, errors,
+    // _fatal, _trace_time, [tfp, _wave_path], trace, log_ctx, _checkers,
+    // _post_eval_services, _auto_cov_reports, then the hook registries).
+    // These are all reference members bound to already-live
+    // `HarcSuiteRuntime` fields so the order cannot change behaviour, but
+    // a mismatch is a `-Wreorder` diagnostic on every hook-bearing suite
+    // and a hard error under `-Werror`.
     writeln!(o, "HarcSuiteGlue::HarcSuiteGlue(HarcSuiteRuntime& r)").ok();
-    writeln!(o, "{INDENT}{init_list}").ok();
+    writeln!(
+        o,
+        "{INDENT}: ctx(r), dut(r.dut), harc_rng(r.rng), cycle_count(r.cycle_count), errors(r.errors),"
+    )
+    .ok();
     writeln!(
         o,
         "{INDENT}{INDENT}_fatal(r._fatal), _trace_time(r._trace_time),"
@@ -2031,11 +2109,25 @@ fn emit_glue_definitions(e: &mut Emitter, prep: &SuitePrep) -> Result<(), EmitEr
     writeln!(o, "{INDENT}{INDENT}trace(r.trace), log_ctx(r.log_ctx),").ok();
     writeln!(o, "{INDENT}{INDENT}_checkers(r._checkers),").ok();
     writeln!(o, "{INDENT}{INDENT}_post_eval_services(r._post_eval_services),").ok();
-    writeln!(
-        o,
-        "{INDENT}{INDENT}_auto_cov_reports(r._auto_cov_reports) {{ harc_rt_current_run = &r; }}"
-    )
-    .ok();
+    let ctor_body = "{ harc_rt_current_run = &r; }";
+    if hooks.is_empty() {
+        writeln!(
+            o,
+            "{INDENT}{INDENT}_auto_cov_reports(r._auto_cov_reports) {ctor_body}"
+        )
+        .ok();
+    } else {
+        writeln!(o, "{INDENT}{INDENT}_auto_cov_reports(r._auto_cov_reports),").ok();
+        for (i, reg) in hooks.iter().enumerate() {
+            let v = reg.vector();
+            let tail = if i + 1 == hooks.len() {
+                format!(" {ctor_body}")
+            } else {
+                ",".to_string()
+            };
+            writeln!(o, "{INDENT}{INDENT}{v}(r.{v}){tail}").ok();
+        }
+    }
     writeln!(o, "").ok();
     writeln!(
         o,
@@ -2184,10 +2276,15 @@ fn emit_shared_callables(e: &mut Emitter, prep: &SuitePrep) -> Result<(), EmitEr
         e.emit_tseq(t, 0);
     }
     let hooks = collect_hook_registries(prep.file, &prep.component_order);
+    let bus_bound = bus_bound_component_types(prep.file);
     for reg in &hooks {
         // Registries carry one entry per side (pre/post); the callable
         // itself is emitted once — on the `pre` entry.
         if !reg.pre {
+            continue;
+        }
+        // Bus-bound hookables stay capsule-local.
+        if bus_bound.contains(&reg.comp_ty) {
             continue;
         }
         if !reg.watchdog {
@@ -6862,10 +6959,19 @@ impl Emitter {
         };
         self.pad(depth);
         if let Some(sink) = self.resolve_connect_hookable_sink(owner, instance, &to) {
+            // Same glue-member rule as a direct call site: a capsule can
+            // only reach a shared callable through `_glue.`.
+            let glue = if self.flavor == Flavor::Capsule
+                && self.is_glue_member(&format!("{}_{}", sink.comp_ty, sink.method))
+            {
+                "_glue."
+            } else {
+                ""
+            };
             writeln!(
                 self.out,
-                "{}.{}.push_back([&](auto _t) {{ {}_{}({}, _t); }});",
-                instance, from, sink.comp_ty, sink.method, sink.instance,
+                "{}.{}.push_back([&](auto _t) {{ {}{}_{}({}, _t); }});",
+                instance, from, glue, sink.comp_ty, sink.method, sink.instance,
             )
             .ok();
         } else {
@@ -11499,9 +11605,10 @@ impl Emitter {
             .unwrap_or_else(|| "void".to_string());
         self.pad(depth);
         // Common layout: out-of-line member of the per-run glue object
-        // (defined once in the common TU). Legacy: `[&]` lambda inside
+        // (defined once in the common TU). Legacy — and bus-bound
+        // hookables under the common layout — emit a `[&]` lambda inside
         // `run_<Test>`. The body machinery below is shared verbatim.
-        let common_member = self.flavor != Flavor::Legacy;
+        let common_member = self.is_glue_member(&format!("{comp_ty}_{m_name}"));
         if common_member {
             write!(
                 self.out,
@@ -11729,7 +11836,7 @@ impl Emitter {
         // shape of `emit_component_method` so the hookable-dispatch
         // path (`<Type>_<method>(obj, args)`) finds the same symbol.
         self.pad(depth);
-        let common_member = self.flavor != Flavor::Legacy;
+        let common_member = self.is_glue_member(&format!("{comp_ty}_watchdog"));
         if common_member {
             writeln!(
                 self.out,
@@ -11878,7 +11985,11 @@ impl Emitter {
         self.pad(depth + 2);
         writeln!(self.out, "{wdog_last} = (int64_t)cycle_count;").ok();
         self.pad(depth + 2);
-        let glue = if self.flavor == Flavor::Capsule { "_glue." } else { "" };
+        let glue = if self.is_glue_member(&format!("{comp_ty}_watchdog")) {
+            "_glue."
+        } else {
+            ""
+        };
         writeln!(self.out, "{glue}{comp_ty}_watchdog({instance});").ok();
         self.pad(depth + 1);
         writeln!(self.out, "}}").ok();
@@ -14512,9 +14623,7 @@ impl Emitter {
             let c_name = c_ident(&f.name);
             let scope = c_scope_ident(field_attr_unique_scope(f));
             let value_ty = txn_field_solver_c_type(f);
-            let cell_name = format!("{cache_tag}_unique_{scope}_{}", c_name.clone());
-            let unique_cell =
-                self.per_run_cell(cell_name, &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"), None);
+            let unique_cell = self.unique_history_ref(&cache_tag, &scope, &c_name, &value_ty);
             if self.flavor == Flavor::Legacy {
                 self.pad(depth + 1);
                 writeln!(
@@ -14636,11 +14745,7 @@ impl Emitter {
                 auto_crosses.len()
             )
             .ok();
-            let cov_state_cell = self.per_run_cell(
-                format!("_auto_cov_state_{cache_tag}"),
-                "harc_rt::random::HarcAutoCovState",
-                None,
-            );
+            let cov_state_cell = self.auto_cov_state_ref(&cache_tag);
             if self.flavor == Flavor::Legacy {
                 self.pad(depth + 1);
                 writeln!(
@@ -14780,10 +14885,11 @@ impl Emitter {
                 auto_value_initializer(&b.values)
             )
             .ok();
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_apply_cross_preference(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _pref_{cache_tag}_{}, _pref_{cache_tag}_{});",
+                "harc_rt::random::harc_auto_cov_apply_cross_preference(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _auto_cross_vals_{cache_tag}_{}__{}_{}, _pref_{cache_tag}_{}, _pref_{cache_tag}_{});",
                 a.c_field,
                 b.c_field,
                 a.c_field,
@@ -14796,6 +14902,7 @@ impl Emitter {
             .ok();
         }
         for (group, goal) in auto_goals.iter().enumerate() {
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
             self.pad(depth + 1);
             let value_ty = auto_value_array_type(goal, &field_info);
             writeln!(
@@ -14809,7 +14916,7 @@ impl Emitter {
             self.pad(depth + 1);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_auto_cov_apply_point_preference(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group}, _auto_point_vals_{cache_tag}_{}, _pref_{cache_tag}_{});",
+                "harc_rt::random::harc_auto_cov_apply_point_preference(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group}, _auto_point_vals_{cache_tag}_{}, _pref_{cache_tag}_{});",
                 goal.c_field, goal.c_field
             )
             .ok();
@@ -14834,11 +14941,7 @@ impl Emitter {
             self.pad(depth + 1);
             let v_expr = solver_bv_value_call("_v", f.signed, f.width, solver_width);
             let value_ty = txn_field_solver_c_type(f);
-            let unique_use = self.per_run_cell(
-                format!("{cache_tag}_unique_{scope}_{}", c_name.clone()),
-                &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"),
-                None,
-            );
+            let unique_use = self.unique_history_ref(&cache_tag, &scope, &c_name, &value_ty);
             let scope_txt = escape_c(field_attr_unique_scope(f));
             writeln!(
                 self.out,
@@ -14877,11 +14980,12 @@ impl Emitter {
         )
         .ok();
         if !auto_goals.is_empty() {
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
             for (group, (_a, _b)) in auto_crosses.iter().enumerate() {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group});"
+                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group});"
                 )
                 .ok();
             }
@@ -14889,7 +14993,7 @@ impl Emitter {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, _auto_cov_selection_{cache_tag}, {group});"
+                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group});"
                 )
                 .ok();
             }
@@ -14939,11 +15043,7 @@ impl Emitter {
                 let scope = c_scope_ident(field_attr_unique_scope(other));
                 let v_expr = solver_bv_value_call("_v", other.signed, other.width, solver_width);
                 let value_ty = txn_field_solver_c_type(other);
-                let unique_use = self.per_run_cell(
-                    format!("{cache_tag}_unique_{scope}_{}", c_name.clone()),
-                    &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"),
-                    None,
-                );
+                let unique_use = self.unique_history_ref(&cache_tag, &scope, &c_name, &value_ty);
                 self.pad(depth + 3);
                 writeln!(
                     self.out,
@@ -14958,10 +15058,16 @@ impl Emitter {
             writeln!(self.out, "_r = _s.check();").ok();
             self.pad(depth + 3);
             writeln!(self.out, "if (_r == z3::sat) {{").ok();
+            let candidate_cell = self.unique_history_ref(
+                &cache_tag,
+                &candidate_scope,
+                &candidate_name,
+                &txn_field_solver_c_type(candidate),
+            );
             self.pad(depth + 4);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_unique_clear({cache_tag}_unique_{candidate_scope}_{candidate_name});"
+                "harc_rt::random::harc_unique_clear({candidate_cell});"
             )
             .ok();
             self.pad(depth + 4);
@@ -14983,11 +15089,16 @@ impl Emitter {
         {
             let c_name = c_ident(&f.name);
             let scope = c_scope_ident(field_attr_unique_scope(f));
+            let cell = self.unique_history_ref(
+                &cache_tag,
+                &scope,
+                &c_name,
+                &txn_field_solver_c_type(f),
+            );
             self.pad(depth + 3);
             writeln!(
                 self.out,
-                "harc_rt::random::harc_unique_clear({cache_tag}_unique_{scope}_{});",
-                c_name
+                "harc_rt::random::harc_unique_clear({cell});"
             )
             .ok();
         }
@@ -15217,11 +15328,17 @@ impl Emitter {
             if !pinned.contains(&f.name) {
                 if f.when_guard.is_none() && unique_fields.contains(&f.name) {
                     let scope = c_scope_ident(field_attr_unique_scope(f));
+                    let cell = self.unique_history_ref(
+                        &cache_tag,
+                        &scope,
+                        &c_name,
+                        &txn_field_solver_c_type(f),
+                    );
                     self.pad(scalar_depth);
                     writeln!(
                         self.out,
-                        "harc_rt::random::harc_unique_remember({cache_tag}_unique_{scope}_{}, _val_{});",
-                        c_name, c_name
+                        "harc_rt::random::harc_unique_remember({cell}, _val_{});",
+                        c_name
                     )
                     .ok();
                 }
@@ -15232,23 +15349,25 @@ impl Emitter {
             }
         }
         for (group, goal) in auto_goals.iter().enumerate() {
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
             for (idx, value) in goal.values.iter().enumerate() {
                 self.pad(depth + 2);
                 writeln!(
                     self.out,
-                    "harc_rt::random::harc_auto_cov_mark_value_hit(_val_{}, {}, _auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, {}, {});",
+                    "harc_rt::random::harc_auto_cov_mark_value_hit(_val_{}, {}, _auto_cov_plan_{cache_tag}, {cov_state}, {}, {});",
                     goal.c_field, value.c_expr, group, idx
                 )
                 .ok();
             }
         }
         for (group, (a, b)) in auto_crosses.iter().enumerate() {
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
             for (i, av) in a.values.iter().enumerate() {
                 for (j, bv) in b.values.iter().enumerate() {
                     self.pad(depth + 2);
                     writeln!(
                         self.out,
-                        "harc_rt::random::harc_auto_cov_mark_cross_hit(_val_{}, {}, _val_{}, {}, _auto_cov_plan_{cache_tag}, _auto_cov_state_{cache_tag}, {}, {}, {});",
+                        "harc_rt::random::harc_auto_cov_mark_cross_hit(_val_{}, {}, _val_{}, {}, _auto_cov_plan_{cache_tag}, {cov_state}, {}, {}, {});",
                         a.c_field, av.c_expr, b.c_field, bv.c_expr, group, i, j
                     )
                     .ok();
@@ -16955,11 +17074,6 @@ impl Emitter {
     /// scenario coroutine, the drive loop, and the epilogue. Shared by
     /// the legacy single-TU backend and the common-object capsule
     /// emitter so both produce identical run bodies.
-    /// True when emitting a common-layout artifact (glue TU or capsule).
-    fn in_common_layout(&self) -> bool {
-        self.flavor != Flavor::Legacy
-    }
-
     /// Register (or look up) a per-run mutable cell named `tag` and
     /// return the C++ lvalue every use must go through.
     ///
@@ -16982,6 +17096,44 @@ impl Emitter {
             });
         }
         format!("ctx._cells.{tag}")
+    }
+
+    /// Whether `name` is emitted as a member of the per-run glue object
+    /// (common TU) rather than as a run-scope `[&]` lambda. Under the
+    /// legacy layout nothing is a glue member; under the common layout
+    /// everything is EXCEPT the bus-bound hookables, which stay
+    /// capsule-local (see `bus_bound_component_types`). Declaration form
+    /// and call-site spelling must both consult this — a callable
+    /// declared one way and called the other does not link.
+    fn is_glue_member(&self, name: &str) -> bool {
+        self.flavor != Flavor::Legacy && self.glue_callees.contains(name)
+    }
+
+    /// Reference to the auto-coverage state cell for `cache_tag`.
+    /// Legacy yields the function-local static's name; the common
+    /// layout yields the per-run `ctx._cells` slot. EVERY reader must
+    /// go through this: the declaration and its use sites live in
+    /// different emitter methods, so a bare `_auto_cov_state_<tag>`
+    /// left behind in one of them is an undeclared identifier the
+    /// moment the static stops being emitted.
+    fn auto_cov_state_ref(&mut self, cache_tag: &str) -> String {
+        self.per_run_cell(
+            format!("_auto_cov_state_{cache_tag}"),
+            "harc_rt::random::HarcAutoCovState",
+            None,
+        )
+    }
+
+    /// Reference to the `[unique]` history cell for one field. Same
+    /// contract as `auto_cov_state_ref` — the constraint-add, clear and
+    /// remember sites are in three different methods and must all name
+    /// the cell through here.
+    fn unique_history_ref(&mut self, cache_tag: &str, scope: &str, c_name: &str, value_ty: &str) -> String {
+        self.per_run_cell(
+            format!("{cache_tag}_unique_{scope}_{c_name}"),
+            &format!("harc_rt::random::HarcUniqueHistory<{value_ty}>"),
+            None,
+        )
     }
 
     /// Bind the historical trace-dump helper names to their glue
@@ -17703,7 +17855,20 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
     writeln!(self.out, "{INDENT}ctx.dut = new V{dut_type};").ok();
     writeln!(self.out, "{INDENT}auto* dut = ctx.dut;").ok();
     writeln!(self.out, "#if HARC_TRACE_ENABLED").ok();
-    writeln!(self.out, "{INDENT}auto* tfp = ctx.tfp;").ok();
+    if self.flavor == Flavor::Legacy {
+        // Legacy keeps the historical COPY: every consumer of `tfp` in
+        // this layout is a `[&]` lambda in this same scope, so they all
+        // see the local, and the byte stream must not change.
+        writeln!(self.out, "{INDENT}auto* tfp = ctx.tfp;").ok();
+    } else {
+        // Common layout: the dump helpers are glue members reading
+        // `ctx.tfp`. A copy here would leave that member null forever and
+        // `harc_dump_wave_trace` silently no-ops on a null tracer — a
+        // `--waves` run would emit a header-only VCD with no value
+        // changes and still exit 0. Alias the runtime slot instead so the
+        // `tfp = new HarcTraceC` below publishes it to the glue.
+        writeln!(self.out, "{INDENT}auto& tfp = ctx.tfp;").ok();
+    }
     writeln!(self.out, "{INDENT}auto& _wave_path = ctx._wave_path;").ok();
     writeln!(self.out, "#endif").ok();
     writeln!(self.out, "{INDENT}auto& _trace_time = ctx._trace_time;").ok();
@@ -18312,22 +18477,26 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
     // a transactor whose field type appears later in the file
     // (issue #301); the topo sort guarantees the callee's
     // lambda is in scope at the caller's capture.
+    // Under the common layout most bodies are glue members in the common
+    // TU and are skipped here; the bus-bound ones are NOT glue members
+    // and still emit locally, one copy per capsule, exactly as legacy
+    // does (see `bus_bound_component_types`). `is_glue_member` is the
+    // single predicate both this site and the call sites consult.
     for &idx in component_order.iter() {
-        if self.flavor != Flavor::Legacy {
-            // Common layout: method/watchdog bodies are glue members in
-            // the common TU. The bus-binding pre-scans above still run —
-            // `emit_let` reuses their results when instantiating bound
-            // drivers inside this capsule.
-            break;
-        }
         match &file.items[idx] {
             Item::Agent(c) | Item::Env(c) | Item::Sequencer(c) | Item::Scoreboard(c) => {
                 for ci in &c.items {
                     if let ComponentItem::Hookable(h) = ci {
+                        if self.is_glue_member(&format!("{}_{}", c.name.name, h.name.name)) {
+                            continue;
+                        }
                         self.emit_component_method(c, h, 1);
                         emitted_any_method = true;
                     }
                     if let ComponentItem::Watchdog(w) = ci {
+                        if self.is_glue_member(&format!("{}_watchdog", c.name.name)) {
+                            continue;
+                        }
                         self.emit_watchdog(c, w, 1);
                         emitted_any_method = true;
                     }
@@ -18341,10 +18510,16 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                 let synth = synth_component_from_transactor(t, /*include_active*/ true);
                 for ci in &synth.items {
                     if let ComponentItem::Hookable(h) = ci {
+                        if self.is_glue_member(&format!("{}_{}", synth.name.name, h.name.name)) {
+                            continue;
+                        }
                         self.emit_component_method(&synth, h, 1);
                         emitted_any_method = true;
                     }
                     if let ComponentItem::Watchdog(w) = ci {
+                        if self.is_glue_member(&format!("{}_watchdog", synth.name.name)) {
+                            continue;
+                        }
                         self.emit_watchdog(&synth, w, 1);
                         emitted_any_method = true;
                     }
@@ -21419,9 +21594,18 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                             return;
                         }
                     }
-                    // Prefix only from capsules: inside common-TU member
-                    // bodies the callee resolves as a sibling member.
-                    let glue = if self.flavor == Flavor::Capsule { "_glue." } else { "" };
+                    // Prefix only from capsules, and only for callables
+                    // that actually became glue members: inside common-TU
+                    // member bodies the callee resolves as a sibling
+                    // member, and a capsule-local (bus-bound) hookable is
+                    // a plain lambda in this same scope.
+                    let glue = if self.flavor == Flavor::Capsule
+                        && self.is_glue_member(&format!("{comp_ty}_{method}"))
+                    {
+                        "_glue."
+                    } else {
+                        ""
+                    };
                     write!(self.out, "{glue}{comp_ty}_{method}({instance}").ok();
                     for a in args.iter() {
                         write!(self.out, ", ").ok();
