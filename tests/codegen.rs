@@ -10708,3 +10708,152 @@ end test T"#,
         "expected the wrap-width diagnostic; got: {err}"
     );
 }
+
+/// A `let` that names a transactor and carries an initializer is not one
+/// of the instantiation forms (`active` / `passive`, plus `= bind <bus>`
+/// for a `bound to` transactor). It used to reach the generic
+/// initialized-local path, where `c_type_for`'s `TypeExpr::Named` arm
+/// means "Verilator DUT handle" and produced `VDrv* drv = drv();` — a
+/// handle type for something that is not a DUT. The failure surfaced as
+/// clang's `unknown type name 'VDrv'` against a generated line, with
+/// nothing tying it back to the `let`.
+///
+/// `drv()` is deliberately not a declared function: the point is that
+/// the initializer was never validated as a callable either, so this is
+/// the exact source that shipped the broken C++.
+#[test]
+fn transactor_let_with_an_initializer_is_rejected_with_the_supported_forms() {
+    let err = v1_emit_err(
+        r#"transaction RegOp
+    addr : uint<8>
+end transaction RegOp
+
+bus BusLite
+    handshake_channel w: send kind: valid_ready
+        addr : uint<8>
+    end handshake_channel w
+end bus BusLite
+
+transactor Drv bound to BusLite
+    when active
+        req : in event<RegOp>
+        on req(t)
+            bus.w.send(t.addr)
+        end on
+    end when
+end transactor Drv
+
+test BadXactorInstantiationTest
+    let dut : DummyDut
+    let axil : BusLite = bind dut
+    let drv : Drv = drv()
+    run
+        wait 1 cycle
+    end run
+end test BadXactorInstantiationTest"#,
+    );
+    assert!(
+        err.contains("transactor `Drv` has no value form"),
+        "expected the instantiation-form diagnostic to name the transactor; got: {err}"
+    );
+    assert!(
+        err.contains("`let <name> : Drv active = bind <bus-binding>`")
+            && err.contains("`let <name> : Drv passive = bind <bus-binding>`"),
+        "the diagnostic must name the supported forms for a `bound to` transactor; got: {err}"
+    );
+}
+
+/// The same guard for an unbound transactor names the two mode forms and
+/// does NOT suggest `= bind`, which has no bus to bind to.
+#[test]
+fn unbound_transactor_let_with_an_initializer_names_only_the_mode_forms() {
+    let err = v1_emit_err(
+        r#"transactor Helper
+    n : uint<8>
+end transactor Helper
+
+test BadUnboundXactorTest
+    let dut : DummyDut
+    let h : Helper = mk()
+    run
+        wait 1 cycle
+    end run
+end test BadUnboundXactorTest"#,
+    );
+    assert!(
+        err.contains("transactor `Helper` has no value form")
+            && err.contains("`let <name> : Helper active` or `let <name> : Helper passive`"),
+        "expected the unbound-transactor mode forms; got: {err}"
+    );
+    assert!(
+        !err.contains("bind <bus-binding>"),
+        "an unbound transactor has no bus to bind — the hint must not suggest it; got: {err}"
+    );
+}
+
+/// Same root cause, same guard: a composite component instance with an
+/// initializer also has no value form. Covered here because the fix is
+/// one rule over the instantiation-only families, not a transactor
+/// special case — a regression that re-narrowed it to transactors would
+/// otherwise go unnoticed.
+#[test]
+fn component_let_with_an_initializer_is_rejected() {
+    let err = v1_emit_err(
+        r#"agent Ag
+    n : uint<8>
+end agent Ag
+
+test BadComponentInstantiationTest
+    let dut : DummyDut
+    let a : Ag = mk()
+    run
+        wait 1 cycle
+    end run
+end test BadComponentInstantiationTest"#,
+    );
+    assert!(
+        err.contains("agent `Ag` has no value form") && err.contains("`let <name> : Ag`"),
+        "expected the component instantiation diagnostic; got: {err}"
+    );
+}
+
+/// The guard must not swallow the legal forms. A record-typed copy is a
+/// value, not an instantiation, and the DUT handle type keeps its
+/// `V<Name>*` mapping — the two things `instantiation_only_forms`
+/// returns `None` for.
+#[test]
+fn record_copies_and_transactor_mode_forms_still_emit() {
+    let parsed = parse_source(
+        r#"transaction Txn
+    v : uint<8>
+end transaction Txn
+
+transactor Helper
+    n : uint<8>
+end transactor Helper
+
+test GoodInstantiationTest
+    let dut : DummyDut
+    let h : Helper passive
+    run
+        let t1 : Txn
+        let t2 : Txn = t1
+        log(info, "${t2.v}")
+    end run
+end test GoodInstantiationTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("Txn t2 = t1;"),
+        "a record-typed copy must keep its by-value C++ type; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Helper h;"),
+        "a mode-annotated transactor let must still default-construct; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("VTxn*") && !cpp.contains("VHelper*"),
+        "no HARC-declared type may lower to a Verilator handle; got:\n{cpp}"
+    );
+}

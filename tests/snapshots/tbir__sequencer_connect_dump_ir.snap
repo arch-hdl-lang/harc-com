@@ -9,8 +9,8 @@ tb-ir program
     field dispatched : out event<uint>
     method dispatch(1 arg) = fn0
   component c1 SeqSb (scoreboard)
-    field count : scalar = 0
-    field sum : scalar = 0
+    field count : uint<32> = 0
+    field sum : uint<32> = 0
     method sink(1 arg) = fn1
   component c2 SeqEnv (env)
     field sqr : sub c0

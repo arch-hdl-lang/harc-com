@@ -9,7 +9,7 @@ tb-ir program
     tag : uint<8>
   component c0 Producer (agent)
     field in_ev : out event<TinyTxn>
-    field seen : scalar = 0
+    field seen : uint<32> = 0
     watchdog period 500 max_idle 1000 = fn1
 
 fn fn0 comp_on_0 [kind=ComponentMethod(c0)]

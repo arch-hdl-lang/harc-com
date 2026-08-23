@@ -12,14 +12,14 @@ tb-ir program
     stamp : uint<32>
   component c0 LifecycleMonitor (transactor)
     field seen : out event<uint>
-    field starts : scalar = 0
-    field stops : scalar = 0
+    field starts : uint<32> = 0
+    field stops : uint<32> = 0
     field history : queue<LifeRec>
     method note_start(1 arg) = fn0
     method note_stop(1 arg) = fn1
   component c1 LifeSink (scoreboard)
-    field count : scalar = 0
-    field last : scalar = 0
+    field count : uint<32> = 0
+    field last : uint<8> = 0
     method accept(1 arg) = fn2
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]

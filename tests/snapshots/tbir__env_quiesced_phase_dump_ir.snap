@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 1607
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -10,7 +9,7 @@ tb-ir program
     tag : uint<8>
   component c0 Producer (agent)
     field in_ev : out event<TinyTxn>
-    field seen : scalar = 0
+    field seen : uint<32> = 0
   component c1 HeartbeatEnv (env)
     field prod : sub c0
     field sb : sub scoreboard sb0

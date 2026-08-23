@@ -3749,14 +3749,80 @@ impl Checker<'_> {
                 Stmt::ComponentFieldWrite { base, field, value } => {
                     // Component host state — the value follows the
                     // no-inline-port rule like any Assign value.
+                    //
+                    // `component_field_vec_shape` already reports an
+                    // unresolvable base, a missing field, and a field
+                    // kind that cannot take this write (a scalar with a
+                    // subfield, a `Vec` against a non-`Vec` value); it
+                    // surfaces them through the `Err` arm of the call
+                    // below.
                     let dst_shape = self.component_field_vec_shape(base, field);
+                    // `dst_ty` feeds #661's whole-collection shape
+                    // (a scalar record list is a collection the raw vec
+                    // shape cannot see). Computed before the call so
+                    // the scalar-type check below can still ask whether
+                    // this destination is a plain, non-collection slot.
                     let dst_ty = self.component_field_type(base, field);
+                    let non_vec_dest = matches!(dst_shape, Ok(None));
                     self.check_whole_vec_write_value(
                         dst_shape,
-                        dst_ty,
+                        dst_ty.clone(),
                         value,
                         "ComponentFieldWrite value",
                     );
+                    // What none of that covered: the destination's
+                    // TYPE. A `uint<129>` written into a `uint<65>`
+                    // field passed the verifier untouched, and both
+                    // sides are `_harc_u128` in C++, so nothing
+                    // downstream objected either. Lowering rejects it
+                    // now (harc#642/#656); this is the IR-level
+                    // backstop, so a future lowering path that skips
+                    // that check cannot emit the truncation silently.
+                    //
+                    // Gated on a NON-VEC destination:
+                    // `component_field_type` answers a fixed vector
+                    // with its ELEMENT type, and a whole-`Vec` copy is
+                    // not an element assignment. The collection shapes
+                    // are the call above's business.
+                    //
+                    // Bounded to a destination past 64 bits, because
+                    // LOWERING is. A verifier is a backstop for the
+                    // lowering rule, not a second, stricter opinion:
+                    // judging `uint<32>` into a `uint<8>` field here
+                    // turned a program lowering deliberately accepts
+                    // into `internal error: TB-IR failed verification
+                    // after lowering`, which is strictly worse than the
+                    // silent truncation it replaced — an internal error
+                    // for source `harc check` accepts. Measured, not
+                    // reasoned: that is what the first version of this
+                    // arm did.
+                    //
+                    // The <=64-bit half is blocked on #658 (an
+                    // `on ev(t)` payload param is widthless, so
+                    // `seen + t` manufactures a 64-bit width). When
+                    // that lands and lowering widens its bound, this
+                    // one widens with it — the two must move together.
+                    let wide_dest = matches!(
+                        dst_ty,
+                        Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if w > 64
+                    );
+                    if non_vec_dest && wide_dest {
+                        if let (Some(expected), Some(actual)) =
+                            (dst_ty, self.aggregate_assignment_expr_type(value))
+                        {
+                            if self.contains_invalid_record_composition(value)
+                                || !aggregate_assignment_compatible(&expected, &actual)
+                            {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} writes {:?} into component field \
+                                         `{field}` declared {:?}",
+                                        self.fid.0, self.bid.0, actual, expected
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
                 Stmt::ComponentVecElementWrite {
                     base,
