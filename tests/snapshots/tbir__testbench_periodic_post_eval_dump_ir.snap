@@ -12,8 +12,8 @@ tb-ir program
     field samples : queue<Sample>
     method push_sample(2 args) = fn0
   component c1 Auditor (scoreboard)
-    field mismatches : scalar = 0
-    field last_got : scalar = 0
+    field mismatches : uint<32> = 0
+    field last_got : uint<64> = 0
     method audit(2 args) = fn1
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]

@@ -13,18 +13,18 @@ tb-ir program
   component c0 ProtocolModel (transactor)
     method predict_read(1 arg) -> ret = fn0
   component c1 ResponseScoreboard (scoreboard)
-    field seen_count : scalar = 0
-    field last_expected : scalar = 0
+    field seen_count : uint<32> = 0
+    field last_expected : uint<32> = 0
     method observe(2 args) = fn1
   component c2 BusResponder (transactor)
     field dut : dut PostEvalProvider
     field model : sub c0
     field sb : sub c1
-    field pending : scalar = 0
-    field visible : scalar = 0
-    field pending_data : scalar = 0
-    field queued : scalar = 0
-    field queued_data : scalar = 0
+    field pending : uint<1> = 0
+    field visible : uint<1> = 0
+    field pending_data : uint<32> = 0
+    field queued : uint<1> = 0
+    field queued_data : uint<32> = 0
     on 1 cycles phase post_eval active-only = fn2
 
 fn fn0 comp_method_0 [kind=ComponentMethod(c0)]

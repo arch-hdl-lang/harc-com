@@ -7,8 +7,8 @@ tb-ir program
   test AgentOnHandlerTest tb=tb0 run=fn1 check=- clock=clk@10000ps(SysDomain)
   component c0 Tagger (agent)
     field in_ev : out event<uint>
-    field seen : scalar = 0
-    field last : scalar = 0
+    field seen : uint<32> = 0
+    field last : uint<8> = 0
 
 fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   params:

@@ -4126,7 +4126,7 @@ fn passive_analysis_monitor_testbench_field_lowers() {
     );
     // Nor its persistent state or record queue.
     assert!(
-        dump.contains("field starts : scalar = 0")
+        dump.contains("field starts : uint<32> = 0")
             && dump.contains("field history : queue<LifeRec>"),
         "passive must keep the monitor's counters and record queue: {dump}"
     );
@@ -36888,4 +36888,104 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
                  wait 2 cycles\n    end run\n\
          end test T\n";
     lower_src(counter).expect("`seen = seen + t` on a widthless payload param stays legal");
+}
+
+/// The IR dump names a component scalar field's EXACT type.
+///
+/// Every other field kind already printed what it holds; the scalar
+/// kind printed the word "scalar", so a `uint<256>` field and a
+/// `uint<8>` field rendered identically — and which of the three
+/// storage classes the emitter picks (`uint64_t`, `_harc_u128`,
+/// `harc_rt::HarcWide<N>`) is exactly what every seam in harc#642
+/// turned on.
+#[test]
+fn the_ir_dump_names_a_component_scalar_fields_exact_type() {
+    let prog = lower_src(&fixture("component_wide_scalar_state_test.harc"))
+        .expect("wide component scalar state lowers");
+    let dump = format!("{prog}");
+    for want in [
+        "field value : uint<256> = 0",
+        "field odd : uint<200> = 0",
+        "field medium : uint<65> = 0",
+    ] {
+        assert!(
+            dump.contains(want),
+            "the dump must name the field's exact type — missing `{want}`:\n{dump}"
+        );
+    }
+    assert!(
+        !dump.contains(": scalar = "),
+        "no component scalar field should still render as the bare word `scalar`:\n{dump}"
+    );
+}
+
+/// The verifier is the IR-level backstop for the directional write rule
+/// lowering enforces — and is bounded to the same widths lowering is.
+///
+/// Both halves matter. Without the check, a `uint<129>` written into a
+/// `uint<65>` field passes the verifier untouched and both sides are
+/// `_harc_u128` in C++, so nothing downstream objects either. With the
+/// check UNBOUNDED, `uint<32>` into a `uint<8>` field — which lowering
+/// deliberately still accepts, pending #658 — becomes `internal error:
+/// TB-IR failed verification after lowering`, which is strictly worse
+/// than what it replaced: an internal error for source `harc check`
+/// accepts. The first version of this arm did exactly that.
+#[test]
+fn the_verifier_backstops_wide_component_field_writes_at_lowerings_bound() {
+    let mut broken = lower_src(&fixture("component_wide_scalar_state_test.harc"))
+        .expect("wide component scalar state lowers");
+    verify::verify_program(&broken).expect("the unmodified fixture verifies");
+
+    // `medium` is `uint<65>`. A 129-bit value shares its `_harc_u128`
+    // carrier, so only this check stands between it and storage that
+    // keeps bits the field does not have.
+    let run = broken.tests[0].run.index();
+    let write = broken.functions[run]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentFieldWrite { field, value, .. } if field == "medium" => Some(value),
+            _ => None,
+        })
+        .expect("the fixture writes the 65-bit field");
+    *write = ir::Expr::WideLiteral(vec![0, 0, 0, 0, 1]);
+    let rendered = verify::verify_program(&broken)
+        .expect_err("a 129-bit value cannot enter a 65-bit component field")
+        .into_iter()
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains(
+            "writes UInt(Some(129)) into component field `medium` declared UInt(Some(65))"
+        ),
+        "the write error must record the assignment direction: {rendered}"
+    );
+
+    // …and the bound: a <=64-bit destination is lowering's to judge,
+    // and lowering does not judge it yet. The verifier must not answer
+    // a question lowering declined — see #658.
+    let sub64 = r#"scoreboard SmallState
+    v : uint<8> default 0
+
+    hookable put(x: uint<32>)
+        v = x
+    end put
+end scoreboard SmallState
+
+testbench SmallTb
+    dut : Top
+    s : SmallState
+end testbench SmallTb
+
+impl SmallTest for SmallTb
+    run
+        wait 1 cycle
+    end run
+end impl SmallTest
+"#;
+    let prog = lower_src(sub64).expect("a <=64-bit component field write still lowers");
+    verify::verify_program(&prog)
+        .expect("the verifier must not reject what lowering deliberately accepts");
 }
