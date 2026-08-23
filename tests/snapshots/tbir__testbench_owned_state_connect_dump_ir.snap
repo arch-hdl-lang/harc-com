@@ -10,7 +10,7 @@ tb-ir program
   record r0 PendingItem
     value : uint<32>
   component c0 TbSource (transactor)
-    field observed : out event<uint>
+    field observed : out event<uint<8>>
     method publish(1 arg) = fn0
   component c1 TbSink (scoreboard)
     field count : uint<32> = 0

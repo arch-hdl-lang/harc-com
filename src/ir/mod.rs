@@ -1366,11 +1366,46 @@ pub enum ComponentFieldKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPayload {
     /// `event<uint<8>>` / `event<sint<…>>` / `event<bool>` — a scalar
-    /// ≤ 64 bits. `signed` selects `int64_t` vs `uint64_t`.
-    Scalar { signed: bool },
+    /// payload: its signedness and its declared width.
+    ///
+    /// This was `Scalar { signed: bool }`, which could say `int64_t` or
+    /// `uint64_t` and nothing else — so an `event<uint<1024>>` had no
+    /// representation and was refused, while v1 emitted
+    /// `std::function<void(harc_rt::HarcWide<32>)>` for it. Two sites
+    /// already converted the payload back into an `IrType` with a
+    /// `None` width to talk to the rest of lowering, one of them
+    /// commenting that the param "IS widthless" — a claim that had
+    /// spread into two more comments and a test by the time it was
+    /// made false.
+    ///
+    /// Every sibling slot — `QueueElem::Scalar { ty }`,
+    /// `StateFieldKind::Scalar { ty }`, `FixedVecSchema { elem }` —
+    /// carries a whole `IrType`, and this one deliberately does not.
+    /// It cannot: `IrType::Event(EventPayload)` makes the two mutually
+    /// recursive, so an `IrType` here is a type of infinite size and
+    /// would cost `IrType` its `Copy`. The pair of fields says the same
+    /// thing for the scalar case without the cycle.
+    Scalar { signed: bool, width: Option<u32> },
     /// `event<TinyTxn>` — a value-record payload. `RecordId` indexes
     /// `TbProgram::records`; the C++ payload type is the record struct.
     Record(RecordId),
+}
+
+impl EventPayload {
+    /// The payload as an `IrType`, for the lowering sites that type a
+    /// handler parameter or an `emit` argument against it. This is the
+    /// conversion two call sites already open-coded with a `None`
+    /// width; it keeps the declared width now.
+    pub fn scalar_ir_type(&self) -> Option<IrType> {
+        match self {
+            EventPayload::Scalar { signed, width } => Some(if *signed {
+                IrType::SInt(*width)
+            } else {
+                IrType::UInt(*width)
+            }),
+            EventPayload::Record(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

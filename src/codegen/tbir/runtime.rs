@@ -430,8 +430,13 @@ pub(super) fn event_payload_cty(
     records: &[crate::ir::RecordSchema],
 ) -> String {
     match p {
-        crate::ir::EventPayload::Scalar { signed: true } => "int64_t".to_string(),
-        crate::ir::EventPayload::Scalar { signed: false } => "uint64_t".to_string(),
+        // The subscriber's parameter type. `field_scalar_cty` carries
+        // the declared width; the pair this replaced could only say
+        // 64 bits, so an `event<uint<1024>>` had nowhere to put the
+        // other fifteen sixteenths.
+        crate::ir::EventPayload::Scalar { .. } => {
+            super::field_scalar_cty(&p.scalar_ir_type().expect("a scalar payload types"))
+        }
         crate::ir::EventPayload::Record(r) => records[r.index()].name.clone(),
     }
 }
@@ -459,11 +464,14 @@ pub(super) fn component_struct(
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             ComponentFieldKind::FixedVec(vec) => {
-                let cty = match vec.elem {
-                    crate::ir::IrType::Bool => "bool",
-                    crate::ir::IrType::SInt(_) => "int64_t",
-                    _ => "uint64_t",
-                };
+                // The fifth copy of the `(bool | int64_t | uint64_t)`
+                // triple, and the last one. It would have rendered a
+                // `Vec<uint<1024>, 4>` as `std::array<uint64_t, 4>` —
+                // an array that compiles, runs, and keeps a
+                // sixteenth of each element. v1 emits
+                // `std::array<harc_rt::HarcWide<32>, 4>`, and
+                // `field_scalar_cty` is the seam that says so.
+                let cty = super::field_scalar_cty(&vec.elem);
                 writeln!(
                     out,
                     "{INDENT}std::array<{cty}, {}> {}{{}};",

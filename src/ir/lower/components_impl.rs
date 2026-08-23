@@ -1491,16 +1491,26 @@ fn lower_field(
                 ));
             }
             let elem = match args.first() {
-                Some(TypeArg::Type(ty)) => scalar_ir_type(ty),
+                Some(TypeArg::Type(ty)) => vec_elem_scalar_ir_type(ty),
                 _ => None,
             }
-            .filter(|ty| matches!(ty,
-                IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
-            ) || matches!(ty, IrType::Bool))
-            .ok_or_else(|| unsupported(
-                &format!("fixed-vector field `{comp}.{fname}` with an unsupported element type"),
-                "only nonzero-width uint/sint/bits/bool/bit elements up to 64 bits are lowered; nested vectors and record elements are not yet supported",
-            ))?;
+            .filter(|ty| {
+                matches!(ty,
+                    IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
+                ) || matches!(ty, IrType::Bool)
+            })
+            .ok_or_else(|| {
+                unsupported(
+                    &format!(
+                        "fixed-vector field `{comp}.{fname}` with an unsupported element type"
+                    ),
+                    format!(
+                        "only nonzero-width uint/sint/bits/bool/bit elements are lowered, and \
+                     {}; nested vectors and record elements are not yet supported",
+                        scalar_width_detail()
+                    ),
+                )
+            })?;
             let len = match args.get(1) {
                 Some(TypeArg::Expr(e)) => match &*e.kind {
                     ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
@@ -2112,8 +2122,14 @@ fn lower_on_handler_body(
     // the body resolve against the record schema).
     let arg_name = on_handler_arg_name(h);
     let ty = match oh.arg_payload {
-        EventPayload::Scalar { signed: true } => IrType::SInt(None),
-        EventPayload::Scalar { signed: false } => IrType::UInt(None),
+        // `scalar_ir_type()`, which keeps the DECLARED width. This
+        // pair open-coded the conversion with `None`, which is what
+        // made a wide payload unrepresentable downstream even once the
+        // schema could hold one.
+        EventPayload::Scalar { .. } => oh
+            .arg_payload
+            .scalar_ir_type()
+            .expect("a scalar payload types"),
         EventPayload::Record(rid) => IrType::Record(rid),
     };
     let local = b.declare(&arg_name);
@@ -2592,6 +2608,15 @@ where
                 both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
+        // Signedness agreeing is not the whole rule once the payload
+        // gate carries widths past 64: `event<uint<1024>> ->
+        // sb.write_obs(v: uint<8>)` matches on signedness and delivers
+        // 64 of 1024 bits.
+        if let Some(src_ty) = src_payload.scalar_ir_type() {
+            if let Some(e) = connect_delivery_verdict(&src_ty, &sm.param_tys[0]) {
+                return Err(e);
+            }
+        }
         (
             crate::ir::ConnectSink::Method { method: sink_name },
             sm.activation,
@@ -2602,12 +2627,25 @@ where
         ..
     }) = sink_comp.field(&sink_name)
     {
-        if *payload != src_payload {
+        // NOT `*payload != src_payload`. `EventPayload` derives
+        // `PartialEq`, so the moment it grew a `width` that struct
+        // equality started refusing `event<uint<8>> ->
+        // event<uint<16>>` — two payloads v1 renders as the same
+        // `uint64_t` and TB-IR lowered until this batch. Ask the two
+        // questions the bridge actually turns on instead.
+        if !event_payloads_agree_in_shape(src_payload, *payload) {
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
                 both_scalar_payloads(src_payload, *payload),
             ));
+        }
+        if let (Some(src_ty), Some(sink_ty)) =
+            (src_payload.scalar_ir_type(), payload.scalar_ir_type())
+        {
+            if let Some(e) = connect_delivery_verdict(&src_ty, &sink_ty) {
+                return Err(e);
+            }
         }
         (
             crate::ir::ConnectSink::Event { event: sink_name },
@@ -2788,9 +2826,106 @@ pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
 fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
+    }
+}
+
+/// C++ storage class of a scalar the `connect` bridge has to carry,
+/// ordered by width so that `rank(src) <= rank(sink)` is exactly
+/// "the delivery does not lose bits".
+///
+/// The emitted bridge is v1's generic lambda —
+/// `src.push_back([&](auto _t) { for (auto& _s : sink) _s(_t); })` —
+/// so delivery is one C++ implicit conversion from the source
+/// payload's storage to the sink's. The classes are
+/// `local_scalar_cty`'s: `uint64_t`/`int64_t` to 64 bits,
+/// `_harc_u128` to `BUILTIN_SCALAR_BITS`, then `HarcWide<N>` with
+/// `N = ceil(width / 32)`. `N` is at least 5 for any wide scalar, so
+/// widening the wide class into the same ordering needs no offset.
+///
+/// A widthless scalar and a `bool` both rank 0: tbir renders each
+/// `uint64_t` in a parameter position.
+fn scalar_storage_rank(ty: &IrType) -> u32 {
+    match ty {
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > super::BUILTIN_SCALAR_BITS => {
+            w.div_ceil(32)
+        }
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64 => 1,
+        _ => 0,
+    }
+}
+
+/// What happens if a notification typed `src` is delivered to a
+/// subscriber whose scalar parameter is typed `sink`.
+///
+/// Measured with g++ `-std=gnu++20` over every ordered pair of the
+/// four storage classes, on v1's own bridge lambda:
+///
+/// | src → sink | result |
+/// | --- | --- |
+/// | same class | exact |
+/// | narrower → wider, any pair | exact — `_harc_u128` zero-extends, and `HarcWide<A>` → `HarcWide<B>` with `A < B` preserves every word (it does NOT round-trip through `uint64_t`) |
+/// | `HarcWide<A>` → `HarcWide<B>`, `A > B` | does not compile |
+/// | anything wider → `uint64_t` / `_harc_u128` | compiles, and drops the high bits with no diagnostic |
+///
+/// Both failing rows became reachable only when the payload gate
+/// opened past 64 bits, so both are this batch's to answer for.
+pub(crate) fn connect_delivery_is_faithful(src: &IrType, sink: &IrType) -> bool {
+    scalar_storage_rank(src) <= scalar_storage_rank(sink)
+}
+
+/// The same question, with the diagnostic lowering owes the user when
+/// the answer is no. The verifier asks the predicate instead: its job
+/// is to accept exactly what lowering produces, and re-deriving the
+/// rule beside it is how the two drift.
+fn connect_delivery_verdict(src: &IrType, sink: &IrType) -> Option<LowerError> {
+    if connect_delivery_is_faithful(src, sink) {
+        return None;
+    }
+    Some(if scalar_storage_rank(sink) > 1 {
+        // Both wide, sink narrower: `HarcWide<A>` has no conversion to
+        // a shorter `HarcWide<B>`, so v1's bridge does not compile.
+        not_implemented(
+            CONNECT_NARROWING_CONSTRUCT,
+            "a wide payload cannot be delivered into a narrower wide subscriber: \
+             `harc_rt::HarcWide<A>` converts to no shorter `HarcWide<B>`, and v1 emits \
+             the bridge anyway, so the emitted C++ does not compile",
+            V1Status::EmitsUncompilable,
+        )
+    } else {
+        not_implemented(
+            CONNECT_NARROWING_CONSTRUCT,
+            "the payload is wider than the subscriber that receives it, so the bridge \
+             would drop the high bits; v1 emits it and the narrowing conversion is \
+             silent — the notification arrives truncated with no diagnostic",
+            V1Status::SilentlyMisLowers,
+        )
+    })
+}
+
+/// One construct string for both narrowing arms. The two differ in
+/// what v1 does, not in what the program said, and a caller that
+/// re-spelled it would be a second place to keep in step.
+const CONNECT_NARROWING_CONSTRUCT: &str =
+    "a `connect` whose payload is wider than the subscriber receiving it";
+
+/// Do a `connect` source payload and a sink EVENT payload have the
+/// same SHAPE — the question `*payload != src_payload` answered back
+/// when `EventPayload::Scalar` held signedness and nothing else.
+///
+/// Width is deliberately not part of it: two scalar payloads of
+/// different declared widths are bridgeable whenever the delivery does
+/// not lose bits, and that is `connect_delivery_verdict`'s question,
+/// with its own diagnostic. Folding the two together is what made a
+/// legal program report "must agree in signedness" when signedness
+/// agreed.
+pub(crate) fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
+    match (src, sink) {
+        (EventPayload::Scalar { signed: a, .. }, EventPayload::Scalar { signed: b, .. }) => a == b,
+        (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
         _ => false,
     }
 }
@@ -2943,7 +3078,8 @@ pub(crate) fn v1_leaves_the_type_name_undeclared(
 /// Resolve the `<T>` inside an `event<T>` analysis-port field to its
 /// `EventPayload`. Mirrors v1's `payload_type_for_arg` for the lowered
 /// subset:
-///   * a scalar (`uint<W>`/`sint<W>`/`bool` ≤ 64 bits) → `Scalar`;
+///   * a scalar (`uint<W>`/`sint<W>`/`bool`, width per
+///     `field_scalar_width_ok`) → `Scalar`;
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value
 ///     as the record struct, matching v1's `std::function<void(Txn)>`).
 ///
@@ -2978,9 +3114,10 @@ pub(crate) fn lower_event_payload(
         not_implemented(
             &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
-                 are lowered; v1 emits `{named}` as the subscriber's parameter type \
-                 and declares no C++ enum, so its output does not compile either"
+                "only event<scalar> and event<transaction|struct> payloads are lowered \
+                 ({}); v1 emits `{named}` as the subscriber's parameter type and declares \
+                 no C++ enum, so its output does not compile either",
+                scalar_width_detail()
             ),
             V1Status::EmitsUncompilable,
         )
@@ -2991,8 +3128,11 @@ pub(crate) fn lower_event_payload(
         }
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
-            "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
-             are lowered; enum/Vec/nested payloads gate on a later slice",
+            format!(
+                "only event<scalar> and event<transaction|struct> payloads are lowered \
+                 ({}); enum/Vec/nested payloads gate on a later slice",
+                scalar_width_detail()
+            ),
         )
     };
     match arg {
@@ -3004,11 +3144,27 @@ pub(crate) fn lower_event_payload(
                     return Ok(EventPayload::Record(*rid));
                 }
             }
-            match scalar_ir_type(ty) {
-                Some(IrType::SInt(_)) => Ok(EventPayload::Scalar { signed: true }),
-                Some(IrType::UInt(_)) | Some(IrType::Bool) => {
-                    Ok(EventPayload::Scalar { signed: false })
-                }
+            // The DECLARED width travels into the schema now. `Bool`
+            // collapses to `width: None`, which is right but not for
+            // the reason this comment first gave ("matching the `bool`
+            // member both backends emit"): measured, tbir emits
+            // `std::function<void(uint64_t)>` for an `event<bool>` and
+            // only v1 emits `void(bool)`. `width: Some(1)` would mean
+            // `uint<1>`, which is a different declared type, so `None`
+            // is the only honest thing the pair can say here.
+            match event_payload_scalar_ir_type(ty) {
+                Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
+                    signed: true,
+                    width,
+                }),
+                Some(IrType::UInt(width)) => Ok(EventPayload::Scalar {
+                    signed: false,
+                    width,
+                }),
+                Some(IrType::Bool) => Ok(EventPayload::Scalar {
+                    signed: false,
+                    width: None,
+                }),
                 _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
         }
@@ -3022,15 +3178,23 @@ pub(crate) fn lower_event_payload(
             }
             Err(unsupported(
                 &format!("a non-identifier event payload on `{comp}.{fname}`"),
-                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads are lowered",
+                format!(
+                    "only event<scalar> and event<transaction|struct> payloads are lowered \
+                     ({})",
+                    scalar_width_detail()
+                ),
             ))
         }
         // `TypeArg::Named` is a keyword-style arg (`depth=16`), never a
         // payload type reference — reject it precisely.
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
-        // A bare `event` with no payload defaults to an unsigned scalar
-        // (matches the prior behavior).
-        None => Ok(EventPayload::Scalar { signed: false }),
+        // A bare `event` with no payload defaults to an unsigned
+        // scalar of unspecified width — the `uint64_t` both backends
+        // have always given it.
+        None => Ok(EventPayload::Scalar {
+            signed: false,
+            width: None,
+        }),
     }
 }
 
@@ -3071,20 +3235,39 @@ fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
 }
 
-/// The component EVENT-payload and FIXED-VECTOR scalar subset, capped at
-/// 64 bits. Queue elements call `decoded_scalar_ir_type` directly
-/// because their shared storage path already supports `_harc_u128` and
-/// `HarcWide<N>`; declared scalar FIELDS go through
-/// `scalar_field_ir_type` below for the same reason.
+/// The component EVENT-payload scalar subset.
 ///
-/// The three subsets are separate on purpose. An event payload is a
-/// `std::function` parameter type and a fixed-vector element is an
-/// `std::array` element, and neither emitter has been shown to carry a
-/// width past 64 — widening the field sites through this one function
-/// would have widened both of those unmeasured.
-fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
-    decoded_scalar_ir_type(t)
-        .filter(|ty| !matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64))
+/// This function used to gate the fixed-vector ELEMENT type as well,
+/// and its comment said the two were "separate on purpose … neither
+/// emitter has been shown to carry a width past 64". Measured: v1
+/// emits `std::array<harc_rt::HarcWide<32>, 4>` for a
+/// `Vec<uint<1024>, 4>` and
+/// `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for an
+/// `event<uint<1024>>`, so BOTH are real gaps rather than mislabels.
+///
+/// The payload half needed the IR to be able to SAY a width first:
+/// `EventPayload::Scalar` held a lone `signed: bool`, so `uint64_t`
+/// and `int64_t` were the only two things it could mean. It carries a
+/// width now, and this gate uses the same policy as any declared
+/// scalar field, so a payload and a field agree about what a width
+/// means.
+fn event_payload_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// The fixed-vector ELEMENT subset. `FixedVecSchema` carries a full
+/// `IrType` and every consumer of it already reads one —
+/// `ir_vec_elem_class` has always rendered `_harc_u128` past 64 bits
+/// and `HarcWide<N>` past 128 — so the only thing that capped a `Vec`
+/// element at 64 was this gate plus a hardcoded
+/// `(bool | int64_t | uint64_t)` triple in the emitter. Both moved
+/// together; opening the gate alone would have turned a refusal into a
+/// silently truncated `std::array` element.
+///
+/// Same width policy as any declared scalar field, so a `Vec` element
+/// and a plain field agree about what a width means.
+fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
 }
 
 /// The scalar subset of a DECLARED component/scoreboard/testbench
@@ -3107,6 +3290,24 @@ fn scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// re-introduced a second copy in `scoreboards.rs` to hold it.
 pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// What the scalar width policy actually admits, in one sentence, for
+/// the diagnostics that name it.
+///
+/// Five of them said "up to 64 bits" / "scalar ≤ 64 bits" — the cap
+/// as it stood before the field, vector-element and payload gates
+/// opened. A user hitting `Vec<uint<2048>, 4>` or `event<sint<128>>`
+/// was told the wrong reason for a real refusal, which is worse than
+/// a vague one: it sends them to shrink a width that was never the
+/// problem. Built from `MAX_WIDTH_METHOD_BITS` rather than spelling
+/// the number, and kept beside `field_scalar_width_ok`, so the next
+/// widening cannot strand it again.
+fn scalar_width_detail() -> String {
+    format!(
+        "an unsigned scalar reaches {} bits and a signed one stops at 64",
+        crate::MAX_WIDTH_METHOD_BITS
+    )
 }
 
 /// The width policy for a declared scalar FIELD, at every site that has
@@ -3133,7 +3334,7 @@ pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
 }
 
 fn scalar_width(t: &TypeExpr) -> Option<u32> {
-    match scalar_ir_type(t) {
+    match event_payload_scalar_ir_type(t) {
         Some(IrType::UInt(Some(w))) | Some(IrType::SInt(Some(w))) => Some(w),
         Some(IrType::Bool) => Some(1),
         _ => None,
@@ -4792,8 +4993,8 @@ impl super::FuncBuilder<'_> {
                         .is_err()
                     {
                         let want = match payload {
-                            EventPayload::Scalar { signed: true } => "sint".to_string(),
-                            EventPayload::Scalar { signed: false } => "uint".to_string(),
+                            EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
+                            EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
                             EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),
                         };
                         return Err(LowerError::Invalid(format!(

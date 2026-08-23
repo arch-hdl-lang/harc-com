@@ -8771,6 +8771,248 @@ former `transaction` group lives in
      pairing is outside the harness's three falsifiable directions, so
      it is reported here rather than asserted.
 
+137. **The harness was measuring a prefix of the compiler
+     (2026-08-23).**
+
+     `scalar_ir_type` gated two things — an event PAYLOAD type and a
+     fixed-vector ELEMENT type — and divergence 134 deliberately left
+     it alone, recording why: "neither emitter has been shown to carry
+     a width past 64 — widening the field sites through this one
+     function would have widened both of those unmeasured."
+
+     Measured now. v1 emits
+     `std::array<harc_rt::HarcWide<32>, 4>` for a `Vec<uint<1024>, 4>`
+     and `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for
+     an `event<uint<1024>>`. Both are real gaps, not mislabels.
+
+     Only the VECTOR half moved, and the reason the two are still
+     separate outlived the comment that separated them:
+     `FixedVecSchema` carries a full `IrType`, so its width was
+     representable and only the emitter truncated;
+     `EventPayload::Scalar { signed: bool }` has no width field at all,
+     so the payload half needs the IR to be able to say a width before
+     anything else can happen.
+
+     **The finding is about the harness, not the feature.** Opening the
+     vector gate, `differential.rs` reported every width as `LOWERS` —
+     and the real pipeline rejected them. `tb_verdict` ran
+     `lower_program` then `emit`, and `harc dump-ir` / `harc sim` both
+     run `verify_program` BETWEEN those two. A program that lowered and
+     failed verification scored as "works". The tool built to stop
+     exactly this class of self-deception had a hole of the same
+     shape, and what caught the defect was an ordinary assertion in
+     `tests/tbir.rs`.
+
+     It runs the verifier now. Re-running every space produced zero
+     other verifier refusals, so the hole was hiding exactly one
+     defect — one this batch had just created. A paired mutation
+     records the hole itself: revert the verifier's cap AND the
+     harness's verify step, and `--test differential` passes a program
+     the compiler rejects.
+
+     **Third site, again.** `verify.rs` carried its own hardcoded
+     `*w <= 64` for fixed-vector elements, the lowering gate and the
+     emitter being the other two. It asks `field_scalar_width_ok` now.
+     That makes three consecutive divergences whose central defect was
+     one rule living in three places — the enum grade (134-136), the
+     scalar decoder (adopted from `main` at a merge), and now this. It
+     is the dominant failure mode in this file, not an incidental one.
+
+     The FixedVec emitter held the fifth and last copy of the
+     `(bool | int64_t | uint64_t)` triple.
+
+138. **A schema that could only say sixty-four (2026-08-23).**
+
+     The other half of divergence 137. `event<uint<1024>>` was refused
+     while v1 emitted
+     `std::vector<std::function<void(harc_rt::HarcWide<32>)>>` for it,
+     and the reason was not a gate but a representation:
+     `EventPayload::Scalar { signed: bool }` could say `int64_t` or
+     `uint64_t` and nothing else. Widening the gate alone would have
+     produced a 64-bit subscriber parameter for a 1024-bit payload.
+
+     The obvious fix — carry an `IrType`, like every sibling slot
+     (`QueueElem::Scalar { ty }`, `StateFieldKind::Scalar { ty }`,
+     `FixedVecSchema { elem }`) — does not compile, and the tree says
+     why: `IrType::Event(EventPayload)` makes the two mutually
+     recursive, so an `IrType` inside the payload is a type of infinite
+     size and costs `IrType` its `Copy`. That is exactly why the
+     siblings can carry one and this cannot. It carries
+     `{ signed, width }` instead, and the doc comment records the
+     constraint so the next person does not spend the same twenty
+     minutes discovering it.
+
+     Two call sites had already open-coded payload → `IrType` with a
+     `None` width to talk to the rest of lowering, one of them
+     commenting that the param "IS widthless". They call
+     `EventPayload::scalar_ir_type()` now and keep the declared width —
+     which is visible in a snapshot: an `on` handler's parameter for
+     `event<uint<8>>` types as `uint<8>` rather than a bare `uint`.
+
+     **A pre-existing divergence the measurement surfaced.** v1 emits
+     `std::function<void(bool)>` for an `event<bool>`; TB-IR emits
+     `void(uint64_t)`. Both compile, so no differential space can see
+     it — the observable difference is that `emit ev(2)` notifies with
+     `true` under v1 and `2` here. Closing it needs the payload schema
+     to be able to SAY bool, which `{ signed, width }` cannot:
+     `width: Some(1)` means `uint<1>`, which v1 renders `uint64_t`.
+     Named in the test that measured it, not asserted away.
+
+     Three mutations: re-capping the gate, restoring the emitter's
+     64-bit pair, and dropping the width on the way into the schema.
+
+139. **A derived `PartialEq` is a rule nobody wrote down
+     (2026-08-23).**
+
+     Divergence 138 added `width` to `EventPayload::Scalar`. The
+     `connect` event-sink branch asked `*payload != src_payload`, and
+     `EventPayload` derives `PartialEq` — so the new field silently
+     joined a comparison written when signedness was the only thing
+     the variant could hold. `event<uint<8>> -> event<uint<16>>`,
+     which v1 renders as two `std::function<void(uint64_t)>` and which
+     TB-IR had lowered all along, started failing with "source and
+     sink scalar payloads must agree in signedness": a refusal of a
+     legal program, under a message that was false about it.
+
+     Nothing in the tree caught it. The full suite passed, and the
+     206-fixture corpus lowered identically — because no fixture
+     connects two events of different declared widths. It took an
+     adversarial review pass reading the schema change against every
+     consumer of the type.
+
+     The lesson is narrower than "review your changes". A derived
+     `PartialEq` on a schema type makes every `==` in the tree a
+     silent participant in a field addition, and the compiler cannot
+     flag it: the code still type-checks and still means something,
+     just not what it meant. Adding a field to a type that derives
+     comparison is a change to every comparison of it. The two
+     questions the bridge actually turns on are now asked separately
+     and named — `event_payloads_agree_in_shape` for signedness and
+     record identity, `connect_delivery_verdict` for width — so a
+     third field cannot join either one by accident.
+
+     **The width question, measured rather than assumed.** Opening the
+     payload gate also made a wide payload deliverable into a narrow
+     subscriber, which main refused only because wide payloads were
+     refused outright. v1's bridge is a generic lambda, so delivery is
+     one C++ implicit conversion; g++ `-std=gnu++20` was asked what
+     each ordered pair of the four storage classes does:
+
+     | src → sink | result |
+     | --- | --- |
+     | same class | exact |
+     | narrower → wider, any pair | exact — `HarcWide<A>` → `HarcWide<B>` with `A < B` preserves every word, and does NOT round-trip through `uint64_t` as first assumed |
+     | `HarcWide<A>` → `HarcWide<B>`, `A > B` | does not compile |
+     | anything wider → `uint64_t` / `_harc_u128` | compiles, drops the high bits, no diagnostic |
+
+     Widening lowers; the two narrowing rows are refused, split by
+     what v1 does with them (`EmitsUncompilable` for the wide-into-
+     narrower-wide row, `SilentlyMisLowers` for the rest). The
+     first guess about the `HarcWide<A>` → `HarcWide<B>` row was
+     wrong in the safe direction, which is the argument for compiling
+     the claim rather than reasoning about the header.
+
+     A `check_space_all_lower` space pins the widening direction. The
+     neighbouring payload space substitutes one hole into both the
+     payload and the sink parameter, so source and sink always agree
+     there — which is precisely why a mismatch regression could pass
+     it. Five mutations: restoring the struct equality, disabling the
+     delivery guard, collapsing the two v1 grades into one, ranking
+     every wide width alike, and refusing on any width difference.
+
+140. **The same rule, one level down (2026-08-23).**
+
+     Divergence 139 said a derived `PartialEq` makes every `==` in the
+     tree a silent participant in a field addition, then fixed ONE of
+     the two. `verify.rs` compared whole `EventPayload` values in the
+     `connect` sink arm as well, so lowering emitted a
+     `ConnectSink::Event` edge for two payloads of different declared
+     widths and the verifier rejected it.
+
+     That is worse than what it replaced. Before 139 these programs got
+     a clean `Unsupported` with a wrong message; after it they got
+     `internal error: TB-IR failed verification after lowering`. Twelve
+     shapes `main` lowers were affected, including
+     `event<uint<8>> -> event<uint<16>>` — verbatim the program named
+     in 139's own commit subject — and the widening capability 139 was
+     built to add was unreachable on that path.
+
+     THREE independent reasons nothing caught it, all inside 139:
+
+     - its new test called `lower_src`, which stops at lowering. The
+       assertion that names this exact hazard — "the verifier must not
+       reject what lowering deliberately accepts" — sits twenty lines
+       above it in the same file.
+     - the test wired the connect inside an `env`, and `verify.rs`
+       walks only `tb.connects`. An `env` connect reaches no verifier
+       at all, so adding the verify call alone would still have passed.
+     - its differential space DOES run the verifier, but probes a
+       METHOD sink inside an `env` — neither the branch that broke nor
+       the scope where verification happens.
+
+     Three ways of missing one thing, each of which looks like
+     coverage. The harness fix in divergence 137 was about a tool that
+     skipped the verifier; this is the same omission committed by hand,
+     in a test written after that fix, by the person who wrote it.
+
+     The verifier ASKS lowering's predicates now rather than restating
+     them, and both tests run at both scopes through
+     `verify_program`. A verifier that re-derives a rule is a second
+     place for it to be wrong — and this one was wrong in the direction
+     that produces an internal error rather than a refusal.
+
+     **Measured and left alone.** The dump prints `out` for every event
+     field, so an input `inev : event<uint<16>>` renders as
+     `out event<uint<16>>`. `ComponentFieldKind::Event { payload }`
+     records no direction, so the renderer has nothing to consult;
+     recording it is a schema change, not a renderer fix. Named in the
+     test that measured it.
+
+141. **Three passes to fix one `==`, and what is still open
+     (2026-08-23).**
+
+     Divergence 140's fix was itself incomplete, in the same shape a
+     third time. `verify.rs` has TWO connect sink arms; 140 fixed the
+     event one and left the method one calling
+     `event_payload_matches_type`, which compares signedness and
+     ignores width. Delete lowering's `connect_delivery_verdict` call
+     and `event<uint<1024>> -> observe(v: uint<8>)` lowers, verifies
+     clean, and emits a `std::function<void(harc_rt::HarcWide<32>)>`
+     feeding a `uint64_t` parameter — 960 bits dropped per
+     notification, silently. Both arms ask the shared predicate now,
+     and a test builds the IR a forgetful lowering site would emit and
+     watches each arm refuse it.
+
+     The scale was also understated. 140 said "twelve shapes"; that was
+     the row count of a test table, three rows of which `main` does not
+     lower anyway. Measured against a rebuilt pre-fix binary over a
+     15-type alphabet: 30 shapes regressed, 72 internal errors. The
+     true set is every pair of distinct declared widths at the same
+     storage class with matching signedness, which is unbounded.
+     Counting a defect's blast radius from the test that found it
+     reports the test, not the defect.
+
+     **Two holes this branch surfaced and does NOT close**, recorded
+     here rather than left implicit:
+
+     - `verify.rs` walks `TestbenchSchema::connects` only.
+       `ComponentSchema::connects` (an `env` `connect` block) and
+       `TbComponentBinding::connects` are never verified — and the env
+       form is the MAJORITY shape, 6 of the 10 connect-using fixtures.
+       Every backstop in this divergence therefore covers one scope of
+       three. The tests say which one.
+     - the boundary constant is shared across all four sites in
+       `lower` now, but `codegen/tbir/mod.rs` still spells 128 in four
+       places of its own. Crossing that needs a home for the constant
+       that neither module owns, which is a bigger change than this
+       branch should carry.
+
+     A rule that is one function in one place is worth the refactor
+     that gets it there. This branch spent three review passes proving
+     it by not doing it: the payload width lived in a derived
+     `PartialEq`, two verifier arms and a lowering arm, and each pass
+     found the copy the previous one had not thought to look for.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

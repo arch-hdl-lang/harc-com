@@ -893,10 +893,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 );
             }
             if let ComponentFieldKind::FixedVec(vec) = &field.kind {
+                // The THIRD site of one width policy — the lowering
+                // gate and the emitter were the other two. A
+                // hardcoded `<= 64` here rejected a program lowering
+                // had just accepted, which is an internal error rather
+                // than a diagnostic. It asks
+                // `components::field_scalar_width_ok` now, the same
+                // function the gate uses.
                 let valid_elem = matches!(
                     &vec.elem,
-                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w))
-                        if *w > 0 && *w <= 64
+                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w)) if *w > 0
+                ) && crate::ir::lower::components::field_scalar_width_ok(
+                    &vec.elem,
                 ) || matches!(&vec.elem, crate::ir::IrType::Bool);
                 if vec.len == 0 || !valid_elem {
                     errs.push(VerifyError::BadProgramRef {
@@ -1571,7 +1579,7 @@ fn verify_testbench_connect(
                     "sink method `{method}` is not a one-argument void hookable"
                 ));
             }
-            if !event_payload_matches_type(payload, &m.param_tys[0]) {
+            if !connect_payload_reaches_param(payload, &m.param_tys[0]) {
                 return Err(format!(
                     "sink method `{method}` has an incompatible payload type"
                 ));
@@ -1585,7 +1593,8 @@ fn verify_testbench_connect(
                     },
                 activation,
                 ..
-            }) if *sink_payload == payload && *activation == edge.sink_activation => {}
+            }) if connect_payloads_bridge(payload, *sink_payload)
+                && *activation == edge.sink_activation => {}
             _ => {
                 return Err(format!(
                     "sink event `{event}` does not resolve or has a mismatched payload"
@@ -1761,11 +1770,58 @@ fn resolve_component_queue_elem(
     }
 }
 
+/// The METHOD-sink half of the same rule, and for the same reason.
+///
+/// `event_payload_matches_type` compares signedness and record
+/// identity and ignores width entirely, while lowering applies
+/// `connect_delivery_verdict` here too. Leaving this arm restated is
+/// exactly the mistake the arm fourteen lines below was fixed for: a
+/// lowering site that forgot the call would emit
+/// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
+/// parameter, verify clean, and truncate 960 bits per notification.
+/// Measured by deleting that call and watching `dump-ir` exit 0.
+fn connect_payload_reaches_param(payload: EventPayload, ty: &IrType) -> bool {
+    if !event_payload_matches_type(payload, ty) {
+        return false;
+    }
+    match payload.scalar_ir_type() {
+        Some(src) => crate::ir::lower::components::connect_delivery_is_faithful(&src, ty),
+        None => true,
+    }
+}
+
+/// The verifier's copy of the `connect` payload rule — which is to
+/// say, not a copy: it ASKS lowering's two predicates.
+///
+/// This arm was `*sink_payload == payload`, the exact twin of the
+/// `*payload != src_payload` in `components_impl.rs`. `EventPayload`
+/// derives `PartialEq`, so when the payload grew a `width` BOTH
+/// comparisons silently became width checks. Fixing only the lowering
+/// one made this the worse of the two failures: lowering emitted a
+/// `ConnectSink::Event` edge for two payloads of different declared
+/// widths and the verifier then rejected it, turning a graceful
+/// diagnostic into `internal error: TB-IR failed verification after
+/// lowering`.
+///
+/// Asking rather than restating is the point. A verifier that
+/// re-derives a rule is a second place for it to be wrong, and this
+/// one was wrong in the direction that produces an internal error
+/// rather than a refusal.
+fn connect_payloads_bridge(src: EventPayload, sink: EventPayload) -> bool {
+    if !crate::ir::lower::components::event_payloads_agree_in_shape(src, sink) {
+        return false;
+    }
+    match (src.scalar_ir_type(), sink.scalar_ir_type()) {
+        (Some(s), Some(k)) => crate::ir::lower::components::connect_delivery_is_faithful(&s, &k),
+        _ => true,
+    }
+}
+
 fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }
@@ -1782,8 +1838,8 @@ fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool 
 
 fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
-        (EventPayload::Scalar { signed: true }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false }, IrType::UInt(_) | IrType::Bool) => true,
+        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
+        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }
@@ -1847,6 +1903,21 @@ fn verify_component_event_ref(
             },
             activation,
             ..
+        // The THIRD `EventPayload` struct equality in the tree, and
+        // the only one that should stay one. The other two compared a
+        // SOURCE payload against a SINK's — two independently declared
+        // types that a C++ conversion has to bridge — so widening the
+        // struct silently turned each into a width check and refused
+        // legal programs (divergences 139-141). This one compares an
+        // op's stored payload against THE SAME FIELD it was copied
+        // from, so the question is identity, not bridging: a
+        // difference means the IR is internally inconsistent, which is
+        // exactly what a verifier is for. It stays correct if a fourth
+        // field is added, for the same reason the others did not.
+        //
+        // Swept across `uint`, `bool`, `uint<1|8|64|65|128|160|1024>`
+        // and `sint<8|64>` after the payload grew a width: no arm of
+        // this match fires on any of them.
         }) if *field_payload == payload => {
             if !component_mode_includes_activation(resolved.effective_mode, *activation) {
                 return Err(format!(

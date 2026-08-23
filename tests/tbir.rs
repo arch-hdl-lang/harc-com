@@ -12037,8 +12037,7 @@ end impl T"#;
     let double_negative = indexed_local.replace("rows[0]", "rows[-(-1)]");
     let double_negative_prog =
         lower_src(&double_negative).expect("an even negation chain preserves a positive index");
-    verify::verify_program(&double_negative_prog)
-        .expect("double-negative indexed lists verify");
+    verify::verify_program(&double_negative_prog).expect("double-negative indexed lists verify");
     let triple_negative = indexed_local.replace("rows[0]", "rows[-(-(-1))]");
     let msg = assert_invalid(
         &lower_src(&triple_negative)
@@ -35043,7 +35042,10 @@ fn component_event_subscription_metadata_is_verified() {
     });
     assert_event_corruption_rejected(prog.clone(), |event| match event {
         ir::EventChannelRef::Component { payload, .. } => {
-            *payload = ir::EventPayload::Scalar { signed: false }
+            *payload = ir::EventPayload::Scalar {
+                signed: false,
+                width: None,
+            }
         }
         _ => panic!("fixture subscription must target a component event"),
     });
@@ -36869,14 +36871,19 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
         );
     }
 
-    // The ORDINARY counting idiom stays legal. An `on ev(t)` payload
-    // param is widthless (`EventPayload::Scalar` records signedness
-    // only), and `common_expr_type` gives a widthless operand the
-    // 64-bit host ABI — so `seen + t` types as 64 bits whatever `seen`
-    // is. A ≤64-bit destination is therefore NOT judged here; a
-    // destination past 64 cannot be narrowed by that manufactured 64,
-    // which is what keeps the check above resting only on declared
-    // widths. See the follow-up issue for the ≤64-bit half.
+    // The ORDINARY counting idiom stays legal. `common_expr_type`
+    // gives a widthless operand the 64-bit host ABI, so a sum can type
+    // as 64 bits whatever its destination is; a ≤64-bit destination is
+    // therefore NOT judged here, and a destination past 64 cannot be
+    // narrowed by that manufactured 64, which is what keeps the check
+    // above resting only on declared widths. See the follow-up issue
+    // for the ≤64-bit half.
+    //
+    // This comment named the `on ev(t)` payload param as THE widthless
+    // operand ("`EventPayload::Scalar` records signedness only"). The
+    // payload carries its width now, so `t` here is `uint<8>` and the
+    // row survives for a different reason: `seen` is `uint<32>`, which
+    // the guard does not judge either way.
     let counter = "domain SysDomain\n  freq_mhz: 100\nend domain SysDomain\n\n\
          agent Tagger\n    \
              in_ev : event<uint<8>>\n    \
@@ -36887,7 +36894,154 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
              run\n        wait 2 cycles\n        emit tagger.in_ev(1)\n        \
                  wait 2 cycles\n    end run\n\
          end test T\n";
-    lower_src(counter).expect("`seen = seen + t` on a widthless payload param stays legal");
+    lower_src(counter).expect("`seen = seen + t` on an event payload param stays legal");
+}
+
+/// A fixed-vector ELEMENT wider than 64 bits keeps its width in the
+/// emitted member.
+///
+/// The differential harness typechecks both backends, and
+/// `std::array<uint64_t, 4>` for a `Vec<uint<1024>, 4>` compiles
+/// perfectly — it just keeps a sixteenth of each element. Only the
+/// member TEXT distinguishes the fix from the bug it replaced, so it is
+/// asserted here, against v1's own answer.
+#[test]
+fn a_wide_fixed_vector_element_keeps_its_width() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor SrcV
+    v : Vec<{ty}, 4>
+    n : uint<32> default 0
+
+    hookable bump(x: uint<8>)
+        v[0] = 1
+        n = n + 1
+    end bump
+end transactor SrcV
+
+testbench TbWv
+    dut : Top
+    src : SrcV passive
+end testbench TbWv
+
+impl TWv for TbWv
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TWv
+"#
+        )
+    };
+    for (ty, member) in [
+        ("uint<8>", "std::array<uint64_t, 4> v{};"),
+        ("uint<64>", "std::array<uint64_t, 4> v{};"),
+        ("uint<128>", "std::array<_harc_u128, 4> v{};"),
+        ("uint<1024>", "std::array<harc_rt::HarcWide<32>, 4> v{};"),
+        ("sint<64>", "std::array<int64_t, 4> v{};"),
+        ("bool", "std::array<bool, 4> v{};"),
+    ] {
+        let src = prog(ty);
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(member),
+            "`Vec<{ty}, 4>`: tbir must emit `{member}`, got:\n{cpp}"
+        );
+        // v1 is the oracle for the member, not this test's memory of it.
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(member),
+            "`Vec<{ty}, 4>`: v1 emits `{member}` too — the two agree"
+        );
+    }
+}
+
+/// A wide event PAYLOAD keeps its width in the subscriber's parameter
+/// type, at both emitters that render one.
+///
+/// `EventPayload::Scalar` carried a lone `signed: bool` until this
+/// batch, so `uint64_t` and `int64_t` were the only two things it could
+/// mean and a `std::function<void(uint64_t)>` for an
+/// `event<uint<1024>>` would have compiled while dropping fifteen
+/// sixteenths of every notification. Only the member TEXT tells the fix
+/// from that bug, so it is asserted against v1's own answer.
+#[test]
+fn a_wide_event_payload_keeps_its_width() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor SrcE
+    ev : out event<{ty}>
+    n  : uint<32> default 0
+
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor SrcE
+
+testbench TbWe
+    dut : Top
+    src : SrcE passive
+end testbench TbWe
+
+impl TWe for TbWe
+    run
+        src.bump(1)
+        wait 1 cycle
+    end run
+end impl TWe
+"#
+        )
+    };
+    // (payload, what tbir emits, what v1 emits). The two agree
+    // everywhere except `bool`, which is NOT this batch's doing and is
+    // recorded rather than quietly asserted away: v1 gives a bool
+    // payload `std::function<void(bool)>` and tbir gives
+    // `void(uint64_t)`. Both compile, so no differential space can see
+    // it; the observable difference is that `emit ev(2)` notifies with
+    // `true` under v1 and `2` here. Closing it needs the payload
+    // schema to be able to SAY bool — `{ signed, width }` cannot, since
+    // `width: Some(1)` means `uint<1>`, which v1 renders `uint64_t`.
+    for (ty, member, v1_member) in [
+        (
+            "uint<8>",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+        ),
+        (
+            "sint<32>",
+            "std::vector<std::function<void(int64_t)>> ev;",
+            "std::vector<std::function<void(int64_t)>> ev;",
+        ),
+        (
+            "bool",
+            "std::vector<std::function<void(uint64_t)>> ev;",
+            "std::vector<std::function<void(bool)>> ev;",
+        ),
+        (
+            "uint<128>",
+            "std::vector<std::function<void(_harc_u128)>> ev;",
+            "std::vector<std::function<void(_harc_u128)>> ev;",
+        ),
+        (
+            "uint<1024>",
+            "std::vector<std::function<void(harc_rt::HarcWide<32>)>> ev;",
+            "std::vector<std::function<void(harc_rt::HarcWide<32>)>> ev;",
+        ),
+    ] {
+        let src = prog(ty);
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains(member),
+            "`event<{ty}>`: tbir must emit `{member}`, got:\n{cpp}"
+        );
+        assert!(
+            cpp_tb::emit(&merged_src(&src))
+                .expect("v1 emits")
+                .contains(v1_member),
+            "`event<{ty}>`: v1 must emit `{v1_member}`"
+        );
+    }
 }
 
 /// The IR dump names a component scalar field's EXACT type.
@@ -36988,4 +37142,484 @@ end impl SmallTest
     let prog = lower_src(sub64).expect("a <=64-bit component field write still lowers");
     verify::verify_program(&prog)
         .expect("the verifier must not reject what lowering deliberately accepts");
+}
+
+/// Two scalar event payloads of DIFFERENT declared widths still
+/// `connect`, exactly as they did before the payload schema carried a
+/// width.
+///
+/// `EventPayload` derives `PartialEq`, and the event-sink branch asked
+/// `*payload != src_payload`. The moment the variant grew a `width`
+/// that struct equality silently became a width check, so
+/// `event<uint<8>> -> event<uint<16>>` — two payloads v1 renders as
+/// the same `std::function<void(uint64_t)>` — started reporting "source
+/// and sink scalar payloads must agree in signedness", a message that
+/// is false about a program whose signedness agrees.
+///
+/// The rows are the ones measured against `origin/main`'s own binary:
+/// all of them lower there. Signedness disagreement is the rule that
+/// arm really enforces, so it stays refused.
+///
+/// TESTBENCH scope, and `verify_program`, both deliberately. The first
+/// version of this test wired the connect inside an `env` and called
+/// `lower_src`, which stops at lowering — and `verify.rs` walks only
+/// `tb.connects`, so an `env` connect reaches no verifier at all. That
+/// combination missed the twin of the very bug this test exists for:
+/// `verify.rs` compared whole `EventPayload` values too, so lowering
+/// emitted the edge and the verifier rejected it, one `internal error:
+/// TB-IR failed verification after lowering` per row. Both scopes run
+/// here now, both through the verifier.
+#[test]
+fn a_connect_between_two_scalar_event_widths_still_lowers() {
+    let env_prog = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcT
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcT
+
+transactor RelayT
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayT
+
+env ConnEnv
+    source : SrcT passive
+    relay  : RelayT passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end env ConnEnv
+
+test ConnTest
+    let dut : Top
+    let env : ConnEnv
+    run
+        env.source.publish(1)
+        wait 1 cycle
+    end run
+end test ConnTest
+"#
+        )
+    };
+    let tb_prog = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcTb
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcTb
+
+transactor RelayTb
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayTb
+
+testbench TbConn
+    dut : Top
+    source : SrcTb passive
+    relay  : RelayTb passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench TbConn
+
+impl TConn for TbConn
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl TConn
+"#
+        )
+    };
+    for (src, sink) in [
+        ("uint<8>", "uint<8>"),
+        ("uint<8>", "uint<16>"),
+        ("uint<8>", "uint"),
+        ("uint", "uint<8>"),
+        ("uint", "uint<64>"),
+        ("bool", "uint<1>"),
+        ("uint<1>", "bool"),
+        ("sint<8>", "sint<64>"),
+        ("sint<64>", "sint<8>"),
+        ("uint<128>", "uint<128>"),
+        ("uint<160>", "uint<1024>"),
+        ("uint<8>", "uint<1024>"),
+    ] {
+        for (scope, src_text) in [
+            ("env", env_prog(src, sink)),
+            ("testbench", tb_prog(src, sink)),
+        ] {
+            let prog = lower_src(&src_text).unwrap_or_else(|e| {
+                panic!("`event<{src}> -> event<{sink}>` must lower at {scope} scope: {e:?}");
+            });
+            // The verifier is where the twin of this bug lived. A
+            // program that lowers and fails verification is an
+            // `internal error` from the CLI, which is strictly worse
+            // than the refusal it replaced.
+            verify::verify_program(&prog).unwrap_or_else(|e| {
+                panic!("`event<{src}> -> event<{sink}>` must VERIFY at {scope} scope: {e:?}");
+            });
+        }
+    }
+    // The rule that arm DOES enforce. Without it the assertions above
+    // would also pass with the whole check deleted.
+    let err =
+        lower_src(&env_prog("uint<8>", "sint<8>")).expect_err("signedness must still disagree");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("agree in signedness"),
+        "a signedness mismatch keeps its own diagnostic: {msg}"
+    );
+}
+
+/// A `connect` whose payload is WIDER than the subscriber receiving it
+/// is refused, at both sink kinds, and graded by what v1 does with the
+/// bridge it emits anyway.
+///
+/// This became reachable only when the payload gate opened past 64
+/// bits. v1's bridge is a generic lambda — `src.push_back([&](auto _t)
+/// { for (auto& _s : sink) _s(_t); })` — so delivery is one C++
+/// implicit conversion, and g++ `-std=gnu++20` was asked what each
+/// conversion does:
+///
+///   - `HarcWide<32>` into `uint64_t` or `_harc_u128`: compiles, and
+///     drops the high words with no diagnostic. `SilentlyMisLowers`.
+///   - `HarcWide<32>` into `HarcWide<5>`: no such conversion exists, so
+///     v1's bridge does not compile. `EmitsUncompilable`.
+///
+/// Widening is NOT refused: `HarcWide<5>` into `HarcWide<32>` was
+/// measured to preserve every word (it does not round-trip through
+/// `uint64_t`), and the widening rows are asserted in
+/// `a_connect_between_two_scalar_event_widths_still_lowers`.
+#[test]
+fn a_connect_that_narrows_its_payload_is_refused() {
+    let event_sink = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcW
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcW
+
+transactor RelayW
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayW
+
+env NarrowEnv
+    source : SrcW passive
+    relay  : RelayW passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end env NarrowEnv
+
+test NarrowTest
+    let dut : Top
+    let env : NarrowEnv
+    run
+        env.source.publish(1)
+        wait 1 cycle
+    end run
+end test NarrowTest
+"#
+        )
+    };
+    // TESTBENCH scope as well as `env` scope: `verify.rs` walks only
+    // `tb.connects`, so an `env` connect never reaches the verifier and
+    // a verdict measured only there says nothing about the path the
+    // CLI takes.
+    let tb_event_sink = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcWTb
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcWTb
+
+transactor RelayWTb
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayWTb
+
+testbench NarrowTb
+    dut : Top
+    source : SrcWTb passive
+    relay  : RelayWTb passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench NarrowTb
+
+impl NarrowTbTest for NarrowTb
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl NarrowTbTest
+"#
+        )
+    };
+    let method_sink = |src: &str, sink: &str| {
+        fixture("analysis_sink_connect_test.harc")
+            .replace("out event<uint<8>>", &format!("out event<{src}>"))
+            .replace("write_obs(v: uint<8>)", &format!("write_obs(v: {sink})"))
+            .replace("sample_obs(v: uint<8>)", &format!("sample_obs(v: {sink})"))
+            .replace("sum = sum + v", "sum = sum + 1")
+    };
+    for (src, sink, v1) in [
+        ("uint<128>", "uint<8>", lower::V1Status::SilentlyMisLowers),
+        ("uint<1024>", "uint<8>", lower::V1Status::SilentlyMisLowers),
+        (
+            "uint<1024>",
+            "uint<128>",
+            lower::V1Status::SilentlyMisLowers,
+        ),
+        (
+            "uint<1024>",
+            "uint<160>",
+            lower::V1Status::EmitsUncompilable,
+        ),
+    ] {
+        for (label, src_text) in [
+            ("env event sink", event_sink(src, sink)),
+            ("testbench event sink", tb_event_sink(src, sink)),
+            ("method sink", method_sink(src, sink)),
+        ] {
+            let err = lower_src(&src_text).err().unwrap_or_else(|| {
+                panic!("`event<{src}>` into a `{sink}` {label} must be refused, not lowered")
+            });
+            let msg = assert_not_implemented(&err, v1);
+            assert!(
+                msg.contains("wider than the subscriber"),
+                "`event<{src}>` -> `{sink}` ({label}): {msg}"
+            );
+        }
+    }
+}
+
+/// The IR dump names an event payload's EXACT type.
+///
+/// `field observed : out event<uint>` was what a `uint<8>` payload and
+/// a `uint<1024>` payload both printed — right beside a scalar field
+/// that names its exact type, which is the discipline
+/// `the_ir_dump_names_a_component_scalar_fields_exact_type` asserts a
+/// few lines up. It also meant the `*_dump_ir` snapshot corpus was
+/// structurally incapable of catching a payload-width regression: the
+/// only line that could move was an `on` handler's parameter.
+///
+/// The COMPONENT-FIELD renderer is what this pins. `type_str`'s
+/// `IrType::Event` arm was changed the same way and is NOT covered:
+/// no probe here and no snapshot in `tests/snapshots/` renders an
+/// `IrType::Event` through it. Saying so is better than a doc comment
+/// claiming "both renderers" over one of them, which is what the first
+/// version of this said.
+///
+/// The dump also prints `out` for EVERY event field, including an
+/// input one — `inev : event<uint<16>>` dumps as `out
+/// event<uint<16>>`. That is not this test's subject and not fixable
+/// here: `ComponentFieldKind::Event { payload }` records no direction
+/// at all, so the renderer has nothing to consult. Measured and left
+/// alone rather than papered over.
+#[test]
+fn the_ir_dump_names_an_event_payloads_exact_type() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor DumpSrc
+    observed : out event<{ty}>
+    n : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor DumpSrc
+
+testbench TbDump
+    dut : Top
+    src : DumpSrc passive
+end testbench TbDump
+
+impl TDump for TbDump
+    run
+        src.publish(1)
+        wait 1 cycle
+    end run
+end impl TDump
+"#
+        )
+    };
+    for (ty, want) in [
+        ("uint<8>", "field observed : out event<uint<8>>"),
+        ("sint<32>", "field observed : out event<sint<32>>"),
+        ("uint<1024>", "field observed : out event<uint<1024>>"),
+        // `event<uint>` — a scalar payload with no declared width.
+        ("uint", "field observed : out event<uint>"),
+    ] {
+        let dump = format!(
+            "{}",
+            lower_src(&prog(ty)).unwrap_or_else(|e| panic!("`event<{ty}>` lowers: {e:?}"))
+        );
+        assert!(
+            dump.contains(want),
+            "`event<{ty}>` must dump as `{want}`:\n{dump}"
+        );
+    }
+
+    // A genuinely BARE `event`, with no type argument at all — a
+    // different source shape from `event<uint>`, and the one that
+    // would show a manufactured width if `scalar_ir_type()` invented
+    // one for a `None`.
+    let bare = prog("uint").replace("out event<uint>", "out event");
+    // Without this the row is a no-op that still passes: the assertion
+    // below is the same string `prog("uint")` already prints, so a
+    // template edit that stopped matching the replace pattern would
+    // silently degrade this into a duplicate of the row above — the
+    // "looks like coverage" failure mode this file keeps finding.
+    assert_ne!(
+        bare,
+        prog("uint"),
+        "the bare-`event` substitution must actually change the source"
+    );
+    let dump = format!("{}", lower_src(&bare).expect("a bare `event` field lowers"));
+    assert!(
+        dump.contains("field observed : out event<uint>"),
+        "a bare `event` must not acquire a width:\n{dump}"
+    );
+}
+
+/// The verifier backstops the `connect` payload-width rule at BOTH
+/// sink kinds — by asking lowering's predicate, not by restating it.
+///
+/// A backstop only earns its name against an IR lowering would not
+/// produce, so this builds one: lower a valid connect, then widen the
+/// SOURCE payload in the schema and hand the result to the verifier.
+/// That is what a lowering site which forgot to call
+/// `connect_delivery_verdict` would emit — and one did: with that call
+/// deleted, `event<uint<1024>> -> observe(v: uint<8>)` lowered,
+/// verified clean, and emitted a
+/// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
+/// parameter, dropping 960 bits per notification with no diagnostic.
+///
+/// Testbench scope on purpose. `verify.rs` walks `tb.connects` only,
+/// so the same edge inside an `env` — the majority shape in the
+/// fixture corpus — reaches no verifier at all. That hole is real and
+/// is NOT closed here; this test pins the scope that is covered so the
+/// coverage claim stays honest about which one it is.
+#[test]
+fn the_verifier_backstops_the_connect_payload_width_rule() {
+    let widen_source_payload = |prog: &mut ir::TbProgram| {
+        let payload = prog
+            .components
+            .iter_mut()
+            .flat_map(|c| c.fields.iter_mut())
+            .find_map(|f| match &mut f.kind {
+                ir::ComponentFieldKind::Event { payload } => Some(payload),
+                _ => None,
+            })
+            .expect("the source declares an event field");
+        *payload = ir::EventPayload::Scalar {
+            signed: false,
+            width: Some(1024),
+        };
+    };
+
+    // Sink kind 1: a hookable METHOD parameter.
+    let method_sink = r#"transactor BackstopSrc
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor BackstopSrc
+
+scoreboard BackstopSb
+    seen : uint<32> default 0
+    hookable observe(v: uint<8>)
+        seen = seen + 1
+    end observe
+end scoreboard BackstopSb
+
+testbench BackstopTb
+    dut : Top
+    source : BackstopSrc passive
+    sb     : BackstopSb
+    connect
+        source.observed -> sb.observe
+    end connect
+end testbench BackstopTb
+
+impl BackstopTest for BackstopTb
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl BackstopTest
+"#;
+
+    // Sink kind 2: another component's EVENT field.
+    let event_sink = r#"transactor BackstopSrc2
+    observed : out event<uint<8>>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor BackstopSrc2
+
+transactor BackstopRelay
+    inev : event<uint<8>>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor BackstopRelay
+
+testbench BackstopTb2
+    dut : Top
+    source : BackstopSrc2 passive
+    relay  : BackstopRelay passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end testbench BackstopTb2
+
+impl BackstopTest2 for BackstopTb2
+    run
+        source.publish(1)
+        wait 1 cycle
+    end run
+end impl BackstopTest2
+"#;
+
+    for (kind, src) in [("method sink", method_sink), ("event sink", event_sink)] {
+        let mut prog = lower_src(src).unwrap_or_else(|e| panic!("{kind} lowers: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("{kind} verifies before the widening: {e:?}"));
+        widen_source_payload(&mut prog);
+        verify::verify_program(&prog).expect_err(&format!(
+            "{kind}: a 1024-bit payload cannot be delivered to a 64-bit subscriber"
+        ));
+    }
 }
