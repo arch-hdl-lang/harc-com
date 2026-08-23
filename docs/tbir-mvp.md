@@ -9013,6 +9013,42 @@ former `transaction` group lives in
      `PartialEq`, two verifier arms and a lowering arm, and each pass
      found the copy the previous one had not thought to look for.
 
+142. **Two field shapes that promised v1 but v1 breaks them the same
+     way at every landing (2026-08-23).**
+
+     Two `unsupported` field-declaration arms — which is to say, two
+     arms telling the user to *re-run with `--codegen v1`* — where v1
+     measurably does the wrong thing:
+
+     - `Vec<T,N> default {…}` emitted `std::array<uint64_t, N> v = 0;`,
+       which g++ rejects ("conversion from `int` to non-scalar type").
+       `EmitsUncompilable`, the grade its sibling `queue`/`Record`/
+       event `default` arms already carry three to twenty lines away.
+     - a `buffer<T>` / `stream<T>` field fell through to the scalar
+       catch-all; v1 has no runtime for either and emits a bare
+       `uint64_t`, dropping the message-passing semantics.
+       `SilentlyMisLowers`. Now a named arm rather than a generic
+       "unsupported type".
+
+     Both measured with `cpp_tb::emit` + g++, on a scoreboard AND a
+     transactor, before regrading — because the third candidate did not
+     survive that check.
+
+     **The one that got away, and why the check mattered.** A
+     directional (`in`/`inout`) event field looked like a third row of
+     the same kind. It is not: v1's behavior splits by landing. On a
+     scoreboard v1 emits a bare `uint64_t` (mis-lowering); on a
+     TRANSACTOR v1 emits the real
+     `std::vector<std::function<void(uint64_t)>> ev;` subscriber list.
+     Grading the two together put a false detail — "v1 emits a bare
+     scalar" — on the transactor case, and a transactor test that
+     pinned the old grade failed the moment the regrade was grouped in.
+     That is the batch-45 lesson arriving on schedule: a grade is per
+     landing, and "measure it on more than one landing" is how you find
+     out the grade is not uniform. The directional-event arm stays
+     `unsupported` pending a landing-split slice, with the split
+     recorded at the site.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

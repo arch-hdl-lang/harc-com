@@ -37623,3 +37623,92 @@ end impl BackstopTest2
         ));
     }
 }
+
+/// Field-declaration shapes that promised v1 (`Unsupported`) while v1
+/// measurably mishandles them, THE SAME WAY at every landing. Each is
+/// regraded to the honest `NotImplemented` grade its own siblings
+/// already carry, and each row pins v1's ACTUAL emission so the grade
+/// rests on what v1 does, not on a remembered claim.
+///
+/// - `Vec<T,N> default` → `EmitsUncompilable`. v1 emits the aggregate
+///   default as a scalar initializer on a `std::array` member
+///   (`= 0`), which g++ refuses. The sibling `queue`/`Record`/event
+///   `default` arms already grade this way.
+/// - `buffer`/`stream` → `SilentlyMisLowers`. v1 has no runtime for
+///   either and emits a bare `uint64_t`, dropping the message-passing
+///   semantics.
+///
+/// A DIRECTIONAL event field looked like a third row and is
+/// deliberately absent: v1's behavior there splits by landing (a
+/// subscriber list on a transactor, a bare `uint64_t` on a
+/// scoreboard), so it is not a uniform mis-grade — the batch-45
+/// lesson, caught here by a transactor test failing when it was
+/// grouped in.
+#[test]
+fn misgraded_field_shapes_are_regraded_to_what_v1_actually_does() {
+    let prog = |field: &str| {
+        format!(
+            r#"scoreboard Sb
+    {field}
+    n : uint<32> default 0
+    hookable put(x: uint<8>)
+        n = n + 1
+    end put
+end scoreboard Sb
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+
+    // (field decl, grade, a substring of v1's mislowered member).
+    for (field, grade, v1_member) in [
+        (
+            "v : Vec<uint<8>, 2> default {0, 0}",
+            lower::V1Status::EmitsUncompilable,
+            "std::array<uint64_t, 2> v = 0",
+        ),
+        (
+            "b : buffer<uint<8>>",
+            lower::V1Status::SilentlyMisLowers,
+            "uint64_t b",
+        ),
+        (
+            "s : stream<uint<8>>",
+            lower::V1Status::SilentlyMisLowers,
+            "uint64_t s",
+        ),
+    ] {
+        let src = prog(field);
+        // tbir: the honest grade, and never the "re-run with v1" line.
+        let err = lower_src(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`{field}` must be refused, not lowered"));
+        let msg = assert_not_implemented(&err, grade);
+        assert!(
+            !msg.contains("re-run with `--codegen v1`"),
+            "`{field}` must not misdirect to v1: {msg}"
+        );
+        // v1: the mislowered member that JUSTIFIES the grade. Deriving
+        // it from v1's own output rather than asserting a remembered
+        // string is what keeps the grade measured.
+        let cpp = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        assert!(
+            cpp.contains(v1_member),
+            "`{field}`: v1 must emit `{v1_member}` (the mislowering the grade records):\n{}",
+            cpp.lines()
+                .filter(|l| l.contains("struct Sb")
+                    || l.trim().starts_with("std::")
+                    || l.contains("uint64_t "))
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
