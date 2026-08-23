@@ -1,0 +1,90 @@
+// Wide scalar state on a METHOD-BEARING component (harc#642).
+//
+// A component with a method is a composite, not a data-only scoreboard,
+// and its declared scalar fields lower through the component-field path.
+// Three separate seams had to hold for this to run:
+//
+//   - the field's storage (`HarcWide<8>` / `_harc_u128`, not `uint64_t`);
+//   - an UNTYPED read (`let observed = w.value`), which took the field's
+//     exact type only after `expr_type`'s host-state blind spot was
+//     covered — before that the local declared `uint64_t` and the copy
+//     silently kept the low word;
+//   - a wide scalar RETURN, whose lambda was hardcoded `-> uint64_t`
+//     independently of how the field was stored.
+//
+// Each assertion below reads a bit ABOVE 64 so a truncation at any one of
+// them fails rather than passing on the low word.
+
+scoreboard WideRegister
+    value  : uint<256> default 0
+    odd    : uint<200> default 0
+    medium : uint<65>  default 0
+
+    hookable write(next: uint<256>)
+        value = next
+    end write
+
+    function read() -> uint<256>
+        return value
+    end function read
+
+    function read_odd() -> uint<200>
+        return odd
+    end function read_odd
+end scoreboard WideRegister
+
+env WideEnv
+    nested : WideRegister
+end env WideEnv
+
+testbench WideScalarStateTb
+    dut  : Top
+    a    : WideRegister
+    b    : WideRegister
+    top  : WideEnv
+end testbench WideScalarStateTb
+
+impl ComponentWideScalarStateTest for WideScalarStateTb
+    run
+        let one : uint<256> = 1
+        let high = one << 200
+        a.value = high
+        a.odd = (one << 199).trunc<200>()
+        a.medium = (one << 64).trunc<65>()
+        top.nested.value = one << 128
+        wait 1 cycle
+
+        // Untyped read of a wide component field: the local must take
+        // the field's 256-bit type, not `uint64_t`.
+        let observed = a.value
+        assert (observed >> 200) == 1 else fail("untyped wide read lost a high bit")
+
+        let odd_observed = a.odd
+        assert (odd_observed >> 199) == 1 else fail("untyped non-word-aligned read truncated")
+
+        let medium_observed = a.medium
+        assert (medium_observed >> 64) == 1 else fail("untyped 65-bit read truncated")
+
+        // …and the same value back out through a wide scalar RETURN.
+        let via_method : uint<256> = a.read()
+        assert (via_method >> 200) == 1 else fail("wide method return lost a high bit")
+
+        let odd_via_method = a.read_odd()
+        assert (odd_via_method >> 199) == 1 else fail("wide 200-bit return truncated")
+
+        // Per-instance ownership: `b` never got a write.
+        let untouched = b.value
+        assert untouched == 0 else fail("wide component state is shared between instances")
+
+        // A wide method PARAMETER, and the nested-component path.
+        b.write(one << 255)
+        wait 1 cycle
+        let b_observed = b.read()
+        assert (b_observed >> 255) == 1 else fail("wide method parameter lost a high bit")
+
+        let nested_observed = top.nested.value
+        assert (nested_observed >> 128) == 1 else fail("nested wide component state truncated")
+
+        log(info, "wide component scalar state held")
+    end run
+end impl ComponentWideScalarStateTest

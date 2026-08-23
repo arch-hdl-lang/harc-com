@@ -3201,10 +3201,18 @@ fn emit_component_fn_lambda(
 
     // A record-returning method (`function predict_read(...) ->
     // ReadResponse`) returns the record struct by value; a scalar return
-    // widens to uint64_t; no return is `void`.
+    // takes the same width-aware storage every other scalar does; no
+    // return is `void`.
+    //
+    // `local_scalar_cty`, not a hardcoded `uint64_t`: past 64 bits a
+    // scalar lives in `_harc_u128` or `harc_rt::HarcWide<N>`, and a
+    // `-> uint<256>` getter narrowed to the low word here even after
+    // its field was stored wide (issue #642). The `__ret` local now
+    // carries the declared return type, so this reads the same
+    // `IrType` the params below do and the two cannot drift.
     let ret_ty = match func.ret.map(|r| &func.locals[r.index()].ty) {
         Some(IrType::Record(r)) => prog.records[r.index()].name.clone(),
-        Some(_) => "uint64_t".to_string(),
+        Some(ty) => super::local_scalar_cty(ty),
         None => "void".to_string(),
     };
     // The receiver `self`, then one parameter per declared param — a

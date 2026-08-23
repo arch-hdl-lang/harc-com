@@ -2242,14 +2242,35 @@ fn lower_method_body(
     }
     if let Some(rt) = &h.return_ty {
         let ret = b.declare("__ret");
-        // A record-returning method (`-> ReadResponse`) types its `__ret`
-        // slot as the record so codegen declares it as the struct (and the
-        // lambda's return type resolves to the record name).
-        if let TypeExpr::Named { name, .. } = rt {
-            let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
-            if let Some(&rid) = ctx.record_ids.get(simple) {
-                b.set_local_type(ret, IrType::Record(rid));
+        // The `__ret` slot carries the method's DECLARED return type, so
+        // codegen declares it — and resolves the lambda's return type —
+        // from one place. A record return (`-> ReadResponse`) becomes the
+        // struct; `-> uint<256>` becomes `UInt(Some(256))` so the emitter
+        // renders `harc_rt::HarcWide<8>` through `local_scalar_cty`.
+        //
+        // Only the RECORD half of this used to be typed, and the emitter
+        // mapped every other return to `uint64_t`. A getter for a wide
+        // field (`function read() -> uint<256>`) therefore truncated to
+        // the low word with no diagnostic even once the field itself was
+        // stored wide — the second, independent truncation seam in issue
+        // #642. `method_param_ir_type` is the same resolver the params a
+        // few lines up use, so a parameter and a return spelled with the
+        // same type can no longer disagree.
+        //
+        // RECORD and SCALAR only. `method_param_ir_type` also resolves
+        // `TSeq<T>` and component-typed spellings, but the method
+        // emitter maps both of those returns to `uint64_t` and no
+        // fixture returns one — typing the slot without teaching the
+        // emitter would declare `std::vector<Beat> __ret` inside a
+        // lambda still declared `-> uint64_t`, which is a new
+        // inconsistency, not a fix. They keep the `Unknown` slot they
+        // have; issue #642 lists expanding unrelated features as a
+        // non-goal.
+        match method_param_ir_type(Some(rt), ctx) {
+            ty @ (IrType::Record(_) | IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
+                b.set_local_type(ret, ty)
             }
+            _ => {}
         }
         b.helper_ret = Some(ret);
     }

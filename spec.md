@@ -2157,6 +2157,30 @@ end scoreboard AxiSb
 
 Equality on transactions is structural and free; `==` does the right thing without `do_compare` boilerplate.
 
+**Persistent scalar state and its width.** A declared scalar field on a
+scoreboard, or on any method-bearing component (agent, env, sequencer,
+analysis component, component-shaped transactor), keeps its declared width and
+signedness independently of the C++ carrier it is stored in — `uint64_t` /
+`int64_t` through 64 bits, `_harc_u128` from 65 through 128, and
+`harc_rt::HarcWide<ceil(N/32)>` above that. Unsigned fields reach the
+language's 1024-bit vector target; **signed fields stop at 64 bits**, because
+both wide carriers are unsigned and `<`, `/`, `%` and `>>` on one would answer
+by magnitude rather than by the declared sign bit.
+
+Writing such a field follows the same directional rule a typed `let` follows:
+the value's width must not exceed the field's, and its signedness must match.
+Implicit narrowing and implicit signed/unsigned relabeling are rejected — use
+`.trunc<N>()` or an explicit `as uint<N>` / `as sint<N>` when the change is
+intended. This matters most where two different declared widths share one
+carrier: `uint<129>` and `uint<65>` are both `_harc_u128`, so C++ would take
+the assignment and leave the bits above 65 live in storage with no error
+anywhere. Widening is implicit, and zero-extends for unsigned values and
+sign-extends for signed ones.
+
+Reads keep the field's exact type too, including an unannotated one: `let v =
+sb.wide` on a `uint<256>` field gives `v` that type, not a 64-bit slot, and so
+does an unannotated destination of a method whose declared return type is wide.
+
 ### 8.5 `env`
 
 `env` is the multi-transactor composition unit. It holds shared scoreboards and cross-bus connect bridges. Its members are typically `transactor`s directly (preferred) or `agent`s when a sequencer + transactor + wiring bundle is being reused.

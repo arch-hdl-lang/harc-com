@@ -36233,3 +36233,154 @@ end impl TDir
         );
     }
 }
+
+/// Wide scalar state on a METHOD-BEARING component — the four seams
+/// issue #642 named, each of which truncates SILENTLY on its own.
+///
+/// Lifting the field-width cap (#653) was only the first of them. The
+/// other three all read or write the same wide field through a path
+/// that had its own hardcoded 64-bit assumption, so a partial fix moved
+/// the failure from a clear lowering diagnostic to a low-word copy that
+/// compiles, runs, and quietly answers wrong.
+#[test]
+fn wide_component_scalar_state_keeps_its_declared_type_at_every_seam() {
+    let prog = lower_src(&fixture("component_wide_scalar_state_test.harc"))
+        .expect("wide component scalar state lowers");
+    verify::verify_program(&prog).expect("wide component scalar state verifies");
+
+    let local_ty = |func: &ir::TbFunction, name: &str| {
+        func.locals
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("local `{name}` is missing"))
+            .ty
+            .clone()
+    };
+    let run = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .expect("the run body is lowered");
+
+    // Seam 2 — an UNTYPED read takes the field's exact type. Before
+    // this, `expr_type` had no `Expr::ComponentField` arm, the local
+    // declared `uint64_t`, and the copy kept the low word. Each of the
+    // three widths exercises a different C++ carrier: `HarcWide<8>`,
+    // `HarcWide<7>` (non-word-aligned), `_harc_u128`.
+    for (name, want) in [
+        ("observed", ir::IrType::UInt(Some(256))),
+        ("odd_observed", ir::IrType::UInt(Some(200))),
+        ("medium_observed", ir::IrType::UInt(Some(65))),
+    ] {
+        assert_eq!(
+            local_ty(run, name),
+            want,
+            "an untyped read of a wide component field must take the field's type"
+        );
+    }
+
+    // Seam 4 — and so does an untyped destination of a wide method
+    // CALL, which survives fixing the lambda's own return type.
+    assert_eq!(
+        local_ty(run, "odd_via_method"),
+        ir::IrType::UInt(Some(200)),
+        "an untyped wide method result must take the method's return type"
+    );
+
+    // Seam 3 — the hidden `__ret` slot carries the DECLARED return
+    // type, which is what the emitter renders the lambda's return type
+    // from. Only the record half of this used to be typed.
+    let returns: Vec<ir::IrType> = prog
+        .functions
+        .iter()
+        .filter_map(|f| f.ret.map(|r| f.locals[r.index()].ty.clone()))
+        .collect();
+    assert!(
+        returns.contains(&ir::IrType::UInt(Some(256)))
+            && returns.contains(&ir::IrType::UInt(Some(200))),
+        "component-method `__ret` slots must carry their declared wide types, got {returns:?}"
+    );
+}
+
+/// A write into a wide component field follows the same directional
+/// assignment rule a data-only scoreboard field already followed.
+///
+/// The two carriers make this necessary rather than merely tidy:
+/// `uint<129>` and `uint<65>` are BOTH `_harc_u128`, so C++ takes the
+/// assignment and leaves the bits above 65 live in storage. There is no
+/// compiler error to fall back on and no runtime check — only this
+/// diagnostic stands between the user and a checker that silently keeps
+/// bits it does not have.
+#[test]
+fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
+    let prog = |field: &str, param: &str| {
+        format!(
+            "scoreboard NarrowState\n    \
+                 value : {field} default 0\n\n    \
+                 hookable write(v: {param})\n        \
+                     value = v\n    \
+                 end write\n\
+             end scoreboard NarrowState\n\n\
+             testbench NarrowTb\n    dut : Top\n    n : NarrowState\n\
+             end testbench NarrowTb\n\n\
+             impl NarrowTest for NarrowTb\n    run\n        wait 1 cycle\n    end run\n\
+             end impl NarrowTest\n"
+        )
+    };
+
+    // Same carrier (`_harc_u128`), different declared widths.
+    let err = lower_src(&prog("uint<65>", "uint<129>"))
+        .expect_err("an implicit narrowing into a wide component field is refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && msg.contains("assignment of a 129-bit value")
+            && msg.contains("component field `value`, declared 65 bits")
+            && msg.contains("narrows"),
+        "the diagnostic must name both widths and the destination: {msg}"
+    );
+
+    // Matching carriers do not make the language types interchangeable.
+    let err = lower_src(&prog("uint<65>", "sint<32>"))
+        .expect_err("an implicit signedness change is refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("component field `value`") && msg.contains("Signedness must match"),
+        "a signedness change must be diagnosed separately from a width change: {msg}"
+    );
+
+    // Legal widening is untouched, in both directions of the carrier
+    // boundary (`_harc_u128` → `HarcWide<5>`, and within one carrier).
+    for (field, param) in [
+        ("uint<129>", "uint<65>"),
+        ("uint<256>", "uint<129>"),
+        ("uint<129>", "uint<129>"),
+    ] {
+        let widening = lower_src(&prog(field, param));
+        assert!(
+            widening.is_ok(),
+            "`{param}` into `{field}` widens and must lower: {:?}",
+            widening.err()
+        );
+    }
+
+    // The ORDINARY counting idiom stays legal. An `on ev(t)` payload
+    // param is widthless (`EventPayload::Scalar` records signedness
+    // only), and `common_expr_type` gives a widthless operand the
+    // 64-bit host ABI — so `seen + t` types as 64 bits whatever `seen`
+    // is. A ≤64-bit destination is therefore NOT judged here; a
+    // destination past 64 cannot be narrowed by that manufactured 64,
+    // which is what keeps the check above resting only on declared
+    // widths. See the follow-up issue for the ≤64-bit half.
+    let counter = "domain SysDomain\n  freq_mhz: 100\nend domain SysDomain\n\n\
+         agent Tagger\n    \
+             in_ev : event<uint<8>>\n    \
+             seen  : uint<32> default 0\n\n    \
+             on in_ev(t)\n        seen = seen + t\n    end on\n\
+         end agent Tagger\n\n\
+         test T\n    let dut : Top\n    let tagger : Tagger\n    clock clk = SysDomain\n    \
+             run\n        wait 2 cycles\n        emit tagger.in_ev(1)\n        \
+                 wait 2 cycles\n    end run\n\
+         end test T\n";
+    lower_src(counter).expect("`seen = seen + t` on a widthless payload param stays legal");
+}
