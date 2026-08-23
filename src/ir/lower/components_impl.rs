@@ -2598,6 +2598,15 @@ where
                 both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
+        // Signedness agreeing is not the whole rule once the payload
+        // gate carries widths past 64: `event<uint<1024>> ->
+        // sb.write_obs(v: uint<8>)` matches on signedness and delivers
+        // 64 of 1024 bits.
+        if let Some(src_ty) = src_payload.scalar_ir_type() {
+            if let Some(e) = connect_delivery_verdict(&src_ty, &sm.param_tys[0]) {
+                return Err(e);
+            }
+        }
         (
             crate::ir::ConnectSink::Method { method: sink_name },
             sm.activation,
@@ -2608,12 +2617,25 @@ where
         ..
     }) = sink_comp.field(&sink_name)
     {
-        if *payload != src_payload {
+        // NOT `*payload != src_payload`. `EventPayload` derives
+        // `PartialEq`, so the moment it grew a `width` that struct
+        // equality started refusing `event<uint<8>> ->
+        // event<uint<16>>` — two payloads v1 renders as the same
+        // `uint64_t` and TB-IR lowered until this batch. Ask the two
+        // questions the bridge actually turns on instead.
+        if !event_payloads_agree_in_shape(src_payload, *payload) {
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
                 both_scalar_payloads(src_payload, *payload),
             ));
+        }
+        if let (Some(src_ty), Some(sink_ty)) =
+            (src_payload.scalar_ir_type(), payload.scalar_ir_type())
+        {
+            if let Some(e) = connect_delivery_verdict(&src_ty, &sink_ty) {
+                return Err(e);
+            }
         }
         (
             crate::ir::ConnectSink::Event { event: sink_name },
@@ -2797,6 +2819,96 @@ fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
         (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
         (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        _ => false,
+    }
+}
+
+/// C++ storage class of a scalar the `connect` bridge has to carry,
+/// ordered by width so that `rank(src) <= rank(sink)` is exactly
+/// "the delivery does not lose bits".
+///
+/// The emitted bridge is v1's generic lambda —
+/// `src.push_back([&](auto _t) { for (auto& _s : sink) _s(_t); })` —
+/// so delivery is one C++ implicit conversion from the source
+/// payload's storage to the sink's. The classes are
+/// `local_scalar_cty`'s: `uint64_t`/`int64_t` to 64 bits,
+/// `_harc_u128` to `BUILTIN_SCALAR_BITS`, then `HarcWide<N>` with
+/// `N = ceil(width / 32)`. `N` is at least 5 for any wide scalar, so
+/// widening the wide class into the same ordering needs no offset.
+///
+/// A widthless scalar and a `bool` both rank 0: tbir renders each
+/// `uint64_t` in a parameter position.
+fn scalar_storage_rank(ty: &IrType) -> u32 {
+    match ty {
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > super::BUILTIN_SCALAR_BITS => {
+            w.div_ceil(32)
+        }
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64 => 1,
+        _ => 0,
+    }
+}
+
+/// What happens if a notification typed `src` is delivered to a
+/// subscriber whose scalar parameter is typed `sink`.
+///
+/// Measured with g++ `-std=gnu++20` over every ordered pair of the
+/// four storage classes, on v1's own bridge lambda:
+///
+/// | src → sink | result |
+/// | --- | --- |
+/// | same class | exact |
+/// | narrower → wider, any pair | exact — `_harc_u128` zero-extends, and `HarcWide<A>` → `HarcWide<B>` with `A < B` preserves every word (it does NOT round-trip through `uint64_t`) |
+/// | `HarcWide<A>` → `HarcWide<B>`, `A > B` | does not compile |
+/// | anything wider → `uint64_t` / `_harc_u128` | compiles, and drops the high bits with no diagnostic |
+///
+/// Both failing rows became reachable only when the payload gate
+/// opened past 64 bits, so both are this batch's to answer for.
+fn connect_delivery_verdict(src: &IrType, sink: &IrType) -> Option<LowerError> {
+    let (s, k) = (scalar_storage_rank(src), scalar_storage_rank(sink));
+    if s <= k {
+        return None;
+    }
+    Some(if k > 1 {
+        // Both wide, sink narrower: `HarcWide<A>` has no conversion to
+        // a shorter `HarcWide<B>`, so v1's bridge does not compile.
+        not_implemented(
+            CONNECT_NARROWING_CONSTRUCT,
+            "a wide payload cannot be delivered into a narrower wide subscriber: \
+             `harc_rt::HarcWide<A>` converts to no shorter `HarcWide<B>`, and v1 emits \
+             the bridge anyway, so the emitted C++ does not compile",
+            V1Status::EmitsUncompilable,
+        )
+    } else {
+        not_implemented(
+            CONNECT_NARROWING_CONSTRUCT,
+            "the payload is wider than the subscriber that receives it, so the bridge \
+             would drop the high bits; v1 emits it and the narrowing conversion is \
+             silent — the notification arrives truncated with no diagnostic",
+            V1Status::SilentlyMisLowers,
+        )
+    })
+}
+
+/// One construct string for both narrowing arms. The two differ in
+/// what v1 does, not in what the program said, and a caller that
+/// re-spelled it would be a second place to keep in step.
+const CONNECT_NARROWING_CONSTRUCT: &str =
+    "a `connect` whose payload is wider than the subscriber receiving it";
+
+/// Do a `connect` source payload and a sink EVENT payload have the
+/// same SHAPE — the question `*payload != src_payload` answered back
+/// when `EventPayload::Scalar` held signedness and nothing else.
+///
+/// Width is deliberately not part of it: two scalar payloads of
+/// different declared widths are bridgeable whenever the delivery does
+/// not lose bits, and that is `connect_delivery_verdict`'s question,
+/// with its own diagnostic. Folding the two together is what made a
+/// legal program report "must agree in signedness" when signedness
+/// agreed.
+fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
+    match (src, sink) {
+        (EventPayload::Scalar { signed: a, .. }, EventPayload::Scalar { signed: b, .. }) => a == b,
+        (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
         _ => false,
     }
 }

@@ -4236,7 +4236,7 @@ impl FuncBuilder<'_> {
     pub(super) fn wide_scalar_words(&self, e: &Expr) -> Option<u32> {
         match self.scalar_assignment_type(e) {
             Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w)))
-                if w > Self::BUILTIN_SCALAR_BITS =>
+                if w > super::BUILTIN_SCALAR_BITS =>
             {
                 Some(w.div_ceil(32))
             }
@@ -4342,14 +4342,6 @@ impl FuncBuilder<'_> {
             _ => self.expr_type(e),
         }
     }
-
-    /// The widest scalar that is still a builtin C++ integer type.
-    /// Past this, `local_scalar_cty` renders the value as
-    /// `harc_rt::HarcWide<N>` — a struct, whose operator set is what a
-    /// binary expression on it can use. Named here rather than
-    /// imported from codegen so lowering does not depend on the
-    /// emitter, and kept in step with `wide_scalar_words`.
-    const BUILTIN_SCALAR_BITS: u32 = 128;
 
     /// Refuse `/ % < > <= >=` when either operand is wider than a
     /// builtin integer type.
@@ -4470,7 +4462,7 @@ impl FuncBuilder<'_> {
         Err(not_implemented(
             &format!(
                 "the operator `{sym}` on a scalar wider than {} bits",
-                Self::BUILTIN_SCALAR_BITS
+                super::BUILTIN_SCALAR_BITS
             ),
             format!(
                 "a scalar wider than {} bits is held as `harc_rt::HarcWide<N>`, which \
@@ -4478,7 +4470,7 @@ impl FuncBuilder<'_> {
                  as an UNSIGNED operation; `+ - * & | ^ == !=` are lowered at any width, as \
                  are `<<`/`>>` with an ordinary integer count. v1 emits the same expression and its C++ does not compile either, \
                  so `--codegen v1` is not a way out",
-                Self::BUILTIN_SCALAR_BITS
+                super::BUILTIN_SCALAR_BITS
             ),
             V1Status::EmitsUncompilable,
         ))

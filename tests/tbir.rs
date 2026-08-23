@@ -37138,3 +37138,175 @@ end impl SmallTest
     verify::verify_program(&prog)
         .expect("the verifier must not reject what lowering deliberately accepts");
 }
+
+/// Two scalar event payloads of DIFFERENT declared widths still
+/// `connect`, exactly as they did before the payload schema carried a
+/// width.
+///
+/// `EventPayload` derives `PartialEq`, and the event-sink branch asked
+/// `*payload != src_payload`. The moment the variant grew a `width`
+/// that struct equality silently became a width check, so
+/// `event<uint<8>> -> event<uint<16>>` — two payloads v1 renders as
+/// the same `std::function<void(uint64_t)>` — started reporting "source
+/// and sink scalar payloads must agree in signedness", a message that
+/// is false about a program whose signedness agrees.
+///
+/// The rows are the ones measured against `origin/main`'s own binary:
+/// all four lower there. Signedness disagreement is the rule that arm
+/// really enforces, so it stays refused.
+#[test]
+fn a_connect_between_two_scalar_event_widths_still_lowers() {
+    let prog = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcT
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcT
+
+transactor RelayT
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayT
+
+env ConnEnv
+    source : SrcT passive
+    relay  : RelayT passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end env ConnEnv
+
+test ConnTest
+    let dut : Top
+    let env : ConnEnv
+    run
+        env.source.publish(1)
+        wait 1 cycle
+    end run
+end test ConnTest
+"#
+        )
+    };
+    for (src, sink) in [
+        ("uint<8>", "uint<8>"),
+        ("uint<8>", "uint<16>"),
+        ("uint<8>", "uint"),
+        ("uint", "uint<8>"),
+        ("uint<128>", "uint<128>"),
+        ("uint<160>", "uint<1024>"),
+        ("uint<8>", "uint<1024>"),
+    ] {
+        lower_src(&prog(src, sink)).unwrap_or_else(|e| {
+            panic!("`event<{src}> -> event<{sink}>` must lower: {e:?}");
+        });
+    }
+    // The rule that arm DOES enforce. Without it the assertions above
+    // would also pass with the whole check deleted.
+    let err = lower_src(&prog("uint<8>", "sint<8>")).expect_err("signedness must still disagree");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("agree in signedness"),
+        "a signedness mismatch keeps its own diagnostic: {msg}"
+    );
+}
+
+/// A `connect` whose payload is WIDER than the subscriber receiving it
+/// is refused, at both sink kinds, and graded by what v1 does with the
+/// bridge it emits anyway.
+///
+/// This became reachable only when the payload gate opened past 64
+/// bits. v1's bridge is a generic lambda — `src.push_back([&](auto _t)
+/// { for (auto& _s : sink) _s(_t); })` — so delivery is one C++
+/// implicit conversion, and g++ `-std=gnu++20` was asked what each
+/// conversion does:
+///
+///   - `HarcWide<32>` into `uint64_t` or `_harc_u128`: compiles, and
+///     drops the high words with no diagnostic. `SilentlyMisLowers`.
+///   - `HarcWide<32>` into `HarcWide<5>`: no such conversion exists, so
+///     v1's bridge does not compile. `EmitsUncompilable`.
+///
+/// Widening is NOT refused: `HarcWide<5>` into `HarcWide<32>` was
+/// measured to preserve every word (it does not round-trip through
+/// `uint64_t`), and the widening rows are asserted in
+/// `a_connect_between_two_scalar_event_widths_still_lowers`.
+#[test]
+fn a_connect_that_narrows_its_payload_is_refused() {
+    let event_sink = |src: &str, sink: &str| {
+        format!(
+            r#"transactor SrcW
+    observed : out event<{src}>
+    n : uint<32> default 0
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor SrcW
+
+transactor RelayW
+    inev : event<{sink}>
+    m : uint<32> default 0
+    hookable poke(v: uint<8>)
+        m = m + 1
+    end poke
+end transactor RelayW
+
+env NarrowEnv
+    source : SrcW passive
+    relay  : RelayW passive
+    connect
+        source.observed -> relay.inev
+    end connect
+end env NarrowEnv
+
+test NarrowTest
+    let dut : Top
+    let env : NarrowEnv
+    run
+        env.source.publish(1)
+        wait 1 cycle
+    end run
+end test NarrowTest
+"#
+        )
+    };
+    let method_sink = |src: &str, sink: &str| {
+        fixture("analysis_sink_connect_test.harc")
+            .replace("out event<uint<8>>", &format!("out event<{src}>"))
+            .replace("write_obs(v: uint<8>)", &format!("write_obs(v: {sink})"))
+            .replace("sample_obs(v: uint<8>)", &format!("sample_obs(v: {sink})"))
+            .replace("sum = sum + v", "sum = sum + 1")
+    };
+    for (src, sink, v1) in [
+        ("uint<128>", "uint<8>", lower::V1Status::SilentlyMisLowers),
+        ("uint<1024>", "uint<8>", lower::V1Status::SilentlyMisLowers),
+        (
+            "uint<1024>",
+            "uint<128>",
+            lower::V1Status::SilentlyMisLowers,
+        ),
+        (
+            "uint<1024>",
+            "uint<160>",
+            lower::V1Status::EmitsUncompilable,
+        ),
+    ] {
+        for (label, src_text) in [
+            ("event sink", event_sink(src, sink)),
+            ("method sink", method_sink(src, sink)),
+        ] {
+            let err = lower_src(&src_text).err().unwrap_or_else(|| {
+                panic!("`event<{src}>` into a `{sink}` {label} must be refused, not lowered")
+            });
+            let msg = assert_not_implemented(&err, v1);
+            assert!(
+                msg.contains("wider than the subscriber"),
+                "`event<{src}>` -> `{sink}` ({label}): {msg}"
+            );
+        }
+    }
+}

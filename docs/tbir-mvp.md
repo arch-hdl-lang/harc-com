@@ -8861,6 +8861,65 @@ former `transaction` group lives in
      Three mutations: re-capping the gate, restoring the emitter's
      64-bit pair, and dropping the width on the way into the schema.
 
+139. **A derived `PartialEq` is a rule nobody wrote down
+     (2026-08-23).**
+
+     Divergence 138 added `width` to `EventPayload::Scalar`. The
+     `connect` event-sink branch asked `*payload != src_payload`, and
+     `EventPayload` derives `PartialEq` — so the new field silently
+     joined a comparison written when signedness was the only thing
+     the variant could hold. `event<uint<8>> -> event<uint<16>>`,
+     which v1 renders as two `std::function<void(uint64_t)>` and which
+     TB-IR had lowered all along, started failing with "source and
+     sink scalar payloads must agree in signedness": a refusal of a
+     legal program, under a message that was false about it.
+
+     Nothing in the tree caught it. The full suite passed, and the
+     206-fixture corpus lowered identically — because no fixture
+     connects two events of different declared widths. It took an
+     adversarial review pass reading the schema change against every
+     consumer of the type.
+
+     The lesson is narrower than "review your changes". A derived
+     `PartialEq` on a schema type makes every `==` in the tree a
+     silent participant in a field addition, and the compiler cannot
+     flag it: the code still type-checks and still means something,
+     just not what it meant. Adding a field to a type that derives
+     comparison is a change to every comparison of it. The two
+     questions the bridge actually turns on are now asked separately
+     and named — `event_payloads_agree_in_shape` for signedness and
+     record identity, `connect_delivery_verdict` for width — so a
+     third field cannot join either one by accident.
+
+     **The width question, measured rather than assumed.** Opening the
+     payload gate also made a wide payload deliverable into a narrow
+     subscriber, which main refused only because wide payloads were
+     refused outright. v1's bridge is a generic lambda, so delivery is
+     one C++ implicit conversion; g++ `-std=gnu++20` was asked what
+     each ordered pair of the four storage classes does:
+
+     | src → sink | result |
+     | --- | --- |
+     | same class | exact |
+     | narrower → wider, any pair | exact — `HarcWide<A>` → `HarcWide<B>` with `A < B` preserves every word, and does NOT round-trip through `uint64_t` as first assumed |
+     | `HarcWide<A>` → `HarcWide<B>`, `A > B` | does not compile |
+     | anything wider → `uint64_t` / `_harc_u128` | compiles, drops the high bits, no diagnostic |
+
+     Widening lowers; the two narrowing rows are refused, split by
+     what v1 does with them (`EmitsUncompilable` for the wide-into-
+     narrower-wide row, `SilentlyMisLowers` for the rest). The
+     first guess about the `HarcWide<A>` → `HarcWide<B>` row was
+     wrong in the safe direction, which is the argument for compiling
+     the claim rather than reasoning about the header.
+
+     A `check_space_all_lower` space pins the widening direction. The
+     neighbouring payload space substitutes one hole into both the
+     payload and the sink parameter, so source and sink always agree
+     there — which is precisely why a mismatch regression could pass
+     it. Five mutations: restoring the struct equality, disabling the
+     delivery guard, collapsing the two v1 grades into one, ranking
+     every wide width alike, and refusing on any width difference.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

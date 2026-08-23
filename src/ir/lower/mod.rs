@@ -11,6 +11,19 @@
 //! silently mis-lowers. Re-run with `--codegen v1` to use the legacy
 //! direct AST → C++ path for unsupported constructs.
 
+/// The widest scalar that is still a builtin C++ integer type.
+/// Past this, `local_scalar_cty` renders the value as
+/// `harc_rt::HarcWide<N>` — a struct, whose operator set is what a
+/// binary expression on it can use, and whose conversions are what a
+/// `connect` bridge can carry. Named here rather than imported from
+/// codegen so lowering does not depend on the emitter, and kept in
+/// step with `wide_scalar_words`.
+///
+/// It lived on `FuncBuilder` until the `connect` payload-width rule
+/// needed it too; a second copy in `components_impl.rs` would have
+/// been the fourth place this file's dominant failure mode has bitten.
+pub(crate) const BUILTIN_SCALAR_BITS: u32 = 128;
+
 mod addrmap;
 mod bus;
 pub(crate) mod components;

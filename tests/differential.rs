@@ -1099,6 +1099,77 @@ end impl TCF2
 /// The 64-bit cap on `scalar_ir_type`, which gates exactly two things:
 /// an event PAYLOAD type and a fixed-vector ELEMENT type.
 ///
+/// A `connect` whose source payload is NARROWER than the subscriber
+/// receiving it lowers at every width — the direction the width gate
+/// must not close.
+///
+/// The neighbouring space substitutes ONE hole into both the payload
+/// and the sink parameter, so source and sink always agree there and
+/// the mismatch case went unmeasured. It was a mismatch that broke:
+/// `EventPayload` derives `PartialEq`, and giving it a `width` turned
+/// the event-sink branch's `*payload != src_payload` into a width
+/// check that refused `event<uint<8>> -> event<uint<16>>`.
+///
+/// Fixing that by refusing LESS needs a space that fails when a row
+/// stops lowering, which is what `check_space_all_lower` is for — none
+/// of the three falsifiable directions fires on an over-refusal. The
+/// sink is pinned at the widest storage class so every row is a
+/// widening; the narrowing rows are refused on purpose and are pinned
+/// by `a_connect_that_narrows_its_payload_is_refused` with the v1
+/// grade each one measured.
+#[test]
+fn a_connect_delivering_into_a_wider_subscriber_lowers_at_every_width() {
+    let widening = r#"
+transactor NarrowSrc
+    ev : out event<@@TY@@>
+    n  : uint<32> default 0
+
+    hookable bump(v: uint<8>)
+        n = n + 1
+    end bump
+end transactor NarrowSrc
+
+scoreboard WideSink
+    seen : uint<32> default 0
+
+    hookable observe(v: uint<1024>)
+        seen = seen + 1
+    end observe
+end scoreboard WideSink
+
+env WidenEnv
+    src  : NarrowSrc passive
+    sink : WideSink
+
+    connect
+        src.ev -> sink.observe
+    end connect
+end env WidenEnv
+
+testbench TbWiden
+    dut : Top
+    e : WidenEnv
+end testbench TbWiden
+
+impl TWiden for TbWiden
+    run
+        e.src.bump(1)
+        wait 1 cycle
+    end run
+end impl TWiden
+"#;
+    println!(
+        "{}",
+        check_space_all_lower(
+            "connect-widening",
+            widening,
+            "@@TY@@",
+            "uint<1024>",
+            &["uint<8>", "uint<64>", "uint<65>", "uint<128>", "uint<1024>"],
+        )
+    );
+}
+
 /// The declared-field width work deliberately did not touch this
 /// function, and said why in its doc comment: "an event payload is a
 /// `std::function` parameter type and a fixed-vector element is an
