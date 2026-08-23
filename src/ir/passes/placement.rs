@@ -392,9 +392,17 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(value, &mut accesses, &mut transactor);
             }
-            Stmt::ComponentVecElementWrite { index, value, .. } => {
+            Stmt::ComponentVecElementWrite {
+                index,
+                inner_index,
+                value,
+                ..
+            } => {
                 host_service_only = false;
                 visit_expr(index, &mut accesses, &mut transactor);
+                if let Some(inner) = inner_index {
+                    visit_expr(inner, &mut accesses, &mut transactor);
+                }
                 visit_expr(value, &mut accesses, &mut transactor);
             }
             Stmt::ComponentEmit { args, .. } => {
@@ -598,7 +606,14 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
                 visit_expr(idx, accesses, transactor);
             }
         }
-        Expr::ComponentVecElement { index, .. } => visit_expr(index, accesses, transactor),
+        Expr::ComponentVecElement {
+            index, inner_index, ..
+        } => {
+            visit_expr(index, accesses, transactor);
+            if let Some(inner) = inner_index {
+                visit_expr(inner, accesses, transactor);
+            }
+        }
     }
 }
 

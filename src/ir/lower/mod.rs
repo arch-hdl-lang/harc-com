@@ -7740,7 +7740,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::Call(_, args) => args.iter().find_map(in_expr),
             // Component fields never carry a transactor-state instance.
             ir::Expr::ComponentField { .. } => None,
-            ir::Expr::ComponentVecElement { index, .. } => in_expr(index),
+            ir::Expr::ComponentVecElement {
+                index, inner_index, ..
+            } => in_expr(index).or_else(|| inner_index.as_deref().and_then(in_expr)),
             _ => None,
         }
     }
@@ -7809,9 +7811,14 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // state filler (they are not bound-to target responders);
                 // any expr they carry holds no transactor-state node.
                 ir::Stmt::ComponentFieldWrite { value, .. } => in_expr(value),
-                ir::Stmt::ComponentVecElementWrite { index, value, .. } => {
-                    in_expr(index).or_else(|| in_expr(value))
-                }
+                ir::Stmt::ComponentVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => in_expr(index)
+                    .or_else(|| inner_index.as_ref().and_then(in_expr))
+                    .or_else(|| in_expr(value)),
                 ir::Stmt::ComponentEmit { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ComponentCall { args, .. } => args.iter().find_map(in_expr),
                 // tseq bodies never appear in a bound-to responder body
@@ -7916,7 +7923,14 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::CovHookParam {
                 index: Some(idx), ..
             } => fill_expr(idx, instance),
-            ir::Expr::ComponentVecElement { index, .. } => fill_expr(index, instance),
+            ir::Expr::ComponentVecElement {
+                index, inner_index, ..
+            } => {
+                fill_expr(index, instance);
+                if let Some(inner) = inner_index {
+                    fill_expr(inner, instance);
+                }
+            }
             ir::Expr::Call(_, args) => {
                 for a in args {
                     fill_expr(a, instance);
@@ -8041,8 +8055,16 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     ir::ScoreboardOp::QueuePop { .. } => {}
                 },
                 ir::Stmt::ComponentFieldWrite { value, .. } => fill_expr(value, instance),
-                ir::Stmt::ComponentVecElementWrite { index, value, .. } => {
+                ir::Stmt::ComponentVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => {
                     fill_expr(index, instance);
+                    if let Some(inner) = inner_index {
+                        fill_expr(inner, instance);
+                    }
                     fill_expr(value, instance);
                 }
                 ir::Stmt::ComponentEmit { args, .. } => {
@@ -8216,8 +8238,13 @@ fn fill_visit_expr(
         Expr::CovHookParam {
             index: Some(idx), ..
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
-        Expr::ComponentVecElement { index, .. } => {
-            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
+        Expr::ComponentVecElement {
+            index, inner_index, ..
+        } => {
+            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict);
+            if let Some(inner) = inner_index {
+                fill_visit_expr(inner, placeholder, binding, remap, rewrite, conflict);
+            }
         }
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
@@ -8319,8 +8346,16 @@ fn fill_initiator_bus_prefix(
                         }
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
-                    Stmt::ComponentVecElementWrite { index, value, .. } => {
+                    Stmt::ComponentVecElementWrite {
+                        index,
+                        inner_index,
+                        value,
+                        ..
+                    } => {
                         visit_expr(index, placeholder, binding, remap, rewrite, &mut conflict);
+                        if let Some(inner) = inner_index {
+                            visit_expr(inner, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::AssertCheck { cond, on_fail }

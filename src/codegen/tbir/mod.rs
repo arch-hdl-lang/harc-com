@@ -885,7 +885,9 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         WidthCast { inner, .. } => expr_has_probe(inner),
         Call(_, args) => args.iter().any(expr_has_probe),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
-        ComponentVecElement { index, .. } => expr_has_probe(index),
+        ComponentVecElement {
+            index, inner_index, ..
+        } => expr_has_probe(index) || inner_index.as_deref().is_some_and(expr_has_probe),
         TransactorStateRecordField {
             mid_indices, index, ..
         } => {
@@ -924,8 +926,15 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
                 || index.as_ref().is_some_and(expr_has_probe)
                 || expr_has_probe(value)
         }
-        ComponentVecElementWrite { index, value, .. } => {
-            expr_has_probe(index) || expr_has_probe(value)
+        ComponentVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        } => {
+            expr_has_probe(index)
+                || inner_index.as_ref().is_some_and(expr_has_probe)
+                || expr_has_probe(value)
         }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
             expr_has_probe(cond) || fmt_has_probe(on_fail)
@@ -1199,8 +1208,16 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             }
             for_each_port_in_expr(value, f);
         }
-        ComponentVecElementWrite { index, value, .. } => {
+        ComponentVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        } => {
             for_each_port_in_expr(index, f);
+            if let Some(inner) = inner_index {
+                for_each_port_in_expr(inner, f);
+            }
             for_each_port_in_expr(value, f);
         }
         AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
@@ -1301,7 +1318,14 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         SeqIndex { index, .. } => for_each_port_in_expr(index, f),
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
-        ComponentVecElement { index, .. } => for_each_port_in_expr(index, f),
+        ComponentVecElement {
+            index, inner_index, ..
+        } => {
+            for_each_port_in_expr(index, f);
+            if let Some(inner) = inner_index {
+                for_each_port_in_expr(inner, f);
+            }
+        }
         TransactorStateRecordField {
             mid_indices, index, ..
         } => {
@@ -1321,6 +1345,12 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
 pub(super) fn field_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
         ir::IrType::Bool => "bool".to_string(),
+        // A nested-vector element renders as a nested `std::array`, the
+        // recursion terminating at the scalar leaf. `Vec<Vec<uint<8>,2>,2>`
+        // → `std::array<std::array<uint64_t, 2>, 2>`, matching v1.
+        ir::IrType::FixedVec { elem, len } => {
+            format!("std::array<{}, {len}>", field_scalar_cty(elem))
+        }
         _ => local_scalar_cty(ty),
     }
 }

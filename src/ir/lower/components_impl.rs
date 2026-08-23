@@ -1523,22 +1523,18 @@ fn lower_field(
                 ));
             }
             let elem = match args.first() {
-                Some(TypeArg::Type(ty)) => vec_elem_scalar_ir_type(ty),
+                Some(TypeArg::Type(ty)) => fixed_vec_elem_ir_type(ty),
                 _ => None,
             }
-            .filter(|ty| {
-                matches!(ty,
-                    IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
-                ) || matches!(ty, IrType::Bool)
-            })
             .ok_or_else(|| {
                 unsupported(
                     &format!(
                         "fixed-vector field `{comp}.{fname}` with an unsupported element type"
                     ),
                     format!(
-                        "only nonzero-width uint/sint/bits/bool/bit elements are lowered, and \
-                     {}; nested vectors and record elements are not yet supported",
+                        "a fixed-vector element is a nonzero-width uint/sint/bits/bool/bit \
+                     scalar ({}), or another `Vec<..>` of those (nested); record and \
+                     dynamic-list elements are not yet lowered",
                         scalar_width_detail()
                     ),
                 )
@@ -3319,6 +3315,49 @@ fn event_payload_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// and a plain field agree about what a width means.
 fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// The element `IrType` of a fixed-vector field, RECURSING into a
+/// nested `Vec<Vec<T, N>, M>`. A scalar leaf returns a width-checked
+/// `UInt`/`SInt`/`Bool`; a `Vec` element returns
+/// `IrType::FixedVec { elem, len }` whose `elem` is itself decoded this
+/// way, so `Vec<Vec<uint<8>, 2>, 2>` yields
+/// `FixedVec { elem: FixedVec { elem: UInt(8), len: 2 }, len: 2 }` and
+/// the emitter renders `std::array<std::array<uint64_t, 2>, 2>`,
+/// matching v1. `None` for any element outside the subset — a record,
+/// a dynamic list, a zero width, or a bad inner length — which the
+/// caller turns into the honest refusal. The inner length is parsed
+/// exactly as the outer one (nonzero decimal literal).
+fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    {
+        let elem = match args.first() {
+            Some(TypeArg::Type(inner)) => fixed_vec_elem_ir_type(inner)?,
+            _ => return None,
+        };
+        let len = match args.get(1) {
+            Some(TypeArg::Expr(e)) => match &*e.kind {
+                ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok()?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if len == 0 {
+            return None;
+        }
+        return Some(IrType::FixedVec {
+            elem: Box::new(elem),
+            len,
+        });
+    }
+    vec_elem_scalar_ir_type(t).filter(|ty| {
+        matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)
+            || matches!(ty, IrType::Bool)
+    })
 }
 
 /// The scalar subset of a DECLARED component/scoreboard/testbench
