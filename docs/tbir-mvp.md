@@ -9013,6 +9013,97 @@ former `transaction` group lives in
      `PartialEq`, two verifier arms and a lowering arm, and each pass
      found the copy the previous one had not thought to look for.
 
+142. **Two field shapes that promised v1 but v1 breaks them the same
+     way at every landing (2026-08-23).**
+
+     Two `unsupported` field-declaration arms — which is to say, two
+     arms telling the user to *re-run with `--codegen v1`* — where v1
+     measurably does the wrong thing:
+
+     - `Vec<T,N> default {…}` emitted `std::array<uint64_t, N> v = 0;`,
+       which g++ rejects ("conversion from `int` to non-scalar type").
+       `EmitsUncompilable`, the grade its sibling `queue`/`Record`/
+       event `default` arms already carry three to twenty lines away.
+     - a `buffer<T>` / `stream<T>` field fell through to the scalar
+       catch-all; v1 has no runtime for either and emits a bare
+       `uint64_t`, dropping the message-passing semantics.
+       `SilentlyMisLowers`. Now a named arm rather than a generic
+       "unsupported type".
+
+     Both measured with `cpp_tb::emit` + g++, on a scoreboard AND a
+     transactor, before regrading — because the third candidate did not
+     survive that check.
+
+     **The one that got away, and why the check mattered.** A
+     directional (`in`/`inout`) event field looked like a third row of
+     the same kind. It is not: v1's behavior splits by landing. On a
+     scoreboard v1 emits a bare `uint64_t` (mis-lowering); on a
+     TRANSACTOR v1 emits the real
+     `std::vector<std::function<void(uint64_t)>> ev;` subscriber list.
+     Grading the two together put a false detail — "v1 emits a bare
+     scalar" — on the transactor case, and a transactor test that
+     pinned the old grade failed the moment the regrade was grouped in.
+     That is the batch-45 lesson arriving on schedule: a grade is per
+     landing, and "measure it on more than one landing" is how you find
+     out the grade is not uniform. The directional-event arm stays
+     `unsupported` pending a landing-split slice, with the split
+     recorded at the site.
+
+143. **Nested fixed-vector component fields (2026-08-23).**
+
+     `Vec<Vec<uint<8>, 2>, 2>` — a fixed vector whose element is itself
+     a fixed vector — was refused ("nested vectors ... are not yet
+     supported") while v1 emitted the correct
+     `std::array<std::array<uint64_t, 2>, 2>` for it. A genuine gap,
+     not a mis-grade: it is an IMPLEMENT batch, and the one recursive
+     change in this whole stack.
+
+     The design is `IrType::FixedVec { elem: Box<IrType>, len }`, a
+     recursive variant like the existing `Seq(Box<IrType>)` (which is
+     why `IrType` is not `Copy` — the `EventPayload` doc's worry about
+     "costing `IrType` its `Copy`" was already moot). `FixedVecSchema.elem`
+     holds a nested `FixedVec`, the decoder recurses to the scalar
+     leaf, and `field_scalar_cty` recurses to a nested `std::array`.
+     The IR carries the second subscript in a new
+     `inner_index: Option<Box<Expr>>` on `ComponentVecElement` /
+     `ComponentVecElementWrite`, because the existing `index_pos`
+     spreads indices across dotted member SEGMENTS and cannot carry two
+     indices on the same leaf.
+
+     Measured against v1 at every storage class:
+     `std::array<std::array<{uint64_t|int64_t|_harc_u128|HarcWide<32>},
+     2>, 2>` for `uint<8>`/`sint<8>`/`uint<128>`/`uint<1024>` leaves,
+     and `self.v[i][j]` for the two-level read/write — all byte-for-byte,
+     and the emitted C++ compiles under g++ `-std=gnu++20`.
+
+     The cut line, each refusal matching v1's own limit or this batch's
+     scope: both index dimensions are bounds-checked (`Invalid`); a
+     record leaf, a `default`, a whole-vector copy of a nested field,
+     and a THREE-level index (`v[i][j][k]`, and a triple-nested field
+     read) all stay refused. A triple-nested field DECLARES and emits
+     (v1's three-deep `std::array` is correct), it just cannot be
+     element-indexed past two levels yet.
+
+     What made this a plan-first batch rather than a sit-down edit: the
+     recursion touched ~15 files, and adding the `IrType` variant plus
+     the two node fields made the compiler enumerate every obligation —
+     two exhaustive `IrType` matches (`type_str`, covergroup
+     `type_name`), the element-type resolvers on both the lowering and
+     codegen sides (which must descend one `FixedVec` when
+     `inner_index` is set, or a nested read types as the inner array),
+     the port/traversal walkers, and the verifier's field-validity and
+     two-level bounds checks. A first pass threaded `inner_index`
+     through construction, emit, and the verifier bounds but missed the
+     READ-ONLY traversal walkers (placement's `visit_expr`,
+     `for_each_port_in_expr`, `expr_has_probe`, `for_each_local`, and
+     the lowering rewrite/fill passes) — an adversarial review caught
+     it: a DUT port hidden in a nested INNER index
+     (`sb.v[0][dut.count_out]`, in a non-hoisting `wait until`) was
+     visible to the emitter but not to the analysis passes. Every
+     walker that visits `index` visits `inner_index` now. The corpus
+     lowers and dumps identically to the branch point; no existing
+     program changed.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

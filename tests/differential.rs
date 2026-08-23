@@ -1197,6 +1197,50 @@ end impl TWiden
     );
 }
 
+/// A NESTED fixed-vector component field `Vec<Vec<T, N>, M>` lowers at
+/// every scalar leaf width, and both backends emit compilable C++ for
+/// it — the g++ check the unit test's byte-match cannot make.
+///
+/// v1 emits `std::array<std::array<{leaf}, N>, M>`; the space feeds the
+/// leaf width through and asserts every row lowers and compiles (the
+/// falsifiable direction that fires if a width regresses, since a
+/// re-cap would turn a row into a refusal).
+#[test]
+fn a_nested_fixed_vector_lowers_and_compiles_at_every_width() {
+    let nested = r#"
+scoreboard NestSb
+    v : Vec<Vec<@@TY@@, 2>, 2>
+    n : uint<32> default 0
+
+    hookable put(x: uint<8>)
+        v[0][1] = 1
+        n = n + v[0][1]
+    end put
+end scoreboard NestSb
+
+testbench TbNest
+    dut : Top
+    sb : NestSb
+end testbench TbNest
+
+impl TNest for TbNest
+    run
+        wait 1 cycle
+    end run
+end impl TNest
+"#;
+    println!(
+        "{}",
+        check_space_all_lower(
+            "nested-fixed-vec",
+            nested,
+            "@@TY@@",
+            "uint<8>",
+            &["uint<8>", "sint<8>", "uint<64>", "uint<128>", "uint<1024>"],
+        )
+    );
+}
+
 /// The declared-field width work deliberately did not touch this
 /// function, and said why in its doc comment: "an event payload is a
 /// `std::function` parameter type and a fixed-vector element is an

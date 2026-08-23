@@ -1418,6 +1418,24 @@ fn lower_field(
             args,
             ..
         } => {
+            // Direction on an event field is NOT a uniform mis-grade —
+            // v1's behavior splits by landing, so this stays as it was.
+            // Measured across all five landings for `inout event<T>`
+            // (2026-08-23, batch-45 discipline — an earlier version of
+            // this comment measured only two and mis-stated the rest):
+            //   - env, agent, sequencer, TRANSACTOR → v1 emits the real
+            //     `std::vector<std::function<void(uint64_t)>> ev;`
+            //     subscriber list, so refusing with a v1-handles-it
+            //     `unsupported` is honest.
+            //   - a method-bearing SCOREBOARD is the lone exception: v1
+            //     emits a bare `uint64_t ev;`, dropping the event, which
+            //     would be `SilentlyMisLowers`.
+            // So four of five landings genuinely want `unsupported` and
+            // one wants `SilentlyMisLowers`. A single grade for the arm
+            // would put a false detail on one side or the other; the
+            // scoreboard is the one landing whose `--codegen v1`
+            // suggestion is a real misdirection. Left for a
+            // landing-split slice.
             if matches!(f.direction, Some(Direction::InOut)) {
                 return Err(unsupported(
                     &format!("an `inout` event field `{comp}.{fname}`"),
@@ -1485,28 +1503,38 @@ fn lower_field(
                 ));
             }
             if f.default.is_some() {
-                return Err(unsupported(
+                // NOT `unsupported`. v1 emits the default straight into
+                // the member initializer, and the member is a
+                // `std::array`: `std::array<uint64_t, 2> v = 0;` for
+                // `Vec<uint<8>, 2> default {0, 0}`. g++ rejects it —
+                // it cannot convert the scalar `0` to a `std::array`
+                // (the exact wording varies by g++ version) — measured
+                // with `-std=gnu++20`. Same failure mode, and the same
+                // grade, as the sibling `queue<T> default`,
+                // `Record default`, and event-`default` arms three to
+                // twenty lines from here: v1 does not handle an
+                // aggregate default, it emits code that will not build.
+                return Err(not_implemented(
                     &format!("a default value on fixed-vector field `{comp}.{fname}`"),
-                    "fixed vectors are value-initialized; aggregate defaults are not lowered",
+                    "fixed vectors are value-initialized; v1 emits the default as a scalar \
+                     initializer on a `std::array` member (`= 0`), which g++ refuses to \
+                     convert — drop the `default`",
+                    V1Status::EmitsUncompilable,
                 ));
             }
             let elem = match args.first() {
-                Some(TypeArg::Type(ty)) => vec_elem_scalar_ir_type(ty),
+                Some(TypeArg::Type(ty)) => fixed_vec_elem_ir_type(ty),
                 _ => None,
             }
-            .filter(|ty| {
-                matches!(ty,
-                    IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
-                ) || matches!(ty, IrType::Bool)
-            })
             .ok_or_else(|| {
                 unsupported(
                     &format!(
                         "fixed-vector field `{comp}.{fname}` with an unsupported element type"
                     ),
                     format!(
-                        "only nonzero-width uint/sint/bits/bool/bit elements are lowered, and \
-                     {}; nested vectors and record elements are not yet supported",
+                        "a fixed-vector element is a nonzero-width uint/sint/bits/bool/bit \
+                     scalar ({}), or another `Vec<..>` of those (nested); record and \
+                     dynamic-list elements are not yet lowered",
                         scalar_width_detail()
                     ),
                 )
@@ -1527,6 +1555,25 @@ fn lower_field(
             })?;
             Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
         }
+        // `buffer<T>` / `stream<T>` message-passing fields. NOT
+        // `unsupported`: these fell through to the scalar catch-all
+        // below, which promises v1 handles them, but v1 has no runtime
+        // for either — it discards the element type and emits a bare
+        // `uint64_t` member (`uint64_t s;` / `uint64_t b;`), measured
+        // with `cpp_tb::emit` + g++. The FIFO/stream semantics vanish;
+        // the field builds as dead scalar storage. Named explicitly so
+        // the diagnostic tells the truth about what v1 does rather than
+        // pointing the user at a backend that silently drops the type.
+        TypeExpr::Builtin {
+            name: BuiltinTy::Buffer | BuiltinTy::Stream,
+            ..
+        } => Err(not_implemented(
+            &format!("a `buffer`/`stream` field `{comp}.{fname}`"),
+            "v1 has no `buffer`/`stream` runtime — it emits a bare `uint64_t` member and \
+             drops the message-passing semantics, so the field builds as dead scalar \
+             storage; neither backend lowers these yet",
+            V1Status::SilentlyMisLowers,
+        )),
         // Scalar counter, or a nested sub-component (`source :
         // AnalysisSource passive` / `sb : AnalysisSb`).
         TypeExpr::Builtin { .. } => {
@@ -3268,6 +3315,49 @@ fn event_payload_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// and a plain field agree about what a width means.
 fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// The element `IrType` of a fixed-vector field, RECURSING into a
+/// nested `Vec<Vec<T, N>, M>`. A scalar leaf returns a width-checked
+/// `UInt`/`SInt`/`Bool`; a `Vec` element returns
+/// `IrType::FixedVec { elem, len }` whose `elem` is itself decoded this
+/// way, so `Vec<Vec<uint<8>, 2>, 2>` yields
+/// `FixedVec { elem: FixedVec { elem: UInt(8), len: 2 }, len: 2 }` and
+/// the emitter renders `std::array<std::array<uint64_t, 2>, 2>`,
+/// matching v1. `None` for any element outside the subset — a record,
+/// a dynamic list, a zero width, or a bad inner length — which the
+/// caller turns into the honest refusal. The inner length is parsed
+/// exactly as the outer one (nonzero decimal literal).
+fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    {
+        let elem = match args.first() {
+            Some(TypeArg::Type(inner)) => fixed_vec_elem_ir_type(inner)?,
+            _ => return None,
+        };
+        let len = match args.get(1) {
+            Some(TypeArg::Expr(e)) => match &*e.kind {
+                ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok()?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if len == 0 {
+            return None;
+        }
+        return Some(IrType::FixedVec {
+            elem: Box::new(elem),
+            len,
+        });
+    }
+    vec_elem_scalar_ir_type(t).filter(|ty| {
+        matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)
+            || matches!(ty, IrType::Bool)
+    })
 }
 
 /// The scalar subset of a DECLARED component/scoreboard/testbench

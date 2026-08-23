@@ -562,6 +562,7 @@ fn type_name(prog: &TbProgram, ty: &IrType) -> String {
         IrType::Record(r) => format!("record `{}`", prog.records[r.index()].name),
         IrType::RecordSeq(r) => format!("TSeq<{}>", prog.records[r.index()].name),
         IrType::Seq(elem) => format!("TSeq<{}>", type_name(prog, elem)),
+        IrType::FixedVec { elem, len } => format!("Vec<{}, {}>", type_name(prog, elem), len),
         IrType::Component(c) => format!("component `{}`", prog.components[c.index()].name),
         IrType::PortSnapshot => "port snapshot".to_string(),
         IrType::Unknown => "unknown".to_string(),

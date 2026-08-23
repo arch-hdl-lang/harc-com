@@ -1975,6 +1975,18 @@ pub enum IrType {
     /// The boxed element is always a scalar (`UInt`/`SInt`/`Bool`); a record
     /// element uses `RecordSeq` instead.
     Seq(Box<IrType>),
+    /// A fixed-length vector value — the element type of a nested
+    /// `Vec<Vec<T, N>, M>` component field, and the type an index into
+    /// its outer dimension (`v[i]`) yields. Emitted as v1 emits it: a
+    /// `std::array<elem, len>` (which nests when `elem` is itself a
+    /// `FixedVec`). `FixedVecSchema.elem` holds one of these for a
+    /// nested field; a single-level `Vec<T, N>` field keeps a scalar
+    /// `elem` and never constructs this. Recursive like `Seq`, which is
+    /// why `IrType` is not `Copy`.
+    FixedVec {
+        elem: Box<IrType>,
+        len: usize,
+    },
     /// A composite-component value local — a method parameter typed by a
     /// component name (`observe(addr: uint<8>, model: ProtocolModel)`).
     /// Taken by value as the component's C++ struct; method calls on it
@@ -2318,6 +2330,9 @@ pub enum Stmt {
         field: String,
         index_pos: usize,
         index: Expr,
+        /// Second index for a nested vector write (`v[i][j] = x`). See
+        /// `Expr::ComponentVecElement::inner_index`.
+        inner_index: Option<Expr>,
         value: Expr,
     },
     /// `emit observed(v)` — fan the args out to every callback registered
@@ -2764,6 +2779,13 @@ pub enum Expr {
         field: String,
         index_pos: usize,
         index: Box<Expr>,
+        /// Second index for a NESTED vector element (`v[i][j]`, where
+        /// `v : Vec<Vec<T, N>, M>`): `index` selects the outer
+        /// dimension, `inner_index` the inner. `None` for an ordinary
+        /// single-level `v[i]`. `index_pos` spreads indices across
+        /// dotted member SEGMENTS and cannot carry a second index on
+        /// the same leaf, which is why this rides alongside it.
+        inner_index: Option<Box<Expr>>,
     },
     /// A whole composite-component value, passed by value as a method
     /// argument: `sb.observe(addr, model)` reads `model` here, where the

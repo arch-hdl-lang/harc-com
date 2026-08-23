@@ -1191,6 +1191,7 @@ impl FuncBuilder<'_> {
                         field: chain.field,
                         index_pos: chain.index_pos,
                         index: Box::new(chain.index),
+                        inner_index: None,
                     });
                 }
                 // Composite-component scalar field read via a test-scope
@@ -1662,6 +1663,44 @@ impl FuncBuilder<'_> {
                         });
                     }
                 }
+                // `v[i][j]` — nested fixed-vector element read. The
+                // outer `Index`'s target is itself `v[i]`; resolve `v`
+                // to a vec whose element is a scalar-leaf `FixedVec` and
+                // carry both indices. A deeper `FixedVec` leaf (triple
+                // nesting) does not match — `v[i][j]` would still be a
+                // vector, refused as a whole-inner-vec use downstream.
+                if let ExprKind::Index {
+                    target: inner_t,
+                    index: outer_idx,
+                } = &*target.kind
+                {
+                    if let Some((base, field, vec)) = self.as_component_vec_field(inner_t)? {
+                        if let IrType::FixedVec {
+                            len: inner_len,
+                            elem: inner_elem,
+                        } = &vec.elem
+                        {
+                            if !matches!(**inner_elem, IrType::FixedVec { .. }) {
+                                let outer = self.lower_expr(outer_idx)?;
+                                check_literal_component_vec_index_bounds(
+                                    &base, &field, &outer, vec.len,
+                                )?;
+                                let inner = self.lower_expr(index)?;
+                                let inner_len = *inner_len;
+                                check_literal_component_vec_index_bounds(
+                                    &base, &field, &inner, inner_len,
+                                )?;
+                                return Ok(Expr::ComponentVecElement {
+                                    base,
+                                    field,
+                                    index_pos: 0,
+                                    index: Box::new(outer),
+                                    inner_index: Some(Box::new(inner)),
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
                     let index = self.lower_expr(index)?;
                     check_literal_component_vec_index_bounds(&base, &field, &index, vec.len)?;
@@ -1670,6 +1709,7 @@ impl FuncBuilder<'_> {
                         field,
                         index_pos: 0,
                         index: Box::new(index),
+                        inner_index: None,
                     });
                 }
                 // `a.data[i]` — element read of a `Vec<T, N>` LEAF
@@ -1697,6 +1737,7 @@ impl FuncBuilder<'_> {
                             field: rf.field,
                             index_pos,
                             index: Box::new(index),
+                            inner_index: None,
                         });
                     }
                 }
@@ -2673,9 +2714,18 @@ impl FuncBuilder<'_> {
                     index: Box::new(index),
                 }
             }
-            Expr::ComponentVecElement { base, field, index_pos, index } => {
+            Expr::ComponentVecElement { base, field, index_pos, index, inner_index } => {
                 let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
-                Expr::ComponentVecElement { base, field, index_pos, index: Box::new(index) }
+                let inner_index = inner_index.map(|j| {
+                    Box::new(self.hoist_ports_with_hint(*j, None, exact_untyped_ports))
+                });
+                Expr::ComponentVecElement {
+                    base,
+                    field,
+                    index_pos,
+                    index: Box::new(index),
+                    inner_index,
+                }
             }
             Expr::TransactorStateRecordField {
                 instance,
@@ -2880,7 +2930,12 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
-            Expr::ComponentVecElement { base, field, .. } => {
+            Expr::ComponentVecElement {
+                base,
+                field,
+                inner_index,
+                ..
+            } => {
                 // `field` is a member SUFFIX and is not always one name:
                 // a `Vec<T, N>` LEAF inside a component RECORD field
                 // spells it dotted (`a.data`). Looking it up by whole
@@ -2892,7 +2947,14 @@ impl FuncBuilder<'_> {
                 let root = segs.next()?;
                 match &self.ctx.components.get(cid.index())?.field(root)?.kind {
                     crate::ir::ComponentFieldKind::FixedVec(vec) if field.find('.').is_none() => {
-                        Some(vec.elem.clone())
+                        // A nested read `v[i][j]` descends one `FixedVec`
+                        // to the scalar leaf; a single `v[i]` yields the
+                        // element as declared (a scalar, or the inner
+                        // vector for a nested field).
+                        match (inner_index, &vec.elem) {
+                            (Some(_), IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+                            _ => Some(vec.elem.clone()),
+                        }
                     }
                     crate::ir::ComponentFieldKind::Record { record } => {
                         let mut cur = *record;
@@ -3156,13 +3218,16 @@ impl FuncBuilder<'_> {
                 field,
                 index_pos,
                 index,
+                inner_index,
             } => {
                 let index = self.hoist_transactor_calls(*index);
+                let inner_index = inner_index.map(|j| Box::new(self.hoist_transactor_calls(*j)));
                 Expr::ComponentVecElement {
                     base,
                     field,
                     index_pos,
                     index: Box::new(index),
+                    inner_index,
                 }
             }
             Expr::TransactorStateRecordField {

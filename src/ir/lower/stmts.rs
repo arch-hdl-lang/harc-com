@@ -2396,6 +2396,7 @@ impl FuncBuilder<'_> {
                     field: chain.field,
                     index_pos: chain.index_pos,
                     index,
+                    inner_index: None,
                     value,
                 });
                 return Ok(());
@@ -2421,6 +2422,7 @@ impl FuncBuilder<'_> {
                 field: chain.field,
                 index_pos: chain.index_pos,
                 index,
+                inner_index: None,
                 value,
             });
             return Ok(());
@@ -3073,6 +3075,51 @@ impl FuncBuilder<'_> {
                     return Ok(());
                 }
             }
+            // `v[i][j] = x` — nested fixed-vector element write. The
+            // assign target is `Index { Index { v, i }, j }`, so `it`
+            // here is itself `v[i]`; resolve its inner target `v` to a
+            // vec whose element is a scalar-leaf `FixedVec`, and carry
+            // both indices. A deeper `FixedVec` leaf (triple nesting)
+            // does not match — `v[i][j]` would still be a vector, and
+            // writing a scalar into it falls through to the refusal.
+            if let ExprKind::Index {
+                target: inner_t,
+                index: outer_idx,
+            } = &*it.kind
+            {
+                if let Some((base, field, vec)) = self.as_component_vec_field(inner_t)? {
+                    if let IrType::FixedVec {
+                        len: inner_len,
+                        elem: inner_elem,
+                    } = &vec.elem
+                    {
+                        if !matches!(**inner_elem, IrType::FixedVec { .. }) {
+                            let outer = self.lower_expr_no_ports(outer_idx)?;
+                            super::exprs::check_literal_component_vec_index_bounds(
+                                &base, &field, &outer, vec.len,
+                            )?;
+                            let inner = self.lower_expr_no_ports(index)?;
+                            super::exprs::check_literal_component_vec_index_bounds(
+                                &base, &field, &inner, *inner_len,
+                            )?;
+                            let value = self.lower_expr_no_ports(value)?;
+                            self.reject_record_into_scalar(
+                                &value,
+                                &format!("element of nested `Vec` field `{field}`"),
+                            )?;
+                            self.push(Stmt::ComponentVecElementWrite {
+                                base,
+                                field,
+                                index_pos: 0,
+                                index: outer,
+                                inner_index: Some(inner),
+                                value,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             if let Some((base, field, vec)) = self.as_component_vec_field(it)? {
                 let index = self.lower_expr_no_ports(index)?;
                 super::exprs::check_literal_component_vec_index_bounds(
@@ -3088,6 +3135,7 @@ impl FuncBuilder<'_> {
                     field,
                     index_pos: 0,
                     index,
+                    inner_index: None,
                     value,
                 });
                 return Ok(());
@@ -3141,6 +3189,7 @@ impl FuncBuilder<'_> {
                         field: rf.field,
                         index_pos,
                         index,
+                        inner_index: None,
                         value,
                     });
                     return Ok(());

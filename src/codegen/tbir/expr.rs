@@ -604,13 +604,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             field,
             index_pos,
             index,
+            inner_index,
         } => {
             let index = expr_cpp(cx, index)?;
-            format!(
-                "{}.{}",
-                comp_base_cpp_subst_cx(cx, base),
-                indexed_member_cpp(field, *index_pos, &index)
-            )
+            let mut member = indexed_member_cpp(field, *index_pos, &index);
+            // Nested `v[i][j]`: append the inner subscript after the
+            // outer member, matching v1's `self.v[i][j]`.
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_cpp(cx, inner)?);
+            }
+            format!("{}.{}", comp_base_cpp_subst_cx(cx, base), member)
         }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
@@ -1209,7 +1212,12 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                     _ => None,
                 })
         }
-        Expr::ComponentVecElement { base, field, .. } => component_vec_elem_type(cx, base, field)
+        Expr::ComponentVecElement {
+            base,
+            field,
+            inner_index,
+            ..
+        } => component_vec_elem_type(cx, base, field, inner_index.is_some())
             .as_ref()
             .and_then(ir_type_width),
         Expr::ScoreboardQuery {
@@ -1385,8 +1393,13 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     _ => false,
                 })
         }
-        Expr::ComponentVecElement { base, field, .. } => matches!(
-            component_vec_elem_type(cx, base, field),
+        Expr::ComponentVecElement {
+            base,
+            field,
+            inner_index,
+            ..
+        } => matches!(
+            component_vec_elem_type(cx, base, field, inner_index.is_some()),
             Some(crate::ir::IrType::SInt(_))
         ),
         Expr::ScoreboardQuery {
@@ -1448,6 +1461,7 @@ fn component_vec_elem_type(
     cx: &ECx<'_>,
     base: &crate::ir::ComponentBase,
     field: &str,
+    nested: bool,
 ) -> Option<crate::ir::IrType> {
     let path: Vec<String> = field.split('.').map(str::to_string).collect();
     let root = path.first()?;
@@ -1456,7 +1470,15 @@ fn component_vec_elem_type(
         .iter()
         .find(|f| f.name == *root)?;
     match &f.kind {
-        crate::ir::ComponentFieldKind::FixedVec(vec) if path.len() == 1 => Some(vec.elem.clone()),
+        crate::ir::ComponentFieldKind::FixedVec(vec) if path.len() == 1 => {
+            // A nested read `v[i][j]` descends one `FixedVec` to the
+            // scalar leaf so width/sign decisions see the element, not
+            // the inner array.
+            match (nested, &vec.elem) {
+                (true, crate::ir::IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+                _ => Some(vec.elem.clone()),
+            }
+        }
         crate::ir::ComponentFieldKind::Record { record } => {
             // The leaf's own type. `record_path_type` reports a `Vec`
             // field as its element type (`vec_len` rides beside `ty` in

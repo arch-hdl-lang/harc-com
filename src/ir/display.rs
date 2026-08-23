@@ -611,6 +611,7 @@ fn type_str(t: &IrType) -> String {
         IrType::Record(r) => format!("record(r{})", r.0),
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
         IrType::Seq(t) => format!("seq({})", type_str(t)),
+        IrType::FixedVec { elem, len } => format!("fixed-vec<{}, {}>", type_str(elem), len),
         IrType::Component(c) => format!("component(c{})", c.0),
         IrType::PortSnapshot => "port-snapshot".to_string(),
         IrType::Unknown => "unknown".to_string(),
@@ -824,9 +825,13 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             field,
             index_pos,
             index,
+            inner_index,
             value,
         } => {
-            let field = indexed_chain_str(func, field, *index_pos, index);
+            let mut field = indexed_chain_str(func, field, *index_pos, index);
+            if let Some(inner) = inner_index {
+                field = format!("{field}[{}]", expr_str(func, inner));
+            }
             format!(
                 "ComponentVecElementWrite({}.{field}, {})",
                 comp_base_str(base),
@@ -1237,8 +1242,12 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             field,
             index_pos,
             index,
+            inner_index,
         } => {
-            let field = indexed_chain_str(func, field, *index_pos, index);
+            let mut field = indexed_chain_str(func, field, *index_pos, index);
+            if let Some(inner) = inner_index {
+                field = format!("{field}[{}]", expr_str(func, inner));
+            }
             format!("{}.{field}", comp_base_str(base))
         }
         Expr::ComponentValue { base } => {

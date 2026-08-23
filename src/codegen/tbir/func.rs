@@ -1722,11 +1722,15 @@ fn emit_stmt(
             field,
             index_pos,
             index,
+            inner_index,
             value,
         } => {
             let index = expr_cpp(cx, index)?;
             let value = expr_cpp(cx, value)?;
-            let field = super::expr::indexed_member_cpp(field, *index_pos, &index);
+            let mut field = super::expr::indexed_member_cpp(field, *index_pos, &index);
+            if let Some(inner) = inner_index {
+                field = format!("{field}[{}]", expr_cpp(cx, inner)?);
+            }
             writeln!(
                 out,
                 "{pad}{}.{field} = {value};",
@@ -1918,9 +1922,15 @@ fn expr_uses_snapshot_lane(expr: &Expr, snapshot: LocalId) -> bool {
                     .as_deref()
                     .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot))
         }
-        Expr::ComponentVecElement { index, .. } | Expr::SeqIndex { index, .. } => {
+        Expr::ComponentVecElement {
+            index, inner_index, ..
+        } => {
             expr_uses_snapshot_lane(index, snapshot)
+                || inner_index
+                    .as_deref()
+                    .is_some_and(|inner| expr_uses_snapshot_lane(inner, snapshot))
         }
+        Expr::SeqIndex { index, .. } => expr_uses_snapshot_lane(index, snapshot),
         Expr::CovHookParam { index, .. } => index
             .as_deref()
             .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot)),

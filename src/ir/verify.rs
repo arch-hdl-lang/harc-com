@@ -586,6 +586,22 @@ fn check_cover_expr(
     }
 }
 
+/// A fixed-vector element is valid when it is a nonzero-width
+/// `UInt`/`SInt`/`Bool` within the field width policy, or another
+/// `FixedVec` (nonzero length) whose element is recursively valid.
+/// Mirrors the lowering decoder `fixed_vec_elem_ir_type`, so the
+/// verifier accepts exactly the nested shapes lowering produces.
+fn fixed_vec_elem_valid(ty: &IrType) -> bool {
+    match ty {
+        IrType::Bool => true,
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0 => {
+            crate::ir::lower::components::field_scalar_width_ok(ty)
+        }
+        IrType::FixedVec { elem, len } => *len != 0 && fixed_vec_elem_valid(elem),
+        _ => false,
+    }
+}
+
 fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<VerifyError>) {
     let QueueElem::Scalar { ty } = elem else {
         return;
@@ -900,12 +916,11 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 // than a diagnostic. It asks
                 // `components::field_scalar_width_ok` now, the same
                 // function the gate uses.
-                let valid_elem = matches!(
-                    &vec.elem,
-                    crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w)) if *w > 0
-                ) && crate::ir::lower::components::field_scalar_width_ok(
-                    &vec.elem,
-                ) || matches!(&vec.elem, crate::ir::IrType::Bool);
+                // Recurses through a nested `FixedVec` element to the
+                // scalar leaf, so `Vec<Vec<uint<8>,2>,2>` validates and
+                // `Vec<Vec<uint<2048>,2>,2>` (an over-wide leaf) still
+                // fails at the same width policy the gate applies.
+                let valid_elem = fixed_vec_elem_valid(&vec.elem);
                 if vec.len == 0 || !valid_elem {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
@@ -3892,6 +3907,7 @@ impl Checker<'_> {
                     field,
                     index_pos,
                     index,
+                    inner_index,
                     value,
                 } => {
                     self.check_expr(index, false, "ComponentVecElementWrite index");
@@ -3902,6 +3918,40 @@ impl Checker<'_> {
                                 self.report_bad_component_field(format!(
                                     "indexed component field `{field}` is out of bounds for length {len}"
                                 ));
+                            }
+                            // A nested write `v[i][j] = x`: `expected`
+                            // (the outer element) must be a `FixedVec`;
+                            // the value is checked against its scalar
+                            // inner element.
+                            if let Some(inner) = inner_index {
+                                self.check_expr(
+                                    inner,
+                                    false,
+                                    "ComponentVecElementWrite inner index",
+                                );
+                                let IrType::FixedVec {
+                                    elem: inner_elem,
+                                    len: inner_len,
+                                } = &expected
+                                else {
+                                    self.report_bad_component_field(format!(
+                                        "nested index write on component field `{field}` whose element is not a fixed vector"
+                                    ));
+                                    continue;
+                                };
+                                if matches!(inner, Expr::Literal { value, .. } if *value as usize >= *inner_len)
+                                {
+                                    self.report_bad_component_field(format!(
+                                        "nested index into component field `{field}` is out of bounds for length {inner_len}"
+                                    ));
+                                }
+                                self.check_expr(value, false, "ComponentVecElementWrite value");
+                                if matches!(**inner_elem, IrType::Record(_)) {
+                                    self.report_bad_component_field(format!(
+                                        "nested vector element of component field `{field}` is a record, not a scalar"
+                                    ));
+                                }
+                                continue;
                             }
                             if matches!(expected, IrType::Seq(_)) {
                                 self.check_whole_vec_write_value(
@@ -4973,6 +5023,7 @@ impl Checker<'_> {
                 field,
                 index_pos,
                 index,
+                inner_index,
             } => {
                 self.check_expr(index, ports_ok, context);
                 match self.component_indexed_field_type(base, field, *index_pos) {
@@ -4983,7 +5034,27 @@ impl Checker<'_> {
                                 "indexed component field `{field}` is out of bounds for length {len}"
                             ));
                         }
-                        if let IrType::Seq(elem) = ty {
+                        // A nested read `v[i][j]`: the outer element
+                        // `ty` must be a `FixedVec`; the second index is
+                        // bounds-checked against its inner length.
+                        if let Some(inner) = inner_index {
+                            self.check_expr(inner, ports_ok, context);
+                            match &ty {
+                                IrType::FixedVec {
+                                    len: inner_len, ..
+                                } => {
+                                    if matches!(inner.as_ref(), Expr::Literal { value, .. } if *value as usize >= *inner_len)
+                                    {
+                                        self.report_bad_component_field(format!(
+                                            "nested index into component field `{field}` is out of bounds for length {inner_len}"
+                                        ));
+                                    }
+                                }
+                                _ => self.report_bad_component_field(format!(
+                                    "nested index read on component field `{field}` whose element is not a fixed vector"
+                                )),
+                            }
+                        } else if let IrType::Seq(elem) = ty {
                             let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
                                 .map(WholeCollectionShape::DynamicSeq);
                             match shape {
@@ -5879,8 +5950,16 @@ fn check_def_before_use(
                     }
                 },
                 Stmt::ComponentFieldWrite { value, .. } => check_e(value, &defined, errs),
-                Stmt::ComponentVecElementWrite { index, value, .. } => {
+                Stmt::ComponentVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => {
                     check_e(index, &defined, errs);
+                    if let Some(inner) = inner_index {
+                        check_e(inner, &defined, errs);
+                    }
                     check_e(value, &defined, errs);
                 }
                 Stmt::ComponentEmit { args, .. } => {
@@ -5995,7 +6074,14 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
                 for_each_local(idx, f);
             }
         }
-        Expr::ComponentVecElement { index, .. } => for_each_local(index, f),
+        Expr::ComponentVecElement {
+            index, inner_index, ..
+        } => {
+            for_each_local(index, f);
+            if let Some(inner) = inner_index {
+                for_each_local(inner, f);
+            }
+        }
         Expr::ComponentValue { base } => {
             if let crate::ir::ComponentBase::Local(l) = base {
                 f(*l);
