@@ -257,6 +257,8 @@ passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
 scoreboard_record_state_test | Top | top_counter.sv | top_counter.arch | pass
 scoreboard_list_state_test | Top | top_counter.sv | top_counter.arch | pass
+record_list_randomize_test | Top | top_counter.sv | - | pass
+record_list_unsat_test | Top | top_counter.sv | - | fail
 
 # Added by the harc#551 coverage audit. These ran under run_fixtures.sh
 # (default backend only) and were never trace-diffed across the two

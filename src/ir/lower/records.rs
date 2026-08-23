@@ -20,7 +20,9 @@
 //! scalars), widthless-scalar leaves, string/object/dynamic leaves,
 //! widths above 64 bits, and non-literal field defaults. Recursive /
 //! mutually-recursive nested records are rejected
-//! (`check_no_record_cycles`).
+//! (`check_no_record_cycles`). Scalar-element `list<T>` fields lower as
+//! dynamic scalar sequences for declaration, equality, and randomization;
+//! ordinary body-position list indexing/querying remains a separate slice.
 //! Enum-typed fields lower as scalar variant indices (v1's `int64_t`
 //! member shape).
 
@@ -447,6 +449,45 @@ fn lower_record_field(
         });
         return Ok(());
     }
+    // A dynamic `list<T>` field with a scalar element type is native
+    // value-record state. The constraint backend already models its length
+    // and elements and v1 emits it as `std::vector<T>`; represent that shape
+    // with the existing scalar-sequence IR type so it cannot be mistaken for
+    // either a scalar field or a fixed `Vec<T, N>` below.
+    if let Some(elem) = record_list_scalar_ir_type(&f.ty) {
+        if f.default.is_some() {
+            return Err(not_implemented(
+                &format!("a `default` on the dynamic list field `{owner}.{fname}`"),
+                "a list is default-constructed empty; v1 emits `std::vector<T> field = 0` and the C++ conversion does not compile",
+                V1Status::EmitsUncompilable,
+            ));
+        }
+        if !f.attrs.is_empty() {
+            return Err(not_implemented(
+                &format!("randomization modifiers on the dynamic list field `{owner}.{fname}`"),
+                "the shared v1 record randomizer returns from its list path before applying \
+                 `range`, `dist`, or `unique`, and the constrained solver likewise omits \
+                 those modifiers for list elements; accepting them would claim constraints \
+                 participated while silently drawing unrestricted values",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
+        let mut attr_src = Vec::with_capacity(f.attrs.len());
+        for a in &f.attrs {
+            let mut buf = String::new();
+            crate::pretty::print_attr(&mut buf, a);
+            attr_src.push(buf);
+        }
+        fields.push(RecordFieldSchema {
+            name: fname.clone(),
+            ty: IrType::Seq(Box::new(elem)),
+            vec_len: None,
+            default: None,
+            non_random: f.non_random,
+            attr_src,
+        });
+        return Ok(());
+    }
     // A `Vec<T, N>` field is the one aggregate this slice lowers: a
     // fixed-size array of a scalar OR record element type (v1's
     // `std::array<T, N>` record member). `ty` then carries the *element*
@@ -512,6 +553,47 @@ fn lower_record_field(
         attr_src,
     });
     Ok(())
+}
+
+/// Scalar list element shapes whose C++ storage and random draw v1 preserves.
+/// `int` is intentionally excluded: v1 silently renders it unsigned.
+fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    let TypeExpr::Named { name, generics, .. } = t else {
+        return None;
+    };
+    if !matches!(
+        name.segments.last().map(|segment| segment.name.as_str()),
+        Some("list" | "List")
+    ) {
+        return None;
+    }
+    let elem = match generics.first()? {
+        TypeArg::Type(elem) => elem,
+        _ => return None,
+    };
+    let TypeExpr::Builtin { name, .. } = elem else {
+        return None;
+    };
+    let ty = matches!(
+        name,
+        BuiltinTy::UInt
+            | BuiltinTy::UIntCap
+            | BuiltinTy::Bits
+            | BuiltinTy::SInt
+            | BuiltinTy::SIntCap
+            | BuiltinTy::Bool
+            | BuiltinTy::BoolLower
+            | BuiltinTy::Bit
+    )
+    .then(|| super::components::scalar_field_ir_type(elem))
+    .flatten()?;
+    matches!(
+        ty,
+        IrType::Bool
+            | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
+            | IrType::SInt(Some(1..=64))
+    )
+    .then_some(ty)
 }
 
 /// Recognize a `Vec<T, N>` field whose element `T` this slice can

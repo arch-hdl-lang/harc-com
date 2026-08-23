@@ -13,6 +13,7 @@ use harc::parser::parse_source;
 use harc::solver::problem_table::{
     build_typed_solver_problem_table, TypedSolverProblemBuild, TypedSolverProblemSource,
 };
+use harc::solver::SolverBuildError;
 
 #[test]
 fn typed_z3_backend_builds_for_clean_fixture_lowers() {
@@ -29,6 +30,7 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     let mut z3_built = 0usize;
     let mut expected_lower_errors = Vec::new();
     let mut unexpected_lower_errors = Vec::new();
+    let mut expected_backend_errors = Vec::new();
     let mut backend_errors = Vec::new();
 
     for entry in entries {
@@ -74,11 +76,17 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
                     }
                 }
                 TypedSolverProblemBuild::BackendError(err) => {
-                    backend_errors.push(format!(
+                    let rendered = format!(
                         "{} {}: {err:#?}",
                         path.display(),
                         source_label(&entry.source)
-                    ));
+                    );
+                    if let Some(reason) = expected_backend_error_reason(&path, &entry.source, &err)
+                    {
+                        expected_backend_errors.push(format!("{rendered}\n  classified: {reason}"));
+                    } else {
+                        backend_errors.push(rendered);
+                    }
                 }
             }
         }
@@ -87,9 +95,11 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     eprintln!(
         "[typed_z3 sweep] fixtures={total_fixtures} problems={total_problems} \
          z3_built={z3_built} expected_lower_errors={expected_lower_errors} \
-         unexpected_lower_errors={unexpected_lower_errors} backend_errors={backend_errors}",
+         unexpected_lower_errors={unexpected_lower_errors} \
+         expected_backend_errors={expected_backend_errors} backend_errors={backend_errors}",
         expected_lower_errors = expected_lower_errors.len(),
         unexpected_lower_errors = unexpected_lower_errors.len(),
+        expected_backend_errors = expected_backend_errors.len(),
         backend_errors = backend_errors.len()
     );
     for line in expected_lower_errors.iter().take(12) {
@@ -97,6 +107,9 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
     }
     for line in unexpected_lower_errors.iter().take(12) {
         eprintln!("[typed_z3 unexpected-lower-error] {line}");
+    }
+    for line in expected_backend_errors.iter().take(12) {
+        eprintln!("[typed_z3 expected-backend-error] {line}");
     }
     for line in backend_errors.iter().take(12) {
         eprintln!("[typed_z3 backend-error] {line}");
@@ -125,6 +138,35 @@ fn typed_z3_backend_builds_for_clean_fixture_lowers() {
         "typed Z3 backend errors reached the sweep:\n{}",
         backend_errors.join("\n")
     );
+}
+
+fn expected_backend_error_reason(
+    path: &Path,
+    source: &TypedSolverProblemSource,
+    error: &SolverBuildError,
+) -> Option<&'static str> {
+    let file = path.file_name().and_then(|s| s.to_str())?;
+    let expected_record = match file {
+        "record_list_randomize_test.harc" => "ListPacket",
+        "record_list_unsat_test.harc" => "ImpossibleListPacket",
+        _ => return None,
+    };
+    let record = match source {
+        TypedSolverProblemSource::TransactionTemplate { transaction, .. }
+        | TypedSolverProblemSource::RandomizeSite { transaction, .. } => transaction,
+    };
+    if record != expected_record {
+        return None;
+    }
+    match error {
+        SolverBuildError::Unsupported {
+            feature: "field sort",
+            detail,
+        } if detail.contains("has type list<") => Some(
+            "bounded-list behavioral fixtures use the legacy runtime solver path; the staged typed-Z3 backend does not yet assign list fields a direct Z3 sort",
+        ),
+        _ => None,
+    }
 }
 
 fn source_label(source: &TypedSolverProblemSource) -> String {

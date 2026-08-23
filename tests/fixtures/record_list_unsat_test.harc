@@ -1,0 +1,27 @@
+domain D
+    freq_mhz : 100
+end domain D
+
+transaction ImpossibleListPacket
+    items : list<uint<8>>
+    keep items.len() == 3
+    // Contradictory per-element bounds prove the list element constraints
+    // reach the solver; a size-only trace cannot distinguish that from an
+    // unconstrained draw.
+    keep for item in items
+        item >= 200
+    end for
+    keep for item in items
+        item <= 100
+    end for
+end transaction ImpossibleListPacket
+
+test RecordListUnsatTest
+    let dut : Top
+    let packet : ImpossibleListPacket
+    clock clk = D
+    run
+        randomize(packet)
+        wait 1 cycle
+    end run
+end test RecordListUnsatTest

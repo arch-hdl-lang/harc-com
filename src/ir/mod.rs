@@ -602,7 +602,7 @@ impl TransactorSchema {
 /// (`src/constraints`, `elaborate_constraints` → `CTypedProblem`)
 /// re-elaborates from the AST and the randomize terminator will carry
 /// a `ConstraintRef` handle into that layer, per the design doc.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordSchema {
     pub name: String,
     pub fields: Vec<RecordFieldSchema>,
@@ -612,7 +612,7 @@ pub struct RecordSchema {
     pub keeps: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordFieldSchema {
     pub name: String,
     /// Field element type. For a scalar field this is the field's own
@@ -621,12 +621,15 @@ pub struct RecordFieldSchema {
     /// storage type and the packed-bit layout) or a nested record
     /// (`IrType::Record`, v1's `std::array<Inner, N>` member; every leaf
     /// of the element record is itself schema-supported). Lowering
-    /// rejects field element types outside that set (enums, lists,
-    /// widthless scalars).
+    /// rejects field element types outside that set. A dynamic scalar
+    /// `list<T>` is represented distinctly as `IrType::Seq(T)` with
+    /// `vec_len = None`; widthless and aggregate list elements remain out of
+    /// subset.
     pub ty: IrType,
     /// `Some(N)` when the field is a fixed-size `Vec<T, N>` aggregate
     /// (v1's `std::array<T, N>` record member); `None` for a scalar
-    /// field. The element type/width is carried in `ty`.
+    /// field or a dynamic `list<T>`. The element type/width is carried in
+    /// `ty`; lists are distinguished by `IrType::Seq(T)`.
     pub vec_len: Option<usize>,
     /// Declared `default <lit>` value (int/bool literals only), or
     /// `None` for the type-appropriate zero — same fallback as v1.

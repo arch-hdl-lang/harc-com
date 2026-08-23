@@ -3248,6 +3248,7 @@ pub(crate) struct ComponentFieldTarget {
     pub base: ComponentBase,
     pub field: String,
     pub leaf_vec: Option<(usize, IrType)>,
+    pub leaf_ty: Option<IrType>,
     pub dotted: String,
 }
 
@@ -3261,6 +3262,7 @@ pub(crate) struct ComponentRecordField {
     pub base: ComponentBase,
     pub field: String,
     pub leaf_vec: Option<(usize, IrType)>,
+    pub leaf_ty: IrType,
     /// The full dotted path as the user wrote it (`env.source.current.data`).
     /// `field` is only the suffix after the emission base, which is what
     /// codegen renders — naming that in a diagnostic told the user about
@@ -3845,7 +3847,7 @@ impl super::FuncBuilder<'_> {
         // pairing check, which has to see it to permit anything.
         let validate = |record: RecordId,
                         sub: &[String]|
-         -> Result<Option<(usize, IrType)>, LowerError> {
+         -> Result<(IrType, Option<(usize, IrType)>), LowerError> {
             let mut rid = record;
             for (i, seg) in sub.iter().enumerate() {
                 let schema = &self.ctx.records[rid.index()];
@@ -3894,10 +3896,12 @@ impl super::FuncBuilder<'_> {
                         }
                     }
                 } else if let Some(n) = field.vec_len {
-                    return Ok(Some((n, field.ty.clone())));
+                    return Ok((field.ty.clone(), Some((n, field.ty.clone()))));
+                } else {
+                    return Ok((field.ty.clone(), None));
                 }
             }
-            Ok(None)
+            unreachable!("component record-field path is non-empty")
         };
 
         // Method-body form: `current.value`, where `current` is a field
@@ -3908,11 +3912,12 @@ impl super::FuncBuilder<'_> {
                 if let Some(schema) = comp.field(&path[0]) {
                     if let ComponentFieldKind::Record { record } = schema.kind {
                         self.require_self_activation(schema.activation, "field", &path[0])?;
-                        let leaf_vec = validate(record, &path[1..])?;
+                        let (leaf_ty, leaf_vec) = validate(record, &path[1..])?;
                         return Ok(Some(ComponentRecordField {
                             base: ComponentBase::SelfField,
                             field: path.join("."),
                             leaf_vec,
+                            leaf_ty,
                             dotted: path.join("."),
                         }));
                     }
@@ -3950,12 +3955,13 @@ impl super::FuncBuilder<'_> {
                 "field",
                 &tail[recv_len],
             )?;
-            let leaf_vec = validate(record, sub)?;
+            let (leaf_ty, leaf_vec) = validate(record, sub)?;
             base.extend_from_slice(&tail[..recv_len]);
             return Ok(Some(ComponentRecordField {
                 base: ComponentBase::Path(base),
                 field: tail[recv_len..].join("."),
                 leaf_vec,
+                leaf_ty,
                 dotted: path.join("."),
             }));
         }
@@ -3971,6 +3977,7 @@ impl super::FuncBuilder<'_> {
                 base: rf.base,
                 field: rf.field,
                 leaf_vec: rf.leaf_vec,
+                leaf_ty: Some(rf.leaf_ty),
                 dotted: rf.dotted,
             }));
         }
@@ -3997,6 +4004,7 @@ impl super::FuncBuilder<'_> {
                                 base: ComponentBase::SelfField,
                                 field: id.name.clone(),
                                 leaf_vec: None,
+                                leaf_ty: None,
                                 dotted: id.name.clone(),
                             }));
                         }
@@ -4055,6 +4063,7 @@ impl super::FuncBuilder<'_> {
                                 base: ComponentBase::Path(base),
                                 field: field.clone(),
                                 leaf_vec: None,
+                                leaf_ty: None,
                                 dotted: path.join("."),
                             }));
                         }
@@ -4088,6 +4097,9 @@ impl super::FuncBuilder<'_> {
         e: &AstExpr,
     ) -> Result<Option<IrExpr>, LowerError> {
         if let Some(rf) = self.as_component_record_field(e)? {
+            if matches!(rf.leaf_ty, IrType::Seq(_)) && !self.whole_vec_read_allowed(e) {
+                return Err(super::exprs::dynamic_record_list_value(&rf.dotted));
+            }
             // A whole-`Vec` leaf read is admissible in exactly one
             // landing — `==`/`!=` against another `Vec` of the same
             // shape, which both backends emit and g++ accepts

@@ -2840,6 +2840,61 @@ pub fn emit_randomize_snippets(
     Ok(out)
 }
 
+/// Emit only the legacy per-record unconstrained-randomize helpers, in the
+/// caller's dependency-safe record order. TBIR uses these for dynamic-list
+/// records when a site has no typed solver problem.
+pub fn emit_record_randomize_helpers(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    records: &[crate::ir::RecordSchema],
+    record_order: &[usize],
+) -> Result<String, EmitError> {
+    if record_order.is_empty() {
+        return Ok(String::new());
+    }
+    let source_prog = crate::ir::lower::lower_program(file)
+        .map_err(|err| EmitError(format!("tbir record randomize helper source check: {err}")))?;
+    if source_prog.records != records {
+        return Err(EmitError(
+            "tbir record randomize helper source/schema mismatch".to_string(),
+        ));
+    }
+    let normalized = normalize_vec_record_elem_fields(file);
+    let normalized = desugar_impl_for_test_in_file(&normalized);
+    let mut e = build_randomize_emitter(&normalized, opts);
+    e.out.clear();
+    e.errors.clear();
+    for &record_index in record_order {
+        let Some(record) = records.get(record_index) else {
+            return Err(EmitError(format!(
+                "tbir randomize helper record index {record_index} does not resolve"
+            )));
+        };
+        let name = &record.name;
+        let Some(item) = normalized.items.iter().find(|item| match item {
+            Item::Struct(s) => s.name.name == *name,
+            Item::Transaction(t) => t.name.name == *name,
+            _ => false,
+        }) else {
+            return Err(EmitError(format!(
+                "tbir randomize helper record `{name}` does not resolve"
+            )));
+        };
+        match item {
+            Item::Struct(s) => e.emit_record_randomize_fn(&s.name.name, &s.fields),
+            Item::Transaction(t) => {
+                let fields = txn_all_fields(&t.body);
+                e.emit_record_randomize_fn(&t.name.name, &fields);
+            }
+            _ => unreachable!("record item filtered above"),
+        }
+    }
+    if let Some(err) = e.errors.first() {
+        return Err(EmitError(format!("tbir record randomize helper: {err}")));
+    }
+    Ok(e.out)
+}
+
 /// Everything `emit_with_opts` derives from the merged source before any
 /// C++ text is produced. Shared by the legacy single-TU emitter and the
 /// common-object split layout so both backends analyze identically.
@@ -5406,6 +5461,22 @@ fn emit_random_unsigned_expr(width: u32) -> String {
             "harc_rt::random::harc_rng_wide<{}>(harc_rng_next, {width})",
             words
         )
+    }
+}
+
+fn emit_random_signed_expr(width: u32) -> String {
+    if width < 63 {
+        format!(
+            "harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1)",
+            width.saturating_sub(1),
+            width.saturating_sub(1)
+        )
+    } else if width == 63 {
+        // The full sint<63> domain has a 2^63 span, which overflows the
+        // signed span arithmetic in harc_rng_range. Draw and sign-extend.
+        "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::random::harc_rng_uint(harc_rng_next, 63)), 63, 64))".to_string()
+    } else {
+        emit_random_unsigned_expr(width)
     }
 }
 
@@ -13245,24 +13316,13 @@ impl Emitter {
                     }
                     BuiltinTy::SInt | BuiltinTy::SIntCap => {
                         let w = width.unwrap_or(32);
-                        if w < 63 {
-                            writeln!(
-                                self.out,
-                                "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1);",
-                                f.name.name,
-                                w - 1,
-                                w - 1
-                            )
-                            .ok();
-                        } else {
-                            writeln!(
-                                self.out,
-                                "{INDENT}t->{} = {};",
-                                f.name.name,
-                                emit_random_unsigned_expr(w)
-                            )
-                            .ok();
-                        }
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = {};",
+                            f.name.name,
+                            emit_random_signed_expr(w)
+                        )
+                        .ok();
                     }
                     BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
                         writeln!(
@@ -14825,7 +14885,16 @@ impl Emitter {
                     n.saturating_sub(1)
                 )
                 .ok();
-            } else if f.signed && f.width > 0 && f.width < 63 {
+            } else if f.signed && f.width > 0 && f.width <= 64 {
+                if f.width == 63 {
+                    writeln!(
+                        self.out,
+                        "int64_t _pref_{cache_tag}_{} = static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::random::harc_prefer_uint(_harc_rt_seed, {}, 63)), 63, 64));",
+                        c_name,
+                        pref_idx,
+                    )
+                    .ok();
+                } else {
                 writeln!(
                     self.out,
                     "int64_t _pref_{cache_tag}_{} = harc_rt::random::harc_prefer_sint(_harc_rt_seed, {}, {});",
@@ -14834,6 +14903,7 @@ impl Emitter {
                     f.width
                 )
                 .ok();
+                }
             } else if f.width <= 64 {
                 writeln!(
                     self.out,
@@ -22155,15 +22225,7 @@ fn list_elem_random_expr(elem: &TypeExpr) -> Option<String> {
         )),
         BuiltinTy::SInt | BuiltinTy::SIntCap => {
             let w = type_arg_width(args).unwrap_or(32);
-            Some(if w < 63 {
-                format!(
-                    "harc_rt::random::harc_rng_range(harc_rng_next, -(1LL << {}), (1LL << {}) - 1)",
-                    w.saturating_sub(1),
-                    w.saturating_sub(1)
-                )
-            } else {
-                emit_random_unsigned_expr(w)
-            })
+            Some(emit_random_signed_expr(w))
         }
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
             Some("harc_rt::random::harc_rng_range(harc_rng_next, 0, 1)".into())

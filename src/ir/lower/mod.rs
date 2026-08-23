@@ -6529,6 +6529,33 @@ pub(crate) struct LowerCtx {
 }
 
 impl LowerCtx {
+    /// A dynamic list has no finite DUT-wire representation. Record values
+    /// containing one are valid host-side state/randomize values, but cannot
+    /// cross a TLM request/response packing boundary (including through a
+    /// nested record).
+    pub(crate) fn reject_dynamic_list_record_wire(
+        &self,
+        record: RecordId,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        fn contains_list(records: &[RecordSchema], record: RecordId) -> bool {
+            records[record.index()].fields.iter().any(|field| {
+                matches!(field.ty, IrType::Seq(_))
+                    || matches!(field.ty, IrType::Record(inner) if contains_list(records, inner))
+            })
+        }
+        if !contains_list(&self.records, record) {
+            return Ok(());
+        }
+        Err(not_implemented(
+            what,
+            "records containing dynamic lists have no finite packed wire layout; v1 also \
+             omits their pack/unpack helpers and emits an unresolved `harc_pack_*`, \
+             `harc_unpack_*`, or `harc_drive_*` call",
+            V1Status::EmitsUncompilable,
+        ))
+    }
+
     /// See `const_vals_from`. Built on demand rather than stored, and
     /// only ever reached from a field default that is not a plain
     /// literal — `fold_field_default` answers the common shapes without
