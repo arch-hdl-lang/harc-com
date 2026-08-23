@@ -1494,13 +1494,23 @@ fn lower_field(
                 Some(TypeArg::Type(ty)) => vec_elem_scalar_ir_type(ty),
                 _ => None,
             }
-            .filter(|ty| matches!(ty,
-                IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
-            ) || matches!(ty, IrType::Bool))
-            .ok_or_else(|| unsupported(
-                &format!("fixed-vector field `{comp}.{fname}` with an unsupported element type"),
-                "only nonzero-width uint/sint/bits/bool/bit elements up to 64 bits are lowered; nested vectors and record elements are not yet supported",
-            ))?;
+            .filter(|ty| {
+                matches!(ty,
+                    IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0
+                ) || matches!(ty, IrType::Bool)
+            })
+            .ok_or_else(|| {
+                unsupported(
+                    &format!(
+                        "fixed-vector field `{comp}.{fname}` with an unsupported element type"
+                    ),
+                    format!(
+                        "only nonzero-width uint/sint/bits/bool/bit elements are lowered, and \
+                     {}; nested vectors and record elements are not yet supported",
+                        scalar_width_detail()
+                    ),
+                )
+            })?;
             let len = match args.get(1) {
                 Some(TypeArg::Expr(e)) => match &*e.kind {
                     ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
@@ -3061,7 +3071,8 @@ pub(crate) fn v1_leaves_the_type_name_undeclared(
 /// Resolve the `<T>` inside an `event<T>` analysis-port field to its
 /// `EventPayload`. Mirrors v1's `payload_type_for_arg` for the lowered
 /// subset:
-///   * a scalar (`uint<W>`/`sint<W>`/`bool` ≤ 64 bits) → `Scalar`;
+///   * a scalar (`uint<W>`/`sint<W>`/`bool`, width per
+///     `field_scalar_width_ok`) → `Scalar`;
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value
 ///     as the record struct, matching v1's `std::function<void(Txn)>`).
 ///
@@ -3096,9 +3107,10 @@ pub(crate) fn lower_event_payload(
         not_implemented(
             &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
-                 are lowered; v1 emits `{named}` as the subscriber's parameter type \
-                 and declares no C++ enum, so its output does not compile either"
+                "only event<scalar> and event<transaction|struct> payloads are lowered \
+                 ({}); v1 emits `{named}` as the subscriber's parameter type and declares \
+                 no C++ enum, so its output does not compile either",
+                scalar_width_detail()
             ),
             V1Status::EmitsUncompilable,
         )
@@ -3109,8 +3121,11 @@ pub(crate) fn lower_event_payload(
         }
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
-            "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads \
-             are lowered; enum/Vec/nested payloads gate on a later slice",
+            format!(
+                "only event<scalar> and event<transaction|struct> payloads are lowered \
+                 ({}); enum/Vec/nested payloads gate on a later slice",
+                scalar_width_detail()
+            ),
         )
     };
     match arg {
@@ -3151,7 +3166,11 @@ pub(crate) fn lower_event_payload(
             }
             Err(unsupported(
                 &format!("a non-identifier event payload on `{comp}.{fname}`"),
-                "only event<scalar ≤ 64 bits> and event<transaction|struct> payloads are lowered",
+                format!(
+                    "only event<scalar> and event<transaction|struct> payloads are lowered \
+                     ({})",
+                    scalar_width_detail()
+                ),
             ))
         }
         // `TypeArg::Named` is a keyword-style arg (`depth=16`), never a
@@ -3259,6 +3278,24 @@ fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// re-introduced a second copy in `scoreboards.rs` to hold it.
 pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
+}
+
+/// What the scalar width policy actually admits, in one sentence, for
+/// the diagnostics that name it.
+///
+/// Five of them said "up to 64 bits" / "scalar ≤ 64 bits" — the cap
+/// as it stood before the field, vector-element and payload gates
+/// opened. A user hitting `Vec<uint<2048>, 4>` or `event<sint<128>>`
+/// was told the wrong reason for a real refusal, which is worse than
+/// a vague one: it sends them to shrink a width that was never the
+/// problem. Built from `MAX_WIDTH_METHOD_BITS` rather than spelling
+/// the number, and kept beside `field_scalar_width_ok`, so the next
+/// widening cannot strand it again.
+fn scalar_width_detail() -> String {
+    format!(
+        "an unsigned scalar reaches {} bits and a signed one stops at 64",
+        crate::MAX_WIDTH_METHOD_BITS
+    )
 }
 
 /// The width policy for a declared scalar FIELD, at every site that has

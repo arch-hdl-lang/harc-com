@@ -6,7 +6,7 @@ tb-ir program
   testbench tb0 AgentOnHandlerTest_tb (synthetic) { dut: Top } component tagger=c0
   test AgentOnHandlerTest tb=tb0 run=fn1 check=- clock=clk@10000ps(SysDomain)
   component c0 Tagger (agent)
-    field in_ev : out event<uint>
+    field in_ev : out event<uint<8>>
     field seen : uint<32> = 0
     field last : uint<8> = 0
 

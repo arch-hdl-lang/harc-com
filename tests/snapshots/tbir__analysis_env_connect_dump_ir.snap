@@ -6,7 +6,7 @@ tb-ir program
   testbench tb0 AnalysisSinkConnectTest_tb (synthetic) { dut: Top } component env=c3
   test AnalysisSinkConnectTest tb=tb0 run=fn3 check=-
   component c0 AnalysisSource (transactor)
-    field observed : out event<uint>
+    field observed : out event<uint<8>>
     method publish(1 arg) = fn0
   component c1 AnalysisSb (scoreboard)
     field count : uint<32> = 0

@@ -284,9 +284,19 @@ impl Display for TbProgram {
                     }
                     ComponentFieldKind::Event { payload } => {
                         use crate::ir::EventPayload;
+                        // The width, not just the signedness. The
+                        // payload could only say `uint` or `sint`
+                        // until it grew a width, and an
+                        // `event<uint<8>>` printed the same as an
+                        // `event<uint<1024>>` right beside a scalar
+                        // field that names its exact type -- which
+                        // also left the `*_dump_ir` snapshots unable
+                        // to see a payload-width regression at all.
                         let inner = match payload {
-                            EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
-                            EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
+                            EventPayload::Scalar { .. } => payload
+                                .scalar_ir_type()
+                                .map(|t| type_str(&t))
+                                .unwrap_or_else(|| "uint".to_string()),
                             EventPayload::Record(r) => self.records[r.index()].name.clone(),
                         };
                         format!("out event<{inner}>")
@@ -589,8 +599,12 @@ fn type_str(t: &IrType) -> String {
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
         IrType::Event(p) => match p {
-            EventPayload::Scalar { signed: true, .. } => "event<sint>".to_string(),
-            EventPayload::Scalar { signed: false, .. } => "event<uint>".to_string(),
+            EventPayload::Scalar { .. } => format!(
+                "event<{}>",
+                p.scalar_ir_type()
+                    .map(|t| type_str(&t))
+                    .unwrap_or_else(|| "uint".to_string())
+            ),
             EventPayload::Record(r) => format!("event<r{}>", r.0),
         },
         IrType::Bool => "bool".to_string(),

@@ -2521,10 +2521,7 @@ impl FuncBuilder<'_> {
                     //
                     // `common_expr_type` gives a WIDTHLESS operand the
                     // 64-bit host ABI, so `seen + t` types as 64 bits
-                    // whatever `seen` is — and an `on ev(t)` payload
-                    // param IS widthless: `EventPayload::Scalar`
-                    // records signedness only, so `event<uint<8>>`
-                    // binds `t : uint`. Judging a ≤64-bit destination
+                    // whatever `seen` is. Judging a ≤64-bit destination
                     // would therefore refuse `seen = seen + t`, the
                     // ordinary counting idiom, on every agent and
                     // transactor in the repo (5 of them in `tbir.rs`
@@ -2534,15 +2531,29 @@ impl FuncBuilder<'_> {
                     // 64, so the verdict there rests only on widths
                     // somebody declared.
                     //
+                    // This paragraph used to name the `on ev(t)`
+                    // payload param as the example, on the grounds
+                    // that it "IS widthless: `EventPayload::Scalar`
+                    // records signedness only". That stopped being
+                    // true when the payload grew a width —
+                    // `event<uint<8>>` binds `t : uint<8>` now, and a
+                    // dump snapshot says so. The BOUND is unchanged,
+                    // because every other widthless operand still gets
+                    // the manufactured 64; only the illustration was
+                    // wrong, and a stale example is how a bound
+                    // outlives its reason.
+                    //
                     // Past 64 is also exactly the territory issue #642
                     // opened: `uint<129>` into `uint<65>` shares the
                     // `_harc_u128` carrier, so C++ took the assignment
                     // and left the bits above 65 live in storage. The
-                    // ≤64-bit half needs the payload-width gap closed
-                    // first and is filed separately; data-only
-                    // scoreboards keep the rule they already had, which
-                    // is stricter here and is not changed by this
-                    // branch.
+                    // ≤64-bit half was filed separately, blocked on
+                    // the payload-width gap; that gap is closed, so
+                    // what remains blocking it is the widthless
+                    // operand above, not the payload. Data-only
+                    // scoreboards keep the rule they already had,
+                    // which is stricter here and is not changed by
+                    // this branch.
                     if matches!(dest, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if w > 64) {
                         self.check_owner_scalar_field_write(
                             &e,

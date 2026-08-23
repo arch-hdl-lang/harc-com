@@ -6,7 +6,7 @@ tb-ir program
   testbench tb0 SequencerConnectTest_tb (synthetic) { dut: Top } component env=c2
   test SequencerConnectTest tb=tb0 run=fn2 check=-
   component c0 CountSeq (sequencer)
-    field dispatched : out event<uint>
+    field dispatched : out event<uint<8>>
     method dispatch(1 arg) = fn0
   component c1 SeqSb (scoreboard)
     field count : uint<32> = 0

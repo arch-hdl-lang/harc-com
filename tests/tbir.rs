@@ -36871,14 +36871,19 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
         );
     }
 
-    // The ORDINARY counting idiom stays legal. An `on ev(t)` payload
-    // param is widthless (`EventPayload::Scalar` records signedness
-    // only), and `common_expr_type` gives a widthless operand the
-    // 64-bit host ABI — so `seen + t` types as 64 bits whatever `seen`
-    // is. A ≤64-bit destination is therefore NOT judged here; a
-    // destination past 64 cannot be narrowed by that manufactured 64,
-    // which is what keeps the check above resting only on declared
-    // widths. See the follow-up issue for the ≤64-bit half.
+    // The ORDINARY counting idiom stays legal. `common_expr_type`
+    // gives a widthless operand the 64-bit host ABI, so a sum can type
+    // as 64 bits whatever its destination is; a ≤64-bit destination is
+    // therefore NOT judged here, and a destination past 64 cannot be
+    // narrowed by that manufactured 64, which is what keeps the check
+    // above resting only on declared widths. See the follow-up issue
+    // for the ≤64-bit half.
+    //
+    // This comment named the `on ev(t)` payload param as THE widthless
+    // operand ("`EventPayload::Scalar` records signedness only"). The
+    // payload carries its width now, so `t` here is `uint<8>` and the
+    // row survives for a different reason: `seen` is `uint<32>`, which
+    // the guard does not judge either way.
     let counter = "domain SysDomain\n  freq_mhz: 100\nend domain SysDomain\n\n\
          agent Tagger\n    \
              in_ev : event<uint<8>>\n    \
@@ -36889,7 +36894,7 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
              run\n        wait 2 cycles\n        emit tagger.in_ev(1)\n        \
                  wait 2 cycles\n    end run\n\
          end test T\n";
-    lower_src(counter).expect("`seen = seen + t` on a widthless payload param stays legal");
+    lower_src(counter).expect("`seen = seen + t` on an event payload param stays legal");
 }
 
 /// A fixed-vector ELEMENT wider than 64 bits keeps its width in the
@@ -37308,5 +37313,61 @@ end test NarrowTest
                 "`event<{src}>` -> `{sink}` ({label}): {msg}"
             );
         }
+    }
+}
+
+/// The IR dump names an event payload's EXACT type, at both renderers
+/// that print one.
+///
+/// `field observed : out event<uint>` was what a `uint<8>` payload and
+/// a `uint<1024>` payload both printed — right beside a scalar field
+/// that names its exact type, which is the discipline
+/// `the_ir_dump_names_a_component_scalar_fields_exact_type` asserts a
+/// few lines up. It also meant the `*_dump_ir` snapshot corpus was
+/// structurally incapable of catching a payload-width regression: the
+/// only line that could move was an `on` handler's parameter.
+#[test]
+fn the_ir_dump_names_an_event_payloads_exact_type() {
+    let prog = |ty: &str| {
+        format!(
+            r#"transactor DumpSrc
+    observed : out event<{ty}>
+    n : uint<32> default 0
+
+    hookable publish(v: uint<8>)
+        n = n + 1
+    end publish
+end transactor DumpSrc
+
+testbench TbDump
+    dut : Top
+    src : DumpSrc passive
+end testbench TbDump
+
+impl TDump for TbDump
+    run
+        src.publish(1)
+        wait 1 cycle
+    end run
+end impl TDump
+"#
+        )
+    };
+    for (ty, want) in [
+        ("uint<8>", "field observed : out event<uint<8>>"),
+        ("sint<32>", "field observed : out event<sint<32>>"),
+        ("uint<1024>", "field observed : out event<uint<1024>>"),
+        // A bare `event` really is widthless, and must keep printing
+        // as one rather than acquiring a manufactured width.
+        ("uint", "field observed : out event<uint>"),
+    ] {
+        let dump = format!(
+            "{}",
+            lower_src(&prog(ty)).unwrap_or_else(|e| panic!("`event<{ty}>` lowers: {e:?}"))
+        );
+        assert!(
+            dump.contains(want),
+            "`event<{ty}>` must dump as `{want}`:\n{dump}"
+        );
     }
 }

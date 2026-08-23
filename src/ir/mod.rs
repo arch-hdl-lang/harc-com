@@ -1374,7 +1374,9 @@ pub enum EventPayload {
     /// `std::function<void(harc_rt::HarcWide<32>)>` for it. Two sites
     /// already converted the payload back into an `IrType` with a
     /// `None` width to talk to the rest of lowering, one of them
-    /// commenting that the param "IS widthless".
+    /// commenting that the param "IS widthless" — a claim that had
+    /// spread into two more comments and a test by the time it was
+    /// made false.
     ///
     /// Every sibling slot — `QueueElem::Scalar { ty }`,
     /// `StateFieldKind::Scalar { ty }`, `FixedVecSchema { elem }` —
@@ -1390,13 +1392,6 @@ pub enum EventPayload {
 }
 
 impl EventPayload {
-    /// Is this a SIGNED scalar payload? The question most call sites
-    /// used to ask the variant directly, back when signedness was all
-    /// it could hold.
-    pub fn is_signed_scalar(&self) -> bool {
-        matches!(self, EventPayload::Scalar { signed: true, .. })
-    }
-
     /// The payload as an `IrType`, for the lowering sites that type a
     /// handler parameter or an `emit` argument against it. This is the
     /// conversion two call sites already open-coded with a `None`
