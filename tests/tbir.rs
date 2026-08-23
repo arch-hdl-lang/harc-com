@@ -37623,3 +37623,153 @@ end impl BackstopTest2
         ));
     }
 }
+
+/// harc#666: a bare enum-variant name declared by more than one enum has
+/// no correct index as a VALUE. TB-IR used to fold it first-wins and
+/// substitute silently — `let w : WrResp = OKAY` compiling to 0 when
+/// `WrResp.OKAY` is 1 — a wrong number with no diagnostic, and (until v1
+/// gained its own guard in harc#662) a wrong number both backends agreed
+/// on, so the equivalence harness could not see it. It is now a hard
+/// `LowerError::Invalid` naming the owning enums.
+#[test]
+fn ambiguous_enum_variant_as_a_value_is_rejected() {
+    let src = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+test T
+    let dut : Top
+    run
+        let w : WrResp = OKAY
+        log(info, "${w}")
+    end run
+end test T"#;
+    let err = lower_src(src).expect_err("an ambiguous variant used as a value must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("`OKAY`") && msg.contains("more than one enum"),
+        "the message must name the variant and the ambiguity: {msg}"
+    );
+    // Both owning enums are named so the user can find them.
+    assert!(
+        msg.contains("RdResp") && msg.contains("WrResp"),
+        "the message must name both owning enums: {msg}"
+    );
+    // HARC has no `Enum.VARIANT` form, so the fix cannot be "qualify it".
+    assert!(
+        !msg.contains("qualify"),
+        "must not suggest a qualified form the language lacks: {msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "the message must have no doubled internal whitespace: {msg:?}"
+    );
+}
+
+/// The complement of the rejection: an ambiguous variant used ONLY inside
+/// a `keep` still lowers. Constraint position resolves variants through
+/// its own path under the documented first-wins rule, so the rejection is
+/// confined to value position and does not regress a program whose only
+/// use of the name is a constraint. This is also what keeps v1 and TB-IR
+/// agreeing on such a program.
+#[test]
+fn ambiguous_enum_variant_in_a_keep_still_lowers() {
+    let src = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+transaction Req
+    r : RdResp
+    keep r == OKAY
+end transaction Req
+test T
+    let dut : Top
+    run
+        let t : Req
+        randomize(t)
+        log(info, "${t.r}")
+    end run
+end test T"#;
+    lower_src(src).expect("an ambiguous variant used only in a keep must still lower");
+}
+
+/// An UNAMBIGUOUS variant — declared by exactly one enum — is a value as
+/// before. The rejection keys on multiple-declaration, not on the name
+/// merely appearing in more than one place.
+#[test]
+fn an_unambiguous_enum_variant_is_still_a_value() {
+    let src = r#"enum RdResp { OKAY, SLVERR }
+enum Color { RED, GREEN, BLUE }
+test T
+    let dut : Top
+    run
+        let c : Color = BLUE
+        log(info, "${c}")
+    end run
+end test T"#;
+    lower_src(src).expect("an unambiguous variant used as a value must still lower");
+}
+
+/// harc#666, covergroup path: a bin bound (or coverpoint target) naming an
+/// ambiguous variant is the same silent-wrong-index bug as a plain value,
+/// in a live sampled comparison — `bins hit = {OKAY}` folded `_v == 0`
+/// (RdResp first-wins) while v1 rejected it, a v1/tbir divergence. It is
+/// now rejected here too, so the backends agree.
+#[test]
+fn ambiguous_enum_variant_in_a_covergroup_bin_is_rejected() {
+    let src = r#"enum RdResp { OKAY, SLVERR }
+enum WrResp { SLVERR, OKAY }
+covergroup G @(posedge dut.clk)
+    cp : cover dut.count
+        bins
+            hit = {OKAY}
+        end bins
+end covergroup G
+testbench Tb
+    dut : Top
+    cov : G
+end testbench Tb
+impl T for Tb
+    run
+        wait 3 cycles
+    end run
+end impl T"#;
+    let err = lower_src(src)
+        .expect_err("an ambiguous variant in a covergroup bin must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("`OKAY`") && msg.contains("more than one enum"),
+        "the covergroup diagnostic must name the variant and the ambiguity: {msg}"
+    );
+    assert!(
+        msg.contains("covergroup `G` bin `hit`"),
+        "the diagnostic should locate the covergroup and name the BIN (not          mislabel it a point): {msg}"
+    );
+    // Guards the `\`-continuation whitespace bug: the rendered message must
+    // not contain a run of stray internal spaces.
+    assert!(
+        !msg.contains("  "),
+        "the message must have no doubled internal whitespace: {msg:?}"
+    );
+}
+
+/// The complement: an UNAMBIGUOUS variant in a covergroup bin still
+/// lowers. The rejection keys on multiple-declaration, not on a variant
+/// appearing in a bin.
+#[test]
+fn an_unambiguous_enum_variant_in_a_covergroup_bin_still_lowers() {
+    let src = r#"enum Color { RED, GREEN, BLUE }
+covergroup G @(posedge dut.clk)
+    cp : cover dut.count
+        bins
+            r = {RED}
+            g = {GREEN}
+        end bins
+end covergroup G
+testbench Tb
+    dut : Top
+    cov : G
+end testbench Tb
+impl T for Tb
+    run
+        wait 3 cycles
+    end run
+end impl T"#;
+    lower_src(src).expect("an unambiguous variant in a covergroup bin must still lower");
+}

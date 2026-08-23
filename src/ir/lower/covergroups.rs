@@ -25,6 +25,7 @@ pub(crate) fn lower_covergroup(
     helpers: &HelperRegistry<'_>,
     extern_fns: &HashMap<String, &ExternFnDecl>,
     consts: &HashMap<String, ConstVal>,
+    ambiguous_variants: &HashMap<String, String>,
 ) -> Result<CovgroupSchema, LowerError> {
     // v1's clock-sample registration ignores the trigger expression
     // entirely — any non-hook covergroup samples once per primary-clock
@@ -55,6 +56,41 @@ pub(crate) fn lower_covergroup(
         }
         Some(CoverTrigger::Clock(_)) | None => CovTrigger::PosedgeDutClk,
     };
+
+    // harc#666: an enum-variant name declared by more than one enum has
+    // no correct index as a VALUE. `consts` folded it first-wins, so a
+    // bin bound or coverpoint target naming one would silently compare
+    // against the wrong enum's index — `{OKAY}` sampling `_v == 0` when
+    // `WrResp.OKAY` is 1, with no diagnostic and (since v1 rejects it) a
+    // v1/tbir divergence. Reject a value use here, the same as the
+    // general expression path does, so the two backends agree.
+    //
+    // Every value expression a covergroup can hold is a coverpoint
+    // `target` or a bin `spec`; validate both up front rather than
+    // threading the map through the recursive point-target lowerer and
+    // its ~18 call sites. A hook parameter of the same name shadows the
+    // variant (bins defer to it — see `mentions_hook_param`), so a name
+    // in `hook_params` is skipped, matching that precedence.
+    for it in &g.items {
+        if let CoverItem::Point(p) = it {
+            reject_ambiguous_variant_use(
+                &g.name.name,
+                &format!("coverpoint `{}`", p.name.name),
+                &p.target,
+                ambiguous_variants,
+                &hook_params,
+            )?;
+            for b in &p.bins {
+                reject_ambiguous_variant_use(
+                    &g.name.name,
+                    &format!("bin `{}`", b.name.name),
+                    &b.spec,
+                    ambiguous_variants,
+                    &hook_params,
+                )?;
+            }
+        }
+    }
 
     // Pass 1: points (a `cross` may reference a point declared after it).
     let mut points = Vec::new();
@@ -1623,6 +1659,124 @@ fn cover_const_refusal(
 /// an enum variant, if any. Walks the whole expression, because a name
 /// buried in `[K + N:0]` is the reason the fold stopped just as much as
 /// a bare one is.
+/// Reject a bare enum-variant name declared by more than one enum
+/// (`ambiguous_variants`) used anywhere inside a covergroup value
+/// expression — a coverpoint target or a bin spec (harc#666). Mirrors the
+/// general expression path's rejection so `--codegen tbir` and v1 agree
+/// instead of v1 rejecting while tbir silently folds first-wins.
+///
+/// Walks the whole expression, not just its fold-subset, so an ambiguous
+/// name reaches this check wherever it appears — inside a `{...}` set, a
+/// `[lo..hi]` range, or an arithmetic bound. Only bare `Ident` nodes are
+/// checked, so a field NAME (`t.OKAY`) is never mistaken for a variant
+/// reference. A `hook_params` name shadows the variant and is skipped,
+/// matching `mentions_hook_param`'s precedence in the fold path.
+fn reject_ambiguous_variant_use(
+    group: &str,
+    location: &str,
+    e: &AstExpr,
+    ambiguous_variants: &HashMap<String, String>,
+    hook_params: &[String],
+) -> Result<(), LowerError> {
+    fn walk(
+        e: &AstExpr,
+        ambiguous_variants: &HashMap<String, String>,
+        hook_params: &[String],
+        found: &mut Option<(String, String)>,
+    ) {
+        if found.is_some() {
+            return;
+        }
+        match &*e.kind {
+            ExprKind::Ident(id) => {
+                if !hook_params.contains(&id.name) {
+                    if let Some(owners) = ambiguous_variants.get(&id.name) {
+                        *found = Some((id.name.clone(), owners.clone()));
+                    }
+                }
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::Cast { expr: target, .. }
+            | ExprKind::Unary { expr: target, .. }
+            | ExprKind::HashHash { expr: target, .. }
+            | ExprKind::SeqRepeat { expr: target, .. }
+            | ExprKind::ForkCall { call: target } => {
+                walk(target, ambiguous_variants, hook_params, found)
+            }
+            ExprKind::Index { target, index } => {
+                walk(target, ambiguous_variants, hook_params, found);
+                walk(index, ambiguous_variants, hook_params, found);
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                walk(target, ambiguous_variants, hook_params, found);
+                walk(hi, ambiguous_variants, hook_params, found);
+                walk(lo, ambiguous_variants, hook_params, found);
+            }
+            ExprKind::Send { target, value } => {
+                walk(target, ambiguous_variants, hook_params, found);
+                walk(value, ambiguous_variants, hook_params, found);
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                walk(lhs, ambiguous_variants, hook_params, found);
+                walk(rhs, ambiguous_variants, hook_params, found);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                walk(cond, ambiguous_variants, hook_params, found);
+                walk(then_branch, ambiguous_variants, hook_params, found);
+                walk(else_branch, ambiguous_variants, hook_params, found);
+            }
+            ExprKind::RangeLit { lo, hi } => {
+                if let Some(e) = lo {
+                    walk(e, ambiguous_variants, hook_params, found);
+                }
+                if let Some(e) = hi {
+                    walk(e, ambiguous_variants, hook_params, found);
+                }
+            }
+            ExprKind::SetLit(items) => {
+                for it in items {
+                    walk(it, ambiguous_variants, hook_params, found);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                walk(callee, ambiguous_variants, hook_params, found);
+                for a in args {
+                    let (crate::ast::CallArg::Expr(ex) | crate::ast::CallArg::Named { value: ex, .. }) = a;
+                    walk(ex, ambiguous_variants, hook_params, found);
+                }
+            }
+            ExprKind::Paren(inner) => walk(inner, ambiguous_variants, hook_params, found),
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, ambiguous_variants, hook_params, found);
+                }
+            }
+            // Literals, `ImplicitSelf`, `DistLit`, `Randomize`,
+            // `SoftConstraint` — no bare-variant value reference reaches a
+            // bin bound or coverpoint target through these, and a missed
+            // descent costs only a diagnostic that does not fire (the
+            // pre-#666 behaviour), never a false rejection.
+            _ => {}
+        }
+    }
+
+    let mut found = None;
+    walk(e, ambiguous_variants, hook_params, &mut found);
+    if let Some((name, owners)) = found {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` {location}: enum variant `{name}` is \
+             declared by more than one enum (`{owners}`), so no single \
+             index is correct for a bare `{name}`. HARC has no qualified \
+             `Enum.VARIANT` form, so rename one of them.",
+        )));
+    }
+    Ok(())
+}
+
 fn first_unresolved_name(e: &AstExpr, consts: &HashMap<String, ConstVal>) -> Option<String> {
     let mut found = None;
     walk_expr(e, &mut |x| {
