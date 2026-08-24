@@ -9285,6 +9285,33 @@ former `transaction` group lives in
      fixed vectors are untouched — they still lower. Corpus dumps
      identically.
 
+148. **Wide wrapping operator (`+%`/`-%`/`*%` at width > 64) — regrade
+     (2026-08-24).**
+
+     A wrapping operator whose operand width exceeds 64 bits was an
+     `unsupported` ("re-run with `--codegen v1`"), but v1 has its OWN
+     identical gate (`wrap_mask_width` in `cpp_tb.rs`) that returns an
+     error and emits no C++ for a wide wrapping op — measured: v1 refuses
+     `+%`, `-%`, `*%` at width 128 verbatim, while both backends lower the
+     same operators at 64 bits (control). Both reject it, so the honest
+     `V1Status` is `Rejects` — and this false promise was previously
+     UNMEASURED (the `wide-ops-unsigned` differential space omitted the
+     wrapping operators). One site, all three operators; the v1 gate is a
+     pure expression-position width check, so there is no host split and no
+     used-form subtlety (v1 never emits C++). Corpus dumps identically.
+
+     A second candidate this batch investigated — regrading the whole
+     "non-scalar queue element" arm to `EmitsUncompilable` — was DROPPED on
+     measurement: the arm is a batch-45 split. `queue<string>` does get
+     v1's scalar fallback (`HarcQueue<uint64_t>`, uncompilable on a
+     `push("hi")` — measured), but `queue<Vec<..>>` / `queue<list<..>>`
+     get a REAL v1 element type and build (pinned by the existing
+     `scalar_queue_rollout_keeps_aggregate_elements_unsupported` test), so
+     they are genuine implement gaps, not false promises. Regrading the
+     shared arm uniformly would have mis-graded Vec/list; splitting `string`
+     out precisely needs its own measured sub-batch, so the arm is left as
+     is for now.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

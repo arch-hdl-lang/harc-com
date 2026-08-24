@@ -4898,11 +4898,16 @@ impl FuncBuilder<'_> {
         };
         let width = wl.max(wr);
         if width > 64 {
-            return Err(unsupported(
+            // Not a `--codegen v1` escape: v1 has its OWN identical gate
+            // (`wrap_mask_width` in `cpp_tb.rs`) that returns an error and
+            // emits no C++ for a wrapping op past 64 bits (measured — v1
+            // refuses `+%`/`-%`/`*%` at width 128). Both backends reject it.
+            return Err(not_implemented(
                 &format!("wrapping operator `{sym}` at width {width} (> 64 bits)"),
                 "wrapping arithmetic is lowered for operand widths up to 64 bits; \
                  wider datapaths need the `HarcWide<N>` model, which is not wired \
                  through the wrapping mask yet",
+                V1Status::Rejects,
             ));
         }
         // `width == 0` can't occur: every determinable width is >= 1.
