@@ -3669,10 +3669,9 @@ impl super::FuncBuilder<'_> {
     ///     (head segment is a component local) naming a method nothing
     ///     declares. v1 emits `c.nosuch(3)` against a struct with no
     ///     such member and g++ rejects it, so no backend runs it.
-    ///   * `Unsupported` — a well-formed call to one of the built-in
-    ///     predicates outside expression position. Nothing declares
-    ///     those either, so they reach the same arm, but both backends
-    ///     implement them; see `is_builtin_component_predicate`.
+    /// Built-in predicates are not declared component methods. This resolver
+    /// returns `None` for those names so the ordinary value-expression path
+    /// can lower them in every source position.
     pub(crate) fn as_component_method_call(
         &self,
         callee: &AstExpr,
@@ -3694,49 +3693,11 @@ impl super::FuncBuilder<'_> {
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if comp.method(&method).is_none() {
-                        // "Not a declared method" is NOT the same set as
-                        // "does not exist", and a first pass made this
-                        // arm `Invalid` on that conflation.
-                        //
-                        // The built-in component predicates — `idle`,
-                        // `idle_in`, `idle_out`, `quiesced` — are not
-                        // declared methods and land here. v1 implements
-                        // all of them (`emit_idle_predicate`,
-                        // `resolve_component_quiesced_predicate`), and
-                        // TB-IR implements them too, one statement
-                        // position over: `assert c.idle(2)` lowers
-                        // through `as_component_idle` and emits, while
-                        // `let q = c.idle(2)` came through here and was
-                        // told its program was invalid. Both backends
-                        // run it; only this seam does not.
-                        //
-                        // So a built-in in a binding position is a real
-                        // TB-IR gap with a working escape hatch, and
-                        // anything else is the program error the first
-                        // pass measured: v1 emits `uint64_t x =
-                        // c.nosuch(3);` against a struct with no such
-                        // member — g++: "'struct Calc' has no member
-                        // named 'nosuch'".
+                        // Predicates are built-ins, not schema methods. Let
+                        // value lowering claim them. Any other absent name is
+                        // a program error: v1 emits a nonexistent C++ member.
                         if is_builtin_component_predicate(&method) {
-                            // THREE landings share this arm, not the two
-                            // an earlier version named: `let q =
-                            // c.idle(2)`, `x = c.idle(2)`, and the bare
-                            // statement `c.idle(2)`, which has neither a
-                            // binding nor a local. So the construct
-                            // names the predicate and the detail names
-                            // what IS lowered, rather than describing
-                            // one landing's syntax as if it were all of
-                            // them.
-                            return Err(unsupported(
-                                &format!(
-                                    "the built-in predicate `{}` outside expression position",
-                                    path.join(".")
-                                ),
-                                "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` where \
-                                 their value is USED (`assert c.idle(2)`, `while \
-                                 !c.idle_in(4)`), but not as a `let`/assignment right-hand \
-                                 side or a bare statement; v1 emits it in all of them",
-                            ));
+                            return Ok(None);
                         }
                         return Err(LowerError::Invalid(format!(
                             "component `{}` has no method `{method}` (in `{}`)",
@@ -3790,31 +3751,11 @@ impl super::FuncBuilder<'_> {
                     if let Some(cid) = self.component_of_local(local) {
                         let comp = &self.ctx.components[cid.index()];
                         if comp.method(&method.name).is_none() {
-                            // Same condition as the path-shaped sibling
-                            // above, reached through a component-typed
-                            // PARAMETER instead — and reachable: a
-                            // `function observe(a: uint<8>, m: Model)`
-                            // calling `m.nosuch(a)` lands here directly.
-                            // (An earlier note said "not probed, every
-                            // source was claimed by the transactor-method
-                            // arm first"; that arm only fires for
-                            // transactor-typed params.) So this is a
-                            // SECOND landing for a missing method, not
-                            // the single one an earlier entry claimed.
-                            //
-                            // Same built-in carve-out, for the same
-                            // reason.
+                            // Same distinction as the path-shaped receiver:
+                            // predicates fall through; other absent names are
+                            // invalid method calls.
                             if is_builtin_component_predicate(&method.name) {
-                                return Err(unsupported(
-                                    &format!(
-                                        "the built-in predicate `{}.{}` on a \
-                                         component-typed parameter",
-                                        recv.name, method.name
-                                    ),
-                                    "TB-IR lowers `idle`/`idle_in`/`idle_out`/`quiesced` \
-                                     in expression position but not here; v1 emits it \
-                                     either way",
-                                ));
+                                return Ok(None);
                             }
                             return Err(LowerError::Invalid(format!(
                                 "component `{}` has no method `{}` (on parameter `{}`)",
@@ -5277,6 +5218,43 @@ impl super::FuncBuilder<'_> {
         self.ctx.components[cid.index()].method(method).is_some()
     }
 
+    /// Resolve a component predicate receiver without conflating a
+    /// component-typed parameter with a testbench component path.
+    fn component_predicate_receiver(
+        &self,
+        target: &AstExpr,
+    ) -> Result<Option<(ComponentBase, ComponentId, Vec<String>)>, LowerError> {
+        let Some(raw) = dotted_path(target) else {
+            return Ok(None);
+        };
+        let path = self.strip_tb_prefix(&raw).to_vec();
+        if let Some(root) = path.first() {
+            if let Some(local) = self.lookup(root) {
+                if let Some(head_cid) = self.component_of_local(local) {
+                    let cid = self.resolve_component_recv(head_cid, &path[1..])?;
+                    return Ok(Some((ComponentBase::Local(local), cid, path[1..].to_vec())));
+                }
+            }
+        }
+        let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
+            return Ok(None);
+        };
+        let cid = self.resolve_component_recv(head_cid, &path[1..])?;
+        Ok(Some((ComponentBase::Path(path), cid, Vec::new())))
+    }
+
+    /// Lower any component heartbeat predicate through the shared value path.
+    pub(crate) fn as_component_builtin_predicate(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<IrExpr>, LowerError> {
+        if let Some(idle) = self.as_component_idle(callee, args)? {
+            return Ok(Some(idle));
+        }
+        self.as_component_quiesced(callee, args)
+    }
+
     /// Lower `<comp>.idle(N)` / `.idle_in(N)` / `.idle_out(N)` to an
     /// `Expr::ComponentIdle` when the callee resolves to a component
     /// instance path. Returns `None` when the callee is not an idle
@@ -5297,20 +5275,9 @@ impl super::FuncBuilder<'_> {
             "idle_out" => crate::ir::IdleKind::Out,
             _ => return Ok(None),
         };
-        // The receiver must be a path rooted at a component local — a
-        // bare `agent` / `env.agent` (test-scope let) or a `_tb`-prefixed
-        // `_tb.prod` (testbench field, after impl-for desugaring). Strip
-        // the `_tb` prefix so both resolve through `component_fields`.
-        let Some(raw) = dotted_path(target) else {
+        let Some((base, recv_cid, subpath)) = self.component_predicate_receiver(target)? else {
             return Ok(None);
         };
-        let path = self.strip_tb_prefix(&raw).to_vec();
-        let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
-            return Ok(None);
-        };
-        // Walk sub-component segments to confirm the path resolves to a
-        // component (the idle stamps live on every component struct).
-        let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
         if self.user_override_wins(recv_cid, &name.name) {
             return Ok(None);
         }
@@ -5345,7 +5312,8 @@ impl super::FuncBuilder<'_> {
         let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
         Ok(Some(IrExpr::ComponentIdle {
-            base: ComponentBase::Path(path),
+            base,
+            subpath,
             kind,
             n: Box::new(n),
         }))
@@ -5371,16 +5339,10 @@ impl super::FuncBuilder<'_> {
         if name.name != "quiesced" {
             return Ok(None);
         }
-        let Some(raw) = dotted_path(target) else {
+        let Some((base, recv_cid, receiver_path)) = self.component_predicate_receiver(target)?
+        else {
             return Ok(None);
         };
-        let path = self.strip_tb_prefix(&raw).to_vec();
-        let Some(&head_cid) = path.first().and_then(|h| self.ctx.component_fields.get(h)) else {
-            return Ok(None);
-        };
-        // Resolve the receiver to its component (errors if a mid-path
-        // segment is not a sub-component).
-        let recv_cid = self.resolve_component_recv(head_cid, &path[1..])?;
         if self.user_override_wins(recv_cid, &name.name) {
             return Ok(None);
         }
@@ -5406,13 +5368,14 @@ impl super::FuncBuilder<'_> {
         // Collect every leaf sub-component instance path under the receiver.
         let mut leaves: Vec<Vec<String>> = Vec::new();
         let mut stack: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
-        self.collect_quiesce_leaves(recv_cid, path.clone(), &mut stack, &mut leaves);
+        self.collect_quiesce_leaves(recv_cid, receiver_path, &mut stack, &mut leaves);
 
         // Each leaf → `idle(N)` (both stamps). AND them together. A single
         // leaf yields a bare `ComponentIdle` (no redundant `&& true`),
         // matching v1's per-condition expansion.
         let mut terms = leaves.into_iter().map(|leaf| IrExpr::ComponentIdle {
-            base: ComponentBase::Path(leaf),
+            base: base.clone(),
+            subpath: leaf,
             kind: crate::ir::IdleKind::Both,
             n: Box::new(n.clone()),
         });

@@ -1487,13 +1487,10 @@ impl FuncBuilder<'_> {
                         }
                         // Component heartbeat-idle predicates:
                         // `agent.idle_in(N)`, `.idle_out(N)`, `.idle(N)`.
-                        if let Some(idle) = self.as_component_idle(callee, args)? {
-                            return Ok(idle);
-                        }
-                        // Env-level aggregation: `<env>.quiesced(N)` expands
-                        // to an AND of `idle(N)` over every leaf sub-component.
-                        if let Some(q) = self.as_component_quiesced(callee, args)? {
-                            return Ok(q);
+                        if let Some(predicate) =
+                            self.as_component_builtin_predicate(callee, args)?
+                        {
+                            return Ok(predicate);
                         }
                         // Direct transactor heartbeat predicates use the
                         // transactor field/schema namespace rather than a
@@ -2741,10 +2738,16 @@ impl FuncBuilder<'_> {
                 // inline values.
                 self.hoist_transactor_edge(Expr::Call(t, args))
             }
-            Expr::ComponentIdle { base, kind, n } => {
+            Expr::ComponentIdle {
+                base,
+                subpath,
+                kind,
+                n,
+            } => {
                 let n = self.hoist_ports_with_hint(*n, None, exact_untyped_ports);
                 Expr::ComponentIdle {
                     base,
+                    subpath,
                     kind,
                     n: Box::new(n),
                 }
@@ -2924,6 +2927,7 @@ impl FuncBuilder<'_> {
                 | crate::ir::CallTarget::ExternFn { ret, .. },
                 _,
             ) => Some(ret.clone()),
+            Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
             Expr::TbField(field) => self.ctx.tb_scalar_fields.get(field).cloned(),
             Expr::ComponentField { base, field } => self.component_field_value_type(base, field),
             Expr::TransactorState { instance, field } => {
@@ -3318,10 +3322,16 @@ impl FuncBuilder<'_> {
                     inner: Box::new(inner),
                 }
             }
-            Expr::ComponentIdle { base, kind, n } => {
+            Expr::ComponentIdle {
+                base,
+                subpath,
+                kind,
+                n,
+            } => {
                 let n = self.hoist_transactor_calls(*n);
                 Expr::ComponentIdle {
                     base,
+                    subpath,
                     kind,
                     n: Box::new(n),
                 }

@@ -1286,13 +1286,23 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 sb_query_str(query)
             )
         }
-        Expr::ComponentIdle { base, kind, n } => {
+        Expr::ComponentIdle {
+            base,
+            subpath,
+            kind,
+            n,
+        } => {
             let m = match kind {
                 crate::ir::IdleKind::In => "idle_in",
                 crate::ir::IdleKind::Out => "idle_out",
                 crate::ir::IdleKind::Both => "idle",
             };
-            format!("{}.{m}({})", comp_base_str(base), expr_str(func, n))
+            let mut recv = comp_base_str(base);
+            if !subpath.is_empty() {
+                recv.push('.');
+                recv.push_str(&subpath.join("."));
+            }
+            format!("{recv}.{m}({})", expr_str(func, n))
         }
         Expr::TransactorIdle { field, kind, n, .. } => {
             let m = match kind {

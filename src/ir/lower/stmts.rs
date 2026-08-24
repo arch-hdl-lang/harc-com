@@ -652,6 +652,15 @@ impl FuncBuilder<'_> {
                         });
                         return Ok(());
                     }
+                    // Component predicates are pure boolean values. Preserve
+                    // statement-position evaluation (including the threshold)
+                    // by assigning the value to an unread boolean temporary.
+                    if let Some(predicate) = self.as_component_builtin_predicate(callee, args)? {
+                        let discard = self.fresh_temp();
+                        self.set_local_type(discard, crate::ir::IrType::Bool);
+                        self.push(Stmt::Assign(discard, predicate));
+                        return Ok(());
+                    }
                 }
                 // A direct transactor heartbeat predicate is a pure value,
                 // not a method edge. In statement position v1 still
