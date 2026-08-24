@@ -78,8 +78,11 @@ pub(crate) fn bound_transactor_is_component(t: &TransactorDecl) -> bool {
 
 /// True when a `transactor` declaration routes to the composite-component
 /// table rather than the DUT-poking `TransactorSchema`. Two shapes:
-///   * pure analysis source — at least one `event<T>` field and NO
-///     module-typed DUT field (`out event<T>` ports + emit-only methods);
+///   * any unbound transactor with an `event<T>` field. This includes a
+///     pure analysis source (`out event<T>` + no DUT), an event-driven
+///     consumer, and a DUT-poking BFM that exposes an event channel without
+///     declaring its own `on` handler. All three need the component event
+///     member / emit path; a subscribing handler is optional.
 ///   * event-driven (consumer-side) transactor — an `in event<T>` field
 ///     with a matching `on <ev>(t)` handler, optionally plus a single
 ///     module-typed DUT field the handler pokes. This is the unbound
@@ -114,7 +117,6 @@ pub(crate) fn transactor_is_component(
     record_ids: &HashMap<String, RecordId>,
 ) -> bool {
     let mut has_event = false;
-    let mut has_in_event = false;
     let mut has_on_handler = false;
     let mut has_periodic_handler = false;
     let mut has_module_field = false;
@@ -124,9 +126,6 @@ pub(crate) fn transactor_is_component(
             ComponentItem::Field(f) => {
                 if is_event_field(f) {
                     has_event = true;
-                    if matches!(f.direction, Some(crate::ast::Direction::In)) {
-                        has_in_event = true;
-                    }
                 } else if let TypeExpr::Named { name, .. } = &f.ty {
                     let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
                     // Declared records are persistent host-side state, not
@@ -146,13 +145,13 @@ pub(crate) fn transactor_is_component(
     if t.bound_to.is_some() {
         return bound_transactor_is_component(t);
     }
-    // Pure analysis source: events, no DUT.
-    if has_event && !has_module_field {
-        return true;
-    }
-    // Event-driven consumer transactor: an `in event` + a subscribing
-    // `on` handler (the DUT field, if any, is the handler's poke target).
-    if has_in_event && has_on_handler {
+    // Every unbound event-bearing transactor needs the component view. The
+    // event member and its emit fan-out do not depend on a self-subscribing
+    // `on` handler: callers may emit directly or an env may connect another
+    // source into it. Keeping the old `!has_module_field || has_on_handler`
+    // split routed the handler-less DUT-poking form to `TransactorSchema`,
+    // whose state representation has no event channel at all.
+    if has_event {
         return true;
     }
     // Reactive monitor / checker transactor with NO `in event`: a
@@ -253,32 +252,49 @@ pub(crate) fn transactor_has_mode_sensitive_analysis_surface(
             .is_some_and(|items| !items.is_empty())
 }
 
-/// True when a transactor routes to the COMPONENT path purely as a
-/// **DUT-poking hookable BFM** — `hookable` methods + exactly the
-/// module-typed DUT handle, with NO `on`/event handler and no `bound to`,
-/// AND it is `env_held` (referenced as an env/agent sub-component field).
-/// Exactly the transactor `transactor_is_component`'s trailing arm admits.
+/// True when a transactor routes to the COMPONENT path as a DUT-attached
+/// BFM without its own `on` handler. This is either a hookable BFM held by
+/// an env, or any DUT-attached transactor exposing an event field (which
+/// needs the component event path even if it declares no methods).
 /// Such a transactor is a transactor at every binding site (its methods
 /// live under `when active`), so it requires an explicit `active` mode
 /// just like an event-driven consumer — even though it lowers to a
 /// `ComponentSchema`. A `passive` instance has no methods at all. Feeds
-/// the `dut_poking_bfm_names` `active`-mode gate; a NON-env-held BFM stays
-/// a `TransactorSchema` whose mode is handled by the `transactor_ids` gate.
-pub(crate) fn transactor_is_dut_poking_bfm(t: &TransactorDecl, env_held: bool) -> bool {
-    if !env_held || t.bound_to.is_some() {
+/// the `dut_poking_bfm_names` `active`-mode gate. A non-env-held BFM without
+/// an event stays a `TransactorSchema`; an event-bearing one is component-
+/// hosted and therefore also needs this gate.
+pub(crate) fn transactor_is_dut_poking_bfm(
+    t: &TransactorDecl,
+    env_held: bool,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
+    if t.bound_to.is_some() {
         return false;
     }
     let mut has_module_field = false;
     let mut has_event = false;
     let mut has_on_handler = false;
     let mut has_hookable = false;
+    let has_active_surface = t
+        .when_active
+        .as_ref()
+        .is_some_and(|items| !items.is_empty());
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f) => {
                 if is_event_field(f) {
                     has_event = true;
-                } else if matches!(&f.ty, TypeExpr::Named { .. }) {
-                    has_module_field = true;
+                } else if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    // A declared value record is component state, not a DUT
+                    // handle. Keep this in lockstep with
+                    // `transactor_is_component` and
+                    // `transactor_is_analysis_source`; otherwise an event
+                    // source carrying record state is misclassified as a
+                    // DUT-poking BFM at test-scope `let` mode validation.
+                    if !record_ids.contains_key(simple) {
+                        has_module_field = true;
+                    }
                 }
             }
             ComponentItem::OnHandler(_) => has_on_handler = true,
@@ -286,9 +302,50 @@ pub(crate) fn transactor_is_dut_poking_bfm(t: &TransactorDecl, env_held: bool) -
             _ => {}
         }
     }
-    // Exactly the shape `transactor_is_component`'s trailing arm admits:
-    // hookable BFM + DUT handle, no event/on/periodic, env-held.
-    has_hookable && has_module_field && !has_event && !has_on_handler
+    // An event channel itself requires component hosting. Without one, this
+    // predicate retains the older env-held hookable-BFM classification.
+    has_module_field
+        && !has_on_handler
+        && if has_event {
+            has_active_surface
+        } else {
+            has_hookable && env_held
+        }
+}
+
+/// A handler-less, DUT-attached event host with no `when active` surface.
+/// It still follows the transactor ownership contract (an explicit active or
+/// passive mode), but unlike an active-only DUT-poking BFM either mode keeps
+/// all of its fields available.
+pub(crate) fn transactor_is_always_on_dut_event_host(
+    t: &TransactorDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> bool {
+    if t.bound_to.is_some()
+        || t.when_active
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+    {
+        return false;
+    }
+    let mut has_event = false;
+    let mut has_module_field = false;
+    for item in &t.items {
+        match item {
+            ComponentItem::Field(f) if is_event_field(f) => has_event = true,
+            ComponentItem::Field(f) => {
+                if let TypeExpr::Named { name, .. } = &f.ty {
+                    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                    if !record_ids.contains_key(simple) {
+                        has_module_field = true;
+                    }
+                }
+            }
+            ComponentItem::OnHandler(_) => return false,
+            _ => {}
+        }
+    }
+    has_event && has_module_field
 }
 
 /// True when a transactor is a DUT-attached passive helper/monitor:

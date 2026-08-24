@@ -14242,14 +14242,22 @@ end impl T"#
         ]
     };
 
-    // v1 models a directional EVENT — a real `std::function` fan-out.
+    // v1 models a directional EVENT — a real `std::function` fan-out —
+    // even without a self-subscribing `on` handler. TBIR routes this shape
+    // through the component event path in both declaration positions.
     for src in both("    req : in event<uint<8>>") {
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
-        assert!(msg.contains("directional event field"), "{msg}");
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        let prog = lower_src(&src).expect("TBIR lowers the handler-less event field");
+        verify::verify_program(&prog).expect("handler-less event field verifies");
+        let out = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .expect("TBIR emits the handler-less event field");
         assert!(
             v1.contains("std::vector<std::function<void(uint64_t)>> req;"),
             "v1 models the event field: {v1}"
+        );
+        assert!(
+            out.contains("std::vector<std::function<void(uint64_t)>> req;"),
+            "TBIR models the event field: {out}"
         );
     }
     // The declaration alone is not the claim — an `emit` into it has to
@@ -14258,11 +14266,18 @@ end impl T"#
         "        drv.step(1)",
         "        emit drv.req(1)\n        drv.step(1)",
     );
-    assert_unsupported(&lower_src(&emitting).unwrap_err());
     let v1 = cpp_tb::emit(&merged_src(&emitting)).expect("v1 emits");
+    let prog = lower_src(&emitting).expect("TBIR lowers direct emit into the event field");
+    verify::verify_program(&prog).expect("direct event emit verifies");
+    let out = tbir::emit(&prog, &merged_src(&emitting), &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits direct event fan-out");
     assert!(
         v1.contains("for (auto& _s : _tb.drv.req) _s(1);"),
         "v1 fans the emit out over the subscriber vector: {v1}"
+    );
+    assert!(
+        out.contains("for (auto& _s : drv.req) _s(1);"),
+        "TBIR fans the emit out over the subscriber vector: {out}"
     );
     // …and flattens a directional SCALAR to an uninitialized member.
     for field in ["    p : in uint<8>", "    p : out uint<8>"] {
@@ -20332,20 +20347,15 @@ impl EvTest for EvTb
     end run
 end impl EvTest
 "#;
-    // A RECORD payload is not certified. v1 handles this one — it
-    // declares `Req` and emits `void(Req)` — but the arm also covers a
-    // regblock mirror, which v1 flattens to `void(uint64_t)` without a
-    // word, and `record_ids` cannot tell the two apart at that site.
-    // Worst wins, so the arm is `SilentlyMisLowers`; a builtin-scalar
-    // payload is the certified shape and keeps `Unsupported`.
-    let msg = assert_not_implemented(
-        &lower_src(event_src).unwrap_err(),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("uncertified payload"), "{msg}");
+    // Declared-record and builtin-scalar payloads both lower through the
+    // component event path even without a subscribing handler. That path
+    // has the declared-record set needed to distinguish a real value record
+    // from regblock mirrors, unlike the old transactor-state landing.
+    let prog = lower_src(event_src).expect("record handler-less event field lowers");
+    verify::verify_program(&prog).expect("record handler-less event field verifies");
     let certified = event_src.replace("req : in event<Req>", "req : in event<uint<8>>");
-    let msg = assert_unsupported(&lower_src(&certified).unwrap_err());
-    assert!(msg.contains("directional event field `req`"), "{msg}");
+    let prog = lower_src(&certified).expect("certified handler-less event field lowers");
+    verify::verify_program(&prog).expect("certified handler-less event field verifies");
     // The directional NON-EVENT spelling is a different verdict — v1
     // models the event field and flattens this one.
     let scalar_src = event_src.replace("req : in event<Req>", "req : in uint<8>");
@@ -36153,6 +36163,91 @@ end test RecordSourceTest
     verify::verify_program(&prog).expect("record-state analysis source verifies");
     tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("record-state analysis source emits");
+}
+
+/// Routing every event-bearing transactor through component lowering must not
+/// turn a declared record state field into evidence of a DUT handle. An
+/// always-on analysis source keeps both ownership spellings accepted at a
+/// test-scope component `let`: modeless and explicitly passive.
+#[test]
+fn record_state_analysis_source_lets_remain_modeless_or_passive() {
+    let src = r#"
+struct Sample
+    value : uint<8> default 0
+end struct Sample
+
+transactor RecordSource
+    observed : out event<uint<8>>
+    current  : Sample
+end transactor RecordSource
+
+test T
+    let dut : Top
+    let modeless : RecordSource
+    let passive_src : RecordSource passive
+    run
+        assert modeless.current.value == 0
+        assert passive_src.current.value == 0
+    end run
+end test T
+"#;
+
+    let prog = lower_src(src).expect("record-state analysis-source lets lower");
+    verify::verify_program(&prog).expect("record-state analysis-source lets verify");
+    tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("record-state analysis-source lets emit");
+}
+
+/// A DUT handle alone does not make an event-bearing transactor active-only.
+/// With no `when active` items, both explicit modes keep the always-on event
+/// channel available. A missing mode remains invalid, matching v1's
+/// transactor ownership rule.
+#[test]
+fn always_on_dut_event_source_lets_accept_both_modes_but_not_modeless() {
+    let src = |mode: &str| {
+        format!(
+            r#"
+transactor Tap
+    dut      : Top
+    observed : out event<uint<8>>
+    hookable ping()
+        emit observed(3)
+    end hookable
+end transactor Tap
+
+env Holder
+    tap : Tap
+end env Holder
+
+test T
+    let dut : Top
+    let tap : Tap{mode}
+    run
+        tap.ping()
+        emit tap.observed(1)
+    end run
+end test T
+"#
+        )
+    };
+
+    for mode in [" active", " passive"] {
+        let text = src(mode);
+        cpp_tb::emit(&merged_src(&text)).unwrap_or_else(|e| panic!("v1 accepts `{mode}`: {e}"));
+        let prog = lower_src(&text).unwrap_or_else(|e| panic!("TBIR accepts `{mode}`: {e}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{mode}` verifies: {e:?}"));
+        let out = tbir::emit(&prog, &merged_src(&text), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("`{mode}` emits: {e}"));
+        assert!(
+            out.contains("for (auto& _s : tap.observed) _s(1);"),
+            "`{mode}` event channel fans out: {out}"
+        );
+    }
+
+    let modeless = src("");
+    cpp_tb::emit(&merged_src(&modeless)).expect_err("v1 requires a transactor mode");
+    let err = lower_src(&modeless).expect_err("TBIR requires the same transactor mode");
+    assert!(assert_invalid(&err).contains("active`/`passive"), "{err}");
 }
 
 /// Record state is a first-class value, not only a collection of independently
