@@ -713,7 +713,7 @@ inline auto harc_port_snapshot(const Elem (&sig)[N]) {
 
 inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
     if (hi < lo) return 0;
-    if (lo >= 128) return 0;
+    if (hi >= 128 || lo >= 128) return 0;
     const uint32_t width = hi - lo + 1;
     const _harc_u128 shifted = value >> lo;
     if (width >= 64) return static_cast<uint64_t>(shifted);

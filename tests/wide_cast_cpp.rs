@@ -203,6 +203,7 @@ int main() {{
             && (shifted_by_wide_source == 2)
             && (harc_rt::harc_wide_shift_count(high_count, 200) == 200)
             && (harc_rt::harc_u128_shift_count((_harc_u128{{1}} << 100), 65) == 65)
+            && (harc_rt::harc_bits((_harc_u128)6, UINT32_MAX, 1) == 0)
             && (harc_rt::harc_wide_sdiv(neg_fifteen, pos_two, 200) == neg_seven)
             && (harc_rt::harc_wide_smod(neg_fifteen, pos_two, 200) == neg_one)
             && (harc_rt::harc_sdiv_u128(harc_rt::harc_sext_u128(0xF1, 8, 65), 2, 65)

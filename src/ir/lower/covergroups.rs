@@ -366,7 +366,6 @@ fn lower_hook_param_field(
                 }
                 Err(err) => return Err(err),
             };
-        reject_wide_cover_composition(group, point, "runtime lane selector", &[&lowered])?;
         index = Some(Box::new(lowered));
         cur = t;
     }
@@ -394,59 +393,6 @@ fn lower_hook_param_field(
         field: name.name.clone(),
         index,
     }))
-}
-
-fn cover_ir_width(expr: &Expr) -> Option<u32> {
-    let type_width = |ty: &IrType| match ty {
-        IrType::UInt(width) | IrType::SInt(width) => *width,
-        IrType::Bool => Some(1),
-        _ => None,
-    };
-    match expr {
-        Expr::Literal { ty, .. } => type_width(ty),
-        Expr::WideLiteral(words) => words
-            .len()
-            .checked_mul(32)
-            .and_then(|width| u32::try_from(width).ok()),
-        Expr::Port(port) => port.width.or(Some(64)),
-        Expr::Unary(_, inner) => cover_ir_width(inner),
-        Expr::Binary(_, lhs, rhs) => match (cover_ir_width(lhs), cover_ir_width(rhs)) {
-            (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
-            _ => None,
-        },
-        Expr::Ternary(_, then_expr, else_expr) => {
-            match (cover_ir_width(then_expr), cover_ir_width(else_expr)) {
-                (Some(then_width), Some(else_width)) => Some(then_width.max(else_width)),
-                _ => None,
-            }
-        }
-        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
-        Expr::BitSliceDyn { .. } => Some(64),
-        Expr::WidthCast { width, .. } => Some(*width),
-        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
-            type_width(ret)
-        }
-        _ => None,
-    }
-}
-
-fn reject_wide_cover_composition(
-    group: &str,
-    point: &str,
-    construct: &str,
-    operands: &[&Expr],
-) -> Result<(), LowerError> {
-    if operands
-        .iter()
-        .any(|expr| cover_ir_width(expr).is_some_and(|width| width > 64))
-    {
-        return Err(unsupported(
-            &format!("covergroup `{group}` point `{point}` {construct} over a wide value"),
-            "direct wide values and slices lower, but composed wide unary/binary/ternary \
-             expressions still need type-directed operand coercion",
-        ));
-    }
-    Ok(())
 }
 
 fn cover_wrap_operand_width(expr: &AstExpr) -> Option<u32> {
@@ -577,12 +523,6 @@ fn lower_point_target(
                             helpers,
                             extern_fns,
                             consts,
-                        )?;
-                        reject_wide_cover_composition(
-                            group,
-                            point,
-                            "runtime lane selector",
-                            &[&index],
                         )?;
                         crate::ir::LaneIndex::Var(Box::new(index))
                     }
@@ -829,12 +769,6 @@ fn lower_point_target(
                             helpers,
                             extern_fns,
                             consts,
-                        )?;
-                        reject_wide_cover_composition(
-                            group,
-                            point,
-                            "runtime bit-slice selector",
-                            &[&expr],
                         )?;
                         Ok(Err(expr))
                     }

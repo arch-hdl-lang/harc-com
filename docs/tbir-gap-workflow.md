@@ -91,8 +91,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 127 remaining constructor call sites (128 textual matches including
-the `unsupported` helper definition) as an inventory, not 128 separate tasks.
+Treat the 126 remaining constructor call sites (127 textual matches including
+the `unsupported` helper definition) as an inventory, not 127 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -167,7 +167,10 @@ trace-checks inferred-let, assignment, and discarded-value predicate uses. The
 dynamic record-list query batch then removes its consolidated boundary
 constructor, leaving 128 textual matches (127 constructors plus the helper),
 and extends the existing record-list runtime-equivalence fixture with all three
-query spellings.
+query spellings. The wide cover-selector batch removes the shared lowering
+gate for DUT lanes, hook-record lanes, and dynamic bit-slice bounds, leaving
+127 textual matches (126 constructors plus the helper). Because v1 emits
+uncompilable C++ for these wide selectors, their compile/run gate is TBIR-only.
 
 ## Review-derived semantic gates
 
@@ -231,9 +234,9 @@ not applicable before requesting review:
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
-   diagnostic-call, component-predicate, and dynamic record-list query slices
-   reduce the count from 174 to 128 textual matches (127 constructors plus the
-   helper definition). The
+   diagnostic-call, component-predicate, dynamic record-list query, and wide
+   cover-selector slices reduce the count from 174 to 127 textual matches (126
+   constructors plus the helper definition). The
    scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths
    were also reclassified because v1 rejects or silently mis-lowers them.
