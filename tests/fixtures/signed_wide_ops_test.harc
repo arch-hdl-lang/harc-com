@@ -1,0 +1,64 @@
+// Signed scalar operations wider than 64 bits (harc#657).
+//
+// `<`, `<=`, `>`, `>=`, `/`, `%` and `==`/`!=` on a signed scalar past
+// 64 bits must answer by the DECLARED SIGN BIT, not by the unsigned
+// magnitude of the `_harc_u128` / `harc_rt::HarcWide<N>` carrier the
+// value lives in. Every assertion here is one an unsigned-by-magnitude
+// answer gets wrong: each involves a negative operand whose top bit,
+// read unsigned, would make it the largest value rather than the
+// smallest.
+//
+// Both carrier tiers are exercised — `sint<100>` is `_harc_u128`,
+// `sint<129>` and `sint<256>` are `HarcWide<N>` — as is a mixed-width
+// pair (the narrower operand sign-extends to the wider width).
+
+testbench SignedWideTb
+    dut : Top
+end testbench SignedWideTb
+
+impl SignedWideOpsTest for SignedWideTb
+    run
+        // --- 65..128 tier: _harc_u128 ---
+        let a100 : sint<100> = -8
+        let b100 : sint<100> = 3
+        assert a100 < b100 else fail("sint100 slt: -8 < 3")
+        assert a100 <= b100 else fail("sint100 sle")
+        assert b100 > a100 else fail("sint100 sgt")
+        assert b100 >= a100 else fail("sint100 sge")
+        assert a100 < 0 else fail("sint100 compare vs 0")
+        assert a100 > -100 else fail("sint100 compare vs negative literal")
+        let q100 : sint<100> = a100 / b100
+        assert q100 < 0 else fail("sint100 sdiv keeps sign")
+        let z100 : sint<100> = 0 - q100
+        assert z100 == 2 else fail("sint100 -(a/b) == 2")
+        let r100 : sint<100> = a100 % b100
+        assert r100 < 0 else fail("sint100 smod keeps sign")
+
+        // --- >128 tier: HarcWide<N> ---
+        let a256 : sint<256> = -1000000000000
+        let b256 : sint<256> = 7
+        assert a256 < b256 else fail("sint256 slt")
+        assert a256 < 0 else fail("sint256 sign")
+        let q256 : sint<256> = a256 / b256
+        let neg_q : sint<256> = 0 - q256
+        assert neg_q > 0 else fail("sint256 sdiv sign: -(neg/pos) > 0")
+        assert (a256 >> 1) < 0 else fail("sint256 arithmetic shift keeps sign")
+
+        // --- mixed width signed (narrower sign-extends) ---
+        let w : sint<256> = -5
+        let n : sint<129> = -5
+        assert w == n else fail("mixed-width signed == : -5 == -5")
+        assert !(w < n) else fail("mixed-width signed !(w < n)")
+        assert !(n < w) else fail("mixed-width signed !(n < w)")
+        let one256 : sint<256> = 1
+        let big : sint<256> = 0 - (one256 << 200)
+        assert big < n else fail("mixed-width signed: very negative < -5")
+
+        // --- signed equality with a negative literal (padding-safe) ---
+        let e : sint<129> = -4
+        assert e == -4 else fail("sint129 == negative literal")
+        assert e != -5 else fail("sint129 != other negative literal")
+
+        wait 1 cycle
+    end run
+end impl SignedWideOpsTest
