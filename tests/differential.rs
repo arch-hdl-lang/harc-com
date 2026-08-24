@@ -1210,7 +1210,11 @@ fn a_nested_fixed_vector_lowers_and_compiles_at_every_width() {
     let nested = r#"
 scoreboard NestSb
     v : Vec<Vec<@@TY@@, 2>, 2>
-    n : uint<32> default 0
+    // Wide enough to hold any element this space substitutes, so reading
+    // one back is never an implicit narrowing (harc#658 refuses a wide
+    // element read into a narrower field). This space measures the
+    // fixed-vector MEMBER at each width, not the assignment rule.
+    n : uint<1024> default 0
 
     hookable put(x: uint<8>)
         v[0][1] = 1

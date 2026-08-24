@@ -3884,23 +3884,23 @@ impl Checker<'_> {
                     // not an element assignment. The collection shapes
                     // are the call above's business.
                     //
-                    // Bounded to a destination past 64 bits, because
-                    // LOWERING is. A verifier is a backstop for the
-                    // lowering rule, not a second, stricter opinion:
-                    // judging `uint<32>` into a `uint<8>` field here
-                    // turned a program lowering deliberately accepts
-                    // into `internal error: TB-IR failed verification
-                    // after lowering`, which is strictly worse than the
-                    // silent truncation it replaced — an internal error
-                    // for source `harc check` accepts. Measured, not
-                    // reasoned: that is what the first version of this
-                    // arm did.
-                    //
-                    // The <=64-bit half is blocked on #658 (an
-                    // `on ev(t)` payload param is widthless, so
-                    // `seen + t` manufactures a 64-bit width). When
-                    // that lands and lowering widens its bound, this
-                    // one widens with it — the two must move together.
+                    // Deliberately bounded to a destination past 64
+                    // bits, even though the LOWERING check now judges
+                    // <=64-bit fields too (harc#658). A verifier is a
+                    // backstop, not a second opinion, and judging <=64
+                    // here faithfully would require re-deriving whether
+                    // the RHS width is DECLARED or MANUFACTURED from a
+                    // widthless leaf (`seen + <const>`) — the exact
+                    // distinction `check_owner_scalar_field_write`'s
+                    // `rhs_width_manufactured` draws in lowering.
+                    // Duplicating that here, on the verifier's separate
+                    // expr typers, is how the two drift; getting it
+                    // wrong turns a program lowering accepts into
+                    // `internal error: failed verification after
+                    // lowering`. So the backstop stays at >64 — the
+                    // silent same-carrier truncation class (#642/#656)
+                    // it was built for — and lowering is authoritative
+                    // for the <=64 rule.
                     let wide_dest = matches!(
                         dst_ty,
                         Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if w > 64
