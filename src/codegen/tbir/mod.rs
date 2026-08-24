@@ -609,16 +609,21 @@ pub fn plan_separate_tests(
         })
         .collect();
 
-    debug_assert!(
-        {
-            let mut names: Vec<&str> = shards.iter().map(|s| s.filename.as_str()).collect();
-            names.sort_unstable();
-            let before = names.len();
-            names.dedup();
-            names.len() == before
-        },
-        "separate plan produced two shards with the same filename"
-    );
+    {
+        let mut names: Vec<&str> = shards.iter().map(|s| s.filename.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        if names.len() != before {
+            return Err(EmitError(
+                "separate plan produced two shards with the same filename".into(),
+            ));
+        }
+        debug_assert!(
+            names.len() == before,
+            "separate plan produced two shards with the same filename"
+        );
+    }
 
     Ok(SeparateCppPlan {
         interface: GeneratedCppFile {
@@ -653,16 +658,13 @@ pub fn separate_category_bytes(
     let plan_sep = plan_separate_tests(prog, file, opts, file_prefix, group_size)?;
 
     // Emit representative artifacts and measure.
-    let interface = emit_separate_interface(prog, file, opts, &plan_sep.scaffold)?;
-    let common = emit_separate_common(prog, file, opts, &plan_sep.scaffold)?;
+    let interface = emit_separate_interface_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
+    let common = emit_separate_common_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
     let dispatcher = emit_split_dispatcher(&plan_sep.test_names).len();
-    // One shard's bytes as proxy for average; multiply for total.
-    let one_shard = if plan_sep.shards.is_empty() {
-        0
-    } else {
-        emit_separate_shard(prog, file, opts, &plan_sep.scaffold, &plan_sep.shards[0])?.len()
-    };
-    let shards_total = one_shard * plan_sep.shards.len();
+    let mut shards_total = 0usize;
+    for shard in &plan_sep.shards {
+        shards_total += emit_separate_shard_with_prefix(prog, file, opts, &plan_sep.scaffold, shard, file_prefix)?.len();
+    }
     // Self-contained total: sum of all shards + dispatcher (each shard repeats scaffold).
     let mut self_total = 0usize;
     for shard in &plan_self.shards {
@@ -822,8 +824,9 @@ pub fn emit_separate_interface_with_prefix(
     _file_prefix: &str,
 ) -> Result<String, EmitError> {
     let mut out = String::new();
-    // Interface pragma and includes — same preamble but without the
-    // mutable `harc_rng` definition and without the problem table body.
+    out.push_str("#pragma once\n\n");
+    // Interface includes — same preamble but without the mutable
+    // `harc_rng` definition and without the problem table body.
     // Those live in the common source (M3).
     let mut preamble_no_rng = String::new();
     runtime::preamble(
@@ -837,20 +840,14 @@ pub fn emit_separate_interface_with_prefix(
     );
     // Strip the `harc_rng` definition from preamble for the header;
     // it will be re-emitted as `extern` / per-context in the deepened
-    // context. For now, keep preamble as-is and let common own the
-    // mutable definition; header keeps the `extern` declaration via
-    // the context.
-    out.push_str(&preamble_no_rng);
-    // Remove the mutable RNG statics from header — they belong in common.
-    // The preamble's `static harc_rng` block is at the end; replace it
-    // with an extern declaration for the separate header.
-    if out.contains("static harc_rt::random::HarcRng harc_rng;") {
-        out = out.replace(
+    // context.
+    if preamble_no_rng.contains("static harc_rt::random::HarcRng harc_rng;") {
+        preamble_no_rng = preamble_no_rng.replace(
             "static harc_rt::random::HarcRng harc_rng;\nstatic inline uint64_t harc_rng_next() {\n    return harc_rng.next();\n}\n\n",
             "extern harc_rt::random::HarcRng harc_rng;\ninline uint64_t harc_rng_next() { return harc_rng.next(); }\n\n",
         );
     }
-    out.push_str("#pragma once\n\n");
+    out.push_str(&preamble_no_rng);
     // Records, scoreboards, components, covergroups — type layouts only.
     let order = record_emit_order(&prog.records);
     for &i in &order {
