@@ -1862,3 +1862,60 @@ end impl T"#
         );
     }
 }
+
+/// The v1 evidence behind the record-element fixed-vector regrade: v1
+/// COMPILES the bare declaration (a scalar-fallback `uint64_t` member,
+/// unused) but EMITS-UNCOMPILABLE the moment an element is accessed
+/// (subscripting the scalar). tbir refuses the field outright either way,
+/// so this pins v1's split — which is why the honest grade is
+/// EmitsUncompilable, not a `--codegen v1` promise.
+#[test]
+fn a_record_element_fixed_vector_field_is_uncompilable_under_v1_when_used() {
+    let Some(cc) = cxx() else {
+        eprintln!("no C++ compiler on PATH — skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join("harc-diff-vecrec");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let mk = |body: &str| {
+        format!(
+            r#"struct Beat
+    p : uint<8>
+end struct Beat
+scoreboard Sb
+    v : Vec<Beat, 2>
+    n : uint<32> default 0
+    hookable put(x: uint<8>)
+        {body}
+    end put
+end scoreboard Sb
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    // Declared-only: v1 compiles the scalar-fallback member.
+    assert!(
+        matches!(
+            v1_behaviour(cc, &mk("n = n + 1"), &dir, "vecrec-decl"),
+            V1Behaviour::Compiles
+        ),
+        "v1 compiles a declared-but-unused record-element Vec field"
+    );
+    // Any element access: v1 emits C++ that does not compile.
+    for body in ["n = n + v[0].p", "v[0].p = x", "v[1] = v[0]"] {
+        assert!(
+            matches!(
+                v1_behaviour(cc, &mk(body), &dir, "vecrec-use"),
+                V1Behaviour::EmitsUncompilable(_)
+            ),
+            "v1 must emit uncompilable C++ for record-vec element access `{body}`"
+        );
+    }
+}

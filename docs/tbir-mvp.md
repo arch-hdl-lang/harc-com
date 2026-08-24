@@ -9248,6 +9248,43 @@ former `transaction` group lives in
      `out_of_order tags <literal>` — so they are left as defensive dead
      code rather than regraded on an unmeasurable path.
 
+147. **Record-element fixed-vector component field — regrade, not
+     implement (2026-08-24).**
+
+     `v : Vec<Beat, N>` (a fixed vector whose element is a declared record)
+     as a component field looked like an implement gap — a survey measured
+     the DECLARATION alone as `v1=compiles` — but measuring the USED
+     construct flipped the verdict. v1 does not recognize a record-element
+     `Vec` field: it falls back to a SCALAR member, emitting `uint64_t v{};`
+     for `Vec<Beat, 2>`. The bare declaration compiles (an unused
+     `uint64_t`), but the instant an element is touched — `v[i]`,
+     `v[i].field`, `v[i] = r` — the body subscripts the scalar and g++
+     refuses: `invalid types 'uint64_t[int]' for array subscript`
+     (measured uniform on scoreboard / agent / env; a `q.push`-style
+     declared-only control compiles, isolating the access as the cause).
+     So the honest grade is `NotImplemented`/`EmitsUncompilable`, not a
+     `--codegen v1` promise — matching the sibling `Vec`-`default` and
+     regblock-field arms that grade "v1 emits the wrong member, any use
+     fails to compile" the same way.
+
+     The lesson is the batch's own: **measure the USED construct, not the
+     declaration.** The declaration-only measurement (compiles) is exactly
+     the trap — a field type only mis-lowers once something reads or writes
+     it, and a grammar-table probe that only declares the field never sees
+     it. This is the record-element counterpart to §143/§144's scalar and
+     nested-scalar fixed vectors, which v1 DOES emit correctly (as
+     `std::array`) and which are therefore implemented — the record element
+     is the one v1 mis-declares.
+
+     The refusal site is a catch-all for any non-scalar element type, so
+     the regrade is scoped precisely: a helper detects a declared-record
+     leaf (through nested `Vec<Vec<Beat,…>,…>` layers, and whether the leaf
+     parses as a type or a bare-identifier type-arg) and regrades only
+     that; other unsupported element kinds (enum / string) keep the
+     catch-all, unmeasured on their access paths. Scalar and nested-scalar
+     fixed vectors are untouched — they still lower. Corpus dumps
+     identically.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
