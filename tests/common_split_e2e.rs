@@ -135,27 +135,25 @@ fn common_layout_requires_v1_and_tests_mode() {
     let dir = fresh_outdir("gates");
     let tb = write_suite(&dir, TB_THREE_TESTS);
 
-    // Default (tbir) codegen must be rejected before emission.
+    // Default (tbir) codegen is now supported for common layout (M1, issue #619).
+    // Explicit tbir should succeed.
     let out = Command::new(harc_bin())
         .arg("sim")
         .arg(&tb)
         .arg("--sv")
         .arg(dir.join("dut.sv"))
+        .arg("--codegen")
+        .arg("tbir")
         .arg("--cpp-split")
         .arg("tests")
         .arg("--cpp-split-layout")
         .arg("common")
         .arg("--outdir")
         .arg(dir.join("o1"))
+        .arg("--emit-only")
         .output()
         .unwrap();
-    assert!(!out.status.success(), "tbir + common must be rejected");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(text.contains("--codegen v1"), "got: {text}");
+    assert!(out.status.success(), "tbir + common should be accepted after M1: got {}", String::from_utf8_lossy(&out.stderr));
 
     // The layout flag requires `--cpp-split tests`.
     let out = Command::new(harc_bin())
