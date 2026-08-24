@@ -996,9 +996,14 @@ impl FuncBuilder<'_> {
                             instance: String::new(),
                             field: id.name.clone(),
                         }),
-                        crate::ir::StateFieldKind::Queue { .. } => Err(unsupported(
+                        // Not a `--codegen v1` escape: v1 emits the bare
+                        // read into a scalar slot and g++ refuses "cannot
+                        // convert `harc_rt::HarcQueue<...>` to `uint64_t`"
+                        // (measured). Read via the queue ops instead.
+                        crate::ir::StateFieldKind::Queue { .. } => Err(not_implemented(
                             &format!("a bare read of the `queue` state field `{}`", id.name),
                             "read a queue state field via `.size()` / `.empty()` / `.pop()`",
+                            V1Status::EmitsUncompilable,
                         )),
                     };
                 }

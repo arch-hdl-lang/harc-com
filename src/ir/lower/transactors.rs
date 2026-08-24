@@ -937,13 +937,14 @@ fn lower_bound_target_transactor(
         // `thread bus.<method>(...)`: the method path is `bus.<method>`.
         let segs: Vec<&str> = th.method.segments.iter().map(|s| s.name.as_str()).collect();
         if segs.len() != 2 || segs[0] != "bus" {
-            return Err(unsupported(
-                &format!(
-                    "transactor `{tname}` target thread `{}` (expected `thread bus.<method>(...)`)",
-                    segs.join(".")
-                ),
-                "",
-            ));
+            // A program error, not a subset gap, so it does NOT point at
+            // `--codegen v1`: v1 refuses it too ("target TLM thread ...
+            // must target `bus.<method>`", measured), matching the sibling
+            // `Invalid`s in this same loop (unknown method, arity, tags).
+            return Err(LowerError::Invalid(format!(
+                "transactor `{tname}` target thread `{}` must target `bus.<method>(...)`",
+                segs.join(".")
+            )));
         }
         let mname = segs[1];
         if schema.target_methods.iter().any(|m| m.name == mname) {
