@@ -104,6 +104,12 @@ pub enum Trigger {
     Done,
     /// `Fatal` reached — simulation aborts.
     Fatal,
+    /// A `TbLifecycleCall` re-inlined a reusable testbench lifecycle body
+    /// (#619 M4a). The body is opaque to this analysis and may itself
+    /// suspend, so its `succ` is treated as a resume boundary.
+    LifecycleInlined {
+        function: crate::ir::FunctionId,
+    },
 }
 
 /// Structured pass failure — never a panic (mirrors
@@ -186,6 +192,9 @@ fn resume_successors(t: &Terminator) -> Vec<BlockId> {
         } => vec![*on_fire, *on_timeout],
         // Randomize is a host-sync point: its `succ` is a resume block.
         Terminator::Randomize { succ, .. } => vec![*succ],
+        // A re-inlined testbench lifecycle body may suspend internally, so
+        // treat its `succ` as a resume block conservatively (#619 M4a).
+        Terminator::TbLifecycleCall { succ, .. } => vec![*succ],
         Terminator::Jump(_)
         | Terminator::Branch(..)
         | Terminator::Return
@@ -339,6 +348,14 @@ fn collapse(
             },
             to: state_at(*succ),
         }),
+        Terminator::TbLifecycleCall { function, succ } => out.push(Transition {
+            from,
+            guard: guard.clone(),
+            trigger: Trigger::LifecycleInlined {
+                function: *function,
+            },
+            to: state_at(*succ),
+        }),
         Terminator::Return => out.push(Transition {
             from,
             guard: guard.clone(),
@@ -433,6 +450,7 @@ fn trigger_str(func: &TbFunction, t: &Trigger) -> String {
         Trigger::Solved { constraints } => format!("randomize(c{})", constraints.0),
         Trigger::Done => "return".to_string(),
         Trigger::Fatal => "fatal".to_string(),
+        Trigger::LifecycleInlined { function } => format!("tb_lifecycle(fn{})", function.0),
     }
 }
 

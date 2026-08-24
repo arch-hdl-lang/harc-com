@@ -4291,6 +4291,23 @@ impl Checker<'_> {
                 }
             }
             Terminator::Fatal(args) => self.check_fmt_args(args),
+            Terminator::TbLifecycleCall { function, .. } => {
+                // The re-inline target must resolve to a lifecycle function
+                // (#619 M4a). `succ` is range-checked with every other
+                // successor by the invariant-6 pass above.
+                match self.prog.functions.get(function.index()) {
+                    Some(f) if matches!(f.kind, FunctionKind::TestbenchLifecycle { .. }) => {}
+                    Some(f) => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "TbLifecycleCall fn{} targets `{}`, not a TestbenchLifecycle function",
+                            function.0, f.name
+                        ),
+                    }),
+                    None => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!("TbLifecycleCall references missing fn{}", function.0),
+                    }),
+                }
+            }
             Terminator::Jump(_) | Terminator::Return => {}
         }
     }
@@ -6321,6 +6338,9 @@ fn check_def_before_use(
                 // defined at its `let` RecordInit site).
                 bit_set(&mut defined, target.index());
             }
+            // No operands: the re-inlined lifecycle body carries its own
+            // locals; nothing is used or defined in the caller frame.
+            Terminator::TbLifecycleCall { .. } => {}
             Terminator::Jump(_) | Terminator::Return => {}
         }
     }

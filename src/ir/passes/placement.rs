@@ -510,6 +510,12 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             // pre-solved replay table) and control resumes at `succ`.
             solves = true;
         }
+        Terminator::TbLifecycleCall { .. } => {
+            // A re-inlined testbench lifecycle body may contain `wait`s, so
+            // classify it as a potential cycle suspension conservatively
+            // (#619 M4a). Debug-only pass, never on the sim path.
+            suspends_cycles = true;
+        }
         Terminator::Jump(_) | Terminator::Return => {}
     }
     BlockFeatures {

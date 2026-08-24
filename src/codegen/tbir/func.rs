@@ -353,6 +353,36 @@ pub(super) fn emit_function(
             Terminator::Return => {
                 writeln!(out, "{pad3}__done = true;").ok();
             }
+            Terminator::TbLifecycleCall { function, succ } => {
+                // #619 M4a: re-inline the once-lowered reusable testbench
+                // lifecycle phase body right here, then resume at `succ`.
+                // The callee is emitted as its OWN self-contained
+                // loop-switch block (its `Return` sets its own `__done`,
+                // exiting only the nested loop); any `wait` inside it
+                // suspends this same run/check coroutine. Local names are
+                // block-scoped to the nested `{ }`, so they cannot collide
+                // with the caller's. This reproduces the exact statement
+                // order the historical per-test lifecycle inlining
+                // produced — see docs/619-m4a-ir-ownership.md.
+                let callee = prog.function(*function);
+                debug_assert!(
+                    matches!(callee.kind, crate::ir::FunctionKind::TestbenchLifecycle { .. }),
+                    "TbLifecycleCall must target a TestbenchLifecycle function"
+                );
+                emit_function(
+                    out,
+                    prog,
+                    callee,
+                    records,
+                    bindings,
+                    lanes,
+                    randomize_snippets,
+                    dut_type,
+                    &HashSet::new(),
+                    depth + 3,
+                )?;
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
             Terminator::Fatal(args) => {
                 emit_log_call(out, &cx, "FATAL", None, args, depth + 3)?;
                 writeln!(out, "{pad3}ctx.errors++; _fatal = true;").ok();
@@ -573,6 +603,7 @@ pub(super) fn emit_tseq(
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
+            | Terminator::TbLifecycleCall { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: tseq `{}` contains terminator {other:?} — lowering gate failed",
@@ -2922,6 +2953,7 @@ pub(super) fn emit_method(
             }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
+            | Terminator::TbLifecycleCall { .. }
             | Terminator::Fatal(_)) => {
                 // Lowering rejects these inside method bodies (or, for
                 // Fatal, never produces the terminator at all).
@@ -3443,6 +3475,7 @@ fn emit_component_fn_lambda(
             }
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
+            | Terminator::TbLifecycleCall { .. }
             | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: component method `{}` contains terminator {other:?} — \

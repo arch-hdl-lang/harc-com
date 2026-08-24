@@ -1903,7 +1903,9 @@ fn for_each_port_in_term(t: &ir::Terminator, f: &mut impl FnMut(&ir::PortRef)) {
             for_each_port_in_expr(cycles, f);
         }
         Fatal(args) => for_each_port_in_fmt(args, f),
-        Jump(_) | WaitTimePs(_, _) | Randomize { .. } | Return => {}
+        // The re-inlined lifecycle body carries its own port operands; the
+        // caller frame's terminator has none (#619 M4a).
+        Jump(_) | WaitTimePs(_, _) | Randomize { .. } | TbLifecycleCall { .. } | Return => {}
     }
 }
 

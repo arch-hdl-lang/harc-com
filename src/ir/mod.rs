@@ -1934,6 +1934,33 @@ pub enum FunctionKind {
     /// the function-per-CFG IR express v1's reference-capturing hook
     /// closures.
     TestHook,
+    /// A reusable testbench lifecycle phase body — `setup`/`check`/
+    /// `teardown` declared on a bound `testbench`. Owned by the
+    /// testbench, NOT by any one bound test: the intent (issue #619
+    /// M4a) is to lower each phase ONCE and invoke it from every owning
+    /// test via an explicit call edge, in the order of issue #619
+    /// §"Lifecycle Ordering". `testbench` indexes
+    /// `TbProgram::testbenches`.
+    ///
+    /// Not yet produced by lowering: the tbir path still reuses v1's
+    /// lifecycle-copying `desugar_impl_for_test_in_file`, which inlines
+    /// these bodies into each test's `Run`/`Check` before the IR is
+    /// built. The native lowering that constructs this variant lands in
+    /// a later M4a slice — see docs/619-m4a-ir-ownership.md. Until then
+    /// the variant is part of the IR vocabulary only; no emitter path
+    /// consumes it.
+    TestbenchLifecycle {
+        testbench: TestbenchId,
+        phase: crate::ast::LifecyclePhase,
+    },
+    /// A reusable testbench helper method body, owned by the testbench
+    /// and shared across every bound test (issue #619 M4a). Same
+    /// not-yet-produced status as [`FunctionKind::TestbenchLifecycle`]:
+    /// today such a method is inlined per test by the desugaring.
+    /// `testbench` indexes `TbProgram::testbenches`.
+    TestbenchMethod {
+        testbench: TestbenchId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2623,6 +2650,21 @@ pub enum Terminator {
     },
     Return,
     Fatal(FmtArgs),
+    /// #619 M4a: re-inline a once-lowered reusable testbench lifecycle
+    /// phase body at this point, then resume at `succ`. `function` indexes
+    /// a [`FunctionKind::TestbenchLifecycle`] function that was lowered
+    /// ONCE for the bound testbench (shared across every test that binds
+    /// it). Unlike a normal call, the tbir emitter EXPANDS the callee's
+    /// loop-switch inline here (a new emitter capability — see
+    /// docs/619-m4a-ir-ownership.md) so the generated C++ and the trace
+    /// are identical to the historical per-test lifecycle inlining. It is
+    /// a terminator (not a `Stmt`) because the callee body may suspend
+    /// (lifecycle `wait`s) — sync points are terminators (invariant 7).
+    /// Only produced under the `HARC_TBIR_NATIVE_LIFECYCLE` switch.
+    TbLifecycleCall {
+        function: FunctionId,
+        succ: BlockId,
+    },
 }
 
 /// Clock qualifier of a `wait N cycles on <clock>` suspension,
@@ -3319,6 +3361,7 @@ impl Terminator {
                 ..
             } => vec![*on_fire, *on_timeout],
             Terminator::Randomize { succ, .. } => vec![*succ],
+            Terminator::TbLifecycleCall { succ, .. } => vec![*succ],
             Terminator::Return | Terminator::Fatal(_) => vec![],
         }
     }

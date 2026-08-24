@@ -1744,6 +1744,10 @@ fn source_name_for_ir_function<'a>(
         }
         ir::FunctionKind::Tseq { .. } => ("pseq", func.name.clone()),
         ir::FunctionKind::TestHook => ("test", func.name.clone()),
+        ir::FunctionKind::TestbenchLifecycle { testbench, .. }
+        | ir::FunctionKind::TestbenchMethod { testbench } => {
+            ("testbench", program.testbench(*testbench).name.clone())
+        }
     }
 }
 
@@ -1763,6 +1767,10 @@ fn function_kind_label(kind: &ir::FunctionKind, program: &ir::TbProgram) -> Stri
         }
         ir::FunctionKind::Tseq { .. } => "tseq".to_string(),
         ir::FunctionKind::TestHook => "test_hook".to_string(),
+        ir::FunctionKind::TestbenchLifecycle { phase, .. } => {
+            format!("testbench_lifecycle:{}", phase.keyword())
+        }
+        ir::FunctionKind::TestbenchMethod { .. } => "testbench_method".to_string(),
     }
 }
 

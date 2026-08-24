@@ -1,0 +1,41 @@
+// #619 M4a sub-step 4: a bound testbench whose lifecycle `setup` reads a
+// testbench field (`warmup`), where one binding test declares a test-scope
+// `let warmup` that SHADOWS that field. The shadowing test's `_tb.<field>`
+// rewrite differs from the shared (first-bind) body, so the sharing
+// decision must classify this testbench UNSAFE and fall back to historical
+// per-test inlining — keeping the trace identical to v1 under both codegens.
+
+testbench ShadowShareTb
+    dut : Top
+    warmup : uint<8> default 2
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycle
+        dut.rst = 0
+        dut.en = 1
+        wait warmup cycles
+        dut.en = 0
+    end setup
+end testbench ShadowShareTb
+
+impl ShadowSharePlain for ShadowShareTb
+    run
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+    end run
+end impl ShadowSharePlain
+
+impl ShadowShareShadows for ShadowShareTb
+    // A test-scope `let` colliding with the `warmup` testbench field. Under
+    // the historical inlining this test's copy of `setup` reads THIS local
+    // (4), not `_tb.warmup` (2) — so the lifecycle body must not be shared.
+    let warmup : uint<8> = 4
+    run
+        dut.en = 1
+        wait 1 cycle
+        dut.en = 0
+    end run
+end impl ShadowShareShadows

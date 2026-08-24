@@ -155,6 +155,14 @@ testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnable
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpThree
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
+# #619 M4a sub-step 4: conservative-fallback fixtures — under
+# HARC_TBIR_NATIVE_LIFECYCLE these testbenches are UNSAFE to share
+# (randomize in lifecycle / field shadowing) and fall back to per-test
+# inlining; both codegens must still trace-diff clean.
+tb_lifecycle_unsafe_share_test | Top | top_counter.sv | - | pass | - | - | UnsafeShareA
+tb_lifecycle_unsafe_share_test | Top | top_counter.sv | - | pass | - | - | UnsafeShareB
+tb_lifecycle_shadow_share_test | Top | top_counter.sv | - | pass | - | - | ShadowSharePlain
+tb_lifecycle_shadow_share_test | Top | top_counter.sv | - | pass | - | - | ShadowShareShadows
 scoreboard_basic_test | Top | top_counter.sv | - | pass
 scoreboard_data_queue_struct_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass
