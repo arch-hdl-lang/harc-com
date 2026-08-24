@@ -2822,6 +2822,12 @@ fn cmd_sim(
                 if let Ok(cxx) = std::env::var("HARC_CXX") {
                     profile_extra.push(format!("cxx={cxx}"));
                 }
+                if let Ok(inc) = std::env::var("HARC_Z3_INCLUDE_DIR") {
+                    profile_extra.push(format!("z3_inc={inc}"));
+                }
+                if let Ok(lib) = std::env::var("HARC_Z3_LIB_DIR") {
+                    profile_extra.push(format!("z3_lib={lib}"));
+                }
                 let interface_started = Instant::now();
                 let interface_cpp = harc::codegen::tbir::emit_separate_interface_with_prefix(
                     &prog,
@@ -2949,9 +2955,7 @@ fn cmd_sim(
                 );
                 let manifest = format!(
                     "{{\"schema_version\":1,\"interface_abi\":\"{}\",\"build_profile\":\"{}\",\"tests\":[{}],\"artifacts\":[{}]}}\n",
-                    harc::codegen::cpp_tb::stable_hash_hex(
-                        format!("{}{}", plan.interface.filename, common_path.display()).as_bytes()
-                    ),
+                    harc::codegen::cpp_tb::stable_hash_hex(interface_cpp.as_bytes()),
                     build_profile,
                     plan.test_names
                         .iter()
