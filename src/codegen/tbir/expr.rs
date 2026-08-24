@@ -246,6 +246,20 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
         Expr::TbField(field) => format!("_tb.{field}"),
+        // Fixed-vector testbench field element read — `_tb.mem[i]` (and
+        // `_tb.mem[i][j]` for a nested `Vec<Vec<..>>`). Mirrors v1's
+        // `_tb.<field>[i]` subscript on the `std::array` member.
+        Expr::TbFieldVecElement {
+            field,
+            index,
+            inner_index,
+        } => {
+            let mut member = format!("_tb.{field}[{}]", expr_cpp(cx, index)?);
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_cpp(cx, inner)?);
+            }
+            member
+        }
         // Latch readings render against the per-closure cells the
         // concurrent-check emitter declares (`func::emit_property_check`
         // / `emit_cover_check`). `_harc_ps<i>` is the `static` previous
@@ -1220,6 +1234,13 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         } => component_vec_elem_type(cx, base, field, inner_index.is_some())
             .as_ref()
             .and_then(ir_type_width),
+        Expr::TbFieldVecElement {
+            field, inner_index, ..
+        } => owner_tb(cx)
+            .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
+            .and_then(|f| fixed_vec_ir_elem(&f.ty, inner_index.is_some()))
+            .as_ref()
+            .and_then(ir_type_width),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1402,6 +1423,12 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
             component_vec_elem_type(cx, base, field, inner_index.is_some()),
             Some(crate::ir::IrType::SInt(_))
         ),
+        Expr::TbFieldVecElement {
+            field, inner_index, ..
+        } => owner_tb(cx)
+            .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
+            .and_then(|f| fixed_vec_ir_elem(&f.ty, inner_index.is_some()))
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
         Expr::ScoreboardQuery {
             sb,
             query: crate::ir::ScoreboardQuery::Scalar { scalar },
@@ -1443,6 +1470,28 @@ fn record_path_is_sint<'a>(
     segs: impl Iterator<Item = &'a String>,
 ) -> bool {
     record_path_type(cx, ty, segs).is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
+}
+
+/// Peel a `FixedVec` `IrType` to the element type a `TbFieldVecElement`
+/// selects — once for `mem[i]`, twice for a nested `mem[i][j]`. Unlike
+/// `component_vec_elem_type` the receiver is already a plain
+/// `IrType::FixedVec` (a testbench field's `ty`), so there is no
+/// component-field indirection to resolve. Getting
+/// this right decides the same two things the component path does: `>>`
+/// arithmetic-vs-logical and whether a >64-bit element is truncated to
+/// `uint64_t` before use.
+fn fixed_vec_ir_elem(ty: &crate::ir::IrType, nested: bool) -> Option<crate::ir::IrType> {
+    let outer = match ty {
+        crate::ir::IrType::FixedVec { elem, .. } => elem.as_ref(),
+        _ => return None,
+    };
+    if !nested {
+        return Some(outer.clone());
+    }
+    match outer {
+        crate::ir::IrType::FixedVec { elem, .. } => Some(elem.as_ref().clone()),
+        _ => None,
+    }
 }
 
 /// The ELEMENT type of the `Vec` a `ComponentVecElement` / -`Write`

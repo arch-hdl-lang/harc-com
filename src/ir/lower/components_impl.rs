@@ -3328,7 +3328,7 @@ fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// a dynamic list, a zero width, or a bad inner length — which the
 /// caller turns into the honest refusal. The inner length is parsed
 /// exactly as the outer one (nonzero decimal literal).
-fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
+pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
         args,

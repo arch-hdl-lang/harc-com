@@ -38009,8 +38009,8 @@ impl T for Tb
         wait 3 cycles
     end run
 end impl T"#;
-    let err = lower_src(src)
-        .expect_err("an ambiguous variant in a covergroup bin must be rejected");
+    let err =
+        lower_src(src).expect_err("an ambiguous variant in a covergroup bin must be rejected");
     let msg = assert_invalid(&err);
     assert!(
         msg.contains("`OKAY`") && msg.contains("more than one enum"),
@@ -38051,4 +38051,214 @@ impl T for Tb
     end run
 end impl T"#;
     lower_src(src).expect("an unambiguous variant in a covergroup bin must still lower");
+}
+
+/// A `Vec<T, N>` TESTBENCH host field lowers, verifies, emits, and matches
+/// v1 byte-for-byte — the member declaration (a zero-filled `std::array`
+/// through the shared `field_scalar_cty` seam, so every element class and
+/// nesting depth v1 handles is handled here too) and the `_tb.mem[i]`
+/// element read/write. v1's own lines are DERIVED, not pasted, so the test
+/// pins what the oracle emits rather than what the author recalled.
+#[test]
+fn a_testbench_fixed_vector_field_matches_v1() {
+    let mk = |field: &str, body: &str| {
+        format!(
+            r#"testbench Tb
+    dut : Top
+    {field}
+end testbench Tb
+impl T for Tb
+    run
+        {body}
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    // (field type, member, index shape). All element classes the field
+    // seam distinguishes (u64 / int64_t / _harc_u128 / HarcWide<N>), plus
+    // a nested `Vec<Vec<..>>`.
+    let cases = [
+        (
+            "mem : Vec<uint<8>, 4>",
+            "std::array<uint64_t, 4> mem{};",
+            "mem[0] = 5\n        mem[1] = mem[0]",
+        ),
+        (
+            "mem : Vec<sint<8>, 4>",
+            "std::array<int64_t, 4> mem{};",
+            "mem[0] = 5\n        mem[1] = mem[0]",
+        ),
+        (
+            "mem : Vec<uint<128>, 4>",
+            "std::array<_harc_u128, 4> mem{};",
+            "mem[0] = 5\n        mem[1] = mem[0]",
+        ),
+        (
+            "mem : Vec<uint<1024>, 4>",
+            "std::array<harc_rt::HarcWide<32>, 4> mem{};",
+            "mem[0] = 5",
+        ),
+        (
+            "mem : Vec<Vec<uint<8>, 2>, 2>",
+            "std::array<std::array<uint64_t, 2>, 2> mem{};",
+            "mem[0][1] = 5\n        mem[1][0] = mem[0][1]",
+        ),
+    ];
+    for (field, member, body) in cases {
+        let src = mk(field, body);
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        let tb = emit_cpp_src(&src);
+        // Both emit the same `std::array` member declaration.
+        assert!(
+            v1.contains(member),
+            "v1 must emit member `{member}` for `{field}`"
+        );
+        assert!(
+            tb.contains(member),
+            "tbir must emit member `{member}` for `{field}`, got:\n{}",
+            tb.lines()
+                .filter(|l| l.contains("mem"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // And the same `_tb.mem[...]` element reads/writes, line-for-line.
+        let v1_mem: Vec<&str> = v1
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("_tb.mem"))
+            .collect();
+        let tb_mem: Vec<&str> = tb
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("_tb.mem"))
+            .collect();
+        assert!(
+            !v1_mem.is_empty(),
+            "`{field}`: v1 emits no element access — probe is inert"
+        );
+        assert_eq!(
+            v1_mem, tb_mem,
+            "`{field}`: tbir element access must match v1 line-for-line"
+        );
+    }
+}
+
+/// The refusals a testbench fixed-vector field inherits, each graded on
+/// MEASURED v1 behaviour. A `default` and a test-scope `let Vec` both make
+/// v1 emit C++ that does not compile, so they are `NotImplemented`
+/// (EmitsUncompilable), never a `--codegen v1` promise; an out-of-range
+/// literal index is a program error (Invalid) under every backend.
+#[test]
+fn a_testbench_fixed_vector_field_refuses_what_v1_cannot_lower() {
+    let mk = |field: &str, body: &str| {
+        format!(
+            r#"testbench Tb
+    dut : Top
+    {field}
+end testbench Tb
+impl T for Tb
+    run
+        {body}
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+
+    // A `default` on the field: v1 emits `std::array<...> mem = <lit>;`,
+    // which std::array has no constructor for (measured).
+    let err = lower_src(&mk("mem : Vec<uint<8>, 4> default 0", "wait 1 cycle"))
+        .expect_err("a default on a fixed-vector field is refused");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("default"), "{msg}");
+
+    // Out-of-range literal indices — Invalid (a program error, so NOT a
+    // `--codegen v1` suggestion), both dimensions of a nested field.
+    for body in ["mem[9] = 5", "mem[0][9] = 5"] {
+        let err = lower_src(&mk("mem : Vec<Vec<uint<8>, 2>, 2>", body))
+            .expect_err("an out-of-range index is Invalid");
+        let msg = assert_invalid(&err);
+        assert!(msg.contains("out of range"), "{msg}");
+    }
+
+    // A test-scope `let m : Vec<T, N>`: v1 declares it as a scalar
+    // (`int64_t m = 0;`) and subscripts it — uncompilable (measured). The
+    // message must NOT falsely promise `--codegen v1` works.
+    let letv = r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let m : Vec<uint<8>, 4>
+        m[0] = 5
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(letv).expect_err("a test-scope let Vec is refused");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        !msg.contains("re-run with `--codegen v1`"),
+        "let-Vec message must not promise --codegen v1 works: {msg}"
+    );
+}
+
+/// A value-returning transactor method call in a fixed-vector
+/// testbench-field INDEX. In a STATEMENT context (`dut.en = mem[xt.idx()]`,
+/// `let z = mem[xt.idx()]`) the call hoists to a `Stmt::TransactorCall`
+/// exactly as the write path does, lowers, verifies, and compiles like v1.
+/// In a `wait until` predicate it cannot hoist (the predicate re-evaluates
+/// every cycle), so it earns the SAME honest refusal a bare call there
+/// does — never a verifier `BadTransactorCall` crash on the un-hoisted
+/// edge. Regression guard for the `hoist_transactor_calls` /
+/// `expr_has_transactor_edge` walkers, which must both see the new node.
+#[test]
+fn a_transactor_call_in_a_tb_vec_index_hoists_or_is_refused_like_v1() {
+    let mk = |body: &str| {
+        format!(
+            r#"transactor Xt
+    dut : Top
+    when active
+        hookable idx() -> uint<8>
+            return 3
+        end idx
+    end when
+end transactor Xt
+testbench Tb
+    dut : Top
+    xt  : Xt active
+    mem : Vec<uint<8>, 4>
+end testbench Tb
+impl T for Tb
+    run
+        xt.dut = dut
+        {body}
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+
+    // Statement contexts: v1 compiles, tbir lowers + verifies (call hoisted).
+    for body in ["dut.en = mem[xt.idx()]", "let z : uint<8> = mem[xt.idx()]"] {
+        let src = mk(body);
+        assert!(
+            cpp_tb::emit(&merged_src(&src)).is_ok(),
+            "v1 must emit `{body}`"
+        );
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{body}` must lower: {e}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("`{body}` must verify (call hoisted): {e:?}"));
+    }
+
+    // `wait until` predicate: the call cannot hoist. Same honest refusal a
+    // bare call earns — an `Unsupported` (v1 does compile the re-eval loop),
+    // NOT a verifier crash.
+    let err = lower_src(&mk("wait until mem[xt.idx()] == 1"))
+        .expect_err("a transactor call in a wait-until predicate is refused");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("wait until"),
+        "must be the wait-until-predicate refusal, not a verifier crash: {msg}"
+    );
 }

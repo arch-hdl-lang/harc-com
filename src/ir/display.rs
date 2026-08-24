@@ -669,6 +669,21 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::TbFieldWrite { field, value } => {
             format!("TbFieldWrite(_tb.{field}, {})", expr_str(func, value))
         }
+        Stmt::TbFieldVecElementWrite {
+            field,
+            index,
+            inner_index,
+            value,
+        } => {
+            let mut member = format!("_tb.{field}[{}]", expr_str(func, index));
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_str(func, inner));
+            }
+            format!(
+                "TbFieldVecElementWrite({member}, {})",
+                expr_str(func, value)
+            )
+        }
         Stmt::TbQueuePush { field, value } => {
             format!("TbQueuePush(_tb.{field}, {})", expr_str(func, value))
         }
@@ -1185,6 +1200,17 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             }
         }
         Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TbFieldVecElement {
+            field,
+            index,
+            inner_index,
+        } => {
+            let mut member = format!("_tb.{field}[{}]", expr_str(func, index));
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_str(func, inner));
+            }
+            member
+        }
         Expr::TemporalSlot { slot, kind } => {
             let f = match kind {
                 crate::ir::TemporalFn::Past => "past",

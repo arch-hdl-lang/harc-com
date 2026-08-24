@@ -3992,6 +3992,22 @@ impl Checker<'_> {
                         Err(detail) => self.report_bad_component_field(detail),
                     }
                 }
+                Stmt::TbFieldVecElementWrite {
+                    field,
+                    index,
+                    inner_index,
+                    value,
+                } => {
+                    self.check_tb_field(field);
+                    let vec_ty = self.tb_scalar_field_ty(field);
+                    self.check_fixed_vec_element_write(
+                        vec_ty,
+                        index,
+                        inner_index.as_ref(),
+                        value,
+                        "TbFieldVecElementWrite",
+                    );
+                }
                 Stmt::ComponentEmit { base, event, args } => {
                     let payload = match self.component_emit_payload(base, event) {
                         Ok(payload) => Some(payload),
@@ -4234,6 +4250,108 @@ impl Checker<'_> {
                 block: self.bid,
                 field: field.to_string(),
             });
+        }
+    }
+
+    /// Declared type of a scalar-kind testbench field. A `Vec<T, N>` host
+    /// field is stored as a `Scalar` state field whose `ty` is a
+    /// `FixedVec`, so this is how the fixed-vector element checks recover
+    /// the receiver's shape. `None` when no scalar field by that name.
+    fn tb_scalar_field_ty(&self, field: &str) -> Option<IrType> {
+        self.func
+            .owner
+            .and_then(|tb| self.prog.testbenches.get(tb.index()))
+            .and_then(|tb| {
+                tb.state_fields.iter().find_map(|state| match state {
+                    TbStateFieldSchema::Scalar(scalar) if scalar.name == field => {
+                        Some(scalar.ty.clone())
+                    }
+                    _ => None,
+                })
+            })
+    }
+
+    /// Bounds- and structure-check a fixed-vector element write whose
+    /// receiver is a plain `IrType::FixedVec` — a testbench host field
+    /// (`_tb.mem[i] = x`). The testbench-field decoder gate admits only
+    /// scalar (or nested-`FixedVec`) elements, so there is no
+    /// component-field / dotted-path indirection and no record elements to
+    /// reject; this mirrors the scalar path of `ComponentVecElementWrite`.
+    /// The value's scalar coercion is an established lowering contract, so
+    /// (as on the component path) only the index bounds are enforced here
+    /// beyond the structural `check_expr` walks.
+    fn check_fixed_vec_element_write(
+        &mut self,
+        vec_ty: Option<IrType>,
+        index: &Expr,
+        inner_index: Option<&Expr>,
+        value: &Expr,
+        what: &'static str,
+    ) {
+        self.check_expr(value, false, what);
+        self.check_fixed_vec_element_indices(vec_ty, index, inner_index, false, what, what);
+    }
+
+    /// Read counterpart of `check_fixed_vec_element_write` — same bounds and
+    /// structural walks, but the index sub-exprs inherit the read's
+    /// `ports_ok`/`context` (a read may legally appear in a port-bearing
+    /// position where a write cannot).
+    fn check_fixed_vec_element_read(
+        &mut self,
+        vec_ty: Option<IrType>,
+        index: &Expr,
+        inner_index: Option<&Expr>,
+        ports_ok: bool,
+        context: &'static str,
+        what: &'static str,
+    ) {
+        self.check_fixed_vec_element_indices(vec_ty, index, inner_index, ports_ok, context, what);
+    }
+
+    /// Shared index-walk + literal-bounds check for the fixed-vector
+    /// element read/write nodes whose receiver is a plain `IrType::FixedVec`.
+    fn check_fixed_vec_element_indices(
+        &mut self,
+        vec_ty: Option<IrType>,
+        index: &Expr,
+        inner_index: Option<&Expr>,
+        ports_ok: bool,
+        context: &'static str,
+        what: &'static str,
+    ) {
+        self.check_expr(index, ports_ok, context);
+        if let Some(inner) = inner_index {
+            self.check_expr(inner, ports_ok, context);
+        }
+        let Some(IrType::FixedVec { elem, len }) = vec_ty else {
+            return;
+        };
+        if matches!(index, Expr::Literal { value, .. } if *value as usize >= len) {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {what}: index out of bounds for fixed vector of length {len}",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+        if let Some(inner) = inner_index {
+            let IrType::FixedVec { len: inner_len, .. } = elem.as_ref() else {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} {what}: nested index whose element is not a fixed vector",
+                        self.fid.0, self.bid.0
+                    ),
+                });
+                return;
+            };
+            if matches!(inner, Expr::Literal { value, .. } if *value as usize >= *inner_len) {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} {what}: nested index out of bounds for fixed vector of length {inner_len}",
+                        self.fid.0, self.bid.0
+                    ),
+                });
+            }
         }
     }
 
@@ -5070,6 +5188,22 @@ impl Checker<'_> {
                     }
                     Err(detail) => self.report_bad_component_field(detail),
                 }
+            }
+            Expr::TbFieldVecElement {
+                field,
+                index,
+                inner_index,
+            } => {
+                self.check_tb_field(field);
+                let vec_ty = self.tb_scalar_field_ty(field);
+                self.check_fixed_vec_element_read(
+                    vec_ty,
+                    index,
+                    inner_index.as_deref(),
+                    ports_ok,
+                    context,
+                    "TbFieldVecElement",
+                );
             }
             // A by-value component passed as a method arg. A `Local` base
             // is a method-param local (verify it is defined); a
@@ -5962,6 +6096,21 @@ fn check_def_before_use(
                     }
                     check_e(value, &defined, errs);
                 }
+                // A fixed-vector testbench-field element write reads its
+                // index/value exprs (the `_tb` receiver is host state, not
+                // a test local).
+                Stmt::TbFieldVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => {
+                    check_e(index, &defined, errs);
+                    if let Some(inner) = inner_index {
+                        check_e(inner, &defined, errs);
+                    }
+                    check_e(value, &defined, errs);
+                }
                 Stmt::ComponentEmit { args, .. } => {
                     for a in args {
                         check_e(a, &defined, errs);
@@ -6075,6 +6224,9 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             }
         }
         Expr::ComponentVecElement {
+            index, inner_index, ..
+        }
+        | Expr::TbFieldVecElement {
             index, inner_index, ..
         } => {
             for_each_local(index, f);

@@ -1750,3 +1750,66 @@ end impl TEv
         }
     }
 }
+
+/// A `Vec<T, N>` TESTBENCH host field, element-accessed in `run`, lowers
+/// and compiles at every element class v1 handles — held to v1's own
+/// output by the differential harness (every row must lower AND the
+/// emitted C++ must typecheck). Single-level and nested templates use the
+/// index shape each supports.
+#[test]
+fn a_testbench_fixed_vector_field_lowers_and_compiles_like_v1() {
+    let single = r#"
+testbench Tb
+    dut : Top
+    mem : @@TY@@
+end testbench Tb
+impl T for Tb
+    run
+        mem[0] = 5
+        mem[1] = mem[0]
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let table = check_space_all_lower(
+        "tb-fixed-vec-field",
+        single,
+        "@@TY@@",
+        "Vec<uint<8>, 4>",
+        &[
+            "Vec<uint<8>, 4>",
+            "Vec<sint<8>, 4>",
+            "Vec<bool, 4>",
+            "Vec<uint<64>, 4>",
+            "Vec<uint<128>, 4>",
+            "Vec<uint<1024>, 4>",
+        ],
+    );
+    eprintln!("{table}");
+
+    let nested = r#"
+testbench Tb
+    dut : Top
+    mem : @@TY@@
+end testbench Tb
+impl T for Tb
+    run
+        mem[0][1] = 5
+        mem[1][0] = mem[0][1]
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let table = check_space_all_lower(
+        "tb-nested-fixed-vec-field",
+        nested,
+        "@@TY@@",
+        "Vec<Vec<uint<8>, 2>, 2>",
+        &[
+            "Vec<Vec<uint<8>, 2>, 2>",
+            "Vec<Vec<sint<8>, 2>, 2>",
+            "Vec<Vec<uint<128>, 2>, 2>",
+        ],
+    );
+    eprintln!("{table}");
+}

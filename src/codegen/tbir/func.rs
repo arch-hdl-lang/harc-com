@@ -1264,6 +1264,23 @@ fn emit_stmt(
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}_tb.{field} = {e};").ok();
         }
+        // `_tb.mem[i] = v` (and `_tb.mem[i][j] = v` for a nested Vec) —
+        // element write of a fixed-vector testbench field. Mirrors v1's
+        // subscript assignment on the `std::array` member.
+        Stmt::TbFieldVecElementWrite {
+            field,
+            index,
+            inner_index,
+            value,
+        } => {
+            let idx = expr_cpp(cx, index)?;
+            let value = expr_cpp(cx, value)?;
+            let mut member = format!("_tb.{field}[{idx}]");
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_cpp(cx, inner)?);
+            }
+            writeln!(out, "{pad}{member} = {value};").ok();
+        }
         Stmt::TbQueuePush { field, value } => {
             let e = expr_cpp(cx, value)?;
             writeln!(out, "{pad}_tb.{field}.push({e});").ok();
@@ -1923,6 +1940,9 @@ fn expr_uses_snapshot_lane(expr: &Expr, snapshot: LocalId) -> bool {
                     .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot))
         }
         Expr::ComponentVecElement {
+            index, inner_index, ..
+        }
+        | Expr::TbFieldVecElement {
             index, inner_index, ..
         } => {
             expr_uses_snapshot_lane(index, snapshot)
