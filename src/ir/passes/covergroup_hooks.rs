@@ -323,7 +323,6 @@ fn coverpoint_expr_type(
             if let Some(crate::ir::LaneIndex::Var(index)) = &port.lane {
                 let index_ty = coverpoint_expr_type(prog, hook_params, index)?;
                 require_scalar(prog, &index_ty, "DUT lane index")?;
-                reject_wide_composition_type(&index_ty, "DUT lane index")?;
             }
             Ok(IrType::UInt(port.width))
         }
@@ -375,8 +374,6 @@ fn coverpoint_expr_type(
             require_scalar(prog, &target_ty, "runtime bit-slice target")?;
             require_scalar(prog, &hi_ty, "runtime bit-slice high bound")?;
             require_scalar(prog, &lo_ty, "runtime bit-slice low bound")?;
-            reject_wide_composition_type(&hi_ty, "runtime bit-slice high bound")?;
-            reject_wide_composition_type(&lo_ty, "runtime bit-slice low bound")?;
             Ok(IrType::UInt(None))
         }
         Expr::WidthCast {
@@ -432,7 +429,6 @@ fn coverpoint_expr_type(
             if let Some(index) = index {
                 let index_ty = coverpoint_expr_type(prog, hook_params, index)?;
                 require_scalar(prog, &index_ty, "hook field index")?;
-                reject_wide_composition_type(&index_ty, "hook field index")?;
             }
             Ok(field_schema.ty.clone())
         }
@@ -499,16 +495,6 @@ fn require_scalar(prog: &TbProgram, ty: &IrType, what: &str) -> Result<(), Strin
             "{what} must be scalar, got {}",
             type_name(prog, ty)
         ))
-    }
-}
-
-fn reject_wide_composition_type(ty: &IrType, what: &str) -> Result<(), String> {
-    if matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 64) {
-        Err(format!(
-            "{what} uses a value wider than 64 bits; composed wide cover expressions need type-directed operand coercion"
-        ))
-    } else {
-        Ok(())
     }
 }
 

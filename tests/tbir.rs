@@ -29323,17 +29323,35 @@ fn coverpoint_compositions_preserve_wide_and_wrapping_widths() {
         "{cpp}"
     );
 
-    let wide_selector = source("dut.count_out[(dut.en as uint<200>):0]");
-    let msg = assert_unsupported(&lower_src(&wide_selector).unwrap_err());
-    assert!(msg.contains("runtime bit-slice selector"), "{msg}");
-
     let lanes = fixture("packed_vec_lane_test.harc");
-    let wide_lane = lanes.replace(
-        "cover dut.lane_id_out[2'd0]",
-        "cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<200>)]",
-    );
-    let msg = assert_unsupported(&lower_src(&wide_lane).unwrap_err());
-    assert!(msg.contains("runtime lane selector"), "{msg}");
+    for (width, helper) in [(65, "harc_u128_shift_count"), (200, "harc_wide_shift_count")] {
+        let wide_selector = source(&format!(
+            "dut.count_out[(dut.en as uint<{width}>) + 2:(dut.en as uint<{width}>)]"
+        ));
+        let prog = lower_src(&wide_selector).expect("wide runtime bit-slice selector lowers");
+        verify::verify_program(&prog).expect("wide runtime bit-slice selector verifies");
+        let cpp = emit_cpp_src(&wide_selector);
+        assert!(
+            cpp.matches(helper).count() >= 2,
+            "both uint<{width}> bounds must use `{helper}`: {cpp}"
+        );
+        assert!(cpp.contains("4294967295ULL"), "uint<{width}>: {cpp}");
+
+        let wide_lane = lanes.replace(
+            "cover dut.lane_id_out[2'd0]",
+            &format!(
+                "cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<{width}>)]"
+            ),
+        );
+        let prog = lower_src(&wide_lane).expect("wide runtime lane selector lowers");
+        verify::verify_program(&prog).expect("wide runtime lane selector verifies");
+        let cpp = emit_cpp_src(&wide_lane);
+        assert!(cpp.contains(helper), "uint<{width}>: {cpp}");
+        assert!(
+            cpp.contains("18446744073709551615ULL"),
+            "uint<{width}>: {cpp}"
+        );
+    }
 
     // A raw DUT port's actual packed width arrives with the SV emit
     // options, after schema lowering. Pin the late guard too.
@@ -29420,11 +29438,11 @@ fn coverpoint_hook_fields_carry_late_width_and_signedness_into_codegen() {
     let src = fixture("covergroup_hook_param_test.harc")
         .replace(
             "    expect : uint<32> default 0",
-            "    expect : uint<32> default 0\n    wide_a : uint<200> default 0\n    wide_b : uint<300> default 0\n    signed_a : sint<200> default 0\n    signed_b : sint<300> default 0",
+            "    expect : uint<32> default 0\n    samples : Vec<uint<8>, 4>\n    wide_a : uint<200> default 0\n    wide_b : uint<300> default 0\n    signed_a : sint<200> default 0\n    signed_b : sint<300> default 0",
         )
         .replace(
             "    cross cp_ticks, cp_expect",
-            "    cp_wide : cover cmd.wide_a + cmd.wide_b\n    cp_signed : cover cmd.signed_a < cmd.signed_b\n    cross cp_ticks, cp_expect",
+            "    cp_wide : cover cmd.wide_a + cmd.wide_b\n    cp_signed : cover cmd.signed_a < cmd.signed_b\n    cp_wide_index : cover cmd.samples[(cmd.ticks as uint<200>)]\n    cross cp_ticks, cp_expect",
         );
     let prog = lower_src(&src).expect("wide hook-field expressions lower");
     verify::verify_program(&prog).expect("wide hook-field expressions verify");
@@ -29436,6 +29454,10 @@ fn coverpoint_hook_fields_carry_late_width_and_signedness_into_codegen() {
     assert!(
         cpp.contains("harc_wide_slt") && cpp.contains("cmd.signed_a"),
         "signed hook fields must use signed comparison semantics: {cpp}"
+    );
+    assert!(
+        cpp.contains("cmd.samples[harc_rt::harc_wide_shift_count"),
+        "wide hook-field indices must lower through the bounded scalar seam: {cpp}"
     );
 }
 

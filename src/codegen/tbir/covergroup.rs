@@ -318,6 +318,26 @@ fn reject_wide_cpp_operand(
     Ok(())
 }
 
+/// Render a covergroup selector into the scalar index expected by the host
+/// runtime. Wide carriers saturate at the consumer's maximum instead of
+/// relying on a wrapping or unavailable implicit C++ conversion.
+fn cover_bounded_index_cpp(
+    expr: &Expr,
+    widths: &CoverWidths<'_>,
+    limit: u64,
+) -> Result<String, EmitError> {
+    let rendered = cover_expr_cpp(expr, widths)?;
+    Ok(match cover_expr_width(expr, widths) {
+        Some(width) if width > 128 => {
+            format!("harc_rt::harc_wide_shift_count(({rendered}), {limit}ULL)")
+        }
+        Some(width) if width > 64 => {
+            format!("harc_rt::harc_u128_shift_count((_harc_u128)({rendered}), {limit}ULL)")
+        }
+        _ => rendered,
+    })
+}
+
 fn cover_coerce_cpp(rendered: String, src_width: Option<u32>, width: u32, signed: bool) -> String {
     if let Some(words) = super::wide_scalar_words(width) {
         if signed {
@@ -565,8 +585,7 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
                     let idx = match lane {
                         crate::ir::LaneIndex::Const(c) => c.to_string(),
                         crate::ir::LaneIndex::Var(index) => {
-                            reject_wide_cpp_operand("runtime lane selector", &[index], widths)?;
-                            cover_expr_cpp(index, widths)?
+                            cover_bounded_index_cpp(index, widths, u64::MAX)?
                         }
                     };
                     match cover_lane_width(widths.lanes, p) {
@@ -596,10 +615,9 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
             }
         }
         Expr::BitSliceDyn { target, hi, lo } => {
-            reject_wide_cpp_operand("runtime bit-slice selector", &[hi, lo], widths)?;
             let target = cover_expr_cpp(target, widths)?;
-            let hi = cover_expr_cpp(hi, widths)?;
-            let lo = cover_expr_cpp(lo, widths)?;
+            let hi = cover_bounded_index_cpp(hi, widths, u32::MAX.into())?;
+            let lo = cover_bounded_index_cpp(lo, widths, u32::MAX.into())?;
             format!("harc_rt::harc_bits(({target}), (uint32_t)({hi}), (uint32_t)({lo}))")
         }
         Expr::WidthCast {
@@ -619,8 +637,7 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
             index,
         } => match index {
             Some(idx) => {
-                reject_wide_cpp_operand("hook-field lane selector", &[idx], widths)?;
-                let i = cover_expr_cpp(idx, widths)?;
+                let i = cover_bounded_index_cpp(idx, widths, u64::MAX)?;
                 format!("{param}.{field}[{i}]")
             }
             None => format!("{param}.{field}"),
