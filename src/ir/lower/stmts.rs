@@ -685,6 +685,37 @@ impl FuncBuilder<'_> {
                         return Ok(());
                     }
                 }
+                // Dynamic record-list queries are pure values, but a
+                // statement-position call still evaluates any index
+                // expressions in its receiver. Try this only after all
+                // real component/transactor method namespaces, so a user
+                // method named `size`, `len`, or `empty` keeps winning.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if args.is_empty()
+                        && matches!(
+                            &*callee.kind,
+                            ExprKind::Field { name, .. }
+                                if matches!(name.name.as_str(), "len" | "size" | "empty")
+                        )
+                    {
+                        let query = self.lower_expr_no_ports(e)?;
+                        let query = self.hoist_transactor_calls(query);
+                        if let crate::ir::Expr::DynamicListQuery { query: kind, .. } = &query {
+                            let discard = self.fresh_temp();
+                            self.set_local_type(
+                                discard,
+                                match kind {
+                                    crate::ir::DynamicListQuery::Size => {
+                                        crate::ir::IrType::UInt(None)
+                                    }
+                                    crate::ir::DynamicListQuery::Empty => crate::ir::IrType::Bool,
+                                },
+                            );
+                            self.push(Stmt::Assign(discard, query));
+                            return Ok(());
+                        }
+                    }
+                }
                 let what = match &*e.kind {
                     ExprKind::Call { callee, args } => match &*callee.kind {
                         ExprKind::Ident(id) => {

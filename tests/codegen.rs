@@ -8927,30 +8927,14 @@ end test T"#;
 /// merely the flag.
 #[test]
 fn the_escape_hatch_phrases_the_parity_gate_greps_are_stable() {
-    // 1. LowerError::Unsupported — v1 implements the construct.
-    let src = r#"transaction Txn
-    items : list<uint<8>>
-    keep items.len() <= 2
-end transaction Txn
-test EscapeHatch
-    let dut : Top
-    run
-        let t : Txn
-        randomize(t)
-        let count = t.items.len()
-        log(info, "x")
-    end run
-end test EscapeHatch"#;
-    let parsed = parse_source(src).expect("parses");
-    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
-    assert!(
-        cpp_tb::emit(&merged).is_ok(),
-        "v1 must still implement the construct, or it is not an escape hatch"
-    );
-    let err = harc::ir::lower::lower_program(&merged)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    // Pin the diagnostic class directly. A concrete source gap is a poor
+    // rendering fixture because successful burn-down intentionally makes
+    // each such program stop producing this error.
+    let err = harc::ir::lower::LowerError::Unsupported {
+        construct: "a v1-supported construct".to_string(),
+        detail: "".to_string(),
+    }
+    .to_string();
     assert!(
         err.contains("re-run with `--codegen v1`"),
         "run_emit_parity.sh greps this exact phrase; got: {err}"

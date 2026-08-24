@@ -11764,14 +11764,58 @@ end test T"#
         format!("{err:?}").contains("dynamic record list"),
         "{err:?}"
     );
-    let body_len = field("list<uint<8>>").replace(
+    let body_queries = field("list<uint<8>>").replace(
         "randomize(r)",
-        "randomize(r)\n        let count = r.data.len()",
+        "randomize(r)\n        let len = r.data.len()\n        let size = r.data.size()\n        let empty = r.data.empty()\n        r.data.len()\n        r.data.size()\n        r.data.empty()\n        assert len == size\n        assert !empty",
     );
-    let msg = assert_unsupported(
-        &lower_src(&body_len).expect_err("ordinary list queries remain a separate slice"),
+    let local_query_prog = lower_src(&body_queries).expect("local list queries lower");
+    verify::verify_program(&local_query_prog).expect("local list queries verify");
+    let query_result_types: Vec<_> = local_query_prog
+        .functions
+        .iter()
+        .flat_map(|func| {
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter_map(move |stmt| match stmt {
+                    ir::Stmt::Assign(dest, ir::Expr::DynamicListQuery { .. }) => {
+                        Some(func.locals[dest.index()].ty.clone())
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    assert!(
+        query_result_types.contains(&ir::IrType::UInt(None))
+            && query_result_types.contains(&ir::IrType::Bool),
+        "dynamic-list query result types: {query_result_types:?}"
     );
-    assert!(msg.contains("dynamic record list"), "{msg}");
+    let local_query_cpp = emit_cpp_src(&body_queries);
+    assert!(
+        local_query_cpp.matches(".data).size()").count() >= 2,
+        "{local_query_cpp}"
+    );
+    assert!(
+        local_query_cpp.contains(".data).empty()"),
+        "{local_query_cpp}"
+    );
+    let mut corrupt_query = local_query_prog.clone();
+    let query_target = corrupt_query
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .flat_map(|block| block.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::DynamicListQuery { target, .. }) => Some(target),
+            _ => None,
+        })
+        .expect("local fixture contains a dynamic-list query");
+    *query_target = Box::new(ir::Expr::Literal {
+        value: 0,
+        ty: ir::IrType::UInt(None),
+    });
+    verify::verify_program(&corrupt_query)
+        .expect_err("a dynamic-list query on a scalar must not verify");
 
     let whole_value =
         field("list<uint<8>>").replace("randomize(r)", "randomize(r)\n        let scalar = r.data");
@@ -11904,11 +11948,36 @@ end test T"#;
     }
     let component_query = component.replace(
         "current.items = current.items",
-        "let n = current.items.len()",
+        "let len = current.items.len()\n            let size = current.items.size()\n            let empty = current.items.empty()\n            current.items.len()\n            current.items.size()\n            current.items.empty()\n            assert len == size\n            assert !empty",
     );
-    assert_unsupported(
-        &lower_src(&component_query).expect_err("component list query keeps the v1 escape"),
+    let component_query_prog =
+        lower_src(&component_query).expect("component record-list queries lower");
+    verify::verify_program(&component_query_prog).expect("component record-list queries verify");
+    let component_query_cpp = emit_cpp_src(&component_query);
+    assert!(
+        component_query_cpp.contains("self.current.items).size()")
+            && component_query_cpp.contains("self.current.items).empty()"),
+        "{component_query_cpp}"
     );
+    let method_name_collision = r#"transactor QueryNameCollision
+    when active
+        hookable size()
+        end size
+    end when
+end transactor QueryNameCollision
+
+test T
+    let dut : Top
+    let src : QueryNameCollision active
+    run
+        src.size()
+        wait 1 cycle
+    end run
+end test T"#;
+    verify::verify_program(
+        &lower_src(method_name_collision).expect("a real component method named size still lowers"),
+    )
+    .expect("a real component method named size still verifies");
 
     let indexed_component = r#"struct Sample
     items : list<uint<8>, max=2>
@@ -11942,6 +12011,41 @@ end test T"#;
         .expect("matching whole lists beneath a component Vec element lower");
     verify::verify_program(&indexed_prog)
         .expect("matching whole lists beneath a component Vec element verify");
+    let indexed_component_query = indexed_component.replace(
+        "let equal = current.rows[0].items == current.rows[1].items",
+        "let equal = current.rows[0].items == current.rows[1].items\n            let n = current.rows[0].items.size()\n            let empty = current.rows[1].items.empty()",
+    );
+    verify::verify_program(
+        &lower_src(&indexed_component_query).expect("indexed component list queries lower"),
+    )
+    .expect("indexed component list queries verify");
+    let component_call_index = indexed_component_query
+        .replacen(
+            "transactor RecordSource",
+            "transactor Indexer\n    dut : Top\n    when active\n        hookable index() -> uint<8>\n            return 0\n        end index\n    end when\nend transactor Indexer\n\ntransactor RecordSource",
+            1,
+        )
+        .replace(
+            "let src : RecordSource active",
+            "let src : RecordSource active\n    let idx : Indexer active",
+        )
+        .replace(
+            "src.publish()",
+            "idx.dut = dut\n        assert src.current.rows[idx.index()].items.empty()\n        let empty = src.current.rows[idx.index()].items.empty()\n        src.current.rows[idx.index()].items.size()\n        src.publish()",
+        );
+    let component_call_index_prog = lower_src(&component_call_index)
+        .expect("transactor-call index in a component list query lowers");
+    verify::verify_program(&component_call_index_prog)
+        .expect("transactor-call index in a component list query verifies");
+    assert!(
+        component_call_index_prog
+            .functions
+            .iter()
+            .flat_map(|func| func.blocks.iter())
+            .flat_map(|block| block.stmts.iter())
+            .any(|stmt| matches!(stmt, ir::Stmt::TransactorCall { dest: Some(_), .. })),
+        "the component query index call is hoisted to the call seam"
+    );
 
     let indexed_local = r#"struct Sample
     items : list<uint<8>, max=2>
@@ -11965,6 +12069,14 @@ end test T"#;
         lower_src(indexed_local).expect("matching indexed record-local lists lower");
     verify::verify_program(&indexed_local_prog)
         .expect("matching indexed record-local lists verify");
+    let indexed_local_query = indexed_local.replace(
+        "let equal = a.rows[0].items == b.rows[1].items",
+        "let equal = a.rows[0].items == b.rows[1].items\n        let n = a.rows[0].items.len()\n        let empty = b.rows[1].items.empty()",
+    );
+    verify::verify_program(
+        &lower_src(&indexed_local_query).expect("indexed local list queries lower"),
+    )
+    .expect("indexed local list queries verify");
     let sized_indexed_local = indexed_local
         .replace("rows[0]", "rows[8'd0]")
         .replace("rows[1]", "rows[8'd1]");
@@ -12009,6 +12121,41 @@ end impl T"#;
         lower_src(indexed_target).expect("matching indexed target-state lists lower");
     verify::verify_program(&indexed_target_prog)
         .expect("matching indexed target-state lists verify");
+    let indexed_target_query = indexed_target.replace(
+        "let equal = cache.rows[0].items == cache.rows[1].items",
+        "let equal = cache.rows[0].items == cache.rows[1].items\n        let n = cache.rows[0].items.size()\n        let empty = cache.rows[1].items.empty()",
+    );
+    verify::verify_program(
+        &lower_src(&indexed_target_query).expect("indexed target-state list queries lower"),
+    )
+    .expect("indexed target-state list queries verify");
+    let target_call_index = indexed_target_query
+        .replacen(
+            "testbench Tb",
+            "transactor Indexer\n    dut : Top\n    when active\n        hookable index() -> uint<8>\n            return 0\n        end index\n    end when\nend transactor Indexer\n\ntestbench Tb",
+            1,
+        )
+        .replace(
+            "let target : Target passive = bind bus",
+            "let target : Target passive = bind bus\n    let idx : Indexer active",
+        )
+        .replace(
+            "wait 1 cycle",
+            "idx.dut = dut\n        assert target.cache.rows[idx.index()].items.empty()\n        let empty = target.cache.rows[idx.index()].items.empty()\n        target.cache.rows[idx.index()].items.size()\n        wait 1 cycle",
+        );
+    let target_call_index_prog = lower_src(&target_call_index)
+        .expect("transactor-call index in a target-state list query lowers");
+    verify::verify_program(&target_call_index_prog)
+        .expect("transactor-call index in a target-state list query verifies");
+    assert!(
+        target_call_index_prog
+            .functions
+            .iter()
+            .flat_map(|func| func.blocks.iter())
+            .flat_map(|block| block.stmts.iter())
+            .any(|stmt| matches!(stmt, ir::Stmt::TransactorCall { dest: Some(_), .. })),
+        "the target-state query index call is hoisted to the call seam"
+    );
     let sized_indexed_target = indexed_target
         .replace("rows[0]", "rows[8'd0]")
         .replace("rows[1]", "rows[8'd1]");
@@ -12133,9 +12280,18 @@ end impl T"#;
     );
     let target_prog = lower_src(&target_copy_eq).expect("whole target list copy/equality lowers");
     verify::verify_program(&target_prog).expect("whole target list copy/equality verifies");
-    let target_query = target.replace("let n = cache.items", "let n = cache.items.len()");
-    assert_unsupported(
-        &lower_src(&target_query).expect_err("target record-list query keeps the v1 escape"),
+    let target_query = target.replace(
+        "let n = cache.items",
+        "let len = cache.items.len()\n        let size = cache.items.size()\n        let empty = cache.items.empty()\n        cache.items.len()\n        cache.items.size()\n        cache.items.empty()\n        assert len == size\n        assert empty",
+    );
+    let target_query_prog =
+        lower_src(&target_query).expect("target-state record-list queries lower");
+    verify::verify_program(&target_query_prog).expect("target-state record-list queries verify");
+    let target_query_cpp = emit_cpp_src(&target_query);
+    assert!(
+        target_query_cpp.contains("target.cache.items).size()")
+            && target_query_cpp.contains("target.cache.items).empty()"),
+        "{target_query_cpp}"
     );
 
     let list_reply = r#"struct Reply

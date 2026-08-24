@@ -718,6 +718,15 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
             }
         }
+        Expr::DynamicListQuery { target, query } => {
+            let recv = expr_cpp(cx, target)?;
+            match query {
+                crate::ir::DynamicListQuery::Size => {
+                    format!("((uint64_t)({recv}).size())")
+                }
+                crate::ir::DynamicListQuery::Empty => format!("({recv}).empty()"),
+            }
+        }
         // Heartbeat-idle predicate on a component instance — mirrors v1's
         // `emit_idle_predicate`: compares `cycle_count` minus the
         // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.

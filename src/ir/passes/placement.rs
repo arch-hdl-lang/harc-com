@@ -535,6 +535,7 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             visit_expr(b, accesses, transactor);
         }
         Expr::Unary(_, a) => visit_expr(a, accesses, transactor),
+        Expr::DynamicListQuery { target, .. } => visit_expr(target, accesses, transactor),
         Expr::BitSlice { target, .. } => visit_expr(target, accesses, transactor),
         Expr::BitSliceDyn { target, hi, lo } => {
             visit_expr(target, accesses, transactor);

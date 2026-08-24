@@ -5328,6 +5328,23 @@ impl Checker<'_> {
             // Component-queue size/empty read — host state resolved at
             // lowering against the component schema; nothing to verify.
             Expr::ComponentQueueQuery { .. } => {}
+            Expr::DynamicListQuery { target, .. } => {
+                match self.expr_whole_collection_shape(target) {
+                    Ok(Some(WholeCollectionShape::DynamicSeq(_))) => {
+                        self.check_expr_inner(target, ports_ok, context, true);
+                    }
+                    Ok(shape) => {
+                        self.report_bad_whole_vec_use(format!(
+                            "dynamic-list query receiver is not a dynamic list: {shape:?}"
+                        ));
+                        self.check_expr_inner(target, ports_ok, context, shape.is_some());
+                    }
+                    Err(detail) => {
+                        self.report_bad_whole_vec_use(detail);
+                        self.check_expr(target, ports_ok, context);
+                    }
+                }
+            }
             Expr::ComponentIdle {
                 base, subpath, n, ..
             } => {
@@ -5780,6 +5797,14 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
             Some(ret.clone())
         }
         Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
+        Expr::DynamicListQuery {
+            query: crate::ir::DynamicListQuery::Size,
+            ..
+        } => Some(IrType::UInt(None)),
+        Expr::DynamicListQuery {
+            query: crate::ir::DynamicListQuery::Empty,
+            ..
+        } => Some(IrType::Bool),
         Expr::ScoreboardQuery {
             sb,
             query: ScoreboardQuery::Scalar { scalar },
@@ -6367,6 +6392,7 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(b, f);
         }
         Expr::Unary(_, a) => for_each_local(a, f),
+        Expr::DynamicListQuery { target, .. } => for_each_local(target, f),
         Expr::BitSlice { target, .. } => for_each_local(target, f),
         Expr::BitSliceDyn { target, hi, lo } => {
             for_each_local(target, f);

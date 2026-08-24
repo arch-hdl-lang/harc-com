@@ -2652,6 +2652,15 @@ pub enum WaitMode {
     AnyOf,
 }
 
+/// A read-only query on a dynamic `list<T>` record field. Source `.len()`
+/// and `.size()` share the same element-count operation; `.empty()` is
+/// boolean-valued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicListQuery {
+    Size,
+    Empty,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Literal {
@@ -2824,6 +2833,15 @@ pub enum Expr {
     ComponentQueueQuery {
         base: ComponentBase,
         query: ScoreboardQuery,
+    },
+    /// `.len()` / `.size()` / `.empty()` on a dynamic `list<T>` record
+    /// field. `target` is one of the whole-list host-state field reads
+    /// (`RecordField`, `ComponentField`, `ComponentVecElement`, or
+    /// `TransactorStateRecordField`). The verifier proves that it still
+    /// resolves to a dynamic list after IR-mutating passes.
+    DynamicListQuery {
+        target: Box<Expr>,
+        query: DynamicListQuery,
     },
     /// A heartbeat-idle predicate on a component: `agent.idle_in(N)`,
     /// `agent.idle_out(N)`, or `agent.idle(N)` (= both). `base` resolves

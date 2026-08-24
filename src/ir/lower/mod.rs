@@ -8013,6 +8013,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 fill_expr(b, instance);
             }
             ir::Expr::Unary(_, a) => fill_expr(a, instance),
+            ir::Expr::DynamicListQuery { target, .. } => fill_expr(target, instance),
             ir::Expr::BitSlice { target, .. } => fill_expr(target, instance),
             ir::Expr::BitSliceDyn { target, hi, lo } => {
                 fill_expr(target, instance);
@@ -8318,6 +8319,7 @@ fn fill_visit_expr(
         Expr::Unary(_, a)
         | Expr::BitSlice { target: a, .. }
         | Expr::WidthCast { inner: a, .. }
+        | Expr::DynamicListQuery { target: a, .. }
         | Expr::ComponentIdle { n: a, .. }
         | Expr::TransactorIdle { n: a, .. } => {
             fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict)
