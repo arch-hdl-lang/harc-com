@@ -633,6 +633,162 @@ pub(super) fn context_struct(out: &mut String, dut_type: &str) {
     );
 }
 
+/// M3: Deepened `HarcTestContext` — runtime seam for separate compilation.
+///
+/// Extends the simple state-bag with owned submodules and lifecycle
+/// methods so shared generated code operates on `HarcTestContext&` plus
+/// its owning testbench instance, never on captured `run_<Test>` locals.
+/// Header declares the struct and its methods; `context_methods` defines
+/// them in the common source. Keeps the same layout as the simple
+/// struct for the self-contained fallback, adding only member
+/// declarations.
+pub(super) fn context_struct_deepened(out: &mut String, dut_type: &str) {
+    writeln!(out, "struct HarcTestContext {{").ok();
+    writeln!(out, "{INDENT}V{dut_type}* dut = nullptr;").ok();
+    out.push_str(
+        r#"#if HARC_TRACE_ENABLED
+    HarcTraceC* tfp = nullptr;
+    std::string _wave_path;
+#endif
+    uint64_t _trace_time = 0;
+    int errors = 0;
+    bool _fatal = false;
+    int cycle_count = 0;
+    harc_rt::trace::HarcTraceWriter trace;
+    harc_rt::log::HarcLogContext log_ctx;
+    std::vector<std::function<void()>> _checkers;
+    std::vector<std::function<void()>> _post_eval_services;
+    std::vector<std::function<void()>> _auto_cov_reports;
+    // M3: Per-test RNG and scheduler state — previously file-scope
+    // `harc_rng` and per-`run_<Test>` locals. Now owned by the
+    // context so two sequential runs in one process remain isolated
+    // and shared code never captures a `run_<Test>` stack frame.
+    harc_rt::random::HarcRng rng;
+    harc_rt::ThreadScheduler scheduler;
+    // Clock scheduler state — empty for single-clock tests, populated
+    // for multi-clock tests. Kept on the context so `tick()` can be
+    // a context method.
+    struct ClockState { const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; };
+    std::vector<ClockState> _clocks;
+    long long _now_ps = 0;
+
+    // Lifecycle seam — shared code calls these, shards provide only
+    // test-owned bodies.
+    void start(const char* test_name, int argc, char** argv);
+    void tick();
+    void eval_clocks_until(long long t_ps);
+    int finish();
+    void _trace_dump_next(const char* clock, uint64_t cycle);
+    void _trace_dump_at(uint64_t t, const char* clock, uint64_t cycle);
+    void _log_wave_file();
+};
+
+"#,
+    );
+}
+
+/// M3: Out-of-line definitions for the deepened `HarcTestContext` seam.
+/// Emitted once into the common source, not into every shard.
+pub(super) fn context_methods(out: &mut String, dut_type: &str) {
+    writeln!(out, "void HarcTestContext::start(const char* test_name, int argc, char** argv) {{").ok();
+    writeln!(out, "{INDENT}Verilated::commandArgs(argc, argv);").ok();
+    writeln!(out, "{INDENT}dut = new V{dut_type};", dut_type = dut_type).ok();
+    writeln!(out, "#if HARC_TRACE_ENABLED").ok();
+    writeln!(out, "{INDENT}Verilated::traceEverOn(true);").ok();
+    writeln!(out, "{INDENT}tfp = new HarcTraceC;").ok();
+    writeln!(
+        out,
+        "{INDENT}_wave_path = harc_rt::log::harc_open_wave_trace(dut, tfp, harc_rt::log::harc_wave_default_name());"
+    )
+    .ok();
+    writeln!(out, "#endif").ok();
+    writeln!(out, "{INDENT}rng.seed_from_env();").ok();
+    writeln!(
+        out,
+        "{INDENT}harc_rt::trace::harc_start_trace(trace, rng.state, \"{dut_type}\", test_name, cycle_count);",
+        dut_type = dut_type
+    )
+    .ok();
+    writeln!(out, "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "void HarcTestContext::_trace_dump_next(const char* clock, uint64_t cycle) {{").ok();
+    writeln!(out, "{INDENT}uint64_t t = _trace_time++;").ok();
+    writeln!(out, "{INDENT}trace.set_timing(t, clock, cycle);").ok();
+    writeln!(out, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "void HarcTestContext::_trace_dump_at(uint64_t t, const char* clock, uint64_t cycle) {{").ok();
+    writeln!(out, "{INDENT}trace.set_timing(t, clock, cycle);").ok();
+    writeln!(out, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(tfp, t);").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "void HarcTestContext::_log_wave_file() {{").ok();
+    writeln!(out, "{INDENT}HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "void HarcTestContext::eval_clocks_until(long long t_ps) {{").ok();
+    writeln!(out, "{INDENT}while (_now_ps < t_ps) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}long long next = t_ps;").ok();
+    writeln!(out, "{INDENT}{INDENT}for (auto& c : _clocks) if (c.next_edge_ps < next) next = c.next_edge_ps;").ok();
+    writeln!(out, "{INDENT}{INDENT}_now_ps = next;").ok();
+    writeln!(out, "{INDENT}{INDENT}bool _primary_rising = false;").ok();
+    writeln!(out, "{INDENT}{INDENT}const char* _last_edge_clock = \"\";").ok();
+    writeln!(out, "{INDENT}{INDENT}uint64_t _last_edge_cycle = 0;").ok();
+    writeln!(out, "{INDENT}{INDENT}for (size_t i = 0; i < _clocks.size(); i++) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}auto& c = _clocks[i];").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}if (c.next_edge_ps == _now_ps) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}c.level = !c.level;").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}if (dut) dut->eval(); // updated via clock writes").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}c.next_edge_ps += c.half_period_ps;").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}if (c.level == 1) c.rising_count++;").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_clock = c.name;").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}_last_edge_cycle = (uint64_t)c.rising_count;").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}if (i == 0 && c.level == 1) {{ cycle_count++; _primary_rising = true; }}").ok();
+    writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
+    writeln!(out, "{INDENT}{INDENT}}}").ok();
+    writeln!(out, "{INDENT}{INDENT}if (dut) dut->eval();").ok();
+    writeln!(out, "{INDENT}{INDENT}trace.set_timing((uint64_t)_now_ps, _last_edge_clock, _last_edge_cycle);").ok();
+    writeln!(out, "{INDENT}{INDENT}if (_primary_rising) {{ for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty() && dut) dut->eval(); }}").ok();
+    writeln!(out, "{INDENT}{INDENT}_trace_dump_at((uint64_t)_now_ps, _last_edge_clock, _last_edge_cycle);").ok();
+    writeln!(out, "{INDENT}}}").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "void HarcTestContext::tick() {{").ok();
+    writeln!(out, "{INDENT}if (_clocks.empty()) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}_harc_eval_negedge(dut);").ok();
+    writeln!(out, "{INDENT}{INDENT}_trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+    writeln!(out, "{INDENT}{INDENT}_harc_eval_posedge(dut);").ok();
+    writeln!(out, "{INDENT}{INDENT}_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));").ok();
+    writeln!(out, "{INDENT}{INDENT}cycle_count++;").ok();
+    writeln!(out, "{INDENT}{INDENT}for (auto& _svc : _post_eval_services) _svc();").ok();
+    writeln!(out, "{INDENT}{INDENT}if (!_post_eval_services.empty() && dut) dut->eval();").ok();
+    writeln!(out, "{INDENT}{INDENT}if (!_post_eval_services.empty()) _trace_dump_next(\"clk\", (uint64_t)cycle_count);").ok();
+    writeln!(out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+    writeln!(out, "{INDENT}}} else {{").ok();
+    writeln!(out, "{INDENT}{INDENT}long long target = _now_ps + _clocks[0].half_period_ps * 2;").ok();
+    writeln!(out, "{INDENT}{INDENT}eval_clocks_until(target);").ok();
+    writeln!(out, "{INDENT}{INDENT}for (auto& _c : _checkers) _c();").ok();
+    writeln!(out, "{INDENT}}}").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+
+    writeln!(out, "int HarcTestContext::finish() {{").ok();
+    writeln!(out, "{INDENT}for (auto& _r : _auto_cov_reports) _r();").ok();
+    writeln!(out, "{INDENT}if (dut) dut->final();").ok();
+    writeln!(out, "{INDENT}HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());").ok();
+    writeln!(out, "{INDENT}HARC_RT_CLOSE_WAVE_TRACE(tfp);").ok();
+    writeln!(out, "{INDENT}if (dut) delete dut;").ok();
+    writeln!(out, "{INDENT}return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+}
+
 /// `run_<Test>` prologue: context construction, alias refs, wave trace
 /// setup, RNG seed, trace writer and dump lambdas.
 pub(super) fn run_prologue(out: &mut String, test_name: &str, dut_type: &str, cosim: bool) {
