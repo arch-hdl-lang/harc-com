@@ -77,9 +77,12 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Scalar-element dynamic `list<T>` fields in transaction/struct records,
   including unconstrained draws and bounded `len()`/`sum(...)` constraint
   solving through the shared randomize runtime. Ordinary body-position list
-  indexing and queries remain a separate slice. List field `range`, `dist`,
+  indexing remains a separate slice. List field `range`, `dist`,
   and `unique` modifiers are rejected as silent v1 mis-lowerings until the
   element-wise modifier semantics are modeled.
+- [x] Read-only `.len()`, `.size()`, and `.empty()` queries on dynamic record
+  lists across record locals, component record state, and bound-target
+  transactor record state, including indexed fixed-vector record paths.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -88,8 +91,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 128 remaining constructor call sites (129 textual matches including
-the `unsupported` helper definition) as an inventory, not 129 separate tasks.
+Treat the 127 remaining constructor call sites (128 textual matches including
+the `unsupported` helper definition) as an inventory, not 128 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -160,7 +163,11 @@ Subsequent mainline batches reduce that inventory to 131 textual matches. The
 component built-in predicate batch removes the two remaining method-routing
 rejections (path and component-typed parameter receivers), leaving 129 textual
 matches (128 constructors plus the helper). Its existing agent fixture now
-trace-checks inferred-let, assignment, and discarded-value predicate uses.
+trace-checks inferred-let, assignment, and discarded-value predicate uses. The
+dynamic record-list query batch then removes its consolidated boundary
+constructor, leaving 128 textual matches (127 constructors plus the helper),
+and extends the existing record-list runtime-equivalence fixture with all three
+query spellings.
 
 ## Review-derived semantic gates
 
@@ -224,9 +231,9 @@ not applicable before requesting review:
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
-   diagnostic-call and component-predicate slices reduce the count
-   from 174 to 129 textual matches (128 constructors plus the helper
-   definition). The
+   diagnostic-call, component-predicate, and dynamic record-list query slices
+   reduce the count from 174 to 128 textual matches (127 constructors plus the
+   helper definition). The
    scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths
    were also reclassified because v1 rejects or silently mis-lowers them.

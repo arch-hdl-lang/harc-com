@@ -136,13 +136,6 @@ pub(crate) struct IndexedComponentRecordChain {
     pub leaf_ty: IrType,
 }
 
-pub(crate) fn dynamic_record_list_query(path: &str) -> LowerError {
-    unsupported(
-        &format!("a query on dynamic record list `{path}`"),
-        "this batch models list declaration and randomization constraints; use --codegen v1 for .len(), .size(), or .empty() in an ordinary body",
-    )
-}
-
 pub(crate) fn dynamic_record_list_value(path: &str) -> LowerError {
     not_implemented(
         &format!("a dynamic record list `{path}` used as an ordinary scalar value"),
@@ -1459,29 +1452,69 @@ impl FuncBuilder<'_> {
                         if let Some(kind) = width_cast_kind(&name.name) {
                             return self.lower_width_method(kind, &name.name, target, args);
                         }
-                        // Keep the declaration/randomization-only record-list
-                        // boundary precise for method-shaped queries too.
-                        // Direct `r.items` and `r.items[i]` already route
-                        // through `try_record_field_chain`; without this
-                        // probe `r.items.len()` fell through to the unrelated
-                        // generic transactor/method diagnostic.
+                        // Read-only queries on a dynamic record-list field.
+                        // Resolve the whole-list receiver directly rather
+                        // than passing it through ordinary expression
+                        // lowering, where a bare list is intentionally not a
+                        // scalar value.
                         if args.is_empty() && matches!(name.name.as_str(), "len" | "size" | "empty")
                         {
+                            let query = if name.name == "empty" {
+                                crate::ir::DynamicListQuery::Empty
+                            } else {
+                                crate::ir::DynamicListQuery::Size
+                            };
                             if let Some(chain) = self.try_record_field_chain(target)? {
                                 if matches!(chain.leaf_ty, IrType::Seq(_)) {
-                                    return Err(dynamic_record_list_query(&chain.spelled));
+                                    return Ok(Expr::DynamicListQuery {
+                                        target: Box::new(Expr::RecordField {
+                                            local: chain.local,
+                                            field: chain.field,
+                                            path: chain.path,
+                                            mid_indices: chain.mid_indices,
+                                            index: None,
+                                        }),
+                                        query,
+                                    });
+                                }
+                            }
+                            if let Some(chain) = self.as_indexed_component_record_field(target)? {
+                                if matches!(chain.leaf_ty, IrType::Seq(_)) {
+                                    return Ok(Expr::DynamicListQuery {
+                                        target: Box::new(Expr::ComponentVecElement {
+                                            base: chain.base,
+                                            field: chain.field,
+                                            index_pos: chain.index_pos,
+                                            index: Box::new(chain.index),
+                                            inner_index: None,
+                                        }),
+                                        query,
+                                    });
                                 }
                             }
                             if let Some(rf) = self.as_component_record_field(target)? {
                                 if matches!(rf.leaf_ty, IrType::Seq(_)) {
-                                    return Err(dynamic_record_list_query(&rf.dotted));
+                                    return Ok(Expr::DynamicListQuery {
+                                        target: Box::new(Expr::ComponentField {
+                                            base: rf.base,
+                                            field: rf.field,
+                                        }),
+                                        query,
+                                    });
                                 }
                             }
                             if let Some(chain) = self.as_transactor_state_record_field(target)? {
                                 if matches!(chain.leaf_ty, IrType::Seq(_)) {
-                                    let dotted =
-                                        format!("{}.{}", chain.field, chain.path.join("."));
-                                    return Err(dynamic_record_list_query(&dotted));
+                                    return Ok(Expr::DynamicListQuery {
+                                        target: Box::new(Expr::TransactorStateRecordField {
+                                            instance: chain.instance,
+                                            field: chain.field,
+                                            path: chain.path,
+                                            mid_indices: chain.mid_indices,
+                                            index: chain.leaf_index.map(Box::new),
+                                        }),
+                                        query,
+                                    });
                                 }
                             }
                         }
@@ -2656,6 +2689,14 @@ impl FuncBuilder<'_> {
                 Expr::Local(t)
             }
             Expr::TbQueueQuery { field, query } => Expr::TbQueueQuery { field, query },
+            Expr::DynamicListQuery { target, query } => Expr::DynamicListQuery {
+                target: Box::new(self.hoist_ports_with_hint(
+                    *target,
+                    None,
+                    exact_untyped_ports,
+                )),
+                query,
+            },
             Expr::Binary(op, a, b) => {
                 let a_hint = if matches!(op, BinOp::Eq | BinOp::Ne) {
                     self.expr_type(&b)
@@ -2928,6 +2969,14 @@ impl FuncBuilder<'_> {
                 _,
             ) => Some(ret.clone()),
             Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
+            Expr::DynamicListQuery {
+                query: crate::ir::DynamicListQuery::Size,
+                ..
+            } => Some(IrType::UInt(None)),
+            Expr::DynamicListQuery {
+                query: crate::ir::DynamicListQuery::Empty,
+                ..
+            } => Some(IrType::Bool),
             Expr::TbField(field) => self.ctx.tb_scalar_fields.get(field).cloned(),
             Expr::ComponentField { base, field } => self.component_field_value_type(base, field),
             Expr::TransactorState { instance, field } => {
@@ -3275,6 +3324,10 @@ impl FuncBuilder<'_> {
     /// inline (lazy assert eval) so there is no port/tick reordering.
     pub(crate) fn hoist_transactor_calls(&mut self, e: Expr) -> Expr {
         match e {
+            Expr::DynamicListQuery { target, query } => Expr::DynamicListQuery {
+                target: Box::new(self.hoist_transactor_calls(*target)),
+                query,
+            },
             Expr::Binary(op, a, b) => {
                 let a = self.hoist_transactor_calls(*a);
                 let b = self.hoist_transactor_calls(*b);

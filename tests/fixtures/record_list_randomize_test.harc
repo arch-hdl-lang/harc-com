@@ -16,6 +16,9 @@ test RecordListRandomizeTest
     clock clk = D
     run
         randomize(packet)
+        assert packet.items.len() == 3
+        assert packet.items.size() == 3
+        assert !packet.items.empty()
         wait 1 cycle
     end run
 end test RecordListRandomizeTest

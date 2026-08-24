@@ -1914,6 +1914,7 @@ fn expr_uses_snapshot_lane(expr: &Expr, snapshot: LocalId) -> bool {
         Expr::Unary(_, inner)
         | Expr::BitSlice { target: inner, .. }
         | Expr::WidthCast { inner, .. }
+        | Expr::DynamicListQuery { target: inner, .. }
         | Expr::ComponentIdle { n: inner, .. }
         | Expr::TransactorIdle { n: inner, .. } => expr_uses_snapshot_lane(inner, snapshot),
         Expr::Ternary(cond, then_expr, else_expr) => {

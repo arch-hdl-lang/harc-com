@@ -1286,6 +1286,13 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 sb_query_str(query)
             )
         }
+        Expr::DynamicListQuery { target, query } => {
+            let method = match query {
+                crate::ir::DynamicListQuery::Size => "size",
+                crate::ir::DynamicListQuery::Empty => "empty",
+            };
+            format!("{}.{}()", expr_str(func, target), method)
+        }
         Expr::ComponentIdle {
             base,
             subpath,
