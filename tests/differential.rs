@@ -1813,3 +1813,52 @@ end impl T
     );
     eprintln!("{table}");
 }
+
+/// A no-payload `on <event>()` handler compiles under both backends, held
+/// to v1 by the differential harness — on the two component hosts that
+/// take an unannotated instance field (agent / env). v1 synthesizes a
+/// throwaway parameter; tbir emits the same subscriber-list shape.
+#[test]
+fn a_no_arg_event_handler_compiles_like_v1() {
+    let Some(cc) = cxx() else {
+        eprintln!("no C++ compiler on PATH — skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join("harc-diff-noarg-handler");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    for kind in ["agent", "env"] {
+        let src = format!(
+            r#"{kind} Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    on in_ev()
+        seen = seen + 1
+    end on
+end {kind} Tagger
+testbench Tb
+    dut : Top
+    tagger : Tagger
+end testbench Tb
+impl T for Tb
+    run
+        emit tagger.in_ev(1)
+        wait 1 cycle
+    end run
+end impl T"#
+        );
+        assert!(
+            matches!(
+                v1_behaviour(cc, &src, &dir, &format!("{kind}-v1")),
+                V1Behaviour::Compiles
+            ),
+            "[{kind}] v1 must compile the no-arg handler"
+        );
+        assert!(
+            matches!(
+                tb_verdict(cc, &src, &dir, &format!("{kind}-tb")),
+                TbVerdict::Lowers
+            ),
+            "[{kind}] tbir must lower and compile the no-arg handler"
+        );
+    }
+}

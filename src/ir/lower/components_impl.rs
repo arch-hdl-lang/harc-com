@@ -1337,12 +1337,14 @@ fn validate_event_handler(
             V1Status::SilentlyMisLowers,
         ));
     }
-    if args.is_empty() {
-        return Err(unsupported(
-            &format!("an `on {event}()` handler with no payload argument on `{comp}`"),
-            "event handlers bind the payload to exactly one name; v1 synthesizes one",
-        ));
-    }
+    // A no-payload `on <event>()` handler is lowered, matching v1: the
+    // subscriber list and lambda signature are the SAME as the one-arg
+    // form (the parameter type is the event's declared payload), only the
+    // binding name is synthesized — `on_handler_arg_name` falls back to
+    // `_v`, and the body simply never references it, exactly as v1's
+    // throwaway parameter is. Measured `v1=compiles` uniformly on
+    // agent / env / transactor hosts; a scoreboard event field is refused
+    // earlier, so there is no further landing.
     Ok(())
 }
 
@@ -1647,9 +1649,17 @@ fn lower_field(
             if declared_records.contains(simple) {
                 let record = record_ids[simple];
                 if f.default.is_some() {
-                    return Err(unsupported(
+                    // Not a `--codegen v1` escape: v1 emits `<Record> r = 0;`
+                    // (the default literal into a record-typed member), and
+                    // g++ refuses — "could not convert '0' from 'int' to
+                    // '<Record>'" (measured on both transactor and env
+                    // hosts). Drop the `default`; a record field
+                    // default-constructs from its own field initializers.
+                    return Err(not_implemented(
                         &format!("a default value on record field `{comp}.{fname}`"),
-                        "record fields use their type-derived default initialization",
+                        "record fields use their type-derived default initialization; drop the \
+                         `default`",
+                        V1Status::EmitsUncompilable,
                     ));
                 }
                 return Ok(ComponentFieldKind::Record { record });
@@ -2173,7 +2183,6 @@ fn lower_on_handler_body(
     // param type mirrors the subscribed event's payload: a scalar
     // (signed per the schema) or a value-record (so `t.field` reads in
     // the body resolve against the record schema).
-    let arg_name = on_handler_arg_name(h);
     let ty = match oh.arg_payload {
         // `scalar_ir_type()`, which keeps the DECLARED width. This
         // pair open-coded the conversion with `None`, which is what
@@ -2185,9 +2194,21 @@ fn lower_on_handler_body(
             .expect("a scalar payload types"),
         EventPayload::Record(rid) => IrType::Record(rid),
     };
-    let local = b.declare(&arg_name);
+    // The payload binding. `on <event>(<arg>)` binds the source name as a
+    // resolvable local so the body reads it. A no-payload `on <event>()`
+    // instead gets a fresh TEMP for the param slot: v1 synthesizes a
+    // throwaway parameter that its body can never name (field reads are
+    // qualified, so the param cannot shadow one), and `fresh_temp` — unlike
+    // `declare` — pushes the local WITHOUT entering it in the name scope,
+    // so a bare identifier in the body (even one matching a field named
+    // `_v`) resolves to the field, not the payload. Matching v1 exactly.
+    let has_source_arg = matches!(&*h.event.kind, ExprKind::Call { args, .. } if !args.is_empty());
+    let local = if has_source_arg {
+        b.declare(&on_handler_arg_name(h))
+    } else {
+        b.fresh_temp()
+    };
     b.set_local_type(local, ty.clone());
-    let params = vec![TypedParam { name: arg_name, ty }];
     b.lower_block_stmts(&h.body)?;
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -2198,7 +2219,10 @@ fn lower_on_handler_body(
         FunctionKind::ComponentMethod { component: cid },
         None,
     )?;
-    f.params = params;
+    // The emitted signature takes the param name from the local, so build
+    // `params` from the local's final (possibly de-duplicated) name.
+    let name = f.locals[local.index()].name.clone();
+    f.params = vec![TypedParam { name, ty }];
     Ok(f)
 }
 
