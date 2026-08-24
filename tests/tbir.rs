@@ -2139,7 +2139,10 @@ fn scoreboard_scalar_schema_and_write_width_are_verified() {
     for bad_ty in [
         ir::IrType::UInt(Some(0)),
         ir::IrType::UInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
-        ir::IrType::SInt(Some(65)),
+        // Signed now shares the unsigned ceiling (harc#657): `sint<65>`
+        // is a valid field, so the invalid signed case is one past the
+        // ceiling, same as the unsigned row above it.
+        ir::IrType::SInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
         ir::IrType::Record(ir::RecordId(0)),
     ] {
         let mut broken = prog.clone();
@@ -13085,36 +13088,34 @@ end impl T"#
     // scalar field is lowered to the language's stated vector target,
     // and BOTH backends emit the same wide member.
     //
-    // `sint<128>` is NOT here, and that is `main`'s call, adopted at
-    // the merge: past 64 bits a scalar lives in `_harc_u128` or
-    // `HarcWide<N>`, both unsigned, so `<` and `/` on one answer by
-    // magnitude in either backend. This branch had widened signed
-    // fields too, without that.
-    for (ty, shape) in [
-        ("uint<128>", "_harc_u128 l"),
-        ("uint<1024>", "harc_rt::HarcWide<32> l"),
+    // `sint<128>` lowers now too (harc#657): the emitter routes signed
+    // wide operators through the two's-complement helpers, so signed
+    // and unsigned share the wide member shape and the width ceiling.
+    // v1 still cannot BUILD signed wide (it has no signed comparison on
+    // the carrier), which is why the signed rows check only the tbir
+    // member, not v1 parity.
+    for (ty, shape, both) in [
+        ("uint<128>", "_harc_u128 l", true),
+        ("uint<1024>", "harc_rt::HarcWide<32> l", true),
+        ("sint<128>", "_harc_u128 l", false),
+        ("sint<1024>", "harc_rt::HarcWide<32> l", false),
     ] {
         let src = prog(&format!("scoreboard Sb\n    l : {ty}\nend scoreboard Sb"));
-        lower_src(&src).expect("a wide unsigned scoreboard field lowers");
+        lower_src(&src).expect("a wide scoreboard field lowers");
         let cpp = emit_cpp_src(&src);
         assert!(
             cpp.contains(shape),
             "`{ty}`: tbir must emit `{shape}`, got:\n{cpp}"
         );
-        assert!(
-            cpp_tb::emit(&merged_src(&src))
-                .expect("v1 emits")
-                .contains(shape),
-            "`{ty}`: v1 emits `{shape}` too — the two agree on the member"
-        );
+        if both {
+            assert!(
+                cpp_tb::emit(&merged_src(&src))
+                    .expect("v1 emits")
+                    .contains(shape),
+                "`{ty}`: v1 emits `{shape}` too — the two agree on the member"
+            );
+        }
     }
-    // The signed cap, and the reason for it.
-    let signed = prog("scoreboard Sb\n    l : sint<128>\nend scoreboard Sb");
-    assert!(
-        lower_src(&signed).is_err(),
-        "a signed field past 64 bits must stay refused while the wide \
-         carrier has no signed comparison"
-    );
 
     // A record-typed field now uses persistent by-value record storage,
     // matching the component and transactor-state seams.
@@ -38264,24 +38265,18 @@ end impl T"#
     );
 }
 
-/// A signed scalar STATE field wider than 64 bits is refused WITHOUT
-/// offering `--codegen v1` as a way out — the point of #657's precondition.
+/// A signed scalar STATE field wider than 64 bits now LOWERS and
+/// verifies (harc#657 PR-B), on both owners.
 ///
-/// The generic subset rejection uses `unsupported`, which appends
-/// "re-run with `--codegen v1`". For a signed wide field that is a false
-/// promise: v1 stores the same unsigned `HarcWide<N>`/`_harc_u128`
-/// carrier and either fails to compile the comparison or answers by
-/// magnitude (measured — `sint<129>` `a < b` with `a = -8, b = 2` says
-/// `-8 >= 2` under `--codegen v1`). So the grade must be
-/// `SilentlyMisLowers`, and `assert_not_implemented` checks the message
-/// does not send the user to v1.
-///
-/// Both owners: a data-only scoreboard field and a method-bearing
-/// component field reach the refusal through different call sites
-/// (`scoreboards.rs` and `components_impl.rs`), and both must give the
-/// same verdict — one language, one rule.
+/// harc#673 had refused it with an honest `NotImplemented` diagnostic
+/// while the operators underneath were still unsigned-by-magnitude; PR-A
+/// routed those operators through the two's-complement helpers, so the
+/// field cap comes down here. Both owners — a data-only scoreboard field
+/// and a method-bearing component field — reach the schema through
+/// different call sites (`scoreboards.rs` and `components_impl.rs`) and
+/// must agree.
 #[test]
-fn a_signed_wide_state_field_is_refused_without_a_false_v1_promise() {
+fn a_signed_wide_state_field_lowers_now_that_its_operators_are_signed() {
     let scoreboard = r#"scoreboard SignedSb
     v : sint<129> default 0
 end scoreboard SignedSb
@@ -38317,26 +38312,38 @@ impl CTest for CTb
 end impl CTest
 "#;
     for (owner, src) in [("scoreboard", scoreboard), ("component", component)] {
-        let err = lower_src(src).unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(
-            msg.contains("signed scalar wider than 64 bits") && msg.contains("by magnitude"),
-            "{owner}: the reason must name the signed-carrier problem, got: {msg}"
-        );
+        // The deliverable: it lowers AND verifies. Before PR-B the
+        // lowering gate (both owners) and the verifier (the data-only
+        // scoreboard path) capped signed at 64, so one or the other
+        // refused a `sint<129>` field — the second as an internal error
+        // for source lowering had accepted.
+        let prog = lower_src(src)
+            .unwrap_or_else(|e| panic!("{owner}: a signed wide field must lower now: {e:?}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("{owner}: a signed wide field must verify: {e:?}"));
     }
 
-    // The neighbours the arm must NOT have started refusing: a signed
-    // field AT the 64-bit boundary, and an UNSIGNED wide field.
-    for ok_src in [
-        "scoreboard Ok1\n    v : sint<64> default 0\nend scoreboard Ok1\n\n\
-         testbench T1\n    dut : Top\n    sb : Ok1\nend testbench T1\n\n\
-         impl I1 for T1\n    run\n        wait 1 cycle\n    end run\nend impl I1\n",
-        "scoreboard Ok2\n    v : uint<129> default 0\nend scoreboard Ok2\n\n\
-         testbench T2\n    dut : Top\n    sb : Ok2\nend testbench T2\n\n\
-         impl I2 for T2\n    run\n        wait 1 cycle\n    end run\nend impl I2\n",
-    ] {
-        lower_src(ok_src).expect("a signed <=64 or unsigned wide field must still lower");
-    }
+    // Width boundaries still hold: `sint` past the 1024-bit ceiling is
+    // still refused, same as unsigned.
+    let too_wide = "scoreboard Ov
+    v : sint<1025> default 0
+end scoreboard Ov
+
+         testbench T
+    dut : Top
+    sb : Ov
+end testbench T
+
+         impl I for T
+    run
+        wait 1 cycle
+    end run
+end impl I
+";
+    assert!(
+        lower_src(too_wide).is_err(),
+        "a signed field past the 1024-bit ceiling must still be refused"
+    );
 }
 
 /// A no-payload `on <event>()` handler lowers exactly as the one-argument

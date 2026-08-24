@@ -19,7 +19,7 @@ pub(crate) use implementation::{
     event_payloads_agree_in_shape, field_scalar_width_ok, fixed_vec_elem_ir_type,
     fold_field_default, is_event_field, lower_component_bodies, lower_component_schema,
     lower_event_payload, lower_queue_elem, resolve_connects, resolve_testbench_connects,
-    scalar_field_ir_type, scoreboard_is_component, signed_wide_field_gap,
+    scalar_field_ir_type, scoreboard_is_component,
     transactor_has_mode_sensitive_analysis_surface, transactor_has_target_threads,
     transactor_is_analysis_source, transactor_is_component, transactor_is_dut_poking_bfm,
     transactor_is_event_driven, transactor_is_function_library, transactor_is_passive_helper,

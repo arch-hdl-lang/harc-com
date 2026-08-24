@@ -2162,10 +2162,13 @@ scoreboard, or on any method-bearing component (agent, env, sequencer,
 analysis component, component-shaped transactor), keeps its declared width and
 signedness independently of the C++ carrier it is stored in — `uint64_t` /
 `int64_t` through 64 bits, `_harc_u128` from 65 through 128, and
-`harc_rt::HarcWide<ceil(N/32)>` above that. Unsigned fields reach the
-language's 1024-bit vector target; **signed fields stop at 64 bits**, because
-both wide carriers are unsigned and `<`, `/`, `%` and `>>` on one would answer
-by magnitude rather than by the declared sign bit.
+`harc_rt::HarcWide<ceil(N/32)>` above that. Both signed and unsigned fields
+reach the language's 1024-bit vector target. The wide carriers are physically
+unsigned, but the compiler routes `<`, `<=`, `>`, `>=`, `/`, `%` and `>>` on a
+signed value through two's-complement operations keyed on the declared width,
+so the result follows the declared sign bit rather than the carrier's
+magnitude. (`==` / `!=` compare the low `N` bits, ignoring any padding above
+the declared width.)
 
 Writing such a field follows the same directional rule a typed `let` follows:
 the value's width must not exceed the field's, and its signedness must match.

@@ -1,0 +1,50 @@
+// Signed scalar STATE fields wider than 64 bits (harc#657 PR-B).
+//
+// The field cap that stopped signed state at 64 bits comes down now that
+// the operators underneath answer by the declared sign bit. Exercised on
+// both owners: a method-bearing component (`hookable`) and a data-only
+// scoreboard field written from the test scope.
+
+scoreboard SignedReg
+    value : sint<129> default 0
+
+    hookable store(next: sint<129>)
+        value = next
+    end store
+
+    function read() -> sint<129>
+        return value
+    end function read
+end scoreboard SignedReg
+
+scoreboard SignedData
+    v : sint<200> default 0
+end scoreboard SignedData
+
+testbench SignedFieldTb
+    dut  : Top
+    holder  : SignedReg
+    data : SignedData
+end testbench SignedFieldTb
+
+impl SignedWideFieldTest for SignedFieldTb
+    run
+        // method-bearing component field
+        let neg129 : sint<129> = 0 - 100
+        holder.store(neg129)
+        wait 1 cycle
+        let got : sint<129> = holder.read()
+        assert got < 0 else fail("component signed wide field lost its sign")
+        let back : sint<129> = 0 - got
+        assert back > 0 else fail("component signed wide field magnitude wrong")
+
+        // data-only scoreboard field
+        let neg200 : sint<200> = 0 - 7
+        data.v = neg200
+        wait 1 cycle
+        assert data.v < 0 else fail("scoreboard signed wide field lost its sign")
+        let dv : sint<200> = data.v
+        assert dv == neg200 else fail("scoreboard signed wide field roundtrip")
+        wait 1 cycle
+    end run
+end impl SignedWideFieldTest
