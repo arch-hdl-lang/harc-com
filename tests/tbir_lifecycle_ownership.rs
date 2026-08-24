@@ -232,3 +232,51 @@ fn field_shadowing_testbench_falls_back() {
         "a field-shadowed testbench must fall back to inlining — no TbLifecycleCall"
     );
 }
+
+#[test]
+fn concurrent_assertion_in_check_falls_back() {
+    // The bound testbench's `check` phase contains a temporal assertion
+    // (`assert dut.en |-> dut.en`). Lowering routes it through the
+    // concurrent-property path (a per-test PropertyCheckId), so the scan —
+    // using the authoritative `is_concurrent_assertion` predicate, NOT a
+    // syntactic named/property_kw shortcut — must classify it UNSAFE and
+    // fall back. This is the case the earlier soundness bug shared.
+    let merged = merged_fixture("tb_lifecycle_concurrent_assert_test.harc");
+    let prog = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        prog
+    });
+    assert_eq!(
+        lifecycle_fn_count(&prog),
+        0,
+        "a testbench with a concurrent/temporal assertion in a phase must NOT be shared"
+    );
+    assert!(
+        !any_lifecycle_call(&prog),
+        "a concurrent-assertion phase must fall back to inlining — no TbLifecycleCall"
+    );
+}
+
+#[test]
+fn method_name_shadowing_testbench_falls_back() {
+    // One binding test declares `let prep` colliding with the `prep`
+    // testbench METHOD name. `rewrite_expr_for_impl` suppresses bare
+    // method-call rewriting through the same flat shadow set as fields, so
+    // a method-name collision must force fallback too.
+    let merged = merged_fixture("tb_lifecycle_method_shadow_test.harc");
+    let prog = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        prog
+    });
+    assert_eq!(
+        lifecycle_fn_count(&prog),
+        0,
+        "a method-name-shadowed testbench must NOT create a TestbenchLifecycle function"
+    );
+    assert!(
+        !any_lifecycle_call(&prog),
+        "a method-name-shadowed testbench must fall back to inlining — no TbLifecycleCall"
+    );
+}

@@ -23817,8 +23817,9 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
 /// the `_tb.<field>` rewrite the desugar applies — the exact shape the
 /// historical per-test inlining would have produced — so TB-IR lowering
 /// can lower it ONCE into a `TestbenchLifecycle` function whose re-emitted
-/// output is byte-identical. First test to bind a given testbench wins
-/// (later binds produce an identical rewrite for the corpus). See #619 M4a.
+/// output is trace-identical (same field references and statement order;
+/// local names differ). First test to bind a given testbench wins (later
+/// binds produce an identical rewrite for the corpus). See #619 M4a.
 pub(crate) type SharedLifecycleBodies =
     std::collections::HashMap<(String, LifecyclePhase), Block>;
 
@@ -23915,280 +23916,342 @@ fn tb_lifecycle_marker_block(phase: LifecyclePhase, span: Span) -> Block {
 // sharing optimization and falls back to the always-correct inlining.
 // ---------------------------------------------------------------------------
 
-/// True if `kind` is DIRECTLY a share-unsafe statement (not recursing).
-fn stmt_directly_share_unsafe(kind: &StmtKind) -> bool {
-    match kind {
-        // A randomize site mints a per-test constraint problem.
-        StmtKind::Randomize { .. } => true,
-        // Any `cover` (named or anonymous) mints a per-test CoverCheckId.
-        StmtKind::Cover(_) => true,
-        // A CONCURRENT property check (`assert name` / `assert property`)
-        // mints a per-test PropertyCheckId. An immediate `assert <expr>` /
-        // `assume <expr>` is safe (proven by the shared-check fixture).
-        StmtKind::Assert(v) | StmtKind::Assume(v) => v.named.is_some() || v.property_kw,
-        _ => false,
-    }
+/// Recursive scanner for share-unsafe constructs. Carries the file's
+/// declared-`property` set so it can apply the AUTHORITATIVE
+/// concurrent-assertion predicate (`is_concurrent_assertion`) that lowering
+/// itself uses — a purely syntactic `named`/`property_kw` shortcut misses
+/// temporal-operator asserts (`|->`, `$rose`, `##N`, …) and bare-ident
+/// property references, which mint per-test `PropertyCheckId`s.
+///
+/// The statement/expression traversals mirror the exhaustive matches of
+/// `rewrite_stmt_for_impl` / `rewrite_expr_for_impl`, so a new AST variant
+/// forces this to be revisited (arms are compiler-checked for
+/// exhaustiveness).
+struct ShareScan<'a> {
+    properties: &'a std::collections::HashMap<String, Expr>,
+    found: bool,
 }
 
-/// Recursively scan a block for any share-unsafe construct, setting
-/// `found`. Mirrors the exhaustive traversal of `rewrite_stmt_for_impl` /
-/// `rewrite_expr_for_impl` so a new AST variant forces this to be revisited
-/// (the match arms are compiler-checked for exhaustiveness).
-fn scan_block_share_unsafe(b: &Block, found: &mut bool) {
-    for s in &b.stmts {
-        if *found {
+impl<'a> ShareScan<'a> {
+    fn new(properties: &'a std::collections::HashMap<String, Expr>) -> Self {
+        ShareScan {
+            properties,
+            found: false,
+        }
+    }
+
+    /// True if `kind` DIRECTLY mints per-test side-table state or a
+    /// per-test-context-dependent body (not recursing).
+    fn stmt_directly_unsafe(&self, kind: &StmtKind) -> bool {
+        match kind {
+            // A randomize site mints a per-test constraint problem.
+            StmtKind::Randomize { .. } => true,
+            // Every `cover` (named or anonymous) mints a per-test
+            // CoverCheckId — `lower_cover` registers unconditionally.
+            StmtKind::Cover(_) => true,
+            // A CONCURRENT assert/assume mints a per-test PropertyCheckId.
+            // Use the SAME predicate lowering uses (`lower_assert` /
+            // `lower_assume` → `is_concurrent_assertion`): a bare ident
+            // naming a declared property OR any temporal operator
+            // (`|->`/`|=>`/`throughout`/`within`/`intersect`/`##`/`[*]`/
+            // `$past`/`$rose`/`$fell`/`$stable`). An immediate boolean
+            // assert/assume is safe.
+            StmtKind::Assert(v) | StmtKind::Assume(v) => v
+                .expr
+                .as_ref()
+                .is_some_and(|e| is_concurrent_assertion(e, self.properties)),
+            // A nested `on ...` handler (a per-register `on regs.REG`
+            // callback, a method hook, or a cycle trigger) is rewritten
+            // against PER-TEST context — regblock bindings, method-hook
+            // param names — so a copy folded into a shared phase would
+            // differ across binding tests. Conservatively unshareable.
+            StmtKind::On(_) => true,
+            _ => false,
+        }
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in &b.stmts {
+            if self.found {
+                return;
+            }
+            self.stmt(s);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        if self.found {
             return;
         }
-        scan_stmt_share_unsafe(s, found);
-    }
-}
-
-fn scan_stmt_share_unsafe(s: &Stmt, found: &mut bool) {
-    if *found {
-        return;
-    }
-    if stmt_directly_share_unsafe(&s.kind) {
-        *found = true;
-        return;
-    }
-    match &s.kind {
-        StmtKind::Let(l) => {
-            if let Some(v) = l.value.as_ref() {
-                scan_expr_share_unsafe(v, found);
-            }
+        if self.stmt_directly_unsafe(&s.kind) {
+            self.found = true;
+            return;
         }
-        StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
-            scan_expr_share_unsafe(target, found);
-            scan_expr_share_unsafe(value, found);
-        }
-        StmtKind::Expr(e) => scan_expr_share_unsafe(e, found),
-        StmtKind::For(f) => {
-            scan_expr_share_unsafe(&f.iter, found);
-            scan_block_share_unsafe(&f.body, found);
-        }
-        StmtKind::Repeat(r) => {
-            scan_expr_share_unsafe(&r.count, found);
-            scan_block_share_unsafe(&r.body, found);
-        }
-        StmtKind::Loop(b) => scan_block_share_unsafe(b, found),
-        StmtKind::While { cond, body, .. } => {
-            scan_expr_share_unsafe(cond, found);
-            scan_block_share_unsafe(body, found);
-        }
-        StmtKind::If(ifs) => {
-            scan_expr_share_unsafe(&ifs.cond, found);
-            scan_block_share_unsafe(&ifs.then_block, found);
-            for (c, b) in ifs.elsifs.iter() {
-                scan_expr_share_unsafe(c, found);
-                scan_block_share_unsafe(b, found);
-            }
-            if let Some(b) = ifs.else_block.as_ref() {
-                scan_block_share_unsafe(b, found);
-            }
-        }
-        StmtKind::Fork(fk) => {
-            for b in fk.branches.iter() {
-                scan_block_share_unsafe(b, found);
-            }
-        }
-        StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
-            for b in blocks.iter() {
-                scan_block_share_unsafe(b, found);
-            }
-        }
-        StmtKind::Select(arms) => {
-            for a in arms.iter() {
-                scan_expr_share_unsafe(&a.event, found);
-                scan_block_share_unsafe(&a.action, found);
-            }
-        }
-        StmtKind::On(h) => {
-            scan_expr_share_unsafe(&h.event, found);
-            scan_block_share_unsafe(&h.body, found);
-        }
-        StmtKind::After { duration, body, .. } => {
-            scan_expr_share_unsafe(duration, found);
-            scan_block_share_unsafe(body, found);
-        }
-        StmtKind::Wait { duration, .. } => scan_expr_share_unsafe(duration, found),
-        StmtKind::WaitUntil {
-            conditions,
-            timeout,
-            ..
-        } => {
-            for c in conditions.iter() {
-                scan_expr_share_unsafe(c, found);
-            }
-            if let Some(t) = timeout.as_ref() {
-                scan_expr_share_unsafe(&t.cycles, found);
-                if let Some(m) = t.message.as_ref() {
-                    scan_expr_share_unsafe(m, found);
+        match &s.kind {
+            StmtKind::Let(l) => {
+                if let Some(v) = l.value.as_ref() {
+                    self.expr(v);
                 }
             }
-        }
-        StmtKind::Yield(e) | StmtKind::Release(e) => scan_expr_share_unsafe(e, found),
-        StmtKind::Return(opt) => {
-            if let Some(e) = opt.as_ref() {
-                scan_expr_share_unsafe(e, found);
+            StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+                self.expr(target);
+                self.expr(value);
             }
-        }
-        // Immediate assert/assume reach here (the concurrent forms were
-        // caught by `stmt_directly_share_unsafe`); scan their operands for a
-        // nested `randomize` expression. `Cover`/`Randomize` never reach
-        // here (already flagged), but are listed for exhaustiveness.
-        StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
-            if let Some(e) = v.expr.as_ref() {
-                scan_expr_share_unsafe(e, found);
+            StmtKind::Expr(e) => self.expr(e),
+            StmtKind::For(f) => {
+                self.expr(&f.iter);
+                self.block(&f.body);
             }
-            if let Some(e) = v.else_fail.as_ref() {
-                scan_expr_share_unsafe(e, found);
+            StmtKind::Repeat(r) => {
+                self.expr(&r.count);
+                self.block(&r.body);
             }
-        }
-        StmtKind::Randomize {
-            target, with_body, ..
-        } => {
-            scan_expr_share_unsafe(target, found);
-            for e in with_body.iter() {
-                scan_expr_share_unsafe(e, found);
+            StmtKind::Loop(b) => self.block(b),
+            StmtKind::While { cond, body, .. } => {
+                self.expr(cond);
+                self.block(body);
             }
-        }
-        StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } | StmtKind::Emit { args, .. } => {
-            for a in args.iter() {
-                scan_arg_share_unsafe(a, found);
+            StmtKind::If(ifs) => {
+                self.expr(&ifs.cond);
+                self.block(&ifs.then_block);
+                for (c, b) in ifs.elsifs.iter() {
+                    self.expr(c);
+                    self.block(b);
+                }
+                if let Some(b) = ifs.else_block.as_ref() {
+                    self.block(b);
+                }
             }
+            StmtKind::Fork(fk) => {
+                for b in fk.branches.iter() {
+                    self.block(b);
+                }
+            }
+            StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+                for b in blocks.iter() {
+                    self.block(b);
+                }
+            }
+            StmtKind::Select(arms) => {
+                for a in arms.iter() {
+                    self.expr(&a.event);
+                    self.block(&a.action);
+                }
+            }
+            // `On` is flagged directly-unsafe above; the arm is kept for
+            // exhaustiveness (its body would be scanned if that changed).
+            StmtKind::On(h) => {
+                self.expr(&h.event);
+                self.block(&h.body);
+            }
+            StmtKind::After { duration, body, .. } => {
+                self.expr(duration);
+                self.block(body);
+            }
+            StmtKind::Wait { duration, .. } => self.expr(duration),
+            StmtKind::WaitUntil {
+                conditions,
+                timeout,
+                ..
+            } => {
+                for c in conditions.iter() {
+                    self.expr(c);
+                }
+                if let Some(t) = timeout.as_ref() {
+                    self.expr(&t.cycles);
+                    if let Some(m) = t.message.as_ref() {
+                        self.expr(m);
+                    }
+                }
+            }
+            StmtKind::Yield(e) | StmtKind::Release(e) => self.expr(e),
+            StmtKind::Return(opt) => {
+                if let Some(e) = opt.as_ref() {
+                    self.expr(e);
+                }
+            }
+            // Immediate assert/assume reach here (the concurrent forms were
+            // caught by `stmt_directly_unsafe`); scan operands for a nested
+            // `randomize` expression. `Cover`/`Randomize` never reach here
+            // (already flagged), but are listed for exhaustiveness.
+            StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+                if let Some(e) = v.expr.as_ref() {
+                    self.expr(e);
+                }
+                if let Some(e) = v.else_fail.as_ref() {
+                    self.expr(e);
+                }
+            }
+            StmtKind::Randomize {
+                target, with_body, ..
+            } => {
+                self.expr(target);
+                for e in with_body.iter() {
+                    self.expr(e);
+                }
+            }
+            StmtKind::Log { args, .. }
+            | StmtKind::LogF { args, .. }
+            | StmtKind::Emit { args, .. } => {
+                for a in args.iter() {
+                    self.arg(a);
+                }
+            }
+            StmtKind::Fail { msg, .. } => self.expr(msg),
+            StmtKind::JoinAll { .. }
+            | StmtKind::Apply(_)
+            | StmtKind::Break { .. }
+            | StmtKind::Continue { .. } => {}
         }
-        StmtKind::Fail { msg, .. } => scan_expr_share_unsafe(msg, found),
-        StmtKind::JoinAll { .. }
-        | StmtKind::Apply(_)
-        | StmtKind::Break { .. }
-        | StmtKind::Continue { .. } => {}
     }
-}
 
-fn scan_arg_share_unsafe(a: &CallArg, found: &mut bool) {
-    match a {
-        CallArg::Expr(e) => scan_expr_share_unsafe(e, found),
-        CallArg::Named { value, .. } => scan_expr_share_unsafe(value, found),
+    fn arg(&mut self, a: &CallArg) {
+        match a {
+            CallArg::Expr(e) => self.expr(e),
+            CallArg::Named { value, .. } => self.expr(value),
+        }
     }
-}
 
-fn scan_expr_share_unsafe(e: &Expr, found: &mut bool) {
-    if *found {
-        return;
-    }
-    match e.kind.as_ref() {
-        // `randomize(t)` in expression position (`let x = randomize(t)`).
-        ExprKind::Randomize { .. } => {
-            *found = true;
+    fn expr(&mut self, e: &Expr) {
+        if self.found {
+            return;
         }
-        ExprKind::Call { callee, args } => {
-            scan_expr_share_unsafe(callee, found);
-            for a in args.iter() {
-                scan_arg_share_unsafe(a, found);
+        match e.kind.as_ref() {
+            // `randomize(t)` in expression position (`let x = randomize(t)`).
+            ExprKind::Randomize { .. } => {
+                self.found = true;
             }
-        }
-        ExprKind::Field { target, .. } => scan_expr_share_unsafe(target, found),
-        ExprKind::Index { target, index } => {
-            scan_expr_share_unsafe(target, found);
-            scan_expr_share_unsafe(index, found);
-        }
-        ExprKind::BitSlice { target, hi, lo } => {
-            scan_expr_share_unsafe(target, found);
-            scan_expr_share_unsafe(hi, found);
-            scan_expr_share_unsafe(lo, found);
-        }
-        ExprKind::Cast { expr, .. } => scan_expr_share_unsafe(expr, found),
-        ExprKind::Send { target, value } => {
-            scan_expr_share_unsafe(target, found);
-            scan_expr_share_unsafe(value, found);
-        }
-        ExprKind::Unary { expr, .. } => scan_expr_share_unsafe(expr, found),
-        ExprKind::ForkCall { call } => scan_expr_share_unsafe(call, found),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            scan_expr_share_unsafe(lhs, found);
-            scan_expr_share_unsafe(rhs, found);
-        }
-        ExprKind::Ternary {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            scan_expr_share_unsafe(cond, found);
-            scan_expr_share_unsafe(then_branch, found);
-            scan_expr_share_unsafe(else_branch, found);
-        }
-        ExprKind::HashHash { expr, .. } => scan_expr_share_unsafe(expr, found),
-        ExprKind::SeqRepeat { expr, .. } => scan_expr_share_unsafe(expr, found),
-        ExprKind::RangeLit { lo, hi } => {
-            if let Some(lo) = lo.as_ref() {
-                scan_expr_share_unsafe(lo, found);
+            ExprKind::Call { callee, args } => {
+                self.expr(callee);
+                for a in args.iter() {
+                    self.arg(a);
+                }
             }
-            if let Some(hi) = hi.as_ref() {
-                scan_expr_share_unsafe(hi, found);
+            ExprKind::Field { target, .. } => self.expr(target),
+            ExprKind::Index { target, index } => {
+                self.expr(target);
+                self.expr(index);
             }
-        }
-        ExprKind::SetLit(es)
-        | ExprKind::SystemCall { args: es, .. }
-        | ExprKind::SolveOrder { args: es } => {
-            for x in es.iter() {
-                scan_expr_share_unsafe(x, found);
+            ExprKind::BitSlice { target, hi, lo } => {
+                self.expr(target);
+                self.expr(hi);
+                self.expr(lo);
             }
-        }
-        ExprKind::ForEachConstraint { iter, body, .. } => {
-            scan_expr_share_unsafe(iter, found);
-            for x in body.iter() {
-                scan_expr_share_unsafe(x, found);
+            ExprKind::Cast { expr, .. } => self.expr(expr),
+            ExprKind::Send { target, value } => {
+                self.expr(target);
+                self.expr(value);
             }
-        }
-        ExprKind::SoftConstraint(sc) => {
-            scan_expr_share_unsafe(&sc.expr, found);
-            if let Some(weight) = sc.weight.as_ref() {
-                scan_expr_share_unsafe(weight, found);
+            ExprKind::Unary { expr, .. } => self.expr(expr),
+            ExprKind::ForkCall { call } => self.expr(call),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
             }
-        }
-        ExprKind::DistDirective { target, .. } => scan_expr_share_unsafe(target, found),
-        ExprKind::Paren(x) => scan_expr_share_unsafe(x, found),
-        ExprKind::NamedArg { value, .. } => scan_expr_share_unsafe(value, found),
-        ExprKind::StructLit { fields: nfs, .. } => {
-            for nf in nfs.iter() {
-                scan_expr_share_unsafe(&nf.value, found);
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr(cond);
+                self.expr(then_branch);
+                self.expr(else_branch);
             }
+            ExprKind::HashHash { expr, .. } => self.expr(expr),
+            ExprKind::SeqRepeat { expr, .. } => self.expr(expr),
+            ExprKind::RangeLit { lo, hi } => {
+                if let Some(lo) = lo.as_ref() {
+                    self.expr(lo);
+                }
+                if let Some(hi) = hi.as_ref() {
+                    self.expr(hi);
+                }
+            }
+            ExprKind::SetLit(es)
+            | ExprKind::SystemCall { args: es, .. }
+            | ExprKind::SolveOrder { args: es } => {
+                for x in es.iter() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                self.expr(iter);
+                for x in body.iter() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::SoftConstraint(sc) => {
+                self.expr(&sc.expr);
+                if let Some(weight) = sc.weight.as_ref() {
+                    self.expr(weight);
+                }
+            }
+            ExprKind::DistDirective { target, .. } => self.expr(target),
+            ExprKind::Paren(x) => self.expr(x),
+            ExprKind::NamedArg { value, .. } => self.expr(value),
+            ExprKind::StructLit { fields: nfs, .. } => {
+                for nf in nfs.iter() {
+                    self.expr(&nf.value);
+                }
+            }
+            ExprKind::CoverArrow { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            ExprKind::Membership { expr, set } => {
+                self.expr(expr);
+                self.expr(set);
+            }
+            ExprKind::DistLit(_)
+            | ExprKind::String(_)
+            | ExprKind::Ident(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Time(_)
+            | ExprKind::Bool(_)
+            | ExprKind::ImplicitSelf => {}
         }
-        ExprKind::CoverArrow { lhs, rhs, .. } => {
-            scan_expr_share_unsafe(lhs, found);
-            scan_expr_share_unsafe(rhs, found);
-        }
-        ExprKind::Membership { expr, set } => {
-            scan_expr_share_unsafe(expr, found);
-            scan_expr_share_unsafe(set, found);
-        }
-        ExprKind::DistLit(_)
-        | ExprKind::String(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Int(_)
-        | ExprKind::Float(_)
-        | ExprKind::Time(_)
-        | ExprKind::Bool(_)
-        | ExprKind::ImplicitSelf => {}
     }
 }
 
 /// Conservative UNION scan (#619 M4a sub-step 4): a testbench's lifecycle
-/// is share-unsafe if ANY lifecycle phase body OR ANY of the testbench's
-/// own helper methods (`hookable`/`function`) contains a share-unsafe
-/// construct. Scanning all methods (rather than only those a phase calls)
-/// is a deliberate over-approximation — a false "unsafe" only forgoes the
-/// sharing optimization.
-fn testbench_lifecycle_share_unsafe(tb: &ComponentDecl) -> bool {
+/// is share-unsafe if ANY body that could be FOLDED INTO the shared
+/// lifecycle function contains a share-unsafe construct. Only two item
+/// kinds contribute such a body — the lifecycle phase itself, and any
+/// helper method a phase CFG-inlines (`hookable`/`function`). Scanning all
+/// methods (rather than only those a phase calls) is a deliberate
+/// over-approximation; a false "unsafe" only forgoes the sharing
+/// optimization. The match is EXHAUSTIVE (no wildcard) so a new
+/// `ComponentItem` kind forces an explicit safe/unsafe decision here.
+fn testbench_lifecycle_share_unsafe(
+    tb: &ComponentDecl,
+    properties: &std::collections::HashMap<String, Expr>,
+) -> bool {
     tb.items.iter().any(|ci| {
-        let mut found = false;
+        let mut scan = ShareScan::new(properties);
         match ci {
-            ComponentItem::Lifecycle(_, body) | ComponentItem::Hookable(HookableMethod { body, .. }) => {
-                scan_block_share_unsafe(body, &mut found);
-            }
-            _ => {}
+            // The shared lifecycle function is lowered from the phase body,
+            // plus any helper method the phase CFG-inlines at a call site.
+            ComponentItem::Lifecycle(_, body)
+            | ComponentItem::Hookable(HookableMethod { body, .. }) => scan.block(body),
+            // The remaining item kinds never contribute a body to the
+            // SHARED lifecycle function, so their contents cannot change a
+            // shared phase's trace:
+            //   * Field / Connect — declarations / wiring, no procedural body.
+            //   * OnHandler — a testbench-scope `on` service lowered to its
+            //     OWN per-test `TestHook` function (periodic/cycle service),
+            //     never folded into a lifecycle phase.
+            //   * TargetTlmThread — a bound-target responder thread, separate.
+            //   * Watchdog — desugars to a periodic-service checker, separate.
+            //   * Apply — aspect activation; inert (no backend applies it).
+            ComponentItem::Field(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::OnHandler(_)
+            | ComponentItem::TargetTlmThread(_)
+            | ComponentItem::Watchdog(_)
+            | ComponentItem::Apply(_) => {}
         }
-        found
+        scan.found
     })
 }
 
@@ -24273,6 +24336,21 @@ fn desugar_impl_for_test_in_file_inner<'a>(
     // substitution + body capture below; the rest inline verbatim. Empty
     // (nothing shared) when `share_lifecycle` is false.
     let shareable_testbenches: std::collections::HashSet<String> = if share_lifecycle {
+        // File-scope `property NAME ... end property` bodies — the exact
+        // table lowering's `is_concurrent_assertion` resolves against (see
+        // `lower_program`), so the share scan classifies concurrent asserts
+        // identically to lowering.
+        let properties: std::collections::HashMap<String, Expr> = file
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Property(pd) => Some((pd.name.name.clone(), pd.body.clone())),
+                _ => None,
+            })
+            .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                m.entry(k).or_insert(v); // first declaration wins, like lowering
+                m
+            });
         // Testbenches actually bound by an impl-for test.
         let bound: std::collections::HashSet<&str> = file
             .items
@@ -24286,16 +24364,21 @@ fn desugar_impl_for_test_in_file_inner<'a>(
             .iter()
             .filter_map(|&name| {
                 let tb = components.get(name)?;
-                if testbench_lifecycle_share_unsafe(tb) {
+                if testbench_lifecycle_share_unsafe(tb, &properties) {
                     return None;
                 }
-                // Field-shadow hazard: any binding test with a test-scope
-                // `let` colliding with a testbench field name.
-                let field_names: std::collections::HashSet<&str> = tb
+                // Shadow hazard: `rewrite_expr_for_impl` suppresses BOTH
+                // field-ref and bare-method-call rewriting via one flat
+                // `shadow` set built from every test-scope `let` name. So a
+                // binding test whose `let` collides with a testbench FIELD
+                // *or* METHOD name gets a different inlined body than the
+                // shared (first-bind) one — force fallback in either case.
+                let shadow_targets: std::collections::HashSet<&str> = tb
                     .items
                     .iter()
                     .filter_map(|ci| match ci {
                         ComponentItem::Field(f) => Some(f.name.name.as_str()),
+                        ComponentItem::Hookable(h) => Some(h.name.name.as_str()),
                         _ => None,
                     })
                     .collect();
@@ -24305,7 +24388,7 @@ fn desugar_impl_for_test_in_file_inner<'a>(
                         return false;
                     }
                     t.items.iter().any(|ti| {
-                        matches!(ti, TestItem::Let(l) if field_names.contains(l.name.name.as_str()))
+                        matches!(ti, TestItem::Let(l) if shadow_targets.contains(l.name.name.as_str()))
                     })
                 });
                 (!shadowed).then(|| name.to_string())

@@ -135,9 +135,11 @@ statements are concatenated within each phase block — the boundary is gone.
   `components` map); (b) lower each marker call to an explicit IR call edge to
   that function, positioned exactly where the inlined block used to be.
 - Emitter (re-inline intermediate): a call to a `TestbenchLifecycle` function is
-  emitted by **re-inlining** the callee body at the call site, so generated C++
-  — and the trace — is byte-identical to today. Only with M3's context seam
-  (M4b) do these become real out-of-line calls.
+  emitted by **re-inlining** the callee body at the call site, so the semantic
+  **trace** is identical to today. The generated C++ is trace-identical, not
+  byte-identical — the re-inlined body is a nested loop-switch with its own
+  block-scoped local names. Only with M3's context seam (M4b) do these become
+  real out-of-line calls.
 
 ### Why this preserves the trace
 
@@ -177,7 +179,8 @@ did). This is the atomic 2–3 unit:
   marker to it, reusing the `_tb`-field resolution the method-inline path uses;
 - lower each phase body ONCE into the `TestbenchLifecycle` function (the desugar
   already rewrites the body to `_tb.<field>` before marker substitution — capture
-  that rewritten body so the re-emitted output is byte-identical);
+  that rewritten body so the re-emitted output is trace-identical: same field
+  references and statement order, differing only in local names);
 - teach the tbir emitter to expand a `TestbenchLifecycle` call inline.
 
 It cannot be verified in halves: switch-ON needs the marker lowered AND the

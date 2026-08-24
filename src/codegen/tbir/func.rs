@@ -362,8 +362,11 @@ pub(super) fn emit_function(
                 // suspends this same run/check coroutine. Local names are
                 // block-scoped to the nested `{ }`, so they cannot collide
                 // with the caller's. This reproduces the exact statement
-                // order the historical per-test lifecycle inlining
-                // produced — see docs/619-m4a-ir-ownership.md.
+                // ORDER the historical per-test lifecycle inlining produced,
+                // so the semantic trace matches — the emitted C++ is
+                // trace-identical, not byte-identical (the nested loop-switch
+                // and its local names differ textually). See
+                // docs/619-m4a-ir-ownership.md.
                 let callee = prog.function(*function);
                 debug_assert!(
                     matches!(callee.kind, crate::ir::FunctionKind::TestbenchLifecycle { .. }),

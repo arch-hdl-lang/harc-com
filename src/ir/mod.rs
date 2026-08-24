@@ -2656,9 +2656,11 @@ pub enum Terminator {
     /// ONCE for the bound testbench (shared across every test that binds
     /// it). Unlike a normal call, the tbir emitter EXPANDS the callee's
     /// loop-switch inline here (a new emitter capability — see
-    /// docs/619-m4a-ir-ownership.md) so the generated C++ and the trace
-    /// are identical to the historical per-test lifecycle inlining. It is
-    /// a terminator (not a `Stmt`) because the callee body may suspend
+    /// docs/619-m4a-ir-ownership.md) so the semantic TRACE is identical to
+    /// the historical per-test lifecycle inlining. The generated C++ is
+    /// trace-identical, not byte-identical — the re-inlined body is a nested
+    /// loop-switch with its own block-scoped local names. It is a
+    /// terminator (not a `Stmt`) because the callee body may suspend
     /// (lifecycle `wait`s) — sync points are terminators (invariant 7).
     /// Only produced under the `HARC_TBIR_NATIVE_LIFECYCLE` switch.
     TbLifecycleCall {

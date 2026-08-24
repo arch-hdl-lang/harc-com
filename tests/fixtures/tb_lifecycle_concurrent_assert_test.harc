@@ -1,0 +1,46 @@
+// #619 M4a sub-step 4: a bound testbench whose lifecycle `check` phase
+// contains a CONCURRENT (temporal) assertion. Lowering routes any assert
+// carrying a temporal operator (here `|->`) through the concurrent-property
+// path, which mints a per-test PropertyCheckId. Sharing this check once
+// would register the property for the FIRST binding test only, so the
+// conservative scan must classify the testbench UNSAFE and fall back to the
+// historical per-test inlining — keeping the trace identical to v1 under
+// both codegens. Two impls bind it.
+//
+// This is the fixture that catches the earlier soundness bug: a purely
+// syntactic `named`/`property_kw` check would have deemed `assert a |-> b`
+// SAFE and shared it. The authoritative `is_concurrent_assertion` predicate
+// classifies it correctly.
+
+testbench ConcurrentAssertTb
+    dut : Top
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycle
+        dut.rst = 0
+    end setup
+
+    check
+        // Temporal implication (tautology: whenever `en` held, `en` held) —
+        // a CONCURRENT assertion, evaluated per primary-clock edge.
+        assert dut.en |-> dut.en
+    end check
+end testbench ConcurrentAssertTb
+
+impl ConcurrentAssertA for ConcurrentAssertTb
+    run
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+    end run
+end impl ConcurrentAssertA
+
+impl ConcurrentAssertB for ConcurrentAssertTb
+    run
+        dut.en = 1
+        wait 4 cycles
+        dut.en = 0
+    end run
+end impl ConcurrentAssertB

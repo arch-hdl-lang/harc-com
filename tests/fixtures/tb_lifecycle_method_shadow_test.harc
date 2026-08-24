@@ -1,0 +1,46 @@
+// #619 M4a sub-step 4: a bound testbench with a helper method (`prep`),
+// where one binding test declares a test-scope `let prep` that shadows the
+// METHOD name. `rewrite_expr_for_impl` suppresses bare method-call
+// rewriting via the same flat `shadow` set it uses for fields, so that
+// test's inlined lifecycle body would differ from the shared (first-bind)
+// one. The decision must therefore treat a method-name collision the same
+// as a field collision and fall back to per-test inlining — keeping the
+// trace identical to v1 under both codegens.
+//
+// `prep()` is not called from the lifecycle here (a called-and-shadowed
+// method is a resolution error, not a silent divergence), so the program is
+// valid under the historical inlining; the fixture exercises the
+// method-name branch of the shadow check.
+
+testbench MethodShadowTb
+    dut : Top
+
+    function prep() -> uint<8>
+        return 7
+    end function prep
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycle
+        dut.rst = 0
+    end setup
+end testbench MethodShadowTb
+
+impl MethodShadowPlain for MethodShadowTb
+    run
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+    end run
+end impl MethodShadowPlain
+
+impl MethodShadowShadows for MethodShadowTb
+    // A test-scope `let` colliding with the `prep` testbench METHOD name.
+    let prep : uint<8> = 3
+    run
+        dut.en = 1
+        wait 1 cycle
+        dut.en = 0
+    end run
+end impl MethodShadowShadows
