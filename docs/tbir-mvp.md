@@ -9168,6 +9168,55 @@ former `transaction` group lives in
      into a `let`" refusal fires instead of a downstream verifier
      `BadTransactorCall`. The corpus dumps identically across all of it.
 
+145. **No-payload `on <event>()` handler (implement) + record-field
+     `default` (regrade) (2026-08-24).**
+
+     Two independent single-site closures, each decided by measurement.
+
+     *Implement:* a no-argument `on <event>()` handler was refused
+     ("...v1 synthesizes one") while v1 compiles it — measured uniform
+     across agent / env / transactor hosts, emitting the SAME subscriber
+     list and lambda signature as the one-argument form, only with a
+     throwaway parameter. The whole lowering path already handled it: the
+     schema's `arg_payload` comes from the event field's declared payload
+     (independent of the handler's args), and `on_handler_arg_name` already
+     falls back to a synthesized `_v`. The only thing refusing it was one
+     validation arm — removed. tbir now binds the payload to a name the
+     body never reads, exactly as v1's throwaway parameter, so the emitted
+     handler is trace-equivalent (variable names don't affect runtime; the
+     one-argument form is already in the equivalence corpus, and the
+     no-arg form differs only by an unread binding). A scoreboard event
+     field is refused earlier, so there is no fourth landing.
+
+     *Regrade:* a `default` on a record-typed COMPONENT field was an
+     `unsupported` ("re-run with `--codegen v1`"), but v1 emits `<Record>
+     r = <lit>;` and g++ refuses the int-to-record conversion (measured on
+     agent and transactor hosts) — a false promise, now
+     `NotImplemented`/`EmitsUncompilable`. The family SPLITS and only the
+     record site moved: the DUT-handle sibling (`dut : Top default 0`)
+     keeps its v1 suggestion because v1 DOES compile `VTop* dut = 0;` (the
+     bind overwrites it harmlessly) — lumping the two would have repeated
+     the batch-45 mistake. The transactor-state record-field default was
+     already `EmitsUncompilable` on its own path; this is the
+     component-field counterpart. Corpus dumps identically — no existing
+     program declared either shape.
+
+     *Two review catches on the implement half.* (a) The first cut bound
+     the synthesized payload to a local named `_v` via `declare`, which
+     enters the name-resolution scope — so a component FIELD named `_v`
+     was SHADOWED: the body's `_v` read the throwaway param, not the field,
+     a silent trace divergence from v1 (which qualifies field reads and so
+     never shadows). Fixed by binding the no-payload slot with a fresh
+     TEMP instead: `fresh_temp` pushes the local for the C++ signature but
+     does NOT register it in the scope, so a body identifier resolves to
+     the field it names, matching v1 exactly. (b) `validate_event_handler`
+     was not the only no-arg gate — the TEST-SCOPE subscription path
+     (`on e()` on an `event` local, or `on s.obs()` in test scope) refused
+     with a false `Invalid` ("takes exactly one payload binding, got 0")
+     while v1 compiles it. Implemented there too, same fresh-temp shape;
+     the two-or-more-argument arm keeps its arity error (a different
+     construct, out of scope).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -4728,11 +4728,15 @@ impl FuncBuilder<'_> {
                 display,
             )
         };
-        // Exactly one parameter, and it must be a plain binding name —
-        // the payload the emitter passes in.
-        let param = match args {
+        // The payload binding: at most one, and a plain name. A
+        // no-payload `on <ev>()` (`None`) is IMPLEMENTED, matching v1 —
+        // which synthesizes a throwaway parameter and compiles (measured,
+        // same as the component-definition path). Two or more remains an
+        // arity error (a different construct, out of this scope).
+        let param: Option<String> = match args {
+            [] => None,
             [CallArg::Expr(e)] => match &*e.kind {
-                ExprKind::Ident(p) => p.name.clone(),
+                ExprKind::Ident(p) => Some(p.name.clone()),
                 _ => {
                     return Err(LowerError::Invalid(format!(
                         "`on {display_name}(...)`: the payload binding must be a name"
@@ -4762,8 +4766,15 @@ impl FuncBuilder<'_> {
         super::reserve_tb_record_names(&mut b, self.ctx);
         // The payload binding is local 0, which is the verifier's
         // parameter convention (`locals[..params.len()]` mirror the
-        // params one-to-one and are defined at entry).
-        let p = b.declare(&param);
+        // params one-to-one and are defined at entry). A named binding is a
+        // resolvable local (`declare`); a synthesized no-payload slot is a
+        // fresh TEMP — pushed for the signature but NOT entered in the name
+        // scope, so a body identifier resolves to what it names rather than
+        // shadowing to the throwaway param, matching v1.
+        let p = match &param {
+            Some(name) => b.declare(name),
+            None => b.fresh_temp(),
+        };
         b.set_local_type(p, param_ty.clone());
         b.lower_block_stmts(&h.body)?;
         if !b.is_terminated() {
@@ -4775,10 +4786,10 @@ impl FuncBuilder<'_> {
             crate::ir::FunctionKind::TestHook,
             self.ctx.owner,
         )?;
-        f.params = vec![crate::ir::TypedParam {
-            name: param,
-            ty: param_ty,
-        }];
+        // Build the param from the local's final (de-duplicated / synthesized)
+        // name — the emitter takes the signature name from the local.
+        let name = f.locals[p.index()].name.clone();
+        f.params = vec![crate::ir::TypedParam { name, ty: param_ty }];
 
         self.commit_pending_function(pending_id, f);
         self.push(Stmt::EventSubscribe {

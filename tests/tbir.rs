@@ -14330,11 +14330,12 @@ end test T"#
         );
     }
 
-    // No payload name: v1 synthesizes one and the handler runs, which
-    // is what was written — the payload is simply unbound.
+    // No payload name: implemented. v1 synthesizes `_v`; tbir binds the
+    // payload to a synthesized name the body never reads and lowers the
+    // handler like the one-arg form (see
+    // `a_no_arg_event_handler_lowers_like_the_one_arg_form`).
     let none = agent("in_ev()", "seen = seen + 1");
-    let msg = assert_unsupported(&lower_src(&none).unwrap_err());
-    assert!(msg.contains("no payload argument"), "{msg}");
+    lower_src(&none).expect("a no-payload `on <event>()` handler lowers");
     let v1 = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
     assert!(
         v1.contains("tagger.in_ev.push_back([&](uint64_t _v) {"),
@@ -38336,4 +38337,182 @@ end impl CTest
     ] {
         lower_src(ok_src).expect("a signed <=64 or unsigned wide field must still lower");
     }
+}
+
+/// A no-payload `on <event>()` handler lowers exactly as the one-argument
+/// form does — same subscriber-list member and fan-out as v1 — on every
+/// host that can reach it (agent / env / transactor). v1 synthesizes a
+/// throwaway parameter; tbir binds the payload to a synthesized `_v` the
+/// body never reads, so the emitted handler is trace-equivalent. Only the
+/// binding name differs, and names do not affect runtime behaviour.
+#[test]
+fn a_no_arg_event_handler_lowers_like_the_one_arg_form() {
+    let mk = |kind: &str, arg: &str| {
+        format!(
+            r#"{kind} Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+    on in_ev({arg})
+        seen = seen + 1
+    end on
+end {kind} Tagger
+testbench Tb
+    dut : Top
+    tagger : Tagger{mode}
+end testbench Tb
+impl T for Tb
+    run
+        emit tagger.in_ev(1)
+        wait 1 cycle
+    end run
+end impl T"#,
+            // A transactor instance field must carry a mode; a passive
+            // instance still exposes its always-on `on` handler. `agent` /
+            // `env` fields take no mode.
+            mode = if kind == "transactor" { " passive" } else { "" }
+        )
+    };
+    for kind in ["agent", "env", "transactor"] {
+        let src = mk(kind, "");
+        // v1 accepts it; derive the subscriber-list member from v1 rather
+        // than pasting it.
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits the no-arg handler");
+        let member = "std::vector<std::function<void(uint64_t)>> in_ev;";
+        assert!(v1.contains(member), "[{kind}] v1 must emit `{member}`");
+
+        // tbir lowers, verifies, and emits the same subscriber-list member
+        // plus the handler dispatch — identical to the one-arg form.
+        let prog =
+            lower_src(&src).unwrap_or_else(|e| panic!("[{kind}] no-arg handler lowers: {e}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("[{kind}] verifies: {e:?}"));
+        let tb = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("[{kind}] emits: {e}"));
+        assert!(tb.contains(member), "[{kind}] tbir must emit `{member}`");
+        assert!(
+            tb.contains("tagger.in_ev.push_back(") && tb.contains("for (auto& _s : tagger.in_ev)"),
+            "[{kind}] tbir must emit the subscriber push + fan-out"
+        );
+
+        // The one-arg form still lowers (no regression), and its member is
+        // byte-identical to the no-arg form's.
+        let one =
+            lower_src(&mk(kind, "t")).unwrap_or_else(|e| panic!("[{kind}] one-arg lowers: {e}"));
+        let one_cpp = tbir::emit(
+            &one,
+            &merged_src(&mk(kind, "t")),
+            &cpp_tb::EmitOpts::default(),
+        )
+        .expect("one-arg emits");
+        assert!(one_cpp.contains(member), "[{kind}] one-arg member matches");
+    }
+}
+
+/// A `default` on a record-typed component field is refused honestly, not
+/// pointed at `--codegen v1`: v1 emits `<Record> r = <lit>;` and g++
+/// rejects the int-to-record conversion (measured). The DUT-handle sibling
+/// (`dut : Top default 0`) keeps its `--codegen v1` suggestion — v1 does
+/// compile `VTop* dut = 0;` — so this regrade is the record site alone.
+#[test]
+fn a_default_on_a_record_component_field_is_refused_without_a_false_v1_promise() {
+    let src = r#"struct Beat
+    p : uint<8>
+end struct Beat
+agent Ag
+    r : Beat default 0
+    seen : uint<32> default 0
+end agent Ag
+testbench Tb2
+    dut : Top
+    ag : Ag
+end testbench Tb2
+impl T2 for Tb2
+    run
+        wait 1 cycle
+    end run
+end impl T2"#;
+    let err = lower_src(src).expect_err("a default on a record component field is refused");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        !msg.contains("re-run with `--codegen v1`"),
+        "record-default message must not promise v1 works: {msg}"
+    );
+}
+
+/// Adversarial-review regressions for the no-payload `on <event>()` batch:
+/// (1) a component FIELD named `_v` must NOT be shadowed by the synthesized
+/// throwaway payload param — the body's `_v` must read the field, as under
+/// v1 (which qualifies every field read); (2) a TEST-SCOPE no-arg
+/// subscription (`on e()` on an `event` local) lowers, matching v1, rather
+/// than being falsely refused as `Invalid`.
+#[test]
+fn the_no_arg_handler_payload_never_shadows_a_field() {
+    let coll = r#"agent Ag
+    ev : event<uint<8>>
+    _v : uint<8> default 7
+    seen : uint<32> default 0
+    on ev()
+        seen = seen + _v
+    end on
+end agent Ag
+testbench Tb
+    dut : Top
+    ag : Ag
+end testbench Tb
+impl T for Tb
+    run
+        emit ag.ev(1)
+        wait 1 cycle
+    end run
+end impl T"#;
+    // v1 reads the field (`_tb.ag._v`); tbir must read the field too
+    // (`self._v`), NOT a bare payload param `_v`.
+    let tb = emit_cpp_src(coll);
+    assert!(
+        tb.contains("self._v"),
+        "the body's `_v` must resolve to the field (self._v), not the payload param:\n{}",
+        tb.lines()
+            .filter(|l| l.contains("seen") && l.contains("_v"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        !tb.lines()
+            .any(|l| l.contains("seen") && l.contains("+ _v)") && !l.contains("self._v")),
+        "the payload param must not shadow the field"
+    );
+    // And v1 agrees the field is what's read.
+    assert!(
+        cpp_tb::emit(&merged_src(coll))
+            .expect("v1")
+            .contains("_tb.ag._v"),
+        "v1 reads the field for `_v`"
+    );
+}
+
+/// A test-scope `on <ev>()` subscription with no payload binding lowers and
+/// verifies (v1 compiles it), rather than the false `Invalid` grade the
+/// arity arm gave before — the test-scope sibling of the component-path
+/// no-arg handler.
+#[test]
+fn a_test_scope_no_arg_event_subscription_lowers_like_v1() {
+    let src = r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let e : event<uint<8>>
+        on e()
+            log(info, "fired")
+        end on
+        emit e(3)
+        wait 1 cycle
+    end run
+end impl T"#;
+    assert!(
+        cpp_tb::emit(&merged_src(src)).is_ok(),
+        "v1 compiles a test-scope no-arg subscription"
+    );
+    let prog = lower_src(src).expect("test-scope no-arg subscription lowers");
+    verify::verify_program(&prog).expect("verifies");
+    tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default()).expect("emits");
 }
