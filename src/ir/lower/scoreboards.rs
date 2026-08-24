@@ -17,7 +17,7 @@
 //!     scoreboard does not lower to a struct missing its methods);
 //!   - queue element types other than exact scalars through the 1024-bit
 //!     language ceiling or value-records (enum/Vec/list/event/nested);
-//!   - non-scalar fields and signed scalar fields above 64 bits.
+//!   - non-scalar fields.
 //!
 //! `NotImplemented { v1: SilentlyMisLowers }` (v1 is not a way out):
 //!   - component `parameters`, which v1 drops entirely;
@@ -463,10 +463,10 @@ fn scoreboard_field_kind(
         // uses. Measured: `list<Vec<uint<8>, 2>>` gives
         // `std::vector<std::array<uint64_t, 2>> l;` and compiles, while
         // the same leaf in a transaction does not.
-        const SUBSET: &str = "only unsigned scalar fields through 1024 bits, signed scalar \
-                              fields up to 64 bits, bool fields, supported `list<T>`, and \
-                              `queue<T>` of such a scalar element type or a \
-                              `queue<transaction|struct>` are lowered";
+        const SUBSET: &str = "only scalar fields through 1024 bits (signed or unsigned), \
+                              bool fields, supported `list<T>`, and `queue<T>` of such a \
+                              scalar element type or a `queue<transaction|struct>` are \
+                              lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
         let fate = crate::codegen::cpp_tb::record_leaf_fate(t, &|n| declared_records.contains(n));
         if fate == RecordLeafFate::Flattens {
@@ -479,8 +479,7 @@ fn scoreboard_field_kind(
                 V1Status::SilentlyMisLowers,
             );
         }
-        super::components::signed_wide_field_gap(&what, t)
-            .unwrap_or_else(|| scoreboard_subset_gap(&what, SUBSET))
+        scoreboard_subset_gap(&what, SUBSET)
     })?;
     Ok(ScoreboardFieldKind::Scalar {
         ty,

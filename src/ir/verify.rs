@@ -624,22 +624,31 @@ fn verify_scoreboard_scalar_schema(
     what: String,
     errs: &mut Vec<VerifyError>,
 ) {
+    // Signed and unsigned share the width ceiling now (harc#657): the
+    // emitter routes signed wide operators through the two's-complement
+    // helpers, so a `sint` past 64 is a real supported type, not the
+    // unsigned-by-magnitude carrier the cap once guarded against.
     let valid = match ty {
         IrType::Bool | IrType::UInt(None) | IrType::SInt(None) => true,
-        IrType::UInt(Some(width)) => (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width),
-        IrType::SInt(Some(width)) => (1..=64).contains(width),
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => {
+            (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
+        }
         _ => false,
     };
     if !valid {
         errs.push(VerifyError::BadProgramRef {
             what: format!(
-                "{what} has invalid scalar type {ty:?}; expected bool, unsigned width 1..={}, \
-                 or signed width 1..=64",
+                "{what} has invalid scalar type {ty:?}; expected bool or a scalar of \
+                 width 1..={} (signed or unsigned)",
                 crate::MAX_WIDTH_METHOD_BITS
             ),
         });
     }
     let default_valid = match default {
+        // The default is only ever folded to zero for a wide field
+        // (source lowering rejects a non-zero wide default), and zero is
+        // in range for every width and sign, so the only bound worth
+        // checking is on the narrow signed/unsigned cases below.
         crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
             IrType::Bool => *value <= 1,
             IrType::UInt(Some(width)) if *width < 64 => *value < (1u64 << width),
@@ -649,7 +658,11 @@ fn verify_scoreboard_scalar_schema(
                 let limit = 1i64 << (*width - 1);
                 (-limit..limit).contains(&signed)
             }
+            // 64-bit and wider signed, and widthless: a zero default is
+            // always representable; a wider non-zero default cannot
+            // reach here (lowering folds absent/zero only).
             IrType::SInt(Some(64)) | IrType::SInt(None) => true,
+            IrType::SInt(Some(_)) => *value == 0,
             _ => false,
         },
         crate::ir::ScoreboardScalarDefault::Wide(words) => {
@@ -990,11 +1003,19 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     }
                 }
                 ScoreboardFieldKind::List { elem, vec_len } => {
-                    let valid_elem = matches!(
-                        elem,
-                        IrType::Bool | IrType::UInt(None) | IrType::SInt(None)
-                    ) || matches!(elem, IrType::UInt(Some(width)) if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width))
-                        || matches!(elem, IrType::SInt(Some(width)) if (1..=64).contains(width));
+                    // Signed and unsigned share the element width ceiling
+                    // (harc#657) — the same lift as scalar fields, so a
+                    // `list<sint<128>>` that lowering now accepts is not
+                    // rejected here into an internal error. The scoreboard
+                    // list decoder routes through the shared
+                    // `field_scalar_width_ok`, so the two must agree.
+                    let valid_elem =
+                        matches!(elem, IrType::Bool | IrType::UInt(None) | IrType::SInt(None))
+                            || matches!(
+                                elem,
+                                IrType::UInt(Some(width)) | IrType::SInt(Some(width))
+                                    if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
+                            );
                     if !valid_elem || vec_len.is_some_and(|len| len == 0) {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(

@@ -1588,15 +1588,11 @@ fn lower_field(
             }
             let what = format!("scalar field `{comp}.{fname}` of an unsupported type");
             let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
-                // The signed-wide arm first: it is the one shape here
-                // for which `--codegen v1` is a false promise.
-                signed_wide_field_gap(&what, &f.ty).unwrap_or_else(|| {
-                    unsupported(
-                        &what,
-                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits \
-                         are lowered",
-                    )
-                })
+                unsupported(
+                    &what,
+                    "only nonzero-width uint/sint/bits/bool fields up to 1024 bits \
+                     are lowered",
+                )
             })?;
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
@@ -3390,68 +3386,6 @@ pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
     })
 }
 
-/// The scalar subset of a DECLARED component/scoreboard/testbench
-/// field. Both emitters render the member through `field_scalar_cty`,
-/// which knows `_harc_u128` and `HarcWide<N>`, so the 64-bit cap
-/// `scalar_ir_type` still applies to event payloads and fixed-vector
-/// elements never belonged here.
-///
-/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`, the language's stated
-/// vector target, which `lib.rs` has held all along — this branch added
-/// a `MAX_SCALAR_FIELD_WIDTH` beside it with a doc comment re-deriving
-/// the number 1024 that the constant it duplicated already fixed.
-///
-/// SIGNED stops at 64. Past that a scalar lives in `_harc_u128` or
-/// `HarcWide<N>`, and BOTH are unsigned: `<` and `/` on either answer
-/// by magnitude, in v1 as well as here. That is `main`'s scoreboard
-/// rule, capped for exactly that reason while this branch was widening
-/// every declared field to 1024 without it. The narrower position is
-/// the right one, and one decoder is the place for it — `main` had
-/// re-introduced a second copy in `scoreboards.rs` to hold it.
-/// The refusal for a SIGNED scalar field wider than 64 bits, which is
-/// the one shape inside the declared-field subset that must NOT offer
-/// `--codegen v1` as a way out.
-///
-/// `unsupported` appends "re-run with `--codegen v1`", and the whole
-/// point of that suggestion is that it is a working escape hatch. For a
-/// signed wide field it is not one. Measured on `sint<129>` scoreboard
-/// state under `--codegen v1`:
-///
-/// - `sb.v < 0` does not compile at all — v1 stores the field as
-///   `harc_rt::HarcWide<5>` and g++/clang call `operator<` between it
-///   and `int` ambiguous;
-/// - `sb.a < sb.b` with `a = -8, b = 2` COMPILES and answers `-8 >= 2`,
-///   because the carrier is unsigned and the comparison is by magnitude;
-/// - `sb.a / sb.b` and `sb.a >> 1` compile and are wrong the same way.
-///
-/// So the grade is `SilentlyMisLowers` — the worse of the two fates, and
-/// the one that decides the promise. TB-IR refusing here is the honest
-/// behaviour of the two backends, not TB-IR trailing v1: v1 does not
-/// implement signed wide semantics either, it just fails less visibly.
-///
-/// `None` when the field is not a signed wide scalar, so the caller
-/// falls through to its own generic subset diagnostic.
-///
-/// See harc#657 for the feature itself; it needs signed compare,
-/// divide, modulo and arithmetic right shift over the unsigned
-/// `_harc_u128` / `HarcWide<N>` carriers.
-pub(crate) fn signed_wide_field_gap(what: &str, t: &TypeExpr) -> Option<LowerError> {
-    matches!(decoded_scalar_ir_type(t), Some(IrType::SInt(Some(w))) if w > 64).then(|| {
-        not_implemented(
-            what,
-            "a signed scalar wider than 64 bits is held in `_harc_u128` or \
-             `harc_rt::HarcWide<N>`, and BOTH carriers are unsigned: `<`, `<=`, `>`, \
-             `>=`, `/`, `%` and `>>` on one answer by magnitude, not by the declared \
-             sign bit. Declare the field `uint<N>` and do the sign handling \
-             explicitly, or keep it at 64 bits or narrower. v1 stores the same \
-             unsigned carrier — it either fails to compile the comparison or answers \
-             `-8 >= 2`, so `--codegen v1` is not a way out"
-                .to_string(),
-            V1Status::SilentlyMisLowers,
-        )
-    })
-}
-
 pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
 }
@@ -3469,7 +3403,7 @@ pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// widening cannot strand it again.
 fn scalar_width_detail() -> String {
     format!(
-        "an unsigned scalar reaches {} bits and a signed one stops at 64",
+        "a scalar reaches {} bits, signed or unsigned",
         crate::MAX_WIDTH_METHOD_BITS
     )
 }
@@ -3477,22 +3411,27 @@ fn scalar_width_detail() -> String {
 /// The width policy for a declared scalar FIELD, at every site that has
 /// one.
 ///
-/// Unsigned reaches `MAX_WIDTH_METHOD_BITS`; SIGNED stops at 64.
+/// Signed and unsigned both reach `MAX_WIDTH_METHOD_BITS` (harc#657).
 ///
 /// There are two field-type decoders — this file's, which also accepts
 /// `BuiltinTy::Int`, and `tb_scalar_field_ir_type` in `mod.rs` — and
 /// they are allowed to differ about which SPELLINGS they admit. They
 /// are not allowed to differ about WIDTH: a `sint<128>` refused on a
 /// scoreboard and lowered on a testbench field is one language with two
-/// rules. Landing the cap in only one of them is exactly what happened
-/// at the merge that introduced it.
+/// rules. Landing a cap in only one of them is exactly what happened at
+/// the merge that first introduced the signed cap.
 pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
     match ty {
-        IrType::UInt(Some(w)) => *w <= crate::MAX_WIDTH_METHOD_BITS,
-        // Past 64 a scalar lives in `_harc_u128` or `HarcWide<N>`, and
-        // BOTH are unsigned: `<` and `/` on one answer by magnitude, in
-        // v1 as well as here.
-        IrType::SInt(Some(w)) => *w <= 64,
+        // Signed and unsigned now share the width limit. Past 64 a
+        // scalar lives in `_harc_u128` or `HarcWide<N>`, both unsigned
+        // carriers — but the emitter routes `< <= > >= / % == !=` on a
+        // signed field through the two's-complement helpers
+        // (`harc_wide_slt`/`sdiv`/`smod`, the `_u128` twins) and `>>`
+        // through `harc_wide_ashr`, so the answer follows the declared
+        // sign bit, not the carrier's magnitude (harc#657). The cap used
+        // to stop signed at 64 precisely because those operators had not
+        // been routed.
+        IrType::UInt(Some(w)) | IrType::SInt(Some(w)) => *w <= crate::MAX_WIDTH_METHOD_BITS,
         _ => true,
     }
 }
