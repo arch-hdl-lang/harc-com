@@ -31,9 +31,10 @@
 //! the test reads them back as `<instance>.<field>`. The DUT-poking BFM
 //! still requires exactly one module-typed DUT handle field.
 //!
-//! Everything outside the subset — `bound to <BusType>` (initiator side),
-//! generics, event ports, `on` handlers, TLM target threads — is an
-//! explicit `Unsupported`. A `watchdog` is the exception: v1 emits its
+//! Event-bearing unbound transactors and `on` handlers route through the
+//! component lowering path before this module. Everything else outside the
+//! subset — `bound to <BusType>` (initiator side), generics, and TLM target
+//! threads — is rejected explicitly. A `watchdog` is the exception: v1 emits its
 //! body and never schedules it, so that one is a `NotImplemented`.
 
 use super::{
@@ -65,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// | item | v1 emits | verdict |
 /// |---|---|---|
-/// | `req : in event<uint<8>>` | `std::vector<std::function<void(uint64_t)>> req;` plus a real fan-out at the emit site (`for (auto& _s : _tb.drv.req) _s(1);`) | a real escape hatch |
+/// | `req : in event<uint<8>>` | routed to component lowering, which emits `std::vector<std::function<void(uint64_t)>> req;` plus the real fan-out at the emit site | supported |
 /// | `p : in uint<8>` / `out uint<8>` | `uint64_t p;` — the direction is dropped; uninitialized unless the field also carries a `default` | `SilentlyMisLowers` |
 /// | `dut : Top default <lit>` | `VTop* dut = <lit>;` — only `0` converts; `default 1` is "invalid conversion from 'int' to 'VTop*'" | `EmitsUncompilable` |
 /// | a second module-typed field | a `V<Name>*` member each, but only the testbench DUT's header — and this function cannot see which module that is | `EmitsUncompilable` |

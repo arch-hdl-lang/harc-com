@@ -1700,8 +1700,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         })
         .collect();
     // DUT-poking hookable BFM transactors (hookable methods + a DUT
-    // handle, no `on`/event/bound). They route to a `ComponentSchema`
-    // (so an `env` can hold one by value as a sub-component) but remain
+    // handle, no `on`/bound). They route to a `ComponentSchema` when an
+    // `env` holds one by value or when an event field needs component event
+    // lowering, but remain
     // transactors at a binding site: their methods live under `when
     // active`, so an instance requires an explicit `active` mode (same as
     // `event_driven_transactor_names`; a `passive` instance has no
@@ -1710,7 +1711,24 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .items
         .iter()
         .filter_map(|it| match it {
-            Item::Transactor(t) if components::transactor_is_dut_poking_bfm(t, env_held(t)) => {
+            Item::Transactor(t)
+                if components::transactor_is_dut_poking_bfm(t, env_held(t), &record_ids) =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    // Handler-less DUT-attached event hosts with no `when active` surface.
+    // Both explicit modes preserve their always-on event field, while v1
+    // rejects a missing mode because the host is still a transactor.
+    let always_on_dut_event_host_names: HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Transactor(t)
+                if components::transactor_is_always_on_dut_event_host(t, &record_ids) =>
+            {
                 Some(t.name.name.clone())
             }
             _ => None,
@@ -1851,6 +1869,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         &event_driven_transactor_names,
                         &reactive_monitor_names,
                         &dut_poking_bfm_names,
+                        &always_on_dut_event_host_names,
                         &function_library_names,
                         &passive_helper_names,
                     )?;
@@ -2461,6 +2480,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &tseq_records,
             &side_tables,
             &dut_poking_bfm_names,
+            &always_on_dut_event_host_names,
             &mut prog,
         )?;
     }
@@ -2658,6 +2678,7 @@ fn validate_testbench_component(
     event_driven_transactor_names: &HashSet<String>,
     reactive_monitor_names: &HashSet<String>,
     dut_poking_bfm_names: &HashSet<String>,
+    always_on_dut_event_host_names: &HashSet<String>,
     function_library_names: &HashSet<String>,
     passive_helper_names: &HashSet<String>,
 ) -> Result<(), LowerError> {
@@ -2762,6 +2783,18 @@ fn validate_testbench_component(
                     // before the event-driven gate (a monitor is a subset).
                     if reactive_monitor_names.contains(simple) {
                         continue;
+                    }
+                    if always_on_dut_event_host_names.contains(simple) {
+                        match mode {
+                            Some(TransactorMode::Active | TransactorMode::Passive) => continue,
+                            None => {
+                                return Err(LowerError::Invalid(format!(
+                                    "always-on event transactor field `{}.{} : {simple}` needs \
+                                     an `active`/`passive` mode annotation",
+                                    c.name.name, f.name.name
+                                )));
+                            }
+                        }
                     }
                     // A function-library transactor field (`model :
                     // ProtocolModel active`) routes to a `ComponentSchema`
@@ -3286,6 +3319,7 @@ fn lower_test(
     tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
+    always_on_dut_event_host_names: &HashSet<String>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -3895,6 +3929,21 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
+                if always_on_dut_event_host_names.contains(simple)
+                    && !matches!(
+                        l.ty.as_ref(),
+                        Some(TypeExpr::Named {
+                            mode: Some(TransactorMode::Active | TransactorMode::Passive),
+                            ..
+                        })
+                    )
+                {
+                    return Err(LowerError::Invalid(format!(
+                        "always-on event transactor instance `let {} : {simple}` needs \
+                         an `active`/`passive` mode annotation",
+                        l.name.name
+                    )));
+                }
                 // A DUT-poking hookable BFM transactor routes to a
                 // `ComponentSchema`, so it lands in this component-let
                 // branch — but it is still a transactor: its methods live

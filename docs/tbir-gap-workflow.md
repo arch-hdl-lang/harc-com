@@ -171,6 +171,11 @@ query spellings. The wide cover-selector batch removes the shared lowering
 gate for DUT lanes, hook-record lanes, and dynamic bit-slice bounds, leaving
 127 textual matches (126 constructors plus the helper). Because v1 emits
 uncompilable C++ for these wide selectors, their compile/run gate is TBIR-only.
+The handler-less unbound-transactor event batch routes scalar and declared-
+record event fields through the existing component event path, including
+direct emit fan-out. It closes the positive-v1 gaps in both declaration
+positions while leaving the raw count at 127 because the shared state-field
+diagnostic still rejects directional non-event fields.
 
 ## Review-derived semantic gates
 
@@ -236,7 +241,9 @@ not applicable before requesting review:
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
    diagnostic-call, component-predicate, dynamic record-list query, and wide
    cover-selector slices reduce the count from 174 to 127 textual matches (126
-   constructors plus the helper definition). The
+   constructors plus the helper definition). The handler-less unbound-
+   transactor event slice closes routes around a shared constructor, so the
+   count remains 127. The
    scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths
    were also reclassified because v1 rejects or silently mis-lowers them.
