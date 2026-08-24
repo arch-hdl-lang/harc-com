@@ -887,6 +887,9 @@ fn expr_has_probe(e: &ir::Expr) -> bool {
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
         ComponentVecElement {
             index, inner_index, ..
+        }
+        | TbFieldVecElement {
+            index, inner_index, ..
         } => expr_has_probe(index) || inner_index.as_deref().is_some_and(expr_has_probe),
         TransactorStateRecordField {
             mid_indices, index, ..
@@ -927,6 +930,12 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
                 || expr_has_probe(value)
         }
         ComponentVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        }
+        | TbFieldVecElementWrite {
             index,
             inner_index,
             value,
@@ -1213,6 +1222,12 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             inner_index,
             value,
             ..
+        }
+        | TbFieldVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
         } => {
             for_each_port_in_expr(index, f);
             if let Some(inner) = inner_index {
@@ -1319,6 +1334,9 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
         Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
         ComponentVecElement {
+            index, inner_index, ..
+        }
+        | TbFieldVecElement {
             index, inner_index, ..
         } => {
             for_each_port_in_expr(index, f);

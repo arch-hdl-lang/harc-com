@@ -1065,7 +1065,17 @@ impl FuncBuilder<'_> {
                 // allowed only from the test/check/hook body itself or from
                 // an inlined `_tb.<method>` frame; free helpers stay fenced.
                 if let Some(field) = self.tb_scalar_field_in_capture_scope(&id.name) {
-                    return Ok(Expr::TbField(field));
+                    // A fixed-vector host field is scalar-shaped storage but
+                    // a whole-`Vec` value; its element access lowers in the
+                    // indexed lane (`as_tb_vec_field`). A bare whole-`Vec`
+                    // read is not a scalar `TbField` — fall through so it is
+                    // refused rather than mis-lowered.
+                    if !matches!(
+                        self.ctx.tb_scalar_fields.get(&field),
+                        Some(IrType::FixedVec { .. })
+                    ) {
+                        return Ok(Expr::TbField(field));
+                    }
                 }
                 if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
                     return Err(unsupported(
@@ -1708,6 +1718,49 @@ impl FuncBuilder<'_> {
                         base,
                         field,
                         index_pos: 0,
+                        index: Box::new(index),
+                        inner_index: None,
+                    });
+                }
+                // `mem[i][j]` — nested fixed-vector testbench-field element
+                // read. The outer `Index`'s target is `mem[i]`; the base
+                // `mem` must resolve to a `Vec` whose element is a
+                // scalar-leaf `FixedVec` (a triple-nested leaf does not
+                // match, matching the component lane).
+                if let ExprKind::Index {
+                    target: inner_t,
+                    index: outer_idx,
+                } = &*target.kind
+                {
+                    if let Some((field, IrType::FixedVec { elem, len })) =
+                        self.as_tb_vec_field(inner_t)
+                    {
+                        if let IrType::FixedVec {
+                            len: inner_len,
+                            elem: inner_elem,
+                        } = &*elem
+                        {
+                            if !matches!(**inner_elem, IrType::FixedVec { .. }) {
+                                let outer = self.lower_expr(outer_idx)?;
+                                check_literal_tb_vec_index_bounds(&field, &outer, len)?;
+                                let inner = self.lower_expr(index)?;
+                                check_literal_tb_vec_index_bounds(&field, &inner, *inner_len)?;
+                                return Ok(Expr::TbFieldVecElement {
+                                    field,
+                                    index: Box::new(outer),
+                                    inner_index: Some(Box::new(inner)),
+                                });
+                            }
+                        }
+                    }
+                }
+                // `mem[i]` — single fixed-vector testbench-field element
+                // read (`_tb.mem[i]`).
+                if let Some((field, IrType::FixedVec { len, .. })) = self.as_tb_vec_field(target) {
+                    let index = self.lower_expr(index)?;
+                    check_literal_tb_vec_index_bounds(&field, &index, len)?;
+                    return Ok(Expr::TbFieldVecElement {
+                        field,
                         index: Box::new(index),
                         inner_index: None,
                     });
@@ -2727,6 +2780,20 @@ impl FuncBuilder<'_> {
                     inner_index,
                 }
             }
+            // Fixed-vector testbench-field / test-local element reads carry
+            // index sub-exprs that may hold DUT ports (`mem[dut.sel]`) —
+            // hoist into both dimensions, mirroring `ComponentVecElement`.
+            Expr::TbFieldVecElement { field, index, inner_index } => {
+                let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
+                let inner_index = inner_index.map(|j| {
+                    Box::new(self.hoist_ports_with_hint(*j, None, exact_untyped_ports))
+                });
+                Expr::TbFieldVecElement {
+                    field,
+                    index: Box::new(index),
+                    inner_index,
+                }
+            }
             Expr::TransactorStateRecordField {
                 instance,
                 field,
@@ -3226,6 +3293,26 @@ impl FuncBuilder<'_> {
                     base,
                     field,
                     index_pos,
+                    index: Box::new(index),
+                    inner_index,
+                }
+            }
+            // A value-returning transactor-method call in a fixed-vector
+            // testbench-field READ index (`mem[xt.idx()]`) must hoist into a
+            // `Stmt::TransactorCall` like any other call-in-expression — the
+            // write path already does (its index goes through this same
+            // helper), so without this arm the read is asymmetric and the
+            // verifier rejects the un-hoisted call edge. Mirrors
+            // `ComponentVecElement`.
+            Expr::TbFieldVecElement {
+                field,
+                index,
+                inner_index,
+            } => {
+                let index = self.hoist_transactor_calls(*index);
+                let inner_index = inner_index.map(|j| Box::new(self.hoist_transactor_calls(*j)));
+                Expr::TbFieldVecElement {
+                    field,
                     index: Box::new(index),
                     inner_index,
                 }
@@ -3830,6 +3917,13 @@ impl FuncBuilder<'_> {
     }
     /// `Some(field)` when the expression is a one-segment access to a
     /// scalar testbench field: `_tb.expected`.
+    ///
+    /// A fixed-vector host field (`_tb.mem`) is deliberately EXCLUDED: it
+    /// is scalar-shaped storage in the same `tb_scalar_fields` table but a
+    /// whole-`Vec` value, not a scalar. Its element access lowers through
+    /// `as_tb_vec_field` (the indexed lane); letting it answer here would
+    /// make a bare `_tb.mem` a scalar `TbField` and a subscript on it fall
+    /// through to the undeclared-name path.
     pub(crate) fn as_tb_scalar_field(&self, e: &AstExpr) -> Option<String> {
         let tb_field = self.ctx.tb_field.as_deref()?;
         let ExprKind::Field { target, name } = &*e.kind else {
@@ -3838,8 +3932,40 @@ impl FuncBuilder<'_> {
         let ExprKind::Ident(root) = &*target.kind else {
             return None;
         };
-        (root.name == tb_field && self.ctx.tb_scalar_fields.contains_key(&name.name))
-            .then(|| name.name.clone())
+        if root.name != tb_field {
+            return None;
+        }
+        match self.ctx.tb_scalar_fields.get(&name.name) {
+            Some(IrType::FixedVec { .. }) | None => None,
+            Some(_) => Some(name.name.clone()),
+        }
+    }
+
+    /// `Some((field, FixedVec type))` when `e` names a fixed-vector
+    /// testbench host field — either `_tb.mem` or a bare `mem` in the
+    /// test/check/hook capture scope. Drives the element read/write lanes
+    /// (`Expr::TbFieldVecElement` / `Stmt::TbFieldVecElementWrite`); the
+    /// scalar resolvers above skip these so the two lanes never collide.
+    pub(crate) fn as_tb_vec_field(&self, e: &AstExpr) -> Option<(String, IrType)> {
+        let name = match &*e.kind {
+            // `_tb.mem`
+            ExprKind::Field { target, name } => {
+                let ExprKind::Ident(root) = &*target.kind else {
+                    return None;
+                };
+                if root.name != self.ctx.tb_field.as_deref()? {
+                    return None;
+                }
+                name.name.clone()
+            }
+            // bare `mem` in capture scope
+            ExprKind::Ident(id) => self.tb_scalar_field_in_capture_scope(&id.name)?,
+            _ => return None,
+        };
+        match self.ctx.tb_scalar_fields.get(&name) {
+            Some(ty @ IrType::FixedVec { .. }) => Some((name, ty.clone())),
+            _ => None,
+        }
     }
 
     /// The record a `_tb.<field>` / bare `<field>` target names, when
@@ -5065,6 +5191,24 @@ pub(crate) fn check_literal_vec_index_bounds(
     )))
 }
 
+pub(crate) fn check_literal_tb_vec_index_bounds(
+    field: &str,
+    idx: &Expr,
+    len: usize,
+) -> Result<(), LowerError> {
+    let Expr::Literal { value, .. } = idx else {
+        return Ok(());
+    };
+    if (*value as u128) < len as u128 {
+        return Ok(());
+    }
+    Err(LowerError::Invalid(format!(
+        "element index {value} is out of range for testbench `Vec` field \
+         `{field}` of length {len} (valid indices are 0..={})",
+        len.saturating_sub(1)
+    )))
+}
+
 pub(crate) fn check_literal_component_vec_index_bounds(
     base: &crate::ir::ComponentBase,
     field: &str,
@@ -5230,6 +5374,21 @@ pub(crate) fn expr_has_transactor_edge(e: &Expr) -> bool {
             expr_has_transactor_edge(n)
         }
         Expr::SeqIndex { index, .. } => expr_has_transactor_edge(index),
+        // A transactor call nested in a fixed-vector element INDEX
+        // (`mem[xt.idx()]` / `sb.v[xt.idx()]`) reaches a `wait until`
+        // predicate wrapped in a vec node, not bare. Without recursing
+        // here the predicate scanner misses it: the honest "call in a
+        // `wait until` predicate" refusal is skipped and the un-hoistable
+        // call surfaces later as a verifier `BadTransactorCall` instead.
+        Expr::TbFieldVecElement {
+            index, inner_index, ..
+        }
+        | Expr::ComponentVecElement {
+            index, inner_index, ..
+        } => {
+            expr_has_transactor_edge(index)
+                || inner_index.as_deref().is_some_and(expr_has_transactor_edge)
+        }
         Expr::BitSlice { target, .. } => expr_has_transactor_edge(target),
         Expr::BitSliceDyn { target, hi, lo } => {
             expr_has_transactor_edge(target)

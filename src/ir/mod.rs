@@ -2129,6 +2129,14 @@ pub enum Stmt {
         field: String,
         value: Expr,
     },
+    /// `_tb.<field>[i] = value` — element write of a fixed-vector
+    /// testbench field. See `Expr::TbFieldVecElement`.
+    TbFieldVecElementWrite {
+        field: String,
+        index: Expr,
+        inner_index: Option<Expr>,
+        value: Expr,
+    },
     /// `_tb.<field>.push(value)` on a testbench-owned typed FIFO.
     TbQueuePush {
         field: String,
@@ -2687,6 +2695,17 @@ pub enum Expr {
     /// `_tb.<field>` read on a scalar testbench field. Host state —
     /// allowed in every expression position a `Local` is.
     TbField(String),
+    /// `_tb.<field>[i]` — element read of a fixed-vector testbench field
+    /// (`mem : Vec<T, N>`). `index` selects the outer dimension;
+    /// `inner_index` a nested `Vec<Vec<..>>`'s inner dimension
+    /// (`mem[i][j]`), `None` for a single-level read. Mirrors the
+    /// component `ComponentVecElement` shape; a distinct node because the
+    /// receiver is a `_tb` field name, not a `ComponentBase`.
+    TbFieldVecElement {
+        field: String,
+        index: Box<Expr>,
+        inner_index: Option<Box<Expr>>,
+    },
     /// A temporal reading (`past`/`rose`/`fell`/`stable`) of latch slot
     /// `slot` in the enclosing concurrent check's `temporals` list.
     ///

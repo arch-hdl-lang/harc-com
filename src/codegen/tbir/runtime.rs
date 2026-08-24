@@ -578,6 +578,22 @@ pub(super) fn tb_struct(
     }
     for field in state_fields {
         match field {
+            crate::ir::TbStateFieldSchema::Scalar(f)
+                if matches!(f.ty, crate::ir::IrType::FixedVec { .. }) =>
+            {
+                // Fixed-vector host field. Zero-filled brace-init on the
+                // `std::array` member (`std::array<cty, N> mem{};`),
+                // matching v1 — `scalar_field_decl`'s `= <init>` form has no
+                // constructor `std::array` accepts, which is exactly why a
+                // `default` on such a field is refused at lowering.
+                writeln!(
+                    out,
+                    "{INDENT}{} {}{{}};",
+                    super::field_scalar_cty(&f.ty),
+                    f.name
+                )
+                .ok();
+            }
             crate::ir::TbStateFieldSchema::Scalar(f) => {
                 let (cty, init) = scalar_field_decl(&f.ty, f.default);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();

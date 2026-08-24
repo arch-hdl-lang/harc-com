@@ -397,6 +397,15 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 inner_index,
                 value,
                 ..
+            }
+            // Host state on the _tb struct / a test-scope `let` local — no
+            // pin access of its own; the index and value may carry inline
+            // reads, so walk them all (mirrors `TbFieldWrite`).
+            | Stmt::TbFieldVecElementWrite {
+                index,
+                inner_index,
+                value,
+                ..
             } => {
                 host_service_only = false;
                 visit_expr(index, &mut accesses, &mut transactor);
@@ -607,6 +616,9 @@ fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
             }
         }
         Expr::ComponentVecElement {
+            index, inner_index, ..
+        }
+        | Expr::TbFieldVecElement {
             index, inner_index, ..
         } => {
             visit_expr(index, accesses, transactor);

@@ -1132,6 +1132,28 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::Assign(id, Expr::Literal { value: 0, ty }));
                 return Ok(());
             }
+            // A fixed-vector `let m : Vec<T, N>` with no initializer. This
+            // is NOT a false `--codegen v1` promise: v1 sizes the local
+            // from a SCALAR fallback (`int64_t m = 0;`) and then subscripts
+            // it (`m[i] = ...`), which g++ rejects — the local is a scalar,
+            // not an array (measured). Host a fixed vector on the testbench
+            // instead, where both backends emit a real `std::array`.
+            if l.ty.as_ref().is_some_and(|t| {
+                matches!(
+                    super::components::fixed_vec_elem_ir_type(t),
+                    Some(IrType::FixedVec { .. })
+                )
+            }) {
+                return Err(not_implemented(
+                    &format!(
+                        "a test-scope `let {} : Vec<...>` fixed-vector local",
+                        l.name.name
+                    ),
+                    "v1 declares it as a scalar (`int64_t m = 0;`) and subscripts it, which does \
+                     not compile — host the fixed vector on the testbench (`mem : Vec<T, N>`)",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
             // Stays an `Unsupported`: v1 emits a COMMENT for the
             // declaration (`// let x (no type / no value)`), so whether
             // its output compiles depends on whether the name is ever
@@ -2190,10 +2212,20 @@ impl FuncBuilder<'_> {
         if let crate::ast::ExprKind::Ident(id) = &*target.kind {
             if self.lookup(&id.name).is_none() {
                 if let Some(field) = self.tb_scalar_field_in_capture_scope(&id.name) {
-                    let e = self.lower_expr_no_ports(value)?;
-                    self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
-                    self.push(Stmt::TbFieldWrite { field, value: e });
-                    return Ok(());
+                    // A fixed-vector host field is scalar-shaped storage but
+                    // a whole-`Vec` value; a bare whole-`Vec` write is not a
+                    // scalar field write. Element writes (`mem[i] = v`) take
+                    // the indexed lane; fall through so a whole-`Vec` write
+                    // is refused rather than mis-lowered.
+                    if !matches!(
+                        self.ctx.tb_scalar_fields.get(&field),
+                        Some(IrType::FixedVec { .. })
+                    ) {
+                        let e = self.lower_expr_no_ports(value)?;
+                        self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
+                        self.push(Stmt::TbFieldWrite { field, value: e });
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -3134,6 +3166,63 @@ impl FuncBuilder<'_> {
                     base,
                     field,
                     index_pos: 0,
+                    index,
+                    inner_index: None,
+                    value,
+                });
+                return Ok(());
+            }
+            // `mem[i][j] = v` — nested fixed-vector testbench-field element
+            // write. `it` here is `mem[i]`; its inner target `mem` must be
+            // a `Vec` whose element is a scalar-leaf `FixedVec` (triple
+            // nesting does not match, mirroring the component lane).
+            if let ExprKind::Index {
+                target: inner_t,
+                index: outer_idx,
+            } = &*it.kind
+            {
+                if let Some((field, IrType::FixedVec { elem, len })) = self.as_tb_vec_field(inner_t)
+                {
+                    if let IrType::FixedVec {
+                        len: inner_len,
+                        elem: inner_elem,
+                    } = &*elem
+                    {
+                        if !matches!(**inner_elem, IrType::FixedVec { .. }) {
+                            let outer = self.lower_expr_no_ports(outer_idx)?;
+                            super::exprs::check_literal_tb_vec_index_bounds(&field, &outer, len)?;
+                            let inner = self.lower_expr_no_ports(index)?;
+                            super::exprs::check_literal_tb_vec_index_bounds(
+                                &field, &inner, *inner_len,
+                            )?;
+                            let value = self.lower_expr_no_ports(value)?;
+                            self.reject_record_into_scalar(
+                                &value,
+                                &format!("element of nested testbench `Vec` field `{field}`"),
+                            )?;
+                            self.push(Stmt::TbFieldVecElementWrite {
+                                field,
+                                index: outer,
+                                inner_index: Some(inner),
+                                value,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            // `mem[i] = v` — single fixed-vector testbench-field element
+            // write (`_tb.mem[i] = v`).
+            if let Some((field, IrType::FixedVec { len, .. })) = self.as_tb_vec_field(it) {
+                let index = self.lower_expr_no_ports(index)?;
+                super::exprs::check_literal_tb_vec_index_bounds(&field, &index, len)?;
+                let value = self.lower_expr_no_ports(value)?;
+                self.reject_record_into_scalar(
+                    &value,
+                    &format!("element of testbench `Vec` field `{field}`"),
+                )?;
+                self.push(Stmt::TbFieldVecElementWrite {
+                    field,
                     index,
                     inner_index: None,
                     value,

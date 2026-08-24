@@ -9104,6 +9104,70 @@ former `transaction` group lives in
      lowers and dumps identically to the branch point; no existing
      program changed.
 
+144. **Testbench fixed-vector host field — and the `let Vec` split it
+     surfaced (2026-08-23).**
+
+     A `Vec<T, N>` declared as TESTBENCH host state (`mem : Vec<uint<8>,
+     4>` on a reusable testbench, read/written `mem[i] = x` in run/check)
+     was refused ("non-scalar, non-named type") while v1 emitted the
+     correct `std::array<uint64_t, 4> mem{};` member and `_tb.mem[i]`
+     element access. An IMPLEMENT batch, the field analogue of divergence
+     143's component field: the member renders through the SAME shared
+     `field_scalar_cty` seam v1 uses, so every element class and nesting
+     depth v1 handles is handled here for free. The IR carries the reads
+     as `Expr::TbFieldVecElement { field, index, inner_index }` and the
+     writes as `Stmt::TbFieldVecElementWrite` — distinct from the
+     component nodes only because the receiver is a `_tb` field name, not
+     a `ComponentBase`.
+
+     Measured against v1 byte-for-byte: `std::array<{uint64_t | int64_t |
+     _harc_u128 | HarcWide<32>}, 4> mem{};` for `uint<8>` / `sint<8>` /
+     `uint<128>` / `uint<1024>` leaves, `std::array<std::array<uint64_t,
+     2>, 2> mem{};` nested, and `_tb.mem[i]` / `_tb.mem[i][j]` for the
+     read/write — all compiling under g++ `-std=gnu++20`. The scalar
+     resolvers (`as_tb_scalar_field`, and the bare-name capture-scope
+     lane) SKIP a fixed-vector-typed entry: it is scalar-shaped storage in
+     the same `tb_scalar_fields` table but a whole-`Vec` value, and
+     letting it answer the scalar lane would make a bare `_tb.mem` a
+     scalar `TbField` and a subscript on it fall through to the
+     undeclared-name path. Element access takes the new indexed lane
+     (`as_tb_vec_field`) instead.
+
+     The cut line, each refusal MEASURED, not assumed: a `default` on the
+     field is refused `NotImplemented`/`EmitsUncompilable` because v1
+     emits `std::array<...> mem = <lit>;`, which `std::array` has no
+     constructor for; both index dimensions are bounds-checked (`Invalid`).
+
+     **The split this batch's measurement forced.** The requested scope
+     was "testbench field AND test-scope `let Vec`", and the two do not
+     share a verdict. A test-scope `let m : Vec<T, N>` makes v1 size the
+     local from a SCALAR fallback — `int64_t m = 0;` — and then subscript
+     it (`m[0] = 5;`), which g++ rejects: the local is a scalar, not an
+     array. So the `let` half is NOT implementable to match v1 (matching
+     it would mean matching uncompilable output, and diverging from it to
+     "fix" it breaks the byte-parity contract). It is regraded
+     `NotImplemented`/`EmitsUncompilable` with a message that names v1's
+     actual failure and points at the working spelling (host the vector on
+     the testbench), never a `--codegen v1` promise. The batch-45 rule
+     again: one construct name, two landings, worst-wins — and here the
+     two landings live in two different source positions, one an implement
+     and one a regrade. `Expr::LocalVecElement` / `LocalVecElementWrite`
+     nodes were built out during the first pass and then removed: with the
+     `let` half regraded, nothing produces them, and an IR node with no
+     producer is a dead, untested path.
+
+     Two walker misses an adversarial review caught, both the §143 class
+     (a node the emitter visits but an analysis pass does not). A
+     value-returning transactor-method call in a vec INDEX
+     (`mem[xt.idx()]`): in a statement context it must hoist to a
+     `Stmt::TransactorCall` like the write path already did, so
+     `hoist_transactor_calls` gained the `TbFieldVecElement` arm; in a
+     `wait until` predicate it cannot hoist, so `expr_has_transactor_edge`
+     — the predicate's call scanner — gained it too (and the long-latent
+     `ComponentVecElement` case beside it), so the honest "hoist the call
+     into a `let`" refusal fires instead of a downstream verifier
+     `BadTransactorCall`. The corpus dumps identically across all of it.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

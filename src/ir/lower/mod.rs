@@ -1204,8 +1204,13 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let mut covgroups: Vec<CovgroupSchema> = Vec::new();
     for it in &file.items {
         if let Item::Covergroup(g) = it {
-            let schema =
-                covergroups::lower_covergroup(g, &helper_registry, &extern_fn_decls, &const_vals, &ambiguous_variants)?;
+            let schema = covergroups::lower_covergroup(
+                g,
+                &helper_registry,
+                &extern_fn_decls,
+                &const_vals,
+                &ambiguous_variants,
+            )?;
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }
@@ -3009,6 +3014,26 @@ fn validate_testbench_component(
                         record_ids,
                         enum_names,
                     )?;
+                } else if matches!(
+                    components::fixed_vec_elem_ir_type(&f.ty),
+                    Some(IrType::FixedVec { .. })
+                ) {
+                    // A fixed-vector host field (`mem : Vec<T, N>`). v1
+                    // emits `std::array<cty, N> mem{};` and `_tb.mem[i]`
+                    // element access; tbir matches through the shared
+                    // `field_scalar_cty` seam. A `default` is refused: v1
+                    // emits `std::array<...> mem = <lit>;`, and `std::array`
+                    // has no such constructor (measured).
+                    if f.default.is_some() {
+                        return Err(not_implemented(
+                            &format!(
+                                "a `default` on testbench fixed-vector field `{}`",
+                                f.name.name
+                            ),
+                            "fixed vectors default-construct zero-filled; drop the `default`",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
                     return Err(unsupported(
                         &format!(
@@ -4303,6 +4328,23 @@ fn lower_test(
                             };
                             queue_fields.push(queue.clone());
                             state_fields.push(ir::TbStateFieldSchema::Queue(queue));
+                        } else if let Some(ty @ IrType::FixedVec { .. }) =
+                            components::fixed_vec_elem_ir_type(&f.ty)
+                        {
+                            // Fixed-vector host field. Stored as a `Scalar`
+                            // state field carrying a `FixedVec` `ty`; the
+                            // emitter renders `std::array<cty, N> mem{};`
+                            // through `field_scalar_cty` (the same seam v1
+                            // uses). `default` was refused at validation.
+                            // `default` carried as 0 — the member is
+                            // zero-filled `{}` regardless, matching v1.
+                            let scalar = ir::TbScalarFieldSchema {
+                                name: f.name.name.clone(),
+                                ty,
+                                default: 0,
+                            };
+                            scalar_fields.push(scalar.clone());
+                            state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
                         } else if let Some(ty) = tb_scalar_field_ir_type(&f.ty) {
                             // Same rule as the component / scoreboard /
                             // transactor-state field defaults: folded
@@ -7806,6 +7848,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
             ir::Expr::ComponentField { .. } => None,
             ir::Expr::ComponentVecElement {
                 index, inner_index, ..
+            }
+            | ir::Expr::TbFieldVecElement {
+                index, inner_index, ..
             } => in_expr(index).or_else(|| inner_index.as_deref().and_then(in_expr)),
             _ => None,
         }
@@ -7876,6 +7921,17 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 // any expr they carry holds no transactor-state node.
                 ir::Stmt::ComponentFieldWrite { value, .. } => in_expr(value),
                 ir::Stmt::ComponentVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => in_expr(index)
+                    .or_else(|| inner_index.as_ref().and_then(in_expr))
+                    .or_else(|| in_expr(value)),
+                // Fixed-vector testbench-field / test-local element writes
+                // are test-scope host state, not per-instance responder
+                // state, but scan their index/value exprs for completeness.
+                ir::Stmt::TbFieldVecElementWrite {
                     index,
                     inner_index,
                     value,
@@ -7988,6 +8044,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 index: Some(idx), ..
             } => fill_expr(idx, instance),
             ir::Expr::ComponentVecElement {
+                index, inner_index, ..
+            }
+            | ir::Expr::TbFieldVecElement {
                 index, inner_index, ..
             } => {
                 fill_expr(index, instance);
@@ -8120,6 +8179,12 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 },
                 ir::Stmt::ComponentFieldWrite { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                }
+                | ir::Stmt::TbFieldVecElementWrite {
                     index,
                     inner_index,
                     value,
@@ -8304,6 +8369,9 @@ fn fill_visit_expr(
         } => fill_visit_expr(idx, placeholder, binding, remap, rewrite, conflict),
         Expr::ComponentVecElement {
             index, inner_index, ..
+        }
+        | Expr::TbFieldVecElement {
+            index, inner_index, ..
         } => {
             fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict);
             if let Some(inner) = inner_index {
@@ -8411,6 +8479,12 @@ fn fill_initiator_bus_prefix(
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::ComponentVecElementWrite {
+                        index,
+                        inner_index,
+                        value,
+                        ..
+                    }
+                    | Stmt::TbFieldVecElementWrite {
                         index,
                         inner_index,
                         value,
