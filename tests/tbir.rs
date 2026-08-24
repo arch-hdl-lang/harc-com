@@ -29860,6 +29860,75 @@ end impl MTest"#;
     );
 }
 
+/// The record-element twin of the scalar-element yield check above: a
+/// `yield <local>` in a `TSeq<Record>` body whose local is not that same
+/// record. v1 pushes the local verbatim and emits the mismatched
+/// `std::vector<Record>::push_back(<other>)`, which g++ refuses — so the
+/// honest verdict is `NotImplemented(EmitsUncompilable)`, not a
+/// `--codegen v1` promise.
+///
+/// Two locals reach the arm: a DISTINCT record (`Other`), and a SCALAR
+/// (`record_of_local == None`). Both measured to `push_back(Other&)` /
+/// `push_back(uint64_t&)` under v1.
+#[test]
+fn yield_of_a_wrong_typed_local_in_a_record_tseq_is_emitsuncompilable() {
+    const SRC: &str = r#"transaction RegOp
+    a : uint<8>
+end transaction RegOp
+
+transaction Other
+    b : uint<8>
+end transaction Other
+
+tseq Gen(n: int) -> TSeq<RegOp>
+    for _ in 1 .. n
+        let u : Other
+        yield u
+    end for
+end tseq Gen
+
+testbench MTb
+    dut : Top
+end testbench MTb
+
+impl MTest for MTb
+    run
+        let xs = Gen(2)
+        wait 1 cycle
+    end run
+end impl MTest"#;
+
+    // A distinct-record local: v1 emits `push_back(Other&)`.
+    let msg = assert_not_implemented(
+        &lower_src(SRC).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("not a `RegOp` record local"), "{msg}");
+    assert!(msg.contains("mismatched"), "{msg}");
+
+    // A SCALAR local reaches the same arm (`record_of_local == None`);
+    // v1 emits `push_back(uint64_t&)`. Same verdict.
+    let scalar = SRC.replace(
+        "        let u : Other\n        yield u\n",
+        "        let m : uint<8> = 5\n        yield m\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&scalar).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("not a `RegOp` record local"), "{msg}");
+
+    // The control — a same-typed record local — still lowers and emits.
+    let ok = SRC.replace(
+        "        let u : Other\n        yield u\n",
+        "        let u : RegOp\n        yield u\n",
+    );
+    assert!(
+        emit_cpp_src(&ok).contains("push_back"),
+        "a same-typed record yield still lowers"
+    );
+}
+
 /// `components.rs`'s sub-component-field arm covered two inputs that v1
 /// treats oppositely, and classified them alike.
 ///

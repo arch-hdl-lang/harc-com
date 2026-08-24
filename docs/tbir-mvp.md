@@ -9312,6 +9312,31 @@ former `transaction` group lives in
      out precisely needs its own measured sub-batch, so the arm is left as
      is for now.
 
+149. **`yield` of a wrong-typed local in a record-element tseq — regrade
+     (2026-08-24).**
+
+     In a `TSeq<Record>` generator body, `yield <ident>` where the local
+     is not that same record was an `unsupported` ("re-run with
+     `--codegen v1`"). v1 accepts it: it pushes the local verbatim and
+     emits the mismatched `std::vector<Record>::push_back(<other>)`, which
+     g++ refuses — so the promise is false and the honest grade is
+     `NotImplemented`/`EmitsUncompilable`.
+
+     Two locals reach the arm, and both were measured: a DISTINCT record
+     (`let u : Other; yield u` into `TSeq<RegOp>`) → v1 emits
+     `push_back(Other&)`; and a SCALAR (`let m : uint<8>; yield m`, which
+     hits the same arm because `record_of_local` is `None`) → v1 emits
+     `push_back(uint64_t&)`. Both are `EmitsUncompilable`, one verdict, so
+     the whole arm regrades cleanly. The control — a same-typed record
+     local — still lowers and emits `push_back`.
+
+     This is the record-element twin of the scalar-element yield check in
+     the arm above (a record yielded into a `TSeq<scalar>`), graded the
+     same way and for the same reason. The SEPARATE non-identifier site
+     (`yield w.inner`, a field access rather than a bare local) is a
+     batch-45 split — v1 compiles it when the field is the element type —
+     and is left as `unsupported`, untouched. Corpus dumps identically.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

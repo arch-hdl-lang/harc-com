@@ -4561,13 +4561,22 @@ impl FuncBuilder<'_> {
                 match self.record_of_local(local) {
                     Some(rid) if rid == elem_rid => {}
                     _ => {
-                        return Err(unsupported(
+                        // The local is not a `<elem>` record — a distinct
+                        // record, or a scalar (which reaches this arm with
+                        // `record_of_local == None`). v1 pushes it verbatim
+                        // and emits the mismatched
+                        // `std::vector<Elem>::push_back(<other>)`, which g++
+                        // refuses — the record-element twin of the
+                        // scalar-element arm above.
+                        return Err(not_implemented(
                             &format!(
                                 "`yield {}` whose value is not a `{}` record local",
                                 id.name,
                                 self.ctx.records[elem_rid.index()].name
                             ),
-                            "yield a same-typed transaction local",
+                            "yield a same-typed transaction local; v1 emits the mismatched \
+                             `push_back`, which does not compile",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                 }
