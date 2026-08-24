@@ -3042,9 +3042,14 @@ impl FuncBuilder<'_> {
                         return Ok(());
                     }
                     crate::ir::StateFieldKind::Queue { .. } => {
-                        return Err(unsupported(
+                        // Not a `--codegen v1` escape: v1 emits the bare
+                        // assignment and g++ refuses "no match for
+                        // `operator=` (`harc_rt::HarcQueue<...>` and int)"
+                        // (measured). Mutate via the queue ops instead.
+                        return Err(not_implemented(
                             &format!("bare assignment to the `queue` state field `{}`", id.name),
                             "mutate a queue state field via `.push(x)` / `.pop()`",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                 }

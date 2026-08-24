@@ -38523,3 +38523,85 @@ end impl T"#;
     verify::verify_program(&prog).expect("verifies");
     tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default()).expect("emits");
 }
+
+/// A bare read or write of a `queue` state field in a bound-to target
+/// responder body is refused honestly, not pointed at `--codegen v1`: v1
+/// emits the bare op against the `harc_rt::HarcQueue<...>` member and g++
+/// rejects it (`no match for operator=` on a write; `cannot convert
+/// HarcQueue to uint64_t` on a read — measured). Mutate/read via the queue
+/// ops. The valid `.push(x)` control lowers under both backends.
+#[test]
+fn a_bare_queue_state_field_op_is_refused_without_a_false_v1_promise() {
+    let mk = |body: &str| {
+        format!(
+            r#"bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+transactor TlmMemTarget bound to TlmMemBus
+    n : uint<32> default 0
+    q : queue<uint<8>>
+    thread bus.read(addr: uint<8>)
+        {body}
+        return 1
+    end thread
+end transactor TlmMemTarget
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T"#
+        )
+    };
+    for (op, what) in [("q = 1", "bare assignment"), ("n = q", "bare read")] {
+        let err = lower_src(&mk(op))
+            .err()
+            .unwrap_or_else(|| panic!("`{op}` must be refused"));
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            !msg.contains("re-run with `--codegen v1`"),
+            "{what}: must not promise v1 works: {msg}"
+        );
+    }
+    // Control: the queue field itself is fine — a valid op lowers.
+    lower_src(&mk("q.push(1)")).expect("a valid queue op lowers");
+}
+
+/// A target thread that does not name `bus.<method>` is a program error
+/// (`Invalid`), not a `--codegen v1` suggestion: v1 refuses it too. Guards
+/// the regrade of the `thread <x>`-shape arm to match its sibling arms.
+#[test]
+fn a_non_bus_target_thread_is_invalid_not_a_v1_suggestion() {
+    let src = r#"bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+transactor TlmMemTarget bound to TlmMemBus
+    n : uint<32> default 0
+    thread run_loop(addr: uint<8>)
+        n = n + 1
+        return 1
+    end thread
+end transactor TlmMemTarget
+testbench Tb
+    dut : TlmReadInitiator
+end testbench Tb
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        dut.rst = 1
+        wait 2 cycles
+    end run
+end impl T"#;
+    let err = lower_src(src).expect_err("a non-`bus.<method>` target thread is refused");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("bus.<method>"),
+        "must name the required `bus.<method>` shape: {msg}"
+    );
+}

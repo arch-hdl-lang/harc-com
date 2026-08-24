@@ -9217,6 +9217,37 @@ former `transaction` group lives in
      the two-or-more-argument arm keeps its arity error (a different
      construct, out of scope).
 
+146. **Bare `queue` state-field op + non-`bus.<method>` target thread —
+     two regrades (2026-08-24).**
+
+     Both were `unsupported` ("re-run with `--codegen v1`") on constructs
+     v1 does not actually handle; neither is an implement (v1's output is
+     wrong or refused), so each is a pure error-classification fix. No IR,
+     no emit change; the corpus dumps identically.
+
+     *Bare queue op → `EmitsUncompilable`.* A bare read (`n = q`) or write
+     (`q = 1`) of a `queue` state field in a bound-to target responder
+     body (`exprs.rs`, `stmts.rs`) — v1 emits the bare op against the
+     `harc_rt::HarcQueue<...>` member and g++ refuses: `no match for
+     'operator=' (HarcQueue<...> and int)` on the write, `cannot convert
+     HarcQueue<...> to uint64_t` on the read (measured, with a `q.push(1)`
+     control that compiles under both backends, isolating the op as the
+     cause). The queue field is read/written through its ops
+     (`.push`/`.pop`/`.size`/`.empty`); the bare form was never a v1
+     escape. Single host (the bound-to responder), two call sites (read +
+     write), both measured to the same verdict — no batch-45 split.
+
+     *Non-`bus.<method>` target thread → `Invalid`.* A `thread <x>` whose
+     path is not `bus.<method>` (`transactors.rs`) is a program error, not
+     a subset gap: v1 refuses it too ("target TLM thread ... must target
+     `bus.<method>`", measured), so it joins the four `Invalid` siblings
+     in the same loop (unknown method, arity mismatch, bad tag count)
+     rather than pointing at v1. Its two neighbouring `unsupported` arms
+     (non-literal `out_of_order tags`, non-`blocking`/`out_of_order` mode)
+     are parser-unreachable — the bus grammar admits only `blocking` /
+     `out_of_order tags <literal>` — so they are left as defensive dead
+     code rather than regraded on an unmeasurable path.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
