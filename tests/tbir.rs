@@ -38654,3 +38654,33 @@ end impl T"#
             .unwrap_or_else(|e| panic!("[{kind}] scalar Vec lowers: {e}"));
     }
 }
+
+/// A wrapping operator (`+%`/`-%`/`*%`) at operand width > 64 is refused
+/// honestly, not pointed at `--codegen v1`: v1 has its own identical gate
+/// and refuses it too (`Rejects` — v1 emits no C++). A wrapping op at 64
+/// bits still lowers.
+#[test]
+fn a_wide_wrapping_operator_is_refused_without_a_false_v1_promise() {
+    let mk = |op: &str, w: u32| {
+        format!(
+            r#"testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let a : uint<{w}> = 7
+        let r : uint<{w}> = a {op} a
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    for op in ["+%", "-%", "*%"] {
+        let err = lower_src(&mk(op, 128))
+            .err()
+            .unwrap_or_else(|| panic!("`{op}` at 128 must be refused"));
+        assert_not_implemented(&err, lower::V1Status::Rejects);
+        // No regression: the same operator at 64 bits lowers.
+        lower_src(&mk(op, 64)).unwrap_or_else(|e| panic!("`{op}` at 64 lowers: {e}"));
+    }
+}
