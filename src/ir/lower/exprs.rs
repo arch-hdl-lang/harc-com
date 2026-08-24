@@ -3158,6 +3158,70 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// Does the composed width of `e` rest on a genuinely-WIDTHLESS
+    /// scalar leaf — a leaf whose declared width is unknown, so its
+    /// contribution to the result width is the 64-bit host-ABI
+    /// PLACEHOLDER `common_expr_type` manufactures, not a width anyone
+    /// declared?
+    ///
+    /// The directional narrowing check must not fire on a manufactured
+    /// width. `seen : uint<32>` written `seen + N` for a file-scope
+    /// `const N = 9` is not a narrowing: `N` substitutes as a widthless
+    /// `UInt(None)` (it carries signedness but no width, by #525's
+    /// design — a const's width is not its value's minimum), so
+    /// `scalar_assignment_type` reports the sum as 64-bit, and flagging
+    /// that against a 32-bit field is a false positive with no honest
+    /// source fix. A widthless DUT-port read or dynamic bit-slice is
+    /// the same. The check is skipped for width when this is true; a
+    /// leaf with a DECLARED width (`v[0][1] : uint<128>`) is not
+    /// widthless, so `n = n + v[0][1]` is still judged and refused.
+    ///
+    /// An ordinary integer literal (`Literal { ty: Unknown }`) is NOT
+    /// widthless here: `common_expr_type` sizes it to the other operand
+    /// rather than to 64, so it never manufactures a width. Only the
+    /// `UInt(None)`/`SInt(None)`-typed leaves do.
+    ///
+    /// Mirrors `scalar_assignment_type`'s arithmetic decomposition so
+    /// the two agree about which leaves a width is built from.
+    pub(super) fn rhs_width_manufactured(&self, e: &Expr) -> bool {
+        match e {
+            // A comparison/logical result is `bool` (width 1, known);
+            // its operands do not contribute to the result width.
+            Expr::Binary(
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or,
+                _,
+                _,
+            ) => false,
+            Expr::Unary(crate::ir::UnOp::Not, _) => false,
+            // A shift's width is the shifted value's; the count does not
+            // contribute. `&` narrows to the narrower operand, and a
+            // sized-literal mask bounds it — but a widthless leaf on
+            // either side still manufactures, so recurse both.
+            Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => self.rhs_width_manufactured(lhs),
+            Expr::Binary(_, lhs, rhs) => {
+                self.rhs_width_manufactured(lhs) || self.rhs_width_manufactured(rhs)
+            }
+            Expr::Ternary(_, t, f) => {
+                self.rhs_width_manufactured(t) || self.rhs_width_manufactured(f)
+            }
+            Expr::Unary(_, inner) => self.rhs_width_manufactured(inner),
+            // Leaf: widthless iff its resolved scalar type has no width.
+            // A `Literal { Unknown }` resolves to `Unknown`, not
+            // `UInt(None)`, so it is not caught here.
+            _ => matches!(
+                self.scalar_assignment_type(e),
+                Some(IrType::UInt(None) | IrType::SInt(None))
+            ),
+        }
+    }
+
     /// If `e` is a value-bearing `CallTarget::TransactorMethod` edge,
     /// pull it into a fresh `Stmt::TransactorCall { dest: Some(temp), .. }`
     /// and return `Expr::Local(temp)`; otherwise return `e` unchanged.

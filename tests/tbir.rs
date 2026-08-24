@@ -37189,13 +37189,16 @@ fn the_verifier_backstops_wide_component_field_writes_at_lowerings_bound() {
         "the write error must record the assignment direction: {rendered}"
     );
 
-    // …and the bound: a <=64-bit destination is lowering's to judge,
-    // and lowering does not judge it yet. The verifier must not answer
-    // a question lowering declined — see #658.
+    // …and the verifier stays a >64 backstop even though lowering now
+    // judges <=64-bit fields too (harc#658). A VALID <=64 write must
+    // lower and verify cleanly — the verifier must not over-reject the
+    // width range it deliberately leaves to lowering. (The <=64
+    // NARROWING refusal itself is lowering's, covered by
+    // `a_le64_component_field_write_is_checked_without_manufactured_widths`.)
     let sub64 = r#"scoreboard SmallState
     v : uint<8> default 0
 
-    hookable put(x: uint<32>)
+    hookable put(x: uint<8>)
         v = x
     end put
 end scoreboard SmallState
@@ -37211,9 +37214,9 @@ impl SmallTest for SmallTb
     end run
 end impl SmallTest
 "#;
-    let prog = lower_src(sub64).expect("a <=64-bit component field write still lowers");
+    let prog = lower_src(sub64).expect("a valid <=64-bit component field write lowers");
     verify::verify_program(&prog)
-        .expect("the verifier must not reject what lowering deliberately accepts");
+        .expect("the verifier must accept a valid <=64-bit component field write");
 }
 
 /// Two scalar event payloads of DIFFERENT declared widths still
@@ -37800,7 +37803,7 @@ fn a_nested_fixed_vector_component_field_matches_v1() {
         format!(
             r#"scoreboard Sb
     v : Vec<Vec<{elem}, 2>, 2>
-    n : uint<32> default 0
+    n : uint<1024> default 0
     hookable put(x: uint<8>)
         {body}
     end put
@@ -38752,4 +38755,70 @@ end impl T"#
         // No regression: the same operator at 64 bits lowers.
         lower_src(&mk(op, 64)).unwrap_or_else(|e| panic!("`{op}` at 64 lowers: {e}"));
     }
+}
+
+/// The directional narrowing check on a ≤64-bit component scalar field,
+/// with the manufactured-width carve-out (harc#658).
+///
+/// harc#656 added this check but bounded it to destinations past 64
+/// bits, because a widthless operand (an `on ev(t)` payload param, a
+/// file-scope `const`) makes `common_expr_type` manufacture a 64-bit
+/// result width, which flagged the ordinary counting idiom
+/// `seen = seen + t` as a narrowing into a ≤64-bit field. The bound is
+/// gone now: payload params carry their declared width, and the check
+/// skips a width MANUFACTURED from any remaining widthless leaf. So the
+/// verdict rests only on declared widths, at every field width.
+#[test]
+fn a_le64_component_field_write_is_checked_without_manufactured_widths() {
+    let src = |fields: &str, body: &str| {
+        format!(
+            "domain SysDomain\n  freq_mhz: 100\nend domain SysDomain\n\
+             const N = 9\n\
+             agent A\n    in_ev : event<uint<8>>\n{fields}\n    \
+             on in_ev(t)\n        {body}\n    end on\n\
+             end agent A\n\n\
+             test T\n    let dut : Top\n    let a : A\n    clock clk = SysDomain\n    \
+             run\n        wait 2 cycles\n        emit a.in_ev(1)\n        wait 2 cycles\n    end run\n\
+             end test T\n"
+        )
+    };
+
+    // Lowers: a payload param carries its declared width, so
+    // `seen(uint<32>) + t(uint<8>)` is 32-bit — no narrowing.
+    lower_src(&src("    seen : uint<32> default 0", "seen = seen + t"))
+        .expect("`seen = seen + t` on a payload param must lower");
+
+    // Lowers: a widthless `const` manufactures a 64-bit width, which the
+    // check must NOT treat as a real narrowing.
+    lower_src(&src("    seen : uint<32> default 0", "seen = seen + N"))
+        .expect("`seen = seen + N` for a widthless const must lower");
+
+    // Refuses: a DECLARED wider width into a narrower ≤64-bit field is a
+    // genuine narrowing. This is the case the >64 bound used to let
+    // through — TB-IR stricter than v1, which truncates it silently.
+    let err = lower_src(&src(
+        "    seen : uint<32> default 0\n    wide : uint<48> default 0",
+        "seen = wide",
+    ))
+    .expect_err("a uint<48> value into a uint<32> field must be refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && msg.contains("48-bit value")
+            && msg.contains("component field `seen`, declared 32 bits")
+            && msg.contains("narrows"),
+        "the ≤64 narrowing diagnostic must name both widths: {msg}"
+    );
+
+    // Refuses: an implicit signedness change on a ≤64 field, unaffected
+    // by the manufactured-width carve-out (signedness is always known).
+    let err = lower_src(&src(
+        "    u : uint<32> default 0\n    sv : sint<16> default 0",
+        "u = sv",
+    ))
+    .expect_err("a signed value into an unsigned ≤64 field must be refused");
+    assert!(
+        err.to_string().contains("Signedness must match"),
+        "signedness mismatch must still be caught at ≤64: {err}"
+    );
 }

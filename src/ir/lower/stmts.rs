@@ -2105,13 +2105,29 @@ impl FuncBuilder<'_> {
                     if dest_signed { "sint" } else { "uint" },
                 )));
             }
-            if src_width > dest_width {
+            // The narrowing verdict rests only on a DECLARED source
+            // width. When the width was manufactured from a widthless
+            // leaf (`seen + N` for a file-scope `const N`, a widthless
+            // DUT-port read, a dynamic bit-slice), `scalar_assignment_
+            // type` reports the 64-bit host-ABI placeholder, and
+            // flagging that against a narrower field is a false positive
+            // with no honest source fix. `n = n + v[0][1]` on a
+            // declared `uint<128>` element is judged and refused as
+            // before — that width is real (harc#658).
+            if src_width > dest_width && !self.rhs_width_manufactured(value) {
                 return Err(LowerError::Invalid(format!(
                     "assignment of a {src_width}-bit value to {what}, declared {dest_width} \
                      bits, narrows. Widths must not shrink implicitly — truncate the value \
                      explicitly or widen the field declaration."
                 )));
             }
+            // Two scalars, signedness agrees, width fits (or is
+            // manufactured): compatible. Reaching here means
+            // `queue_scalar_assignment_compatible` already said the pair
+            // was not trivially compatible, so only a manufactured-width
+            // narrowing lands here as `Ok`; every real narrowing errored
+            // above.
+            return Ok(());
         }
         Err(LowerError::Invalid(format!(
             "{what} is declared {expected:?}, but the assigned value is {actual:?}"
@@ -2551,51 +2567,22 @@ impl FuncBuilder<'_> {
                         })
                         .unwrap_or(IrType::Unknown);
                     // Only a destination PAST 64 BITS is judged, and
-                    // the bound is what makes the check sound rather
-                    // than merely strict.
-                    //
-                    // `common_expr_type` gives a WIDTHLESS operand the
-                    // 64-bit host ABI, so `seen + t` types as 64 bits
-                    // whatever `seen` is. Judging a ≤64-bit destination
-                    // would therefore refuse `seen = seen + t`, the
-                    // ordinary counting idiom, on every agent and
-                    // transactor in the repo (5 of them in `tbir.rs`
-                    // alone) — and `.trunc<32>()` is no answer when the
-                    // source width was never real. A destination past
-                    // 64 bits cannot be narrowed by that manufactured
-                    // 64, so the verdict there rests only on widths
-                    // somebody declared.
-                    //
-                    // This paragraph used to name the `on ev(t)`
-                    // payload param as the example, on the grounds
-                    // that it "IS widthless: `EventPayload::Scalar`
-                    // records signedness only". That stopped being
-                    // true when the payload grew a width —
-                    // `event<uint<8>>` binds `t : uint<8>` now, and a
-                    // dump snapshot says so. The BOUND is unchanged,
-                    // because every other widthless operand still gets
-                    // the manufactured 64; only the illustration was
-                    // wrong, and a stale example is how a bound
-                    // outlives its reason.
-                    //
-                    // Past 64 is also exactly the territory issue #642
-                    // opened: `uint<129>` into `uint<65>` shares the
-                    // `_harc_u128` carrier, so C++ took the assignment
-                    // and left the bits above 65 live in storage. The
-                    // ≤64-bit half was filed separately, blocked on
-                    // the payload-width gap; that gap is closed, so
-                    // what remains blocking it is the widthless
-                    // operand above, not the payload. Data-only
-                    // scoreboards keep the rule they already had,
-                    // which is stricter here and is not changed by
-                    // this branch.
-                    if matches!(dest, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if w > 64) {
-                        self.check_owner_scalar_field_write(
-                            &e,
-                            &dest,
-                            &format!("component field `{}`", tgt.dotted),
-                        )?;
-                    }
+                    // No longer bounded to widths past 64 (harc#658).
+                    // The bound existed because a widthless operand
+                    // (an `on ev(t)` payload param, a file-scope const)
+                    // manufactured a 64-bit result width, which flagged
+                    // `seen = seen + t` — the counting idiom — as a
+                    // narrowing into a ≤64-bit field. Payload params
+                    // now carry their declared width, and
+                    // `check_owner_scalar_field_write` skips a
+                    // manufactured width outright, so the check is sound
+                    // at every width and matches the data-only
+                    // scoreboard rule.
+                    self.check_owner_scalar_field_write(
+                        &e,
+                        &dest,
+                        &format!("component field `{}`", tgt.dotted),
+                    )?;
                 }
             }
             self.push(Stmt::ComponentFieldWrite {
