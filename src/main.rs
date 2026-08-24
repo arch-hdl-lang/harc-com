@@ -2367,14 +2367,19 @@ fn cmd_sim(
                 "--cpp-split-layout common requires --cpp-split tests"
             ));
         }
-        if codegen != CodegenKind::V1 {
+        // M1: TB-IR now supports common-object layout via SeparateCppPlan;
+        // v1 remains supported. Other codegens (none today) are rejected.
+        if codegen != CodegenKind::V1 && codegen != CodegenKind::Tbir {
             return Err(miette::miette!(
-                "--cpp-split-layout common is v1-only for now; pass --codegen v1"
+                "--cpp-split-layout common is currently supported for --codegen v1 and --codegen tbir"
             ));
         }
-        if split.group_size != 4 {
+        // v1 common always emits one capsule per test; group_size is
+        // meaningless there. TB-IR common still groups tests into shards.
+        if codegen == CodegenKind::V1 && split.group_size != 4 {
             return Err(miette::miette!(
-                "--cpp-split-group-size does not apply to --cpp-split-layout common                  (it always emits one stable capsule per test); drop the flag"
+                "--cpp-split-group-size does not apply to --cpp-split-layout common with --codegen v1 \
+                 (it always emits one stable capsule per test); drop the flag"
             ));
         }
         if cosim.is_some() {
@@ -2719,6 +2724,258 @@ fn cmd_sim(
                         cpp_paths.push(cpp_path);
                     }
                 }
+            }
+            // M1: TB-IR separate-compilation path (issue #619) — interface +
+            // common are emitted once, shards contain only test-owned
+            // `run_<Test>` wrappers.
+            CodegenKind::Tbir if split.layout == CppSplitLayout::Common => {
+                eprintln!(
+                    "TBIR parse: {} | merge: {}",
+                    fmt_secs(parse_elapsed),
+                    fmt_secs(merge_elapsed),
+                );
+                let lower_started = Instant::now();
+                let prog = harc::ir::lower::lower_program(&codegen_source)
+                    .map_err(|e| miette::miette!("{}", e))?;
+                let lower_elapsed = lower_started.elapsed();
+                uses_solver |= !prog.constraint_sites.is_empty();
+                let verify_started = Instant::now();
+                harc::ir::verify::verify_program(&prog).map_err(|errs| {
+                    let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
+                    miette::miette!(
+                        "internal error: TB-IR failed verification after lowering:\n{}",
+                        lines.join("\n")
+                    )
+                })?;
+                eprintln!(
+                    "TBIR lower: {} | verify: {}",
+                    fmt_secs(lower_elapsed),
+                    fmt_secs(verify_started.elapsed()),
+                );
+
+                let plan_started = Instant::now();
+                let plan = harc::codegen::tbir::plan_separate_tests(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &format!("{stem}__"),
+                    split.group_size,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+                let shard_count = plan.shards.len();
+                let jobs = harc::codegen::tbir::resolve_emit_jobs(split.emit_jobs, shard_count);
+                eprintln!(
+                    "TBIR separate plan: {} tests, {shard_count} shards, group size {}, \
+                     emit jobs {jobs}, planned in {}",
+                    plan.test_names.len(),
+                    split.group_size,
+                    fmt_secs(plan_started.elapsed()),
+                );
+
+                // M0: Category accounting — report shared vs per-shard bytes.
+                let cat_started = Instant::now();
+                let cat = harc::codegen::tbir::separate_category_bytes(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &format!("{stem}__"),
+                    split.group_size,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+                eprintln!(
+                    "TBIR category bytes: preamble {} | records {} | scoreboards {} | components {} | helpers {} | tb+ctx {} | covergroups {} | problem_table {}",
+                    fmt_bytes(cat.preamble),
+                    fmt_bytes(cat.records),
+                    fmt_bytes(cat.scoreboards),
+                    fmt_bytes(cat.components),
+                    fmt_bytes(cat.helpers),
+                    fmt_bytes(cat.tb_and_context),
+                    fmt_bytes(cat.covergroups),
+                    fmt_bytes(cat.problem_table),
+                );
+                eprintln!(
+                    "TBIR layout bytes: interface {} | common {} | dispatcher {} | shards {} (avg {}), total separate {} vs self-contained {} (saved {}), in {}",
+                    fmt_bytes(cat.interface_total),
+                    fmt_bytes(cat.common_total),
+                    fmt_bytes(cat.dispatcher),
+                    fmt_bytes(cat.shards_total),
+                    fmt_bytes(cat.shards_avg),
+                    fmt_bytes(cat.total_separate),
+                    fmt_bytes(cat.total_self_contained),
+                    fmt_bytes(cat.total_self_contained.saturating_sub(cat.total_separate)),
+                    fmt_secs(cat_started.elapsed()),
+                );
+
+                // Emit interface and common first — shards include the header.
+                let file_prefix = format!("{stem}__");
+                let mut profile_extra: Vec<String> = Vec::new();
+                profile_extra.push(format!("top={}", top.clone().unwrap_or_default()));
+                profile_extra.push(format!("mt={}", mt));
+                profile_extra.push(format!("coverage={}", coverage));
+                profile_extra.push(format!(
+                    "waves={}",
+                    waves.waves.then(|| waves.format.clone()).unwrap_or_default()
+                ));
+                for p in &params {
+                    profile_extra.push(format!("param:{p}"));
+                }
+                if let Ok(cxx) = std::env::var("HARC_CXX") {
+                    profile_extra.push(format!("cxx={cxx}"));
+                }
+                if let Ok(inc) = std::env::var("HARC_Z3_INCLUDE_DIR") {
+                    profile_extra.push(format!("z3_inc={inc}"));
+                }
+                if let Ok(lib) = std::env::var("HARC_Z3_LIB_DIR") {
+                    profile_extra.push(format!("z3_lib={lib}"));
+                }
+                let interface_started = Instant::now();
+                let interface_cpp = harc::codegen::tbir::emit_separate_interface_with_prefix(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &plan.scaffold,
+                    &file_prefix,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+                let interface_path = outdir.join(&plan.interface.filename);
+                let interface_changed = write_if_changed(&interface_path, interface_cpp.as_bytes())?;
+                eprintln!(
+                    "{} {} (interface) in {}",
+                    if interface_changed { "emitted" } else { "reused" },
+                    interface_path.display(),
+                    fmt_secs(interface_started.elapsed())
+                );
+                // Common is .cpp, not header — tracked for Verilator.
+                let common_started = Instant::now();
+                let common_cpp = harc::codegen::tbir::emit_separate_common_with_prefix(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &plan.scaffold,
+                    &file_prefix,
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+                let common_path = outdir.join(&plan.common.filename);
+                let common_changed = write_if_changed(&common_path, common_cpp.as_bytes())?;
+                eprintln!(
+                    "{} {} (common) in {}",
+                    if common_changed { "emitted" } else { "reused" },
+                    common_path.display(),
+                    fmt_secs(common_started.elapsed())
+                );
+                cpp_paths.push(common_path.clone());
+
+                let dispatcher_path = outdir.join(&plan.dispatcher.filename);
+                if write_if_changed(&dispatcher_path, plan.dispatcher.contents.as_bytes())? {
+                    eprintln!("emitted {}", dispatcher_path.display());
+                } else {
+                    eprintln!("reused {} (unchanged)", dispatcher_path.display());
+                }
+                cpp_paths.push(dispatcher_path);
+
+                let emit_started = Instant::now();
+                let total_bytes = AtomicUsize::new(0);
+                let delivered = harc::codegen::tbir::emit_separate_shards(
+                    &prog,
+                    &codegen_source,
+                    &emit_opts,
+                    &plan,
+                    jobs,
+                    &file_prefix,
+                    |shard, cpp, elapsed| {
+                        let path = outdir.join(&shard.filename);
+                        let bytes = cpp.len();
+                        match write_if_changed(&path, cpp.as_bytes()) {
+                            Ok(changed) => {
+                                total_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+                                eprintln!(
+                                    "TBIR separate shard {}/{shard_count}: {} tests, {}, {}, {}",
+                                    shard.index + 1,
+                                    shard.test_indices.len(),
+                                    fmt_bytes(bytes),
+                                    fmt_secs(elapsed),
+                                    if changed { "emitted" } else { "reused" },
+                                );
+                                Ok(())
+                            }
+                            Err(e) => Err(harc::codegen::cpp_tb::EmitError(format!(
+                                "write {}: {e}",
+                                path.display()
+                            ))),
+                        }
+                    },
+                )
+                .map_err(|e| miette::miette!("{}", e))?;
+
+                eprintln!(
+                    "TBIR separate emit: {}/{shard_count} shards, {}, {}",
+                    delivered.len(),
+                    fmt_bytes(total_bytes.load(AtomicOrdering::Relaxed)),
+                    fmt_secs(emit_started.elapsed()),
+                );
+                cpp_paths.extend(
+                    delivered
+                        .into_iter()
+                        .map(|i| outdir.join(&plan.shards[i].filename)),
+                );
+
+                // Manifest for incremental builds — records interface,
+                // common, dispatcher, and shards.
+                let manifest_path = outdir.join(format!("{file_prefix}manifest.json"));
+                // Stale cleanup: remove files owned by previous manifest
+                // but absent now.
+                if let Ok(prev) = fs::read_to_string(&manifest_path) {
+                    if let Some(items) = parse_manifest_artifacts(&prev) {
+                        let mut current = vec![
+                            plan.interface.filename.clone(),
+                            plan.common.filename.clone(),
+                            plan.dispatcher.filename.clone(),
+                        ];
+                        current.extend(plan.shards.iter().map(|s| s.filename.clone()));
+                        for name in items {
+                            if !current.contains(&name) {
+                                let stale = outdir.join(&name);
+                                match fs::remove_file(&stale) {
+                                    Ok(()) => eprintln!("removed stale {}", stale.display()),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        return Err(miette::miette!(
+                                            "failed to remove stale artifact {}: {e}",
+                                            stale.display()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let build_profile = harc::codegen::cpp_tb::build_profile_fingerprint(
+                    &emit_opts,
+                    &profile_extra,
+                );
+                let manifest = format!(
+                    "{{\"schema_version\":1,\"interface_abi\":\"{}\",\"build_profile\":\"{}\",\"tests\":[{}],\"artifacts\":[{}]}}\n",
+                    harc::codegen::cpp_tb::stable_hash_hex(interface_cpp.as_bytes()),
+                    build_profile,
+                    plan.test_names
+                        .iter()
+                        .map(|t| format!("\"{t}\""))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    {
+                        let mut arts = vec![
+                            plan.interface.filename.clone(),
+                            plan.common.filename.clone(),
+                            plan.dispatcher.filename.clone(),
+                        ];
+                        arts.extend(plan.shards.iter().map(|s| s.filename.clone()));
+                        arts.iter()
+                            .map(|f| format!("\"{f}\""))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                );
+                write_if_changed(&manifest_path, manifest.as_bytes())?;
             }
             // TB-IR streams: the suite is lowered and verified once, the
             // dispatcher lands before any shard work starts, and each

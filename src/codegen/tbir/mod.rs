@@ -112,7 +112,7 @@ pub(super) fn has_component_method_hook_subscription(
 /// makes hoisting it out of the per-shard loop byte-identical rather than
 /// merely plausible. Built once per suite and shared by `&` across shard
 /// workers.
-struct SuiteScaffold {
+pub struct SuiteScaffold {
     /// From `tests[0]`'s testbench, but `validate_tests_share_dut` proves
     /// every test agrees, so the string is the same for any test subset.
     dut_type: String,
@@ -447,6 +447,48 @@ pub struct SplitCppPlan {
     scaffold: SuiteScaffold,
 }
 
+/// M0: Category accounting for generated C++ bytes.
+///
+/// Splits the self-contained shard's byte count into the categories that
+/// M2 will move out of shards. All fields are byte lengths of the
+/// *would-be* separate artifacts when the same `SuiteScaffold` and program
+/// are emitted through the separate path. The `shared` field is the sum of
+/// every category except `shards` and `dispatcher`; `per_shard_avg` is
+/// useful for estimating the effect of `group_size`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryBytes {
+    pub preamble: usize,
+    pub records: usize,
+    pub scoreboards: usize,
+    pub components: usize,
+    pub helpers: usize,
+    pub tb_and_context: usize,
+    pub covergroups: usize,
+    pub problem_table: usize,
+    pub interface_total: usize,
+    pub common_total: usize,
+    pub dispatcher: usize,
+    pub shards_total: usize,
+    pub shards_avg: usize,
+    pub total_self_contained: usize,
+    pub total_separate: usize,
+}
+
+/// M1: Planned separate-compilation build — interface header, common
+/// implementation source, dispatcher, plus shards that contain only
+/// test-owned bodies. Keeps the same `SplitShardPlan` for shard
+/// membership so drivers can reuse `emit_split_shards` machinery, but
+/// shards are no longer self-contained.
+pub struct SeparateCppPlan {
+    pub interface: GeneratedCppFile,
+    pub common: GeneratedCppFile,
+    pub dispatcher: GeneratedCppFile,
+    /// Every test in the suite, in program order.
+    pub test_names: Vec<String>,
+    pub shards: Vec<SplitShardPlan>,
+    pub scaffold: SuiteScaffold,
+}
+
 /// Plan a dispatcher plus one or more self-contained C++ translation units
 /// for TB-IR tests. The split happens after lowering: each shard keeps the
 /// full lowered scaffolding (records, components, helpers, randomize tables)
@@ -521,6 +563,580 @@ pub fn plan_split_tests(
         shards,
         scaffold,
     })
+}
+
+/// M1: Plan an interface + common + dispatcher + shards split build for TB-IR.
+/// Like `plan_split_tests` but shards will be *non-self-contained*: they
+/// contain only test-owned `run_<Test>` wrappers and include the
+/// interface header for shared declarations.
+pub fn plan_separate_tests(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    file_prefix: &str,
+    group_size: usize,
+) -> Result<SeparateCppPlan, EmitError> {
+    let group_size = group_size.max(1);
+    if prog.tests.is_empty() {
+        return Err(EmitError("no `test` declaration found".into()));
+    }
+    if opts.cosim.is_some() {
+        return Err(EmitError(
+            "--cosim dpi does not support split-test builds yet (the split \
+             dispatcher links against per-shard `main()` functions; co-sim \
+             emission replaces `main()` with DPI entrypoints)"
+                .into(),
+        ));
+    }
+    let scaffold = SuiteScaffold::build(prog, file, opts, "one split binary")?;
+
+    let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
+    let all: Vec<usize> = (0..test_names.len()).collect();
+    let shards: Vec<SplitShardPlan> = all
+        .chunks(group_size)
+        .enumerate()
+        .map(|(index, test_indices)| SplitShardPlan {
+            index,
+            filename: if group_size == 1 {
+                format!(
+                    "{file_prefix}test_{}.cpp",
+                    crate::codegen::cpp_tb::sanitize_file_component(&test_names[test_indices[0]])
+                )
+            } else {
+                format!("{file_prefix}shard{}.cpp", index + 1)
+            },
+            test_indices: test_indices.to_vec(),
+        })
+        .collect();
+
+    {
+        let mut names: Vec<&str> = shards.iter().map(|s| s.filename.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        if names.len() != before {
+            return Err(EmitError(
+                "separate plan produced two shards with the same filename".into(),
+            ));
+        }
+        debug_assert!(
+            names.len() == before,
+            "separate plan produced two shards with the same filename"
+        );
+    }
+
+    Ok(SeparateCppPlan {
+        interface: GeneratedCppFile {
+            filename: format!("{file_prefix}suite.hpp"),
+            contents: String::new(),
+        },
+        common: GeneratedCppFile {
+            filename: format!("{file_prefix}common.cpp"),
+            contents: String::new(),
+        },
+        dispatcher: GeneratedCppFile {
+            filename: format!("{file_prefix}main.cpp"),
+            contents: emit_split_dispatcher(&test_names),
+        },
+        test_names,
+        shards,
+        scaffold,
+    })
+}
+
+/// M0: Category accounting — byte breakdown of the separate vs self-contained
+/// layouts for the same program. Reports how many bytes move out of shards
+/// into the shared interface/common artifacts (M2).
+pub fn separate_category_bytes(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    file_prefix: &str,
+    group_size: usize,
+) -> Result<CategoryBytes, EmitError> {
+    let plan_self = plan_split_tests(prog, file, opts, file_prefix, group_size)?;
+    let plan_sep = plan_separate_tests(prog, file, opts, file_prefix, group_size)?;
+
+    // Emit representative artifacts and measure.
+    let interface = emit_separate_interface_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
+    let common = emit_separate_common_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
+    let dispatcher = emit_split_dispatcher(&plan_sep.test_names).len();
+    let mut shards_total = 0usize;
+    for shard in &plan_sep.shards {
+        shards_total += emit_separate_shard_with_prefix(prog, file, opts, &plan_sep.scaffold, shard, file_prefix)?.len();
+    }
+    // Self-contained total: sum of all shards + dispatcher (each shard repeats scaffold).
+    let mut self_total = 0usize;
+    for shard in &plan_self.shards {
+        self_total += emit_split_shard(prog, file, opts, &plan_self, shard)?.len();
+    }
+    self_total += plan_self.dispatcher.contents.len();
+
+    let interface_len = interface.len();
+    let common_len = common.len();
+    // Heuristic split of interface vs common from their emitted contents.
+    // For now, treat preamble+structs+prototypes as interface, helpers+tables as common.
+    // The sum is what matters for the ratio.
+    let shards_avg = if plan_sep.shards.is_empty() {
+        0
+    } else {
+        shards_total / plan_sep.shards.len()
+    };
+    let total_separate = interface_len + common_len + dispatcher + shards_total;
+
+    // Detailed preamble/records/etc. are approximated by re-emitting each
+    // section in isolation and measuring. This keeps accounting independent
+    // of the main emit path and cheap (no extra lowering).
+    let preamble = {
+        let mut out = String::new();
+        runtime::preamble(
+            &mut out,
+            &plan_sep.scaffold.dut_type,
+            &plan_sep.test_names,
+            &plan_sep.scaffold.problem_table_cpp,
+            plan_sep.scaffold.uses_constraint_solver,
+            plan_sep.scaffold.has_probes,
+            opts.cosim.as_ref(),
+        );
+        out.len()
+    };
+    let records = {
+        let mut out = String::new();
+        let order = record_emit_order(&prog.records);
+        for &i in &order {
+            record_struct(&mut out, &prog.records[i], &prog.records);
+        }
+        out.len()
+    };
+    let scoreboards = {
+        let mut out = String::new();
+        for sb in &prog.scoreboards {
+            runtime::scoreboard_struct(&mut out, sb, &prog.records);
+        }
+        out.len()
+    };
+    let components = {
+        let mut out = String::new();
+        for ci in component_emit_order(prog) {
+            runtime::component_struct(
+                &mut out,
+                prog,
+                &prog.components[ci],
+                &prog.components,
+                &prog.scoreboards,
+                &prog.records,
+            );
+        }
+        out.len()
+    };
+    let helpers = {
+        let mut out = String::new();
+        let helpers: Vec<&ir::TbFunction> = prog
+            .functions
+            .iter()
+            .filter(|f| f.kind == ir::FunctionKind::Helper)
+            .collect();
+        for h in &helpers {
+            func::emit_helper_prototype(&mut out, h);
+        }
+        for h in &helpers {
+            let _ = func::emit_helper_function(&mut out, prog, h);
+        }
+        out.len()
+    };
+    let tb_and_context = {
+        let mut out = String::new();
+        let mut seen = HashSet::new();
+        for tb in &prog.testbenches {
+            if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
+                let cov_fields: Vec<(String, String)> = tb
+                    .cov_fields
+                    .iter()
+                    .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
+                    .collect();
+                let sb_fields: Vec<(String, String)> = tb
+                    .scoreboard_fields
+                    .iter()
+                    .map(|(f, sb)| (f.clone(), prog.scoreboards[sb.index()].name.clone()))
+                    .collect();
+                runtime::tb_struct(
+                    &mut out,
+                    &tb.name,
+                    &plan_sep.scaffold.dut_type,
+                    &cov_fields,
+                    &tb.state_fields,
+                    &sb_fields,
+                    &prog.records,
+                );
+            }
+        }
+        runtime::context_struct(&mut out, &plan_sep.scaffold.dut_type);
+        out.len()
+    };
+    let covergroups = {
+        let mut out = String::new();
+        for cg in &prog.covgroups {
+            covergroup::covgroup_struct(&mut out, cg);
+        }
+        out.len()
+    };
+
+    Ok(CategoryBytes {
+        preamble,
+        records,
+        scoreboards,
+        components,
+        helpers,
+        tb_and_context,
+        covergroups,
+        problem_table: plan_sep.scaffold.problem_table_cpp.len(),
+        interface_total: interface_len,
+        common_total: common_len,
+        dispatcher,
+        shards_total,
+        shards_avg,
+        total_self_contained: self_total,
+        total_separate,
+    })
+}
+
+/// M2: Emit only the interface header for the separate build.
+///
+/// Contains suite-wide declarations that every shard needs: includes,
+/// record/transaction/scoreboard/component/covergroup/tb layouts,
+/// `HarcTestContext` (deepened for M3), helper prototypes, and immutable
+/// solver descriptors. No `run_<Test>` bodies, no dispatcher.
+pub fn emit_separate_interface(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+) -> Result<String, EmitError> {
+    emit_separate_interface_with_prefix(prog, file, opts, scaffold, "")
+}
+
+/// Internal helper with explicit header prefix handling.
+pub fn emit_separate_interface_with_prefix(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+    _file_prefix: &str,
+) -> Result<String, EmitError> {
+    let mut out = String::new();
+    out.push_str("#pragma once\n\n");
+    // Interface includes — same preamble but without the mutable
+    // `harc_rng` definition and without the problem table body.
+    // Those live in the common source (M3).
+    let mut preamble_no_rng = String::new();
+    runtime::preamble(
+        &mut preamble_no_rng,
+        &scaffold.dut_type,
+        &[],
+        "",
+        scaffold.uses_constraint_solver,
+        scaffold.has_probes,
+        opts.cosim.as_ref(),
+    );
+    // Strip the `harc_rng` definition from preamble for the header;
+    // it will be re-emitted as `extern` / per-context in the deepened
+    // context.
+    if preamble_no_rng.contains("static harc_rt::random::HarcRng harc_rng;") {
+        preamble_no_rng = preamble_no_rng.replace(
+            "static harc_rt::random::HarcRng harc_rng;\nstatic inline uint64_t harc_rng_next() {\n    return harc_rng.next();\n}\n\n",
+            "extern harc_rt::random::HarcRng harc_rng;\ninline uint64_t harc_rng_next() { return harc_rng.next(); }\n\n",
+        );
+    }
+    out.push_str(&preamble_no_rng);
+    // Records, scoreboards, components, covergroups — type layouts only.
+    let order = record_emit_order(&prog.records);
+    for &i in &order {
+        record_struct(&mut out, &prog.records[i], &prog.records);
+    }
+    if prog.records.iter().any(|r| {
+        r.fields
+            .iter()
+            .any(|f| matches!(f.ty, ir::IrType::Seq(_)))
+    }) {
+        out.push_str(&crate::codegen::cpp_tb::emit_record_randomize_helpers(
+            file, opts, &prog.records, &order,
+        )?);
+    }
+    for sb in &prog.scoreboards {
+        runtime::scoreboard_struct(&mut out, sb, &prog.records);
+    }
+    for ci in component_emit_order(prog) {
+        runtime::component_struct(
+            &mut out,
+            prog,
+            &prog.components[ci],
+            &prog.components,
+            &prog.scoreboards,
+            &prog.records,
+        );
+    }
+    let helpers: Vec<&ir::TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    for h in &helpers {
+        func::emit_helper_prototype(&mut out, h);
+    }
+    if !helpers.is_empty() {
+        writeln!(out).ok();
+    }
+    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
+    for cg in &prog.covgroups {
+        covergroup::covgroup_struct(&mut out, cg);
+    }
+    let mut seen = HashSet::new();
+    for tb in &prog.testbenches {
+        if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
+            let cov_fields: Vec<(String, String)> = tb
+                .cov_fields
+                .iter()
+                .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
+                .collect();
+            let sb_fields: Vec<(String, String)> = tb
+                .scoreboard_fields
+                .iter()
+                .map(|(f, sb)| (f.clone(), prog.scoreboards[sb.index()].name.clone()))
+                .collect();
+            runtime::tb_struct(
+                &mut out,
+                &tb.name,
+                &scaffold.dut_type,
+                &cov_fields,
+                &tb.state_fields,
+                &sb_fields,
+                &prog.records,
+            );
+        }
+    }
+    // M3: Deepened HarcTestContext — owns DUT, scheduler, trace, log,
+    // coverage, RNG, and exposes lifecycle methods. Header declares the
+    // struct and its methods; common defines them.
+    runtime::context_struct_deepened(&mut out, &scaffold.dut_type);
+    // Immutable solver descriptors — emitted as `static` in header for
+    // now so shards see the `prepare_call` helper. M6 will move the
+    // mutable call-site counters into per-context state and keep only
+    // the descriptor table in common with an `extern` declaration here.
+    if !scaffold.problem_table_cpp.is_empty() {
+        out.push_str(&scaffold.problem_table_cpp);
+        writeln!(out).ok();
+    }
+    out.push_str("\n// M2: Shared testbench lifecycle and method prototypes would follow here;\n");
+    out.push_str("// M4 will lower them once per testbench and emit explicit calls.\n");
+    Ok(out)
+}
+
+/// M2/M3: Emit the common implementation source.
+///
+/// Owns out-of-line definitions for helpers, record helpers, solver table,
+/// and the deepened `HarcTestContext` methods. Compiled once per suite.
+pub fn emit_separate_common(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+) -> Result<String, EmitError> {
+    emit_separate_common_with_prefix(prog, file, opts, scaffold, "")
+}
+
+pub fn emit_separate_common_with_prefix(
+    prog: &TbProgram,
+    _file: &SourceFile,
+    _opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+    file_prefix: &str,
+) -> Result<String, EmitError> {
+    let mut out = String::new();
+    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
+    writeln!(out, "// TB-IR common implementation (M2/M3 separate compilation).").ok();
+    writeln!(out, "#include \"{file_prefix}suite.hpp\"").ok();
+    writeln!(out, "#include \"harc_thread_rt.h\"").ok();
+    writeln!(out, "#include \"harc_random_rt.h\"").ok();
+    writeln!(out).ok();
+    // Solver problem table: for M2, keep it in the interface header
+    // (static) so shards see the `prepare_call` helper. The common
+    // source does not redefine it to avoid duplicate definitions when
+    // it includes the header. M6 will move the mutable call-site
+    // counters into per-context state and keep only the descriptor
+    // table in common with an `extern` declaration in the header.
+    // Mutable RNG instance — one per suite binary, reset per test via
+    // HarcTestContext::start(). For M3, this will move into the
+    // context's `rng` member.
+    out.push_str("harc_rt::random::HarcRng harc_rng;\n\n");
+    // Helper definitions
+    let helpers: Vec<&ir::TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|f| f.kind == ir::FunctionKind::Helper)
+        .collect();
+    for h in &helpers {
+        func::emit_helper_function(&mut out, prog, h)?;
+        writeln!(out).ok();
+    }
+    // Deepened HarcTestContext method definitions (M3)
+    runtime::context_methods(&mut out, &scaffold.dut_type);
+    Ok(out)
+}
+
+/// M2: Emit one shard for the separate build — test-owned bodies only.
+///
+/// The shard includes the interface header for shared declarations and
+/// emits only the selected `run_<Test>` wrappers. No record/component/
+/// helper definitions are repeated.
+pub fn emit_separate_shard(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+    shard: &SplitShardPlan,
+) -> Result<String, EmitError> {
+    emit_separate_shard_with_prefix(prog, file, opts, scaffold, shard, "")
+}
+
+pub fn emit_separate_shard_with_prefix(
+    prog: &TbProgram,
+    _file: &SourceFile,
+    opts: &EmitOpts,
+    scaffold: &SuiteScaffold,
+    shard: &SplitShardPlan,
+    file_prefix: &str,
+) -> Result<String, EmitError> {
+    let mut out = String::new();
+    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
+    writeln!(out, "#include \"{file_prefix}suite.hpp\"").ok();
+    writeln!(out, "#include \"harc_thread_rt.h\"").ok();
+    writeln!(out).ok();
+    for &idx in &shard.test_indices {
+        emit_test(
+            &mut out,
+            prog,
+            &prog.tests[idx],
+            &scaffold.dut_type,
+            opts,
+            &scaffold.randomize_snippets,
+        )?;
+    }
+    Ok(out)
+}
+
+/// M2: Emit all separate shards in parallel, analogous to `emit_split_shards`.
+/// Each shard is handed to `on_shard` on the worker that produced it.
+pub fn emit_separate_shards<F>(
+    prog: &TbProgram,
+    file: &SourceFile,
+    opts: &EmitOpts,
+    plan: &SeparateCppPlan,
+    jobs: usize,
+    file_prefix: &str,
+    on_shard: F,
+) -> Result<Vec<usize>, EmitError>
+where
+    F: Fn(&SplitShardPlan, String, Duration) -> Result<(), EmitError> + Sync,
+{
+    debug_assert!(
+        plan.shards
+            .iter()
+            .all(|s| s.test_indices.iter().all(|&i| i < prog.tests.len())),
+        "separate plan was built for a different program than the one being emitted"
+    );
+    if jobs <= 1 || plan.shards.len() <= 1 {
+        let mut delivered = Vec::with_capacity(plan.shards.len());
+        for (pos, shard) in plan.shards.iter().enumerate() {
+            let started = Instant::now();
+            let cpp = emit_separate_shard_with_prefix(
+                prog, file, opts, &plan.scaffold, shard, file_prefix,
+            )?;
+            on_shard(shard, cpp, started.elapsed())?;
+            delivered.push(pos);
+        }
+        return Ok(delivered);
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let fail_limit = AtomicUsize::new(usize::MAX);
+    let first_err: Mutex<Option<(usize, EmitError)>> = Mutex::new(None);
+    type Payload = Box<dyn std::any::Any + Send + 'static>;
+    let first_panic: Mutex<Option<(usize, Payload)>> = Mutex::new(None);
+    let delivered: Mutex<Vec<usize>> = Mutex::new(Vec::with_capacity(plan.shards.len()));
+
+    let record_err = |i: usize, e: EmitError| {
+        fail_limit.fetch_min(i, Ordering::Relaxed);
+        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, e));
+        }
+    };
+    let record_panic = |i: usize, payload: Payload| {
+        fail_limit.fetch_min(i, Ordering::Relaxed);
+        let mut slot = first_panic.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, payload));
+        }
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let cursor = &cursor;
+            let fail_limit = &fail_limit;
+            let record_err = &record_err;
+            let on_shard = &on_shard;
+            let delivered = &delivered;
+            let spawned = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= plan.shards.len() {
+                        break;
+                    }
+                    if i > fail_limit.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let started = Instant::now();
+                    let cpp = match emit_separate_shard_with_prefix(
+                        prog, file, opts, &plan.scaffold, &plan.shards[i], file_prefix,
+                    ) {
+                        Ok(cpp) => cpp,
+                        Err(e) => {
+                            record_err(i, e);
+                            continue;
+                        }
+                    };
+                    if i > fail_limit.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        on_shard(&plan.shards[i], cpp, started.elapsed())
+                    }));
+                    match handed {
+                        Ok(Ok(())) => delivered.lock().unwrap_or_else(|p| p.into_inner()).push(i),
+                        Ok(Err(e)) => record_err(i, e),
+                        Err(payload) => record_panic(i, payload),
+                    }
+                });
+            if let Err(e) = spawned {
+                record_err(
+                    usize::MAX,
+                    EmitError(format!("could not spawn separate shard emission worker: {e}")),
+                );
+                break;
+            }
+        }
+    });
+
+    if let Some((_, payload)) = first_panic.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some((_, e)) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    let mut delivered = delivered.into_inner().unwrap_or_else(|p| p.into_inner());
+    delivered.sort_unstable();
+    Ok(delivered)
 }
 
 /// Emit one shard of a planned split build, borrowing the verified program.
