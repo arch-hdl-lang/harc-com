@@ -479,7 +479,8 @@ fn scoreboard_field_kind(
                 V1Status::SilentlyMisLowers,
             );
         }
-        scoreboard_subset_gap(&what, SUBSET)
+        super::components::signed_wide_field_gap(&what, t)
+            .unwrap_or_else(|| scoreboard_subset_gap(&what, SUBSET))
     })?;
     Ok(ScoreboardFieldKind::Scalar {
         ty,

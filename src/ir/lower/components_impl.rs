@@ -1584,11 +1584,17 @@ fn lower_field(
                     V1Status::SilentlyMisLowers,
                 ));
             }
+            let what = format!("scalar field `{comp}.{fname}` of an unsupported type");
             let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
-                unsupported(
-                    &format!("scalar field `{comp}.{fname}` of an unsupported type"),
-                    "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
-                )
+                // The signed-wide arm first: it is the one shape here
+                // for which `--codegen v1` is a false promise.
+                signed_wide_field_gap(&what, &f.ty).unwrap_or_else(|| {
+                    unsupported(
+                        &what,
+                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits \
+                         are lowered",
+                    )
+                })
             })?;
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
             Ok(ComponentFieldKind::Scalar { ty, default })
@@ -3378,6 +3384,50 @@ pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// every declared field to 1024 without it. The narrower position is
 /// the right one, and one decoder is the place for it — `main` had
 /// re-introduced a second copy in `scoreboards.rs` to hold it.
+/// The refusal for a SIGNED scalar field wider than 64 bits, which is
+/// the one shape inside the declared-field subset that must NOT offer
+/// `--codegen v1` as a way out.
+///
+/// `unsupported` appends "re-run with `--codegen v1`", and the whole
+/// point of that suggestion is that it is a working escape hatch. For a
+/// signed wide field it is not one. Measured on `sint<129>` scoreboard
+/// state under `--codegen v1`:
+///
+/// - `sb.v < 0` does not compile at all — v1 stores the field as
+///   `harc_rt::HarcWide<5>` and g++/clang call `operator<` between it
+///   and `int` ambiguous;
+/// - `sb.a < sb.b` with `a = -8, b = 2` COMPILES and answers `-8 >= 2`,
+///   because the carrier is unsigned and the comparison is by magnitude;
+/// - `sb.a / sb.b` and `sb.a >> 1` compile and are wrong the same way.
+///
+/// So the grade is `SilentlyMisLowers` — the worse of the two fates, and
+/// the one that decides the promise. TB-IR refusing here is the honest
+/// behaviour of the two backends, not TB-IR trailing v1: v1 does not
+/// implement signed wide semantics either, it just fails less visibly.
+///
+/// `None` when the field is not a signed wide scalar, so the caller
+/// falls through to its own generic subset diagnostic.
+///
+/// See harc#657 for the feature itself; it needs signed compare,
+/// divide, modulo and arithmetic right shift over the unsigned
+/// `_harc_u128` / `HarcWide<N>` carriers.
+pub(crate) fn signed_wide_field_gap(what: &str, t: &TypeExpr) -> Option<LowerError> {
+    matches!(decoded_scalar_ir_type(t), Some(IrType::SInt(Some(w))) if w > 64).then(|| {
+        not_implemented(
+            what,
+            "a signed scalar wider than 64 bits is held in `_harc_u128` or \
+             `harc_rt::HarcWide<N>`, and BOTH carriers are unsigned: `<`, `<=`, `>`, \
+             `>=`, `/`, `%` and `>>` on one answer by magnitude, not by the declared \
+             sign bit. Declare the field `uint<N>` and do the sign handling \
+             explicitly, or keep it at 64 bits or narrower. v1 stores the same \
+             unsigned carrier — it either fails to compile the comparison or answers \
+             `-8 >= 2`, so `--codegen v1` is not a way out"
+                .to_string(),
+            V1Status::SilentlyMisLowers,
+        )
+    })
+}
+
 pub(crate) fn scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     decoded_scalar_ir_type(t).filter(field_scalar_width_ok)
 }

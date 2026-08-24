@@ -99,23 +99,29 @@ marker_field() {
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-branch="$(git branch --show-current)"
+# Branch and reviewed revision default to the checked-out HEAD, but may be
+# overridden by the caller. The pre-push hook sets both so it can key the
+# marker to the branch actually being pushed and the exact commit being
+# pushed, rather than to whatever the worktree happens to have checked out
+# (worktrees are frequently on a detached HEAD, or on a different branch).
+branch="${PRE_PR_REVIEW_BRANCH:-$(git branch --show-current)}"
 if [[ -z "$branch" ]]; then
-  echo "pre-pr-review: detached HEAD is not supported" >&2
+  echo "pre-pr-review: no branch to check (detached HEAD) — set PRE_PR_REVIEW_BRANCH to name one" >&2
   exit 2
 fi
 
-head_sha="$(git rev-parse HEAD)"
+rev="${PRE_PR_REVIEW_HEAD:-HEAD}"
+head_sha="$(git rev-parse "$rev")"
 safe_branch="$(printf '%s' "$branch" | tr '/: ' '___')"
 marker_dir="$(git rev-parse --git-path pre-pr-reviews)"
 marker="${marker_dir}/${safe_branch}.review"
-merge_base="$(git merge-base "${base_ref}" HEAD 2>/dev/null || true)"
+merge_base="$(git merge-base "${base_ref}" "$rev" 2>/dev/null || true)"
 
 mkdir -p "$marker_dir"
 
-changed_files="$(git diff --name-only "${base_ref}...HEAD" 2>/dev/null || true)"
+changed_files="$(git diff --name-only "${base_ref}...${rev}" 2>/dev/null || true)"
 if [[ -z "$changed_files" ]]; then
-  changed_files="$(git diff --name-only HEAD~1...HEAD 2>/dev/null || true)"
+  changed_files="$(git diff --name-only "${rev}~1...${rev}" 2>/dev/null || true)"
 fi
 
 if [[ "$mode" == "mark" ]]; then
