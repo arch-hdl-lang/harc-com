@@ -1524,23 +1524,48 @@ fn lower_field(
                     V1Status::EmitsUncompilable,
                 ));
             }
-            let elem = match args.first() {
+            let decoded = match args.first() {
                 Some(TypeArg::Type(ty)) => fixed_vec_elem_ir_type(ty),
                 _ => None,
-            }
-            .ok_or_else(|| {
-                unsupported(
-                    &format!(
-                        "fixed-vector field `{comp}.{fname}` with an unsupported element type"
-                    ),
-                    format!(
-                        "a fixed-vector element is a nonzero-width uint/sint/bits/bool/bit \
-                     scalar ({}), or another `Vec<..>` of those (nested); record and \
-                     dynamic-list elements are not yet lowered",
-                        scalar_width_detail()
-                    ),
-                )
-            })?;
+            };
+            let elem = match decoded {
+                Some(e) => e,
+                None => {
+                    // A RECORD-element fixed vector (`Vec<Beat, N>`, or a
+                    // nested `Vec<Vec<Beat, M>, N>`) is NOT a `--codegen v1`
+                    // escape: v1 does not recognize a record-element `Vec`
+                    // field and falls back to a SCALAR member (`uint64_t
+                    // v{}`). The declaration compiles unused, but any
+                    // element access — `v[i]`, `v[i].f`, `v[i] = r` —
+                    // subscripts the scalar and g++ refuses ("invalid types
+                    // 'uint64_t[int]' for array subscript", measured uniform
+                    // on scoreboard / agent / env). Regrade precisely; other
+                    // unsupported element kinds keep the catch-all below.
+                    if args
+                        .first()
+                        .is_some_and(|a| fixed_vec_leaf_is_record(a, declared_records))
+                    {
+                        return Err(not_implemented(
+                            &format!("a record-element fixed-vector field `{comp}.{fname}`"),
+                            "v1 mis-declares a record-element `Vec` as a scalar member, so any \
+                             element access (`v[i]`, `v[i].field`, `v[i] = r`) does not compile; \
+                             a record-element fixed vector is not lowered",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    return Err(unsupported(
+                        &format!(
+                            "fixed-vector field `{comp}.{fname}` with an unsupported element type"
+                        ),
+                        format!(
+                            "a fixed-vector element is a nonzero-width uint/sint/bits/bool/bit \
+                         scalar ({}), or another `Vec<..>` of those (nested); record and \
+                         dynamic-list elements are not yet lowered",
+                            scalar_width_detail()
+                        ),
+                    ));
+                }
+            };
             let len = match args.get(1) {
                 Some(TypeArg::Expr(e)) => match &*e.kind {
                     ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
@@ -3278,6 +3303,32 @@ fn type_arg_simple_name(t: &TypeExpr) -> Option<&str> {
     match t {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
+    }
+}
+
+/// Whether a fixed-vector element type bottoms out in a declared RECORD
+/// (`Vec<Beat, N>`, or a nested `Vec<Vec<Beat, M>, N>`). Used to grade the
+/// record-element case of a fixed-vector field honestly: v1 does not
+/// recognize a record-element `Vec` and falls back to a scalar member, so
+/// any element access does not compile (see the call site).
+fn fixed_vec_leaf_is_record(arg: &TypeArg, records: &std::collections::HashSet<String>) -> bool {
+    match arg {
+        // A nested `Vec<..>` element — recurse into its own first arg.
+        TypeArg::Type(TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        }) => args
+            .first()
+            .is_some_and(|inner| fixed_vec_leaf_is_record(inner, records)),
+        // A named type element (`Vec<Beat, N>` when `Beat` parses as a type).
+        TypeArg::Type(t) => type_arg_simple_name(t).is_some_and(|n| records.contains(n)),
+        // A bare identifier element — how a single-name record type
+        // (`Vec<Beat, N>`) most often parses in a type-arg position.
+        TypeArg::Expr(e) => {
+            matches!(&*e.kind, ExprKind::Ident(id) if records.contains(&id.name))
+        }
+        TypeArg::Named { .. } => false,
     }
 }
 

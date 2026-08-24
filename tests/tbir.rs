@@ -38605,3 +38605,52 @@ end impl T"#;
         "must name the required `bus.<method>` shape: {msg}"
     );
 }
+
+/// A record-element fixed-vector component field (`v : Vec<Beat, 2>`, or a
+/// nested `Vec<Vec<Beat, 2>, 2>`) is refused honestly, not pointed at
+/// `--codegen v1`: v1 does not recognize a record-element `Vec` field and
+/// falls back to a scalar `uint64_t` member, so any element access
+/// subscripts the scalar and g++ refuses (`invalid types 'uint64_t[int]'
+/// for array subscript` — measured uniform on scoreboard / agent / env).
+/// Scalar-element fixed vectors are unaffected (they lower).
+#[test]
+fn a_record_element_fixed_vector_field_is_refused_without_a_false_v1_promise() {
+    let mk = |kind: &str, elem: &str| {
+        format!(
+            r#"struct Beat
+    p : uint<8>
+end struct Beat
+{kind} Sb
+    v : Vec<{elem}, 2>
+    n : uint<32> default 0
+    hookable put(x: uint<8>)
+        n = n + 1
+    end put
+end {kind} Sb
+testbench Tb
+    dut : Top
+    sb : Sb
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        )
+    };
+    for kind in ["scoreboard", "agent", "env"] {
+        for elem in ["Beat", "Vec<Beat, 2>"] {
+            let err = lower_src(&mk(kind, elem))
+                .err()
+                .unwrap_or_else(|| panic!("[{kind}] `Vec<{elem}, 2>` must be refused"));
+            let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+            assert!(
+                !msg.contains("re-run with `--codegen v1`"),
+                "[{kind}/{elem}] must not promise v1 works: {msg}"
+            );
+        }
+        // No regression: a scalar-element fixed vector still lowers.
+        lower_src(&mk(kind, "uint<8>"))
+            .unwrap_or_else(|e| panic!("[{kind}] scalar Vec lowers: {e}"));
+    }
+}
