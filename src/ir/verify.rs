@@ -2444,6 +2444,85 @@ impl Checker<'_> {
         }
     }
 
+    /// Validate the receiver and relative leaf selected by a component idle
+    /// predicate. Unlike ordinary component fields, predicates may use a
+    /// component-typed parameter as their base.
+    fn check_component_idle(&mut self, base: &ComponentBase, subpath: &[String]) {
+        let mut component = match base {
+            ComponentBase::Local(local) => {
+                self.check_local(*local);
+                match self.func.locals.get(local.index()).map(|entry| &entry.ty) {
+                    Some(IrType::Component(component))
+                        if self.prog.components.get(component.index()).is_some() =>
+                    {
+                        *component
+                    }
+                    Some(IrType::Component(component)) => {
+                        self.report_bad_component_field(format!(
+                            "component idle local %{} references missing component c{}",
+                            local.0, component.0
+                        ));
+                        return;
+                    }
+                    _ => {
+                        self.report_bad_component_field(format!(
+                            "component idle local %{} is not component-typed",
+                            local.0
+                        ));
+                        return;
+                    }
+                }
+            }
+            _ => match self.component_base_id(base) {
+                Ok(component) => component,
+                Err(detail) => {
+                    self.report_bad_component_field(format!(
+                        "component idle base does not resolve: {detail}"
+                    ));
+                    return;
+                }
+            },
+        };
+
+        for (position, segment) in subpath.iter().enumerate() {
+            let terminal = position + 1 == subpath.len();
+            let Some(schema) = self.prog.components.get(component.index()) else {
+                self.report_bad_component_field(format!(
+                    "component idle path reaches missing component c{}",
+                    component.0
+                ));
+                return;
+            };
+            match schema.field(segment).map(|field| &field.kind) {
+                Some(ComponentFieldKind::Sub {
+                    component: next, ..
+                }) => component = *next,
+                Some(ComponentFieldKind::ScoreboardSub { scoreboard }) if terminal => {
+                    if self.prog.scoreboards.get(scoreboard.index()).is_none() {
+                        self.report_bad_component_field(format!(
+                            "component idle leaf `{segment}` references missing scoreboard sb{}",
+                            scoreboard.0
+                        ));
+                    }
+                    return;
+                }
+                _ => {
+                    self.report_bad_component_field(format!(
+                        "component idle path `{}` has invalid segment `{segment}`",
+                        subpath.join(".")
+                    ));
+                    return;
+                }
+            }
+        }
+        if self.prog.components.get(component.index()).is_none() {
+            self.report_bad_component_field(format!(
+                "component idle path reaches missing component c{}",
+                component.0
+            ));
+        }
+    }
+
     fn component_emit_payload(
         &self,
         base: &ComponentBase,
@@ -5249,9 +5328,12 @@ impl Checker<'_> {
             // Component-queue size/empty read — host state resolved at
             // lowering against the component schema; nothing to verify.
             Expr::ComponentQueueQuery { .. } => {}
-            // Idle predicate: the base/kind are resolved at lowering; only
-            // the threshold sub-expression carries verifiable structure.
-            Expr::ComponentIdle { n, .. } => self.check_expr(n, ports_ok, context),
+            Expr::ComponentIdle {
+                base, subpath, n, ..
+            } => {
+                self.check_component_idle(base, subpath);
+                self.check_expr(n, ports_ok, context);
+            }
             Expr::TransactorIdle {
                 field,
                 transactor,
@@ -5697,6 +5779,7 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             Some(ret.clone())
         }
+        Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
         Expr::ScoreboardQuery {
             sb,
             query: ScoreboardQuery::Scalar { scalar },
@@ -6302,7 +6385,13 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
             for_each_local(e, f);
         }
         Expr::WidthCast { inner, .. } => for_each_local(inner, f),
-        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => for_each_local(n, f),
+        Expr::ComponentIdle { base, n, .. } => {
+            if let ComponentBase::Local(local) = base {
+                f(*local);
+            }
+            for_each_local(n, f);
+        }
+        Expr::TransactorIdle { n, .. } => for_each_local(n, f),
         Expr::CovBin { .. } => {}
         Expr::CovHookParam { index, .. } => {
             if let Some(i) = index {

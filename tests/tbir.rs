@@ -34706,9 +34706,8 @@ end impl SpTest"#
 ///
 /// And the set this arm fires on is "not a DECLARED method", which is
 /// wider than "does not exist": the built-in predicates `idle`,
-/// `idle_in`, `idle_out` and `quiesced` land here too, and BOTH backends
-/// implement those — TB-IR one statement position over. They are carved
-/// out to `Unsupported` and pinned below.
+/// `idle_in`, `idle_out` and `quiesced` land here too. They must fall
+/// through to predicate lowering rather than being classified as methods.
 #[test]
 fn a_missing_or_void_component_method_is_a_program_error() {
     let src = |call: &str| {
@@ -34834,43 +34833,46 @@ end test PTest"#;
         "parameter form: {msg}"
     );
 
-    // The carve-out through the PARAMETER form, pinned separately from
-    // the path form. Without this the arm is unguarded: turning its
-    // `is_builtin_component_predicate` call into `if false &&` passed
-    // the entire suite, so the one arm the carve-out exists to create
-    // was the one nothing measured.
-    let param_builtin = param.replacen("m.nosuch(a)", "m.idle(a)", 1);
-    let msg = assert_unsupported(&lower_src(&param_builtin).unwrap_err());
-    assert!(
-        msg.contains("on a component-typed parameter"),
-        "parameter-form carve-out: {msg}"
-    );
-    cpp_tb::emit(&merged_src(&param_builtin))
-        .expect("v1 emits the built-in predicate on a parameter");
-
-    // And the carve-out: a BUILT-IN predicate is not a declared method
-    // either, but both backends implement it — TB-IR in expression
-    // position, v1 anywhere. It keeps the suggestion.
-    //
-    // THREE landings reach the path-form arm, not the two an earlier
-    // version of this test checked. A bare statement has no binding and
-    // no local, so a message about "a binding position" described the
-    // wrong one of them.
-    for stmt in ["let q = c.idle(2)", "c.idle(2)", "x = c.idle(2)"] {
-        let builtin = if stmt.starts_with("x =") {
-            src(&format!("let x : uint<32> = 0\n        {stmt}"))
-        } else {
-            src(stmt)
-        };
-        let msg = assert_unsupported(&lower_src(&builtin).unwrap_err());
-        assert!(msg.contains("built-in predicate"), "{stmt}: {msg}");
-        cpp_tb::emit(&merged_src(&builtin))
-            .unwrap_or_else(|e| panic!("{stmt}: v1 emits the built-in predicate: {e}"));
+    // Component-typed parameters take the same predicate path as concrete
+    // component instances. `quiesced` is significant here: its expanded
+    // leaf paths must remain relative to the parameter receiver.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        let param_builtin = param.replacen("m.nosuch(a)", &format!("m.{name}(a)"), 1);
+        let prog = lower_src(&param_builtin)
+            .unwrap_or_else(|e| panic!("parameter predicate {name} lowers: {e}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("parameter predicate {name} verifies: {e:?}"));
+        let cpp = emit_cpp_src(&param_builtin);
+        assert!(
+            cpp.contains("m._last_"),
+            "parameter predicate {name} must render through the local name: {cpp}"
+        );
     }
-    // The same predicate one statement position over lowers under TB-IR,
-    // which is what makes `Invalid` false for it.
-    lower_src(&src("assert c.idle(2) else fail(\"q\")"))
-        .expect("TB-IR lowers the predicate in expression position");
+
+    // All four built-ins lower in the three source positions that used to
+    // be intercepted by component-method resolution: untyped let,
+    // assignment RHS, and a pure statement whose value is discarded.
+    for name in ["idle", "idle_in", "idle_out", "quiesced"] {
+        for (position, call) in [
+            ("let", format!("let q = c.{name}(2)")),
+            ("statement", format!("c.{name}(2)")),
+            (
+                "assignment",
+                format!("let x : bool = false\n        x = c.{name}(2)"),
+            ),
+        ] {
+            let builtin = src(&call);
+            let prog = lower_src(&builtin)
+                .unwrap_or_else(|e| panic!("{name} in {position} position lowers: {e}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("{name} in {position} position verifies: {e:?}"));
+            let cpp = emit_cpp_src(&builtin);
+            assert!(
+                cpp.contains("c._last_"),
+                "{name} in {position} position emits its heartbeat read: {cpp}"
+            );
+        }
+    }
 
     // A component that DECLARES the name gets its own method, on both
     // backends — the built-in is a default, not a reserved word. TB-IR
@@ -34910,6 +34912,91 @@ end test PTest"#;
             "{name}: v1 calls the declared method"
         );
     }
+}
+
+#[test]
+fn component_idle_parameter_base_and_relative_leaf_are_verified() {
+    let src = fixture("post_eval_provider_test.harc").replacen(
+        "        let r : ReadResponse = model.predict_read(addr)",
+        "        let q = model.idle(addr)\n        let r : ReadResponse = model.predict_read(addr)",
+        1,
+    );
+    let prog = lower_src(&src).expect("component-local predicate lowers");
+    verify::verify_program(&prog).expect("component-local predicate verifies");
+
+    let mut wrong_base = prog.clone();
+    let function = wrong_base
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.blocks.iter().any(|block| {
+                block
+                    .stmts
+                    .iter()
+                    .any(|stmt| matches!(stmt, ir::Stmt::Assign(_, ir::Expr::ComponentIdle { .. })))
+            })
+        })
+        .expect("function containing component idle");
+    let scalar = function
+        .locals
+        .iter()
+        .position(|local| local.name == "addr")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("scalar parameter local");
+    let idle = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentIdle { base, .. }) => Some(base),
+            _ => None,
+        })
+        .expect("component idle expression");
+    *idle = ir::ComponentBase::Local(scalar);
+    let errs = verify::verify_program(&wrong_base)
+        .expect_err("a scalar local cannot be a component predicate receiver");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("component idle local") && what.contains("not component-typed")
+        )),
+        "{errs:?}"
+    );
+
+    let mut wrong_leaf = prog;
+    let function = wrong_leaf
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.blocks.iter().any(|block| {
+                block
+                    .stmts
+                    .iter()
+                    .any(|stmt| matches!(stmt, ir::Stmt::Assign(_, ir::Expr::ComponentIdle { .. })))
+            })
+        })
+        .expect("function containing component idle");
+    let subpath = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::ComponentIdle { subpath, .. }) => Some(subpath),
+            _ => None,
+        })
+        .expect("component idle expression");
+    subpath.push("missing".to_string());
+    let errs = verify::verify_program(&wrong_leaf)
+        .expect_err("a missing relative predicate leaf cannot verify");
+    assert!(
+        errs.iter().any(|err| matches!(
+            err,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("component idle path") && what.contains("missing")
+        )),
+        "{errs:?}"
+    );
 }
 
 /// Statement-position subscriptions accept both a test-scope event local

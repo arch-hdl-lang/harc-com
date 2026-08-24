@@ -2833,6 +2833,10 @@ pub enum Expr {
     /// allowed wherever a `Local` is.
     ComponentIdle {
         base: ComponentBase,
+        /// Sub-component member path relative to `base`. Empty for a
+        /// predicate on the receiver itself; populated by `quiesced` when
+        /// it expands a component-local receiver into its leaf components.
+        subpath: Vec<String>,
         kind: IdleKind,
         n: Box<Expr>,
     },

@@ -721,8 +721,17 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // Heartbeat-idle predicate on a component instance — mirrors v1's
         // `emit_idle_predicate`: compares `cycle_count` minus the
         // `_last_in_cycle`/`_last_out_cycle` stamp against the threshold.
-        Expr::ComponentIdle { base, kind, n } => {
-            let recv = comp_base_cpp_subst(base, cx.self_subst);
+        Expr::ComponentIdle {
+            base,
+            subpath,
+            kind,
+            n,
+        } => {
+            let mut recv = comp_base_cpp_subst_cx(cx, base);
+            if !subpath.is_empty() {
+                recv.push('.');
+                recv.push_str(&subpath.join("."));
+            }
             let n = bounded_count_expr_cpp(cx, n, u64::MAX)?;
             match kind {
                 crate::ir::IdleKind::In => {
@@ -1913,13 +1922,13 @@ pub(super) fn comp_base_cpp(base: &crate::ir::ComponentBase) -> String {
 /// clause exprs lowered self-relatively but emitted in a `_checkers`
 /// closure that has no `self` (watchdog/periodic period + max_idle).
 ///
-/// A `ComponentBase::Local` only ever arises inside a method body (a
-/// component-typed parameter receiver), where the cx-aware
-/// [`comp_base_cpp_subst_cx`] is used to render it via the local-name
-/// table. This name-less variant therefore never sees a `Local` and
-/// renders it to a deliberately-invalid sentinel rather than threading a
-/// names table everywhere — the call paths that can produce a `Local`
-/// base all route through the cx-aware variant.
+/// A `ComponentBase::Local` arises inside a method body (a
+/// component-typed parameter receiver) for method calls and predicates. The
+/// cx-aware [`comp_base_cpp_subst_cx`] is used to render it via the local-name
+/// table. This name-less variant therefore never sees a `Local` and renders it
+/// to a deliberately-invalid sentinel rather than threading a names table
+/// everywhere — the call paths that can produce a `Local` base all route
+/// through the cx-aware variant.
 pub(super) fn comp_base_cpp_subst(
     base: &crate::ir::ComponentBase,
     self_subst: Option<&str>,

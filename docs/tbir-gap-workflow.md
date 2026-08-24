@@ -35,6 +35,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Method-hook paths: statement-position registration, nested component
   receivers, and non-transactor component receivers.
 - [x] Heartbeat predicates on transactor receivers.
+- [x] Component heartbeat predicates (`idle`, `idle_in`, `idle_out`, and
+  `quiesced`) in expression, inferred-let, assignment, and discarded-value
+  positions, including component-typed parameter receivers.
 - [x] Bound-transactor `thread` items routed through the component path.
 - [x] Direct coverpoint value gaps with working v1 behavior (sized literals,
   runtime slice/lane selectors, and directly sampled or narrowed wide values).
@@ -85,8 +88,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 139 remaining constructor call sites (140 textual matches including
-the `unsupported` helper definition) as an inventory, not 140 separate tasks.
+Treat the 128 remaining constructor call sites (129 textual matches including
+the `unsupported` helper definition) as an inventory, not 129 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -153,6 +156,11 @@ The record-list randomize batch closes the scalar-element declaration and
 constraint family. Its explicit source boundary for ordinary body-position
 list queries reuses the consolidated boundary diagnostic, leaving 140 textual
 matches (139 constructors plus the helper).
+Subsequent mainline batches reduce that inventory to 131 textual matches. The
+component built-in predicate batch removes the two remaining method-routing
+rejections (path and component-typed parameter receivers), leaving 129 textual
+matches (128 constructors plus the helper). Its existing agent fixture now
+trace-checks inferred-let, assignment, and discarded-value predicate uses.
 
 ## Review-derived semantic gates
 
@@ -216,8 +224,8 @@ not applicable before requesting review:
    bound-thread, direct coverpoint-value, composed-wide-cover, record-value
    destination, whole component fixed-vector, and wide unsigned scoreboard
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
-   diagnostic-call slices reduce the count
-   from 174 to 140 textual matches (139 constructors plus the helper
+   diagnostic-call and component-predicate slices reduce the count
+   from 174 to 129 textual matches (128 constructors plus the helper
    definition). The
    scoreboard source families did not remove constructors because unsupported
    non-scalar fields share it. Nested bus expressions and sized cover widths

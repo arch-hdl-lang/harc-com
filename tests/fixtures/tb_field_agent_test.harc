@@ -76,6 +76,15 @@ impl TbFieldAgentTest for TbFieldAgentTb
 
         assert tagger.idle_in(4)
             else fail("agent never reported idle_in(4); waited=${waited}")
+        // Exercise the value-routing positions shared by every component
+        // built-in predicate: inferred let, assignment RHS, and discarded
+        // statement value. These observe the same input heartbeat above.
+        let idle_value = tagger.idle_in(4)
+        let assigned : bool = false
+        assigned = tagger.idle_in(4)
+        tagger.idle_in(4)
+        assert idle_value && assigned
+            else fail("component idle predicate lost its boolean value")
         log(info, "PASS: agent handled ${tagger.seen} events, idle_in(4) after ${waited} cycles")
     end run
 end impl TbFieldAgentTest
