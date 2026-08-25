@@ -30265,7 +30265,7 @@ end impl MTest"#;
         &lower_src(SRC).unwrap_err(),
         lower::V1Status::EmitsUncompilable,
     );
-    assert!(msg.contains("not a `RegOp` record local"), "{msg}");
+    assert!(msg.contains("not a `RegOp` record expression"), "{msg}");
     assert!(msg.contains("mismatched"), "{msg}");
 
     // A SCALAR local reaches the same arm (`record_of_local == None`);
@@ -30278,7 +30278,7 @@ end impl MTest"#;
         &lower_src(&scalar).unwrap_err(),
         lower::V1Status::EmitsUncompilable,
     );
-    assert!(msg.contains("not a `RegOp` record local"), "{msg}");
+    assert!(msg.contains("not a `RegOp` record expression"), "{msg}");
 
     // The control — a same-typed record local — still lowers and emits.
     let ok = SRC.replace(
@@ -30289,6 +30289,156 @@ end impl MTest"#;
         emit_cpp_src(&ok).contains("push_back"),
         "a same-typed record yield still lowers"
     );
+}
+
+/// v1 places the entire `yield` expression inside `push_back`, so a
+/// record-element tseq accepts every expression whose result is that record
+/// type, not only a bare identifier. Parentheses are the smallest witness;
+/// a ternary proves the lowering and type check compose beyond syntax sugar.
+#[test]
+fn record_tseq_yield_accepts_record_valued_expressions() {
+    const SRC: &str = r#"transaction Req
+    a : uint<8>
+end transaction Req
+
+tseq Gen(pick_first: bool) -> TSeq<Req>
+    let a : Req
+    let b : Req
+    a.a = 3
+    b.a = 7
+    yield (a)
+    yield pick_first ? a : b
+end tseq Gen
+
+testbench MTb
+    dut : Top
+end testbench MTb
+
+impl MTest for MTb
+    run
+        let xs = Gen(false)
+        let sum = 0
+        for x in xs
+            sum = sum + x.a
+        end for
+        assert sum == 10 else fail("record yield expression sum=${sum}")
+    end run
+end impl MTest"#;
+
+    let prog = lower_src(SRC).expect("record-valued yield expressions lower");
+    verify::verify_program(&prog).expect("record-valued yield expressions verify");
+    let cpp = emit_cpp_src(SRC);
+    assert!(
+        cpp.contains("push_back(a)") && cpp.contains("push_back((pick_first ? a : b))"),
+        "both record-valued expressions reach the sequence accumulator:\n{cpp}"
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(SRC)).expect("v1 emits record-valued yield expressions");
+    assert!(
+        v1.contains("_result.push_back((a))")
+            && v1.contains("_result.push_back((pick_first ? a : b))"),
+        "v1 provides the parity control:\n{v1}"
+    );
+}
+
+/// `SeqPush` is a typed IR seam: later passes must not be able to replace a
+/// valid record yield with an incompatible accumulator or value and reach C++
+/// emission. Exercise each corruption independently, including the mixed-arm
+/// ternary shape newly admitted by the source lowering.
+#[test]
+fn verifier_rejects_corrupted_record_sequence_pushes() {
+    const SRC: &str = r#"transaction Req
+    a : uint<8>
+end transaction Req
+
+transaction Other
+    b : uint<8>
+end transaction Other
+
+tseq Gen() -> TSeq<Req>
+    let a : Req
+    let other : Other
+    yield a
+end tseq Gen
+
+testbench MTb
+    dut : Top
+end testbench MTb
+
+impl MTest for MTb
+    run
+        let xs = Gen()
+    end run
+end impl MTest"#;
+
+    let prog = lower_src(SRC).expect("record sequence control lowers");
+    verify::verify_program(&prog).expect("record sequence control verifies");
+    let fidx = prog
+        .functions
+        .iter()
+        .position(|function| matches!(function.kind, ir::FunctionKind::Tseq { .. }))
+        .expect("tseq function exists");
+    let local = |name: &str| {
+        prog.functions[fidx]
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .map(|index| ir::LocalId(index as u32))
+            .expect("record local exists")
+    };
+    let req = local("a");
+    let other = local("other");
+    let seq = prog.functions[fidx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::SeqPush { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .expect("SeqPush exists");
+
+    fn push_value(prog: &mut ir::TbProgram, fidx: usize) -> &mut ir::Expr {
+        prog.functions[fidx]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::SeqPush { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("SeqPush exists")
+    }
+
+    let mut wrong_accumulator = prog.clone();
+    wrong_accumulator.functions[fidx].locals[seq.index()].ty = ir::IrType::UInt(Some(8));
+    verify::verify_program(&wrong_accumulator)
+        .expect_err("a non-sequence SeqPush accumulator must fail verification");
+
+    let mut scalar = prog.clone();
+    *push_value(&mut scalar, fidx) = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(8)),
+    };
+    verify::verify_program(&scalar)
+        .expect_err("a scalar pushed into RecordSeq must fail verification");
+
+    let mut wrong_record = prog.clone();
+    *push_value(&mut wrong_record, fidx) = ir::Expr::Local(other);
+    verify::verify_program(&wrong_record)
+        .expect_err("a distinct record pushed into RecordSeq must fail verification");
+
+    let mut mixed_ternary = prog;
+    *push_value(&mut mixed_ternary, fidx) = ir::Expr::Ternary(
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Bool,
+        }),
+        Box::new(ir::Expr::Local(req)),
+        Box::new(ir::Expr::Local(other)),
+    );
+    verify::verify_program(&mixed_ternary)
+        .expect_err("mixed-record ternary pushed into RecordSeq must fail verification");
 }
 
 /// `components.rs`'s sub-component-field arm covered two inputs that v1

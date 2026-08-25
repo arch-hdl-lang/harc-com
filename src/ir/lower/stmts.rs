@@ -4618,47 +4618,29 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::SeqPush { seq, value: v });
                 Ok(())
             }
-            // Record-element sequence: yield a bare same-typed record local
-            // — the only thing `push_back` accepts.
+            // Record-element sequence: yield any expression that produces
+            // the accumulator's record type. v1 emits the expression
+            // directly into `push_back`, so parenthesized locals and
+            // record-valued ternaries are just as valid as a bare local.
             IrType::Record(elem_rid) => {
-                let ExprKind::Ident(id) = &*value.kind else {
-                    return Err(unsupported(
-                        "`yield` of a non-identifier value",
-                        "yield a record-typed local declared with `let t : <Transaction>`",
+                let v = self.lower_expr_no_ports(value)?;
+                if self.record_id_of_expr(&v) != Some(elem_rid) {
+                    // A distinct record, scalar or malformed record
+                    // expression is accepted by v1's frontend and pasted
+                    // into `vector<Elem>::push_back`, where C++ rejects it.
+                    // Keep that measured classification while widening the
+                    // successful path from locals to record expressions.
+                    return Err(not_implemented(
+                        &format!(
+                            "`yield` whose value is not a `{}` record expression",
+                            self.ctx.records[elem_rid.index()].name
+                        ),
+                        "yield an expression of the tseq's record type; v1 emits the \
+                         mismatched `push_back`, which does not compile",
+                        V1Status::EmitsUncompilable,
                     ));
-                };
-                let Some(local) = self.lookup(&id.name) else {
-                    return Err(LowerError::Invalid(format!(
-                        "yield {0}: `{0}` is not in scope",
-                        id.name
-                    )));
-                };
-                match self.record_of_local(local) {
-                    Some(rid) if rid == elem_rid => {}
-                    _ => {
-                        // The local is not a `<elem>` record — a distinct
-                        // record, or a scalar (which reaches this arm with
-                        // `record_of_local == None`). v1 pushes it verbatim
-                        // and emits the mismatched
-                        // `std::vector<Elem>::push_back(<other>)`, which g++
-                        // refuses — the record-element twin of the
-                        // scalar-element arm above.
-                        return Err(not_implemented(
-                            &format!(
-                                "`yield {}` whose value is not a `{}` record local",
-                                id.name,
-                                self.ctx.records[elem_rid.index()].name
-                            ),
-                            "yield a same-typed transaction local; v1 emits the mismatched \
-                             `push_back`, which does not compile",
-                            V1Status::EmitsUncompilable,
-                        ));
-                    }
                 }
-                self.push(Stmt::SeqPush {
-                    seq,
-                    value: Expr::Local(local),
-                });
+                self.push(Stmt::SeqPush { seq, value: v });
                 Ok(())
             }
             other => Err(LowerError::Invalid(format!(
