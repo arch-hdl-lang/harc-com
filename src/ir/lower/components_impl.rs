@@ -2689,38 +2689,19 @@ where
     //     error: "connect: hookable sink `sink.two` must take exactly
     //     one payload argument, got 2" and "connect: hookable sink
     //     `sink.ret` must return void".
-    //   * payload mismatch — MIXED, and this is the row a first pass
-    //     got wrong. `event_payload_matches_ir_type` compares
-    //     signedness and record identity only, so one arm covers two
-    //     very different shapes:
+    //   * payload shape mismatch — records and scalars cannot bridge,
+    //     and two record payloads must name the same record. Scalar
+    //     signedness differences are supported: the callback bridge
+    //     performs the same ordinary C++ conversion as v1.
     //       - record vs scalar (`event<uint<8>>` into a `Beat` sink) —
     //         the bridge lambda is generic, but converting it to the
     //         source's `std::function<void(uint64_t)>` instantiates it,
     //         so it bites at the wiring line. g++: "no match for call
     //         to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'".
-    //       - SIGNEDNESS only (`event<uint<8>>` into a `sint<8>` sink)
-    //         — v1 emits `Sink_write_obs(e.sb, _t)` from a
-    //         `void(uint64_t)` channel into an `int64_t` parameter.
-    //         That is an implicit conversion, and it COMPILES AND RUNS
-    //         CORRECTLY: built and run, count=2 sum=8, exactly what the
-    //         program asks for. So v1 implements that program and the
-    //         suggestion is honest for it.
-    //
-    // These are therefore NOT `Invalid`. An earlier pass made them so on
-    // the grounds that an uninstantiated env is "v1 not looking, not v1
-    // running the program" — but v1 emits, compiles and RUNS such a
-    // program to completion, so "a program error under every backend"
-    // is false for every one of these arms, and it was the same
-    // observation the endpoint-shape arms above cite for keeping their
-    // suggestion. One observation cannot reach opposite verdicts in one
-    // function.
-    //
-    // What separates these from the endpoint arms is narrower: an
-    // instantiated malformed PATH can still mean something to v1 (a
-    // single-segment endpoint resolves against the owner's own
-    // hookable), while an instantiated bad SINK never does — except the
-    // signedness row, which is split out below precisely because it
-    // does.
+    // Scalar signedness differences do not reach the mismatch arm: v1
+    // emits `Sink_write_obs(e.sb, _t)` from a `void(uint64_t)` channel
+    // into an `int64_t` parameter, and TBIR now preserves that ordinary
+    // implicit conversion.
     let (sink, sink_activation) = if let Some(sm) = sink_comp.method(&sink_name) {
         if !sm.hookable {
             return Err(not_implemented(
@@ -2756,11 +2737,10 @@ where
                 V1Status::Rejects,
             ));
         }
-        if !event_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
+        if !connect_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
-                both_scalar_payload_and_param(src_payload, &sm.param_tys[0]),
             ));
         }
         // Signedness agreeing is not the whole rule once the payload
@@ -2792,7 +2772,6 @@ where
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
-                both_scalar_payloads(src_payload, *payload),
             ));
         }
         if let (Some(src_ty), Some(sink_ty)) =
@@ -2874,74 +2853,21 @@ fn resolve_testbench_path(
     }
 }
 
-/// A `connect` payload mismatch, split on the one distinction that
-/// decides whether v1 runs the program.
-///
-/// `event_payload_matches_ir_type` compares signedness and record
-/// identity, so one check covers two shapes that behave completely
-/// differently under v1:
-///
-///   * both sides SCALAR, differing only in signedness — v1's bridge
-///     lambda is generic, and converting it to the source's
-///     `std::function<void(uint64_t)>` gives an implicit conversion into
-///     the sink's `int64_t` parameter. Built and run: `count=2 sum=8`,
-///     exactly what the program asks for. v1 implements it, so the
-///     suggestion is honest.
-///   * anything else — a RECORD against a scalar in either direction,
-///     two DIFFERENT records, or a component-typed sink parameter
-///     (`method_schema_ir_type` can produce `IrType::Component`). The
-///     same conversion has nothing to convert. g++: "no match for call
-///     to '(<lambda(Sink&, Beat)>) (Sink&, long unsigned int&)'". A
-///     first version of this comment named only the record-vs-scalar
-///     row, which is one of three.
-///
-/// `scalars` is the caller's answer to "are both sides scalars?", which
-/// is the exact discriminator rather than a proxy for it.
-fn connect_payload_mismatch(src: &str, sink: &str, scalars: bool) -> LowerError {
+/// Diagnose a `connect` whose endpoints have incompatible payload
+/// shapes. Scalar-to-scalar delivery, including a signedness change, is
+/// handled by the bridge; reaching here means there is no C++ conversion
+/// that can connect the two endpoints.
+fn connect_payload_mismatch(src: &str, sink: &str) -> LowerError {
     // Both arguments are already full endpoint labels (`endpoint_label`),
     // not path-plus-leaf: an owner-relative endpoint has an EMPTY path,
     // and re-appending the leaf here would render it `.own_ev`.
     let construct = format!("a `connect` payload mismatch from `{src}` to `{sink}`");
-    if scalars {
-        unsupported(
-            &construct,
-            "source and sink scalar payloads must agree in signedness; v1 lets the \
-             implicit conversion through and the program runs",
-        )
-    } else {
-        not_implemented(
-            &construct,
-            "the payload shapes cannot be bridged — a record against a scalar, two \
-             different records, or a component-typed parameter; v1 emits the generic \
-             bridge anyway and the emitted C++ does not compile",
-            V1Status::EmitsUncompilable,
-        )
-    }
-}
-
-/// Whether a `connect` source payload and a sink EVENT payload are both
-/// scalars — the discriminator `connect_payload_mismatch` splits on,
-/// for the event-sink branch.
-fn both_scalar_payloads(src: EventPayload, sink: EventPayload) -> bool {
-    matches!(
-        (src, sink),
-        (EventPayload::Scalar { .. }, EventPayload::Scalar { .. })
-    )
-}
-
-/// The same discriminator for the METHOD-sink branch, where the sink
-/// side is a declared parameter type rather than an event payload.
-///
-/// Named for what it answers, not for the branch it is called from: it
-/// is only ever consulted once the payloads are known NOT to match, so
-/// a `true` here means "both scalars, and the mismatch is signedness".
-fn both_scalar_payload_and_param(payload: EventPayload, ty: &IrType) -> bool {
-    matches!(
-        (payload, ty),
-        (
-            EventPayload::Scalar { .. },
-            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
-        )
+    not_implemented(
+        &construct,
+        "the payload shapes cannot be bridged — a record against a scalar, two \
+         different records, or a component-typed parameter; v1 emits the generic \
+         bridge anyway and the emitted C++ does not compile",
+        V1Status::EmitsUncompilable,
     )
 }
 
@@ -2974,15 +2900,16 @@ pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
     matches!(name, "idle" | "idle_in" | "idle_out" | "quiesced")
 }
 
-/// Whether a hookable method's declared parameter has the same runtime
-/// callback shape as an analysis event payload. Narrow unsigned values,
-/// `bits`, and `bool` all widen to the unsigned callback representation;
-/// signed values and value records retain distinct shapes.
-fn event_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
+/// Whether an analysis event payload can reach a hookable method through
+/// a `connect` bridge. All scalar payloads can cross signedness through
+/// the emitted C++ conversion; records must retain identity.
+pub(crate) fn connect_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
+        (
+            EventPayload::Scalar { .. },
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool,
+        ) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
         _ => false,
     }
@@ -3071,15 +2998,13 @@ const CONNECT_NARROWING_CONSTRUCT: &str =
 /// same SHAPE — the question `*payload != src_payload` answered back
 /// when `EventPayload::Scalar` held signedness and nothing else.
 ///
-/// Width is deliberately not part of it: two scalar payloads of
-/// different declared widths are bridgeable whenever the delivery does
-/// not lose bits, and that is `connect_delivery_verdict`'s question,
-/// with its own diagnostic. Folding the two together is what made a
-/// legal program report "must agree in signedness" when signedness
-/// agreed.
+/// Width and signedness are deliberately not part of it: two scalar
+/// payloads are bridgeable whenever delivery does not lose storage bits,
+/// and that is `connect_delivery_verdict`'s question with its own
+/// diagnostic.
 pub(crate) fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
     match (src, sink) {
-        (EventPayload::Scalar { signed: a, .. }, EventPayload::Scalar { signed: b, .. }) => a == b,
+        (EventPayload::Scalar { .. }, EventPayload::Scalar { .. }) => true,
         (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
         _ => false,
     }

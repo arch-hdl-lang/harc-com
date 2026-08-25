@@ -2474,10 +2474,10 @@ fn analysis_env_connect_emitted_cpp_snapshot() {
 
 /// Analysis `connect` is a typed subscription boundary. A plain `function`
 /// is callable but is not hookable, so it must not silently become a
-/// subscription sink; similarly, signed and unsigned scalar callback shapes
-/// must agree before C++ emission.
+/// subscription sink. Signed and unsigned scalar callbacks, however, cross
+/// the bridge through the same implicit conversion both backends emit.
 #[test]
-fn analysis_connect_rejects_non_hookable_and_payload_mismatched_sinks() {
+fn analysis_connect_rejects_non_hookable_and_accepts_scalar_signedness_conversion() {
     let non_hookable = r#"
 transactor Source
     observed : out event<uint<8>>
@@ -2521,23 +2521,20 @@ end test T
         "unexpected diagnostic: {msg}"
     );
 
-    // This second case is a SIGNEDNESS-only mismatch, and v1 RUNS it:
+    // This second case is a SIGNEDNESS-only conversion, and v1 RUNS it:
     // the generic bridge converts `uint64_t` into the sink's `int64_t`
     // parameter and the program behaves as written (built and run:
-    // count=2 sum=8). So it keeps the suggestion. It sat under
-    // `assert_invalid` for one commit — the counterexample to that
-    // verdict was inside the suite asserting it.
+    // count=2 sum=8). TBIR now accepts and emits the same bridge.
     let mismatched_payload = non_hookable.replace(
         "function accept(v: uint<8>)\n    end accept",
         "hookable accept(v: sint<8>)\n    end accept",
     );
-    let err = lower_src(&mismatched_payload).expect_err("must reject incompatible payloads");
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("payload mismatch"),
-        "unexpected diagnostic: {msg}"
-    );
-    cpp_tb::emit(&merged_src(&mismatched_payload)).expect("v1 emits the sign mismatch");
+    let prog = lower_src(&mismatched_payload).expect("TBIR lowers the sign conversion");
+    verify::verify_program(&prog).expect("TBIR verifies the sign conversion");
+    let merged = merged_src(&mismatched_payload);
+    tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits the sign conversion");
+    cpp_tb::emit(&merged).expect("v1 emits the sign conversion");
 }
 
 /// An omitted hookable-parameter annotation leaves the front-end type as
@@ -34584,20 +34581,15 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
 /// | sink is a plain `function` | `for (auto& _s : sink.plain)` — not a struct member | `EmitsUncompilable` |
 /// | sink is a scalar field | `for (auto& _s : sink.other)` over a `uint64_t` | `EmitsUncompilable` |
 /// | payload mismatch, RECORD vs scalar | bridge lambda instantiates against the wrong type | `EmitsUncompilable` |
-/// | payload mismatch, SIGNEDNESS only | implicit conversion — compiles and runs correctly | `Unsupported` |
+/// | payload mismatch, SIGNEDNESS only | implicit conversion — compiles and runs correctly | supported |
 ///
 /// The uncompilable rows are compiler-measured, not read off the text.
 ///
-/// The payload rows are one arm covering two shapes, because
-/// `event_payload_matches_ir_type` compares signedness and record
-/// identity only. v1's bridge lambda is GENERIC and looks
-/// type-agnostic; converting it to the source's
-/// `std::function<void(uint64_t)>` instantiates it at the wiring line,
-/// which a record cannot survive and a sign difference passes through
-/// as an ordinary implicit conversion. A first pass measured only the
-/// record shape and called the whole arm `Invalid` — wrong twice over,
-/// since v1 both runs the sign case and runs any of these inside an env
-/// nothing instantiates.
+/// v1's bridge lambda is generic and looks type-agnostic; converting it
+/// to the source's `std::function<void(uint64_t)>` instantiates it at the
+/// wiring line. A record mismatch cannot survive that instantiation, but
+/// a scalar sign difference passes through as an ordinary implicit
+/// conversion. TBIR supports that same scalar bridge.
 #[test]
 fn a_connect_sink_that_cannot_receive_the_payload_is_split_by_what_v1_does() {
     let src = |sink_decl: &str, target: &str, extra: &str| {
@@ -34691,9 +34683,8 @@ end impl T"#,
         assert!(msg.contains(want), "{what}: {msg}");
     }
 
-    // The SIGNEDNESS row, which is the same arm and the opposite
-    // verdict: v1's implicit conversion carries the payload through
-    // intact, so it keeps the suggestion.
+    // The SIGNEDNESS row is supported: both backends' implicit
+    // conversion carries the scalar payload through.
     for (what, sink_decl, target, extra) in [
         (
             "method sink",
@@ -34704,9 +34695,12 @@ end impl T"#,
         ("event sink", hookable, "dst.incoming", dst("sint<8>")),
     ] {
         let s = src(sink_decl, target, &extra);
-        let msg = assert_unsupported(&lower_src(&s).unwrap_err());
-        assert!(msg.contains("payload mismatch"), "{what}: {msg}");
-        cpp_tb::emit(&merged_src(&s))
+        let prog = lower_src(&s).unwrap_or_else(|e| panic!("{what}: TBIR lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what}: TBIR verifies: {e:?}"));
+        let merged = merged_src(&s);
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("{what}: TBIR emits a sign mismatch: {e}"));
+        cpp_tb::emit(&merged)
             .unwrap_or_else(|e| panic!("{what}: v1 emits a sign mismatch: {e}"));
     }
 }
@@ -37916,8 +37910,8 @@ end impl SmallTest
 /// is false about a program whose signedness agrees.
 ///
 /// The rows are the ones measured against `origin/main`'s own binary:
-/// all of them lower there. Signedness disagreement is the rule that
-/// arm really enforces, so it stays refused.
+/// all of them lower there. Signedness differences use the same scalar
+/// callback bridge and are covered here too.
 ///
 /// TESTBENCH scope, and `verify_program`, both deliberately. The first
 /// version of this test wired the connect inside an `env` and called
@@ -38016,6 +38010,8 @@ end impl TConn
         ("uint<128>", "uint<128>"),
         ("uint<160>", "uint<1024>"),
         ("uint<8>", "uint<1024>"),
+        ("uint<8>", "sint<8>"),
+        ("sint<8>", "uint<16>"),
     ] {
         for (scope, src_text) in [
             ("env", env_prog(src, sink)),
@@ -38033,15 +38029,6 @@ end impl TConn
             });
         }
     }
-    // The rule that arm DOES enforce. Without it the assertions above
-    // would also pass with the whole check deleted.
-    let err =
-        lower_src(&env_prog("uint<8>", "sint<8>")).expect_err("signedness must still disagree");
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("agree in signedness"),
-        "a signedness mismatch keeps its own diagnostic: {msg}"
-    );
 }
 
 /// A `connect` whose payload is WIDER than the subscriber receiving it
@@ -38282,11 +38269,9 @@ end impl TDump
 /// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
 /// parameter, dropping 960 bits per notification with no diagnostic.
 ///
-/// Testbench scope on purpose. `verify.rs` walks `tb.connects` only,
-/// so the same edge inside an `env` — the majority shape in the
-/// fixture corpus — reaches no verifier at all. That hole is real and
-/// is NOT closed here; this test pins the scope that is covered so the
-/// coverage claim stays honest about which one it is.
+/// Covers testbench-owned connects and component-owned env connects.
+/// The latter are codegen's primary reusable-composition path and must
+/// not bypass the same metadata checks.
 #[test]
 fn the_verifier_backstops_the_connect_payload_width_rule() {
     let widen_source_payload = |prog: &mut ir::TbProgram| {
@@ -38372,7 +38357,45 @@ impl BackstopTest2 for BackstopTb2
 end impl BackstopTest2
 "#;
 
-    for (kind, src) in [("method sink", method_sink), ("event sink", event_sink)] {
+    // Component-owned edge: the env schema retains this connect and the
+    // synthetic testbench merely instantiates the env.
+    let env_method_sink = r#"transactor BackstopEnvSrc
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor BackstopEnvSrc
+
+scoreboard BackstopEnvSb
+    seen : uint<32> default 0
+    hookable observe(v: uint<8>)
+        seen = seen + v
+    end observe
+end scoreboard BackstopEnvSb
+
+env BackstopEnv
+    source : BackstopEnvSrc passive
+    sb     : BackstopEnvSb
+    connect
+        source.observed -> sb.observe
+    end connect
+end env BackstopEnv
+
+test BackstopEnvTest
+    let dut : Top
+    let env : BackstopEnv
+    run
+        env.source.publish(1)
+        wait 1 cycle
+    end run
+end test BackstopEnvTest
+"#;
+
+    for (kind, src) in [
+        ("testbench method sink", method_sink),
+        ("testbench event sink", event_sink),
+        ("env method sink", env_method_sink),
+    ] {
         let mut prog = lower_src(src).unwrap_or_else(|e| panic!("{kind} lowers: {e:?}"));
         verify::verify_program(&prog)
             .unwrap_or_else(|e| panic!("{kind} verifies before the widening: {e:?}"));
@@ -38381,6 +38404,17 @@ end impl BackstopTest2
             "{kind}: a 1024-bit payload cannot be delivered to a 64-bit subscriber"
         ));
     }
+
+    let mut prog = lower_src(env_method_sink).expect("env connect lowers");
+    let edge = &mut prog
+        .components
+        .iter_mut()
+        .find(|component| component.name == "BackstopEnv")
+        .expect("env component schema")
+        .connects[0];
+    edge.sink_component = ir::ComponentId(999);
+    verify::verify_program(&prog)
+        .expect_err("an env connect's corrupted sink component must not reach codegen");
 }
 
 /// Field-declaration shapes that promised v1 (`Unsupported`) while v1

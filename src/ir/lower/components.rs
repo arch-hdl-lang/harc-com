@@ -15,8 +15,9 @@ use super::*;
 mod implementation;
 
 pub(crate) use implementation::{
-    bound_transactor_is_component, connect_delivery_is_faithful, dotted_path, endpoint_label,
-    event_payloads_agree_in_shape, field_scalar_width_ok, fixed_vec_elem_ir_type,
+    bound_transactor_is_component, connect_delivery_is_faithful,
+    connect_payload_matches_ir_type, dotted_path, endpoint_label, event_payloads_agree_in_shape,
+    field_scalar_width_ok, fixed_vec_elem_ir_type,
     fold_field_default, is_event_field, lower_component_bodies, lower_component_schema,
     lower_event_payload, lower_queue_elem, resolve_connects, resolve_testbench_connects,
     scalar_field_ir_type, scoreboard_is_component, transactor_has_mode_sensitive_analysis_surface,
