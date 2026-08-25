@@ -34572,6 +34572,80 @@ fn an_event_emit_takes_exactly_one_payload_at_every_branch() {
     );
 }
 
+/// An event has one payload slot but does not declare a name for that slot.
+/// v1 therefore discards any written name and binds the value positionally.
+/// With exactly one argument this is unambiguous, and all three TB-IR emit
+/// lanes should accept the same spelling rather than report a subset gap.
+#[test]
+fn a_single_named_event_payload_binds_to_the_only_slot() {
+    let path = fixture("agent_on_handler_test.harc");
+    let path_named = path.replacen(
+        "emit tagger.in_ev(i + 1)",
+        "emit tagger.in_ev(payload = i + 1)",
+        1,
+    );
+
+    let self_relative = fixture("analysis_sink_connect_test.harc");
+    let self_named = self_relative.replacen(
+        "emit observed(v)",
+        "emit observed(payload = v)",
+        1,
+    );
+
+    let local = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+test T
+    let dut : Top
+    clock clk = SysDomain
+    run
+        let e : event<uint<8>>
+        on e(v)
+            assert v == 7
+        end on
+        emit e(payload = 7)
+        wait 2 cycles
+    end run
+end test T
+"#;
+
+    for (what, src, emitted) in [
+        (
+            "component path",
+            path_named.as_str(),
+            "for (auto& _s : tagger.in_ev) _s((i + 1));",
+        ),
+        (
+            "self-relative",
+            self_named.as_str(),
+            "for (auto& _s : self.observed) _s(v);",
+        ),
+        (
+            "test-scope local",
+            local,
+            "for (auto& _s : e) _s(7);",
+        ),
+    ] {
+        let cpp = emit_cpp_src(src);
+        assert!(
+            cpp.contains(emitted),
+            "{what} named payload must survive lower, verify, and emit: expected `{emitted}`"
+        );
+    }
+
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&path)).expect("v1 emits positional path payload"),
+        cpp_tb::emit(&merged_src(&path_named)).expect("v1 emits named path payload"),
+        "v1 confirms the name is inert on the sole event payload slot"
+    );
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&self_relative)).expect("v1 emits positional self payload"),
+        cpp_tb::emit(&merged_src(&self_named)).expect("v1 emits named self payload"),
+        "v1 confirms the self-relative payload name is inert"
+    );
+}
+
 /// The remaining `connect` SEMANTIC arms, none of which had a test.
 /// Measured against v1 on an instantiated env — the only place v1 looks
 /// at the edge at all.
