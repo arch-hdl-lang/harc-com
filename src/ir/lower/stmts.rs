@@ -1564,6 +1564,19 @@ impl FuncBuilder<'_> {
         let signed_scalar_ty = self.host_state_scalar_type(&e).filter(|t| {
             matches!(t, IrType::SInt(None)) || matches!(t, IrType::SInt(Some(w)) if *w <= 64)
         });
+        // A newly admitted sized literal expression follows v1's signed host
+        // scalar model when no stronger result type exists. Keep that source
+        // provenance separate from ordinary unsized literals, whose existing
+        // widthless/unsigned inference remains unchanged.
+        let sized_scalar_ty = l.value.as_ref().and_then(|value| {
+            if !super::exprs::ast_expr_contains_sized_literal(value) {
+                return None;
+            }
+            match self.scalar_assignment_type(&e) {
+                Some(IrType::Unknown) | None => Some(IrType::SInt(None)),
+                ty => ty,
+            }
+        });
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
@@ -1572,6 +1585,7 @@ impl FuncBuilder<'_> {
             .or(declared_scalar_ty)
             .or(wide_scalar_ty)
             .or(signed_scalar_ty)
+            .or(sized_scalar_ty)
         {
             self.set_local_type(id, ty);
         }

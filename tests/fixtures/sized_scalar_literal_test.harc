@@ -1,0 +1,60 @@
+// Runtime-equivalence fixture for bare HARC/Verilog-sized scalar literals in
+// ordinary value positions. General expressions use v1-compatible signed host
+// scalars, while assignments, helper arguments, comparisons, and DUT writes
+// must carry the same numeric value under v1 and TB-IR.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+function echo(x: uint<8>) -> uint<8>
+    return x
+end function echo
+
+testbench SizedScalarLiteralTb
+    dut : Top
+end testbench SizedScalarLiteralTb
+
+impl SizedScalarLiteralTest for SizedScalarLiteralTb
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1'b1
+        dut.en = 1'b0
+        wait 1 cycle
+        assert dut.count_out == 8'd0 else fail("reset=${dut.count_out}")
+
+        let nibble = 4'd3
+        let byte : uint<8> = 8'hAB
+        let flag : bool = 1'b1
+        let negative = -8'd1
+        let typed_negative : sint<8> = -8'd1
+        let complemented = ~4'd0
+        let composed_negative = -(4'd1 + 0)
+        let composed_complemented = ~(4'd0 + 0)
+        let nested_logical_complement = ~!4'd0
+        let nested_negative_complement = ~-4'd1
+        nibble = 4'hF
+        assert nibble == 4'd15 else fail("nibble=${nibble}")
+        assert byte == 8'd171 else fail("byte=${byte}")
+        assert flag else fail("flag")
+        assert negative < 0 else fail("negative=${negative}")
+        assert typed_negative < 0 else fail("typed_negative=${typed_negative}")
+        assert complemented < 0 else fail("complemented=${complemented}")
+        assert composed_negative < 0 else fail("composed_negative=${composed_negative}")
+        assert composed_complemented < 0 else fail("composed_complemented=${composed_complemented}")
+        assert nested_logical_complement < 0 else fail("nested_logical_complement=${nested_logical_complement}")
+        assert nested_negative_complement == 0 else fail("nested_negative_complement=${nested_negative_complement}")
+        assert !1'b0 else fail("logical not")
+        assert echo(8'd7) == 8'h07 else fail("echo=${echo(8'd7)}")
+
+        flag = 1'b0
+        assert !flag else fail("flag assignment")
+
+        dut.rst = 1'b0
+        dut.en = 1'b1
+        wait 1 cycle
+        assert dut.count_out == 8'd1 else fail("count=${dut.count_out}")
+        log(info, "PASS: nibble=${nibble} byte=${byte} negative=${negative} complemented=${complemented} count=${dut.count_out}")
+    end run
+end impl SizedScalarLiteralTest

@@ -67,6 +67,7 @@
 # specifies under `--codegen tbir`.
 
 top_counter_test | Top | top_counter.sv | top_counter.arch | pass
+sized_scalar_literal_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass

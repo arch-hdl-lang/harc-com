@@ -372,6 +372,7 @@ fn cover_expr_type_hint(expr: &Expr) -> Option<IrType> {
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Port(port) => Some(IrType::UInt(port.width)),
         Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+        Expr::Unary(crate::ir::UnOp::BitNotHost, _) => Some(IrType::SInt(None)),
         Expr::Unary(_, inner) => cover_expr_type_hint(inner),
         Expr::Binary(op, lhs, rhs) => match op {
             crate::ir::BinOp::Eq
@@ -5791,6 +5792,7 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
             assignment_expr_type(prog, func, else_expr),
         ),
         Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+        Expr::Unary(crate::ir::UnOp::BitNotHost, _) => Some(IrType::SInt(None)),
         Expr::Unary(_, inner) => assignment_expr_type(prog, func, inner),
         _ => expr_type(prog, func, e),
     }

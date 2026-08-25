@@ -28063,6 +28063,109 @@ fn a_const_coverpoint_slice_bound_folds() {
     assert_ne!(k3, k7, "a different const must produce a different mask");
 }
 
+/// Bare sized literals are ordinary scalar values outside covergroups too.
+/// General expressions follow v1's signed host-scalar behavior, including
+/// composed unary operations. The same shared parser serves assignments,
+/// helper arguments, comparisons, and DUT writes.
+#[test]
+fn bare_sized_scalar_literals_lower_in_general_value_positions() {
+    let src = r#"
+function echo(x: uint<8>) -> uint<8>
+    return x
+end function echo
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let nibble = 4'd3
+        let ordinary = 3
+        let byte : uint<8> = 8'hAB
+        let flag : bool = 1'b1
+        let negative = -8'd1
+        let typed_negative : sint<8> = -8'd1
+        let complemented = ~4'd0
+        let composed_negative = -(4'd1 + 0)
+        let composed_complemented = ~(4'd0 + 0)
+        let nested_logical_complement = ~!4'd0
+        let nested_negative_complement = ~-4'd1
+        nibble = 4'hF
+        flag = 1'b0
+        dut.en = 1'b1
+        assert nibble == 4'd15
+        assert byte == 8'hAB
+        assert !flag
+        assert negative < 0
+        assert typed_negative < 0
+        assert complemented < 0
+        assert composed_negative < 0
+        assert composed_complemented < 0
+        assert nested_logical_complement < 0
+        assert nested_negative_complement == 0
+        assert !1'b0
+        assert echo(8'd7) == 7
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("bare sized scalar values lower");
+    verify::verify_program(&prog).expect("bare sized scalar values verify");
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "nibble")
+            .expect("nibble local")
+            .ty,
+        ir::IrType::SInt(None)
+    );
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "ordinary")
+            .expect("ordinary local")
+            .ty,
+        ir::IrType::Unknown,
+        "admitting sized literals must not change unsized-let inference"
+    );
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "flag")
+            .expect("flag local")
+            .ty,
+        ir::IrType::Bool
+    );
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "negative")
+            .expect("negative local")
+            .ty,
+        ir::IrType::SInt(None)
+    );
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "complemented")
+            .expect("complemented local")
+            .ty,
+        ir::IrType::SInt(None)
+    );
+
+    let tbir = emit_cpp_src(src);
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits bare sized scalar values");
+    for value in ["0xAB", "0xF", "0b1"] {
+        assert!(v1.contains(value), "v1 retains normalized `{value}`: {v1}");
+    }
+    assert!(
+        !tbir.contains("'h") && !tbir.contains("'d") && !tbir.contains("'b"),
+        "{tbir}"
+    );
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both
@@ -28124,6 +28227,11 @@ fn a_const_regblock_offset_or_reset_folds() {
         literal,
         "`reset R` with `const R = 7` must lower exactly like `reset 7`"
     );
+    assert_eq!(
+        emit_cpp_src(&reset("", "32'd7")),
+        literal,
+        "a sized reset value must decode exactly like plain 7"
+    );
 
     // Both values genuinely matter, so the equalities above are the
     // folds working rather than the values being dropped.
@@ -28149,6 +28257,10 @@ fn a_const_regblock_offset_or_reset_folds() {
     assert!(
         v1(&reset("const R = 7\n\n", "R")).contains("uint32_t CTRL = 0;"),
         "v1 folds the const reset to 0"
+    );
+    assert!(
+        v1(&reset("", "32'd7")).contains("uint32_t CTRL = 7;"),
+        "v1 lowers a bare sized reset value correctly"
     );
     // …and NOT the one it was written as, which is what makes the fold
     // a silent bug rather than a spelling difference.
@@ -28188,14 +28300,14 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
     let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(msg.contains("non-constant `@ <addr>` offset"), "{msg}");
 
-    // A BARE Verilog-sized literal is the one shape here v1 gets right,
-    // and TB-IR does not lower them HERE — `let z = 32'h18` is refused
-    // the same way, though a `keep` constraint lowers them under both
-    // backends. So it stays `Unsupported`, pointing at v1,
-    // and must not be swept in with the fold-to-zero shapes around it.
-    let err = lower_src(&offset("", "32'h18")).unwrap_err();
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("is a Verilog-sized literal"), "{msg}");
+    // A BARE Verilog-sized literal uses the same value parser as general
+    // expressions and lowers to its numeric address. The width prefix is
+    // intentionally discarded here because an address has no value type.
+    assert_eq!(
+        emit_cpp_src(&offset("", "32'h18")),
+        emit_cpp_src(&fixture),
+        "the sized offset must decode exactly like plain 0x18"
+    );
     assert!(
         cpp_tb::emit(&merged_src(&offset("", "32'h18")))
             .expect("v1 emits a sized literal")
@@ -28203,8 +28315,8 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
         "v1 lowers a bare sized literal to the right offset, which is why this points at it"
     );
 
-    // …but ONLY the bare SIZED form, and the arm narrows twice for two
-    // different reasons. v1's `c_int_literal_from` matches
+    // The surrounding compound/parenthesized forms remain outside this
+    // batch. v1's `c_int_literal_from` matches
     // `ExprKind::Int` and nothing else, so a sized literal inside an
     // expression — or merely parenthesised — hits its `"0"` arm; and an
     // over-wide literal, unreadable by the same parser, becomes a
