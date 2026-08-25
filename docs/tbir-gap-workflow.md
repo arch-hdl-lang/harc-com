@@ -83,6 +83,11 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Read-only `.len()`, `.size()`, and `.empty()` queries on dynamic record
   lists across record locals, component record state, and bound-target
   transactor record state, including indexed fixed-vector record paths.
+- [x] Bare native-width HARC/Verilog-sized scalar literals in general value
+  positions and direct register address/reset metadata. General expressions
+  use v1-compatible signed host-scalar semantics; metadata sites explicitly
+  consume only the value. Width-aware cover/index paths remain unchanged.
+  Wider sized values and compound address expressions remain separate slices.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -176,6 +181,14 @@ record event fields through the existing component event path, including
 direct emit fan-out. It closes the positive-v1 gaps in both declaration
 positions while leaving the raw count at 127 because the shared state-field
 diagnostic still rejects directional non-event fields.
+The native-width sized-scalar batch shares the validated literal parser across
+general expressions and direct address-like metadata, using v1-compatible host
+scalar values while consuming only numeric values at metadata boundaries. It removes
+the dedicated address-site rejection and leaves 126 textual matches (125
+constructors plus the helper). A self-checking fixture covers inferred and typed
+locals, assignments, helper arguments, comparisons, and DUT writes under both
+emitters. Sized values wider than 64 bits still require the wide-word IR, and
+compound address forms remain excluded because v1 silently folds them to zero.
 
 ## Review-derived semantic gates
 

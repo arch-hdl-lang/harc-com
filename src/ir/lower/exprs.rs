@@ -927,6 +927,21 @@ impl FuncBuilder<'_> {
                         ty: IrType::Unknown,
                     });
                 }
+                // Coverpoints and record Vec indices already use this parser
+                // with declared-width semantics. General value positions can
+                // share its numeric decoding when the value fits the native
+                // scalar carrier, while matching v1's host-scalar behavior.
+                // Wider sized values remain a separate wide-word slice.
+                if let Some((_width @ 1..=64, value)) = parse_sized_int_literal_with_width(s) {
+                    return Ok(Expr::Literal {
+                        value,
+                        // v1 emits a general sized literal as an ordinary
+                        // signed host integer. Width-aware literals remain in
+                        // the cover/index-specific paths; using the host type
+                        // here preserves v1 behavior through composition.
+                        ty: IrType::Unknown,
+                    });
+                }
                 // Hex literals wider than 64 bits lower to LSB-first
                 // 32-bit word lists (v1's `c_wide_lit_words` shape).
                 if let Some(words) = parse_wide_hex_literal(s) {
@@ -1328,6 +1343,7 @@ impl FuncBuilder<'_> {
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
+                    UnaryOp::BitNot if ast_expr_contains_sized_literal(expr) => UnOp::BitNotHost,
                     UnaryOp::BitNot => UnOp::BitNot,
                 };
                 Ok(Expr::Unary(op, Box::new(inner)))
@@ -3201,6 +3217,12 @@ impl FuncBuilder<'_> {
                 self.scalar_assignment_type(else_expr),
             ),
             Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
+            Expr::Unary(crate::ir::UnOp::BitNotHost, _) => Some(IrType::SInt(None)),
+            // Unary minus normally retains its operand's scalar type: this is
+            // load-bearing for existing unsigned wide values. A sized-literal
+            // expression is widthless here, and the AST-provenance fallback in
+            // let lowering turns only that newly admitted form into SInt(None).
+            Expr::Unary(crate::ir::UnOp::Neg, inner) => self.scalar_assignment_type(inner),
             Expr::Unary(_, inner) => self.scalar_assignment_type(inner),
             // Not `expr_type`: it answers `None` for every host-state
             // read — a testbench/scoreboard/component field, a
@@ -5426,7 +5448,9 @@ pub(crate) fn wide_literal_bits(words: &[u32]) -> u32 {
 }
 
 /// Parse a plain integer literal (decimal / 0x / 0b / 0o, `_`
-/// separators). Verilog-style sized literals are not lowered.
+/// separators). Verilog-style sized literals use
+/// [`parse_sized_int_literal_with_width`] so callers cannot accidentally
+/// discard their declared width.
 pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     parse_int_literal_checked(s).ok()
 }
@@ -5463,13 +5487,62 @@ pub(crate) fn parse_int_literal_checked(s: &str) -> Result<u64, IntLiteralErr> {
 /// Parse the VALUE of a validated HARC/Verilog-style sized literal such
 /// as `8'hAB`, `8'd42`, or `4'b1010` when it fits the scalar IR domain.
 ///
-/// This deliberately stays separate from [`parse_int_literal`]. Most TB-IR
-/// expression positions still treat sized literals as a distinct migration
-/// gap because their declared width participates in wrapping/type inference.
-/// Coverpoint values only sample the resulting integer, so callers there can
-/// use this value parser without erasing width semantics elsewhere.
+/// This deliberately stays separate from [`parse_int_literal`]: callers that
+/// only need an index, sampled value, metadata value, or v1-compatible host
+/// scalar may discard the width explicitly; width-aware paths call
+/// [`parse_sized_int_literal_with_width`].
 pub(crate) fn parse_sized_int_literal(s: &str) -> Option<u64> {
     parse_sized_int_literal_with_width(s).map(|(_, value)| value)
+}
+
+/// Whether a general AST expression contains a HARC/Verilog-sized literal.
+/// The value IR deliberately erases this source provenance when matching v1's
+/// host-scalar semantics; host-width unary bit-not still needs the distinction.
+pub(crate) fn ast_expr_contains_sized_literal(e: &AstExpr) -> bool {
+    match &*e.kind {
+        ExprKind::Int(text) => text.contains('\''),
+        ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
+            ast_expr_contains_sized_literal(inner)
+        }
+        ExprKind::Cast { expr, .. } => ast_expr_contains_sized_literal(expr),
+        ExprKind::Field { target, .. } => ast_expr_contains_sized_literal(target),
+        ExprKind::Index { target, index } => {
+            ast_expr_contains_sized_literal(target) || ast_expr_contains_sized_literal(index)
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            ast_expr_contains_sized_literal(target)
+                || ast_expr_contains_sized_literal(hi)
+                || ast_expr_contains_sized_literal(lo)
+        }
+        ExprKind::Call { callee, args } => {
+            ast_expr_contains_sized_literal(callee)
+                || args.iter().any(|arg| match arg {
+                    CallArg::Expr(value) | CallArg::Named { value, .. } => {
+                        ast_expr_contains_sized_literal(value)
+                    }
+                })
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            ast_expr_contains_sized_literal(lhs) || ast_expr_contains_sized_literal(rhs)
+        }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            ast_expr_contains_sized_literal(cond)
+                || ast_expr_contains_sized_literal(then_branch)
+                || ast_expr_contains_sized_literal(else_branch)
+        }
+        ExprKind::SystemCall { args, .. } | ExprKind::SolveOrder { args } => {
+            args.iter().any(ast_expr_contains_sized_literal)
+        }
+        ExprKind::NamedArg { value, .. } => ast_expr_contains_sized_literal(value),
+        ExprKind::Membership { expr, set } => {
+            ast_expr_contains_sized_literal(expr) || ast_expr_contains_sized_literal(set)
+        }
+        _ => false,
+    }
 }
 
 /// A syntactically valid sized h/d/b literal whose value cannot fit the

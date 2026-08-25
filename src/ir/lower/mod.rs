@@ -6908,20 +6908,12 @@ pub(crate) fn const_vals_from(
 /// carries a `TypeExpr` and is checked against it, an address does not
 /// and is checked against zero instead.
 ///
-/// The error mapping is deliberately NOT the field-default one, and it
-/// splits two ways:
-///
-///   * a **sized literal** (`32'h18`) is `Unsupported`. TB-IR does not
-///     lower one HERE, while v1's `c_int_literal` handles a bare one
-///     correctly — `{ "SRC", 0x18, 32 }` — so pointing at `--codegen v1`
-///     is accurate and this arm must not be swept in with the one below.
-///     Note the scope: TB-IR DOES lower sized literals inside a `keep`
-///     constraint (`src/constraints/typed_lower.rs` has its own
-///     prefix-stripping parser), so the claim is about this site and the
-///     statement position, not about the language (divergence 49);
-///   * anything else that will not fold is `SilentlyMisLowers`, because
-///     v1 accepts it and yields ZERO. Pointing a user at v1 for
-///     `@ dut.count_out` would hand them a register at address 0.
+/// A bare sized literal (`32'h18`) is a value-bearing literal here just as it
+/// is in a general scalar expression; reuse the shared parser and discard only
+/// the declared width because an address slot has no value type. Anything else
+/// that will not fold is `SilentlyMisLowers`, because v1 accepts it and yields
+/// ZERO. Pointing a user at v1 for `@ dut.count_out` would hand them a register
+/// at address 0.
 pub(crate) fn fold_addr_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
@@ -6932,15 +6924,9 @@ pub(crate) fn fold_addr_const(
         if let Some(bits) = exprs::parse_int_literal(lit) {
             return Ok(bits);
         }
-    }
-    if let Some(lit) = unlowerable_int_literal(e) {
-        return Err(unsupported(
-            &format!("the {what}"),
-            format!(
-                "`{lit}` is a Verilog-sized literal, which TB-IR does not lower at an address \
-                 site yet; v1 lowers a bare one correctly here"
-            ),
-        ));
+        if let Some(bits) = exprs::parse_sized_int_literal(lit) {
+            return Ok(bits);
+        }
     }
     // `""` as the self-name: an address has no enclosing `const` to form
     // a cycle with, so no identifier here can be a self-reference — and
@@ -6969,36 +6955,6 @@ pub(crate) fn fold_addr_const(
         )));
     }
     Ok(v.bits)
-}
-
-/// `Some(lit)` when `e` is a BARE Verilog-sized integer literal
-/// (`32'h18`) — the one non-folding shape at an address site that v1
-/// gets RIGHT, so the one that should point at it.
-///
-/// Two narrowings, each because v1's behaviour splits there and only the
-/// half that works may point at v1:
-///
-///   * **Top-level only**, not a walk over the expression tree. v1's
-///     `c_int_literal_from` matches `ExprKind::Int` and nothing else, so
-///     `32'h18` lowers correctly there while `32'h10 + 0x08` — and even
-///     `(32'h18)` — falls to its `"0"` arm.
-///   * **Sized only**, not every literal `parse_int_literal` rejects.
-///     An over-wide literal (`0x10000000000000000`) is also unreadable
-///     by that parser, but v1 emits it as a `_harc_u128` composite that
-///     truncates into the 64-bit table field — `{ "SRC", (((_harc_u128)
-///     0x1ULL << 64) | ...), 32 }`, i.e. offset 0 again.
-///
-/// Everything else falls through to the `SilentlyMisLowers` mapping,
-/// with the rest of the shapes v1 quietly turns into address 0.
-fn unlowerable_int_literal(e: &crate::ast::Expr) -> Option<String> {
-    match &*e.kind {
-        crate::ast::ExprKind::Int(lit)
-            if lit.contains('\'') && exprs::parse_int_literal(lit).is_none() =>
-        {
-            Some(lit.clone())
-        }
-        _ => None,
-    }
 }
 
 /// Lowered metadata for one `probe` / `probe force` declaration on

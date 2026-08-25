@@ -180,6 +180,7 @@ fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
             .get(&format!("{param}.{field}"))
             .and_then(cover_type_width),
         Expr::Unary(UnOp::Not, _) => Some(1),
+        Expr::Unary(UnOp::BitNotHost, _) => None,
         Expr::Unary(_, inner) => cover_expr_width(inner, widths),
         Expr::Binary(op, lhs, rhs) => match op {
             BinOp::Eq
@@ -221,6 +222,7 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
     match e {
         Expr::Literal { ty, .. } => matches!(ty, IrType::SInt(_)),
         Expr::Unary(UnOp::Not, _) => false,
+        Expr::Unary(UnOp::BitNotHost, _) => true,
         Expr::Unary(_, inner) => cover_expr_signed(inner, widths),
         Expr::Binary(op, lhs, rhs) => match op {
             BinOp::Eq
@@ -515,6 +517,7 @@ fn cover_unary_cpp(op: UnOp, inner: &Expr, widths: &CoverWidths<'_>) -> Result<S
     let width = cover_expr_width(inner, widths);
     let rendered = cover_expr_cpp(inner, widths)?;
     Ok(match (op, width) {
+        (UnOp::BitNotHost, _) => format!("~({rendered})"),
         (UnOp::Neg, Some(width)) if width > 128 => {
             let words = width.div_ceil(32);
             let value = cover_coerce_cpp(
@@ -725,7 +728,7 @@ fn cover_un_op_cpp(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
-        UnOp::BitNot => "~",
+        UnOp::BitNot | UnOp::BitNotHost => "~",
     }
 }
 

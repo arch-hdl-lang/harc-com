@@ -3151,6 +3151,9 @@ pub enum UnOp {
     Neg,
     Not,
     BitNot,
+    /// v1-compatible host-width `~` for a general expression whose newly
+    /// admitted source tree contains a sized literal.
+    BitNotHost,
 }
 
 /// Structured handle to a DUT signal. Codegen never re-parses port

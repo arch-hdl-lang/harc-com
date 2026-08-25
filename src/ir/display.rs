@@ -1520,6 +1520,6 @@ pub(crate) fn un_op_str(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
-        UnOp::BitNot => "~",
+        UnOp::BitNot | UnOp::BitNotHost => "~",
     }
 }

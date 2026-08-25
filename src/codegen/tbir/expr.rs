@@ -572,6 +572,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             let a = expr_cpp(cx, a)?;
             match op {
                 UnOp::BitNot => bit_not_cpp(&a, width),
+                UnOp::BitNotHost => format!("~({a})"),
                 UnOp::Neg if width.is_some_and(|w| w > 128) => {
                     let width = width.unwrap();
                     format!("harc_rt::harc_wide_negate({a}, {width})")
@@ -1390,7 +1391,7 @@ fn un_op_cpp(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
-        UnOp::BitNot => "~",
+        UnOp::BitNot | UnOp::BitNotHost => "~",
     }
 }
 
@@ -1508,6 +1509,7 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             _ => expr_static_width(cx, a).max(expr_static_width(cx, b)),
         },
         Expr::Unary(UnOp::Not, _) => Some(1),
+        Expr::Unary(UnOp::BitNotHost, _) => None,
         Expr::Unary(_, inner) => expr_static_width(cx, inner),
         Expr::Ternary(_, t, f) => expr_static_width(cx, t).max(expr_static_width(cx, f)),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
@@ -1564,6 +1566,7 @@ fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             expr_shift_width(cx, then_expr).max(expr_shift_width(cx, else_expr))
         }
         Expr::Unary(UnOp::Not, _) => Some(1),
+        Expr::Unary(UnOp::BitNotHost, _) => None,
         Expr::Unary(_, inner) => expr_shift_width(cx, inner),
         Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
         _ => expr_static_width(cx, e),
@@ -1684,6 +1687,7 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                 )
             }),
         Expr::Unary(UnOp::Not, _) => false,
+        Expr::Unary(UnOp::BitNotHost, _) => true,
         Expr::Unary(_, inner) => expr_is_signed(cx, inner),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)
