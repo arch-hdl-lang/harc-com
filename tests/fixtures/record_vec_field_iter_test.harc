@@ -19,6 +19,9 @@
 struct Bundle
     tag  : uint<8> default 0
     data : Vec<uint<32>, 4>
+    native_u : Vec<uint, 2>
+    native_s : Vec<sint, 2>
+    builtin_i : Vec<int, 2>
 end struct Bundle
 
 struct Nested
@@ -89,6 +92,16 @@ impl RecordVecFieldIterTest for RecordVecFieldIterTb
         assert src.data[0] == 1 else fail("src.data[0] after iteration: ${src.data[0]}")
         assert src.data[3] == 8 else fail("src.data[3] after iteration: ${src.data[3]}")
         assert src.tag == 0x5A else fail("src.tag after iteration: 0x${src.tag:02x}")
+
+        // Widthless uint/sint lanes use their native 64-bit ABI under both
+        // emitters. Builtin int keeps its 32-bit packed language width while
+        // using the same uint64_t C++ carrier v1 has always emitted.
+        src.native_u[0] = 0xFEDCBA9876543210
+        src.native_s[0] = -7
+        src.builtin_i[0] = 0x7FFFFFFF
+        assert src.native_u[0] == 0xFEDCBA9876543210 else fail("widthless uint Vec lane")
+        assert src.native_s[0] == -7 else fail("widthless sint Vec lane")
+        assert src.builtin_i[0] == 0x7FFFFFFF else fail("builtin int Vec lane")
 
         // ── the loop variable is scoped to the loop ────────────────
         // A same-named local after the loop is a fresh binding, not the
