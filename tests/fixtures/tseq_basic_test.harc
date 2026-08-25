@@ -5,7 +5,7 @@
 // Exercises the whole tseq surface in one fixture:
 //   - a `tseq Gen(n) -> TSeq<Req>` declaration with a parameter,
 //   - a `for _ in 0 .. n` loop body that `let t : Req` / `randomize(t)`
-//     / overrides a field / `yield t`,
+//     / overrides a field / record-valued ternary `yield`,
 //   - a test-scope `let txns = Gen(5)` call (the sequence is
 //     materialized once),
 //   - TWO `for t in txns` iterations over the SAME materialized
@@ -37,7 +37,9 @@ tseq Gen(n: int) -> TSeq<Req>
         let t : Req
         randomize(t)
         t.addr = 64
-        yield t
+        // Parentheses and a ternary both preserve the record value; TBIR
+        // must not require the yielded spelling to be a bare identifier.
+        yield true ? (t) : t
     end for
 end tseq Gen
 

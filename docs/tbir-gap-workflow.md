@@ -96,8 +96,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 126 remaining constructor call sites (127 textual matches including
-the `unsupported` helper definition) as an inventory, not 127 separate tasks.
+Treat the 124 remaining constructor call sites (125 textual matches including
+the `unsupported` helper definition) as an inventory, not 125 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -189,6 +189,11 @@ constructors plus the helper). A self-checking fixture covers inferred and typed
 locals, assignments, helper arguments, comparisons, and DUT writes under both
 emitters. Sized values wider than 64 bits still require the wide-word IR, and
 compound address forms remain excluded because v1 silently folds them to zero.
+The record-valued tseq-yield batch then admits parenthesized and conditional
+record expressions through the existing `SeqPush` IR path, removing the bare-
+identifier gate and leaving 125 textual matches (124 constructors plus the
+helper). Mismatched record/scalar yields retain their measured v1
+`EmitsUncompilable` classification.
 
 ## Review-derived semantic gates
 
@@ -253,15 +258,17 @@ not applicable before requesting review:
    destination, whole component fixed-vector, and wide unsigned scoreboard
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
    diagnostic-call, component-predicate, dynamic record-list query, and wide
-   cover-selector slices reduce the count from 174 to 127 textual matches (126
-   constructors plus the helper definition). The handler-less unbound-
-   transactor event slice closes routes around a shared constructor, so the
-   count remains 127. The
-   Widthless scalar fixed-`Vec` record fields now route through the existing
+   cover-selector, native-width sized-scalar, and record-valued tseq-yield
+   slices reduce the count from 174 to 125 textual matches (124 constructors
+   plus the helper definition). The handler-less unbound-
+   transactor event slice closes routes around a shared constructor without
+   changing the count. Widthless scalar fixed-`Vec` record fields now route
+   through the existing
    fixed-array schema and use v1-compatible 64-bit widthless integer spellings
    (`uint`/`UInt`/`bits`, `sint`/`SInt`) and 32-bit builtin-`int` packed widths;
    this also routes around the shared constructor,
-   so the count remains 127. Nested `Vec<Vec<...>>` fields remain unsupported.
+   so that slice does not change the count. Nested `Vec<Vec<...>>` fields
+   remain unsupported.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently

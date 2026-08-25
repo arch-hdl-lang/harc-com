@@ -4150,9 +4150,43 @@ impl Checker<'_> {
                 }
                 Stmt::SeqPush { seq, value } => {
                     self.check_local(*seq);
-                    // The yielded value (a record `Local`) follows the
-                    // no-inline-port rule like any host-state assignment.
+                    // The yielded expression follows the no-inline-port
+                    // rule like any host-state assignment.
                     self.check_expr(value, false, "SeqPush value");
+                    let expected = match self.func.locals.get(seq.index()).map(|l| &l.ty) {
+                        Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
+                        Some(IrType::Seq(elem)) => Some((**elem).clone()),
+                        Some(other) => {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} SeqPush accumulator l{} has non-sequence type {:?}",
+                                    self.fid.0, self.bid.0, seq.0, other
+                                ),
+                            });
+                            None
+                        }
+                        None => None,
+                    };
+                    if let Some(expected) = expected {
+                        let actual = self.aggregate_assignment_expr_type(value);
+                        let compatible = match &expected {
+                            IrType::Record(_) => {
+                                actual.as_ref() == Some(&expected)
+                                    && !self.contains_invalid_record_composition(value)
+                            }
+                            _ => actual
+                                .as_ref()
+                                .is_some_and(|actual| assign_compatible(&expected, actual)),
+                        };
+                        if !compatible {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} SeqPush into l{} expects {:?}, got {:?}",
+                                    self.fid.0, self.bid.0, seq.0, expected, actual
+                                ),
+                            });
+                        }
+                    }
                 }
                 Stmt::ComponentQueuePush { base, queue, value } => {
                     // Component-queue host state — the pushed value follows
