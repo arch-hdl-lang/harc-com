@@ -5722,6 +5722,7 @@ end test T
             "`{bad}`: v1 emits it (and g++ refuses)"
         );
     }
+
 }
 
 /// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
@@ -34643,6 +34644,151 @@ end test T
         cpp_tb::emit(&merged_src(&self_relative)).expect("v1 emits positional self payload"),
         cpp_tb::emit(&merged_src(&self_named)).expect("v1 emits named self payload"),
         "v1 confirms the self-relative payload name is inert"
+    );
+}
+
+/// A component method may publish directly through a composed child's event.
+/// The receiver is self-relative even though it is dotted, and arbitrary
+/// sub-component depth must survive lowering, verification, and emission.
+#[test]
+fn a_component_body_emit_resolves_nested_child_event_paths() {
+    let cpp = emit_fixture_cpp("component_dotted_emit_test.harc");
+    assert!(
+        cpp.contains("for (auto& _s : self.relay.sink.received) _s(v);"),
+        "two-level child emit must stay rooted at self:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("for (auto& _s : self.sink.received) _s(v);"),
+        "one-level child emit must stay rooted at self:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("for (auto& _s : sink.received) _s(v);"),
+        "a shadowing component parameter must remain the event receiver:\n{cpp}"
+    );
+
+    let merged = merged_src(&fixture("component_dotted_emit_test.harc"));
+    let prog = lower::lower_program(&merged).expect("fixture lowers");
+    verify::verify_program(&prog).expect("fixture verifies");
+
+    let mut broken_self_path = prog.clone();
+    let path = broken_self_path
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentEmit {
+                base: ir::ComponentBase::Path(path),
+                ..
+            } if path == &["self", "relay", "sink"] => Some(path),
+            _ => None,
+        })
+        .expect("nested self-rooted emit exists");
+    path[1] = "missing".to_string();
+    assert!(
+        verify::verify_program(&broken_self_path).is_err(),
+        "verifier must reject a corrupted self-rooted child path"
+    );
+
+    let mut broken_local_path = prog.clone();
+    let subpath = broken_local_path
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentEmit {
+                base: ir::ComponentBase::Local(_),
+                subpath,
+                ..
+            } => Some(subpath),
+            _ => None,
+        })
+        .expect("component-parameter emit exists");
+    subpath.push("missing".to_string());
+    assert!(
+        verify::verify_program(&broken_local_path).is_err(),
+        "verifier must reject a corrupted component-parameter subpath"
+    );
+
+    let unresolved = fixture("component_dotted_emit_test.harc").replacen(
+        "emit sink.received(v)",
+        "emit ghost.received(v)",
+        1,
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&unresolved).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("does not resolve to a component event"), "{msg}");
+
+    for bad in [
+        ("emit sink.received(v)", "emit sink.ghost.received(v)"),
+        ("emit sink.received(v)", "emit sink.missing(v)"),
+    ] {
+        let src = fixture("component_dotted_emit_test.harc").replacen(bad.0, bad.1, 1);
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+    }
+
+    let mode_src = |receiver: &str, mode: &str| {
+        format!(
+            r#"transactor ModeEmitter
+    when active
+        active_ev : out event<bool>
+    end when
+end transactor ModeEmitter
+
+env ModeHolder
+    emitter : ModeEmitter {mode}
+end env ModeHolder
+
+env ModeWrap
+    holder : ModeHolder
+    hookable fire(holder : ModeHolder)
+        emit {receiver}.active_ev(true)
+    end fire
+end env ModeWrap
+
+test T
+    let dut : Top
+    let wrap : ModeWrap
+    run
+        log(info, "mode fixture")
+    end run
+end test T
+"#
+        )
+    };
+    let active_src = mode_src("holder.emitter", "active");
+    let active = lower_src(&active_src)
+        .expect("an explicit active descendant exposes its active-only event");
+    verify::verify_program(&active).expect("the active descendant verifies");
+    let msg = assert_invalid(
+        &lower_src(&mode_src("holder.emitter", "passive")).unwrap_err(),
+    );
+    assert!(msg.contains("passive component parameter path"), "{msg}");
+
+    let mut broken_mode = active;
+    let holder = broken_mode
+        .components
+        .iter_mut()
+        .find(|component| component.name == "ModeHolder")
+        .expect("mode-holder schema exists");
+    let emitter = holder
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "emitter")
+        .expect("emitter sub-component field exists");
+    let ir::ComponentFieldKind::Sub { mode, .. } = &mut emitter.kind else {
+        panic!("emitter remains a sub-component")
+    };
+    *mode = Some(ir::ComponentInstanceMode::Passive);
+    assert!(
+        verify::verify_program(&broken_mode).is_err(),
+        "verifier must reject a mode-disabled component-parameter event path"
     );
 }
 

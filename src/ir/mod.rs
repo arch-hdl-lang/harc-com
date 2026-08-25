@@ -2374,11 +2374,16 @@ pub enum Stmt {
     /// on the named `out event<T>` field of the component named by `base`.
     /// `base = SelfField` for a self-relative `emit observed(v)` inside a
     /// method body (`self.<event>`); `base = Path([...])` for a test-scope
-    /// `emit env.agent.in_ev(v)` (`env.agent.<event>`). Emitted as
+    /// or self-rooted child path; `base = Local` plus `subpath` for a
+    /// component-typed parameter receiver. Emitted as
     /// `for (auto& _s : <base>.<event>) _s(args);` plus v1's
     /// `_last_out_cycle` heartbeat bump on the emitting component.
     ComponentEmit {
         base: ComponentBase,
+        /// Sub-components below `base`. Normally empty because path bases
+        /// already carry their receiver; used when `base` is a component-
+        /// typed local and the event lives below that parameter.
+        subpath: Vec<String>,
         event: String,
         args: Vec<Expr>,
     },

@@ -1931,26 +1931,33 @@ fn verify_component_event_ref(
 ) -> Result<(), String> {
     verify_event_payload_ref(prog, payload)?;
     let ComponentBase::Path(path) = base else {
-        return Err("component event target must use a test-scope component path".to_string());
+        return Err("component event target must use a component path".to_string());
     };
     let (root, tail) = path
         .split_first()
         .ok_or_else(|| "component event target has an empty path".to_string())?;
-    let owner = func
+    // Match `component_base_id`'s namespace order. A real testbench field
+    // wins; otherwise `self.<child>...` is rooted at the component method's
+    // owning schema and verifies component-body dotted emits.
+    let owner_tb = func
         .owner
-        .ok_or_else(|| "component event subscription has no owning testbench".to_string())?;
-    let tb = prog
-        .testbenches
-        .get(owner.index())
-        .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
-    let binding = tb
-        .component_fields
-        .iter()
-        .find(|binding| binding.field == *root)
-        .ok_or_else(|| format!("root `{root}` is not a testbench component field"))?;
-    let resolved =
+        .and_then(|owner| prog.testbenches.get(owner.index()));
+    let resolved = if let Some(binding) = owner_tb.and_then(|tb| {
+        tb.component_fields
+            .iter()
+            .find(|binding| binding.field == *root)
+    }) {
         resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| err.to_string())?
+    } else if root == "self" {
+        let FunctionKind::ComponentMethod { component: owner } = func.kind else {
+            return Err("self-rooted component event outside a component method".to_string());
+        };
+        resolve_component_path_mode(&prog.components, owner, None, tail)
+            .map_err(|err| err.to_string())?
+    } else {
+        return Err(format!("root `{root}` is not a testbench component field"));
+    };
     if resolved.component != component {
         return Err(format!(
             "component path `{}` resolves to c{}, not stored c{}",
@@ -2557,9 +2564,41 @@ impl Checker<'_> {
     fn component_emit_payload(
         &self,
         base: &ComponentBase,
+        subpath: &[String],
         event: &str,
     ) -> Result<EventPayload, String> {
-        let component = self.component_base_id(base)?;
+        let (mut component, local_effective_mode) = match base {
+            ComponentBase::Local(local) => {
+                let root = match self.func.locals.get(local.index()).map(|l| &l.ty) {
+                    Some(IrType::Component(component)) => *component,
+                    _ => return Err(format!("local %{} is not component-typed", local.0)),
+                };
+                let resolved = resolve_component_path_mode(&self.prog.components, root, None, subpath)
+                    .map_err(|err| err.to_string())?;
+                (resolved.component, resolved.effective_mode)
+            }
+            _ => (self.component_base_id(base)?, None),
+        };
+        for segment in if matches!(base, ComponentBase::Local(_)) {
+            &[][..]
+        } else {
+            subpath
+        } {
+            let schema = self
+                .prog
+                .components
+                .get(component.index())
+                .ok_or_else(|| format!("references missing component c{}", component.0))?;
+            component = match schema.field(segment).map(|field| &field.kind) {
+                Some(ComponentFieldKind::Sub { component, .. }) => *component,
+                _ => {
+                    return Err(format!(
+                        "`{segment}` is not a sub-component of `{}`",
+                        schema.name
+                    ));
+                }
+            };
+        }
         let schema = self
             .prog
             .components
@@ -2597,9 +2636,21 @@ impl Checker<'_> {
                     ));
                 }
             }
-            ComponentBase::Local(_) => {
-                return Err("component event emission cannot use a local component base".into());
+            // The root binding mode of a component parameter is unknown, but
+            // an explicit passive descendant mode is statically decisive.
+            ComponentBase::Local(_)
+                if matches!(field.activation, Activation::ActiveOnly)
+                    && matches!(
+                        local_effective_mode,
+                        Some(ComponentInstanceMode::Passive)
+                    ) =>
+            {
+                return Err(format!(
+                    "active-only component event `{event}` is disabled by a passive \
+                     component-parameter descendant"
+                ));
             }
+            ComponentBase::Local(_) => {}
         }
         Ok(payload)
     }
@@ -4139,8 +4190,13 @@ impl Checker<'_> {
                         "TbFieldVecElementWrite",
                     );
                 }
-                Stmt::ComponentEmit { base, event, args } => {
-                    let payload = match self.component_emit_payload(base, event) {
+                Stmt::ComponentEmit {
+                    base,
+                    subpath,
+                    event,
+                    args,
+                } => {
+                    let payload = match self.component_emit_payload(base, subpath, event) {
                         Ok(payload) => Some(payload),
                         Err(detail) => {
                             self.errs.push(VerifyError::BadProgramRef {

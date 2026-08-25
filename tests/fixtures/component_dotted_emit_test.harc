@@ -1,0 +1,66 @@
+// Component-body dotted emit TBIR runtime fixture. Both calls publish through
+// a child event path rather than a test-scope component binding: one crosses
+// one composition level, and one crosses two.
+
+agent DottedEmitSink
+    received : event<uint<8>>
+    seen     : uint<32> default 0
+    last     : uint<8> default 0
+
+    on received(v)
+        seen = seen + 1
+        last = v
+    end on
+end agent DottedEmitSink
+
+env DottedEmitRelay
+    sink : DottedEmitSink
+
+    hookable publish(v : uint<8>)
+        emit sink.received(v)
+    end publish
+end env DottedEmitRelay
+
+env DottedEmitTop
+    relay : DottedEmitRelay
+    sink  : DottedEmitSink
+    other : DottedEmitSink
+
+    hookable publish(v : uint<8>)
+        emit relay.sink.received(v)
+    end publish
+
+    // The parameter deliberately shadows `self.sink`. Lexical lookup must
+    // publish through the supplied component rather than silently retargeting
+    // the event to the same-named field.
+    hookable publish_to(sink : DottedEmitSink, v : uint<8>)
+        emit sink.received(v)
+    end publish_to
+
+    hookable exercise_shadow()
+        publish_to(other, 11)
+    end exercise_shadow
+end env DottedEmitTop
+
+test ComponentDottedEmitTest
+    let dut : Top
+    let env : DottedEmitTop
+
+    run
+        env.publish(3)
+        env.relay.publish(7)
+        env.exercise_shadow()
+
+        assert env.relay.sink.seen == 2
+            else fail("dotted emits delivered ${env.relay.sink.seen} events, expected 2")
+        assert env.relay.sink.last == 7
+            else fail("last dotted payload=${env.relay.sink.last}, expected 7")
+        assert env.other.seen == 1
+            else fail("shadowed component parameter received ${env.other.seen} events, expected 1")
+        assert env.other.last == 11
+            else fail("shadowed component parameter last=${env.other.last}, expected 11")
+        assert env.sink.seen == 0
+            else fail("same-named self field was incorrectly targeted ${env.sink.seen} times")
+        log(info, "PASS: component-body dotted emits reached nested child event")
+    end run
+end test ComponentDottedEmitTest
