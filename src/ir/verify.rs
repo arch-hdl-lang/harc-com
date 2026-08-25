@@ -608,14 +608,36 @@ fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<Verif
         return;
     };
     let valid = matches!(ty, IrType::Bool)
-        || matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 0);
+        || matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width))
+            if *width > 0 && *width <= crate::MAX_WIDTH_METHOD_BITS);
     if !valid {
-        errs.push(VerifyError::BadProgramRef {
-            what: format!(
+        // Distinguish the over-ceiling case so the diagnostic points at the
+        // offending width and the 1024-bit language limit, matching the
+        // width-method / width-cast ceiling messages elsewhere
+        // (verify.rs WidthCast, main.rs width methods, lib.rs MAX_WIDTH_METHOD_BITS).
+        let over_ceiling = matches!(
+            ty,
+            IrType::UInt(Some(width)) | IrType::SInt(Some(width))
+                if *width > crate::MAX_WIDTH_METHOD_BITS
+        );
+        let what = if over_ceiling {
+            let width = match ty {
+                IrType::UInt(Some(w)) | IrType::SInt(Some(w)) => *w,
+                _ => unreachable!("over_ceiling implies a resolved UInt/SInt width"),
+            };
+            format!(
+                "{what} has scalar element width {width}, which exceeds the language limit of \
+                 {} bits",
+                crate::MAX_WIDTH_METHOD_BITS
+            )
+        } else {
+            format!(
                 "{what} has invalid scalar element type {ty:?}; expected bool or a resolved, \
-                 nonzero UInt/SInt"
-            ),
-        });
+                 nonzero UInt/SInt within 1..={} bits",
+                crate::MAX_WIDTH_METHOD_BITS
+            )
+        };
+        errs.push(VerifyError::BadProgramRef { what });
     }
 }
 

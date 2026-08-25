@@ -1,0 +1,42 @@
+// Companion to testbench_wide_queue_test: the wide-scalar-queue work must
+// also survive the two forms the exact-width fixtures do NOT exercise — a
+// push of a NARROWER value into a wide queue (zero-extension on the widening
+// push) and a bool queue driven through a real compiled push/pop round-trip
+// (the uint64_t->bool storage change is otherwise only checked by an emit
+// string). Both must behave identically under --codegen v1 and --codegen tbir.
+
+testbench QueueWidenBoolTb
+    dut         : Top
+    wide_values : queue<uint<256>>
+    flags       : queue<bool>
+end testbench QueueWidenBoolTb
+
+impl QueueWidenBoolTest for QueueWidenBoolTb
+    run
+        // Narrow -> wide push: a uint<32> value must widen into 256-bit
+        // storage with zero-extended high bits, not truncate or leave dirt.
+        let narrow : uint<32> = 0xDEADBEEF
+        wide_values.push(narrow)
+        let widened : uint<256> = wide_values.pop()
+        assert widened == 0xDEADBEEF
+            else fail("narrow push into wide queue lost or corrupted the value")
+        assert (widened >> 32) == 0
+            else fail("narrow push into wide queue left dirty high bits")
+
+        // Bool round-trip: FIFO order and value both preserved across the
+        // bool storage carrier.
+        flags.push(true)
+        flags.push(false)
+        flags.push(true)
+        let f0 = flags.pop()
+        let f1 = flags.pop()
+        let f2 = flags.pop()
+        assert f0        else fail("bool queue lost true at head")
+        assert !f1       else fail("bool queue lost false in middle")
+        assert f2        else fail("bool queue lost true at tail")
+        assert flags.empty()
+            else fail("bool queue not drained after three pops")
+
+        log(info, "PASS: narrow-widen push and bool round-trip preserve queue values")
+    end run
+end impl QueueWidenBoolTest
