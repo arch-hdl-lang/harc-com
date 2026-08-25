@@ -96,8 +96,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 124 remaining constructor call sites (125 textual matches including
-the `unsupported` helper definition) as an inventory, not 125 separate tasks.
+Treat the 122 remaining constructor call sites (123 textual matches including
+the `unsupported` helper definition) as an inventory, not 123 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -194,6 +194,13 @@ record expressions through the existing `SeqPush` IR path, removing the bare-
 identifier gate and leaving 125 textual matches (124 constructors plus the
 helper). Mismatched record/scalar yields retain their measured v1
 `EmitsUncompilable` classification.
+The signed-scalar connect batch then routes signed component event bridges
+through the existing connect IR, leaving 124 textual matches (123 constructors
+plus the helper). The single named event-payload batch accepts the only
+unambiguous named-argument shape across component-path, self-relative, and
+test-scope-local emits, leaving 123 textual matches (122 constructors plus the
+helper). Multi-argument named event payloads retain their measured silent-swap
+classification.
 
 ## Review-derived semantic gates
 
@@ -258,9 +265,10 @@ not applicable before requesting review:
    destination, whole component fixed-vector, and wide unsigned scoreboard
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
    diagnostic-call, component-predicate, dynamic record-list query, and wide
-   cover-selector, native-width sized-scalar, and record-valued tseq-yield
-   slices reduce the count from 174 to 125 textual matches (124 constructors
-   plus the helper definition). The handler-less unbound-
+   cover-selector, native-width sized-scalar, record-valued tseq-yield, signed
+   scalar connect, and single named event-payload slices reduce the count from
+   174 to 123 textual matches (122 constructors plus the helper definition).
+   The handler-less unbound-
    transactor event slice closes routes around a shared constructor without
    changing the count. Widthless scalar fixed-`Vec` record fields now route
    through the existing

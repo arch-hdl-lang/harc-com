@@ -4918,14 +4918,16 @@ impl super::FuncBuilder<'_> {
                 // true at the time, and the list is now carried in
                 // `ComponentMethodSchema::param_names`.
                 if args.len() == 1 {
-                    // Not "method call": this helper also lowers the
-                    // payload of `emit <ev>(...)`, so the construct name
-                    // covers both callers rather than naming one of them.
-                    return Err(unsupported(
-                        "a named argument in a single-argument component call",
-                        "v1 ignores the name and binds by position; with one argument there \
-                         is no other position, so it emits exactly the positional form",
-                    ));
+                    // Event payloads have exactly one positional slot and no
+                    // declared parameter name. Match v1's useful behaviour:
+                    // discard the spelling on that sole slot and lower its
+                    // value. Arity is checked by every `emit` caller before
+                    // reaching this helper, so no reordered binding exists.
+                    let CallArg::Named { value, .. } = a else {
+                        unreachable!("the expression arm returned above")
+                    };
+                    out.push(self.lower_expr_no_ports(value)?);
+                    continue;
                 }
                 // "component call", not "method call": every method
                 // caller now passes `declared` and takes the guarded
