@@ -892,6 +892,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             check_component_function("watchdog", handler.function);
         }
         drop(check_component_function);
+        for edge in &component.connects {
+            if let Err(detail) =
+                verify_component_connect(prog, ComponentId(ci as u32), edge)
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` has invalid connect metadata: {detail}",
+                        component.name
+                    ),
+                });
+            }
+        }
         for handler in &component.cycle_handlers {
             if let Some(func) = prog.functions.get(handler.function.index()) {
                 let mut checker = Checker {
@@ -1569,6 +1581,35 @@ fn verify_testbench_connect(
     }
 
     let src_id = resolve_testbench_component_path(prog, tb, &edge.src_path)?;
+    let sink_id = resolve_testbench_component_path(prog, tb, &edge.sink_path)?;
+    verify_resolved_connect(prog, edge, src_id, sink_id)
+}
+
+fn verify_component_connect(
+    prog: &TbProgram,
+    owner: ComponentId,
+    edge: &ConnectEdgeSchema,
+) -> Result<(), String> {
+    let resolve = |path: &[String]| {
+        resolve_component_path_mode(&prog.components, owner, None, path)
+            .map_err(|err| err.to_string())
+    };
+    let source = resolve(&edge.src_path)?;
+    let sink = resolve(&edge.sink_path)?;
+    // A reusable component schema has no inherited instance mode. Its
+    // active-only edge is valid metadata even when one passive binding
+    // later omits that wiring; the binding/codegen traversal decides
+    // visibility. Here we verify only the schema-relative endpoints and
+    // payload contract shared by every instantiation.
+    verify_resolved_connect(prog, edge, source.component, sink.component)
+}
+
+fn verify_resolved_connect(
+    prog: &TbProgram,
+    edge: &ConnectEdgeSchema,
+    src_id: ComponentId,
+    sink_id: ComponentId,
+) -> Result<(), String> {
     let src = prog
         .components
         .get(src_id.index())
@@ -1588,7 +1629,6 @@ fn verify_testbench_connect(
         }
     };
 
-    let sink_id = resolve_testbench_component_path(prog, tb, &edge.sink_path)?;
     if sink_id != edge.sink_component {
         return Err(format!(
             "sink path `{}` resolves to c{} but edge stores c{}",
@@ -1809,16 +1849,16 @@ fn resolve_component_queue_elem(
 
 /// The METHOD-sink half of the same rule, and for the same reason.
 ///
-/// `event_payload_matches_type` compares signedness and record
-/// identity and ignores width entirely, while lowering applies
-/// `connect_delivery_verdict` here too. Leaving this arm restated is
-/// exactly the mistake the arm fourteen lines below was fixed for: a
-/// lowering site that forgot the call would emit
+/// Lowering's shape predicate permits every scalar-to-scalar bridge and
+/// requires record identity, while its delivery predicate separately
+/// prevents storage-width loss. Leaving either rule restated here is
+/// exactly the drift this verifier backstop is meant to avoid: a
+/// lowering site that forgot the delivery call would emit
 /// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
 /// parameter, verify clean, and truncate 960 bits per notification.
 /// Measured by deleting that call and watching `dump-ir` exit 0.
 fn connect_payload_reaches_param(payload: EventPayload, ty: &IrType) -> bool {
-    if !event_payload_matches_type(payload, ty) {
+    if !crate::ir::lower::components::connect_payload_matches_ir_type(payload, ty) {
         return false;
     }
     match payload.scalar_ir_type() {
@@ -1851,16 +1891,6 @@ fn connect_payloads_bridge(src: EventPayload, sink: EventPayload) -> bool {
     match (src.scalar_ir_type(), sink.scalar_ir_type()) {
         (Some(s), Some(k)) => crate::ir::lower::components::connect_delivery_is_faithful(&s, &k),
         _ => true,
-    }
-}
-
-fn event_payload_matches_type(payload: EventPayload, ty: &IrType) -> bool {
-    match (payload, ty) {
-        (_, IrType::Unknown) => true,
-        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
-        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
-        _ => false,
     }
 }
 

@@ -1,0 +1,56 @@
+// Runtime equivalence for scalar connect bridges whose source and sink
+// signedness differ. The boundary values exercise both C++ conversion
+// directions instead of merely proving that the generated bridge compiles.
+
+transactor SignedConnectSource
+    unsigned_value : out event<uint<64>>
+    signed_value   : out event<sint<64>>
+
+    hookable publish_unsigned(v: uint<64>)
+        emit unsigned_value(v)
+    end publish_unsigned
+
+    hookable publish_signed(v: sint<64>)
+        emit signed_value(v)
+    end publish_signed
+end transactor SignedConnectSource
+
+scoreboard SignedConnectSink
+    as_signed   : sint<64> default 0
+    as_unsigned : uint<64> default 0
+
+    hookable take_unsigned_as_signed(v: sint<64>)
+        as_signed = v
+    end take_unsigned_as_signed
+
+    hookable take_signed_as_unsigned(v: uint<64>)
+        as_unsigned = v
+    end take_signed_as_unsigned
+end scoreboard SignedConnectSink
+
+env SignedConnectEnv
+    source : SignedConnectSource passive
+    sink   : SignedConnectSink
+
+    connect
+        source.unsigned_value -> sink.take_unsigned_as_signed
+        source.signed_value -> sink.take_signed_as_unsigned
+    end connect
+end env SignedConnectEnv
+
+test AnalysisSignedConnectTest
+    let dut : Top
+    let env : SignedConnectEnv
+
+    run
+        env.source.publish_unsigned(18446744073709551615)
+        assert env.sink.as_signed == 0 - 1
+            else fail("uint-to-sint bridge produced ${env.sink.as_signed}")
+
+        env.source.publish_signed(0 - 1)
+        assert env.sink.as_unsigned + 1 == 0
+            else fail("sint-to-uint bridge produced ${env.sink.as_unsigned}")
+
+        log(info, "PASS: signed scalar connect conversions")
+    end run
+end test AnalysisSignedConnectTest
