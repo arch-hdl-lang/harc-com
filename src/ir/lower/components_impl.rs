@@ -4966,32 +4966,98 @@ impl super::FuncBuilder<'_> {
         let segs: Vec<String> = name.segments.iter().map(|s| s.name.clone()).collect();
         let segs = self.strip_tb_prefix(&segs);
         if segs.len() >= 2 {
-            let head = segs[0].clone();
-            if let Some(&head_cid) = self.ctx.component_fields.get(&head) {
-                let recv: Vec<String> = segs[..segs.len() - 1].to_vec();
-                let event = segs.last().unwrap().clone();
-                let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
+            // A lexical local wins over a same-named self field. Component
+            // parameters use `Local` plus an explicit subpath; path bases
+            // carry their receiver directly, as before.
+            let target = if let Some(local) = self.lookup(&segs[0]) {
+                match self.component_of_local(local) {
+                    Some(head_cid) => Some((
+                        head_cid,
+                        ComponentBase::Local(local),
+                        &segs[1..segs.len() - 1],
+                        None,
+                        false,
+                        segs[1..segs.len() - 1].to_vec(),
+                    )),
+                    None => {
+                        return Err(LowerError::Invalid(format!(
+                            "`{}` is a local but is not component-typed",
+                            segs[0]
+                        )));
+                    }
+                }
+            } else if let Some((head_cid, mut recv, tail, head_mode)) =
+                self.component_path_head(&segs)
+            {
+                let recv_tail = &tail[..tail.len() - 1];
+                recv.extend_from_slice(recv_tail);
+                Some((
+                    head_cid,
+                    ComponentBase::Path(recv),
+                    recv_tail,
+                    head_mode,
+                    true,
+                    Vec::new(),
+                ))
+            } else {
+                None
+            };
+            if let Some((head_cid, base, recv_tail, head_mode, check_mode, subpath)) = target {
+                let event = segs.last().expect("a dotted emit has a leaf").clone();
+                let cid = self.resolve_component_recv(head_cid, recv_tail).map_err(|_| {
+                    not_implemented(
+                        &format!("`emit {}` to an unresolved component event", path_str(name)),
+                        "v1 emits the receiver path verbatim and the generated C++ does not compile",
+                        V1Status::EmitsUncompilable,
+                    )
+                })?;
                 let comp = &self.ctx.components[cid.index()];
                 match comp.field(&event) {
                     Some(field) if matches!(field.kind, ComponentFieldKind::Event { .. }) => {
-                        self.require_component_activation(
-                            &head,
-                            head_cid,
-                            self.binding_mode(&head),
-                            &recv[1..],
-                            field.activation,
-                            "event",
-                            &event,
-                        )?;
+                        if check_mode {
+                            self.require_component_activation(
+                                &segs[0],
+                                head_cid,
+                                head_mode,
+                                recv_tail,
+                                field.activation,
+                                "event",
+                                &event,
+                            )?;
+                        } else if matches!(field.activation, Activation::ActiveOnly) {
+                            // A component parameter's root mode is unknown,
+                            // but explicit modes below it are still decisive.
+                            // Preserve the method-parameter policy for a
+                            // modeless root while rejecting a known-passive
+                            // descendant.
+                            let resolved = crate::ir::resolve_component_path_mode(
+                                &self.ctx.components,
+                                head_cid,
+                                None,
+                                recv_tail,
+                            )
+                            .map_err(|err| LowerError::Invalid(err.to_string()))?;
+                            if matches!(
+                                resolved.effective_mode,
+                                Some(ComponentInstanceMode::Passive)
+                            ) {
+                                return Err(LowerError::Invalid(format!(
+                                    "active-only event `{event}` is used through passive \
+                                     component parameter path `{}`",
+                                    segs[..segs.len() - 1].join(".")
+                                )));
+                            }
+                        }
                     }
                     _ => {
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
                                 "`emit {}` — `{}.{event}` is not an `event` field",
                                 path_str(name),
                                 comp.name
                             ),
-                            "",
+                            "v1 emits the receiver path verbatim and the generated C++ does not compile",
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                 }
@@ -5039,7 +5105,8 @@ impl super::FuncBuilder<'_> {
                     )?;
                 }
                 self.push(IrStmt::ComponentEmit {
-                    base: ComponentBase::Path(recv),
+                    base,
+                    subpath,
                     event,
                     args: lowered,
                 });
@@ -5104,10 +5171,11 @@ impl super::FuncBuilder<'_> {
             )
         })?;
         if name.segments.len() != 1 {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!("`emit {}` to a dotted event path", path_str(name)),
-                "only self-relative `emit <event>(...)` or a test-scope \
-                 `emit <comp>.<event>(...)` is lowered",
+                "the path does not resolve to a component event; v1 emits it as an \
+                 unqualified C++ receiver that does not compile",
+                V1Status::EmitsUncompilable,
             ));
         }
         let event = name.segments[0].name.clone();
@@ -5144,6 +5212,7 @@ impl super::FuncBuilder<'_> {
         }
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
+            subpath: Vec::new(),
             event,
             args: lowered,
         });

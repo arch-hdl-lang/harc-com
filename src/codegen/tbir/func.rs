@@ -1792,13 +1792,21 @@ fn emit_stmt(
         // `emit observed(v)` inside a method body: fan the args out to
         // every subscriber registered on `self.<event>`, then bump the
         // component's `_last_out_cycle` heartbeat (v1's emit lowering).
-        Stmt::ComponentEmit { base, event, args } => {
+        Stmt::ComponentEmit {
+            base,
+            subpath,
+            event,
+            args,
+        } => {
             let mut rendered = Vec::with_capacity(args.len());
             for a in args {
                 rendered.push(expr_cpp(cx, a)?);
             }
             let csv = rendered.join(", ");
-            let recv = comp_base_cpp(base);
+            let recv = std::iter::once(comp_base_cpp_subst_cx(cx, base))
+                .chain(subpath.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(".");
             writeln!(out, "{pad}for (auto& _s : {recv}.{event}) _s({csv});").ok();
             writeln!(out, "{pad}{recv}._last_out_cycle = (uint64_t)cycle_count;").ok();
         }

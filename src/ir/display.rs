@@ -859,11 +859,19 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 expr_str(func, value)
             )
         }
-        Stmt::ComponentEmit { base, event, args } => {
+        Stmt::ComponentEmit {
+            base,
+            subpath,
+            event,
+            args,
+        } => {
             let a: Vec<String> = args.iter().map(|e| expr_str(func, e)).collect();
+            let recv = std::iter::once(comp_base_str(base))
+                .chain(subpath.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(".");
             format!(
-                "ComponentEmit({}.{event}, [{}])",
-                comp_base_str(base),
+                "ComponentEmit({recv}.{event}, [{}])",
                 a.join(", ")
             )
         }
