@@ -4814,9 +4814,8 @@ end test StructTest
     );
 }
 
-/// A non-scalar struct field (here a `Vec`) is out of the scalar-only
-/// subset: rejected at the field, never mis-lowered. (This is the
-/// residual blocker for the `tlm_pairing_arch_burst_*` fixtures.)
+/// A fixed scalar `Vec` field is part of the record model and supports
+/// indexed reads and writes.
 #[test]
 fn struct_vec_field_lowers_and_indexes() {
     // A `Vec<T, N>` struct field is the one aggregate the record subset
@@ -4851,36 +4850,96 @@ end test StructVecTest
     assert!(dump.contains("%r.data[0]"), "indexed element read: {dump}");
 }
 
-/// A record field typed as a NON-fixed aggregate (`Vec` with a
-/// widthless element, a nested record, a list) is still rejected —
-/// only fixed `Vec<scalar, N>` lowers.
+/// Widthless integer elements retain their language ABI inside fixed Vec
+/// fields: uint/sint use 64 packed bits and builtin int uses 32, while all
+/// three keep v1's native scalar C++ carriers.
 #[test]
-fn struct_non_scalar_field_is_rejected() {
+fn struct_widthless_vec_fields_lower_with_v1_packed_widths() {
     let src = r#"
 struct Resp
-    data : Vec<uint, 4>
+    u : Vec<uint, 2>
+    s : Vec<sint, 2>
+    i : Vec<int, 2>
 end struct Resp
 
 test StructVecTest
     let dut : Top
     run
         let r : Resp
+        r.u[0] = 1
+        r.s[0] = -1
+        r.i[0] = 2
+        assert r.u[0] == 1
+        assert r.s[0] < 0
+        assert r.i[0] == 2
     end run
 end test StructVecTest
 "#;
-    let err = lower_src(src).expect_err("widthless Vec element must be rejected");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("struct field"), "names the field: {msg}");
-    assert!(msg.contains("non-scalar"), "names the reason: {msg}");
+    let prog = lower_src(src).expect("widthless scalar Vec fields lower");
+    verify::verify_program(&prog).expect("widthless scalar Vec fields verify");
+    let fields = &prog.records[0].fields;
+    assert_eq!(
+        (fields[0].ty.clone(), fields[0].vec_len),
+        (ir::IrType::UInt(Some(64)), Some(2))
+    );
+    assert_eq!(
+        (fields[1].ty.clone(), fields[1].vec_len),
+        (ir::IrType::SInt(Some(64)), Some(2))
+    );
+    assert_eq!(
+        (fields[2].ty.clone(), fields[2].vec_len),
+        (ir::IrType::UInt(Some(32)), Some(2))
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits widthless Vec fields");
+    let out = emit_cpp_src(src);
+    for shape in [
+        "std::array<uint64_t, 2> u = {};",
+        "std::array<int64_t, 2> s = {};",
+        "std::array<uint64_t, 2> i = {};",
+    ] {
+        assert!(v1.contains(shape), "v1 emits `{shape}`: {v1}");
+        assert!(out.contains(shape), "TBIR emits `{shape}`: {out}");
+    }
+    for packed in [
+        "harc_wide_write_bits(_packed, 0, 32, value.i[0])",
+        "harc_wide_write_bits(_packed, 64, 64, value.s[0])",
+        "harc_wide_write_bits(_packed, 192, 64, value.u[0])",
+    ] {
+        assert!(
+            out.contains(packed),
+            "TBIR preserves packed width in `{packed}`: {out}"
+        );
+    }
+
+    // Enum record fields share the signed scalar carrier but deliberately
+    // have no v1 packed layout. They must remain distinguishable from a
+    // genuine widthless `sint` after the latter is normalized to 64 bits.
+    let enum_src = r#"
+enum Mode { OFF, ON }
+
+struct EnumResp
+    mode : Mode
+end struct EnumResp
+
+test EnumRecordTest
+    let dut : Top
+    run
+        let r : EnumResp
+    end run
+end test EnumRecordTest
+"#;
+    let enum_prog = lower_src(enum_src).expect("enum record field lowers");
+    assert_eq!(enum_prog.records[0].fields[0].ty, ir::IrType::SInt(None));
+    let enum_out = emit_cpp_src(enum_src);
+    assert!(!enum_out.contains("harc_pack_EnumResp"), "{enum_out}");
+    assert!(!enum_out.contains("harc_unpack_EnumResp"), "{enum_out}");
 }
 
-/// A NESTED struct whose inner leaf is a genuinely unsupported type (a
-/// `Vec` with a widthless element — no defined packed width) is still
-/// rejected. Nested structs are now lowered, but only when every leaf is
-/// itself representable. The diagnostic must name the offending leaf
-/// (`Inner.bad`), not just say "non-scalar".
+/// The same widthless Vec remains representable when reached through a nested
+/// record; the outer record reuses the inner record's 64-bit-per-lane layout.
 #[test]
-fn nested_struct_with_unsupported_leaf_is_rejected() {
+fn nested_struct_with_widthless_vec_leaf_lowers() {
     let src = r#"
 struct Inner
     bad : Vec<uint, 4>
@@ -4894,16 +4953,15 @@ test NestedBadLeafTest
     let dut : Top
     run
         let o : Outer
+        o.inner.bad[1] = 7
+        assert o.inner.bad[1] == 7
     end run
 end test NestedBadLeafTest
 "#;
-    let err = lower_src(src).expect_err("unsupported nested leaf must be rejected");
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("Inner.bad"),
-        "names the offending leaf path: {msg}"
-    );
-    assert!(msg.contains("non-scalar"), "names the reason: {msg}");
+    let prog = lower_src(src).expect("nested widthless Vec leaf lowers");
+    verify::verify_program(&prog).expect("nested widthless Vec leaf verifies");
+    let out = emit_cpp_src(src);
+    assert!(out.contains("std::array<uint64_t, 4> bad = {};"), "{out}");
 }
 
 /// A fixed `Vec<Record, N>` struct field lowers (harc#522): the schema
@@ -5058,14 +5116,14 @@ end test VecOfStructCppTest
 }
 
 /// A `Vec<Record, N>` whose element record contains a genuinely
-/// unsupported leaf is rejected via the ELEMENT record's own lowering,
+/// unsupported nested-Vec leaf is rejected via the ELEMENT record's own lowering,
 /// and the diagnostic names the complete offending leaf path
 /// (`Inner.bad`), not the vector field (harc#522 acceptance).
 #[test]
 fn vec_of_record_with_unsupported_leaf_names_leaf_path() {
     let src = r#"
 struct Inner
-    bad : Vec<uint, 4>
+    bad : Vec<Vec<uint<8>, 2>, 4>
 end struct Inner
 
 struct Outer
@@ -12359,33 +12417,37 @@ end impl T"#;
     verify::verify_program(&corrupt_target)
         .expect_err("a pass cannot make a target drive a dynamic-list record");
 
-    // The other container shapes remain outside this batch. v1 preserves
-    // these particular declarations, so they retain the honest Unsupported
-    // classification.
+    // Fixed Vecs of scalar leaves now use the same member shape and zeroing
+    // as v1. Widthless uint/sint use their 64-bit carrier width; builtin int
+    // keeps its 32-bit language width while using v1's uint64_t carrier.
     for (ty, shape, draw) in [
         ("Vec<uint, 4>", "std::array<uint64_t, 4> data", "data = {}"),
-        // `int` is 32-bit signed in HARC and this backend maps it
-        // through the UNSIGNED width helper, so a `Vec<int, N>` member
-        // is `std::array<uint64_t, N>` — which is also what TB-IR
-        // mirrors. Pinned because the `Int` arm of `scalar_leaf_c_type`
-        // had nothing measuring it.
+        ("Vec<UInt, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        ("Vec<bits, 4>", "std::array<uint64_t, 4> data", "data = {}"),
+        ("Vec<sint, 4>", "std::array<int64_t, 4> data", "data = {}"),
+        ("Vec<SInt, 4>", "std::array<int64_t, 4> data", "data = {}"),
         ("Vec<int, 4>", "std::array<uint64_t, 4> data", "data = {}"),
-        (
-            "Vec<Vec<uint<8>, 2>, 4>",
-            "std::array<std::array<uint64_t, 2>, 4> data",
-            "data = {}",
-        ),
     ] {
         let src = field(ty);
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
-        assert!(msg.contains("non-scalar"), "`{ty}`: {msg}");
+        let prog = lower_src(&src).unwrap_or_else(|e| panic!("`{ty}` lowers: {e}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("`{ty}` verifies: {e:?}"));
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("`{ty}`: {e}"));
-        assert!(
-            v1.contains(shape),
-            "`{ty}`: v1 must emit `{shape}` for the suggestion to be honest"
-        );
+        let tbir = emit_cpp_src(&src);
+        assert!(v1.contains(shape), "`{ty}`: v1 emits `{shape}`: {v1}");
+        assert!(tbir.contains(shape), "`{ty}`: TBIR emits `{shape}`: {tbir}");
         assert!(v1.contains(draw), "`{ty}`: v1 must emit `{draw}`");
+        assert!(tbir.contains(draw), "`{ty}`: TBIR must emit `{draw}`");
     }
+    // Nested fixed arrays still need a recursive element representation.
+    let nested_vec = field("Vec<Vec<uint<8>, 2>, 4>");
+    let msg = assert_unsupported(&lower_src(&nested_vec).unwrap_err());
+    assert!(msg.contains("non-scalar"), "{msg}");
+    let nested_v1 = cpp_tb::emit(&merged_src(&nested_vec)).expect("v1 emits nested Vec");
+    assert!(
+        nested_v1.contains("std::array<std::array<uint64_t, 2>, 4> data")
+            && nested_v1.contains("data = {}"),
+        "v1 nested Vec control: {nested_v1}"
+    );
     // v1 keeps the container but has no per-element draw for it, so the
     // loop body is `[_i] = 0` into a `std::array` — the emitted C++
     // does not compile, for any program that declares the record.

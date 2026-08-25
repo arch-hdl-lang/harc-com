@@ -244,9 +244,15 @@ not applicable before requesting review:
    constructors plus the helper definition). The handler-less unbound-
    transactor event slice closes routes around a shared constructor, so the
    count remains 127. The
-   scoreboard source families did not remove constructors because unsupported
-   non-scalar fields share it. Nested bus expressions and sized cover widths
-   were also reclassified because v1 rejects or silently mis-lowers them.
+   Widthless scalar fixed-`Vec` record fields now route through the existing
+   fixed-array schema and use v1-compatible 64-bit widthless integer spellings
+   (`uint`/`UInt`/`bits`, `sint`/`SInt`) and 32-bit builtin-`int` packed widths;
+   this also routes around the shared constructor,
+   so the count remains 127. Nested `Vec<Vec<...>>` fields remain unsupported.
+   The scoreboard source families did not remove constructors because
+   unsupported non-scalar fields share it. Nested bus expressions and sized
+   cover widths were also reclassified because v1 rejects or silently
+   mis-lowers them.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

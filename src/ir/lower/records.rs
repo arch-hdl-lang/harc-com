@@ -16,8 +16,8 @@
 //! supported record (`IrType::Record` element + `vec_len`, v1's
 //! `std::array<T, N>` member). Out-of-scope shapes are explicit
 //! `Unsupported` rejections, never silent drops: `when` subtype blocks,
-//! `Vec` of any other element (enums, `Vec`-of-`Vec`, widthless
-//! scalars), widthless-scalar leaves, string/object/dynamic leaves,
+//! `Vec` of any other element (enums and `Vec`-of-`Vec`),
+//! string/object/dynamic leaves,
 //! widths above 64 bits, and non-literal field defaults. Recursive /
 //! mutually-recursive nested records are rejected
 //! (`check_no_record_cycles`). Scalar-element `list<T>` fields lower as
@@ -40,7 +40,8 @@ use std::collections::HashMap;
 /// | field type | v1 emits | verdict |
 /// |---|---|---|
 /// | `list<uint<8>>`, `list<uint<256>>`, `list<bool>` | `std::vector<T>` + resize + per-element draw | likewise |
-/// | `Vec<uint, 4>`, `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | likewise |
+/// | `Vec<uint, 4>`, `Vec<sint, 4>`, `Vec<int, 4>` | `std::array<T, 4>` | modeled by `RecordFieldSchema::vec_len` |
+/// | `Vec<Vec<uint<8>, 2>, 4>` | the nested `std::array` | likewise |
 /// | `list<Vec<uint<8>, 2>>` | `std::vector<std::array<uint64_t, 2>>` — then `[_i] = 0` | `EmitsUncompilable` |
 /// | `list<Inner>`, `list<string>` | `std::vector<uint64_t>`, and randomize skips the field | `SilentlyMisLowers` |
 /// | `list<queue<uint<8>>>`, `list<int>` | `std::vector<uint64_t>` + `[_i] = 0` | `SilentlyMisLowers` |
@@ -298,10 +299,10 @@ pub(crate) fn lower_transaction(
 /// routes through the very same `emit_record_struct`), so it lowers
 /// into the same `records` table and reuses every record-local
 /// statement/expression (`RecordInit` / `RecordFieldWrite` /
-/// `Expr::RecordField`). Only the structural, scalar (≤64-bit) subset
-/// lowers; everything else is an explicit rejection, never a silent
-/// drop:
-///   - non-scalar / >64-bit fields (e.g. `Vec<...>`, nested structs)
+/// `Expr::RecordField`). The structural subset includes scalar fields,
+/// nested records, and fixed scalar/record `Vec<T, N>` fields; everything
+/// else is an explicit rejection, never a silent drop:
+///   - unsupported aggregate / >64-bit fields (e.g. nested `Vec<Vec<...>>`)
 ///     and non-literal defaults (the `field_ir_type` / default gate,
 ///     shared with transactions),
 ///   - `keep` clauses and `when` subtype blocks in the struct body
@@ -603,8 +604,12 @@ fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// length, or an unsupported element type (those fall through to the
 /// scalar gate and its rejection). A scalar element's width lives in
 /// the returned `IrType`; it drives both the C++ storage type and the
-/// packed-bit layout, so a `Vec` element with no explicit width (which
-/// would have no defined packed width) is rejected here. A record
+/// packed-bit layout. A widthless integer spelling (`uint`/`UInt`/`bits`
+/// or `sint`/`SInt`) is normalized to its
+/// language-defined 64-bit host ABI here, keeping it distinct from an enum's
+/// deliberately layout-less `SInt(None)`; builtin `int` carries its specified
+/// 32-bit packed width while retaining the same `uint64_t` member carrier v1
+/// emits. A record
 /// element (`Vec<Record, N>`, v1's `std::array<Inner, N>` member)
 /// returns `IrType::Record(rid)`; its layout recurses through the
 /// element record's own schema.
@@ -657,11 +662,8 @@ fn fixed_vec_field(
         _ => return None,
     };
     let elem_ty = field_ir_type(elem, enum_names)?;
-    // The packed layout needs a defined element width. A widthless
-    // scalar (`uint` with no `<N>`) maps to `IrType::UInt(None)`, which
-    // has no packed width — reject rather than guess.
     match elem_ty {
-        IrType::UInt(Some(_)) | IrType::SInt(Some(_)) | IrType::Bool => Some((elem_ty, len)),
+        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => Some((elem_ty, len)),
         _ => None,
     }
 }
@@ -752,12 +754,13 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
         return None;
     }
     match name {
-        // v1 lowers `int` record fields through `cpp_uint_for_width`
-        // (unsigned), so the IR mirrors that as UInt.
-        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-            Some(IrType::UInt(width))
+        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+            Some(IrType::UInt(Some(width.unwrap_or(64))))
         }
-        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
+        // v1 stores builtin `int` in the same uint64_t carrier as other
+        // narrow unsigned fields, but its packed language width is 32 bits.
+        BuiltinTy::Int => Some(IrType::UInt(Some(32))),
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(Some(width.unwrap_or(64)))),
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
         _ => None,
     }

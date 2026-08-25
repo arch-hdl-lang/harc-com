@@ -2025,10 +2025,11 @@ pub(super) fn wide_scalar_words(width: u32) -> Option<u32> {
 /// Packed-bit width of a record field's element type — the declared
 /// width (`Bool` → 1). Mirrors v1's `packed_width` for the scalar leaves
 /// the record subset lowers; a nested-record element recurses into the
-/// inner record's total width (v1 parity). `None` for a widthless scalar
-/// (no defined layout); lowering already rejects those for Vec fields,
-/// and scalar fields never reach the pack helpers when any sum is
-/// undefined. For a `Vec<T, N>` field this is the per-element width `T`;
+/// inner record's total width (v1 parity). Widthless uint/sint leaves reach
+/// this helper as the explicit 64-bit width assigned by record lowering,
+/// while builtin `int` arrives as `UInt(Some(32))`. `None` remains reserved
+/// for leaves such as enums that have storage but no v1 packed layout. For a
+/// `Vec<T, N>` field this is the per-element width `T`;
 /// the caller multiplies by `N`.
 fn field_packed_width(ty: &ir::IrType, records: &[ir::RecordSchema]) -> Option<usize> {
     match ty {
@@ -2364,7 +2365,7 @@ fn emit_structured_drive_field(
 /// fast-path that copies field-wise when the response pin is exposed as
 /// a struct (Verilator packed struct), falling back to the bit layout
 /// for a flat wide wire. Skipped when the record has no defined packed
-/// width (a widthless scalar field) — exactly v1's `try_fold` guard.
+/// width (for example, an enum field) — exactly v1's `try_fold` guard.
 fn record_pack_helpers(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
     let Some(width) = record_packed_width(r, records) else {
         return;
