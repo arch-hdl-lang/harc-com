@@ -478,6 +478,9 @@ pub(crate) fn lower_transactor(
         // Transactor-context lowering never resolves test-scope probes.
         probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
+        // Transactor bodies never host a testbench-lifecycle marker call
+        // (#619 M4a); the map stays empty here.
+        tb_lifecycle_fns: std::collections::HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -931,6 +934,9 @@ fn lower_bound_target_transactor(
         // Transactor-context lowering never resolves test-scope probes.
         probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
+        // Transactor bodies never host a testbench-lifecycle marker call
+        // (#619 M4a); the map stays empty here.
+        tb_lifecycle_fns: std::collections::HashMap::new(),
     };
 
     let mut funcs = Vec::new();
@@ -1522,6 +1528,9 @@ fn lower_bound_initiator_transactor(
         // Transactor-context lowering never resolves test-scope probes.
         probes: HashMap::new(),
         extern_fns: record_ctx.extern_fns.clone(),
+        // Transactor bodies never host a testbench-lifecycle marker call
+        // (#619 M4a); the map stays empty here.
+        tb_lifecycle_fns: std::collections::HashMap::new(),
     };
 
     let mut funcs = Vec::new();

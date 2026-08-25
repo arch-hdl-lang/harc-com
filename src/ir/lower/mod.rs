@@ -924,6 +924,16 @@ fn bind_rhs_ident(
     }
 }
 
+/// Experimental #619 M4a switch: when `HARC_TBIR_NATIVE_LIFECYCLE` is
+/// set in the environment, TB-IR lowering desugars impl-for tests with
+/// SHARED testbench lifecycle (marker calls lowered once to
+/// `FunctionKind::TestbenchLifecycle`) instead of the historical
+/// per-test inlining. OFF by default and WIP — see the call site in
+/// `lower_program` and docs/619-m4a-ir-ownership.md.
+fn native_lifecycle_enabled() -> bool {
+    std::env::var_os("HARC_TBIR_NATIVE_LIFECYCLE").is_some()
+}
+
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
@@ -942,7 +952,27 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Reuse v1's impl-for desugaring so both codegens see the exact
     // same classic-form AST (synthesized `let dut` / `let _tb`, merged
     // lifecycle blocks, `_tb.<field>` rewrites).
-    let file = crate::codegen::cpp_tb::desugar_impl_for_test_in_file(file);
+    //
+    // #619 M4a (WIP): under the experimental `HARC_TBIR_NATIVE_LIFECYCLE`
+    // switch, use the lifecycle-SHARING desugaring instead — it leaves a
+    // `__harc_tb_lifecycle_<phase>()` marker call where each testbench
+    // lifecycle body would have been inlined, so lowering can lower the
+    // body once and call it. The marker→`TestbenchLifecycle` lowering
+    // lands in the next slice; until then the switch is incomplete and
+    // OFF by default (no test sets the env var). See
+    // docs/619-m4a-ir-ownership.md.
+    // #619 M4a: `shared_lifecycle_bodies` is the per-testbench rewritten
+    // phase bodies captured by the sharing desugar, for the once-per-
+    // testbench `TestbenchLifecycle` lowering below. Empty when the switch
+    // is off (historical inlining folds the bodies into each test instead).
+    let (file, shared_lifecycle_bodies) = if native_lifecycle_enabled() {
+        crate::codegen::cpp_tb::desugar_impl_for_test_sharing_lifecycle(file)
+    } else {
+        (
+            crate::codegen::cpp_tb::desugar_impl_for_test_in_file(file),
+            crate::codegen::cpp_tb::SharedLifecycleBodies::new(),
+        )
+    };
 
     // Domain table: `domain D freq_mhz: N` → period_ps = 1_000_000 / N.
     let mut domains: HashMap<String, i64> = HashMap::new();
@@ -2066,6 +2096,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         probes: HashMap::new(),
         // Extern fns are PURE calls — callable from a pure helper body.
         extern_fns: extern_fns.clone(),
+        // Marker calls never appear in helper/tseq/method bodies — only in
+        // the shared-lifecycle desugar output for run/check (#619 M4a).
+        tb_lifecycle_fns: HashMap::new(),
     };
     for it in &file.items {
         let Item::Function(fd) = it else { continue };
@@ -2135,6 +2168,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // tseq generator bodies never access the DUT.
         probes: HashMap::new(),
         extern_fns: extern_fns.clone(),
+        // Marker calls never appear in helper/tseq/method bodies — only in
+        // the shared-lifecycle desugar output for run/check (#619 M4a).
+        tb_lifecycle_fns: HashMap::new(),
     };
     for it in &file.items {
         let Item::Tseq(decl) = it else { continue };
@@ -2357,6 +2393,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // never test-scope probes (probes live on `let dut`).
         probes: HashMap::new(),
         extern_fns: extern_fns.clone(),
+        // Marker calls never appear in helper/tseq/method bodies — only in
+        // the shared-lifecycle desugar output for run/check (#619 M4a).
+        tb_lifecycle_fns: HashMap::new(),
     };
     let mut method_funcs: Vec<TbFunction> = Vec::new();
     for (i, src) in comp_sources.iter().enumerate() {
@@ -2454,6 +2493,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let _ = start_fn;
     prog.functions.extend(method_funcs);
 
+    // #619 M4a: the once-per-testbench `TestbenchLifecycle` FunctionIds,
+    // keyed by SOURCE-testbench name → phase → function. Shared across all
+    // tests binding the same testbench so each phase body is lowered ONCE;
+    // populated on first bind, reused after. Empty when the switch is off.
+    let mut shared_lifecycle_fns: HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>> =
+        HashMap::new();
     for it in &file.items {
         let Item::Test(t) = it else { continue };
         lower_test(
@@ -2481,6 +2526,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &side_tables,
             &dut_poking_bfm_names,
             &always_on_dut_event_host_names,
+            &shared_lifecycle_bodies,
+            &mut shared_lifecycle_fns,
             &mut prog,
         )?;
     }
@@ -3320,6 +3367,12 @@ fn lower_test(
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
     always_on_dut_event_host_names: &HashSet<String>,
+    // #619 M4a: rewritten reusable-testbench lifecycle bodies (per
+    // source-testbench name + phase), and the dedup map of the once-
+    // lowered `TestbenchLifecycle` FunctionIds shared across binding tests.
+    // Both empty when `HARC_TBIR_NATIVE_LIFECYCLE` is off.
+    shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
+    shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -5539,7 +5592,7 @@ fn lower_test(
             )
         })
         .collect();
-    let ctx = LowerCtx {
+    let mut ctx = LowerCtx {
         dut_field: "dut".to_string(),
         tb_field: if synthetic {
             None
@@ -5602,6 +5655,10 @@ fn lower_test(
         tseqs: tseq_records.clone(),
         probes: probes.clone(),
         extern_fns: extern_fns.clone(),
+        // Populated just below (before run/check lowering) when the
+        // native-lifecycle switch is on and the bound testbench declares
+        // lifecycle phases; empty otherwise.
+        tb_lifecycle_fns: HashMap::new(),
     };
 
     // Synthesized auto-sampler functions, one per covergroup field, in
@@ -5626,6 +5683,58 @@ fn lower_test(
             ret: None,
             implicit_returns: Vec::new(),
         });
+    }
+
+    // #619 M4a: lower each bound testbench's reusable lifecycle phase body
+    // ONCE into a `FunctionKind::TestbenchLifecycle` function (shared
+    // across every test that binds the testbench) and expose the
+    // FunctionIds to the marker-call lowering below via `ctx`. The bodies
+    // were captured pre-rewritten by the sharing desugar. A
+    // `__harc_tb_lifecycle_<phase>()` marker in the run/check body then
+    // lowers to a `Terminator::TbLifecycleCall` to the mapped function,
+    // which the emitter re-inlines — reproducing the historical inlined
+    // output. No-op when the switch is off (both maps are empty).
+    //
+    // NOTE (known limitation): a lifecycle body that registers per-test
+    // side-table entries (a concurrent `cover`/property) would be counted
+    // for the FIRST binding test only, since the shared function is lowered
+    // once. No fixture exercises that today (lifecycle bodies in the corpus
+    // hold no cover/property/randomize); see docs/619-m4a-ir-ownership.md.
+    if let Some(tbn) = &tb_name {
+        for phase in [
+            crate::ast::LifecyclePhase::Setup,
+            crate::ast::LifecyclePhase::Check,
+            crate::ast::LifecyclePhase::Teardown,
+        ] {
+            let Some(body) = shared_lifecycle_bodies.get(&(tbn.clone(), phase)) else {
+                continue;
+            };
+            let fid = if let Some(existing) =
+                shared_lifecycle_fns.get(tbn).and_then(|m| m.get(&phase))
+            {
+                *existing
+            } else {
+                let fid = FunctionId(prog.functions.len() as u32);
+                let f = lower_tb_lifecycle_body(
+                    fid,
+                    format!("__tb_lifecycle_{tbn}_{phase:?}"),
+                    Some(tb_id),
+                    tb_id,
+                    phase,
+                    body,
+                    &ctx,
+                    helpers,
+                    side_tables,
+                )?;
+                prog.functions.push(f);
+                shared_lifecycle_fns
+                    .entry(tbn.clone())
+                    .or_default()
+                    .insert(phase, fid);
+                fid
+            };
+            ctx.tb_lifecycle_fns.insert(phase, fid);
+        }
     }
 
     // Concurrent `cover` checks minted from here on belong to THIS test:
@@ -6718,6 +6827,16 @@ pub(crate) struct LowerCtx {
     /// helpers, methods) — an extern fn is callable wherever a pure
     /// helper is. Empty when the program declares no extern fns.
     pub extern_fns: ExternFnTable,
+    /// #619 M4a: reusable testbench lifecycle phase → the once-lowered
+    /// `FunctionKind::TestbenchLifecycle` function that owns that phase's
+    /// body for the bound testbench. Populated ONLY in the test-scope
+    /// `ctx` when the `HARC_TBIR_NATIVE_LIFECYCLE` switch is on, after the
+    /// shared lifecycle functions are lowered and before the run/check
+    /// bodies. A `__harc_tb_lifecycle_<phase>()` marker call in a run/check
+    /// body lowers to a `Terminator::TbLifecycleCall` to the mapped
+    /// function; the emitter re-inlines it. Empty everywhere else (marker
+    /// calls only appear in the shared-lifecycle desugar output).
+    pub tb_lifecycle_fns: HashMap<crate::ast::LifecyclePhase, FunctionId>,
 }
 
 impl LowerCtx {
@@ -7163,6 +7282,49 @@ fn lower_function<'a>(
         b.terminate(Terminator::Return);
     }
     b.finish(id, name, kind, owner)
+}
+
+/// #619 M4a: lower one reusable testbench lifecycle phase body (already
+/// rewritten to `_tb.<field>` by the sharing desugar) into a
+/// `FunctionKind::TestbenchLifecycle` function. Lowered ONCE per bound
+/// testbench and re-inlined by the emitter at each marker call site, so
+/// its output must match what the historical per-test inlining produced:
+///   * `in_check` follows the phase — `check`/`teardown` historically
+///     lowered inside the test's Check function, `setup` inside Run — so
+///     any `in_check`-sensitive lowering lands the same way;
+///   * `in_test_body` is true (the inlined bodies ran in the test body);
+///   * testbench record-field locals are declared exactly as the run/check
+///     functions declare them (the backend skips those declarations and
+///     binds to the shared `_tb` object at emit).
+#[allow(clippy::too_many_arguments)]
+fn lower_tb_lifecycle_body<'a>(
+    id: FunctionId,
+    name: String,
+    owner: Option<TestbenchId>,
+    testbench: TestbenchId,
+    phase: crate::ast::LifecyclePhase,
+    body: &Block,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    side_tables: &'a RefCell<SideTables>,
+) -> Result<TbFunction, LowerError> {
+    let mut b = FuncBuilder::new(ctx, helpers, side_tables);
+    b.in_check = matches!(
+        phase,
+        crate::ast::LifecyclePhase::Check | crate::ast::LifecyclePhase::Teardown
+    );
+    b.in_test_body = true;
+    declare_tb_record_fields(&mut b, ctx);
+    b.lower_block_stmts(body)?;
+    if !b.is_terminated() {
+        b.terminate(Terminator::Return);
+    }
+    b.finish(
+        id,
+        name,
+        FunctionKind::TestbenchLifecycle { testbench, phase },
+        owner,
+    )
 }
 
 /// Lower one closure-hook body (`on <obj>.<method> pre/post`) as a
@@ -7837,6 +7999,7 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
             m(on_timeout);
         }
         Terminator::Randomize { succ, .. } => m(succ),
+        Terminator::TbLifecycleCall { succ, .. } => m(succ),
         Terminator::Return | Terminator::Fatal(_) => {}
     }
 }
@@ -8155,6 +8318,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             // never appears in a responder body (transactor-method
             // randomize is out of subset) — nothing to fill.
             Terminator::Randomize { .. }
+            | Terminator::TbLifecycleCall { .. }
             | Terminator::Jump(_)
             | Terminator::WaitTimePs(_, _)
             | Terminator::Return => {}
@@ -8668,6 +8832,7 @@ fn fill_initiator_bus_prefix(
                     }
                 }
                 Terminator::Randomize { .. }
+                | Terminator::TbLifecycleCall { .. }
                 | Terminator::Jump(_)
                 | Terminator::WaitTimePs(_, _)
                 | Terminator::Return => {}

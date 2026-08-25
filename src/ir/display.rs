@@ -589,6 +589,12 @@ fn kind_str(k: &FunctionKind) -> String {
             crate::ir::TseqElem::Scalar(t) => format!("Tseq({})", type_str(t)),
         },
         FunctionKind::TestHook => "TestHook".to_string(),
+        FunctionKind::TestbenchLifecycle { testbench, phase } => {
+            format!("TestbenchLifecycle(tb{}, {})", testbench.0, phase.keyword())
+        }
+        FunctionKind::TestbenchMethod { testbench } => {
+            format!("TestbenchMethod(tb{})", testbench.0)
+        }
     }
 }
 
@@ -1005,6 +1011,9 @@ fn term_str(func: &TbFunction, t: &Terminator) -> String {
         ),
         Terminator::Return => "Return".to_string(),
         Terminator::Fatal(args) => format!("Fatal({})", fmt_args_str(func, args)),
+        Terminator::TbLifecycleCall { function, succ } => {
+            format!("TbLifecycleCall {{ fn{}, b{} }}", function.0, succ.0)
+        }
     }
 }
 

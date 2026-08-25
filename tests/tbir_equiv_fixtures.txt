@@ -155,6 +155,22 @@ testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnable
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpThree
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
+# #619 M4a sub-step 4: conservative-fallback fixtures — under
+# HARC_TBIR_NATIVE_LIFECYCLE these testbenches are UNSAFE to share and fall
+# back to per-test inlining; both codegens must still trace-diff clean.
+#   unsafe_share  — randomize in a testbench method (side-table state)
+#   shadow_share  — a binding test shadows a testbench FIELD
+#   concurrent_assert — a temporal `|->` assert in check (mints a per-test
+#                       PropertyCheckId; caught by is_concurrent_assertion)
+#   method_shadow — a binding test shadows a testbench METHOD name
+tb_lifecycle_unsafe_share_test | Top | top_counter.sv | - | pass | - | - | UnsafeShareA
+tb_lifecycle_unsafe_share_test | Top | top_counter.sv | - | pass | - | - | UnsafeShareB
+tb_lifecycle_shadow_share_test | Top | top_counter.sv | - | pass | - | - | ShadowSharePlain
+tb_lifecycle_shadow_share_test | Top | top_counter.sv | - | pass | - | - | ShadowShareShadows
+tb_lifecycle_concurrent_assert_test | Top | top_counter.sv | - | pass | - | - | ConcurrentAssertA
+tb_lifecycle_concurrent_assert_test | Top | top_counter.sv | - | pass | - | - | ConcurrentAssertB
+tb_lifecycle_method_shadow_test | Top | top_counter.sv | - | pass | - | - | MethodShadowPlain
+tb_lifecycle_method_shadow_test | Top | top_counter.sv | - | pass | - | - | MethodShadowShadows
 scoreboard_basic_test | Top | top_counter.sv | - | pass
 scoreboard_data_queue_struct_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass

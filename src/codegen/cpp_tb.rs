@@ -23809,6 +23809,457 @@ fn check_addrmap_overlap(a: &AddrmapDecl) -> Option<String> {
 /// `dut_probes`, lowering, and the randomize emitter. Desugaring once up
 /// front in `cmd_sim` would collapse all three to a borrow; see harc#546.
 pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::Cow<'_, SourceFile> {
+    desugar_impl_for_test_in_file_inner(file, false, None)
+}
+
+/// Captured reusable-testbench lifecycle phase bodies, keyed by
+/// `(source-testbench name, phase)`. Each `Block` is the phase body AFTER
+/// the `_tb.<field>` rewrite the desugar applies — the exact shape the
+/// historical per-test inlining would have produced — so TB-IR lowering
+/// can lower it ONCE into a `TestbenchLifecycle` function whose re-emitted
+/// output is trace-identical (same field references and statement order;
+/// local names differ). First test to bind a given testbench wins (later
+/// binds produce an identical rewrite for the corpus). See #619 M4a.
+pub(crate) type SharedLifecycleBodies =
+    std::collections::HashMap<(String, LifecyclePhase), Block>;
+
+/// Like [`desugar_impl_for_test_in_file`], but for the TB-IR native
+/// lifecycle-ownership path (issue #619 M4a). Instead of splicing each
+/// bound testbench's `setup`/`check`/`teardown` bodies into every test,
+/// it leaves a single `__harc_tb_lifecycle_<phase>()` marker call in
+/// their place (the wire and the impl-owned lifecycle statements stay
+/// exactly where they were). TB-IR lowering lowers each testbench phase
+/// body ONCE into a `FunctionKind::TestbenchLifecycle` function and
+/// lowers the marker to a call to it, so the reusable lifecycle exists
+/// once rather than copied per test.
+///
+/// v1 never calls this — it keeps the historical inlining via
+/// [`desugar_impl_for_test_in_file`]. See docs/619-m4a-ir-ownership.md.
+pub(crate) fn desugar_impl_for_test_sharing_lifecycle(
+    file: &SourceFile,
+) -> (std::borrow::Cow<'_, SourceFile>, SharedLifecycleBodies) {
+    let mut captured = SharedLifecycleBodies::new();
+    let file = desugar_impl_for_test_in_file_inner(file, true, Some(&mut captured));
+    (file, captured)
+}
+
+/// The reserved marker-call name TB-IR lowering recognizes for a shared
+/// testbench lifecycle phase, under `share_lifecycle` desugaring.
+pub(crate) fn tb_lifecycle_marker_name(phase: LifecyclePhase) -> &'static str {
+    match phase {
+        LifecyclePhase::Setup => "__harc_tb_lifecycle_setup",
+        LifecyclePhase::Check => "__harc_tb_lifecycle_check",
+        LifecyclePhase::Teardown => "__harc_tb_lifecycle_teardown",
+    }
+}
+
+/// Reverse of [`tb_lifecycle_marker_name`]: the lifecycle phase a bare
+/// call name denotes, or `None` if it is not a reserved marker. TB-IR
+/// lowering uses this to recognize a `__harc_tb_lifecycle_<phase>()`
+/// marker call and lower it to a `Terminator::TbLifecycleCall` (#619 M4a).
+pub(crate) fn tb_lifecycle_marker_phase(name: &str) -> Option<LifecyclePhase> {
+    match name {
+        "__harc_tb_lifecycle_setup" => Some(LifecyclePhase::Setup),
+        "__harc_tb_lifecycle_check" => Some(LifecyclePhase::Check),
+        "__harc_tb_lifecycle_teardown" => Some(LifecyclePhase::Teardown),
+        _ => None,
+    }
+}
+
+/// A one-statement block holding the reserved lifecycle marker call for
+/// `phase`. Substituted for a testbench lifecycle body when desugaring
+/// in `share_lifecycle` mode (#619 M4a).
+fn tb_lifecycle_marker_block(phase: LifecyclePhase, span: Span) -> Block {
+    let callee = Expr {
+        kind: Box::new(ExprKind::Ident(Ident {
+            name: tb_lifecycle_marker_name(phase).into(),
+            span,
+        })),
+        span,
+    };
+    let call = Expr {
+        kind: Box::new(ExprKind::Call {
+            callee,
+            args: Vec::new(),
+        }),
+        span,
+    };
+    Block {
+        stmts: vec![Stmt {
+            kind: StmtKind::Expr(call),
+            span,
+        }],
+        span,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #619 M4a sub-step 4: conservative shareability decision.
+//
+// A reusable testbench's lifecycle may be SHARED (lowered once, marker →
+// call edge) only when doing so cannot change the trace vs the historical
+// per-test inlining. Two hazards force a per-testbench fallback to the
+// historical inlining (byte-identical to switch-OFF):
+//
+//   1. Side-table state. A phase body — or ANY of the testbench's own
+//      methods, scanned as a conservative union — that mints per-test
+//      side-table state (a `randomize` site, a concurrent `cover`, or a
+//      concurrent `property` check) must not be shared: lowering it once
+//      attributes that state to the FIRST binding test only.
+//   2. Field shadowing. If any binding test declares a test-scope `let`
+//      whose name collides with a testbench field, that test's `_tb.<field>`
+//      rewrite differs from the shared (first-bind) body.
+//
+// When in doubt we classify UNSAFE. The union method scan and the
+// any-field shadow rule are deliberately coarse (per-testbench, not
+// per-phase / per-referenced-field); a false "unsafe" only forgoes the
+// sharing optimization and falls back to the always-correct inlining.
+// ---------------------------------------------------------------------------
+
+/// Recursive scanner for share-unsafe constructs. Carries the file's
+/// declared-`property` set so it can apply the AUTHORITATIVE
+/// concurrent-assertion predicate (`is_concurrent_assertion`) that lowering
+/// itself uses — a purely syntactic `named`/`property_kw` shortcut misses
+/// temporal-operator asserts (`|->`, `$rose`, `##N`, …) and bare-ident
+/// property references, which mint per-test `PropertyCheckId`s.
+///
+/// The statement/expression traversals mirror the exhaustive matches of
+/// `rewrite_stmt_for_impl` / `rewrite_expr_for_impl`, so a new AST variant
+/// forces this to be revisited (arms are compiler-checked for
+/// exhaustiveness).
+struct ShareScan<'a> {
+    properties: &'a std::collections::HashMap<String, Expr>,
+    found: bool,
+}
+
+impl<'a> ShareScan<'a> {
+    fn new(properties: &'a std::collections::HashMap<String, Expr>) -> Self {
+        ShareScan {
+            properties,
+            found: false,
+        }
+    }
+
+    /// True if `kind` DIRECTLY mints per-test side-table state or a
+    /// per-test-context-dependent body (not recursing).
+    fn stmt_directly_unsafe(&self, kind: &StmtKind) -> bool {
+        match kind {
+            // A randomize site mints a per-test constraint problem.
+            StmtKind::Randomize { .. } => true,
+            // Every `cover` (named or anonymous) mints a per-test
+            // CoverCheckId — `lower_cover` registers unconditionally.
+            StmtKind::Cover(_) => true,
+            // A CONCURRENT assert/assume mints a per-test PropertyCheckId.
+            // Use the SAME predicate lowering uses (`lower_assert` /
+            // `lower_assume` → `is_concurrent_assertion`): a bare ident
+            // naming a declared property OR any temporal operator
+            // (`|->`/`|=>`/`throughout`/`within`/`intersect`/`##`/`[*]`/
+            // `$past`/`$rose`/`$fell`/`$stable`). An immediate boolean
+            // assert/assume is safe.
+            StmtKind::Assert(v) | StmtKind::Assume(v) => v
+                .expr
+                .as_ref()
+                .is_some_and(|e| is_concurrent_assertion(e, self.properties)),
+            // A nested `on ...` handler (a per-register `on regs.REG`
+            // callback, a method hook, or a cycle trigger) is rewritten
+            // against PER-TEST context — regblock bindings, method-hook
+            // param names — so a copy folded into a shared phase would
+            // differ across binding tests. Conservatively unshareable.
+            StmtKind::On(_) => true,
+            _ => false,
+        }
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in &b.stmts {
+            if self.found {
+                return;
+            }
+            self.stmt(s);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        if self.found {
+            return;
+        }
+        if self.stmt_directly_unsafe(&s.kind) {
+            self.found = true;
+            return;
+        }
+        match &s.kind {
+            StmtKind::Let(l) => {
+                if let Some(v) = l.value.as_ref() {
+                    self.expr(v);
+                }
+            }
+            StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+                self.expr(target);
+                self.expr(value);
+            }
+            StmtKind::Expr(e) => self.expr(e),
+            StmtKind::For(f) => {
+                self.expr(&f.iter);
+                self.block(&f.body);
+            }
+            StmtKind::Repeat(r) => {
+                self.expr(&r.count);
+                self.block(&r.body);
+            }
+            StmtKind::Loop(b) => self.block(b),
+            StmtKind::While { cond, body, .. } => {
+                self.expr(cond);
+                self.block(body);
+            }
+            StmtKind::If(ifs) => {
+                self.expr(&ifs.cond);
+                self.block(&ifs.then_block);
+                for (c, b) in ifs.elsifs.iter() {
+                    self.expr(c);
+                    self.block(b);
+                }
+                if let Some(b) = ifs.else_block.as_ref() {
+                    self.block(b);
+                }
+            }
+            StmtKind::Fork(fk) => {
+                for b in fk.branches.iter() {
+                    self.block(b);
+                }
+            }
+            StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+                for b in blocks.iter() {
+                    self.block(b);
+                }
+            }
+            StmtKind::Select(arms) => {
+                for a in arms.iter() {
+                    self.expr(&a.event);
+                    self.block(&a.action);
+                }
+            }
+            // `On` is flagged directly-unsafe above; the arm is kept for
+            // exhaustiveness (its body would be scanned if that changed).
+            StmtKind::On(h) => {
+                self.expr(&h.event);
+                self.block(&h.body);
+            }
+            StmtKind::After { duration, body, .. } => {
+                self.expr(duration);
+                self.block(body);
+            }
+            StmtKind::Wait { duration, .. } => self.expr(duration),
+            StmtKind::WaitUntil {
+                conditions,
+                timeout,
+                ..
+            } => {
+                for c in conditions.iter() {
+                    self.expr(c);
+                }
+                if let Some(t) = timeout.as_ref() {
+                    self.expr(&t.cycles);
+                    if let Some(m) = t.message.as_ref() {
+                        self.expr(m);
+                    }
+                }
+            }
+            StmtKind::Yield(e) | StmtKind::Release(e) => self.expr(e),
+            StmtKind::Return(opt) => {
+                if let Some(e) = opt.as_ref() {
+                    self.expr(e);
+                }
+            }
+            // Immediate assert/assume reach here (the concurrent forms were
+            // caught by `stmt_directly_unsafe`); scan operands for a nested
+            // `randomize` expression. `Cover`/`Randomize` never reach here
+            // (already flagged), but are listed for exhaustiveness.
+            StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
+                if let Some(e) = v.expr.as_ref() {
+                    self.expr(e);
+                }
+                if let Some(e) = v.else_fail.as_ref() {
+                    self.expr(e);
+                }
+            }
+            StmtKind::Randomize {
+                target, with_body, ..
+            } => {
+                self.expr(target);
+                for e in with_body.iter() {
+                    self.expr(e);
+                }
+            }
+            StmtKind::Log { args, .. }
+            | StmtKind::LogF { args, .. }
+            | StmtKind::Emit { args, .. } => {
+                for a in args.iter() {
+                    self.arg(a);
+                }
+            }
+            StmtKind::Fail { msg, .. } => self.expr(msg),
+            StmtKind::JoinAll { .. }
+            | StmtKind::Apply(_)
+            | StmtKind::Break { .. }
+            | StmtKind::Continue { .. } => {}
+        }
+    }
+
+    fn arg(&mut self, a: &CallArg) {
+        match a {
+            CallArg::Expr(e) => self.expr(e),
+            CallArg::Named { value, .. } => self.expr(value),
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        if self.found {
+            return;
+        }
+        match e.kind.as_ref() {
+            // `randomize(t)` in expression position (`let x = randomize(t)`).
+            ExprKind::Randomize { .. } => {
+                self.found = true;
+            }
+            ExprKind::Call { callee, args } => {
+                self.expr(callee);
+                for a in args.iter() {
+                    self.arg(a);
+                }
+            }
+            ExprKind::Field { target, .. } => self.expr(target),
+            ExprKind::Index { target, index } => {
+                self.expr(target);
+                self.expr(index);
+            }
+            ExprKind::BitSlice { target, hi, lo } => {
+                self.expr(target);
+                self.expr(hi);
+                self.expr(lo);
+            }
+            ExprKind::Cast { expr, .. } => self.expr(expr),
+            ExprKind::Send { target, value } => {
+                self.expr(target);
+                self.expr(value);
+            }
+            ExprKind::Unary { expr, .. } => self.expr(expr),
+            ExprKind::ForkCall { call } => self.expr(call),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr(cond);
+                self.expr(then_branch);
+                self.expr(else_branch);
+            }
+            ExprKind::HashHash { expr, .. } => self.expr(expr),
+            ExprKind::SeqRepeat { expr, .. } => self.expr(expr),
+            ExprKind::RangeLit { lo, hi } => {
+                if let Some(lo) = lo.as_ref() {
+                    self.expr(lo);
+                }
+                if let Some(hi) = hi.as_ref() {
+                    self.expr(hi);
+                }
+            }
+            ExprKind::SetLit(es)
+            | ExprKind::SystemCall { args: es, .. }
+            | ExprKind::SolveOrder { args: es } => {
+                for x in es.iter() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::ForEachConstraint { iter, body, .. } => {
+                self.expr(iter);
+                for x in body.iter() {
+                    self.expr(x);
+                }
+            }
+            ExprKind::SoftConstraint(sc) => {
+                self.expr(&sc.expr);
+                if let Some(weight) = sc.weight.as_ref() {
+                    self.expr(weight);
+                }
+            }
+            ExprKind::DistDirective { target, .. } => self.expr(target),
+            ExprKind::Paren(x) => self.expr(x),
+            ExprKind::NamedArg { value, .. } => self.expr(value),
+            ExprKind::StructLit { fields: nfs, .. } => {
+                for nf in nfs.iter() {
+                    self.expr(&nf.value);
+                }
+            }
+            ExprKind::CoverArrow { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            ExprKind::Membership { expr, set } => {
+                self.expr(expr);
+                self.expr(set);
+            }
+            ExprKind::DistLit(_)
+            | ExprKind::String(_)
+            | ExprKind::Ident(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Time(_)
+            | ExprKind::Bool(_)
+            | ExprKind::ImplicitSelf => {}
+        }
+    }
+}
+
+/// Conservative UNION scan (#619 M4a sub-step 4): a testbench's lifecycle
+/// is share-unsafe if ANY body that could be FOLDED INTO the shared
+/// lifecycle function contains a share-unsafe construct. Only two item
+/// kinds contribute such a body — the lifecycle phase itself, and any
+/// helper method a phase CFG-inlines (`hookable`/`function`). Scanning all
+/// methods (rather than only those a phase calls) is a deliberate
+/// over-approximation; a false "unsafe" only forgoes the sharing
+/// optimization. The match is EXHAUSTIVE (no wildcard) so a new
+/// `ComponentItem` kind forces an explicit safe/unsafe decision here.
+fn testbench_lifecycle_share_unsafe(
+    tb: &ComponentDecl,
+    properties: &std::collections::HashMap<String, Expr>,
+) -> bool {
+    tb.items.iter().any(|ci| {
+        let mut scan = ShareScan::new(properties);
+        match ci {
+            // The shared lifecycle function is lowered from the phase body,
+            // plus any helper method the phase CFG-inlines at a call site.
+            ComponentItem::Lifecycle(_, body)
+            | ComponentItem::Hookable(HookableMethod { body, .. }) => scan.block(body),
+            // The remaining item kinds never contribute a body to the
+            // SHARED lifecycle function, so their contents cannot change a
+            // shared phase's trace:
+            //   * Field / Connect — declarations / wiring, no procedural body.
+            //   * OnHandler — a testbench-scope `on` service lowered to its
+            //     OWN per-test `TestHook` function (periodic/cycle service),
+            //     never folded into a lifecycle phase.
+            //   * TargetTlmThread — a bound-target responder thread, separate.
+            //   * Watchdog — desugars to a periodic-service checker, separate.
+            //   * Apply — aspect activation; inert (no backend applies it).
+            ComponentItem::Field(_)
+            | ComponentItem::Connect(_)
+            | ComponentItem::OnHandler(_)
+            | ComponentItem::TargetTlmThread(_)
+            | ComponentItem::Watchdog(_)
+            | ComponentItem::Apply(_) => {}
+        }
+        scan.found
+    })
+}
+
+fn desugar_impl_for_test_in_file_inner<'a>(
+    file: &'a SourceFile,
+    share_lifecycle: bool,
+    mut captured: Option<&mut SharedLifecycleBodies>,
+) -> std::borrow::Cow<'a, SourceFile> {
     if !file
         .items
         .iter()
@@ -23877,6 +24328,76 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
         })
         .collect();
 
+    // #619 M4a sub-step 4: under `share_lifecycle`, decide PER TESTBENCH
+    // whether its lifecycle may be shared. A testbench falls back to the
+    // historical per-test inlining (byte-identical to switch-OFF) if any
+    // phase/method body is share-unsafe (side-table state) OR any binding
+    // test shadows one of its fields. Only shareable testbenches get marker
+    // substitution + body capture below; the rest inline verbatim. Empty
+    // (nothing shared) when `share_lifecycle` is false.
+    let shareable_testbenches: std::collections::HashSet<String> = if share_lifecycle {
+        // File-scope `property NAME ... end property` bodies — the exact
+        // table lowering's `is_concurrent_assertion` resolves against (see
+        // `lower_program`), so the share scan classifies concurrent asserts
+        // identically to lowering.
+        let properties: std::collections::HashMap<String, Expr> = file
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Property(pd) => Some((pd.name.name.clone(), pd.body.clone())),
+                _ => None,
+            })
+            .fold(std::collections::HashMap::new(), |mut m, (k, v)| {
+                m.entry(k).or_insert(v); // first declaration wins, like lowering
+                m
+            });
+        // Testbenches actually bound by an impl-for test.
+        let bound: std::collections::HashSet<&str> = file
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Test(t) => t.for_testbench.as_ref().map(|i| i.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        bound
+            .iter()
+            .filter_map(|&name| {
+                let tb = components.get(name)?;
+                if testbench_lifecycle_share_unsafe(tb, &properties) {
+                    return None;
+                }
+                // Shadow hazard: `rewrite_expr_for_impl` suppresses BOTH
+                // field-ref and bare-method-call rewriting via one flat
+                // `shadow` set built from every test-scope `let` name. So a
+                // binding test whose `let` collides with a testbench FIELD
+                // *or* METHOD name gets a different inlined body than the
+                // shared (first-bind) one — force fallback in either case.
+                let shadow_targets: std::collections::HashSet<&str> = tb
+                    .items
+                    .iter()
+                    .filter_map(|ci| match ci {
+                        ComponentItem::Field(f) => Some(f.name.name.as_str()),
+                        ComponentItem::Hookable(h) => Some(h.name.name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let shadowed = file.items.iter().any(|it| {
+                    let Item::Test(t) = it else { return false };
+                    if t.for_testbench.as_ref().map(|i| i.name.as_str()) != Some(name) {
+                        return false;
+                    }
+                    t.items.iter().any(|ti| {
+                        matches!(ti, TestItem::Let(l) if shadow_targets.contains(l.name.name.as_str()))
+                    })
+                });
+                (!shadowed).then(|| name.to_string())
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut out = file.clone();
     for it in out.items.iter_mut() {
         let Item::Test(t) = it else { continue };
@@ -23889,6 +24410,11 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
             // resolves `_tb`'s type.
             continue;
         };
+        // #619 M4a sub-step 4: share THIS testbench's lifecycle only if the
+        // per-testbench decision above cleared it. Otherwise behave exactly
+        // like the historical inlining (no markers, no capture) — the
+        // conservative fallback.
+        let share_this_tb = share_lifecycle && shareable_testbenches.contains(&tb_ident.name);
 
         // Classify testbench fields.
         let mut dut_field: Option<ComponentField> = None;
@@ -24104,6 +24630,28 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
             );
         }
 
+        // #619 M4a: under `share_lifecycle`, stash each SHAREABLE bound
+        // testbench's now-rewritten (`_tb.<field>`) phase body so TB-IR
+        // lowering can lower it ONCE into a `TestbenchLifecycle` function.
+        // Keyed by source-testbench name + phase; the FIRST test to bind a
+        // given testbench wins (subsequent binds rewrite identically for a
+        // shareable testbench — shadowing tests force fallback, so they
+        // never reach here). Captured BEFORE the marker substitution below
+        // discards the bodies. Only the phases that get a marker are
+        // stashed. Skipped entirely for a non-shareable testbench.
+        if let Some(cap) = captured.as_deref_mut().filter(|_| share_this_tb) {
+            for (phase, body) in [
+                (LifecyclePhase::Setup, &tb_lifecycle.setup),
+                (LifecyclePhase::Check, &tb_lifecycle.check),
+                (LifecyclePhase::Teardown, &tb_lifecycle.teardown),
+            ] {
+                if let Some(b) = body {
+                    cap.entry((tb_ident.name.clone(), phase))
+                        .or_insert_with(|| b.clone());
+                }
+            }
+        }
+
         // Prepend synthesized lets. Order: `let dut : Top` (so the
         // Verilator-init path sees it as a top-level DUT pointer),
         // then `let _tb : TopTb`. Inserted at the head of items so
@@ -24186,21 +24734,34 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
                     .as_ref()
                     .map(|_| make_wire_dut_stmt(tb_ident.span));
 
+                // Under `share_lifecycle` (#619 M4a) each testbench
+                // lifecycle body is replaced by a single marker call,
+                // leaving the wire and impl-owned statements in place;
+                // otherwise the historical inlining substitutes the
+                // body verbatim.
+                let tb_phase = |body: &Option<Block>, phase: LifecyclePhase| -> Option<Block> {
+                    if share_this_tb {
+                        body.as_ref()
+                            .map(|_| tb_lifecycle_marker_block(phase, tb_ident.span))
+                    } else {
+                        body.clone()
+                    }
+                };
                 sc.setup = merge_lifecycle_blocks(
-                    tb_lifecycle.setup.clone(),
+                    tb_phase(&tb_lifecycle.setup, LifecyclePhase::Setup),
                     sc.setup.clone(),
                     wire_stmt,
                     tb_ident.span,
                 );
                 sc.check = merge_lifecycle_blocks(
-                    tb_lifecycle.check.clone(),
+                    tb_phase(&tb_lifecycle.check, LifecyclePhase::Check),
                     sc.check.clone(),
                     None,
                     tb_ident.span,
                 );
                 sc.teardown = merge_lifecycle_blocks(
                     sc.teardown.clone(),
-                    tb_lifecycle.teardown.clone(),
+                    tb_phase(&tb_lifecycle.teardown, LifecyclePhase::Teardown),
                     None,
                     tb_ident.span,
                 );
@@ -24217,8 +24778,22 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
             let wire_stmt = dut_field
                 .as_ref()
                 .map(|_| make_wire_dut_stmt(tb_ident.span));
-            let setup =
-                merge_lifecycle_blocks(tb_lifecycle.setup.clone(), None, wire_stmt, tb_ident.span);
+            // Under `share_lifecycle` (#619 M4a) each testbench lifecycle
+            // body becomes a marker call; see the scoped-branch comment.
+            let tb_phase = |body: &Option<Block>, phase: LifecyclePhase| -> Option<Block> {
+                if share_this_tb {
+                    body.as_ref()
+                        .map(|_| tb_lifecycle_marker_block(phase, tb_ident.span))
+                } else {
+                    body.clone()
+                }
+            };
+            let setup = merge_lifecycle_blocks(
+                tb_phase(&tb_lifecycle.setup, LifecyclePhase::Setup),
+                None,
+                wire_stmt,
+                tb_ident.span,
+            );
             let run_stmts = bare_run_stmts;
             t.items.push(TestItem::Scope(ScopeDecl {
                 name: Ident {
@@ -24230,8 +24805,8 @@ pub(crate) fn desugar_impl_for_test_in_file(file: &SourceFile) -> std::borrow::C
                     stmts: run_stmts,
                     span: tb_ident.span,
                 }),
-                check: tb_lifecycle.check.clone(),
-                teardown: tb_lifecycle.teardown.clone(),
+                check: tb_phase(&tb_lifecycle.check, LifecyclePhase::Check),
+                teardown: tb_phase(&tb_lifecycle.teardown, LifecyclePhase::Teardown),
                 span: tb_ident.span,
             }));
         }
@@ -26621,5 +27196,103 @@ mod time_literal_tests {
         assert_eq!(time_literal_to_ps("1_000ns"), Ok(1_000_000));
         assert_eq!(time_literal_to_ps("5ns"), Ok(5_000));
         assert!(time_literal_to_ps("5cycles").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tb_lifecycle_share_tests {
+    //! #619 M4a: the lifecycle-sharing desugar variant replaces each
+    //! bound testbench's lifecycle body with a marker call instead of
+    //! inlining it into every test, while the historical variant keeps
+    //! inlining. Lowering (next slice) turns the marker into a call to a
+    //! once-lowered `FunctionKind::TestbenchLifecycle` function.
+    use super::{desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle};
+    use crate::ast::LifecyclePhase;
+    use crate::ast::{Item, SourceFile, TestItem};
+    use crate::parser::parse_source;
+
+    const SRC: &str = r#"testbench CounterLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    function reset()
+        dut.rst = 1
+        wait 1 cycle
+        dut.rst = 0
+    end function reset
+
+    setup
+        reset()
+    end setup
+
+    check
+        assert dut.count_out == expected
+    end check
+end testbench CounterLifecycleTb
+
+impl LifecycleBumpThree for CounterLifecycleTb
+    run
+        dut.en = 1
+        wait 3 cycles
+        expected = 3
+    end run
+end impl LifecycleBumpThree
+"#;
+
+    fn setup_debug(file: &SourceFile, test_name: &str) -> String {
+        for it in &file.items {
+            if let Item::Test(t) = it {
+                if t.name.name == test_name {
+                    for ti in &t.items {
+                        if let TestItem::Scope(sc) = ti {
+                            return format!("{:?}", sc.setup);
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no scope setup for test {test_name}");
+    }
+
+    #[test]
+    fn sharing_desugar_replaces_tb_setup_with_marker() {
+        let file = parse_source(SRC).expect("parse");
+
+        // Historical inlining: the tb `setup` body (a `reset()` call) is
+        // spliced into the test; no marker appears.
+        let normal = desugar_impl_for_test_in_file(&file);
+        let normal_setup = setup_debug(&normal, "LifecycleBumpThree");
+        assert!(
+            !normal_setup.contains("__harc_tb_lifecycle_setup"),
+            "normal desugar must not emit a lifecycle marker"
+        );
+        assert!(
+            normal_setup.contains("reset"),
+            "normal desugar inlines the tb setup body (a `reset()` call)"
+        );
+
+        // Sharing variant: the tb `setup` body is replaced by the marker
+        // call; the body itself is NOT inlined into the test.
+        let (shared, captured) = desugar_impl_for_test_sharing_lifecycle(&file);
+        let shared_setup = setup_debug(&shared, "LifecycleBumpThree");
+        assert!(
+            shared_setup.contains("__harc_tb_lifecycle_setup"),
+            "sharing desugar leaves a lifecycle marker call in the test setup"
+        );
+        assert!(
+            !shared_setup.contains("reset"),
+            "sharing desugar must not inline the tb setup body into the test"
+        );
+
+        // The rewritten setup body is captured ONCE for the bound
+        // testbench, keyed by (testbench name, phase), for TB-IR lowering
+        // to lower into a single `TestbenchLifecycle` function (#619 M4a).
+        let setup_body = captured
+            .get(&("CounterLifecycleTb".to_string(), LifecyclePhase::Setup))
+            .expect("setup body captured for the bound testbench");
+        assert!(
+            format!("{setup_body:?}").contains("reset"),
+            "captured setup body is the rewritten `reset()` call, ready to lower once"
+        );
     }
 }

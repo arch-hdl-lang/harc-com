@@ -1,0 +1,49 @@
+// #619 M4a sub-step 4: a bound testbench whose lifecycle `setup`/`check`
+// are themselves SAFE, but which owns a helper `function` (`draw`) that
+// mints per-test side-table state — a `randomize` site. The conservative
+// UNION scan classifies the whole testbench UNSAFE to share (it scans every
+// method, not just those a phase calls), so under HARC_TBIR_NATIVE_LIFECYCLE
+// the lifecycle falls back to the historical per-test inlining (no
+// TestbenchLifecycle function is created) and the trace stays identical to
+// v1 under both codegens. Two impls bind it; each calls `draw()` from its
+// own `run`, so the randomize compiles in an ordinary run context.
+
+transaction Warmup
+    cycles : uint<8>
+    keep cycles in [1..3]
+end transaction Warmup
+
+testbench UnsafeShareTb
+    dut : Top
+
+    function draw() -> uint<8>
+        let w : Warmup
+        randomize(w)
+        return w.cycles
+    end function draw
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycle
+        dut.rst = 0
+    end setup
+end testbench UnsafeShareTb
+
+impl UnsafeShareA for UnsafeShareTb
+    run
+        let n = draw()
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+    end run
+end impl UnsafeShareA
+
+impl UnsafeShareB for UnsafeShareTb
+    run
+        let n = draw()
+        dut.en = 1
+        wait 4 cycles
+        dut.en = 0
+    end run
+end impl UnsafeShareB

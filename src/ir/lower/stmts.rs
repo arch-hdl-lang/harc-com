@@ -324,6 +324,40 @@ impl FuncBuilder<'_> {
                 if self.try_lower_record_write(e)? {
                     return Ok(());
                 }
+                // #619 M4a: a reserved `__harc_tb_lifecycle_<phase>()`
+                // marker call (emitted by the lifecycle-SHARING desugar
+                // under `HARC_TBIR_NATIVE_LIFECYCLE`). It lowers to a
+                // `Terminator::TbLifecycleCall` call edge to the once-
+                // lowered `TestbenchLifecycle` function for this phase —
+                // NOT a CFG-inline (that is the no-ownership pattern this
+                // replaces). The emitter re-inlines the callee body at the
+                // call site. Intercepted BEFORE the generic call handlers.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if let ExprKind::Ident(id) = &*callee.kind {
+                        if let Some(phase) =
+                            crate::codegen::cpp_tb::tb_lifecycle_marker_phase(&id.name)
+                        {
+                            if !args.is_empty() {
+                                return Err(LowerError::Invalid(format!(
+                                    "internal: lifecycle marker `{}` takes no arguments",
+                                    id.name
+                                )));
+                            }
+                            let function =
+                                *self.ctx.tb_lifecycle_fns.get(&phase).ok_or_else(|| {
+                                    LowerError::Invalid(format!(
+                                        "internal: no lowered TestbenchLifecycle function for \
+                                         marker `{}`",
+                                        id.name
+                                    ))
+                                })?;
+                            let cont = self.new_block();
+                            self.terminate(Terminator::TbLifecycleCall { function, succ: cont });
+                            self.start_block(cont);
+                            return Ok(());
+                        }
+                    }
+                }
                 // Testbench helper method call (`_tb.reset()`), CFG-
                 // inlined like an impure helper; statement position
                 // discards the (usually void) result.
