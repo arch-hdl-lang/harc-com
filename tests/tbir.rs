@@ -3758,6 +3758,161 @@ end impl VecQueueTargetTest
     );
 }
 
+/// Fixed vectors of records retain every array dimension and the record leaf
+/// in queue storage, inferred pop locals, and owner metadata.
+#[test]
+fn record_fixed_vector_queue_elements_lower_as_exact_aggregate_values() {
+    let src = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench RecordVecQueueTb
+    dut : Top
+    values : queue<Vec<Vec<Beat, 2>, 3>>
+end testbench RecordVecQueueTb
+
+impl RecordVecQueueTest for RecordVecQueueTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl RecordVecQueueTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("record-vector queue lowers");
+    verify::verify_program(&prog).expect("record-vector queue verifies");
+    let beat = prog
+        .records
+        .iter()
+        .position(|record| record.name == "Beat")
+        .map(|index| ir::RecordId(index as u32))
+        .expect("fixture has Beat record");
+    assert_eq!(
+        prog.testbenches[0].queue_fields[0].elem,
+        ir::QueueElem::FixedVec {
+            elem: Box::new(ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::Record(beat)),
+                len: 2,
+            }),
+            len: 3,
+        }
+    );
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("record-vector queue emits");
+    let aggregate = "std::array<std::array<Beat, 2>, 3>";
+    assert!(
+        cpp.contains(&format!("harc_rt::HarcQueue<{aggregate}> values;"))
+            && cpp.contains(&format!("{aggregate} observed{{}};")),
+        "queue storage and inferred pop local retain the nested record-vector type:\n{cpp}"
+    );
+    let v1 = cpp_tb::emit(&merged).expect("v1 emits the retirement control");
+    assert!(
+        v1.contains("harc_rt::HarcQueue<std::array<uint64_t, 3>> values;"),
+        "documented divergence: v1 silently loses the record leaf and inner dimension:\n{v1}"
+    );
+
+    let owners = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+scoreboard RecordVecQueueSb
+    values : queue<Vec<Beat, 4>>
+end scoreboard RecordVecQueueSb
+agent RecordVecQueueAgent
+    values : queue<Vec<Beat, 4>>
+end agent RecordVecQueueAgent
+testbench RecordVecQueueOwnersTb
+    dut : Top
+    sb : RecordVecQueueSb
+    ag : RecordVecQueueAgent
+end testbench RecordVecQueueOwnersTb
+impl RecordVecQueueOwnersTest for RecordVecQueueOwnersTb
+    run
+        assert sb.values.empty()
+        assert ag.values.size() == 0
+        wait 1 cycle
+    end run
+end impl RecordVecQueueOwnersTest
+"#;
+    let owners_prog = lower_src(owners).expect("component-owned record-vector queues lower");
+    verify::verify_program(&owners_prog).expect("component-owned record-vector queues verify");
+    let owners_cpp = tbir::emit(
+        &owners_prog,
+        &merged_src(owners),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("component-owned record-vector queues emit");
+    assert_eq!(
+        owners_cpp
+            .matches("harc_rt::HarcQueue<std::array<Beat, 4>> values;")
+            .count(),
+        2,
+        "scoreboard and agent retain record-vector queue storage:\n{owners_cpp}"
+    );
+
+    let target = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+bus RecordVecQueueBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RecordVecQueueBus
+transactor RecordVecQueueTarget bound to RecordVecQueueBus
+    values : queue<Vec<Beat, 4>>
+    thread bus.read(addr: uint<8>)
+        assert values.empty()
+        return addr
+    end thread
+end transactor RecordVecQueueTarget
+testbench RecordVecQueueTargetTb
+    dut : TlmReadInitiator
+end testbench RecordVecQueueTargetTb
+impl RecordVecQueueTargetTest for RecordVecQueueTargetTb
+    let mem : RecordVecQueueBus = bind dut
+    let target : RecordVecQueueTarget passive = bind mem
+    run
+        assert target.values.size() == 0
+        wait 1 cycle
+    end run
+end impl RecordVecQueueTargetTest
+"#;
+    let target_prog = lower_src(target).expect("target-state record-vector queue lowers");
+    verify::verify_program(&target_prog).expect("target-state record-vector queue verifies");
+    assert!(matches!(
+        target_prog.transactors[0].state_fields[0].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::FixedVec { .. }
+        }
+    ));
+
+    let mismatch = src.replace(
+        "let observed = values.pop()",
+        "let observed : Vec<Vec<uint<8>, 2>, 3> = values.pop()",
+    );
+    assert!(
+        lower_src(&mismatch).is_err(),
+        "a record-vector pop annotation must retain its record leaf type"
+    );
+
+    let mut broken = prog.clone();
+    let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0] else {
+        panic!("fixture state field is a queue");
+    };
+    field.elem = ir::QueueElem::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(99))),
+        len: 3,
+    };
+    let errors = verify::verify_program(&broken).expect_err("bad record-vector metadata rejects");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("invalid fixed-vector element schema")),
+        "verifier names the corrupt record-vector schema: {errors:?}"
+    );
+}
+
 /// A dynamic scalar list is a by-value queue element, retaining its exact
 /// nested `std::vector` storage and inferred pop-local type across owners.
 #[test]

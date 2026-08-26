@@ -603,6 +603,16 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
     }
 }
 
+fn queue_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
+    match ty {
+        IrType::Record(record) => record.index() < record_count,
+        IrType::FixedVec { elem, len } => {
+            *len != 0 && queue_fixed_vec_elem_valid(elem, record_count)
+        }
+        scalar => fixed_vec_elem_valid(scalar),
+    }
+}
+
 fn verify_queue_elem_schema(
     elem: &QueueElem,
     record_count: usize,
@@ -629,11 +639,11 @@ fn verify_queue_elem_schema(
             }
         }
         QueueElem::FixedVec { elem, len } => {
-            if *len == 0 || !fixed_vec_elem_valid(elem) {
+            if *len == 0 || !queue_fixed_vec_elem_valid(elem, record_count) {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "{what} has invalid fixed-vector element schema {elem:?} x {len}; \
-                         expected a nonempty vector with resolved scalar leaves"
+                         expected a nonempty vector with resolved scalar or record leaves"
                     ),
                 });
             }

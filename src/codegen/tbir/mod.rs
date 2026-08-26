@@ -2190,6 +2190,18 @@ pub(super) fn field_scalar_cty(ty: &ir::IrType) -> String {
     }
 }
 
+/// C++ value carrier for a queue aggregate whose recursive leaf may be a
+/// scalar or a declared record.
+pub(super) fn aggregate_value_cty(ty: &ir::IrType, records: &[ir::RecordSchema]) -> String {
+    match ty {
+        ir::IrType::Record(record) => records[record.index()].name.clone(),
+        ir::IrType::FixedVec { elem, len } => {
+            format!("std::array<{}, {len}>", aggregate_value_cty(elem, records))
+        }
+        scalar => field_scalar_cty(scalar),
+    }
+}
+
 /// C++ storage type for a loop-switch local / method param. Unsigned and
 /// unknown scalars ≤64 bits widen to `uint64_t`; a `sint` ≤64 bits is
 /// `int64_t`, matching v1's `c_type_for`, so signed division, modulo,

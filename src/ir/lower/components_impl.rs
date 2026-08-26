@@ -3034,7 +3034,7 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
 /// Resolve the `<T>` inside a `queue<T>` component-field element to its
 /// `QueueElem`. Mirrors `lower_event_payload`:
 ///   * a scalar (`uint<W>`/`sint<W>`/`bool`) → `Scalar { ty }`;
-///   * a fixed vector over scalar leaves → `FixedVec` (carried by value);
+///   * a fixed vector over scalar or record leaves → `FixedVec` (carried by value);
 ///   * a dynamic list over a scalar or record leaf → `List` (carried by value);
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value).
 ///
@@ -3057,7 +3057,7 @@ pub(crate) fn lower_queue_elem(
                 &format!("an enum queue element `{named}` on `{comp}.{fname}`"),
                 format!(
                     "lowered queue elements are scalars, declared transaction/struct records, \
-                     fully specified scalar fixed vectors, and scalar/record dynamic lists; v1 emits `{named}` as the \
+                     fully specified scalar/record fixed vectors, and scalar/record dynamic lists; v1 emits `{named}` as the \
                      `HarcQueue` element type and declares no C++ enum, so its output does not \
                      compile either"
                 ),
@@ -3067,7 +3067,7 @@ pub(crate) fn lower_queue_elem(
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
             "lowered queue elements are scalars, declared transaction/struct records, \
-             fully specified `Vec<scalar, N>` values (including nested scalar vectors), \
+             fully specified `Vec<scalar-or-record, N>` values (including nested vectors), \
              and `list<scalar-or-record>` values; \
              this element shape has no typed queue representation yet",
         )
@@ -3081,7 +3081,9 @@ pub(crate) fn lower_queue_elem(
                     return Ok(QueueElem::Record(*rid));
                 }
             }
-            if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
+            if let Some(IrType::FixedVec { elem, len }) =
+                queue_fixed_vec_elem_ir_type(ty, record_ids)
+            {
                 return Ok(QueueElem::FixedVec { elem, len });
             }
             if let Some(elem) = super::records::record_list_elem_ir_type(ty, record_ids) {
@@ -3107,14 +3109,14 @@ pub(crate) fn lower_queue_elem(
             Err(unsupported(
                 &format!("a non-identifier queue element on `{comp}.{fname}`"),
                 "use a scalar, declared transaction/struct record, fully specified \
-                 `Vec<scalar, N>`, or `list<scalar-or-record>` element type",
+                 `Vec<scalar-or-record, N>`, or `list<scalar-or-record>` element type",
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
         None => Err(unsupported(
             &format!("a `queue` with no element type on `{comp}.{fname}`"),
             "declare the element type: `queue<uint<W>>`, `queue<Record>`, \
-             `queue<Vec<scalar, N>>`, or `queue<list<scalar>>`",
+             `queue<Vec<scalar-or-record, N>>`, or `queue<list<scalar-or-record>>`",
         )),
     }
 }
@@ -3373,6 +3375,23 @@ fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// caller turns into the honest refusal. The inner length is parsed
 /// exactly as the outer one (nonzero decimal literal).
 pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
+    fixed_vec_elem_ir_type_with_records(t, &HashMap::new())
+}
+
+/// Queue fixed vectors additionally admit a declared-record leaf. Record IDs
+/// stay embedded through nested `Vec` layers so queue storage and pop locals
+/// can render the exact nested `std::array<Record, N>` carrier.
+pub(crate) fn queue_fixed_vec_elem_ir_type(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
+    fixed_vec_elem_ir_type_with_records(t, record_ids)
+}
+
+fn fixed_vec_elem_ir_type_with_records(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
         args,
@@ -3380,7 +3399,13 @@ pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
     } = t
     {
         let elem = match args.first() {
-            Some(TypeArg::Type(inner)) => fixed_vec_elem_ir_type(inner)?,
+            Some(TypeArg::Type(inner)) => fixed_vec_elem_ir_type_with_records(inner, record_ids)?,
+            Some(TypeArg::Expr(expr)) => {
+                let ExprKind::Ident(id) = &*expr.kind else {
+                    return None;
+                };
+                IrType::Record(*record_ids.get(&id.name)?)
+            }
             _ => return None,
         };
         let len = match args.get(1) {
@@ -3397,6 +3422,11 @@ pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
             elem: Box::new(elem),
             len,
         });
+    }
+    if let Some(name) = type_arg_simple_name(t) {
+        if let Some(record) = record_ids.get(name) {
+            return Some(IrType::Record(*record));
+        }
     }
     vec_elem_scalar_ir_type(t).filter(|ty| {
         matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)

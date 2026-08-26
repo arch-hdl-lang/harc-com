@@ -1705,7 +1705,8 @@ impl FuncBuilder<'_> {
             }
             crate::ir::QueueElem::FixedVec { .. } => {
                 let expected = elem.ir_type();
-                let declared = super::components::fixed_vec_elem_ir_type(ty);
+                let declared =
+                    super::components::queue_fixed_vec_elem_ir_type(ty, &self.ctx.record_ids);
                 if declared.as_ref() == Some(&expected) {
                     return Ok(());
                 }

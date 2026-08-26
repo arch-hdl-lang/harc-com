@@ -720,9 +720,10 @@ pub enum ScoreboardScalarDefault {
 }
 
 /// The element type of a `queue<T>` field: an exact scalar IR type, a
-/// scalar-leaf fixed vector, scalar/record dynamic list, or a value-record carried
-/// by struct. Shared by testbenches, scoreboards, composite components, and
-/// transactor state so every queue owner uses one storage descriptor.
+/// scalar/record-leaf fixed vector, scalar/record dynamic list, or a
+/// value-record carried by struct. Shared by testbenches, scoreboards,
+/// composite components, and transactor state so every queue owner uses one
+/// storage descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
     /// `queue<uint<256>>` / `queue<sint<65>>` / `queue<bool>` — the exact
@@ -730,9 +731,9 @@ pub enum QueueElem {
     /// the width-aware C++ storage mapping (`uint64_t`, `_harc_u128`, or
     /// `HarcWide<N>`).
     Scalar { ty: IrType },
-    /// `queue<Vec<uint<8>, 4>>` — a fixed-size aggregate carried by value.
-    /// The element schema is recursive, so nested scalar vectors retain
-    /// their exact `std::array` layout rather than flattening to a scalar.
+    /// `queue<Vec<uint<8>, 4>>` / `queue<Vec<Beat, 4>>` — a fixed-size
+    /// aggregate carried by value. The element schema is recursive, so nested
+    /// scalar or record vectors retain their exact `std::array` layout.
     FixedVec { elem: Box<IrType>, len: usize },
     /// `queue<list<uint<8>>>` / `queue<list<Beat>>` — a dynamic scalar or
     /// record list carried by value. The element remains exact so storage is
