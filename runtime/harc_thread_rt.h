@@ -1345,6 +1345,33 @@ inline WaitUntilTimeoutAwaiter wait_until_timeout(
     ThreadSlot* s, std::function<bool()> p, uint32_t n
 ) { return {std::move(p), s, n, /*ready_satisfied=*/false}; }
 
+// Awaiter: `co_await harc_lifecycle_yield()` (#619 M4b).
+//
+// Bounces the CURRENT coroutine back to the scheduler WITHOUT touching
+// its ThreadSlot's wait state. Used only by the parent-drives-child
+// pattern for an out-of-line SUSPENDING testbench-lifecycle coroutine:
+// the run coroutine calls the shared lifecycle coroutine's `.resume()`
+// directly, so an inner `co_await wait_cycles(_slot, N)` inside the
+// child sets the SHARED `_slot`'s wait state (WaitCycles/WaitUntil/…)
+// and returns control to the parent. The parent then `co_await`s this
+// awaiter to suspend ITSELF on that already-set slot state — leaving
+// `slot->kind`/`cycles_remaining`/`pred` exactly as the child wrote
+// them, and leaving `slot->thread` pointing at the parent (the run
+// coroutine the scheduler already owns). When the scheduler next marks
+// the slot Ready and resumes `slot->thread`, the parent wakes here and
+// re-drives the child. Net effect: the child's suspensions ARE the
+// parent's suspensions on one shared slot — trace-identical to the
+// M4a re-inline, which pasted the same `co_await wait_cycles(_slot, …)`
+// straight into the run coroutine. `await_ready` is always false so the
+// parent always parks once per child suspension (no lost cycle); it
+// touches no slot field so it cannot perturb the child's timing.
+struct HarcLifecycleYieldAwaiter {
+    bool await_ready() noexcept { return false; }
+    void await_suspend(std::coroutine_handle<>) noexcept {}
+    void await_resume() noexcept {}
+};
+inline HarcLifecycleYieldAwaiter harc_lifecycle_yield() { return {}; }
+
 // ─── Multi-OS-thread support (Phase 3a) ───────────────────────────────
 //
 // Atomic spin-wait barrier. ~10–30 ns per round-trip vs ~µs for

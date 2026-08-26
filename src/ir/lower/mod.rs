@@ -924,14 +924,29 @@ fn bind_rhs_ident(
     }
 }
 
-/// Experimental #619 M4a switch: when `HARC_TBIR_NATIVE_LIFECYCLE` is
-/// set in the environment, TB-IR lowering desugars impl-for tests with
-/// SHARED testbench lifecycle (marker calls lowered once to
-/// `FunctionKind::TestbenchLifecycle`) instead of the historical
-/// per-test inlining. OFF by default and WIP — see the call site in
-/// `lower_program` and docs/619-m4a-ir-ownership.md.
+/// #619 M4a sub-step 4 part 2: native out-of-line testbench-lifecycle
+/// lowering — impl-for tests with SHARED testbench lifecycle desugar to a
+/// once-per-testbench `FunctionKind::TestbenchLifecycle` (marker calls
+/// lowered to `Terminator::TbLifecycleCall`) instead of the historical
+/// per-test inlining. This is now the **default** for `--codegen tbir`,
+/// removing tbir's dependency on v1's lifecycle-copying desugar for the
+/// default path (the core #619 "Required IR Changes" goal).
+///
+/// A debug opt-OUT is retained for the transition (issue M8): set
+/// `HARC_TBIR_NATIVE_LIFECYCLE=0` to restore the historical inlining. Any
+/// other value (or unset) keeps native lowering on. Ineligible bodies
+/// (clock/method/time waits, side-table registrants, unshareable
+/// testbenches) still fall back to re-inline / historical inlining inside
+/// the native path — this switch only chooses the desugar, not the
+/// per-body emitter decision. See the call site in `lower_program`,
+/// docs/619-m4a-ir-ownership.md, and docs/619-m4b-outofline.md.
 fn native_lifecycle_enabled() -> bool {
-    std::env::var_os("HARC_TBIR_NATIVE_LIFECYCLE").is_some()
+    // Default ON (unset). Explicit `=0` is the debug opt-out; any other
+    // value (including non-UTF8) keeps native lowering on.
+    match std::env::var_os("HARC_TBIR_NATIVE_LIFECYCLE") {
+        Some(v) => v.to_str() != Some("0"),
+        None => true,
+    }
 }
 
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
@@ -953,14 +968,16 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // same classic-form AST (synthesized `let dut` / `let _tb`, merged
     // lifecycle blocks, `_tb.<field>` rewrites).
     //
-    // #619 M4a (WIP): under the experimental `HARC_TBIR_NATIVE_LIFECYCLE`
-    // switch, use the lifecycle-SHARING desugaring instead — it leaves a
+    // #619 M4a/M4b: by DEFAULT (unless `HARC_TBIR_NATIVE_LIFECYCLE=0`),
+    // use the lifecycle-SHARING desugaring — it leaves a
     // `__harc_tb_lifecycle_<phase>()` marker call where each testbench
-    // lifecycle body would have been inlined, so lowering can lower the
-    // body once and call it. The marker→`TestbenchLifecycle` lowering
-    // lands in the next slice; until then the switch is incomplete and
-    // OFF by default (no test sets the env var). See
-    // docs/619-m4a-ir-ownership.md.
+    // lifecycle body would have been inlined, so lowering lowers the body
+    // once (`FunctionKind::TestbenchLifecycle`) and calls it
+    // (`Terminator::TbLifecycleCall`). The emitter then emits eligible
+    // bodies out of line (once) and re-inlines the rest. Set
+    // `HARC_TBIR_NATIVE_LIFECYCLE=0` to restore the historical per-test
+    // inlining during the transition. See docs/619-m4a-ir-ownership.md and
+    // docs/619-m4b-outofline.md.
     // #619 M4a: `shared_lifecycle_bodies` is the per-testbench rewritten
     // phase bodies captured by the sharing desugar, for the once-per-
     // testbench `TestbenchLifecycle` lowering below. Empty when the switch

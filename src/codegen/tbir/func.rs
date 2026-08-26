@@ -238,6 +238,14 @@ pub(super) fn emit_function(
     dut_type: &str,
     predeclared: &HashSet<LocalId>,
     depth: usize,
+    // #619 M4b: `TestbenchLifecycle` FunctionIds emitted OUT-OF-LINE for
+    // THIS emission, each mapped to its variant. A `TbLifecycleCall` whose
+    // target is `Plain` lowers to a real `void` call; `Coro` lowers to the
+    // parent-drives-child coroutine drive loop; a target ABSENT from the map
+    // keeps the M4a re-inline. Empty on paths that do not emit the
+    // out-of-line definitions (split/separate shards), which therefore
+    // preserve the M4a re-inline unchanged.
+    outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
 ) -> Result<(), EmitError> {
     let mut names = cpp_local_names(func);
     for local in predeclared {
@@ -372,18 +380,72 @@ pub(super) fn emit_function(
                     matches!(callee.kind, crate::ir::FunctionKind::TestbenchLifecycle { .. }),
                     "TbLifecycleCall must target a TestbenchLifecycle function"
                 );
-                emit_function(
-                    out,
-                    prog,
-                    callee,
-                    records,
-                    bindings,
-                    lanes,
-                    randomize_snippets,
-                    dut_type,
-                    &HashSet::new(),
-                    depth + 3,
-                )?;
+                match outofline_lifecycle.get(function).copied() {
+                    Some(LifecycleEmit::Plain) => {
+                        // #619 M4b: the non-suspending callee is emitted once
+                        // as a file-scope `void` function; lower the call edge
+                        // to a real call. `ctx` and `_tb` are in scope at every
+                        // call site (the run coroutine captures both), so the
+                        // shared body reaches all its runtime state through the
+                        // two params — the de-duplication #619 is about.
+                        writeln!(out, "{pad3}{}(ctx, _tb);", lifecycle_cpp_name(&callee.name))
+                            .ok();
+                    }
+                    Some(LifecycleEmit::Coro) => {
+                        // #619 M4b: the SUSPENDING callee is emitted once as a
+                        // file-scope `harc_rt::HarcThread` coroutine taking the
+                        // caller's own `_slot`. The run coroutine drives it
+                        // directly: `.resume()` runs it to its next `co_await
+                        // wait_*(_slot, …)` (which parks the SHARED `_slot`),
+                        // then the parent `co_await`s `harc_lifecycle_yield()`
+                        // to suspend ITSELF on that already-set slot state
+                        // (leaving `slot->thread` = this run coroutine). When
+                        // the scheduler resumes the slot, the parent wakes and
+                        // re-drives the child. The child's suspensions ARE the
+                        // parent's suspensions on one slot — trace-identical to
+                        // the M4a re-inline that pasted the same `co_await
+                        // wait_*(_slot, …)` into the run coroutine. See
+                        // `emit_lifecycle_coroutine` and the runtime awaiter.
+                        writeln!(
+                            out,
+                            "{pad3}{{ auto _lc_sub = {}(ctx, _tb, _slot); _lc_sub.resume();",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
+                        writeln!(
+                            out,
+                            "{pad3}{INDENT}while (!_lc_sub.done()) {{ co_await \
+                             harc_rt::harc_lifecycle_yield(); _lc_sub.resume(); }}"
+                        )
+                        .ok();
+                        writeln!(out, "{pad3}{INDENT}_lc_sub.destroy(); }}").ok();
+                    }
+                    None => {
+                        // M4a fallback: re-inline the once-lowered body here.
+                        // The callee is emitted as its OWN self-contained
+                        // loop-switch block (its `Return` sets its own
+                        // `__done`, exiting only the nested loop); any `wait`
+                        // inside it suspends this same run/check coroutine.
+                        // Local names are block-scoped to the nested `{ }`, so
+                        // they cannot collide with the caller's. Reproduces the
+                        // exact statement ORDER the historical per-test
+                        // lifecycle inlining produced. See
+                        // docs/619-m4a-ir-ownership.md.
+                        emit_function(
+                            out,
+                            prog,
+                            callee,
+                            records,
+                            bindings,
+                            lanes,
+                            randomize_snippets,
+                            dut_type,
+                            &HashSet::new(),
+                            depth + 3,
+                            outofline_lifecycle,
+                        )?;
+                    }
+                }
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::Fatal(args) => {
@@ -460,6 +522,275 @@ pub(super) fn emit_function(
     writeln!(out, "{pad2}}}").ok();
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad}}}").ok();
+    Ok(())
+}
+
+/// C++ name of an out-of-line `TestbenchLifecycle` function (#619 M4b).
+/// The IR name is already unique per (testbench, phase)
+/// (`__tb_lifecycle_<tb>_<Phase>`); prefix it to keep the file-scope
+/// symbol namespace obvious and to avoid colliding with user helpers.
+pub(super) fn lifecycle_cpp_name(name: &str) -> String {
+    format!("_harc_lc{name}")
+}
+
+/// #619 M4b: how an out-of-line reusable-lifecycle body is emitted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LifecycleEmit {
+    /// Non-suspending body → a plain `static void f(HarcTestContext&,
+    /// <Tb>&)` called directly at the site.
+    Plain,
+    /// Suspending body → a `harc_rt::HarcThread f(HarcTestContext&, <Tb>&,
+    /// ThreadSlot*)` coroutine driven by the run coroutine via the
+    /// parent-drives-child loop (see the `TbLifecycleCall` arm).
+    Coro,
+}
+
+/// #619 M4b: how (or whether) a `TestbenchLifecycle` body can be emitted
+/// OUT-OF-LINE rather than re-inlined per the M4a fallback.
+///
+/// Returns `Some(Plain)` for a NON-suspending body (a `void` function the
+/// run coroutine calls), `Some(Coro)` for a SUSPENDING body whose only
+/// coroutine needs are the `_slot`-parking awaiters (`wait N cycles`
+/// without a named clock, `wait until`, `wait until … timeout`), and
+/// `None` when the body must stay re-inlined.
+///
+/// A body is shareable at all only when EVERY statement is in the
+/// whitelist (`stmt_out_of_line_safe`) — value/DUT/`_tb`/log/assert forms
+/// whose emission reaches only names the out-of-line prologue reconstructs
+/// from `HarcTestContext& ctx` + `<Tb>& _tb` (plus the file-scope
+/// `harc_rng`). That whitelist deliberately EXCLUDES the statements that
+/// register a `[&]`-capturing closure into the per-test `_checkers` /
+/// service lists (concurrent `cover`/property/`on`-handlers): a coroutine
+/// or function frame that returns would leave those captures dangling
+/// (same limitation as M4a), and it excludes `TransactorCall` (its
+/// internal waits reach the frame-local `tick`).
+///
+/// Terminators then decide Plain vs Coro vs re-inline:
+///   * `Jump`/`Branch`/`Return`/`Randomize` — pure control flow / an
+///     `harc_rng`-global Z3 solve; neither suspends nor reaches the frame.
+///   * `WaitCycles(None)`/`WaitUntil`/`WaitUntilTimeout` — suspend on the
+///     shared `_slot` only → force the `Coro` variant.
+///   * `WaitCycles(Some(clock))` (`wait N cycles on <clk>`),
+///     `WaitCyclesSync` (`tick()` loop), `WaitTimePs` (`after <dur>`),
+///     `TbLifecycleCall`, `Fatal` — reach coroutine-frame-locals
+///     (`clocks_`/`eval_clocks_until`/`tick`/`now_ps`) or are otherwise
+///     unsupported here → the whole body stays re-inlined (conservative;
+///     never emit a call that would reference an unreachable name).
+pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmit> {
+    let mut suspends = false;
+    for b in &func.blocks {
+        if !b.stmts.iter().all(stmt_out_of_line_safe) {
+            return None;
+        }
+        match &b.terminator {
+            Terminator::Jump(_)
+            | Terminator::Branch(..)
+            | Terminator::Return
+            | Terminator::Randomize { .. } => {}
+            Terminator::WaitCycles(_, None, _)
+            | Terminator::WaitUntil { .. }
+            | Terminator::WaitUntilTimeout { .. } => suspends = true,
+            // Frame-local-reaching or unsupported → keep re-inlined.
+            Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitCyclesSync(..)
+            | Terminator::WaitTimePs(..)
+            | Terminator::TbLifecycleCall { .. }
+            | Terminator::Fatal(_) => return None,
+        }
+    }
+    Some(if suspends {
+        LifecycleEmit::Coro
+    } else {
+        LifecycleEmit::Plain
+    })
+}
+
+/// Whitelist of `Stmt` kinds whose emission touches only `ctx`-reachable
+/// state, `_tb`, the DUT, file-scope `harc_rng`, and reconstructed log
+/// lambdas — i.e. nothing captured from the run coroutine's frame. See
+/// `lifecycle_shareable_kind`.
+fn stmt_out_of_line_safe(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Assign(..)
+            | Stmt::DutWrite(..)
+            | Stmt::DutRead(..)
+            | Stmt::ProbeRelease(..)
+            | Stmt::RecordInit(..)
+            | Stmt::RecordFieldWrite { .. }
+            | Stmt::TbFieldWrite { .. }
+            | Stmt::TbFieldVecElementWrite { .. }
+            | Stmt::TbQueuePush { .. }
+            | Stmt::TbQueuePop { .. }
+            | Stmt::Log { .. }
+            | Stmt::AssertCheck { .. }
+            | Stmt::AssumeCheck { .. }
+    )
+}
+
+/// #619 M4b: reconstruct, at the top of an out-of-line lifecycle
+/// function/coroutine body, the ambient names the re-inlined body reads
+/// from the run coroutine's frame. All are `HarcTestContext` members (M3
+/// seam) or the file-scope `harc_rng`, so an out-of-line body reaches them
+/// through the `ctx` param: `dut`/`errors`/`_fatal`/`cycle_count`/`trace`/
+/// `log_ctx`/`_checkers` alias the matching members, and `sim_log_line` /
+/// `sim_logf_line` are rebuilt as local lambdas over those aliases (they
+/// are coroutine-locals in the inline form, not context members). Shared
+/// by the `Plain` and `Coro` emitters so both see an identical name
+/// environment (and therefore emit identical body text).
+fn emit_lifecycle_ambient_prologue(out: &mut String) {
+    out.push_str(
+        "    (void)_tb;\n\
+         \x20   auto* dut = ctx.dut; (void)dut;\n\
+         #if HARC_TRACE_ENABLED\n\
+             auto* tfp = ctx.tfp; (void)tfp;\n\
+         #endif\n\
+         \x20   auto& _trace_time = ctx._trace_time; (void)_trace_time;\n\
+         \x20   auto& errors = ctx.errors; (void)errors;\n\
+         \x20   auto& _fatal = ctx._fatal; (void)_fatal;\n\
+         \x20   auto& cycle_count = ctx.cycle_count; (void)cycle_count;\n\
+         \x20   auto& trace = ctx.trace; (void)trace;\n\
+         \x20   auto& log_ctx = ctx.log_ctx; (void)log_ctx;\n\
+         \x20   auto& _checkers = ctx._checkers; (void)_checkers;\n\
+         \x20   auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {\n\
+         \x20       HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);\n\
+         \x20   }; (void)sim_logf_line;\n\
+         \x20   auto sim_log_line = [&](const char* sev, const char* fmt, ...) {\n\
+         \x20       HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);\n\
+         \x20   }; (void)sim_log_line;\n",
+    );
+}
+
+/// #619 M4b: C++ signature (no trailing brace/semicolon) for a Plain
+/// (non-suspending) out-of-line lifecycle function. `static_linkage` picks
+/// internal (`static void …`, monolithic single-TU) vs external (`void …`,
+/// the split/common layout where a shard in another TU must call it).
+fn lifecycle_plain_sig(func: &TbFunction, tb_name: &str, static_linkage: bool) -> String {
+    format!(
+        "{}void {}(HarcTestContext& ctx, {tb_name}& _tb)",
+        if static_linkage { "static " } else { "" },
+        lifecycle_cpp_name(&func.name)
+    )
+}
+
+/// #619 M4b: C++ signature (no trailing brace/semicolon) for a Coro
+/// (suspending) out-of-line lifecycle coroutine. Always external linkage —
+/// the monolithic single-TU def and the split/common def are identical, and
+/// only the split path additionally declares a prototype in the header.
+fn lifecycle_coro_sig(func: &TbFunction, tb_name: &str) -> String {
+    format!(
+        "harc_rt::HarcThread {}(HarcTestContext& ctx, {tb_name}& _tb, harc_rt::ThreadSlot* _slot)",
+        lifecycle_cpp_name(&func.name)
+    )
+}
+
+/// #619 M4b (split/common layout): emit a forward declaration for a shared
+/// out-of-line lifecycle function into the interface header, so a shard in
+/// another translation unit can call the definition that lives in the
+/// common `.cpp`. Plain functions are declared with EXTERNAL linkage (no
+/// `static`), matching their common-source definition.
+pub(super) fn emit_lifecycle_prototype(
+    out: &mut String,
+    func: &TbFunction,
+    tb_name: &str,
+    kind: LifecycleEmit,
+) {
+    match kind {
+        LifecycleEmit::Plain => {
+            writeln!(out, "{};", lifecycle_plain_sig(func, tb_name, false)).ok();
+        }
+        LifecycleEmit::Coro => {
+            writeln!(out, "{};", lifecycle_coro_sig(func, tb_name)).ok();
+        }
+    }
+}
+
+/// #619 M4b: emit one NON-suspending `TestbenchLifecycle` body as a
+/// file-scope function, ONCE per (testbench, phase). The run coroutine's
+/// `TbLifecycleCall` lowers to `<name>(ctx, _tb)` (see the `TbLifecycleCall`
+/// arm), so the shared body compiles once per suite instead of being
+/// re-inlined once per test — the de-duplication #619 is about. Only bodies
+/// classified `LifecycleEmit::Plain` reach here, so no `_slot`/`tick`/
+/// scheduler name is ever referenced. `static_linkage` is `true` for the
+/// monolithic single-TU emission (`static void`) and `false` for the
+/// split/common layout (`void`, callable from a shard TU via the header
+/// prototype).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_lifecycle_function(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    tb_name: &str,
+    records: &[RecordSchema],
+    bindings: &[BusBindingSchema],
+    lanes: &HashMap<String, u32>,
+    randomize_snippets: &[String],
+    dut_type: &str,
+    static_linkage: bool,
+    outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
+) -> Result<(), EmitError> {
+    writeln!(out, "{} {{", lifecycle_plain_sig(func, tb_name, static_linkage)).ok();
+    emit_lifecycle_ambient_prologue(out);
+    emit_function(
+        out,
+        prog,
+        func,
+        records,
+        bindings,
+        lanes,
+        randomize_snippets,
+        dut_type,
+        &HashSet::new(),
+        1,
+        outofline_lifecycle,
+    )?;
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+    Ok(())
+}
+
+/// #619 M4b: emit one SUSPENDING `TestbenchLifecycle` body as a file-scope
+/// `harc_rt::HarcThread` coroutine taking the caller's own `_slot`, ONCE
+/// per (testbench, phase). Its `co_await wait_*(_slot, …)` awaiters park
+/// the SHARED `_slot` exactly as the M4a re-inline did; the run coroutine
+/// drives it via the parent-drives-child loop emitted at the
+/// `TbLifecycleCall` site. Only bodies classified `LifecycleEmit::Coro`
+/// reach here, so the only coroutine construct the body needs is `_slot`
+/// (no `tick`/`eval_clocks_until`/`now_ps`/`clocks_`). An explicit
+/// `co_return;` after the loop-switch makes the body unambiguously a
+/// coroutine even when its only awaits are on branches not taken.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_lifecycle_coroutine(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    tb_name: &str,
+    records: &[RecordSchema],
+    bindings: &[BusBindingSchema],
+    lanes: &HashMap<String, u32>,
+    randomize_snippets: &[String],
+    dut_type: &str,
+    outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
+) -> Result<(), EmitError> {
+    writeln!(out, "{} {{", lifecycle_coro_sig(func, tb_name)).ok();
+    writeln!(out, "{INDENT}(void)_slot;").ok();
+    emit_lifecycle_ambient_prologue(out);
+    emit_function(
+        out,
+        prog,
+        func,
+        records,
+        bindings,
+        lanes,
+        randomize_snippets,
+        dut_type,
+        &HashSet::new(),
+        1,
+        outofline_lifecycle,
+    )?;
+    writeln!(out, "{INDENT}co_return;").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
     Ok(())
 }
 
