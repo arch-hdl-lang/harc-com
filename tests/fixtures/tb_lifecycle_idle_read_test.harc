@@ -1,0 +1,57 @@
+// #619 M4 A3 (exhaustive follow-up): a reusable testbench whose SHARED
+// `check` reads an AGENT heartbeat-idle predicate (`tagger.idle_in(2)`).
+//
+// `idle_in` lowers to `Expr::ComponentIdle { base: Path(["tagger"]), .. }`,
+// emitted as a BARE `tagger._last_in_cycle` run-coroutine frame local
+// (`codegen/tbir/expr.rs`). The first A3 fix rejected `Component*` field reads
+// but NOT `ComponentIdle`, so an out-of-line shared check still referenced an
+// undeclared `tagger` — the SAME `use of undeclared identifier` miscompile,
+// under the default. ShareScan mints the shared lifecycle (no randomize side
+// table), so the out-of-line classifier is the sole gate: the exhaustive
+// `expr_reaches_frame_local` must reject the `ComponentIdle` read and keep the
+// check RE-INLINED.
+//
+// Expected: BOTH codegens build + run + trace-diff clean; the shared check
+// falls back to re-inline. Bound by two impls.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent Tagger
+    in_ev : event<uint<8>>
+    seen  : uint<32> default 0
+
+    on in_ev(t)
+        seen = seen + 1
+    end on
+end agent Tagger
+
+testbench IdleLifecycleTb
+    dut    : Top
+    tagger : Tagger
+
+    // Shared check reads the agent heartbeat-idle predicate. The fail message
+    // is deliberately CONSTANT — an interpolated `${tagger.seen}` would be a
+    // frame-local read the first (non-exhaustive) fix ALREADY caught, masking
+    // the `ComponentIdle` gap this fixture isolates.
+    check
+        assert tagger.idle_in(2)
+            else fail("agent not idle at check")
+    end check
+end testbench IdleLifecycleTb
+
+impl IdleLcA for IdleLifecycleTb
+    run
+        emit tagger.in_ev(1)
+        wait 5 cycles
+    end run
+end impl IdleLcA
+
+impl IdleLcB for IdleLifecycleTb
+    run
+        emit tagger.in_ev(1)
+        emit tagger.in_ev(2)
+        wait 5 cycles
+    end run
+end impl IdleLcB

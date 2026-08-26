@@ -1,0 +1,67 @@
+// #619 M4 A3 (exhaustive follow-up): a reusable testbench whose SHARED
+// `check` reads a testbench-owned SCOREBOARD field WRAPPED in a width-cast
+// (`(direct.count as uint<8>)`).
+//
+// The frame-local scoreboard read (`ScoreboardQuery{nested_path: Some}`,
+// bare `direct.count`) is nested under an `Expr::WidthCast`. The first A3 fix
+// rejected a top-level scoreboard read but did NOT descend into `WidthCast`
+// (its match ended in `_ => false`), so a cast- or bit-slice-wrapped read
+// slipped through and the shared out-of-line check again referenced an
+// undeclared `direct`. The exhaustive `expr_reaches_frame_local` now recurses
+// into EVERY sub-expression position, so the wrapped read is caught and the
+// check RE-INLINES.
+//
+// Expected: BOTH codegens build + run + trace-diff clean; the shared check
+// falls back to re-inline. Bound by two impls.
+
+transactor TbSource
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor TbSource
+
+scoreboard TbSink
+    count : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+    end accept
+end scoreboard TbSink
+
+testbench CastLifecycleTb
+    dut      : Top
+    source   : TbSource passive
+    direct   : TbSink
+    expected : uint<8> default 0
+
+    connect
+        source.observed -> direct.accept
+    end connect
+
+    // Shared check reads the owned scoreboard field through a width-cast. The
+    // fail message is deliberately CONSTANT: an interpolated `${direct.count}`
+    // would be a top-level frame-local read the first fix ALREADY caught,
+    // masking the WidthCast-nesting gap this fixture isolates. `expected` is a
+    // testbench scalar field (`_tb.expected`) and is safe.
+    check
+        assert (direct.count as uint<8>) == expected
+            else fail("cast check failed")
+    end check
+end testbench CastLifecycleTb
+
+impl CastLcOne for CastLifecycleTb
+    run
+        source.publish(1)
+        expected = 1
+    end run
+end impl CastLcOne
+
+impl CastLcTwo for CastLifecycleTb
+    run
+        source.publish(1)
+        source.publish(2)
+        expected = 2
+    end run
+end impl CastLcTwo
