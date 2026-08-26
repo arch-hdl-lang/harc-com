@@ -1,0 +1,45 @@
+// #619 M4b (suspending slice): a reusable testbench whose `setup`
+// SUSPENDS over plain `wait N cycles` (no named clock, no randomize).
+// Under HARC_TBIR_NATIVE_LIFECYCLE the shared `setup` is emitted ONCE as
+// a harc_rt::HarcThread coroutine driven by the run coroutine via the
+// parent-drives-child loop; v1 inlines it per test. The v1==tbir
+// trace-diff proves first-resume timing and per-cycle event order match
+// across the coroutine boundary. Bound by two impls.
+
+testbench WaitSetupTb
+    dut : Top
+    expected : uint<32> default 0
+
+    // Suspending setup (Coro variant): drive reset across three cycles.
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 3 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end setup
+
+    // Non-suspending check (Plain variant).
+    check
+        assert dut.count_out == expected
+            else fail("wait-setup check: count=${dut.count_out} exp=${expected}")
+    end check
+end testbench WaitSetupTb
+
+impl WaitSetupSix for WaitSetupTb
+    run
+        dut.en = 1
+        wait 6 cycles
+        dut.en = 0
+        expected = 6
+    end run
+end impl WaitSetupSix
+
+impl WaitSetupTwo for WaitSetupTb
+    run
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+        expected = 2
+    end run
+end impl WaitSetupTwo

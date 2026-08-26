@@ -1,0 +1,64 @@
+// #619 M4b review defect #1 (frame-local CALL in a shared lifecycle):
+// a reusable testbench whose `setup` materializes a `tseq` generator
+// (`let txns = Gen(3)`). A tseq call lowers to
+// `Stmt::Assign(dest, Expr::Call(CallTarget::Tseq, ..))` and is emitted
+// as a `[&]`-captured run-coroutine lambda — a frame-local an out-of-line
+// lifecycle function/coroutine cannot reach. `ShareScan` still mints a
+// shared `TestbenchLifecycle` for this setup (the randomize lives inside
+// the tseq body, not directly in a testbench method), so the OUT-OF-LINE
+// classifier must be the thing that keeps it re-inlined: without the
+// `stmt_out_of_line_safe` rvalue-scan fix the emitter would put a
+// reference to the `Gen` lambda inside a file-scope function and the C++
+// would fail to compile ("use of undeclared identifier 'Gen'").
+//
+// Expected: BOTH codegens build + run + trace-diff clean; the shared
+// setup falls back to re-inline (zero out-of-line `_harc_lc` symbols).
+// Bound by two impls so the shared setup has two call sites.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transaction Req
+    len : uint<8>
+    keep len in [1..16]
+end transaction Req
+
+tseq Gen(n: int) -> TSeq<Req>
+    for _ in 1 .. n
+        let t : Req
+        randomize(t)
+        yield t
+    end for
+end tseq Gen
+
+testbench TseqLcTb
+    dut : Top
+    total : uint<32> default 0
+
+    // Non-suspending setup that CALLS a tseq — the frame-local-call case.
+    setup
+        let txns = Gen(3)
+        for t in txns
+            total = total + t.len
+        end for
+    end setup
+
+    check
+        assert total >= 3
+            else fail("expected total>=3 from three len>=1 items, got ${total}")
+        log(info, "tseq-in-lifecycle fell back and ran, total=${total}")
+    end check
+end testbench TseqLcTb
+
+impl TseqLcA for TseqLcTb
+    run
+        dut.en = 0
+    end run
+end impl TseqLcA
+
+impl TseqLcB for TseqLcTb
+    run
+        dut.en = 0
+    end run
+end impl TseqLcB

@@ -1,0 +1,61 @@
+// #619 M4b (suspending slice): a reusable testbench whose `setup` both
+// SUSPENDS (`wait`) AND draws from the RNG (`randomize`) — the randomize
+// sits BETWEEN two waits, i.e. AFTER a coroutine suspension. Under
+// HARC_TBIR_NATIVE_LIFECYCLE the shared `setup` is emitted ONCE as a
+// harc_rt::HarcThread coroutine the run coroutine drives; v1 inlines it
+// per test. The v1==tbir trace-diff proves RNG draw order is preserved
+// across the suspension/coroutine boundary — the #1 M4b risk. Bound by
+// two impls so both call sites drive the same shared coroutine.
+
+struct DelayCfg
+    cycles : uint<4>
+    keep cycles >= 1
+    keep cycles <= 3
+end struct DelayCfg
+
+testbench RandDelayTb
+    dut : Top
+    delay : uint<4> default 0
+    total : uint<32> default 0
+
+    // Suspending setup with a randomize AFTER the first wait: draw a
+    // random delay into a persisted testbench field.
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        let c : DelayCfg
+        randomize(c)
+        delay = c.cycles
+        wait 1 cycle
+    end setup
+
+    // Non-suspending check (Plain variant): assert + log.
+    check
+        assert dut.count_out == total
+            else fail("rand-delay check: count=${dut.count_out} total=${total}")
+        log(info, "rand-delay check ok total=${total}")
+    end check
+end testbench RandDelayTb
+
+impl RandDelayUseSetup for RandDelayTb
+    run
+        dut.en = 1
+        wait delay cycles
+        dut.en = 0
+        total = delay
+    end run
+end impl RandDelayUseSetup
+
+impl RandDelayReroll for RandDelayTb
+    run
+        let rc : DelayCfg
+        randomize(rc)
+        delay = rc.cycles
+        dut.en = 1
+        wait delay cycles
+        dut.en = 0
+        total = delay
+    end run
+end impl RandDelayReroll

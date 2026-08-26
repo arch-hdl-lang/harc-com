@@ -33,13 +33,14 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Run `f` with the native-lifecycle switch forced on/off, serialized
 /// against every other env-touching test and always clearing the variable
 /// afterward (panics are re-raised after cleanup).
+///
+/// #619 M4a sub-step 4 part 2: native lifecycle lowering is now the DEFAULT
+/// (unset ⇒ ON), so forcing it OFF requires the explicit `=0` opt-out — not
+/// merely clearing the variable, which would leave the default (ON) in
+/// place. The `on` case still sets `=1` (any non-"0" value enables).
 fn with_switch<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if on {
-        std::env::set_var(SWITCH, "1");
-    } else {
-        std::env::remove_var(SWITCH);
-    }
+    std::env::set_var(SWITCH, if on { "1" } else { "0" });
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::env::remove_var(SWITCH);
     match r {
@@ -279,4 +280,288 @@ fn method_name_shadowing_testbench_falls_back() {
         !any_lifecycle_call(&prog),
         "a method-name-shadowed testbench must fall back to inlining — no TbLifecycleCall"
     );
+}
+
+/// Count non-overlapping occurrences of `needle` in `hay`.
+fn count_occurrences(hay: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    let mut i = 0;
+    while let Some(pos) = hay[i..].find(needle) {
+        n += 1;
+        i += pos + needle.len();
+    }
+    n
+}
+
+#[test]
+fn m4b_suspending_setup_emitted_once_as_coroutine() {
+    // #619 M4b (suspending slice): a bound testbench whose `setup` waits
+    // DIRECTLY in the lifecycle body (`wait N cycles` → coroutine
+    // WaitCycles, not the method-call WaitCyclesSync) is emitted OUT-OF-LINE
+    // exactly ONCE as a `harc_rt::HarcThread` coroutine, and each binding
+    // test drives it via the parent-drives-child loop
+    // (`co_await harc_rt::harc_lifecycle_yield()`). The non-suspending
+    // `check` is emitted once as a plain `void` function. Two impls bind it.
+    let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+
+    // The suspending setup coroutine is DEFINED exactly once, out of line.
+    let coro_def = "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(";
+    assert_eq!(
+        count_occurrences(&cpp, coro_def),
+        1,
+        "suspending setup must be emitted exactly once as a HarcThread coroutine"
+    );
+    // Its signature threads the caller's own slot through.
+    assert!(
+        cpp.contains(
+            "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(HarcTestContext& ctx, \
+             WaitSetupTb& _tb, harc_rt::ThreadSlot* _slot)"
+        ),
+        "the out-of-line lifecycle coroutine takes (ctx, _tb, _slot)"
+    );
+
+    // The non-suspending check is a plain void function, once.
+    assert_eq!(
+        count_occurrences(&cpp, "static void _harc_lc__tb_lifecycle_WaitSetupTb_Check("),
+        1,
+        "non-suspending check must be emitted exactly once as a plain void function"
+    );
+
+    // Two binding tests each drive the shared setup coroutine via the
+    // parent-drives-child loop (start, yield-loop, destroy).
+    assert_eq!(
+        count_occurrences(
+            &cpp,
+            "auto _lc_sub = _harc_lc__tb_lifecycle_WaitSetupTb_Setup(ctx, _tb, _slot); _lc_sub.resume();"
+        ),
+        2,
+        "both impls' run coroutines drive the shared setup coroutine"
+    );
+    assert_eq!(
+        count_occurrences(&cpp, "co_await harc_rt::harc_lifecycle_yield();"),
+        2,
+        "each drive loop yields to the scheduler while re-driving the child"
+    );
+    // Two call sites also invoke the shared check (plain call).
+    assert_eq!(
+        count_occurrences(&cpp, "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _tb);"),
+        2,
+        "both impls' check coroutines call the shared check function"
+    );
+}
+
+#[test]
+fn m4b_randomize_in_suspending_lifecycle_falls_back() {
+    // #619 M4b: a suspending lifecycle that ALSO randomizes. The M4a
+    // sharing desugar marks a randomize-bearing testbench UNSAFE to share,
+    // so NO TestbenchLifecycle is minted and the whole thing falls back to
+    // per-test re-inline — there is nothing for M4b to emit out of line, so
+    // no coroutine/void lifecycle symbol appears. This is why the RNG-order
+    // risk never materializes: such bodies are never shared.
+    let merged = merged_fixture("tb_lifecycle_rand_suspend_test.harc");
+    let (prog, cpp) = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on");
+        (prog, cpp)
+    });
+    assert_eq!(
+        lifecycle_fn_count(&prog),
+        0,
+        "a randomize-bearing lifecycle testbench must fall back (no TestbenchLifecycle fn)"
+    );
+    assert!(
+        !any_lifecycle_call(&prog),
+        "a randomize-bearing lifecycle must fall back to inlining — no TbLifecycleCall"
+    );
+    assert!(
+        !cpp.contains("_harc_lc__tb_lifecycle_RandDelayTb"),
+        "no out-of-line lifecycle symbol is emitted for a fallback testbench"
+    );
+}
+
+#[test]
+fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
+    // #619 M4b (cross-shard de-dup): under the separate/common split layout
+    // with the switch ON, each shareable lifecycle body is DEFINED exactly
+    // once in the common `.cpp` (external linkage) with a prototype in the
+    // interface header, and each shard CALLS it (never re-inlines / redefines
+    // it). This is the payoff #619 targets: the shared body compiles once per
+    // suite, not once per shard. Two impls, group size 1 → two shards.
+    let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
+    let coro_sig = "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(HarcTestContext";
+    let check_sig = "void _harc_lc__tb_lifecycle_WaitSetupTb_Check(HarcTestContext";
+
+    let (iface, common, shards) = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        let opts = cpp_tb::EmitOpts::default();
+        // group_size 1 → one test per shard → two shards, so the
+        // once-in-common / zero-in-shard property is exercised across shards.
+        let plan =
+            tbir::plan_separate_tests(&prog, &merged, &opts, "", 1).expect("separate plan");
+        let iface =
+            tbir::emit_separate_interface_with_prefix(&prog, &merged, &opts, &plan.scaffold, "")
+                .expect("interface");
+        let common =
+            tbir::emit_separate_common_with_prefix(&prog, &merged, &opts, &plan.scaffold, "")
+                .expect("common");
+        let shards: Vec<String> = plan
+            .shards
+            .iter()
+            .map(|s| {
+                tbir::emit_separate_shard_with_prefix(&prog, &merged, &opts, &plan.scaffold, s, "")
+                    .expect("shard")
+            })
+            .collect();
+        (iface, common, shards)
+    });
+
+    assert!(shards.len() >= 2, "group_size 1 must produce ≥2 shards");
+
+    // The definition (signature followed by a body `{`) lives ONCE in common.
+    assert_eq!(
+        count_occurrences(&common, &format!("{coro_sig}& ctx")),
+        1,
+        "the suspending setup coroutine must be DEFINED exactly once in common.cpp"
+    );
+    assert_eq!(
+        count_occurrences(&common, &format!("{check_sig}& ctx")),
+        1,
+        "the non-suspending check must be DEFINED exactly once in common.cpp"
+    );
+
+    // The header carries a prototype for each (so shards can call them).
+    assert!(
+        iface.contains(&format!("{coro_sig}& ctx, WaitSetupTb& _tb, harc_rt::ThreadSlot* _slot);")),
+        "interface header must declare the setup coroutine prototype"
+    );
+    assert!(
+        iface.contains(&format!("{check_sig}& ctx, WaitSetupTb& _tb);")),
+        "interface header must declare the check function prototype"
+    );
+
+    // NO shard defines or re-inlines the bodies; each shard CALLS them.
+    let mut setup_drives = 0;
+    let mut check_calls = 0;
+    for (i, shard) in shards.iter().enumerate() {
+        assert_eq!(
+            count_occurrences(shard, coro_sig),
+            0,
+            "shard {i} must NOT define/redefine the shared setup coroutine"
+        );
+        assert_eq!(
+            count_occurrences(shard, check_sig),
+            0,
+            "shard {i} must NOT define/redefine the shared check function"
+        );
+        // Re-inline would emit the named loop-switch comment; a call must not.
+        assert!(
+            !shard.contains("// __tb_lifecycle_WaitSetupTb_Setup (TB-IR loop-switch)"),
+            "shard {i} must CALL the shared setup, not re-inline its loop-switch"
+        );
+        setup_drives += count_occurrences(
+            shard,
+            "_harc_lc__tb_lifecycle_WaitSetupTb_Setup(ctx, _tb, _slot)",
+        );
+        check_calls +=
+            count_occurrences(shard, "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _tb);");
+    }
+    assert_eq!(setup_drives, shards.len(), "every shard drives the shared setup coroutine");
+    assert_eq!(check_calls, shards.len(), "every shard calls the shared check");
+}
+
+#[test]
+fn m4b_self_contained_split_emits_static_coro_per_shard() {
+    // #619 M4b review defect #2 (duplicate external Coro symbol): in the
+    // SELF-CONTAINED split each shard is a full TU that DEFINES the shared
+    // lifecycle bodies, and all shard .cpps link into one executable. A
+    // suspending (Coro) body MUST therefore have INTERNAL (`static`)
+    // linkage per shard — an external definition in two TUs is a
+    // duplicate-symbol link error. Byte-compare cannot catch a link error;
+    // this pins the linkage keyword, and the equiv/real-build gates prove
+    // the actual link. (The separate/COMMON layout keeps one EXTERNAL def
+    // in common.cpp — covered by `m4b_split_common_layout_*`.)
+    let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
+    let coro_ext = "\nharc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(";
+    let coro_static = "static harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(";
+
+    let shards = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        let opts = cpp_tb::EmitOpts::default();
+        // group_size 1 → one test per shard → two self-contained shards.
+        let plan = tbir::plan_split_tests(&prog, &merged, &opts, "", 1).expect("split plan");
+        plan.shards
+            .iter()
+            .map(|s| tbir::emit_split_shard(&prog, &merged, &opts, &plan, s).expect("shard"))
+            .collect::<Vec<String>>()
+    });
+
+    assert!(shards.len() >= 2, "group_size 1 must produce ≥2 self-contained shards");
+    for (i, shard) in shards.iter().enumerate() {
+        assert_eq!(
+            count_occurrences(shard, coro_static),
+            1,
+            "self-contained shard {i} must define the suspending setup coroutine with \
+             INTERNAL (static) linkage exactly once"
+        );
+        // No EXTERNAL (non-static) definition — that is what collides at link.
+        // The `\n` anchor excludes the `static …` match (which is preceded by
+        // "static ", not a newline).
+        assert_eq!(
+            count_occurrences(shard, coro_ext),
+            0,
+            "self-contained shard {i} must NOT emit an external Coro definition"
+        );
+    }
+}
+
+#[test]
+fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
+    // #619 M4b review defect #1 (frame-local CALL in a shared lifecycle):
+    // a shared `setup` that materializes a `tseq` (`let txns = Gen(3)`) must
+    // NOT be emitted out of line — the tseq is a `[&]`-captured
+    // run-coroutine lambda a file-scope function cannot reach. ShareScan
+    // still mints the shared TestbenchLifecycle (the randomize is inside the
+    // tseq body, not a testbench method), so the out-of-line classifier is
+    // the gate: the setup falls back to re-inline (no `_harc_lc..._Setup`)
+    // while the clean `check` still shares (`_harc_lc..._Check`). Also
+    // asserts the tseq lambda name never leaks into an out-of-line def.
+    let merged = merged_fixture("tb_lifecycle_tseq_fallback_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+
+    assert_eq!(
+        count_occurrences(&cpp, "_harc_lc__tb_lifecycle_TseqLcTb_Setup"),
+        0,
+        "the tseq-bearing setup must fall back to re-inline (no out-of-line symbol)"
+    );
+    assert!(
+        cpp.contains("_harc_lc__tb_lifecycle_TseqLcTb_Check"),
+        "the clean check phase must still be emitted out of line"
+    );
+    // The tseq lambda `Gen(` must only appear at test scope, never inside an
+    // out-of-line lifecycle definition (which would be undeclared there).
+    let leaked = cpp
+        .split("_harc_lc__tb_lifecycle_TseqLcTb_")
+        .skip(1)
+        .any(|seg| {
+            // Within each out-of-line def body (up to its closing at file
+            // scope), the tseq call must not appear.
+            let body = seg.split("\n}\n").next().unwrap_or("");
+            body.contains("Gen(")
+        });
+    assert!(!leaked, "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def");
 }

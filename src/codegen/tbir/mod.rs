@@ -19,7 +19,7 @@ mod runtime;
 use crate::ast::SourceFile;
 use crate::codegen::cpp_tb::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutput};
 use crate::ir::{self, TbProgram};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -220,6 +220,127 @@ pub fn emit(prog: &TbProgram, file: &SourceFile, opts: &EmitOpts) -> Result<Stri
     emit_selected_tests(prog, file, opts, &scaffold, &all, EmitTail::Whole)
 }
 
+/// #619 M4b: which reusable-testbench lifecycle bodies can be emitted OUT
+/// OF LINE (once) rather than re-inlined per test, keyed to their variant
+/// (`Plain` void function / `Coro` `HarcThread`). Empty unless
+/// `HARC_TBIR_NATIVE_LIFECYCLE` minted the `TestbenchLifecycle` functions.
+/// Computed identically by every emission path (monolithic, self-contained
+/// shard, and separate/common interface+common+shard) so the definitions,
+/// prototypes, and call sites always agree.
+fn shareable_lifecycle_map(prog: &TbProgram) -> HashMap<ir::FunctionId, func::LifecycleEmit> {
+    prog.functions
+        .iter()
+        .filter(|f| matches!(f.kind, ir::FunctionKind::TestbenchLifecycle { .. }))
+        .filter_map(|f| func::lifecycle_shareable_kind(f).map(|k| (f.id, k)))
+        .collect()
+}
+
+/// #619 M4b: the `TestbenchLifecycle` FunctionIds actually referenced (via
+/// `Terminator::TbLifecycleCall`) by the run/check bodies of `test_indices`.
+/// A self-contained shard carries only a subset of the suite's tests, so it
+/// must define only the lifecycle bodies its own tests call — a `static`
+/// definition that nothing in the TU calls trips `-Wunused-function`.
+fn referenced_lifecycle_fns(prog: &TbProgram, test_indices: &[usize]) -> HashSet<ir::FunctionId> {
+    let mut set = HashSet::new();
+    for &i in test_indices {
+        let test = &prog.tests[i];
+        for fid in std::iter::once(test.run).chain(test.check) {
+            for b in &prog.function(fid).blocks {
+                if let ir::Terminator::TbLifecycleCall { function, .. } = &b.terminator {
+                    set.insert(*function);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// #619 M4b: emit each shareable lifecycle body ONCE — a `Plain` body as a
+/// `void` function, a `Coro` body as a `harc_rt::HarcThread` coroutine.
+/// `static_linkage` is `true` for a complete single TU (monolithic or a
+/// self-contained shard: internal linkage, definition precedes the tests)
+/// and `false` for the separate/common layout (external linkage, the
+/// definition lives once in the common `.cpp` and shards call it).
+///
+/// `referenced` scopes WHICH bodies are emitted: `Some(set)` (a complete
+/// single TU) emits only bodies its own tests call, so an internal-linkage
+/// def is never left uncalled (`-Wunused-function`); `None` (the common
+/// `.cpp`) emits ALL shareable bodies with external linkage, since different
+/// shards in other TUs call different ones and an unused EXTERNAL function
+/// does not warn.
+fn emit_shared_lifecycle_defs(
+    out: &mut String,
+    prog: &TbProgram,
+    opts: &EmitOpts,
+    randomize_snippets: &[String],
+    dut_type: &str,
+    map: &HashMap<ir::FunctionId, func::LifecycleEmit>,
+    static_linkage: bool,
+    referenced: Option<&HashSet<ir::FunctionId>>,
+) -> Result<(), EmitError> {
+    for f in &prog.functions {
+        let Some(kind) = map.get(&f.id).copied() else {
+            continue;
+        };
+        if referenced.is_some_and(|set| !set.contains(&f.id)) {
+            continue;
+        }
+        let ir::FunctionKind::TestbenchLifecycle { testbench, .. } = f.kind else {
+            continue;
+        };
+        let tb = prog.testbench(testbench);
+        match kind {
+            func::LifecycleEmit::Plain => func::emit_lifecycle_function(
+                out,
+                prog,
+                f,
+                &tb.name,
+                &prog.records,
+                &tb.bus_bindings,
+                &opts.vec_lane_widths,
+                randomize_snippets,
+                dut_type,
+                static_linkage,
+                map,
+            )?,
+            func::LifecycleEmit::Coro => func::emit_lifecycle_coroutine(
+                out,
+                prog,
+                f,
+                &tb.name,
+                &prog.records,
+                &tb.bus_bindings,
+                &opts.vec_lane_widths,
+                randomize_snippets,
+                dut_type,
+                static_linkage,
+                map,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// #619 M4b: emit forward declarations for every shareable lifecycle body
+/// into the split/common interface header, so shards in other translation
+/// units can call the definitions that live in the common `.cpp`.
+fn emit_shared_lifecycle_prototypes(
+    out: &mut String,
+    prog: &TbProgram,
+    map: &HashMap<ir::FunctionId, func::LifecycleEmit>,
+) {
+    for f in &prog.functions {
+        let Some(kind) = map.get(&f.id).copied() else {
+            continue;
+        };
+        let ir::FunctionKind::TestbenchLifecycle { testbench, .. } = f.kind else {
+            continue;
+        };
+        let tb = prog.testbench(testbench);
+        func::emit_lifecycle_prototype(out, f, &tb.name, kind);
+    }
+}
+
 /// Emit one translation unit covering `test_indices` (indices into
 /// `prog.tests`), borrowing the whole verified program.
 ///
@@ -395,6 +516,42 @@ fn emit_selected_tests(
     }
     runtime::context_struct(&mut out, dut_type);
 
+    // #619 M4b: emit each shareable reusable-testbench lifecycle body ONCE
+    // at file scope — a plain `void` function for a non-suspending body, a
+    // `harc_rt::HarcThread` coroutine for a suspending one — and lower its
+    // `TbLifecycleCall`s accordingly (see `func::emit_lifecycle_function` /
+    // `func::emit_lifecycle_coroutine` / the `TbLifecycleCall` arm).
+    //
+    // Both `EmitTail::Whole` (monolithic single TU) and `EmitTail::ShardBody`
+    // (a `SplitCppPlan` self-contained shard) emit the FULL preamble/structs
+    // here, so each is a complete translation unit: the `static` definitions
+    // precede the tests and are internally linked, giving within-TU
+    // de-duplication with no cross-TU ODR risk. The separate/common layout
+    // (`emit_separate_*`, NOT this function) is the cross-shard case: its
+    // shards call EXTERNAL definitions that live once in the common `.cpp`.
+    // The map is empty unless `HARC_TBIR_NATIVE_LIFECYCLE` produced the
+    // `TestbenchLifecycle` functions at lowering time.
+    let outofline_lifecycle: HashMap<ir::FunctionId, func::LifecycleEmit> =
+        shareable_lifecycle_map(prog);
+    // This is a complete single TU (monolithic Whole, or a self-contained
+    // split shard): define only the bodies THIS TU's tests call, with
+    // internal (`static`) linkage — a shard carrying a subset of tests must
+    // not emit a `static` def nothing in the TU calls (`-Wunused-function`),
+    // and must not export an external symbol another shard also defines
+    // (duplicate-symbol link error). For `Whole` every shareable body is
+    // referenced, so the filter is a no-op there.
+    let referenced_lifecycle = referenced_lifecycle_fns(prog, test_indices);
+    emit_shared_lifecycle_defs(
+        &mut out,
+        prog,
+        opts,
+        &scaffold.randomize_snippets,
+        dut_type,
+        &outofline_lifecycle,
+        /* static_linkage */ true,
+        Some(&referenced_lifecycle),
+    )?;
+
     for &i in test_indices {
         emit_test(
             &mut out,
@@ -403,6 +560,7 @@ fn emit_selected_tests(
             dut_type,
             opts,
             &scaffold.randomize_snippets,
+            &outofline_lifecycle,
         )?;
     }
 
@@ -926,8 +1084,15 @@ pub fn emit_separate_interface_with_prefix(
         out.push_str(&scaffold.problem_table_cpp);
         writeln!(out).ok();
     }
-    out.push_str("\n// M2: Shared testbench lifecycle and method prototypes would follow here;\n");
-    out.push_str("// M4 will lower them once per testbench and emit explicit calls.\n");
+    // #619 M4b: forward declarations for the shared out-of-line lifecycle
+    // functions/coroutines whose definitions live in the common `.cpp`, so
+    // each shard can call them. Empty unless HARC_TBIR_NATIVE_LIFECYCLE
+    // minted the TestbenchLifecycle functions.
+    let outofline_lifecycle = shareable_lifecycle_map(prog);
+    if !outofline_lifecycle.is_empty() {
+        out.push_str("\n// #619 M4b: shared testbench-lifecycle prototypes (defined in common).\n");
+        emit_shared_lifecycle_prototypes(&mut out, prog, &outofline_lifecycle);
+    }
     Ok(out)
 }
 
@@ -947,7 +1112,7 @@ pub fn emit_separate_common(
 pub fn emit_separate_common_with_prefix(
     prog: &TbProgram,
     _file: &SourceFile,
-    _opts: &EmitOpts,
+    opts: &EmitOpts,
     scaffold: &SuiteScaffold,
     file_prefix: &str,
 ) -> Result<String, EmitError> {
@@ -980,6 +1145,32 @@ pub fn emit_separate_common_with_prefix(
     }
     // Deepened HarcTestContext method definitions (M3)
     runtime::context_methods(&mut out, &scaffold.dut_type);
+    // #619 M4b: shared out-of-line testbench-lifecycle definitions — compiled
+    // ONCE per suite here (external linkage), called from every shard via the
+    // header prototypes. This is the cross-shard de-duplication #619 targets.
+    // Empty unless HARC_TBIR_NATIVE_LIFECYCLE minted the TestbenchLifecycle
+    // functions. Reaches ambient state exactly like the monolithic emission:
+    // the deepened `HarcTestContext` is a superset of the simple one (same
+    // `dut`/`errors`/`_fatal`/`cycle_count`/`trace`/`log_ctx`/`_checkers`
+    // members), and `harc_rng` is the common-defined global declared `extern`
+    // in the header.
+    let outofline_lifecycle = shareable_lifecycle_map(prog);
+    if !outofline_lifecycle.is_empty() {
+        writeln!(out).ok();
+        emit_shared_lifecycle_defs(
+            &mut out,
+            prog,
+            opts,
+            &scaffold.randomize_snippets,
+            &scaffold.dut_type,
+            &outofline_lifecycle,
+            /* static_linkage */ false,
+            // Common `.cpp`: emit ALL shareable bodies (external linkage);
+            // different shards call different ones, and an unused EXTERNAL
+            // function does not warn, so no per-TU reference filter.
+            None,
+        )?;
+    }
     Ok(out)
 }
 
@@ -1011,6 +1202,13 @@ pub fn emit_separate_shard_with_prefix(
     writeln!(out, "#include \"{file_prefix}suite.hpp\"").ok();
     writeln!(out, "#include \"harc_thread_rt.h\"").ok();
     writeln!(out).ok();
+    // #619 M4b: cross-shard de-dup — the shared lifecycle DEFINITIONS live
+    // once in the common `.cpp` (external linkage) with prototypes in the
+    // header this shard includes, so here we lower each `TbLifecycleCall` to
+    // the real call / drive-loop against that single definition (NOT a
+    // per-shard re-inline). Same map the interface + common used, so the call
+    // sites, prototypes, and definitions agree.
+    let outofline_lifecycle = shareable_lifecycle_map(prog);
     for &idx in &shard.test_indices {
         emit_test(
             &mut out,
@@ -1019,6 +1217,7 @@ pub fn emit_separate_shard_with_prefix(
             &scaffold.dut_type,
             opts,
             &scaffold.randomize_snippets,
+            &outofline_lifecycle,
         )?;
     }
     Ok(out)
@@ -3077,6 +3276,7 @@ fn emit_tb_cycle_services(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_test(
     out: &mut String,
     prog: &TbProgram,
@@ -3084,6 +3284,16 @@ fn emit_test(
     dut_type: &str,
     opts: &EmitOpts,
     randomize_snippets: &[String],
+    // #619 M4b: TestbenchLifecycle FunctionIds emitted out-of-line for
+    // this suite, mapped to their variant (Plain void call / Coro drive
+    // loop); their definitions are emitted at file scope by the caller (the
+    // enclosing TU for the monolithic/self-contained paths, or the common
+    // `.cpp` for the separate/common layout). A `TbLifecycleCall` to one of
+    // these lowers accordingly; a target absent from the map → the M4a
+    // re-inline. The map is empty only when native lifecycle produced no
+    // shareable body; all emission paths (monolithic, self-contained shard,
+    // and separate/common shard) now pass the shareable map.
+    outofline_lifecycle: &HashMap<ir::FunctionId, func::LifecycleEmit>,
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
@@ -3591,6 +3801,7 @@ fn emit_test(
         dut_type,
         &run_hook_captures,
         2,
+        outofline_lifecycle,
     )?;
     if let Some(check) = test.check {
         func::emit_function(
@@ -3604,6 +3815,7 @@ fn emit_test(
             dut_type,
             &HashSet::new(),
             2,
+            outofline_lifecycle,
         )?;
     }
     writeln!(out, "{INDENT}{INDENT}co_return;").ok();

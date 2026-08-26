@@ -156,6 +156,36 @@ testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchEnable
 testbench_basic_test | Top | top_counter.sv | - | pass | - | - | TestbenchMethodCallsMethod
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpThree
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
+# #619 M4b: NON-SUSPENDING setup+check lifecycle bodies emitted OUT-OF-LINE
+# (a real call, once per suite) under HARC_TBIR_NATIVE_LIFECYCLE; bound by
+# two impls so both call sites hit the shared file-scope function. Both
+# codegens must trace-diff clean (v1 always inlines; tbir now calls).
+tb_lifecycle_nowait_test | Top | top_counter.sv | - | pass | - | - | NoWaitBumpTwo
+tb_lifecycle_nowait_test | Top | top_counter.sv | - | pass | - | - | NoWaitBumpFour
+# #619 M4b (suspending slice): a SUSPENDING setup (`wait N cycles` directly
+# in the lifecycle body → coroutine WaitCycles) emitted OUT-OF-LINE as a
+# harc_rt::HarcThread coroutine, driven by the run coroutine via the
+# parent-drives-child loop; check stays a Plain call. Two impls. Tests
+# first-resume timing / per-cycle event order across the coroutine boundary.
+tb_lifecycle_wait_setup_test | Top | top_counter.sv | - | pass | - | - | WaitSetupSix
+tb_lifecycle_wait_setup_test | Top | top_counter.sv | - | pass | - | - | WaitSetupTwo
+# #619 M4b: a suspending lifecycle that ALSO randomizes. The M4a sharing
+# desugar marks a randomize-bearing testbench UNSAFE to share, so NO
+# TestbenchLifecycle is minted and the whole thing FALLS BACK to per-test
+# re-inline (0 out-of-line defs). This row proves that fallback is
+# equivalence-clean — RNG draw order is never at risk because such bodies
+# are never emitted out-of-line. Two impls.
+tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayUseSetup
+tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayReroll
+# #619 M4b review defect #1: a shared `setup` that CALLS a tseq (a
+# `[&]`-captured run-coroutine lambda — a frame-local an out-of-line body
+# cannot reach). ShareScan still mints the shared TestbenchLifecycle, so
+# the out-of-line CLASSIFIER must keep the setup re-inlined (the check,
+# which is clean, still goes out-of-line). Without the stmt rvalue-scan fix
+# tbir would reference the `Gen` lambda in a file-scope function and fail
+# to compile. Both codegens must build+run+trace-diff clean. Two impls.
+tb_lifecycle_tseq_fallback_test | Top | top_counter.sv | - | pass | - | - | TseqLcA
+tb_lifecycle_tseq_fallback_test | Top | top_counter.sv | - | pass | - | - | TseqLcB
 # #619 M4a sub-step 4: conservative-fallback fixtures — under
 # HARC_TBIR_NATIVE_LIFECYCLE these testbenches are UNSAFE to share and fall
 # back to per-test inlining; both codegens must still trace-diff clean.
