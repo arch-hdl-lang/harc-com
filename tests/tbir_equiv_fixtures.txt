@@ -177,6 +177,15 @@ tb_lifecycle_wait_setup_test | Top | top_counter.sv | - | pass | - | - | WaitSet
 # are never emitted out-of-line. Two impls.
 tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayUseSetup
 tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayReroll
+# #619 M4b review defect #1: a shared `setup` that CALLS a tseq (a
+# `[&]`-captured run-coroutine lambda — a frame-local an out-of-line body
+# cannot reach). ShareScan still mints the shared TestbenchLifecycle, so
+# the out-of-line CLASSIFIER must keep the setup re-inlined (the check,
+# which is clean, still goes out-of-line). Without the stmt rvalue-scan fix
+# tbir would reference the `Gen` lambda in a file-scope function and fail
+# to compile. Both codegens must build+run+trace-diff clean. Two impls.
+tb_lifecycle_tseq_fallback_test | Top | top_counter.sv | - | pass | - | - | TseqLcA
+tb_lifecycle_tseq_fallback_test | Top | top_counter.sv | - | pass | - | - | TseqLcB
 # #619 M4a sub-step 4: conservative-fallback fixtures — under
 # HARC_TBIR_NATIVE_LIFECYCLE these testbenches are UNSAFE to share and fall
 # back to per-test inlining; both codegens must still trace-diff clean.

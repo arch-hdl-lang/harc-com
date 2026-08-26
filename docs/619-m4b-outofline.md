@@ -405,3 +405,47 @@ testbench. Enumerated by running `cargo test` with the default flipped:
 `HARC=./target/release/harc JOBS=1 ./tests/run_tbir_equiv.sh` with NO env var
 is now a direct gate on native lowering: 213/0. The opt-out
 `HARC_TBIR_NATIVE_LIFECYCLE=0 …` (historical inline) is also 213/0.
+
+## Review hardening (post-default-flip defects)
+
+An independent review of the squashed branch found latent defects reachable now
+that native lifecycle is the default. Fixes:
+
+1. **Whitelist looks THROUGH rvalues for frame-local/suspending calls.**
+   `stmt_out_of_line_safe` whitelisted `Stmt::Assign(..)` unconditionally, but a
+   statement-level call to a frame-local/suspending target lowers to
+   `Stmt::Assign(dest, Expr::Call(target, ..))` and emits `co_await`/`_slot`
+   (TLM `TransactorMethod`) or references a `[&]`-captured run-coroutine lambda
+   (`Tseq`). Classified `Plain`, such a body would emit those inside a
+   `static void` — a compile break. Now every whitelisted statement's rvalue
+   expressions are scanned (`stmt_rvalue_reaches_frame_call` /
+   `expr_reaches_frame_call`), and a body reaching `TransactorMethod`,
+   `TransactorSelfMethod`, or `Tseq` falls back to re-inline.
+   - **Reachability:** a testbench-level bus bind is parser-rejected (`let inside
+     a testbench currently supports DUT declarations only`), so
+     TLM-in-lifecycle is unreachable via the surface language today — but a
+     `tseq` call IS reachable: a testbench `setup` may `let txns = Gen(3)`,
+     which ShareScan still shares (the randomize is inside the tseq body, not a
+     testbench method). Without the fix `--codegen tbir` failed to compile
+     (`use of undeclared identifier 'Gen'`); with it the setup falls back while
+     a clean `check` still shares. Fixture `tb_lifecycle_tseq_fallback_test`
+     (two impls) + classifier unit tests in `func.rs`.
+2. **Coro respects `static_linkage` (self-contained split link fix).** The Coro
+   emitter always emitted an EXTERNAL `harc_rt::HarcThread` symbol. In the
+   self-contained split every shard is a full TU that defines the shared
+   bodies and all shards link into one executable → duplicate external symbol.
+   `lifecycle_coro_sig`/`emit_lifecycle_coroutine` now honor `static_linkage`:
+   `static harc_rt::HarcThread` for a complete single TU (monolithic +
+   self-contained shard), external only for the separate/COMMON layout (one def
+   in `common.cpp` + header prototype). Verified by a real self-contained
+   2-shard build that links + runs, plus unit test
+   `m4b_self_contained_split_emits_static_coro_per_shard`.
+   - **Unused-function:** `emit_shared_lifecycle_defs` now takes a `referenced`
+     set — a complete single TU emits only the bodies ITS tests call (so a
+     `static` def is never left uncalled under `-Wunused-function`); the common
+     `.cpp` emits all (external, no unused warning).
+3. **`Randomize` terminator returns `None` defensively.** It was treated as
+   shareable, safe only because ShareScan rejects randomize testbenches
+   upstream — an unenforced invariant here. Now `None` (re-inlined), so a future
+   ShareScan relaxation cannot silently share randomize bodies with a possibly
+   divergent RNG order.

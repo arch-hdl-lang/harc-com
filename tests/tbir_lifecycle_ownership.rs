@@ -478,3 +478,90 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
     assert_eq!(setup_drives, shards.len(), "every shard drives the shared setup coroutine");
     assert_eq!(check_calls, shards.len(), "every shard calls the shared check");
 }
+
+#[test]
+fn m4b_self_contained_split_emits_static_coro_per_shard() {
+    // #619 M4b review defect #2 (duplicate external Coro symbol): in the
+    // SELF-CONTAINED split each shard is a full TU that DEFINES the shared
+    // lifecycle bodies, and all shard .cpps link into one executable. A
+    // suspending (Coro) body MUST therefore have INTERNAL (`static`)
+    // linkage per shard — an external definition in two TUs is a
+    // duplicate-symbol link error. Byte-compare cannot catch a link error;
+    // this pins the linkage keyword, and the equiv/real-build gates prove
+    // the actual link. (The separate/COMMON layout keeps one EXTERNAL def
+    // in common.cpp — covered by `m4b_split_common_layout_*`.)
+    let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
+    let coro_ext = "\nharc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(";
+    let coro_static = "static harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(";
+
+    let shards = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        let opts = cpp_tb::EmitOpts::default();
+        // group_size 1 → one test per shard → two self-contained shards.
+        let plan = tbir::plan_split_tests(&prog, &merged, &opts, "", 1).expect("split plan");
+        plan.shards
+            .iter()
+            .map(|s| tbir::emit_split_shard(&prog, &merged, &opts, &plan, s).expect("shard"))
+            .collect::<Vec<String>>()
+    });
+
+    assert!(shards.len() >= 2, "group_size 1 must produce ≥2 self-contained shards");
+    for (i, shard) in shards.iter().enumerate() {
+        assert_eq!(
+            count_occurrences(shard, coro_static),
+            1,
+            "self-contained shard {i} must define the suspending setup coroutine with \
+             INTERNAL (static) linkage exactly once"
+        );
+        // No EXTERNAL (non-static) definition — that is what collides at link.
+        // The `\n` anchor excludes the `static …` match (which is preceded by
+        // "static ", not a newline).
+        assert_eq!(
+            count_occurrences(shard, coro_ext),
+            0,
+            "self-contained shard {i} must NOT emit an external Coro definition"
+        );
+    }
+}
+
+#[test]
+fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
+    // #619 M4b review defect #1 (frame-local CALL in a shared lifecycle):
+    // a shared `setup` that materializes a `tseq` (`let txns = Gen(3)`) must
+    // NOT be emitted out of line — the tseq is a `[&]`-captured
+    // run-coroutine lambda a file-scope function cannot reach. ShareScan
+    // still mints the shared TestbenchLifecycle (the randomize is inside the
+    // tseq body, not a testbench method), so the out-of-line classifier is
+    // the gate: the setup falls back to re-inline (no `_harc_lc..._Setup`)
+    // while the clean `check` still shares (`_harc_lc..._Check`). Also
+    // asserts the tseq lambda name never leaks into an out-of-line def.
+    let merged = merged_fixture("tb_lifecycle_tseq_fallback_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+
+    assert_eq!(
+        count_occurrences(&cpp, "_harc_lc__tb_lifecycle_TseqLcTb_Setup"),
+        0,
+        "the tseq-bearing setup must fall back to re-inline (no out-of-line symbol)"
+    );
+    assert!(
+        cpp.contains("_harc_lc__tb_lifecycle_TseqLcTb_Check"),
+        "the clean check phase must still be emitted out of line"
+    );
+    // The tseq lambda `Gen(` must only appear at test scope, never inside an
+    // out-of-line lifecycle definition (which would be undeclared there).
+    let leaked = cpp
+        .split("_harc_lc__tb_lifecycle_TseqLcTb_")
+        .skip(1)
+        .any(|seg| {
+            // Within each out-of-line def body (up to its closing at file
+            // scope), the tseq call must not appear.
+            let body = seg.split("\n}\n").next().unwrap_or("");
+            body.contains("Gen(")
+        });
+    assert!(!leaked, "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def");
+}

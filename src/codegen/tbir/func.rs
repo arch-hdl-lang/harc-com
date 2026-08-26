@@ -566,10 +566,15 @@ pub(super) enum LifecycleEmit {
 /// internal waits reach the frame-local `tick`).
 ///
 /// Terminators then decide Plain vs Coro vs re-inline:
-///   * `Jump`/`Branch`/`Return`/`Randomize` — pure control flow / an
-///     `harc_rng`-global Z3 solve; neither suspends nor reaches the frame.
+///   * `Jump`/`Branch`/`Return` — pure control flow; neither suspends nor
+///     reaches the frame.
 ///   * `WaitCycles(None)`/`WaitUntil`/`WaitUntilTimeout` — suspend on the
 ///     shared `_slot` only → force the `Coro` variant.
+///   * `Randomize` — an `harc_rng`-global Z3 solve that an out-of-line body
+///     could technically emit, but sharing it is only RNG-order-safe because
+///     `ShareScan` rejects randomize-bearing testbenches upstream; that
+///     invariant is unenforced here, so `Randomize` returns `None`
+///     defensively (kept re-inlined) rather than relying on it.
 ///   * `WaitCycles(Some(clock))` (`wait N cycles on <clk>`),
 ///     `WaitCyclesSync` (`tick()` loop), `WaitTimePs` (`after <dur>`),
 ///     `TbLifecycleCall`, `Fatal` — reach coroutine-frame-locals
@@ -583,15 +588,24 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
             return None;
         }
         match &b.terminator {
-            Terminator::Jump(_)
-            | Terminator::Branch(..)
-            | Terminator::Return
-            | Terminator::Randomize { .. } => {}
+            Terminator::Jump(_) | Terminator::Branch(..) | Terminator::Return => {}
             Terminator::WaitCycles(_, None, _)
             | Terminator::WaitUntil { .. }
             | Terminator::WaitUntilTimeout { .. } => suspends = true,
+            // `Randomize` draws from the file-scope `harc_rng` global — an
+            // out-of-line body COULD emit it — but sharing a randomize-bearing
+            // lifecycle would only be RNG-order-correct because `ShareScan`
+            // (`src/codegen/cpp_tb::desugar_impl_for_test_sharing_lifecycle`)
+            // rejects randomize-bearing testbenches upstream, so no
+            // `TestbenchLifecycle` is ever minted for one. That invariant is
+            // not enforced HERE, so return `None` defensively: if a future
+            // `ShareScan` relaxation started sharing randomize bodies, this
+            // gate must NOT silently emit them out of line with a possibly
+            // divergent RNG draw order. Keep re-inlined until a slice proves
+            // the ordering (see docs/619-m4b-outofline.md, RNG-order risk).
+            Terminator::Randomize { .. }
             // Frame-local-reaching or unsupported → keep re-inlined.
-            Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(..)
             | Terminator::WaitTimePs(..)
             | Terminator::TbLifecycleCall { .. }
@@ -609,8 +623,21 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
 /// state, `_tb`, the DUT, file-scope `harc_rng`, and reconstructed log
 /// lambdas — i.e. nothing captured from the run coroutine's frame. See
 /// `lifecycle_shareable_kind`.
+///
+/// The `Stmt` KIND is necessary but not sufficient: a whitelisted statement
+/// can still carry an rvalue that emits frame-local / suspending code. The
+/// canonical case is a statement-level blocking TLM call, which lowers to
+/// `Stmt::Assign(dest, Expr::Call(CallTarget::TransactorMethod, ..))`
+/// (`ir::lower::bus`) and whose emission is `co_await
+/// harc_rt::wait_cycles(_slot, …)` + `_slot` refs (`emit_transactor_call`).
+/// A lifecycle body whose only content is such a call has terminator
+/// `Return`, so without this guard it would classify as `Plain` and emit
+/// `co_await`/`_slot` inside a `static void` function — a compile break.
+/// So a statement is out-of-line-safe only when its kind is whitelisted AND
+/// none of its rvalue expressions reach a frame-local/suspending call
+/// target (`stmt_rvalue_reaches_frame_call`).
 fn stmt_out_of_line_safe(s: &Stmt) -> bool {
-    matches!(
+    let kind_ok = matches!(
         s,
         Stmt::Assign(..)
             | Stmt::DutWrite(..)
@@ -625,7 +652,85 @@ fn stmt_out_of_line_safe(s: &Stmt) -> bool {
             | Stmt::Log { .. }
             | Stmt::AssertCheck { .. }
             | Stmt::AssumeCheck { .. }
+    );
+    kind_ok && !stmt_rvalue_reaches_frame_call(s)
+}
+
+/// A CALL target that an out-of-line lifecycle body cannot reach: a
+/// bus/TLM `TransactorMethod` (emits `co_await`/`_slot`), a transactor
+/// `TransactorSelfMethod`, or a `Tseq` generator (emitted as a
+/// `[&]`-captured run-coroutine lambda). `Helper`/`ExternFn`/`Builtin`
+/// resolve to file-scope symbols and are safe.
+fn call_target_reaches_frame(t: &CallTarget) -> bool {
+    matches!(
+        t,
+        CallTarget::TransactorMethod { .. }
+            | CallTarget::TransactorSelfMethod { .. }
+            | CallTarget::Tseq(_)
     )
+}
+
+/// Does an rvalue expression (recursively) contain a call to a frame-local
+/// / suspending target? In practice such calls only ever appear as the
+/// TOP-LEVEL rvalue of an `Assign` (TLM/tseq calls are lowered
+/// statement-level, never nested), but the walk descends through the
+/// arithmetic combinators defensively; unhandled leaf/host-state variants
+/// carry no call and are safe.
+fn expr_reaches_frame_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call(target, args) => {
+            call_target_reaches_frame(target) || args.iter().any(expr_reaches_frame_call)
+        }
+        Expr::Binary(_, a, b) => expr_reaches_frame_call(a) || expr_reaches_frame_call(b),
+        Expr::Unary(_, a) => expr_reaches_frame_call(a),
+        Expr::Ternary(a, b, c) => {
+            expr_reaches_frame_call(a)
+                || expr_reaches_frame_call(b)
+                || expr_reaches_frame_call(c)
+        }
+        _ => false,
+    }
+}
+
+/// Does any rvalue expression carried by a whitelisted statement reach a
+/// frame-local/suspending call target? Extracts the value/condition/index
+/// expressions of each rvalue-bearing whitelisted `Stmt` and scans them.
+/// Statements with no rvalue expression (`DutRead`, `ProbeRelease`,
+/// `RecordInit`, `TbQueuePop`) — and any non-whitelisted statement, already
+/// excluded by the positive list — carry nothing to reach the frame.
+fn stmt_rvalue_reaches_frame_call(s: &Stmt) -> bool {
+    match s {
+        Stmt::Assign(_, e) | Stmt::DutWrite(_, e) => expr_reaches_frame_call(e),
+        Stmt::TbFieldWrite { value, .. } | Stmt::TbQueuePush { value, .. } => {
+            expr_reaches_frame_call(value)
+        }
+        Stmt::TbFieldVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        } => {
+            expr_reaches_frame_call(index)
+                || inner_index.as_ref().is_some_and(expr_reaches_frame_call)
+                || expr_reaches_frame_call(value)
+        }
+        Stmt::RecordFieldWrite {
+            mid_indices,
+            index,
+            value,
+            ..
+        } => {
+            mid_indices.iter().any(|(_, e)| expr_reaches_frame_call(e))
+                || index.as_ref().is_some_and(expr_reaches_frame_call)
+                || expr_reaches_frame_call(value)
+        }
+        Stmt::Log { args, .. } => args.args.iter().any(|a| expr_reaches_frame_call(&a.expr)),
+        Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
+            expr_reaches_frame_call(cond)
+                || on_fail.args.iter().any(|a| expr_reaches_frame_call(&a.expr))
+        }
+        _ => false,
+    }
 }
 
 /// #619 M4b: reconstruct, at the top of an out-of-line lifecycle
@@ -674,12 +779,19 @@ fn lifecycle_plain_sig(func: &TbFunction, tb_name: &str, static_linkage: bool) -
 }
 
 /// #619 M4b: C++ signature (no trailing brace/semicolon) for a Coro
-/// (suspending) out-of-line lifecycle coroutine. Always external linkage —
-/// the monolithic single-TU def and the split/common def are identical, and
-/// only the split path additionally declares a prototype in the header.
-fn lifecycle_coro_sig(func: &TbFunction, tb_name: &str) -> String {
+/// (suspending) out-of-line lifecycle coroutine. `static_linkage` picks
+/// internal (`static harc_rt::HarcThread …`) vs external
+/// (`harc_rt::HarcThread …`). A coroutine may have internal linkage, and it
+/// MUST here for a complete single TU (monolithic + self-contained split):
+/// the self-contained split emits EVERY shard as a full TU that defines the
+/// shared bodies, and all shards link into one executable — an EXTERNAL
+/// coroutine symbol would then be multiply-defined (duplicate-symbol link
+/// error). Only the separate/COMMON layout keeps it external (one
+/// definition in `common.cpp` + a header prototype the shards call).
+fn lifecycle_coro_sig(func: &TbFunction, tb_name: &str, static_linkage: bool) -> String {
     format!(
-        "harc_rt::HarcThread {}(HarcTestContext& ctx, {tb_name}& _tb, harc_rt::ThreadSlot* _slot)",
+        "{}harc_rt::HarcThread {}(HarcTestContext& ctx, {tb_name}& _tb, harc_rt::ThreadSlot* _slot)",
+        if static_linkage { "static " } else { "" },
         lifecycle_cpp_name(&func.name)
     )
 }
@@ -700,7 +812,9 @@ pub(super) fn emit_lifecycle_prototype(
             writeln!(out, "{};", lifecycle_plain_sig(func, tb_name, false)).ok();
         }
         LifecycleEmit::Coro => {
-            writeln!(out, "{};", lifecycle_coro_sig(func, tb_name)).ok();
+            // Prototypes exist only for the separate/COMMON layout, where the
+            // single definition in `common.cpp` has EXTERNAL linkage.
+            writeln!(out, "{};", lifecycle_coro_sig(func, tb_name, false)).ok();
         }
     }
 }
@@ -770,9 +884,10 @@ pub(super) fn emit_lifecycle_coroutine(
     lanes: &HashMap<String, u32>,
     randomize_snippets: &[String],
     dut_type: &str,
+    static_linkage: bool,
     outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
 ) -> Result<(), EmitError> {
-    writeln!(out, "{} {{", lifecycle_coro_sig(func, tb_name)).ok();
+    writeln!(out, "{} {{", lifecycle_coro_sig(func, tb_name, static_linkage)).ok();
     writeln!(out, "{INDENT}(void)_slot;").ok();
     emit_lifecycle_ambient_prologue(out);
     emit_function(
@@ -4784,4 +4899,127 @@ pub(super) fn emit_test_hook(
     writeln!(out, "{pad1}}}").ok(); // while
     writeln!(out, "{pad}}};").ok(); // lambda
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_classifier_tests {
+    //! #619 M4b: `lifecycle_shareable_kind` must NOT classify a lifecycle
+    //! body that carries a frame-local / suspending CALL (a bus/TLM
+    //! `TransactorMethod`, a `Tseq` generator, or a transactor
+    //! `TransactorSelfMethod`) as out-of-line-shareable. Such a call emits
+    //! `co_await`/`_slot` or references a `[&]`-captured run-coroutine
+    //! lambda, neither of which an out-of-line `static void` function (or a
+    //! coroutine driven from the outside) can reach — so the whole body must
+    //! fall back to re-inline. These tests build the offending IR directly
+    //! (no bus DUT needed) and pin the classifier decision.
+    use super::*;
+    use crate::ast::LifecyclePhase;
+    use crate::ir::{BasicBlock, BinOp, FunctionId, FunctionKind, TestbenchId, TypedLocal};
+
+    fn single_block_lifecycle(stmts: Vec<Stmt>, terminator: Terminator) -> TbFunction {
+        TbFunction {
+            id: FunctionId(0),
+            name: "__tb_lifecycle_Test_Setup".to_string(),
+            kind: FunctionKind::TestbenchLifecycle {
+                testbench: TestbenchId(0),
+                phase: LifecyclePhase::Setup,
+            },
+            params: vec![],
+            locals: vec![TypedLocal {
+                name: "r".to_string(),
+                ty: IrType::UInt(Some(32)),
+            }],
+            blocks: vec![BasicBlock { stmts, terminator }],
+            entry: BlockId(0),
+            owner: Some(TestbenchId(0)),
+            ret: None,
+            implicit_returns: vec![],
+        }
+    }
+
+    fn tlm_call() -> Expr {
+        // `bus.read(...)` lowers to Stmt::Assign(dest, Expr::Call(TransactorMethod,..)).
+        Expr::Call(
+            CallTarget::TransactorMethod {
+                bus_field: "mem".to_string(),
+                method: "read".to_string(),
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn tlm_call_in_lifecycle_is_not_shareable() {
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), tlm_call())], Terminator::Return);
+        assert_eq!(
+            lifecycle_shareable_kind(&f),
+            None,
+            "a TLM/transactor-method call in a lifecycle body must fall back to re-inline"
+        );
+    }
+
+    #[test]
+    fn tseq_call_in_lifecycle_is_not_shareable() {
+        let call = Expr::Call(CallTarget::Tseq("Gen".to_string()), vec![]);
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn nested_tlm_call_under_arithmetic_is_not_shareable() {
+        // Defensive: even wrapped in a combinator, the TLM call excludes.
+        let expr = Expr::Binary(
+            BinOp::Add,
+            Box::new(tlm_call()),
+            Box::new(Expr::Literal {
+                value: 1,
+                ty: IrType::UInt(Some(32)),
+            }),
+        );
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), expr)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn tlm_call_carried_by_tb_field_write_is_not_shareable() {
+        // The rvalue scan covers non-Assign whitelisted stmts too, so a
+        // frame-reaching call hidden in any whitelisted stmt's value excludes.
+        let f = single_block_lifecycle(
+            vec![Stmt::TbFieldWrite {
+                field: "f".to_string(),
+                value: tlm_call(),
+            }],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn plain_value_lifecycle_is_shareable_plain() {
+        let f = single_block_lifecycle(
+            vec![Stmt::Assign(
+                LocalId(0),
+                Expr::Literal {
+                    value: 1,
+                    ty: IrType::UInt(Some(32)),
+                },
+            )],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    #[test]
+    fn pure_helper_call_lifecycle_is_shareable_plain() {
+        // A pure-helper call resolves to a file-scope symbol → safe to share.
+        let call = Expr::Call(
+            CallTarget::Helper {
+                name: "h".to_string(),
+                ret: IrType::UInt(Some(32)),
+            },
+            vec![],
+        );
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
 }
