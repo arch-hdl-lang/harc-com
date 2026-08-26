@@ -96,8 +96,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 120 remaining constructor call sites (121 textual matches including
-the `unsupported` helper definition) as an inventory, not 121 separate tasks.
+Treat the 119 remaining constructor call sites (120 textual matches including
+the `unsupported` helper definition) as an inventory, not 120 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -275,9 +275,9 @@ not applicable before requesting review:
    state, pure-helper record-local, struct-keep, scoreboard-list, and lazy
    diagnostic-call, component-predicate, dynamic record-list query, and wide
    cover-selector, native-width sized-scalar, record-valued tseq-yield, signed
-   scalar connect, single named event-payload, and component-body dotted-emit
-   slices reduce the count from 174 to 121 textual matches (120 constructors
-   plus the helper definition).
+   scalar connect, single named event-payload, component-body dotted-emit, and
+   component post-eval cycle-trigger slices reduce the count from 174 to 120
+   textual matches (119 constructors plus the helper definition).
    The handler-less unbound-
    transactor event slice closes routes around a shared constructor without
    changing the count. Widthless scalar fixed-`Vec` record fields now route

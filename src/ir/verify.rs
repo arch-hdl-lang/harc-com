@@ -905,6 +905,17 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
         for handler in &component.cycle_handlers {
+            if handler.monitor_channel.is_some()
+                && matches!(handler.phase, HandlerPhase::PostEval)
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` has a bound handshake monitor scheduled at \
+                         post_eval, which is outside the lowered monitor contract",
+                        component.name
+                    ),
+                });
+            }
             if let Some(func) = prog.functions.get(handler.function.index()) {
                 let mut checker = Checker {
                     prog,

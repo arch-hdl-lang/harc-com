@@ -2769,7 +2769,7 @@ fn emit_lifecycle_checkers(
     }
 
     // Cycle-trigger handlers (`on <bool-expr>`). Each installs a
-    // `_checkers` closure that re-evaluates the trigger predicate every
+    // selected cycle-service closure that re-evaluates the trigger predicate every
     // primary-clock cycle and fires the body when the predicate satisfies
     // the requested edge mode. Mirrors v1's `emit_cycle_trigger`.
     for ch in &comp.cycle_handlers {
@@ -2779,6 +2779,7 @@ fn emit_lifecycle_checkers(
         let lambda = func::cycle_handler_lambda_name(comp, ch);
         let trigger = func::clause_predicate_cpp(prog, ch.function, inst_path, &ch.trigger)?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
+        let svc = ch.phase.service_vec();
         if ch.monitor_channel.is_some() {
             // Bound-bus handshake monitor (v1's `emit_bound_monitor_actors`).
             // v1 lowers it as a coroutine: `while (true) { co_await
@@ -2790,7 +2791,7 @@ fn emit_lifecycle_checkers(
             // OTHER cycle (e.g. held over cycles 5,6,7 → beats at 5 and 7),
             // NOT every cycle (Level) and NOT only the rising edge.
             //
-            // The `_checkers` pass runs once per primary cycle at the same
+            // The selected service pass runs once per primary cycle at the same
             // phase the monitor coroutine would resume (`sched.tick()` then
             // checkers), so the cadence is reproduced exactly with a
             // fire-then-cooldown latch: fire when the predicate holds, then
@@ -2808,10 +2809,10 @@ fn emit_lifecycle_checkers(
             // monitor would miss every handshake. Re-lowering active
             // transactors into actors is a separate, larger change (see
             // issue #425 / the WS2 follow-up). Keeping the monitor as the
-            // `_checkers` latch is trace-correct under both `--mt` and the
+            // cycle-service latch is trace-correct under both `--mt` and the
             // default — the latch already fires at the right phases on
             // every `tick()`.
-            writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+            writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
             writeln!(out, "{INDENT}{INDENT}static bool {tag}_cool = false;").ok();
             writeln!(out, "{INDENT}{INDENT}if ({tag}_cool) {{").ok();
             writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = false;").ok();
@@ -2822,7 +2823,7 @@ fn emit_lifecycle_checkers(
             writeln!(out, "{INDENT}}});").ok();
             continue;
         }
-        writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
         match ch.edge {
             ir::CycleEdge::Level => {
                 writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();

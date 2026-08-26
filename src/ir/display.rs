@@ -376,10 +376,14 @@ impl Display for TbProgram {
                     crate::ir::CycleEdge::Falling => "falling",
                     crate::ir::CycleEdge::Level => "level",
                 };
+                let phase = match ch.phase {
+                    crate::ir::HandlerPhase::Checker => "",
+                    crate::ir::HandlerPhase::PostEval => " phase post_eval",
+                };
                 if let Some(channel) = &ch.monitor_channel {
                     writeln!(
                         f,
-                        "    on bus.{channel}.handshake [{}] ({edge}){} = fn{}",
+                        "    on bus.{channel}.handshake [{}] ({edge}){phase}{} = fn{}",
                         expr_str_for_component(self, ch.function, &ch.trigger),
                         match ch.activation {
                             crate::ir::Activation::Always => "",
@@ -390,7 +394,7 @@ impl Display for TbProgram {
                 } else {
                     writeln!(
                         f,
-                        "    on {} ({edge}){} = fn{}",
+                        "    on {} ({edge}){phase}{} = fn{}",
                         expr_str_for_component(self, ch.function, &ch.trigger),
                         match ch.activation {
                             crate::ir::Activation::Always => "",

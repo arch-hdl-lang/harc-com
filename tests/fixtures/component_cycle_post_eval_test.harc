@@ -1,0 +1,41 @@
+// A component boolean cycle-trigger scheduled at `post_eval` must run after
+// the DUT posedge and before the run coroutine resumes. The assertion directly
+// after `wait 1 cycle` is the boundary proof: a checker-phase handler would not
+// run until after that resumed segment and would leave `hits == 0` here.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor PostEvalCycleObserver
+    dut  : Top
+    hits : uint<32> default 0
+
+    on dut.count_out == 1 phase post_eval level
+        hits = hits + 1
+    end on
+end transactor PostEvalCycleObserver
+
+test ComponentCyclePostEvalTest
+    let dut : Top
+    let obs : PostEvalCycleObserver passive
+
+    clock clk = SysDomain
+
+    run
+        obs.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+
+        dut.rst = 0
+        dut.en = 1
+        wait 1 cycle
+
+        assert obs.hits == 1
+            else fail("post_eval cycle trigger did not run before wait resumed; hits=${obs.hits}")
+        dut.en = 0
+        wait 1 cycle
+        log(info, "PASS: component post_eval cycle trigger ran before coroutine resume")
+    end run
+end test ComponentCyclePostEvalTest
