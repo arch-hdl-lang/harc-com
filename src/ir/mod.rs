@@ -2109,12 +2109,12 @@ pub enum Stmt {
     /// whole-nested-record leaf assignment (`o.a = d`) carries a
     /// record-valued `value`.
     ///
-    /// `mid_indices` carries element selections on NON-leaf `Vec<Record, N>`
-    /// segments (`tbl.entries[i].tag = v`): each `(pos, idx)` indexes the
-    /// segment at `pos` in `[field] ++ path` (so `pos` is strictly less
-    /// than the leaf position), and the chain then descends into the
-    /// element record. Positions are strictly increasing. Empty for every
-    /// chain with no record-vector traversal.
+    /// `mid_indices` carries selections embedded in the member path. On a
+    /// non-leaf `Vec<Record, N>` segment it selects the record element to
+    /// traverse (`tbl.entries[i].tag`). Repeated entries at the leaf position
+    /// carry all but the final selection of a nested fixed vector
+    /// (`grid[i][j]`); `index` carries the final `[j]`. Positions are
+    /// nondecreasing and indexes at one position retain source order.
     RecordFieldWrite {
         local: LocalId,
         field: String,
@@ -2741,12 +2741,12 @@ pub enum Expr {
     /// `[field] ++ path`; `index` (when `Some`) indexes that leaf's
     /// `Vec`.  An empty `path` is the single-level read.
     ///
-    /// `mid_indices` carries element selections on NON-leaf `Vec<Record, N>`
-    /// segments (`tbl.entries[i].tag`): each `(pos, idx)` indexes the
-    /// segment at `pos` in `[field] ++ path` (so `pos` is strictly less
-    /// than the leaf position), and the chain then descends into the
-    /// element record. Positions are strictly increasing. Empty for every
-    /// chain with no record-vector traversal.
+    /// `mid_indices` carries selections embedded in the member path. On a
+    /// non-leaf `Vec<Record, N>` segment it selects the record element to
+    /// traverse (`tbl.entries[i].tag`). Repeated entries at the leaf position
+    /// carry all but the final selection of a nested fixed vector
+    /// (`grid[i][j]`); `index` carries the final `[j]`. Positions are
+    /// nondecreasing and indexes at one position retain source order.
     RecordField {
         local: LocalId,
         field: String,

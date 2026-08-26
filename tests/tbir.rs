@@ -10176,18 +10176,8 @@ end test T
     emit_cpp_src(&prog("a.small[0] = 7"));
 }
 
-/// An element selection INSIDE a component-record or responder-state
-/// path (`ba.data[0]`, `c.b.tbl[0].data`) is refused with the verdict
-/// that is true of it: v1 compiles the whole family.
-///
-/// Neither resolver carries mid-path `[i]`, so these shapes used to fall
-/// past every lane onto whichever generic arm caught the leftovers —
-/// "index expressions" (`EmitsUncompilable`), "assignment to a target
-/// that is neither a DUT port nor a local" (`SilentlyMisLowers`, the
-/// loudest verdict in the enum), "field access on a non-DUT value"
-/// (`EmitsUncompilable`). All three were false. Those arms cover much
-/// else, so the answer comes before them rather than by relabelling
-/// them.
+/// Element selections inside component-record and responder-state paths
+/// preserve their typed receiver, including nested fixed-vector leaves.
 #[test]
 fn indexed_component_and_state_record_paths_lower() {
     let state = |body: &str| {
@@ -10199,6 +10189,7 @@ end struct Kid
 
 struct Bundle
     data : Vec<uint<8>, 4>
+    matrix : Vec<Vec<uint<8>, 2>, 3>
     kids : Vec<Kid, 4>
 end struct Bundle
 
@@ -10233,6 +10224,8 @@ end impl T
     for (body, rendered) in [
         ("let z = ba.data[0]", ".ba.data[0]"),
         ("ba.data[0] = 1", ".ba.data[0] = 1"),
+        ("let z = ba.matrix[2][1]", ".ba.matrix[2][1]"),
+        ("ba.matrix[2][1] = 7", ".ba.matrix[2][1] = 7"),
         ("let z = ba.kids[0].p", ".ba.kids[0].p"),
     ] {
         let src = state(body);
@@ -12558,6 +12551,92 @@ end impl T"#;
         nested_tbir.contains("std::array<std::array<uint64_t, 2>, 4> data = {}"),
         "TBIR nested Vec storage: {nested_tbir}"
     );
+    let indexed_nested = nested_vec.replace(
+        "        let r : Resp\n",
+        "        let r : Resp\n        r.data[0][1] = 18\n        let lane = r.data[0][1]\n",
+    );
+    let indexed_prog = lower_src(&indexed_nested).expect("nested record Vec indexing lowers");
+    verify::verify_program(&indexed_prog).expect("nested record Vec indexing verifies");
+    let indexed_tbir = emit_cpp_src(&indexed_nested);
+    assert!(
+        indexed_tbir.contains("r.data[0][1] = 18") && indexed_tbir.contains("r.data[0][1]"),
+        "nested record Vec reads and writes preserve both indices: {indexed_tbir}"
+    );
+    for (bad, dimension) in [("r.data[4][1]", "outer"), ("r.data[0][2]", "inner")] {
+        let bad_index = indexed_nested.replace("r.data[0][1]", bad);
+        let err = lower_src(&bad_index).expect_err(&format!(
+            "{dimension} nested record Vec bound must be checked"
+        ));
+        assert!(
+            matches!(err, lower::LowerError::Invalid(_))
+                && (err.to_string().contains("out of bounds")
+                    || err.to_string().contains("out of range")),
+            "{dimension} nested record Vec bound: {err:?}"
+        );
+    }
+    let narrowed = indexed_nested.replace(
+        "let lane = r.data[0][1]",
+        "let lane : uint<4> = r.data[0][1]",
+    );
+    assert!(
+        lower_src(&narrowed)
+            .expect_err("the nested leaf retains uint<8> for narrowing checks")
+            .to_string()
+            .contains("narrows"),
+        "nested record Vec leaf type participates in scalar assignment checks"
+    );
+    let mut over_indexed = indexed_prog.clone();
+    let mid_indices = over_indexed
+        .functions
+        .iter_mut()
+        .flat_map(|func| func.blocks.iter_mut())
+        .flat_map(|block| block.stmts.iter_mut())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::RecordFieldWrite {
+                mid_indices,
+                index: Some(_),
+                ..
+            } if !mid_indices.is_empty() => Some(mid_indices),
+            _ => None,
+        })
+        .expect("nested record Vec write carries its outer leaf index");
+    mid_indices.push((
+        0,
+        ir::Expr::Literal {
+            value: 0,
+            ty: ir::IrType::UInt(None),
+        },
+    ));
+    verify::verify_program(&over_indexed)
+        .expect_err("verifier rejects more record leaf indices than fixed-vector layers");
+    for dimension in ["outer", "inner"] {
+        let mut out_of_bounds = indexed_prog.clone();
+        let (mid_indices, index) = out_of_bounds
+            .functions
+            .iter_mut()
+            .flat_map(|func| func.blocks.iter_mut())
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::RecordFieldWrite {
+                    mid_indices,
+                    index: Some(index),
+                    ..
+                } if !mid_indices.is_empty() => Some((mid_indices, index)),
+                _ => None,
+            })
+            .expect("nested record Vec write carries both leaf indices");
+        let selector = if dimension == "outer" {
+            &mut mid_indices[0].1
+        } else {
+            index
+        };
+        *selector = ir::Expr::Literal {
+            value: if dimension == "outer" { 4 } else { 2 },
+            ty: ir::IrType::UInt(None),
+        };
+        verify::verify_program(&out_of_bounds)
+            .expect_err("verifier rejects an out-of-bounds record leaf selector");
+    }
     for packed_lane in [
         "harc_wide_write_bits(_packed, 0, 8, value.data[0][0])",
         "harc_wide_write_bits(_packed, 56, 8, value.data[3][1])",

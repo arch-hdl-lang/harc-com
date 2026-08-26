@@ -10,9 +10,16 @@ test NestedRecordVecSchemaTest
         let source : NestedGrid
         let copy : NestedGrid
         source.tag = 19
+        source.lanes[0][1] = 18
+        source.lanes[2][0] = 52
+        let observed = source.lanes[0][1]
+        assert observed == 18 else fail("nested fixed-vector inferred lane mismatch")
+        assert source.lanes[2][0] == 52 else fail("nested fixed-vector last lane mismatch")
         copy = source
         assert copy == source else fail("nested fixed-vector record copy changed value")
         assert copy.tag == source.tag else fail("nested fixed-vector record tag changed")
+        assert copy.lanes[0][1] == 18 else fail("nested fixed-vector copy first lane mismatch")
+        assert copy.lanes[2][0] == 52 else fail("nested fixed-vector copy last lane mismatch")
         wait 1 cycle
     end run
 end test NestedRecordVecSchemaTest
