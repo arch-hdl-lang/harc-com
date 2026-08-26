@@ -40,6 +40,7 @@ end struct StateKid
 
 struct StateBundle
     data : Vec<uint<8>, 4>
+    matrix : Vec<Vec<uint<8>, 2>, 4>
     kids : Vec<StateKid, 4>
 end struct StateBundle
 
@@ -59,6 +60,7 @@ transactor MemoryResponder bound to TlmMemBus
         last.addr = addr
         last.data = 256 + addr
         bundle.data[slot] = addr
+        bundle.matrix[slot][1] = addr + 2
         bundle.kids[slot].value = addr + 1
         // Read subfields back inside the responder body.
         assert last.addr == addr
@@ -66,6 +68,8 @@ transactor MemoryResponder bound to TlmMemBus
         assert last.data == 256 + addr
             else fail("responder: last.data=${last.data}, expected ${256 + addr}")
         assert bundle.data[slot] == addr else fail("responder indexed scalar state mismatch")
+        let nested_seen = bundle.matrix[slot][1]
+        assert nested_seen == addr + 2 else fail("responder nested indexed state mismatch")
         assert bundle.kids[slot].value == addr + 1 else fail("responder indexed record state mismatch")
         // Return the whole-record subfield.
         return last.data
@@ -98,6 +102,8 @@ impl TargetRecordStateTest for TargetRecordStateTb
         assert responder.last.data == 261
             else fail("responder.last.data=${responder.last.data}, expected 261")
         assert responder.bundle.data[1] == 5 else fail("test indexed scalar state mismatch")
+        let nested_seen = responder.bundle.matrix[1][1]
+        assert nested_seen == 7 else fail("test nested indexed state mismatch")
         assert responder.bundle.kids[1].value == 6 else fail("test indexed record state mismatch")
 
         log(info, "PASS: whole-record target-transactor state round-tripped")

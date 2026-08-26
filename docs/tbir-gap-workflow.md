@@ -223,6 +223,14 @@ The shared non-scalar record diagnostic still covers other aggregate shapes,
 so the raw inventory remains 118 textual matches (117 constructors plus the
 helper).
 
+The follow-on nested record fixed-vector indexing batch carries every leaf
+selection in source order, so record locals and bound responder record state
+can read and write `grid[i][j]` without flattening either dimension. Literal
+bounds are checked at each layer, component-record paths retain their
+component receiver semantics, and the same fixture now observes nonzero lanes
+under both emitters. This routes around existing shared fallbacks, so the raw
+inventory remains 118 textual matches.
+
 ## Review-derived semantic gates
 
 The method-hook batch exposed defects that lowering-only tests could not see.
@@ -288,8 +296,8 @@ not applicable before requesting review:
    diagnostic-call, component-predicate, dynamic record-list query, and wide
    cover-selector, native-width sized-scalar, record-valued tseq-yield, signed
    scalar connect, single named event-payload, component-body dotted-emit, and
-   component post-eval cycle-trigger, and component event-direction slices
-   and nested record fixed-vector schema slice
+   component post-eval cycle-trigger, component event-direction, nested record
+   fixed-vector schema, and nested record fixed-vector indexing slices
    reduce the count from 174 to 118 textual matches (117 constructors plus the
    helper definition).
    The handler-less unbound-
@@ -299,8 +307,7 @@ not applicable before requesting review:
    fixed-array schema and use v1-compatible 64-bit widthless integer spellings
    (`uint`/`UInt`/`bits`, `sint`/`SInt`) and 32-bit builtin-`int` packed widths;
    this also routes around the shared constructor,
-   so that slice does not change the count. Nested `Vec<Vec<...>>` fields
-   remain unsupported.
+   so that slice does not change the count.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently

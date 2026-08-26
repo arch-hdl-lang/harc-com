@@ -2868,8 +2868,27 @@ impl Checker<'_> {
                 .ok_or_else(|| format!("record `{}` has no field `{segment}`", schema.name))?;
             let last = position + 1 == segments.len();
             if last {
-                return match member.vec_len {
-                    Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&member.ty)
+                let mut len = member.vec_len;
+                let mut ty = member.ty.clone();
+                for _ in mid_indices.iter().filter(|p| **p == position) {
+                    let Some(_) = len else {
+                        return Err(format!(
+                            "record path over-indexes fixed-vector field `{segment}`"
+                        ));
+                    };
+                    match ty {
+                        IrType::FixedVec {
+                            elem,
+                            len: inner_len,
+                        } => {
+                            len = Some(inner_len);
+                            ty = *elem;
+                        }
+                        _ => len = None,
+                    }
+                }
+                return match len {
+                    Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&ty)
                         .map(|elem| Some((len, elem)))
                         .ok_or_else(|| {
                             format!("record vector field `{segment}` has an invalid element type")
@@ -2896,7 +2915,7 @@ impl Checker<'_> {
         field: &str,
         path: &[String],
         mid_indices: &[(usize, Expr)],
-        leaf_indexed: bool,
+        index: Option<&Expr>,
     ) -> Result<Option<(usize, String)>, String> {
         let record = match self.func.locals.get(local.index()).map(|local| &local.ty) {
             Some(IrType::Record(record)) => *record,
@@ -2906,7 +2925,75 @@ impl Checker<'_> {
             .chain(path.iter().map(String::as_str))
             .collect();
         let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
-        if leaf_indexed {
+        // Verify every literal selector against the layer it consumes. The
+        // final selector is stored separately from path selectors, but both
+        // participate in the same recursive fixed-vector shape.
+        let mut rid = record;
+        for (position, segment) in segments.iter().enumerate() {
+            let member = self
+                .prog
+                .records
+                .get(rid.index())
+                .and_then(|schema| schema.field(segment))
+                .ok_or_else(|| format!("record path field `{segment}` does not resolve"))?;
+            let last = position + 1 == segments.len();
+            let selected: Vec<&Expr> = mid_indices
+                .iter()
+                .filter(|(p, _)| *p == position)
+                .map(|(_, expr)| expr)
+                .collect();
+            if last {
+                let mut len = member.vec_len;
+                let mut ty = member.ty.clone();
+                for selector in selected.into_iter().chain(index.into_iter()) {
+                    let selected_len = len.ok_or_else(|| {
+                        format!("record path over-indexes fixed-vector field `{segment}`")
+                    })?;
+                    if matches!(selector, Expr::Literal { value, .. } if *value as usize >= selected_len)
+                    {
+                        return Err(format!(
+                            "record path selects `{segment}` out of bounds for length {selected_len}"
+                        ));
+                    }
+                    match ty {
+                        IrType::FixedVec {
+                            elem,
+                            len: inner_len,
+                        } => {
+                            len = Some(inner_len);
+                            ty = *elem;
+                        }
+                        _ => len = None,
+                    }
+                }
+            } else {
+                if selected.len() > 1 {
+                    return Err(format!("record path over-indexes record field `{segment}`"));
+                }
+                if let Some(selector) = selected.first() {
+                    let selected_len = member.vec_len.ok_or_else(|| {
+                        format!("record path indexes non-vector field `{segment}`")
+                    })?;
+                    if matches!(selector, Expr::Literal { value, .. } if *value as usize >= selected_len)
+                    {
+                        return Err(format!(
+                            "record path selects `{segment}` out of bounds for length {selected_len}"
+                        ));
+                    }
+                }
+                let indexed = !selected.is_empty();
+                match member.ty {
+                    IrType::Record(next)
+                        if (member.vec_len.is_none() && !indexed)
+                            || (member.vec_len.is_some() && indexed) =>
+                    {
+                        rid = next
+                    }
+                    _ => return Err(format!("record path cannot traverse `{segment}`")),
+                }
+            }
+        }
+        if index.is_some() {
             if matches!(
                 self.record_path_leaf_type(record, &segments, &positions),
                 Some(IrType::Seq(_))
@@ -2916,6 +3003,10 @@ impl Checker<'_> {
                         .to_string(),
                 );
             }
+            self.record_path_vec_shape(record, &segments, &positions)?
+                .ok_or_else(|| {
+                    "an indexed record leaf has no remaining vector layer".to_string()
+                })?;
             return Ok(None);
         }
         self.record_path_vec_shape(record, &segments, &positions)
@@ -3010,7 +3101,14 @@ impl Checker<'_> {
         for (position, segment) in segments.iter().enumerate() {
             let member = self.prog.records.get(record.index())?.field(segment)?;
             if position + 1 == segments.len() {
-                return Some(member.ty.clone());
+                let mut ty = member.ty.clone();
+                for _ in mid_positions.iter().filter(|p| **p == position) {
+                    ty = match ty {
+                        IrType::FixedVec { elem, .. } => *elem,
+                        _ => return None,
+                    };
+                }
+                return Some(ty);
             }
             let indexed = mid_positions.contains(&position);
             match member.ty {
@@ -3233,10 +3331,10 @@ impl Checker<'_> {
         }
         let record = self.transactor_state_record(instance, field)?;
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-        if mid_indices.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        if mid_indices.windows(2).any(|pair| pair[0].0 > pair[1].0)
             || mid_indices
                 .iter()
-                .any(|(position, _)| *position + 1 >= segments.len())
+                .any(|(position, _)| *position >= segments.len())
         {
             return Err(format!(
                 "transactor state path `{instance}.{field}` has malformed index positions"
@@ -3252,34 +3350,67 @@ impl Checker<'_> {
             let member = schema
                 .field(segment)
                 .ok_or_else(|| format!("record `{}` has no field `{segment}`", schema.name))?;
-            let idx = mid_indices
-                .iter()
-                .find(|(p, _)| *p == position)
-                .map(|(_, e)| e)
-                .or_else(|| (position + 1 == segments.len()).then_some(index).flatten());
-            if let Some(idx) = idx {
-                let len = member
-                    .vec_len
-                    .ok_or_else(|| format!("indexed state path selects non-vector `{segment}`"))?;
-                if matches!(idx, Expr::Literal { value, .. } if *value as usize >= len) {
+            if position + 1 < segments.len() {
+                let selected: Vec<&Expr> = mid_indices
+                    .iter()
+                    .filter(|(p, _)| *p == position)
+                    .map(|(_, e)| e)
+                    .collect();
+                if selected.len() > 1 {
                     return Err(format!(
-                        "indexed state path selects `{segment}` out of bounds for length {len}"
+                        "indexed state path over-indexes record vector `{segment}`"
                     ));
                 }
-            }
-            if position + 1 < segments.len() {
-                let indexed = idx.is_some();
+                let indexed = !selected.is_empty();
+                if let Some(idx) = selected.first() {
+                    let len = member.vec_len.ok_or_else(|| {
+                        format!("indexed state path selects non-vector `{segment}`")
+                    })?;
+                    if matches!(idx, Expr::Literal { value, .. } if *value as usize >= len) {
+                        return Err(format!(
+                            "indexed state path selects `{segment}` out of bounds for length {len}"
+                        ));
+                    }
+                }
                 match member.ty {
                     IrType::Record(next) if member.vec_len.is_none() && !indexed => rid = next,
                     IrType::Record(next) if member.vec_len.is_some() && indexed => rid = next,
                     _ => return Err(format!("indexed state path cannot traverse `{segment}`")),
+                }
+            } else {
+                let mut len = member.vec_len;
+                let mut ty = member.ty.clone();
+                for idx in mid_indices
+                    .iter()
+                    .filter(|(p, _)| *p == position)
+                    .map(|(_, e)| e)
+                    .chain(index.into_iter())
+                {
+                    let selected_len = len.ok_or_else(|| {
+                        format!("indexed state path selects non-vector `{segment}`")
+                    })?;
+                    if matches!(idx, Expr::Literal { value, .. } if *value as usize >= selected_len)
+                    {
+                        return Err(format!(
+                            "indexed state path selects `{segment}` out of bounds for length {selected_len}"
+                        ));
+                    }
+                    match ty {
+                        IrType::FixedVec {
+                            elem,
+                            len: inner_len,
+                        } => {
+                            len = Some(inner_len);
+                            ty = *elem;
+                        }
+                        _ => len = None,
+                    }
                 }
             }
         }
         let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
         let shape = self.record_path_vec_shape(record, &segments, &positions)?;
         if index.is_some() {
-            shape.ok_or_else(|| format!("indexed state path leaf is not a vector"))?;
             Ok(None)
         } else {
             Ok(shape)
@@ -3308,7 +3439,7 @@ impl Checker<'_> {
                 path,
                 mid_indices,
                 index,
-            } => self.record_field_vec_shape(*local, field, path, mid_indices, index.is_some()),
+            } => self.record_field_vec_shape(*local, field, path, mid_indices, index.as_deref()),
             Expr::TransactorStateRecordField {
                 instance,
                 field,
@@ -3502,7 +3633,7 @@ impl Checker<'_> {
                         field,
                         path,
                         mid_indices,
-                        index.is_some(),
+                        index.as_ref(),
                     );
                     let dst_ty = self.record_field_type(*local, field, path, mid_indices);
                     self.check_whole_vec_write_value(
@@ -4945,7 +5076,8 @@ impl Checker<'_> {
     }
     /// `local` must be record-typed and its schema must declare `field`.
     /// `mid_positions` lists the segments (positions in `[field] ++ path`)
-    /// that carry a `Vec<Record, N>` element selection.
+    /// that carry path selections. Repeated leaf positions consume nested
+    /// fixed-vector layers in order.
     fn check_record_field(
         &mut self,
         local: LocalId,
@@ -4957,9 +5089,12 @@ impl Checker<'_> {
         // record schemas: a non-leaf component must reach a nested record
         // to descend into — a plain nested-record field (unindexed), or
         // one element of a `Vec<Record, N>` field (indexed); the leaf may
-        // be any field but never carries a mid index. Fails on an unknown
+        // carry nested fixed-vector selections. Fails on an unknown
         // field, a non-record intermediate, or an index/`Vec` mismatch.
         let ok = (|| -> Option<()> {
+            if mid_positions.windows(2).any(|pair| pair[0] > pair[1]) {
+                return None;
+            }
             let tl = self.func.locals.get(local.index())?;
             let mut rid = match tl.ty {
                 IrType::Record(r) => r,
@@ -4971,12 +5106,33 @@ impl Checker<'_> {
             let last = segs.len() - 1;
             for (i, seg) in segs.iter().enumerate() {
                 let fld = self.prog.records.get(rid.index())?.field(seg)?;
-                let indexed = mid_positions.contains(&i);
+                let index_count = mid_positions.iter().filter(|p| **p == i).count();
+                let indexed = index_count != 0;
                 if i == last {
-                    return (!indexed).then_some(());
+                    let mut len = fld.vec_len;
+                    let mut ty = fld.ty.clone();
+                    for _ in 0..index_count {
+                        len?;
+                        match ty {
+                            IrType::FixedVec {
+                                elem,
+                                len: inner_len,
+                            } => {
+                                len = Some(inner_len);
+                                ty = *elem;
+                            }
+                            _ => len = None,
+                        }
+                    }
+                    return Some(());
                 }
                 match fld.ty {
-                    IrType::Record(r) if fld.vec_len.is_none() == !indexed => rid = r,
+                    IrType::Record(r)
+                        if (fld.vec_len.is_none() && !indexed)
+                            || (fld.vec_len.is_some() && index_count == 1) =>
+                    {
+                        rid = r
+                    }
                     _ => return None,
                 }
             }
@@ -5352,8 +5508,13 @@ impl Checker<'_> {
                 if let Some(idx) = index {
                     self.check_expr(idx, ports_ok, context);
                 }
-                let vec_shape =
-                    self.record_field_vec_shape(*local, field, path, mid_indices, index.is_some());
+                let vec_shape = self.record_field_vec_shape(
+                    *local,
+                    field,
+                    path,
+                    mid_indices,
+                    index.as_deref(),
+                );
                 let ty = self.record_field_type(*local, field, path, mid_indices);
                 match self.whole_collection_shape(vec_shape, ty) {
                     Ok(Some(shape)) if !whole_vec_ok => self.report_bad_whole_vec_use(format!(

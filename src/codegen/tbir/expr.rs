@@ -1988,8 +1988,8 @@ pub(super) fn comp_base_cpp_subst_cx(cx: &ECx<'_>, base: &crate::ir::ComponentBa
 
 /// Render a record-field access chain as a C++ member path:
 /// `base.field[.path…]`, inserting a `[idx]` element selection after any
-/// segment carrying a mid-chain `Vec<Record, N>` index and after the leaf
-/// when `index` is `Some` (a `Vec` element read/write). Shared by the
+/// segment carrying a path index (including repeated nested-vector indexes
+/// at the leaf) and after the leaf when `index` is `Some`. Shared by the
 /// `Expr::RecordField` read and `Stmt::RecordFieldWrite` store emission,
 /// so both sides render one chain shape (`tbl.entries[i].tag`).
 pub(super) fn record_access_cpp(

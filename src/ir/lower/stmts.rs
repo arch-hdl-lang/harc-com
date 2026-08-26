@@ -2338,7 +2338,12 @@ impl FuncBuilder<'_> {
         // `responder.last.addr = ...` (test). Checked before the whole-
         // record `as_transactor_state` write lane, which only fires when
         // there is no further subfield.
-        if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
+        let state_record_chain = if matches!(&*target.kind, ExprKind::Field { .. }) {
+            self.as_transactor_state_record_field(target)?
+        } else {
+            None
+        };
+        if let Some(mut chain) = state_record_chain {
             chain.mid_indices = chain
                 .mid_indices
                 .into_iter()
@@ -3153,6 +3158,24 @@ impl FuncBuilder<'_> {
                 if matches!(chain.leaf_ty, IrType::Seq(_)) {
                     let dotted = format!("{}.{}", chain.field, chain.path.join("."));
                     return Err(super::exprs::dynamic_record_list_index(&dotted));
+                }
+                if let Some(previous) = chain.leaf_index.take() {
+                    let Some(len) = chain.leaf_vec_len else {
+                        return Err(not_implemented(
+                            "indexing past a scalar responder record-state field",
+                            "only nested `Vec<T, N>` layers are indexable",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    };
+                    super::exprs::check_literal_vec_index_bounds(&chain.field, &previous, len)?;
+                    chain.mid_indices.push((chain.path.len() - 1, previous));
+                    match chain.leaf_ty {
+                        IrType::FixedVec { len, ref elem } => {
+                            chain.leaf_vec_len = Some(len);
+                            chain.leaf_ty = (**elem).clone();
+                        }
+                        _ => chain.leaf_vec_len = None,
+                    }
                 }
                 if let Some(len) = chain.leaf_vec_len {
                     chain.mid_indices = chain
