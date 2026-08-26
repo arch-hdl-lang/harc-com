@@ -485,7 +485,7 @@ pub(super) fn component_struct(
                 // sixteenth of each element. v1 emits
                 // `std::array<harc_rt::HarcWide<32>, 4>`, and
                 // `field_scalar_cty` is the seam that says so.
-                let cty = super::field_scalar_cty(&vec.elem);
+                let cty = super::aggregate_value_cty(&vec.elem, records);
                 writeln!(
                     out,
                     "{INDENT}std::array<{cty}, {}> {}{{}};",

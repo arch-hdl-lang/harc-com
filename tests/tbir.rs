@@ -39978,15 +39978,10 @@ end impl T"#
         assert!(msg.contains("out of range"), "{msg}");
     }
 
-    // A record leaf, a `default`, a whole-vec copy, and a three-level
-    // index all stay refused — each is out of v1's supported subset or
-    // this batch's cut line.
+    // A `default`, a whole-vec copy, and a three-level index stay refused —
+    // each is out of the supported subset or this batch's cut line. Record
+    // leaves are now valid component storage and are covered separately.
     let refused = [
-        (
-            "struct B\n    a : uint<8>\nend struct B\n",
-            "v : Vec<Vec<B, 2>, 2>",
-            "n = n + 1",
-        ),
         ("", "v : Vec<Vec<uint<8>, 2>, 2> default {}", "n = n + 1"),
         (
             "",
@@ -40751,16 +40746,17 @@ end impl T"#;
     );
 }
 
-/// A record-element fixed-vector component field (`v : Vec<Beat, 2>`, or a
-/// nested `Vec<Vec<Beat, 2>, 2>`) is refused honestly, not pointed at
-/// `--codegen v1`: v1 does not recognize a record-element `Vec` field and
-/// falls back to a scalar `uint64_t` member, so any element access
-/// subscripts the scalar and g++ refuses (`invalid types 'uint64_t[int]'
-/// for array subscript` — measured uniform on scoreboard / agent / env).
-/// Scalar-element fixed vectors are unaffected (they lower).
+/// Component fixed vectors carry record leaves directly or through a nested
+/// fixed vector. This is a TBIR capability: v1 misdeclares these fields as a
+/// scalar, but the retiring backend does not constrain the typed IR surface.
 #[test]
-fn a_record_element_fixed_vector_field_is_refused_without_a_false_v1_promise() {
+fn record_element_fixed_vector_component_fields_lower_and_emit() {
     let mk = |kind: &str, elem: &str| {
+        let body = if elem == "Beat" {
+            "v[0] = b\n        let got : Beat = v[0]"
+        } else {
+            "v[0][1] = b\n        let got : Beat = v[0][1]"
+        };
         format!(
             r#"struct Beat
     p : uint<8>
@@ -40769,6 +40765,10 @@ end struct Beat
     v : Vec<{elem}, 2>
     n : uint<32> default 0
     hookable put(x: uint<8>)
+        let b : Beat
+        b.p = x
+        {body}
+        assert got.p == x else fail("record vector read/write failed")
         n = n + 1
     end put
 end {kind} Sb
@@ -40785,18 +40785,48 @@ end impl T"#
     };
     for kind in ["scoreboard", "agent", "env"] {
         for elem in ["Beat", "Vec<Beat, 2>"] {
-            let err = lower_src(&mk(kind, elem))
-                .err()
-                .unwrap_or_else(|| panic!("[{kind}] `Vec<{elem}, 2>` must be refused"));
-            let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-            assert!(
-                !msg.contains("re-run with `--codegen v1`"),
-                "[{kind}/{elem}] must not promise v1 works: {msg}"
-            );
+            let src = mk(kind, elem);
+            let prog = lower_src(&src)
+                .unwrap_or_else(|e| panic!("[{kind}] `Vec<{elem}, 2>` lowers: {e}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("[{kind}] `Vec<{elem}, 2>` verifies: {e:?}"));
+            let cpp = emit_cpp_src(&src);
+            let expected = if elem == "Beat" {
+                "std::array<Beat, 2> v{};"
+            } else {
+                "std::array<std::array<Beat, 2>, 2> v{};"
+            };
+            assert!(cpp.contains(expected), "[{kind}/{elem}] {cpp}");
+            let access = if elem == "Beat" {
+                "self.v[0] = b;"
+            } else {
+                "self.v[0][1] = b;"
+            };
+            assert!(cpp.contains(access), "[{kind}/{elem}] {cpp}");
+
+            let mut broken = prog.clone();
+            let component = broken
+                .components
+                .iter_mut()
+                .find(|component| component.name == "Sb")
+                .unwrap();
+            let ir::ComponentFieldKind::FixedVec(vec) = &mut component
+                .fields
+                .iter_mut()
+                .find(|field| field.name == "v")
+                .unwrap()
+                .kind
+            else {
+                panic!("v remains a fixed vector");
+            };
+            let leaf = if let ir::IrType::FixedVec { elem, .. } = &mut vec.elem {
+                elem
+            } else {
+                &mut vec.elem
+            };
+            *leaf = ir::IrType::Record(ir::RecordId(999));
+            assert!(verify::verify_program(&broken).is_err(), "bad record ref is rejected");
         }
-        // No regression: a scalar-element fixed vector still lowers.
-        lower_src(&mk(kind, "uint<8>"))
-            .unwrap_or_else(|e| panic!("[{kind}] scalar Vec lowers: {e}"));
     }
 }
 

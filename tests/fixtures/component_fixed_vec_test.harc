@@ -9,6 +9,8 @@ end struct TableBundle
 scoreboard FixedTable
     words  : Vec<uint<64>, 4>
     valids : Vec<uint<1>, 4>
+    direct : Vec<TableKid, 4>
+    nested : Vec<Vec<TableKid, 2>, 2>
     bundle : TableBundle
 
     hookable store(index: uint<32>, value: uint<64>)
