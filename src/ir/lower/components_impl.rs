@@ -3034,6 +3034,7 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
 /// Resolve the `<T>` inside a `queue<T>` component-field element to its
 /// `QueueElem`. Mirrors `lower_event_payload`:
 ///   * a scalar (`uint<W>`/`sint<W>`/`bool`) → `Scalar { ty }`;
+///   * a fixed vector over scalar leaves → `FixedVec` (carried by value);
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value).
 ///
 /// A scalar element parses as `TypeArg::Type`; a user-named record element
@@ -3054,17 +3055,19 @@ pub(crate) fn lower_queue_elem(
             return not_implemented(
                 &format!("an enum queue element `{named}` on `{comp}.{fname}`"),
                 format!(
-                    "only `queue<scalar>` and `queue<transaction|struct>` elements are \
-                     lowered; v1 emits `{named}` as the `HarcQueue` element type and \
-                     declares no C++ enum, so its output does not compile either"
+                    "lowered queue elements are scalars, declared transaction/struct records, \
+                     and fully specified scalar fixed vectors; v1 emits `{named}` as the \
+                     `HarcQueue` element type and declares no C++ enum, so its output does not \
+                     compile either"
                 ),
                 V1Status::EmitsUncompilable,
             );
         }
         unsupported(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
-            "only `queue<scalar>` and `queue<transaction|struct>` elements are \
-             lowered; enum/Vec/nested elements gate on a later slice",
+            "lowered queue elements are scalars, declared transaction/struct records, and \
+             fully specified `Vec<scalar, N>` values (including nested scalar vectors); \
+             this element shape has no typed queue representation yet",
         )
     };
     match arg {
@@ -3075,6 +3078,9 @@ pub(crate) fn lower_queue_elem(
                 if let Some(rid) = record_ids.get(name) {
                     return Ok(QueueElem::Record(*rid));
                 }
+            }
+            if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
+                return Ok(QueueElem::FixedVec { elem, len });
             }
             match decoded_scalar_ir_type(ty) {
                 Some(ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)) => {
@@ -3093,13 +3099,15 @@ pub(crate) fn lower_queue_elem(
             }
             Err(unsupported(
                 &format!("a non-identifier queue element on `{comp}.{fname}`"),
-                "only `queue<scalar>` and `queue<transaction|struct>` elements are lowered",
+                "use a scalar, declared transaction/struct record, or fully specified \
+                 `Vec<scalar, N>` element type",
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
         None => Err(unsupported(
             &format!("a `queue` with no element type on `{comp}.{fname}`"),
-            "declare the element type: `queue<uint<W>>` / `queue<Record>`",
+            "declare the element type: `queue<uint<W>>`, `queue<Record>`, or \
+             `queue<Vec<scalar, N>>`",
         )),
     }
 }

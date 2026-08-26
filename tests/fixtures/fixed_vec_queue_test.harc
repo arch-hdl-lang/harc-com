@@ -1,0 +1,26 @@
+// A fixed-vector queue element is carried by value with its full nested
+// std::array layout. Aggregate construction remains intentionally separate;
+// this runtime fixture exercises the safe empty-state size/empty surface under
+// both emitters, while the lowering test covers inferred aggregate pop typing.
+
+scoreboard FixedVecQueueSb
+    values : queue<Vec<Vec<uint<8>, 2>, 3>>
+
+    hookable exercise()
+        assert values.size() == 0 else fail("fixed-vector queue did not start empty")
+        assert values.empty() else fail("fixed-vector queue did not report empty")
+    end exercise
+end scoreboard FixedVecQueueSb
+
+testbench FixedVecQueueTb
+    dut : Top
+    sb : FixedVecQueueSb
+end testbench FixedVecQueueTb
+
+impl FixedVecQueueTest for FixedVecQueueTb
+    run
+        sb.exercise()
+        log(info, "PASS: fixed-vector queue retained aggregate storage and empty state")
+        wait 1 cycle
+    end run
+end impl FixedVecQueueTest

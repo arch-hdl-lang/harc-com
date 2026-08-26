@@ -707,7 +707,7 @@ pub enum ScoreboardFieldKind {
     },
     /// `expected : queue<uint<32>>` / `errors : queue<CheckerError>` — a
     /// FIFO whose element is an exact scalar type through the 1024-bit
-    /// language ceiling or a value-record.
+    /// language ceiling, a scalar-leaf fixed vector, or a value-record.
     Queue { elem: QueueElem },
 }
 
@@ -719,10 +719,10 @@ pub enum ScoreboardScalarDefault {
     Wide(Vec<u32>),
 }
 
-/// The element type of a `queue<T>` field: an exact scalar IR type, or a
-/// value-record carried by struct. Shared by testbenches, scoreboards,
-/// composite components, and transactor state so every queue owner uses one
-/// storage descriptor.
+/// The element type of a `queue<T>` field: an exact scalar IR type, a
+/// scalar-leaf fixed vector, or a value-record carried by struct. Shared by
+/// testbenches, scoreboards, composite components, and transactor state so
+/// every queue owner uses one storage descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
     /// `queue<uint<256>>` / `queue<sint<65>>` / `queue<bool>` — the exact
@@ -730,6 +730,10 @@ pub enum QueueElem {
     /// the width-aware C++ storage mapping (`uint64_t`, `_harc_u128`, or
     /// `HarcWide<N>`).
     Scalar { ty: IrType },
+    /// `queue<Vec<uint<8>, 4>>` — a fixed-size aggregate carried by value.
+    /// The element schema is recursive, so nested scalar vectors retain
+    /// their exact `std::array` layout rather than flattening to a scalar.
+    FixedVec { elem: Box<IrType>, len: usize },
     /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
     /// `TbProgram::records`; the C++ element type is the record struct.
     Record(RecordId),
@@ -742,6 +746,10 @@ impl QueueElem {
     pub fn ir_type(&self) -> IrType {
         match self {
             Self::Scalar { ty } => ty.clone(),
+            Self::FixedVec { elem, len } => IrType::FixedVec {
+                elem: elem.clone(),
+                len: *len,
+            },
             Self::Record(record) => IrType::Record(*record),
         }
     }

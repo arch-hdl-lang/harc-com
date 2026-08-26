@@ -2578,6 +2578,13 @@ fn declare_locals_except(
                 })?;
                 writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
             }
+            IrType::FixedVec { ref elem, len } => {
+                let cty = super::field_scalar_cty(&IrType::FixedVec {
+                    elem: elem.clone(),
+                    len,
+                });
+                writeln!(out, "{pad}{cty} {n}{{}}; (void){n};").ok();
+            }
             // A scalar-element transaction-sequence local —
             // `std::vector<T>` over the scalar C++ type. v1's tseq scalar
             // accumulator / call-result shape.

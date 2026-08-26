@@ -30,6 +30,9 @@ impl Display for TbProgram {
                     TbStateFieldSchema::Queue(qf) => {
                         let elem = match &qf.elem {
                             QueueElem::Scalar { ty } => type_str(ty),
+                            QueueElem::FixedVec { elem, len } => {
+                                format!("Vec<{}, {len}>", type_str(elem))
+                            }
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         write!(f, " queue {}:{elem}", qf.name)?;
@@ -185,6 +188,9 @@ impl Display for TbProgram {
                     crate::ir::StateFieldKind::Queue { elem } => {
                         let e = match elem {
                             crate::ir::QueueElem::Scalar { ty } => type_str(ty),
+                            crate::ir::QueueElem::FixedVec { elem, len } => {
+                                format!("Vec<{}, {len}>", type_str(elem))
+                            }
                             crate::ir::QueueElem::Record(r) => format!("rec{}", r.index()),
                         };
                         writeln!(f, "    state {} : queue<{}>", sf.name, e)?;
@@ -278,6 +284,9 @@ impl Display for TbProgram {
                         use crate::ir::QueueElem;
                         let inner = match elem {
                             QueueElem::Scalar { ty } => type_str(ty),
+                            QueueElem::FixedVec { elem, len } => {
+                                format!("Vec<{}, {len}>", type_str(elem))
+                            }
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         format!("queue<{inner}>")
