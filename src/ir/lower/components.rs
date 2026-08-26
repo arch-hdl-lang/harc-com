@@ -74,7 +74,10 @@ pub(crate) fn transactor_is_active_only_consumer(t: &crate::ast::TransactorDecl)
                 item,
                 crate::ast::ComponentItem::Field(field)
                     if implementation::is_event_field(field)
-                        && matches!(field.direction, Some(crate::ast::Direction::In))
+                        && matches!(
+                            field.direction,
+                            Some(crate::ast::Direction::In | crate::ast::Direction::InOut)
+                        )
                         && field.name.name == event
             )
         })
