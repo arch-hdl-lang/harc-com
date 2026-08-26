@@ -40830,6 +40830,206 @@ end impl T"#
     }
 }
 
+#[test]
+fn fixed_vector_event_payloads_lower_verify_and_emit() {
+    let src = r#"agent Sink
+    incoming : in event<Vec<uint<8>, 4>>
+    forwarded : out event<Vec<uint<8>, 4>>
+    values : Vec<uint<8>, 4>
+    seen : uint<32> default 0
+
+    hookable publish()
+        emit incoming(values)
+    end publish
+
+    on incoming(values)
+        emit forwarded(values)
+        seen = seen + 1
+    end on
+end agent Sink
+
+testbench Tb
+    dut : Top
+    sink : Sink
+end testbench Tb
+
+impl T for Tb
+    run
+        let unused : event<Vec<uint<8>, 4>>
+        sink.publish()
+        assert sink.seen == 1 else fail("fixed-vector event payload was not delivered")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("fixed-vector event payload lowers");
+    verify::verify_program(&prog).expect("fixed-vector event payload verifies");
+    let mut unused_local_schema = prog.clone();
+    let payload = unused_local_schema
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.locals)
+        .find_map(|local| match &mut local.ty {
+            ir::IrType::Event(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("fixture has an unused local event schema");
+    *payload = ir::EventPayload::FixedVec {
+        boolean: false,
+        signed: false,
+        width: None,
+        len: 4,
+    };
+    assert!(
+        verify::verify_program(&unused_local_schema).is_err(),
+        "unused local event schemas are validated"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::function<void(std::array<uint64_t, 4>)>> incoming;"),
+        "{cpp}"
+    );
+    assert!(cpp.contains("_s(self.values)"), "{cpp}");
+    assert!(
+        cpp.contains("Sink_on_h1 = [&](Sink& self, std::array<uint64_t, 4> values)"),
+        "{cpp}"
+    );
+
+    let mismatch = src.replace("values : Vec<uint<8>, 4>", "values : Vec<uint<8>, 3>");
+    let err = lower_src(&mismatch).expect_err("event vectors require an exact length match");
+    assert!(assert_invalid(&err).contains("does not match fixed-vector payload"));
+
+    let width_mismatch =
+        src.replace("values : Vec<uint<8>, 4>", "values : Vec<uint<16>, 4>");
+    let err = lower_src(&width_mismatch)
+        .expect_err("event vectors require an exact element-width match");
+    assert!(assert_invalid(&err).contains("does not match fixed-vector payload"));
+
+    let mut verifier_width_mismatch = prog.clone();
+    let sink = verifier_width_mismatch
+        .components
+        .iter_mut()
+        .find(|component| component.name == "Sink")
+        .unwrap();
+    let ir::ComponentFieldKind::FixedVec(values) = &mut sink
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "values")
+        .unwrap()
+        .kind
+    else {
+        panic!("values remains a fixed vector");
+    };
+    values.elem = ir::IrType::UInt(Some(16));
+    assert!(
+        verify::verify_program(&verifier_width_mismatch).is_err(),
+        "verifier rejects equal-carrier but unequal-width event emission"
+    );
+
+    for invalid_payload in [
+        ir::EventPayload::FixedVec {
+            boolean: true,
+            signed: true,
+            width: None,
+            len: 4,
+        },
+        ir::EventPayload::FixedVec {
+            boolean: true,
+            signed: false,
+            width: Some(1),
+            len: 4,
+        },
+        ir::EventPayload::FixedVec {
+            boolean: false,
+            signed: false,
+            width: None,
+            len: 4,
+        },
+        ir::EventPayload::FixedVec {
+            boolean: false,
+            signed: false,
+            width: Some(0),
+            len: 4,
+        },
+        ir::EventPayload::FixedVec {
+            boolean: false,
+            signed: false,
+            width: Some(2048),
+            len: 4,
+        },
+        ir::EventPayload::FixedVec {
+            boolean: false,
+            signed: false,
+            width: Some(8),
+            len: 0,
+        },
+    ] {
+        let mut broken = prog.clone();
+        let sink = broken
+            .components
+            .iter_mut()
+            .find(|component| component.name == "Sink")
+            .unwrap();
+        let ir::ComponentFieldKind::Event { payload } = &mut sink
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "incoming")
+            .unwrap()
+            .kind
+        else {
+            panic!("incoming remains an event");
+        };
+        *payload = invalid_payload;
+        assert!(
+            verify::verify_program(&broken).is_err(),
+            "invalid event payload metadata {invalid_payload:?} is rejected at schema level"
+        );
+    }
+
+    let wide = src.replace("uint<8>", "uint<128>");
+    let wide_cpp = emit_cpp_src(&wide);
+    assert!(
+        wide_cpp.contains("std::function<void(std::array<_harc_u128, 4>)>"),
+        "{wide_cpp}"
+    );
+    let bool_cpp = emit_cpp_src(&src.replace("uint<8>", "bool"));
+    assert!(
+        bool_cpp.contains("std::function<void(std::array<bool, 4>)>"),
+        "{bool_cpp}"
+    );
+    let signed_cpp = emit_cpp_src(&src.replace("uint<8>", "sint<8>"));
+    assert!(
+        signed_cpp.contains("std::function<void(std::array<int64_t, 4>)>"),
+        "{signed_cpp}"
+    );
+
+    let connected = r#"transactor Source
+    observed : out event<Vec<uint<8>, 4>>
+end transactor Source
+scoreboard Collector
+    hookable collect(values: Vec<uint<8>, 4>)
+    end collect
+end scoreboard Collector
+env E
+    source : Source passive
+    collector : Collector
+    connect
+        source.observed -> collector.collect
+    end connect
+end env E
+testbench CTb
+    dut : Top
+    env : E
+end testbench CTb
+impl CT for CTb
+    run
+        wait 1 cycle
+    end run
+end impl CT"#;
+    let connected = lower_src(connected).expect("fixed-vector event connects to matching hookable");
+    verify::verify_program(&connected).expect("fixed-vector event connect verifies");
+}
+
 /// A wrapping operator (`+%`/`-%`/`*%`) at operand width > 64 is refused
 /// honestly, not pointed at `--codegen v1`: v1 has its own identical gate
 /// and refuses it too (`Rejects` — v1 emits no C++). A wrapping op at 64

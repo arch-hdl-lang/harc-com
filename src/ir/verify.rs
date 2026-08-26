@@ -1008,6 +1008,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for field in &component.fields {
+            if let ComponentFieldKind::Event { payload } = field.kind {
+                if let Err(detail) = verify_event_payload_ref(prog, payload) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} field `{}` event payload {detail}",
+                            field.name
+                        ),
+                    });
+                }
+            }
             if let ComponentFieldKind::Queue { elem } = &field.kind {
                 verify_queue_elem_schema(
                     elem,
@@ -1577,6 +1587,15 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 what: format!("fn at index {i} carries id fn{}", func.id.0),
             });
         }
+        for (local, schema) in func.locals.iter().enumerate() {
+            if let IrType::Event(payload) = schema.ty {
+                if let Err(detail) = verify_event_payload_ref(prog, payload) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!("fn{} local %{local} event payload {detail}", func.id.0),
+                    });
+                }
+            }
+        }
         if let Err(mut e) = verify_function(prog, func) {
             errs.append(&mut e);
         }
@@ -1984,6 +2003,9 @@ fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool 
         (_, IrType::Unknown) => true,
         (EventPayload::Scalar { .. }, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
+            payload.value_ir_type() == *ty
+        }
         _ => false,
     }
 }
@@ -1993,15 +2015,45 @@ fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> boo
         (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
         (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
+            payload.value_ir_type() == *ty
+        }
         _ => false,
     }
 }
 
 fn verify_event_payload_ref(prog: &TbProgram, payload: EventPayload) -> Result<(), String> {
-    if let EventPayload::Record(record) = payload {
-        if record.index() >= prog.records.len() {
+    match payload {
+        EventPayload::Record(record) if record.index() >= prog.records.len() => {
             return Err(format!("references missing record r{}", record.0));
         }
+        EventPayload::FixedVec {
+            boolean,
+            signed,
+            width,
+            len,
+        } => {
+            if len == 0 {
+                return Err("has a zero-length fixed-vector payload".to_string());
+            }
+            let valid_elem = if boolean {
+                !signed && width.is_none()
+            } else {
+                let ty = if signed {
+                    IrType::SInt(width)
+                } else {
+                    IrType::UInt(width)
+                };
+                width.is_some_and(|width| width > 0)
+                    && crate::ir::lower::components::field_scalar_width_ok(&ty)
+            };
+            if !valid_elem {
+                return Err(format!(
+                    "has invalid fixed-vector element metadata boolean={boolean}, signed={signed}, width={width:?}"
+                ));
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2431,6 +2483,27 @@ impl Checker<'_> {
         expr: &Expr,
         context: &'static str,
     ) {
+        if matches!(payload, EventPayload::FixedVec { .. }) {
+            if self.contains_invalid_record_composition(expr) {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} {context} contains an invalid record composition",
+                        self.fid.0, self.bid.0
+                    ),
+                });
+            }
+            self.check_expr_inner(expr, false, context, true);
+            let actual = self.expr_whole_vec_type(expr).ok().flatten();
+            if actual != Some(payload.value_ir_type()) {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} {context} has aggregate type {actual:?}, incompatible with payload {payload:?}",
+                        self.fid.0, self.bid.0
+                    ),
+                });
+            }
+            return;
+        }
         self.check_expr(expr, false, context);
         let actual = self
             .aggregate_assignment_expr_type(expr)
@@ -3531,6 +3604,45 @@ impl Checker<'_> {
             ),
             _ => Ok(None),
         }
+    }
+
+    /// Exact whole-vector type for payload compatibility. The shape helper
+    /// intentionally collapses scalar widths that share a C++ carrier;
+    /// event schemas retain declared element width and signedness.
+    fn expr_whole_vec_type(&self, expr: &Expr) -> Result<Option<IrType>, String> {
+        if let Expr::Local(local) = expr {
+            return Ok(self
+                .func
+                .locals
+                .get(local.index())
+                .map(|local| local.ty.clone())
+                .filter(|ty| matches!(ty, IrType::FixedVec { .. })));
+        }
+        let Some((len, _)) = self.expr_whole_vec_shape(expr)? else {
+            return Ok(None);
+        };
+        let elem = match expr {
+            Expr::ComponentField { base, field } => self.component_field_type(base, field),
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                index: None,
+            } => self.record_field_type(*local, field, path, mid_indices),
+            Expr::TransactorStateRecordField {
+                instance,
+                field,
+                path,
+                mid_indices,
+                index: None,
+            } => self.transactor_state_record_field_type(instance, field, path, mid_indices),
+            _ => None,
+        };
+        Ok(elem.map(|elem| IrType::FixedVec {
+            elem: Box::new(elem),
+            len,
+        }))
     }
 
     fn whole_collection_shape(

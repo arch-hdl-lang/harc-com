@@ -312,6 +312,7 @@ impl Display for TbProgram {
                                 .map(|t| type_str(&t))
                                 .unwrap_or_else(|| "uint".to_string()),
                             EventPayload::Record(r) => self.records[r.index()].name.clone(),
+                            EventPayload::FixedVec { .. } => type_str(&payload.value_ir_type()),
                         };
                         format!("out event<{inner}>")
                     }
@@ -630,6 +631,9 @@ fn type_str(t: &IrType) -> String {
                     .unwrap_or_else(|| "uint".to_string())
             ),
             EventPayload::Record(r) => format!("event<r{}>", r.0),
+            EventPayload::FixedVec { .. } => {
+                format!("event<{}>", type_str(&p.value_ir_type()))
+            }
         },
         IrType::Bool => "bool".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),

@@ -1,0 +1,26 @@
+agent FixedVecEventSink
+    incoming : in event<Vec<uint<8>, 4>>
+    values : Vec<uint<8>, 4>
+    seen : uint<32> default 0
+
+    hookable publish()
+        emit incoming(values)
+    end publish
+
+    on incoming(payload)
+        seen = seen + 1
+    end on
+end agent FixedVecEventSink
+
+testbench FixedVecEventTb
+    dut : Top
+    sink : FixedVecEventSink
+end testbench FixedVecEventTb
+
+impl FixedVecEventPayloadTest for FixedVecEventTb
+    run
+        sink.publish()
+        assert sink.seen == 1 else fail("fixed-vector event payload was not delivered")
+        wait 1 cycle
+    end run
+end impl FixedVecEventPayloadTest

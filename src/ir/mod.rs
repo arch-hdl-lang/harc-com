@@ -1407,6 +1407,13 @@ pub enum EventPayload {
     /// would cost `IrType` its `Copy`. The pair of fields says the same
     /// thing for the scalar case without the cycle.
     Scalar { signed: bool, width: Option<u32> },
+    /// `event<Vec<uint<8>, 4>>` — one fixed-size vector of scalar values.
+    FixedVec {
+        boolean: bool,
+        signed: bool,
+        width: Option<u32>,
+        len: usize,
+    },
     /// `event<TinyTxn>` — a value-record payload. `RecordId` indexes
     /// `TbProgram::records`; the C++ payload type is the record struct.
     Record(RecordId),
@@ -1425,6 +1432,29 @@ impl EventPayload {
                 IrType::UInt(*width)
             }),
             EventPayload::Record(_) => None,
+            EventPayload::FixedVec { .. } => None,
+        }
+    }
+
+    pub fn value_ir_type(&self) -> IrType {
+        match self {
+            EventPayload::Scalar { .. } => self.scalar_ir_type().expect("scalar payload"),
+            EventPayload::Record(record) => IrType::Record(*record),
+            EventPayload::FixedVec {
+                signed,
+                boolean,
+                width,
+                len,
+            } => IrType::FixedVec {
+                elem: Box::new(if *boolean {
+                    IrType::Bool
+                } else if *signed {
+                    IrType::SInt(*width)
+                } else {
+                    IrType::UInt(*width)
+                }),
+                len: *len,
+            },
         }
     }
 }
