@@ -800,13 +800,13 @@ pub(crate) fn lower_component_schema(
                     let param_tys = h
                         .params
                         .iter()
-                        .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids))
+                        .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids, true))
                         .collect();
                     let has_ret = h.return_ty.is_some();
                     let ret_ty = h
                         .return_ty
                         .as_ref()
-                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids));
+                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids, false));
                     let fid = FunctionId(*next_fn);
                     *next_fn += 1;
                     methods.push(ComponentMethodSchema {
@@ -2289,6 +2289,11 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
     if let Some(seq) = helpers::tseq_ir_type(ty, &ctx.record_ids) {
         return seq;
     }
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        ty.and_then(|ty| fixed_vec_elem_ir_type_with_records(ty, &ctx.record_ids))
+    {
+        return fixed;
+    }
     // A record-typed component/scoreboard method parameter
     // (`observe(cmd: Cmd)`) is a by-value transaction/struct, not a
     // component/module handle. Resolve it before the component-typed
@@ -2323,9 +2328,17 @@ fn method_schema_ir_type(
     ty: Option<&TypeExpr>,
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,
+    allow_fixed_vec: bool,
 ) -> IrType {
     if let Some(seq) = helpers::tseq_ir_type(ty, record_ids) {
         return seq;
+    }
+    if allow_fixed_vec {
+        if let Some(fixed @ IrType::FixedVec { .. }) =
+            ty.and_then(|ty| fixed_vec_elem_ir_type_with_records(ty, record_ids))
+        {
+            return fixed;
+        }
     }
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -3139,7 +3152,8 @@ pub(crate) fn v1_leaves_the_type_name_undeclared(
 /// subset:
 ///   * a scalar (`uint<W>`/`sint<W>`/`bool`, width per
 ///     `field_scalar_width_ok`) → `Scalar`;
-///   * a recursively nested fixed vector with scalar leaves → `FixedVec`;
+///   * a recursively nested fixed vector with scalar or record leaves →
+///     `FixedVec`;
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value
 ///     as the record struct, matching v1's `std::function<void(Txn)>`).
 ///
@@ -3147,8 +3161,6 @@ pub(crate) fn v1_leaves_the_type_name_undeclared(
 /// payload parses as a bare identifier — `TypeArg::Expr(Ident)` (the
 /// common case) or `TypeArg::Named`. A named type that is neither a
 /// scalar nor a known record (enum / unknown) is rejected precisely.
-/// Fixed vectors with record leaves remain unsupported and gate on a later
-/// slice.
 pub(crate) fn lower_event_payload(
     comp: &str,
     fname: &str,
@@ -3174,7 +3186,7 @@ pub(crate) fn lower_event_payload(
         not_implemented(
             &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                "only event<scalar>, recursively nested event<Vec<scalar-or-record, N>>, and \
                  event<transaction|struct> payloads are lowered \
                  ({}); v1 emits `{named}` as the subscriber's parameter type and declares \
                  no C++ enum, so its output does not compile either",
@@ -3190,9 +3202,9 @@ pub(crate) fn lower_event_payload(
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                "only event<scalar>, recursively nested event<Vec<scalar-or-record, N>>, and \
                  event<transaction|struct> payloads are lowered \
-                 ({}); enum and record-vector payloads gate on a later slice",
+                 ({}); enum and other unresolved named payloads remain unsupported",
                 scalar_width_detail()
             ),
         )
@@ -3214,7 +3226,9 @@ pub(crate) fn lower_event_payload(
             // only v1 emits `void(bool)`. `width: Some(1)` would mean
             // `uint<1>`, which is a different declared type, so `None`
             // is the only honest thing the pair can say here.
-            if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
+            if let Some(IrType::FixedVec { elem, len }) =
+                fixed_vec_elem_ir_type_with_records(ty, record_ids)
+            {
                 return Ok(EventPayload::FixedVec { elem, len });
             }
             match event_payload_scalar_ir_type(ty) {
@@ -3244,7 +3258,7 @@ pub(crate) fn lower_event_payload(
             Err(unsupported(
                 &format!("a non-identifier event payload on `{comp}.{fname}`"),
                 format!(
-                    "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                    "only event<scalar>, recursively nested event<Vec<scalar-or-record, N>>, and \
                      event<transaction|struct> payloads are lowered \
                      ({})",
                     scalar_width_detail()

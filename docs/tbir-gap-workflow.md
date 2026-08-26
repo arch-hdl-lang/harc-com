@@ -102,6 +102,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Nested scalar fixed-vector event payloads, retaining every recursive
   `std::array` dimension through event schemas, handlers, emits, connects, and
   test-scope channels.
+- [x] Record-leaf fixed-vector event payloads, including recursively nested
+  vectors, with resolved record IDs carried through schemas, handlers, emits,
+  connects, verifier checks, and C++ callback signatures.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -326,6 +329,9 @@ not applicable before requesting review:
    (`uint`/`UInt`/`bits`, `sint`/`SInt`) and 32-bit builtin-`int` packed widths;
    this also routes around the shared constructor,
    so that slice does not change the count.
+   Nested scalar and record-leaf fixed-vector event payloads similarly route
+   around the shared non-scalar event constructor. The current raw inventory
+   remains 119 textual matches (118 constructors plus the helper definition).
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently

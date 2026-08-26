@@ -41057,6 +41057,206 @@ end impl CT"#;
     verify::verify_program(&nested_connected).expect("nested vector event connect verifies");
 }
 
+#[test]
+fn record_fixed_vector_event_payloads_lower_verify_and_emit() {
+    let src = r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+
+agent Sink
+    incoming : in event<Vec<Beat, 4>>
+    forwarded : out event<Vec<Beat, 4>>
+    values : Vec<Beat, 4>
+    seen : uint<32> default 0
+
+    hookable publish()
+        emit incoming(values)
+    end publish
+
+    on incoming(payload)
+        emit forwarded(payload)
+        seen = seen + 1
+    end on
+end agent Sink
+
+testbench Tb
+    dut : Top
+    sink : Sink
+end testbench Tb
+
+impl T for Tb
+    run
+        let unused : event<Vec<Beat, 4>>
+        sink.publish()
+        assert sink.seen == 1 else fail("record fixed-vector event payload was not delivered")
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("record fixed-vector event payload lowers");
+    verify::verify_program(&prog).expect("record fixed-vector event payload verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::function<void(std::array<Beat, 4>)>"),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("Sink_on_h1 = [&](Sink& self, std::array<Beat, 4> payload)"),
+        "{cpp}"
+    );
+
+    let nested = src.replace("Vec<Beat, 4>", "Vec<Vec<Beat, 2>, 4>");
+    let nested_prog = lower_src(&nested).expect("nested record-vector event payload lowers");
+    verify::verify_program(&nested_prog).expect("nested record-vector event payload verifies");
+    let nested_cpp = emit_cpp_src(&nested);
+    assert!(
+        nested_cpp.contains(
+            "std::function<void(std::array<std::array<Beat, 2>, 4>)>"
+        ),
+        "{nested_cpp}"
+    );
+
+    let mut broken = prog.clone();
+    let sink = broken
+        .components
+        .iter_mut()
+        .find(|component| component.name == "Sink")
+        .unwrap();
+    let ir::ComponentFieldKind::Event { payload } = &mut sink
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "incoming")
+        .unwrap()
+        .kind
+    else {
+        panic!("incoming remains an event");
+    };
+    *payload = ir::EventPayload::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 4,
+    };
+    assert!(
+        verify::verify_program(&broken).is_err(),
+        "missing record references in event vector schemas are rejected"
+    );
+
+    let connected = r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+transactor Source
+    observed : out event<Vec<Vec<Beat, 2>, 4>>
+end transactor Source
+scoreboard Collector
+    hookable collect(values: Vec<Vec<Beat, 2>, 4>)
+    end collect
+end scoreboard Collector
+env E
+    source : Source passive
+    collector : Collector
+    connect
+        source.observed -> collector.collect
+    end connect
+end env E
+testbench CTb
+    dut : Top
+    env : E
+end testbench CTb
+impl CT for CTb
+    run
+        wait 1 cycle
+    end run
+end impl CT"#;
+    let connected_cpp = emit_cpp_src(connected);
+    assert!(
+        connected_cpp.contains("std::array<std::array<Beat, 2>, 4> values"),
+        "{connected_cpp}"
+    );
+    let connected =
+        lower_src(connected).expect("nested record-vector event connects to matching hookable");
+    verify::verify_program(&connected).expect("nested record-vector event connect verifies");
+
+    let mut broken_local = connected.clone();
+    let function = broken_local
+        .components
+        .iter()
+        .find(|component| component.name == "Collector")
+        .unwrap()
+        .methods
+        .iter()
+        .find(|method| method.name == "collect")
+        .unwrap()
+        .function;
+    broken_local.functions[function.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&broken_local).is_err(),
+        "hookable parameter locals must mirror the method ABI schema"
+    );
+
+    let mut broken_method = connected.clone();
+    let bad_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::FixedVec {
+            elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+            len: 2,
+        }),
+        len: 4,
+    };
+    let function = {
+        let collector = broken_method
+            .components
+            .iter_mut()
+            .find(|component| component.name == "Collector")
+            .unwrap();
+        let method = collector
+            .methods
+            .iter_mut()
+            .find(|method| method.name == "collect")
+            .unwrap();
+        method.param_tys[0] = bad_ty.clone();
+        method.function
+    };
+    let function = &mut broken_method.functions[function.index()];
+    function.params[0].ty = bad_ty.clone();
+    function.locals[0].ty = bad_ty;
+    assert!(
+        verify::verify_program(&broken_method).is_err(),
+        "missing record references in hookable vector parameters are rejected"
+    );
+
+    let aggregate_return = r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+scoreboard Returns
+    hookable unsupported_return() -> Vec<Beat, 4>
+    end unsupported_return
+end scoreboard Returns
+testbench RTb
+    dut : Top
+    returns : Returns
+end testbench RTb
+impl RT for RTb
+    run
+        wait 1 cycle
+    end run
+end impl RT"#;
+    let aggregate_return = lower_src(aggregate_return)
+        .expect("the existing aggregate-return fallback remains independently classified");
+    let method = aggregate_return
+        .components
+        .iter()
+        .find(|component| component.name == "Returns")
+        .unwrap()
+        .methods
+        .iter()
+        .find(|method| method.name == "unsupported_return")
+        .unwrap();
+    assert_eq!(method.ret_ty, Some(ir::IrType::Unknown));
+    let function = &aggregate_return.functions[method.function.index()];
+    assert_eq!(
+        function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+        Some(ir::IrType::Unknown)
+    );
+}
+
 /// A wrapping operator (`+%`/`-%`/`*%`) at operand width > 64 is refused
 /// honestly, not pointed at `--codegen v1`: v1 has its own identical gate
 /// and refuses it too (`Rejects` — v1 emits no C++). A wrapping op at 64
