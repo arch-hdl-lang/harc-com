@@ -40875,9 +40875,7 @@ end impl T"#;
         })
         .expect("fixture has an unused local event schema");
     *payload = ir::EventPayload::FixedVec {
-        boolean: false,
-        signed: false,
-        width: None,
+        elem: Box::new(ir::IrType::UInt(None)),
         len: 4,
     };
     assert!(
@@ -40928,39 +40926,30 @@ end impl T"#;
 
     for invalid_payload in [
         ir::EventPayload::FixedVec {
-            boolean: true,
-            signed: true,
-            width: None,
+            elem: Box::new(ir::IrType::SInt(None)),
             len: 4,
         },
         ir::EventPayload::FixedVec {
-            boolean: true,
-            signed: false,
-            width: Some(1),
+            elem: Box::new(ir::IrType::UInt(None)),
             len: 4,
         },
         ir::EventPayload::FixedVec {
-            boolean: false,
-            signed: false,
-            width: None,
+            elem: Box::new(ir::IrType::UInt(Some(0))),
             len: 4,
         },
         ir::EventPayload::FixedVec {
-            boolean: false,
-            signed: false,
-            width: Some(0),
+            elem: Box::new(ir::IrType::UInt(Some(2048))),
             len: 4,
         },
         ir::EventPayload::FixedVec {
-            boolean: false,
-            signed: false,
-            width: Some(2048),
+            elem: Box::new(ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::UInt(Some(8))),
+                len: 0,
+            }),
             len: 4,
         },
         ir::EventPayload::FixedVec {
-            boolean: false,
-            signed: false,
-            width: Some(8),
+            elem: Box::new(ir::IrType::UInt(Some(8))),
             len: 0,
         },
     ] {
@@ -40979,7 +40968,7 @@ end impl T"#;
         else {
             panic!("incoming remains an event");
         };
-        *payload = invalid_payload;
+        *payload = invalid_payload.clone();
         assert!(
             verify::verify_program(&broken).is_err(),
             "invalid event payload metadata {invalid_payload:?} is rejected at schema level"
@@ -41001,6 +40990,17 @@ end impl T"#;
     assert!(
         signed_cpp.contains("std::function<void(std::array<int64_t, 4>)>"),
         "{signed_cpp}"
+    );
+
+    let nested = src.replace("uint<8>", "Vec<uint<8>, 2>");
+    let nested_prog = lower_src(&nested).expect("nested fixed-vector event payload lowers");
+    verify::verify_program(&nested_prog).expect("nested fixed-vector event payload verifies");
+    let nested_cpp = emit_cpp_src(&nested);
+    assert!(
+        nested_cpp.contains(
+            "std::function<void(std::array<std::array<uint64_t, 2>, 4>)>"
+        ),
+        "{nested_cpp}"
     );
 
     let connected = r#"transactor Source
@@ -41028,6 +41028,33 @@ impl CT for CTb
 end impl CT"#;
     let connected = lower_src(connected).expect("fixed-vector event connects to matching hookable");
     verify::verify_program(&connected).expect("fixed-vector event connect verifies");
+
+    let nested_connected = r#"transactor Source
+    observed : out event<Vec<Vec<uint<8>, 2>, 4>>
+end transactor Source
+scoreboard Collector
+    hookable collect(values: Vec<Vec<uint<8>, 2>, 4>)
+    end collect
+end scoreboard Collector
+env E
+    source : Source passive
+    collector : Collector
+    connect
+        source.observed -> collector.collect
+    end connect
+end env E
+testbench CTb
+    dut : Top
+    env : E
+end testbench CTb
+impl CT for CTb
+    run
+        wait 1 cycle
+    end run
+end impl CT"#;
+    let nested_connected =
+        lower_src(nested_connected).expect("nested vector event connects to matching hookable");
+    verify::verify_program(&nested_connected).expect("nested vector event connect verifies");
 }
 
 /// A wrapping operator (`+%`/`-%`/`*%`) at operand width > 64 is refused

@@ -99,6 +99,9 @@ family of rejections over a one-site exception. Current implementation order:
   recursive `std::array` layout; inferred pop locals and verifier metadata
   carry the aggregate element type, while safe empty-state queries run under
   both emitters.
+- [x] Nested scalar fixed-vector event payloads, retaining every recursive
+  `std::array` dimension through event schemas, handlers, emits, connects, and
+  test-scope channels.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call

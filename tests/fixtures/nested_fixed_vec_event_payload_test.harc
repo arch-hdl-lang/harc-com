@@ -1,0 +1,26 @@
+agent NestedFixedVecEventSink
+    incoming : in event<Vec<Vec<uint<8>, 2>, 3>>
+    values : Vec<Vec<uint<8>, 2>, 3>
+    seen : uint<32> default 0
+
+    hookable publish()
+        emit incoming(values)
+    end publish
+
+    on incoming(payload)
+        seen = seen + 1
+    end on
+end agent NestedFixedVecEventSink
+
+testbench NestedFixedVecEventTb
+    dut : Top
+    sink : NestedFixedVecEventSink
+end testbench NestedFixedVecEventTb
+
+impl NestedFixedVecEventPayloadTest for NestedFixedVecEventTb
+    run
+        sink.publish()
+        assert sink.seen == 1 else fail("nested fixed-vector event payload was not delivered")
+        wait 1 cycle
+    end run
+end impl NestedFixedVecEventPayloadTest
