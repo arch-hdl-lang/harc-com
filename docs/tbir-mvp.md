@@ -9304,7 +9304,8 @@ former `transaction` group lives in
      "non-scalar queue element" arm to `EmitsUncompilable` — was DROPPED on
      measurement: the arm is a batch-45 split. `queue<string>` does get
      v1's scalar fallback (`HarcQueue<uint64_t>`, uncompilable on a
-     `push("hi")` — measured), but `queue<Vec<..>>` / `queue<list<..>>`
+     `push("hi")` — measured), but scalar-leaf `queue<Vec<..>>` /
+     `queue<list<..>>`
      get a REAL v1 element type and build (pinned by the existing
      `scalar_queue_rollout_keeps_aggregate_elements_unsupported` test), so
      they are genuine implement gaps, not false promises. Regrading the
@@ -9336,6 +9337,25 @@ former `transaction` group lives in
      (`yield w.inner`, a field access rather than a bare local) is a
      batch-45 split — v1 compiles it when the field is the element type —
      and is left as `unsupported`, untouched. Corpus dumps identically.
+
+150. **Record-list queue elements — TBIR correctness divergence
+     (2026-08-26).**
+
+     `queue<list<Beat>>` now lowers as a value queue whose element is
+     `RecordSeq(Beat)`: TBIR emits `HarcQueue<std::vector<Beat>>`, and an
+     inferred pop destination is exactly `std::vector<Beat>`. The shared
+     queue descriptor serves testbench, scoreboard/component, and bound
+     target-transactor state owners; typed pop annotations must name the
+     same record-list element.
+
+     v1 is not a semantic control for this shape. It compiles but silently
+     maps the named list element to its scalar fallback and emits
+     `HarcQueue<std::vector<uint64_t>>`. This batch intentionally fixes TBIR
+     instead of preserving that type loss. Empty-query and empty-pop
+     fixtures remain in the equivalence registry because their observable
+     traces agree while exercising both generated carrier paths; the unit
+     test pins the C++ type divergence directly. Recursive lists and lists
+     of fixed vectors remain fenced.
 
 ## Next steps
 

@@ -3035,7 +3035,7 @@ pub(crate) fn dotted_path(e: &crate::ast::Expr) -> Option<Vec<String>> {
 /// `QueueElem`. Mirrors `lower_event_payload`:
 ///   * a scalar (`uint<W>`/`sint<W>`/`bool`) → `Scalar { ty }`;
 ///   * a fixed vector over scalar leaves → `FixedVec` (carried by value);
-///   * a dynamic list over a scalar leaf → `List` (carried by value);
+///   * a dynamic list over a scalar or record leaf → `List` (carried by value);
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value).
 ///
 /// A scalar element parses as `TypeArg::Type`; a user-named record element
@@ -3057,7 +3057,7 @@ pub(crate) fn lower_queue_elem(
                 &format!("an enum queue element `{named}` on `{comp}.{fname}`"),
                 format!(
                     "lowered queue elements are scalars, declared transaction/struct records, \
-                     fully specified scalar fixed vectors, and scalar dynamic lists; v1 emits `{named}` as the \
+                     fully specified scalar fixed vectors, and scalar/record dynamic lists; v1 emits `{named}` as the \
                      `HarcQueue` element type and declares no C++ enum, so its output does not \
                      compile either"
                 ),
@@ -3068,7 +3068,7 @@ pub(crate) fn lower_queue_elem(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
             "lowered queue elements are scalars, declared transaction/struct records, \
              fully specified `Vec<scalar, N>` values (including nested scalar vectors), \
-             and `list<scalar>` values; \
+             and `list<scalar-or-record>` values; \
              this element shape has no typed queue representation yet",
         )
     };
@@ -3084,7 +3084,7 @@ pub(crate) fn lower_queue_elem(
             if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
                 return Ok(QueueElem::FixedVec { elem, len });
             }
-            if let Some(elem) = super::records::record_list_scalar_ir_type(ty) {
+            if let Some(elem) = super::records::record_list_elem_ir_type(ty, record_ids) {
                 return Ok(QueueElem::List {
                     elem: Box::new(elem),
                 });
@@ -3107,7 +3107,7 @@ pub(crate) fn lower_queue_elem(
             Err(unsupported(
                 &format!("a non-identifier queue element on `{comp}.{fname}`"),
                 "use a scalar, declared transaction/struct record, fully specified \
-                 `Vec<scalar, N>`, or `list<scalar>` element type",
+                 `Vec<scalar, N>`, or `list<scalar-or-record>` element type",
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),

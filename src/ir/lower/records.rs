@@ -561,6 +561,15 @@ fn lower_record_field(
 /// Scalar list element shapes whose C++ storage and random draw v1 preserves.
 /// `int` is intentionally excluded: v1 silently renders it unsigned.
 pub(super) fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+    record_list_elem_ir_type(t, &HashMap::new()).filter(|ty| !matches!(ty, IrType::Record(_)))
+}
+
+/// A dynamic-list element supported by value storage: either the scalar
+/// subset above or a declared transaction/struct record.
+pub(super) fn record_list_elem_ir_type(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
     let TypeExpr::Named { name, generics, .. } = t else {
         return None;
     };
@@ -572,8 +581,17 @@ pub(super) fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     }
     let elem = match generics.first()? {
         TypeArg::Type(elem) => elem,
-        _ => return None,
+        TypeArg::Expr(expr) => {
+            let ExprKind::Ident(id) = &*expr.kind else {
+                return None;
+            };
+            return record_ids.get(&id.name).copied().map(IrType::Record);
+        }
+        TypeArg::Named { .. } => return None,
     };
+    if let Some(record) = named_record_id(elem, record_ids) {
+        return Some(IrType::Record(record));
+    }
     let TypeExpr::Builtin { name, .. } = elem else {
         return None;
     };

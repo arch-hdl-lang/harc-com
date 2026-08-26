@@ -368,7 +368,11 @@ fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchem
             },
         ),
         crate::ir::QueueElem::List { elem } => {
-            format!("std::vector<{}>", super::field_scalar_cty(elem))
+            let elem = match elem.as_ref() {
+                crate::ir::IrType::Record(record) => records[record.index()].name.clone(),
+                scalar => super::field_scalar_cty(scalar),
+            };
+            format!("std::vector<{elem}>")
         }
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }

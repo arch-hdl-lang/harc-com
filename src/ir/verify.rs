@@ -603,8 +603,18 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
     }
 }
 
-fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<VerifyError>) {
+fn verify_queue_elem_schema(
+    elem: &QueueElem,
+    record_count: usize,
+    what: String,
+    errs: &mut Vec<VerifyError>,
+) {
     match elem {
+        QueueElem::Record(record) if record.index() >= record_count => {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!("{what} references missing record r{}", record.0),
+            });
+        }
         QueueElem::Record(_) => {}
         QueueElem::Scalar { ty } => {
             let valid = matches!(ty, IrType::Bool)
@@ -629,15 +639,16 @@ fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<Verif
             }
         }
         QueueElem::List { elem } => {
-            if !matches!(
+            let valid = matches!(
                 elem.as_ref(),
                 IrType::Bool
                     | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
                     | IrType::SInt(Some(1..=64))
-            ) {
+            ) || matches!(elem.as_ref(), IrType::Record(record) if record.index() < record_count);
+            if !valid {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
-                        "{what} has invalid dynamic-list element schema {elem:?}; expected a resolved scalar list element"
+                        "{what} has invalid dynamic-list element schema {elem:?}; expected a resolved scalar or record list element"
                     ),
                 });
             }
@@ -980,6 +991,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             if let ComponentFieldKind::Queue { elem } = &field.kind {
                 verify_queue_elem_schema(
                     elem,
+                    prog.records.len(),
                     format!("component c{ci} field `{}`", field.name),
                     &mut errs,
                 );
@@ -1046,6 +1058,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             match &field.kind {
                 ScoreboardFieldKind::Queue { elem } => verify_queue_elem_schema(
                     elem,
+                    prog.records.len(),
                     format!("scoreboard sb{si} field `{}`", field.name),
                     &mut errs,
                 ),
@@ -1165,6 +1178,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             if let StateFieldKind::Queue { elem } = &field.kind {
                 verify_queue_elem_schema(
                     elem,
+                    prog.records.len(),
                     format!("transactor x{xi} state field `{}`", field.name),
                     &mut errs,
                 );
@@ -1282,6 +1296,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 TbStateFieldSchema::Queue(field) => {
                     verify_queue_elem_schema(
                         &field.elem,
+                        prog.records.len(),
                         format!("tb{ti} queue field `{}`", field.name),
                         &mut errs,
                     );
