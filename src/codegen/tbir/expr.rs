@@ -1687,7 +1687,16 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                 )
             }),
         Expr::Unary(UnOp::Not, _) => false,
-        Expr::Unary(UnOp::BitNotHost, _) => true,
+        // `BitNotHost` is v1's UNMASKED host `~`; its signedness is that of
+        // its operand under C++ usual-arithmetic conversion, exactly like the
+        // width-masked `BitNot` below — NOT unconditionally signed. Hardcoding
+        // it signed flipped a following right-shift from logical to arithmetic
+        // whenever the operand was an unsigned wide/port value (e.g.
+        // `(~(port & sized)) >> k`), silently diverging from v1 (harc#630
+        // family). A bare sized literal operand is `Literal { ty: Unknown }`,
+        // which `expr_is_signed` already scores signed, so the pure
+        // `~sized` case (and `~sized < 0`) is unchanged.
+        Expr::Unary(UnOp::BitNotHost, inner) => expr_is_signed(cx, inner),
         Expr::Unary(_, inner) => expr_is_signed(cx, inner),
         Expr::Ternary(_, then_expr, else_expr) => {
             expr_is_signed(cx, then_expr) && expr_is_signed(cx, else_expr)

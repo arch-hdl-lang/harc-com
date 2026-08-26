@@ -222,7 +222,11 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
     match e {
         Expr::Literal { ty, .. } => matches!(ty, IrType::SInt(_)),
         Expr::Unary(UnOp::Not, _) => false,
-        Expr::Unary(UnOp::BitNotHost, _) => true,
+        // See `expr_is_signed` (tbir/expr.rs): `BitNotHost`'s signedness
+        // follows its operand, not an unconditional signed — so a shift or
+        // ordered compare over `~(port & sized)` inside a coverpoint renders
+        // logical/unsigned, matching v1.
+        Expr::Unary(UnOp::BitNotHost, inner) => cover_expr_signed(inner, widths),
         Expr::Unary(_, inner) => cover_expr_signed(inner, widths),
         Expr::Binary(op, lhs, rhs) => match op {
             BinOp::Eq

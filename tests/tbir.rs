@@ -39760,3 +39760,89 @@ fn a_le64_component_field_write_is_checked_without_manufactured_widths() {
         "signedness mismatch must still be caught at ≤64: {err}"
     );
 }
+/// `~` over an expression that contains a sized literal lowers to the
+/// UNMASKED host bit-not (`BitNotHost`), matching v1. Its C++ signedness
+/// must follow the OPERAND, not be unconditionally signed: when the operand
+/// is an unsigned value (a DUT/port read, here masked by a sized literal), a
+/// following right-shift is LOGICAL, exactly as v1's `~(uint64 & 0x00) >> k`
+/// is. Hardcoding `BitNotHost` signed rendered the shift arithmetic
+/// (`(int64_t)(~…) >> k`), a silent divergence in the harc#630 family that
+/// only surfaced at wide result widths (the equiv corpus's ≤8-bit cases hid
+/// it). Regression guard for that fix.
+#[test]
+fn bitnothost_shift_over_unsigned_operand_is_logical_like_v1() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        dut.en = 1'b1
+        let a : uint<64> = (~(dut.count_out & 8'h00)) >> 2
+        assert a == 4611686018427387903
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let tbir_cpp = emit_cpp_src(src);
+    // The shift over the bit-not is unsigned (logical), not `(int64_t)`
+    // (arithmetic). Pin the exact emitted form so a future regression to the
+    // arithmetic shape is caught.
+    assert!(
+        tbir_cpp.contains("(((uint64_t)(~((__t0 & 0)))) >> 2)"),
+        "bit-not-of-unsigned shift must be logical (uint64_t):\n{tbir_cpp}"
+    );
+    assert!(
+        !tbir_cpp.contains("(int64_t)(~((__t0 & 0)))"),
+        "bit-not-of-unsigned shift must NOT be arithmetic (int64_t):\n{tbir_cpp}"
+    );
+    // v1 renders the same unmasked host bit-not; C++ `~(uint64 & 0x00)` is
+    // unsigned, so `>> 2` is logical — the value both must compute is
+    // 0x3FFF…FFF = 4611686018427387903, not -1 (0xFFFF…FF) from an
+    // arithmetic shift.
+    let v1_cpp = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
+    assert!(
+        v1_cpp.contains("(~(harc_rt::harc_read(dut->count_out) & 0x00)) >> 2"),
+        "v1 renders the same unmasked host bit-not, shifted logically:\n{v1_cpp}"
+    );
+}
+
+/// Companion to the shift guard: a bare sized-literal bit-not (`~4'd0`, no
+/// unsigned operand mixed in) stays SIGNED, because a general sized literal
+/// lowers to `Literal { ty: Unknown }`, which is v1's signed host int. The
+/// operand-following signedness must not regress this — `~4'd0 < 0` holds.
+#[test]
+fn bitnothost_over_bare_sized_literal_stays_signed() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let complemented = ~4'd0
+        assert complemented < 0
+        dut.en = 1'b1
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    // The real invariant: `complemented` is inferred SIGNED (SInt(None) —
+    // v1's signed host int for a bare sized literal), so `~4'd0` is a
+    // negative value and `< 0` holds. Operand-following signedness must not
+    // demote this to unsigned. (Storage typing comes from the untouched
+    // type-hint path; this pins that the shift-signedness fix left it alone.)
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "complemented")
+            .expect("complemented local")
+            .ty,
+        ir::IrType::SInt(None),
+        "bare-sized `~4'd0` must stay signed so `< 0` holds"
+    );
+}
