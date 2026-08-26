@@ -1,0 +1,15 @@
+// Dynamic scalar-list queue storage and read-only queries must compile and
+// run identically under v1 and TBIR while the queue is empty.
+
+testbench DynamicListQueueTb
+    dut : Top
+    values : queue<list<bool>>
+end testbench DynamicListQueueTb
+
+impl DynamicListQueueTest for DynamicListQueueTb
+    run
+        assert values.empty()
+        assert values.size() == 0
+        wait 1 cycle
+    end run
+end impl DynamicListQueueTest

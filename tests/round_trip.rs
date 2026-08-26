@@ -703,3 +703,19 @@ end test DiscardTest"#;
     assert!(printed.contains("on in_ev(_)"));
     assert!(printed.contains("let _ = 1"));
 }
+
+#[test]
+fn nested_list_queue_type_round_trips_through_canonical_generics() {
+    let src = r#"testbench ListQueueTb
+    dut : Top
+    values : queue<list<bool>>
+end testbench ListQueueTb
+
+impl ListQueueTest for ListQueueTb
+    run
+        assert values.empty()
+    end run
+end impl ListQueueTest"#;
+    let printed = parse_print_reparse(src);
+    assert!(printed.contains("queue<list#(bool)>"));
+}

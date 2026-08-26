@@ -367,6 +367,9 @@ fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchem
                 len: *len,
             },
         ),
+        crate::ir::QueueElem::List { elem } => {
+            format!("std::vector<{}>", super::field_scalar_cty(elem))
+        }
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }
 }
@@ -557,7 +560,7 @@ fn component_method_param_ctypes(
                 format!("std::vector<{}>", prog.records[r.index()].name)
             }
             crate::ir::IrType::Seq(ref scalar) => {
-                format!("std::vector<{}>", super::local_scalar_cty(scalar))
+                format!("std::vector<{}>", super::field_scalar_cty(scalar))
             }
             crate::ir::IrType::Component(c) => prog.components[c.index()].name.clone(),
             ref ty => super::local_scalar_cty(ty),

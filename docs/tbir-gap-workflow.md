@@ -311,6 +311,10 @@ not applicable before requesting review:
    fixed-vector schema, and nested record fixed-vector indexing slices
    reduce the count from 174 to 118 textual matches (117 constructors plus the
    helper definition).
+   Fixed-vector and scalar dynamic-list queue elements now route through the
+   shared queue-element constructor for every owner; these slices retire real
+   TBIR gaps without changing that raw textual count because unsupported enum,
+   recursive-list, and other non-scalar neighbors still use the same fence.
    The handler-less unbound-
    transactor event slice closes routes around a shared constructor without
    changing the count. Widthless scalar fixed-`Vec` record fields now route

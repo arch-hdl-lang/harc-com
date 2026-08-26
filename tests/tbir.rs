@@ -3758,6 +3758,279 @@ end impl VecQueueTargetTest
     );
 }
 
+/// A dynamic scalar list is a by-value queue element, retaining its exact
+/// nested `std::vector` storage and inferred pop-local type across owners.
+#[test]
+fn dynamic_list_queue_elements_lower_as_exact_aggregate_values() {
+    let src = r#"
+function take_scalar(value: uint<8>) -> uint<8>
+    return value
+end function take_scalar
+
+testbench DynamicListQueueTb
+    dut : Top
+    values : queue<list<uint<8>>>
+end testbench DynamicListQueueTb
+
+impl DynamicListQueueTest for DynamicListQueueTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl DynamicListQueueTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("dynamic-list queue lowers");
+    verify::verify_program(&prog).expect("dynamic-list queue verifies");
+    assert_eq!(
+        prog.testbenches[0].queue_fields[0].elem,
+        ir::QueueElem::List {
+            elem: Box::new(ir::IrType::UInt(Some(8))),
+        }
+    );
+    let cpp =
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("dynamic-list queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<std::vector<uint64_t>> values;")
+            && cpp.contains("std::vector<uint64_t> observed{};"),
+        "queue storage and pop local retain the nested vector type:\n{cpp}"
+    );
+    let v1 = cpp_tb::emit(&merged).expect("v1 emits the migration control");
+    assert!(
+        v1.contains("harc_rt::HarcQueue<std::vector<uint64_t>> values;"),
+        "v1 uses the same dynamic-list queue storage:\n{v1}"
+    );
+
+    let bool_src = src.replace("list<uint<8>>", "list<bool>");
+    let bool_merged = merged_src(&bool_src);
+    let bool_prog = lower::lower_program(&bool_merged).expect("bool-list queue lowers");
+    verify::verify_program(&bool_prog).expect("bool-list queue verifies");
+    let bool_tbir = tbir::emit(&bool_prog, &bool_merged, &cpp_tb::EmitOpts::default())
+        .expect("bool-list queue emits through TBIR");
+    let bool_v1 = cpp_tb::emit(&bool_merged).expect("bool-list queue emits through v1");
+    assert!(
+        bool_tbir.contains("harc_rt::HarcQueue<std::vector<bool>> values;")
+            && bool_tbir.contains("std::vector<bool> observed{};"),
+        "TBIR must retain bool in queue storage and the typed pop local:\n{bool_tbir}"
+    );
+    assert!(
+        bool_v1.contains("harc_rt::HarcQueue<std::vector<bool>> values;")
+            && bool_v1.contains("auto observed = _tb.values.pop();"),
+        "v1 must retain bool in queue storage and infer the pop local:\n{bool_v1}"
+    );
+
+    let owners = r#"
+scoreboard ListQueueSb
+    values : queue<list<sint<16>>>
+    hookable put(value: uint<8>)
+    end put
+end scoreboard ListQueueSb
+agent ListQueueAgent
+    values : queue<list<sint<16>>>
+end agent ListQueueAgent
+testbench ListQueueOwnersTb
+    dut : Top
+    sb : ListQueueSb
+    ag : ListQueueAgent
+end testbench ListQueueOwnersTb
+impl ListQueueOwnersTest for ListQueueOwnersTb
+    run
+        assert sb.values.empty()
+        assert ag.values.size() == 0
+        let list_value = sb.values.pop()
+        sb.put(1)
+        wait 1 cycle
+    end run
+end impl ListQueueOwnersTest
+"#;
+    let owners_prog = lower_src(owners).expect("component-owned list queues lower");
+    verify::verify_program(&owners_prog).expect("component-owned list queues verify");
+    let owners_cpp = tbir::emit(
+        &owners_prog,
+        &merged_src(owners),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("component-owned list queues emit");
+    assert_eq!(
+        owners_cpp
+            .matches("harc_rt::HarcQueue<std::vector<int64_t>> values;")
+            .count(),
+        2,
+        "scoreboard and agent retain list-valued queue storage:\n{owners_cpp}"
+    );
+
+    let target = r#"
+bus ListQueueBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus ListQueueBus
+transactor ListQueueTarget bound to ListQueueBus
+    values : queue<list<uint<16>>>
+    thread bus.read(addr: uint<8>)
+        assert values.empty()
+        return addr
+    end thread
+end transactor ListQueueTarget
+testbench ListQueueTargetTb
+    dut : TlmReadInitiator
+end testbench ListQueueTargetTb
+impl ListQueueTargetTest for ListQueueTargetTb
+    let mem : ListQueueBus = bind dut
+    let target : ListQueueTarget passive = bind mem
+    run
+        assert target.values.size() == 0
+        wait 1 cycle
+    end run
+end impl ListQueueTargetTest
+"#;
+    let target_prog = lower_src(target).expect("target-state list queue lowers");
+    verify::verify_program(&target_prog).expect("target-state list queue verifies");
+    assert!(matches!(
+        target_prog.transactors[0].state_fields[0].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::List { .. }
+        }
+    ));
+
+    let bad_use = |expr: &str| {
+        src.replace(
+            "        values.push(observed)",
+            &format!("        {expr}\n        values.push(observed)"),
+        )
+    };
+    for (expr, needle) in [
+        ("let bad = observed + observed", "dynamic-list local"),
+        ("let bad = !observed", "dynamic-list local"),
+        ("let bad = take_scalar(observed)", "scalar `TSeq`"),
+        (
+            "if observed\n            wait 1 cycle\n        end if",
+            "not a dynamic list",
+        ),
+        (
+            "let scalar_event : event<uint<8>>\n        emit scalar_event(observed)",
+            "payload does not match",
+        ),
+        ("values.push(1)", "pushed value is Unknown"),
+    ] {
+        let err = lower_src(&bad_use(expr))
+            .err()
+            .unwrap_or_else(|| panic!("`{expr}` must reject aggregate scalar use"));
+        assert!(err.to_string().contains(needle), "`{expr}`: {err}");
+    }
+
+    for replacement in ["queue<list<list<uint<8>>>>", "queue<list<Vec<uint<8>, 2>>>"] {
+        let bad = src.replace("queue<list<uint<8>>>", replacement);
+        assert!(
+            lower_src(&bad).is_err(),
+            "unsupported recursive list shape `{replacement}` must remain fenced"
+        );
+    }
+    let mismatch = src.replace(
+        "let observed = values.pop()",
+        "let observed : list<sint<8>> = values.pop()",
+    );
+    assert!(
+        lower_src(&mismatch).is_err(),
+        "a list-valued pop must retain its exact scalar element type"
+    );
+
+    let mut broken = prog.clone();
+    let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0] else {
+        panic!("fixture state field is a queue");
+    };
+    field.elem = ir::QueueElem::List {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(99))),
+    };
+    let errors = verify::verify_program(&broken).expect_err("bad list queue metadata rejects");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("invalid dynamic-list element schema")),
+        "verifier names the corrupt list schema: {errors:?}"
+    );
+
+    let run_id = prog.tests[0].run;
+    let observed = prog.functions[run_id.index()]
+        .locals
+        .iter()
+        .position(|local| local.name == "observed")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("fixture has inferred list pop local");
+    let mut broken_use = prog.clone();
+    broken_use.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::TbQueuePush {
+            field: "values".to_string(),
+            value: ir::Expr::Binary(
+                ir::BinOp::Add,
+                Box::new(ir::Expr::Local(observed)),
+                Box::new(ir::Expr::Local(observed)),
+            ),
+        });
+    assert!(
+        verify::verify_program(&broken_use).is_err(),
+        "verifier rejects scalar composition of a list-valued local"
+    );
+
+    let mut broken_helper = prog.clone();
+    let helper = broken_helper
+        .functions
+        .iter()
+        .find(|function| function.name == "take_scalar")
+        .expect("fixture has scalar helper");
+    let ret = helper
+        .ret
+        .and_then(|local| helper.locals.get(local.index()))
+        .map(|local| local.ty.clone())
+        .expect("scalar helper returns a value");
+    let scalar_dest = ir::LocalId(broken_helper.functions[run_id.index()].locals.len() as u32);
+    broken_helper.functions[run_id.index()]
+        .locals
+        .push(ir::TypedLocal {
+            name: "broken_list_scalar_dest".to_string(),
+            ty: ret.clone(),
+        });
+    broken_helper.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::Assign(
+            scalar_dest,
+            ir::Expr::Call(
+                ir::CallTarget::Helper {
+                    name: "take_scalar".to_string(),
+                    ret,
+                },
+                vec![ir::Expr::Local(observed)],
+            ),
+        ));
+    assert!(
+        verify::verify_program(&broken_helper).is_err(),
+        "verifier rejects a list-valued argument at a scalar helper ABI"
+    );
+
+    let owner_run = owners_prog.tests[0].run;
+    let mut broken_component = owners_prog.clone();
+    let list_local = broken_component.functions[owner_run.index()]
+        .locals
+        .iter()
+        .position(|local| matches!(local.ty, ir::IrType::Seq(_)))
+        .map(|index| ir::LocalId(index as u32))
+        .expect("owner fixture has an inferred list local");
+    let call_args = broken_component.functions[owner_run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { args, .. } => Some(args),
+            _ => None,
+        })
+        .expect("owner fixture has a scalar component call");
+    call_args[0] = ir::Expr::Local(list_local);
+    assert!(
+        verify::verify_program(&broken_component).is_err(),
+        "verifier rejects a list-valued argument at a scalar component ABI"
+    );
+}
+
 /// A source-level type annotation on `queue.pop()` is an assignment slot.
 /// Narrowing or changing signedness is a program error, so it must be
 /// reported by lowering rather than surfacing as an internal verifier error.
