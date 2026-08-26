@@ -603,6 +603,16 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
     }
 }
 
+fn component_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
+    match ty {
+        IrType::Record(record) => record.index() < record_count,
+        IrType::FixedVec { elem, len } => {
+            *len != 0 && component_fixed_vec_elem_valid(elem, record_count)
+        }
+        scalar => fixed_vec_elem_valid(scalar),
+    }
+}
+
 fn queue_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::Record(record) => record.index() < record_count,
@@ -1018,7 +1028,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 // scalar leaf, so `Vec<Vec<uint<8>,2>,2>` validates and
                 // `Vec<Vec<uint<2048>,2>,2>` (an over-wide leaf) still
                 // fails at the same width policy the gate applies.
-                let valid_elem = fixed_vec_elem_valid(&vec.elem);
+                let valid_elem = component_fixed_vec_elem_valid(&vec.elem, prog.records.len());
                 if vec.len == 0 || !valid_elem {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
@@ -4349,10 +4359,21 @@ impl Checker<'_> {
                                     ));
                                 }
                                 self.check_expr(value, false, "ComponentVecElementWrite value");
-                                if matches!(**inner_elem, IrType::Record(_)) {
-                                    self.report_bad_component_field(format!(
-                                        "nested vector element of component field `{field}` is a record, not a scalar"
-                                    ));
+                                let actual = self.aggregate_assignment_expr_type(value);
+                                if let Some(actual) = actual {
+                                    let compatible = match (&**inner_elem, &actual) {
+                                        (IrType::Record(expected), IrType::Record(actual)) => {
+                                            expected == actual
+                                        }
+                                        (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
+                                        _ => true,
+                                    };
+                                    if !compatible {
+                                        self.report_bad_component_field(format!(
+                                            "nested component field `{field}` element of type {:?} is written from incompatible type {actual:?}",
+                                            inner_elem
+                                        ));
+                                    }
                                 }
                                 continue;
                             }

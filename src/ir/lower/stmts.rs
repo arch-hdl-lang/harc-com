@@ -3282,10 +3282,21 @@ impl FuncBuilder<'_> {
                                 &base, &field, &inner, *inner_len,
                             )?;
                             let value = self.lower_expr_no_ports(value)?;
-                            self.reject_record_into_scalar(
-                                &value,
-                                &format!("element of nested `Vec` field `{field}`"),
-                            )?;
+                            if let IrType::Record(record) = **inner_elem {
+                                if self.record_id_of_expr(&value) != Some(record) {
+                                    return Err(self.record_assign_mismatch(
+                                        &value,
+                                        record,
+                                        format!("element of nested `Vec` field `{field}`"),
+                                        "assign a value of the vector element's record type",
+                                    ));
+                                }
+                            } else {
+                                self.reject_record_into_scalar(
+                                    &value,
+                                    &format!("element of nested `Vec` field `{field}`"),
+                                )?;
+                            }
                             self.push(Stmt::ComponentVecElementWrite {
                                 base,
                                 field,
@@ -3305,10 +3316,21 @@ impl FuncBuilder<'_> {
                     &base, &field, &index, vec.len,
                 )?;
                 let value = self.lower_expr_no_ports(value)?;
-                self.reject_record_into_scalar(
-                    &value,
-                    &format!("element of component `Vec` field `{field}`"),
-                )?;
+                if let IrType::Record(record) = vec.elem {
+                    if self.record_id_of_expr(&value) != Some(record) {
+                        return Err(self.record_assign_mismatch(
+                            &value,
+                            record,
+                            format!("element of component `Vec` field `{field}`"),
+                            "assign a value of the vector element's record type",
+                        ));
+                    }
+                } else {
+                    self.reject_record_into_scalar(
+                        &value,
+                        &format!("element of component `Vec` field `{field}`"),
+                    )?;
+                }
                 self.push(Stmt::ComponentVecElementWrite {
                     base,
                     field,
