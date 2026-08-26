@@ -1,0 +1,20 @@
+// Compile/run gate for a record-vector queue pop destination and matching push.
+// The queue is intentionally empty, so both backends compile the nested value
+// transfers and report the same runtime failure.
+
+transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench RecordFixedVecQueuePopTb
+    dut : Top
+    values : queue<Vec<Beat, 4>>
+end testbench RecordFixedVecQueuePopTb
+
+impl RecordFixedVecQueuePopTest for RecordFixedVecQueuePopTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl RecordFixedVecQueuePopTest

@@ -305,6 +305,8 @@ passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
 component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_queue_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
+record_fixed_vec_queue_test | Top | top_counter.sv | top_counter.arch | pass
+record_fixed_vec_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
 dynamic_list_queue_test | Top | top_counter.sv | top_counter.arch | pass
 dynamic_list_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
 record_list_queue_test | Top | top_counter.sv | top_counter.arch | pass

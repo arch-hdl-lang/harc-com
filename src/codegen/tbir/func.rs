@@ -3025,10 +3025,13 @@ fn declare_locals_except(
                 writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
             }
             IrType::FixedVec { ref elem, len } => {
-                let cty = super::field_scalar_cty(&IrType::FixedVec {
-                    elem: elem.clone(),
-                    len,
-                });
+                let cty = super::aggregate_value_cty(
+                    &IrType::FixedVec {
+                        elem: elem.clone(),
+                        len,
+                    },
+                    &prog.records,
+                );
                 writeln!(out, "{pad}{cty} {n}{{}}; (void){n};").ok();
             }
             // A scalar-element transaction-sequence local —

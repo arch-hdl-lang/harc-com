@@ -9357,6 +9357,24 @@ former `transaction` group lives in
      test pins the C++ type divergence directly. Recursive lists and lists
      of fixed vectors remain fenced.
 
+151. **Record fixed-vector queue elements — TBIR correctness divergence
+     (2026-08-26).**
+
+     `queue<Vec<Beat, N>>` and nested forms now retain a declared-record leaf
+     through the recursive `FixedVec` queue descriptor. TBIR emits the exact
+     `HarcQueue<std::array<Beat, N>>` carrier, and inferred or annotated pop
+     destinations keep the same array shape. The implementation is shared by
+     testbench, scoreboard/component, and bound target-transactor queues, and
+     the verifier checks every nested length and record reference.
+
+     v1 is again a retirement control, not a semantic model. It substitutes
+     `uint64_t` for a record leaf; for `Vec<Vec<Beat, 2>, 3>` it also discards
+     the inner dimension and emits only `std::array<uint64_t, 3>`. TBIR
+     intentionally preserves both the leaf and all dimensions. Empty-query
+     and empty-pop fixtures trace-match because no value is transferred before
+     the deliberate empty-pop failure; the unit test pins the generated type
+     divergence directly.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

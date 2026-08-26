@@ -169,6 +169,7 @@ record_vec_field_iter_test | Top         | top_counter.sv         |
 transactor_record_field_test | Top       | top_counter.sv         |
 component_fixed_vec_test | Top           | top_counter.sv         |
 fixed_vec_queue_test | Top               | top_counter.sv         |
+record_fixed_vec_queue_test | Top        | top_counter.sv         |
 dynamic_list_queue_test | Top             | top_counter.sv         |
 record_list_queue_test | Top             | top_counter.sv         |
 scoreboard_record_state_test | Top        | top_counter.sv         |
