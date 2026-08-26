@@ -10,6 +10,7 @@ struct WideEnvelope
     head  : uint<8>
     inner : WideLeaf
     lanes : Vec<uint<129>, 2>
+    matrix : Vec<Vec<uint<8>, 2>, 3>
 end struct WideEnvelope
 
 struct WideTable

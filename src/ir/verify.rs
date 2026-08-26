@@ -715,6 +715,19 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         what: format!("{what} references missing record r{}", rid.0),
                     });
                 }
+                IrType::FixedVec { .. }
+                    if field.vec_len.is_none()
+                        || field.vec_len == Some(0)
+                        || field.default.is_some()
+                        || !fixed_vec_elem_valid(&field.ty) =>
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "{what} has invalid nested fixed-vector schema {:?} with outer length {:?}",
+                            field.ty, field.vec_len
+                        ),
+                    });
+                }
                 _ => {}
             }
         }

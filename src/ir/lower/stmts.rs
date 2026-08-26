@@ -4422,6 +4422,40 @@ impl FuncBuilder<'_> {
                 id.name
             )));
         };
+        fn record_contains_nested_fixed_vec(
+            records: &[crate::ir::RecordSchema],
+            record_id: crate::ir::RecordId,
+            seen: &mut std::collections::HashSet<crate::ir::RecordId>,
+        ) -> bool {
+            if !seen.insert(record_id) {
+                return false;
+            }
+            records.get(record_id.index()).is_some_and(|record| {
+                record.fields.iter().any(|field| match field.ty {
+                    IrType::FixedVec { .. } => true,
+                    IrType::Record(nested) => {
+                        record_contains_nested_fixed_vec(records, nested, seen)
+                    }
+                    _ => false,
+                })
+            })
+        }
+        if record_contains_nested_fixed_vec(
+            &self.ctx.records,
+            record_id,
+            &mut std::collections::HashSet::new(),
+        ) {
+            return Err(not_implemented(
+                &format!(
+                    "`randomize({})` of a record with a nested fixed-vector field",
+                    id.name
+                ),
+                "nested fixed-vector records are valid state values, but the current \
+                 randomize/trace path treats the inner array as a scalar; v1 emits the \
+                 same invalid scalar assignment and its C++ does not compile either",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let record = self.ctx.records[record_id.index()].name.clone();
 
         // Spec §4: transaction/struct-level `keep`s are part of every

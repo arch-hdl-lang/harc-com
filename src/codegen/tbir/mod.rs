@@ -2038,6 +2038,9 @@ fn field_packed_width(ty: &ir::IrType, records: &[ir::RecordSchema]) -> Option<u
         ir::IrType::Bool => Some(1),
         ir::IrType::UInt(w) | ir::IrType::SInt(w) => w.map(|w| w as usize),
         ir::IrType::Record(rid) => record_packed_width(records.get(rid.index())?, records),
+        ir::IrType::FixedVec { elem, len } => {
+            field_packed_width(elem, records).map(|width| width * len)
+        }
         _ => None,
     }
 }
@@ -2185,6 +2188,20 @@ fn emit_pack_field(
         }
         return;
     }
+    if let ir::IrType::FixedVec { elem, len } = ty {
+        let elem_w = field_packed_width(elem, records).unwrap_or(0);
+        for i in 0..*len {
+            emit_pack_field(
+                out,
+                records,
+                elem,
+                None,
+                &format!("{value_expr}[{i}]"),
+                offset + i * elem_w,
+            );
+        }
+        return;
+    }
     let w = field_packed_width(ty, records).unwrap_or(0);
     writeln!(
         out,
@@ -2233,6 +2250,20 @@ fn emit_unpack_field(
                 off,
             );
             off += field_slot_width(f, records);
+        }
+        return;
+    }
+    if let ir::IrType::FixedVec { elem, len } = ty {
+        let elem_w = field_packed_width(elem, records).unwrap_or(0);
+        for i in 0..*len {
+            emit_unpack_field(
+                out,
+                records,
+                elem,
+                None,
+                &format!("{target_expr}[{i}]"),
+                offset + i * elem_w,
+            );
         }
         return;
     }
@@ -2286,6 +2317,20 @@ fn emit_structured_unpack_field(
             inner.name
         )
         .ok();
+        return;
+    }
+    if let ir::IrType::FixedVec { elem, len } = ty {
+        for i in 0..*len {
+            emit_structured_unpack_field(
+                out,
+                records,
+                elem,
+                None,
+                &format!("{target_expr}[{i}]"),
+                &format!("{raw_expr}[{i}]"),
+                depth,
+            );
+        }
         return;
     }
     let rhs = match ty {
@@ -2344,18 +2389,32 @@ fn emit_structured_drive_field(
             inner.name
         )
         .ok();
-    } else {
-        let normalized = match ty {
-            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
-                format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
-            }
-            ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => {
-                format!("harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})")
-            }
-            _ => value_expr.to_string(),
-        };
-        writeln!(out, "{pad}harc_rt::harc_assign({sig_expr}, {normalized});").ok();
+        return;
     }
+    if let ir::IrType::FixedVec { elem, len } = ty {
+        for i in 0..*len {
+            emit_structured_drive_field(
+                out,
+                records,
+                elem,
+                None,
+                &format!("{sig_expr}[{i}]"),
+                &format!("{value_expr}[{i}]"),
+                depth,
+            );
+        }
+        return;
+    }
+    let normalized = match ty {
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 128 => {
+            format!("harc_rt::harc_wide_mask_bits({value_expr}, {w})")
+        }
+        ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => {
+            format!("harc_rt::harc_trunc_u128(static_cast<_harc_u128>({value_expr}), {w})")
+        }
+        _ => value_expr.to_string(),
+    };
+    writeln!(out, "{pad}harc_rt::harc_assign({sig_expr}, {normalized});").ok();
 }
 
 /// Emit `harc_pack_<R>` / `harc_unpack_<R>` / `harc_drive_<R>` for a
