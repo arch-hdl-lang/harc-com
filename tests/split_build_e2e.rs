@@ -478,3 +478,237 @@ fn emit_jobs_does_not_change_generated_output() {
     let _ = std::fs::remove_dir_all(&serial);
     let _ = std::fs::remove_dir_all(&parallel);
 }
+
+// --------------------------------------------------------------------------
+// #619 M4 hardening (Phase A1): SHARED reusable-testbench lifecycle across a
+// self-contained multi-shard split, REAL build + link + run.
+//
+// The in-process ownership test `m4b_self_contained_split_emits_static_coro_
+// per_shard` (tests/tbir_lifecycle_ownership.rs) pins the LINKAGE KEYWORD by
+// substring, but a byte/string compare cannot prove that the resulting shard
+// TUs actually LINK: an external (non-`static`) Coro definition in two shard
+// TUs is a duplicate-symbol link error, and a desynced prototype is an
+// undefined-symbol link error — exactly the class of #619 M4b review defect
+// #2, which no string test detects. This drives the real CLI: two impls at
+// `--cpp-split-group-size 1` produce two self-contained shard TUs, each
+// DEFINING the shared suspending (`Coro`) setup, and they must build, link
+// into one binary, and dispatch every test.
+// --------------------------------------------------------------------------
+
+/// A clocked counter DUT for the reusable-testbench lifecycle e2e. Unlike
+/// the combinational `SplitAdder`, a lifecycle `setup` that does `wait N
+/// cycles` needs a real clock edge to advance.
+const LC_COUNTER_SV: &str = "\
+module LcCounter(input logic clk, input logic rst, input logic en, output logic [7:0] count_out);
+  logic [7:0] c;
+  always_ff @(posedge clk) begin
+    if (rst) c <= 0;
+    else if (en) c <= c + 8'd1;
+  end
+  assign count_out = c;
+endmodule
+";
+
+/// A reusable testbench with a SHARED lifecycle: a suspending (`Coro`)
+/// `setup` — `wait N cycles` directly in the body — plus a non-suspending
+/// (`Plain`) `check`, bound by two impls. Under the default native
+/// out-of-line lifecycle the self-contained split emits the setup coroutine
+/// as a `static harc_rt::HarcThread` in EACH shard; only a real multi-shard
+/// link proves those internal-linkage definitions do not collide.
+const LC_SHARED_TB: &str = "\
+testbench LcSharedTb
+    dut : LcCounter
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail(\"shared check: count=${dut.count_out} exp=${expected}\")
+    end check
+end testbench LcSharedTb
+
+impl LcBumpThree for LcSharedTb
+    run
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        expected = 3
+    end run
+end impl LcBumpThree
+
+impl LcBumpFive for LcSharedTb
+    run
+        dut.en = 1
+        wait 5 cycles
+        dut.en = 0
+        expected = 5
+    end run
+end impl LcBumpFive
+";
+
+const LC_TEST_NAMES: [&str; 2] = ["LcBumpThree", "LcBumpFive"];
+
+/// `harc sim --sv … --top LcCounter --cpp-split tests
+/// --cpp-split-group-size N` for the lifecycle suite.
+fn run_lc_split_build(
+    outdir: &Path,
+    sv: &Path,
+    tb: &Path,
+    codegen: &str,
+    group_size: Option<u32>,
+) -> (bool, String) {
+    let mut cmd = Command::new(harc_bin());
+    cmd.arg("sim")
+        .arg("--sv")
+        .arg(sv)
+        .arg(tb)
+        .arg("--top")
+        .arg("LcCounter")
+        .arg("--codegen")
+        .arg(codegen)
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--jobs")
+        .arg("2")
+        .arg("--outdir")
+        .arg(outdir);
+    if let Some(n) = group_size {
+        cmd.arg("--cpp-split-group-size").arg(n.to_string());
+    }
+    let out = cmd.output().expect("spawn harc sim");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    (
+        out.status.success(),
+        format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"),
+    )
+}
+
+/// Dispatch every lifecycle test by name against `<outdir>/obj_dir/VLcCounter`
+/// and assert each passes (an unknown name is rejected).
+fn assert_lc_tests_dispatch(outdir: &Path, label: &str) {
+    let bin = outdir.join("obj_dir/VLcCounter");
+    assert!(
+        bin.exists(),
+        "[{label}] lifecycle split build did not produce a linked binary at {}",
+        bin.display()
+    );
+    for name in LC_TEST_NAMES {
+        let out = Command::new(&bin)
+            .arg("--test")
+            .arg(name)
+            .output()
+            .unwrap_or_else(|e| panic!("[{label}] spawn {} --test {name}: {e}", bin.display()));
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("ALL TESTS PASSED"),
+            "[{label}] dispatch of `{name}` did not pass; output:\n{combined}"
+        );
+        assert!(
+            !combined.contains("TESTS FAILED"),
+            "[{label}] dispatch of `{name}` reported a failure; output:\n{combined}"
+        );
+    }
+    let out = Command::new(&bin)
+        .arg("--test")
+        .arg("NoSuchTest")
+        .output()
+        .expect("spawn unknown-test dispatch");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("unknown test"),
+        "[{label}] unknown test name should be reported, got:\n{combined}"
+    );
+}
+
+#[test]
+fn split_build_shared_lifecycle_coro_links_and_dispatches_e2e() {
+    if !verilator_present() {
+        eprintln!(
+            "SKIP split_build_shared_lifecycle_coro_links_and_dispatches_e2e: `verilator` not \
+             found on PATH. This test compiles and links the generated split shards through \
+             Verilator."
+        );
+        return;
+    }
+
+    let dir = fresh_outdir("lc_inputs");
+    let sv = dir.join("LcCounter.sv");
+    let tb = dir.join("lc_shared_tb.harc");
+    std::fs::write(&sv, LC_COUNTER_SV).expect("write DUT");
+    std::fs::write(&tb, LC_SHARED_TB).expect("write TB");
+
+    let mut outdirs = Vec::new();
+    for codegen in ["v1", "tbir"] {
+        // group_size 1 → one impl per shard → two SELF-CONTAINED shard TUs
+        // that each define the shared lifecycle bodies and link together.
+        let out = fresh_outdir(&format!("lc_{codegen}_g1"));
+        let (ok, log) = run_lc_split_build(&out, &sv, &tb, codegen, Some(1));
+        assert!(ok, "{codegen} lifecycle split build failed:\n{log}");
+        assert_lc_tests_dispatch(&out, &format!("{codegen} lc group=1"));
+
+        // Under the native out-of-line default (`tbir`), each shard TU must
+        // DEFINE the suspending setup coroutine with INTERNAL (`static`)
+        // linkage — an external definition in two TUs is the duplicate-symbol
+        // link error the real build above would have already rejected; this
+        // pins WHY the link stayed clean so a future external-linkage
+        // regression fails here with a legible message, not just a linker
+        // wall of text. (v1 always inlines the lifecycle — no out-of-line
+        // symbol — so this shape is tbir-only.)
+        if codegen == "tbir" {
+            let shards: Vec<PathBuf> = std::fs::read_dir(&out)
+                .expect("read outdir")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let n = p.file_name().unwrap().to_string_lossy();
+                    n.ends_with(".cpp") && n.contains("__test_")
+                })
+                .collect();
+            assert!(
+                shards.len() >= 2,
+                "group_size 1 must produce >=2 self-contained shard TUs, got {}",
+                shards.len()
+            );
+            for s in &shards {
+                let body = std::fs::read_to_string(s).expect("read shard");
+                assert!(
+                    body.contains(
+                        "static harc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup("
+                    ),
+                    "shard {} must define the shared setup coroutine with internal \
+                     (static) linkage",
+                    s.display()
+                );
+                // The `\n` anchor excludes the `static …` match above (which is
+                // preceded by `static `, not a newline).
+                assert!(
+                    !body.contains("\nharc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup("),
+                    "shard {} must NOT emit an EXTERNAL Coro definition (would be a \
+                     duplicate-symbol link error across shards)",
+                    s.display()
+                );
+            }
+        }
+        outdirs.push(out);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    for outdir in outdirs {
+        let _ = std::fs::remove_dir_all(outdir);
+    }
+}

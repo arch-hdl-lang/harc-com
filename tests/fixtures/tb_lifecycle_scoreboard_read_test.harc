@@ -1,0 +1,67 @@
+// #619 M4 hardening (Phase A3): a reusable testbench whose SHARED `check`
+// lifecycle body reads a testbench-owned SCOREBOARD field (`direct.count`).
+//
+// Owned/env scoreboards are emitted as run-coroutine FRAME LOCALS
+// (`TbSink direct;`, read as a bare `direct.count`), not `_tb.` members. The
+// M4b out-of-line lifecycle path hands the shared body only `ctx`/`_tb`/`dut`
+// + log lambdas (`emit_lifecycle_ambient_prologue`), so an out-of-line body
+// that read `direct.count` referenced an UNDECLARED identifier — a real
+// miscompile (`use of undeclared identifier 'direct'`) under the default
+// (native lifecycle ON). ShareScan still mints the shared `TestbenchLifecycle`
+// for this check (a scoreboard is not randomize side-table state), so the
+// OUT-OF-LINE classifier (`stmt_out_of_line_safe` /
+// `expr_reaches_frame_local`) is the sole gate: it must reject the frame-local
+// host-state READ and keep the check RE-INLINED (byte-identical to switch-OFF).
+//
+// Expected: BOTH codegens build + run + trace-diff clean; the shared check
+// falls back to re-inline (zero out-of-line `_harc_lc..._Check` symbols).
+// Bound by two impls so the shared check has two call sites.
+
+transactor TbSource
+    observed : out event<uint<8>>
+
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor TbSource
+
+scoreboard TbSink
+    count : uint<32> default 0
+
+    hookable accept(v: uint<8>)
+        count = count + 1
+    end accept
+end scoreboard TbSink
+
+testbench SbLifecycleTb
+    dut      : Top
+    source   : TbSource passive
+    direct   : TbSink
+    expected : uint<32> default 0
+
+    connect
+        source.observed -> direct.accept
+    end connect
+
+    // Shared check reading the testbench-owned scoreboard field.
+    check
+        assert direct.count == expected
+            else fail("sb count=${direct.count} exp=${expected}")
+    end check
+end testbench SbLifecycleTb
+
+impl SbLcOne for SbLifecycleTb
+    run
+        source.publish(1)
+        expected = 1
+    end run
+end impl SbLcOne
+
+impl SbLcThree for SbLifecycleTb
+    run
+        source.publish(1)
+        source.publish(2)
+        source.publish(3)
+        expected = 3
+    end run
+end impl SbLcThree

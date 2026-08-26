@@ -526,6 +526,79 @@ fn m4b_self_contained_split_emits_static_coro_per_shard() {
 }
 
 #[test]
+fn m4_a3_scoreboard_read_in_lifecycle_check_falls_back() {
+    // #619 M4 A3 (frame-local host-state READ in a shared lifecycle): a shared
+    // `check` that reads a testbench-owned SCOREBOARD field (`direct.count`)
+    // must NOT be emitted out of line. Owned scoreboards are run-coroutine
+    // frame locals emitted as a bare `direct.count`; the out-of-line ambient
+    // prologue provides only `ctx`/`_tb`/`dut` + log lambdas, so an out-of-line
+    // body referenced an undeclared `direct` — a real miscompile (`use of
+    // undeclared identifier 'direct'`). ShareScan still mints the shared
+    // TestbenchLifecycle (a scoreboard is not randomize side-table state), so
+    // the out-of-line classifier is the sole gate: the check must fall back to
+    // re-inline (no `_harc_lc..._Check` symbol). The v1==tbir build+trace-diff
+    // is covered by the `tb_lifecycle_scoreboard_read_test` equiv rows.
+    let merged = merged_fixture("tb_lifecycle_scoreboard_read_test.harc");
+    let (prog, cpp) = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on");
+        (prog, cpp)
+    });
+
+    // ShareScan mints the shared lifecycle (there IS a TestbenchLifecycle fn),
+    // but the classifier keeps it re-inlined: no out-of-line def/call symbol.
+    assert!(
+        lifecycle_fn_count(&prog) >= 1,
+        "ShareScan should still mint the shared check lifecycle function"
+    );
+    assert_eq!(
+        count_occurrences(&cpp, "_harc_lc__tb_lifecycle_SbLifecycleTb_Check"),
+        0,
+        "the scoreboard-reading check must fall back to re-inline (no out-of-line symbol)"
+    );
+    // The bare frame-local read must appear (re-inlined at the call site),
+    // proving the body was emitted inline rather than dropped.
+    assert!(
+        cpp.contains("direct.count"),
+        "the re-inlined check must still read the owned scoreboard"
+    );
+}
+
+/// #619 M4 A3 exhaustive follow-up: shapes the first, non-exhaustive
+/// `expr_reaches_frame_local` (which ended in `_ => false`) missed. Each
+/// reads a frame local the out-of-line ambient prologue cannot provide, so
+/// the shared check must RE-INLINE — an out-of-line body would reference an
+/// undeclared identifier. Pins the emit shape; the v1==tbir build+trace-diff
+/// is covered by the matching equiv rows.
+#[test]
+fn m4_a3_idle_and_cast_reads_in_lifecycle_check_fall_back() {
+    for (fixture, tb) in [
+        // `tagger.idle_in(2)` → `Expr::ComponentIdle`, bare `tagger._last_in_cycle`.
+        ("tb_lifecycle_idle_read_test.harc", "IdleLifecycleTb"),
+        // `(direct.count as uint<8>)` → frame local nested under `Expr::WidthCast`.
+        ("tb_lifecycle_cast_read_test.harc", "CastLifecycleTb"),
+    ] {
+        let merged = merged_fixture(fixture);
+        let (prog, cpp) = with_switch(true, || {
+            let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+            verify::verify_program(&prog).expect("verifies (switch on)");
+            let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on");
+            (prog, cpp)
+        });
+        assert!(
+            lifecycle_fn_count(&prog) >= 1,
+            "{fixture}: ShareScan should still mint the shared check lifecycle function"
+        );
+        assert_eq!(
+            count_occurrences(&cpp, &format!("_harc_lc__tb_lifecycle_{tb}_Check")),
+            0,
+            "{fixture}: the frame-local-reading check must fall back to re-inline"
+        );
+    }
+}
+
+#[test]
 fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
     // #619 M4b review defect #1 (frame-local CALL in a shared lifecycle):
     // a shared `setup` that materializes a `tseq` (`let txns = Gen(3)`) must
@@ -564,4 +637,55 @@ fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
             body.contains("Gen(")
         });
     assert!(!leaked, "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def");
+}
+
+#[test]
+fn testbench_scoped_bus_bind_is_parser_unreachable() {
+    // #619 M4 hardening (Phase A2): the frame-local-call classifier gate is
+    // exercised for a statement-level bus/TLM `TransactorMethod` call by the
+    // in-module unit tests in `src/codegen/tbir/func.rs`
+    // (`tlm_call_in_lifecycle_is_not_shareable` et al.). There is deliberately
+    // NO real build fixture for a bus-call-in-lifecycle because the shape is
+    // UNREACHABLE from the surface language: a shared lifecycle (setup/check/
+    // teardown) exists only on a reusable `testbench`, and a `testbench` field
+    // cannot carry a `= bind` initializer, so no bus/bound-transactor is ever
+    // in scope for a lifecycle body to call. (A `test` block CAN bind a bus —
+    // see `common_split_e2e::common_layout_bus_bound_hookables_stay_capsule_local`
+    // — but a `test` has no shared lifecycle.)
+    //
+    // This test pins that unreachability: if the parser ever starts accepting a
+    // testbench-scoped bus bind, this fails and forces a revisit of whether the
+    // out-of-line lifecycle classifier still guards the now-reachable TLM call.
+    // The reachable frame-local-call analog (a `tseq` in a shared setup) is
+    // covered end-to-end by `tb_lifecycle_tseq_fallback_test` +
+    // `m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares`.
+    let src = "\
+bus PokeBus\n\
+\x20   handshake_channel cmd: send kind: valid_ready\n\
+\x20       addr: uint<8>\n\
+\x20   end handshake_channel cmd\n\
+end bus PokeBus\n\
+\n\
+testbench TlmTb\n\
+\x20   dut : BusDut\n\
+\x20   p : PokeBus = bind dut\n\
+\x20   setup\n\
+\x20       wait 1 cycle\n\
+\x20   end setup\n\
+end testbench TlmTb\n";
+    let err = match parse_source(src) {
+        Ok(_) => panic!(
+            "a testbench-scoped bus bind now PARSES — revisit the out-of-line \
+             lifecycle classifier: a statement-level bus/TLM call may now reach a \
+             shared lifecycle body and must still route to re-inline"
+        ),
+        Err(e) => format!("{e:?}"),
+    };
+    // The `= bind` initializer is rejected; the diagnostic surfaces at the
+    // field grammar (`expected :`). Assert on the stable prefix so the pin
+    // does not depend on which token follows.
+    assert!(
+        err.contains("UnexpectedToken") && err.contains("expected: \":\""),
+        "expected a field-grammar parse error for the `= bind` initializer, got: {err}"
+    );
 }

@@ -625,17 +625,26 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
 /// `lifecycle_shareable_kind`.
 ///
 /// The `Stmt` KIND is necessary but not sufficient: a whitelisted statement
-/// can still carry an rvalue that emits frame-local / suspending code. The
-/// canonical case is a statement-level blocking TLM call, which lowers to
-/// `Stmt::Assign(dest, Expr::Call(CallTarget::TransactorMethod, ..))`
-/// (`ir::lower::bus`) and whose emission is `co_await
-/// harc_rt::wait_cycles(_slot, …)` + `_slot` refs (`emit_transactor_call`).
-/// A lifecycle body whose only content is such a call has terminator
-/// `Return`, so without this guard it would classify as `Plain` and emit
-/// `co_await`/`_slot` inside a `static void` function — a compile break.
+/// can still carry an rvalue that emits code an out-of-line body cannot
+/// support. Two failure classes:
+///   1. A statement-level blocking TLM CALL, which lowers to
+///      `Stmt::Assign(dest, Expr::Call(CallTarget::TransactorMethod, ..))`
+///      (`ir::lower::bus`) and whose emission is `co_await
+///      harc_rt::wait_cycles(_slot, …)` + `_slot` refs (`emit_transactor_call`).
+///      A lifecycle body whose only content is such a call has terminator
+///      `Return`, so without this guard it would classify as `Plain` and emit
+///      `co_await`/`_slot` inside a `static void` function — a compile break.
+///   2. A non-call HOST-STATE READ whose emitted receiver is a run-coroutine
+///      frame local, not an ambient-prologue name — an owned/env scoreboard
+///      (`ScoreboardQuery{nested_path: Some}`, emitted as bare `direct.count`)
+///      or a bound-to transactor instance (`TransactorState*`). The out-of-line
+///      body is handed only `ctx`/`_tb`/`dut` + log lambdas
+///      (`emit_lifecycle_ambient_prologue`), so such a read references an
+///      undeclared name (`use of undeclared identifier 'direct'`). See
+///      `expr_reaches_frame_local`.
 /// So a statement is out-of-line-safe only when its kind is whitelisted AND
-/// none of its rvalue expressions reach a frame-local/suspending call
-/// target (`stmt_rvalue_reaches_frame_call`).
+/// none of its rvalue expressions reach a frame-local name
+/// (`stmt_rvalue_reaches_frame_local`).
 fn stmt_out_of_line_safe(s: &Stmt) -> bool {
     let kind_ok = matches!(
         s,
@@ -653,7 +662,7 @@ fn stmt_out_of_line_safe(s: &Stmt) -> bool {
             | Stmt::AssertCheck { .. }
             | Stmt::AssumeCheck { .. }
     );
-    kind_ok && !stmt_rvalue_reaches_frame_call(s)
+    kind_ok && !stmt_rvalue_reaches_frame_local(s)
 }
 
 /// A CALL target that an out-of-line lifecycle body cannot reach: a
@@ -670,39 +679,171 @@ fn call_target_reaches_frame(t: &CallTarget) -> bool {
     )
 }
 
-/// Does an rvalue expression (recursively) contain a call to a frame-local
-/// / suspending target? In practice such calls only ever appear as the
-/// TOP-LEVEL rvalue of an `Assign` (TLM/tseq calls are lowered
-/// statement-level, never nested), but the walk descends through the
-/// arithmetic combinators defensively; unhandled leaf/host-state variants
-/// carry no call and are safe.
-fn expr_reaches_frame_call(e: &Expr) -> bool {
+/// A composite-component read whose receiver is a run-frame local the
+/// out-of-line ambient prologue does not reconstruct: `ComponentBase::Path`
+/// (a bare `env.sb` test-scope path) or `SelfField` (`self`, whose
+/// `self_subst` is `None` in a lifecycle). `ComponentBase::Local` is the
+/// lifecycle function's own body-local and is safe.
+fn component_base_reaches_frame_local(base: &crate::ir::ComponentBase) -> bool {
+    use crate::ir::ComponentBase;
+    matches!(base, ComponentBase::Path(_) | ComponentBase::SelfField)
+}
+
+/// A DUT port's RUNTIME lane index (`dut.vec[<expr>]`) is emitted by
+/// `lane_index_cpp` as an arbitrary expression, so it can itself read a frame
+/// local (`dut.vec[direct.count]`). A `None` / `Const` lane renders a literal
+/// and is safe.
+fn lane_reaches_frame_local(lane: &Option<crate::ir::LaneIndex>) -> bool {
+    matches!(lane, Some(crate::ir::LaneIndex::Var(e)) if expr_reaches_frame_local(e))
+}
+
+/// Does an rvalue expression (recursively) reach a name an out-of-line
+/// lifecycle body cannot provide? The out-of-line body is handed only
+/// `ctx`/`_tb`/`dut` + the reconstructed log lambdas
+/// (`emit_lifecycle_ambient_prologue`) plus the lifecycle function's OWN
+/// locals; every other receiver in the emitted C++ is a run-coroutine frame
+/// local. Two failure classes:
+///   * a CALL to a frame-local / suspending target
+///     (`call_target_reaches_frame`); or
+///   * a non-call HOST-STATE READ whose emitted receiver is such a frame
+///     local — an owned/env scoreboard (`ScoreboardQuery{nested_path: Some}`,
+///     bare `direct.count`), a bound-to transactor instance / heartbeat stamp
+///     (`TransactorState*` / `TransactorIdle`, bare `<storage>`), a
+///     composite-component read through a `Path`/`SelfField` base (`Component*`
+///     / `ComponentIdle`, bare `env.sb`), a concurrent-check latch cell
+///     (`TemporalSlot`, `_harc_ps<i>`), a cover hook-sampler closure arg
+///     (`CovHookParam`/`CovHookArg`), or a regblock mirror / bus-read helper
+///     lambda (`RegRead`).
+///
+/// This match is EXHAUSTIVE — no `_` wildcard — so a new `Expr` variant is a
+/// compile error here rather than a silent `false` that ships the next
+/// undeclared-identifier miscompile. It mirrors the variant enumeration and
+/// per-position recursion of `expr_uses_snapshot_lane`: safe receivers
+/// (`_tb.<field>` / `dut` / body-locals / file scope) return `false` but every
+/// sub-expression position (`inner`/`target`/`hi`/`lo`/`index`/`mid_indices`/
+/// args/…) is still descended, so a frame local nested under a width-cast,
+/// bit-slice, index, or arithmetic combinator (`_tb.mem[direct.count]`,
+/// `(direct.count as uint<8>)`) is still caught.
+fn expr_reaches_frame_local(e: &Expr) -> bool {
     match e {
+        // ---- Frame-local LEAF reads: the emitted receiver is a run-frame
+        //      local (bare instance/storage, closure cell, or `[&]` lambda)
+        //      the ambient prologue does not reconstruct. ----
+        Expr::TransactorState { .. }
+        | Expr::TransactorStateRecordField { .. }
+        | Expr::TransactorStateQueueQuery { .. }
+        | Expr::TransactorIdle { .. }
+        | Expr::TemporalSlot { .. }
+        | Expr::CovHookParam { .. }
+        | Expr::CovHookArg { .. }
+        | Expr::RegRead { .. } => true,
+        // Owned/env scoreboard read: `Some(path)` is a bare `<path>.<scalar>`
+        // (or a `self`-rooted receiver, `self_subst == None` in a lifecycle);
+        // `None` is `_tb.<field>` and is safe (in the safe-leaf arm below).
+        Expr::ScoreboardQuery {
+            nested_path: Some(_),
+            ..
+        } => true,
+        // ---- Composite-component reads: frame-local only when the receiver
+        //      base is `Path`/`SelfField`; `ComponentBase::Local` is this
+        //      function's own body-local (safe). Index sub-expressions are
+        //      still scanned. ----
+        Expr::ComponentField { base, .. }
+        | Expr::ComponentValue { base }
+        | Expr::ComponentQueueQuery { base, .. } => component_base_reaches_frame_local(base),
+        Expr::ComponentVecElement {
+            base,
+            index,
+            inner_index,
+            ..
+        } => {
+            component_base_reaches_frame_local(base)
+                || expr_reaches_frame_local(index)
+                || inner_index.as_deref().is_some_and(expr_reaches_frame_local)
+        }
+        Expr::ComponentIdle { base, n, .. } => {
+            component_base_reaches_frame_local(base) || expr_reaches_frame_local(n)
+        }
+        // ---- Frame-reaching CALL target (TLM / tseq / transactor self-method);
+        //      Helper/ExternFn/Builtin resolve to file scope. Args scanned. ----
         Expr::Call(target, args) => {
-            call_target_reaches_frame(target) || args.iter().any(expr_reaches_frame_call)
+            call_target_reaches_frame(target) || args.iter().any(expr_reaches_frame_local)
         }
-        Expr::Binary(_, a, b) => expr_reaches_frame_call(a) || expr_reaches_frame_call(b),
-        Expr::Unary(_, a) => expr_reaches_frame_call(a),
+        // ---- Wrapper / index-bearing expressions: safe in themselves, but a
+        //      sub-expression may reach a frame local. Recurse into EVERY
+        //      sub-expression position. ----
+        Expr::Binary(_, a, b) => expr_reaches_frame_local(a) || expr_reaches_frame_local(b),
+        Expr::Unary(_, a) => expr_reaches_frame_local(a),
         Expr::Ternary(a, b, c) => {
-            expr_reaches_frame_call(a)
-                || expr_reaches_frame_call(b)
-                || expr_reaches_frame_call(c)
+            expr_reaches_frame_local(a)
+                || expr_reaches_frame_local(b)
+                || expr_reaches_frame_local(c)
         }
-        _ => false,
+        Expr::WidthCast { inner, .. } => expr_reaches_frame_local(inner),
+        Expr::BitSlice { target, .. } => expr_reaches_frame_local(target),
+        Expr::BitSliceDyn { target, hi, lo } => {
+            expr_reaches_frame_local(target)
+                || expr_reaches_frame_local(hi)
+                || expr_reaches_frame_local(lo)
+        }
+        Expr::DynamicListQuery { target, .. } => expr_reaches_frame_local(target),
+        Expr::RecordField {
+            mid_indices, index, ..
+        } => {
+            mid_indices
+                .iter()
+                .any(|(_, value)| expr_reaches_frame_local(value))
+                || index.as_deref().is_some_and(expr_reaches_frame_local)
+        }
+        Expr::TbFieldVecElement {
+            index, inner_index, ..
+        } => {
+            expr_reaches_frame_local(index)
+                || inner_index.as_deref().is_some_and(expr_reaches_frame_local)
+        }
+        Expr::SeqIndex { index, .. } => expr_reaches_frame_local(index),
+        Expr::PortSnapshotLane { index, .. } => expr_reaches_frame_local(index),
+        // A DUT port read is `dut->…` (safe), but a runtime lane subscript is
+        // an arbitrary expression that may reach a frame local.
+        Expr::Port(p) => lane_reaches_frame_local(&p.lane),
+        // ---- Safe leaves: literal / body-local / `_tb.<field>` / `dut` /
+        //      file-scope receivers with no frame-local sub-expression. ----
+        Expr::Literal { .. }
+        | Expr::WideLiteral(_)
+        | Expr::Local(_)
+        | Expr::TbField(_)
+        | Expr::TbQueueQuery { .. }
+        | Expr::ScoreboardQuery {
+            nested_path: None, ..
+        }
+        | Expr::CycleCount
+        | Expr::ErrorCount
+        | Expr::CovBin { .. }
+        | Expr::SeqLen(_) => false,
     }
 }
 
-/// Does any rvalue expression carried by a whitelisted statement reach a
-/// frame-local/suspending call target? Extracts the value/condition/index
-/// expressions of each rvalue-bearing whitelisted `Stmt` and scans them.
-/// Statements with no rvalue expression (`DutRead`, `ProbeRelease`,
-/// `RecordInit`, `TbQueuePop`) — and any non-whitelisted statement, already
-/// excluded by the positive list — carry nothing to reach the frame.
-fn stmt_rvalue_reaches_frame_call(s: &Stmt) -> bool {
+/// Does any expression carried by a whitelisted statement reach a frame-local
+/// name (a frame-local/suspending call target OR a frame-local host-state
+/// read)? Scans EVERY expression position of each whitelisted `Stmt` —
+/// including DUT-port runtime lane subscripts (`dut.vec[direct.count] = …`),
+/// not just rvalues — via `expr_reaches_frame_local`. Every whitelisted kind
+/// (the same positive list as `stmt_out_of_line_safe`) is matched EXPLICITLY,
+/// so the no-expression kinds are visibly `false` and a new expression field on
+/// any of them is a compile error rather than a silent skip. The trailing
+/// `_ => false` therefore covers ONLY non-whitelisted kinds, which
+/// `stmt_out_of_line_safe` has already excluded before this is called.
+fn stmt_rvalue_reaches_frame_local(s: &Stmt) -> bool {
     match s {
-        Stmt::Assign(_, e) | Stmt::DutWrite(_, e) => expr_reaches_frame_call(e),
+        Stmt::Assign(_, e) => expr_reaches_frame_local(e),
+        // A DUT-port write/read/release: the lvalue `PortRef` may carry a
+        // runtime lane subscript that reads a frame local.
+        Stmt::DutWrite(port, e) => {
+            lane_reaches_frame_local(&port.lane) || expr_reaches_frame_local(e)
+        }
+        Stmt::DutRead(_, port) | Stmt::ProbeRelease(port) => lane_reaches_frame_local(&port.lane),
         Stmt::TbFieldWrite { value, .. } | Stmt::TbQueuePush { value, .. } => {
-            expr_reaches_frame_call(value)
+            expr_reaches_frame_local(value)
         }
         Stmt::TbFieldVecElementWrite {
             index,
@@ -710,9 +851,9 @@ fn stmt_rvalue_reaches_frame_call(s: &Stmt) -> bool {
             value,
             ..
         } => {
-            expr_reaches_frame_call(index)
-                || inner_index.as_ref().is_some_and(expr_reaches_frame_call)
-                || expr_reaches_frame_call(value)
+            expr_reaches_frame_local(index)
+                || inner_index.as_ref().is_some_and(expr_reaches_frame_local)
+                || expr_reaches_frame_local(value)
         }
         Stmt::RecordFieldWrite {
             mid_indices,
@@ -720,15 +861,22 @@ fn stmt_rvalue_reaches_frame_call(s: &Stmt) -> bool {
             value,
             ..
         } => {
-            mid_indices.iter().any(|(_, e)| expr_reaches_frame_call(e))
-                || index.as_ref().is_some_and(expr_reaches_frame_call)
-                || expr_reaches_frame_call(value)
+            mid_indices.iter().any(|(_, e)| expr_reaches_frame_local(e))
+                || index.as_ref().is_some_and(expr_reaches_frame_local)
+                || expr_reaches_frame_local(value)
         }
-        Stmt::Log { args, .. } => args.args.iter().any(|a| expr_reaches_frame_call(&a.expr)),
+        Stmt::Log { args, .. } => args.args.iter().any(|a| expr_reaches_frame_local(&a.expr)),
         Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
-            expr_reaches_frame_call(cond)
-                || on_fail.args.iter().any(|a| expr_reaches_frame_call(&a.expr))
+            expr_reaches_frame_local(cond)
+                || on_fail.args.iter().any(|a| expr_reaches_frame_local(&a.expr))
         }
+        // Whitelisted kinds that carry NO expression — explicit so a future
+        // expression field breaks the build here instead of slipping past.
+        // (`DutRead`/`ProbeRelease` are handled above for their port lane.)
+        Stmt::RecordInit(_, _) => false,
+        Stmt::TbQueuePop { field: _, dest: _ } => false,
+        // Non-whitelisted kinds never reach here (gated by
+        // `stmt_out_of_line_safe`'s kind whitelist).
         _ => false,
     }
 }
@@ -4914,17 +5062,28 @@ pub(super) fn emit_test_hook(
 #[cfg(test)]
 mod lifecycle_classifier_tests {
     //! #619 M4b: `lifecycle_shareable_kind` must NOT classify a lifecycle
-    //! body that carries a frame-local / suspending CALL (a bus/TLM
-    //! `TransactorMethod`, a `Tseq` generator, or a transactor
-    //! `TransactorSelfMethod`) as out-of-line-shareable. Such a call emits
-    //! `co_await`/`_slot` or references a `[&]`-captured run-coroutine
-    //! lambda, neither of which an out-of-line `static void` function (or a
-    //! coroutine driven from the outside) can reach — so the whole body must
-    //! fall back to re-inline. These tests build the offending IR directly
-    //! (no bus DUT needed) and pin the classifier decision.
+    //! body that reaches a run-coroutine frame local as out-of-line-shareable.
+    //! Two classes:
+    //!   * a frame-local / suspending CALL — a bus/TLM `TransactorMethod`, a
+    //!     `Tseq` generator, or a transactor `TransactorSelfMethod` — which
+    //!     emits `co_await`/`_slot` or references a `[&]`-captured run-coroutine
+    //!     lambda; and
+    //!   * (#619 M4 A3) a non-call HOST-STATE READ whose emitted receiver is a
+    //!     run-frame local not reconstructed by the ambient prologue — an
+    //!     owned/env scoreboard (`ScoreboardQuery{nested_path: Some}`, bare
+    //!     `direct.count`), a bound-to transactor instance (`TransactorState*`),
+    //!     or a composite-component read through a `Path`/`SelfField` base.
+    //! Neither an out-of-line `static void` function nor a coroutine driven from
+    //! the outside can reach those names, so the whole body must fall back to
+    //! re-inline. These tests build the offending IR directly (no DUT needed)
+    //! and pin the classifier decision.
     use super::*;
     use crate::ast::LifecyclePhase;
-    use crate::ir::{BasicBlock, BinOp, FunctionId, FunctionKind, TestbenchId, TypedLocal};
+    use crate::ir::{
+        BasicBlock, BinOp, ComponentBase, CovgroupId, CovgroupInstance, FunctionId, FunctionKind,
+        IdleKind, LaneIndex, PortAccess, PortRef, ScoreboardId, TemporalFn, TestbenchId,
+        TransactorId, TypedLocal, WidthCastKind,
+    };
 
     fn single_block_lifecycle(stmts: Vec<Stmt>, terminator: Terminator) -> TbFunction {
         TbFunction {
@@ -4973,6 +5132,32 @@ mod lifecycle_classifier_tests {
         let call = Expr::Call(CallTarget::Tseq("Gen".to_string()), vec![]);
         let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
         assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn transactor_self_method_call_in_lifecycle_is_not_shareable() {
+        // The module docstring names all three frame-reaching call targets;
+        // `TransactorMethod` and `Tseq` are pinned above. `TransactorSelfMethod`
+        // emits a `<Transactor>_<method>(...)` call INSIDE the enclosing
+        // transactor-method lambda (a run-coroutine frame local), so an
+        // out-of-line lifecycle body cannot reach it either. It never appears
+        // directly in a lifecycle body today (self-method calls are confined to
+        // transactor method bodies), but `call_target_reaches_frame` rejects it
+        // defensively — this pins that leg of the classifier so a future
+        // relaxation cannot silently start sharing such a body.
+        let call = Expr::Call(
+            CallTarget::TransactorSelfMethod {
+                transactor: "Drv".to_string(),
+                method: "step".to_string(),
+            },
+            vec![],
+        );
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
+        assert_eq!(
+            lifecycle_shareable_kind(&f),
+            None,
+            "a transactor self-method call in a lifecycle body must fall back to re-inline"
+        );
     }
 
     #[test]
@@ -5030,6 +5215,238 @@ mod lifecycle_classifier_tests {
             vec![],
         );
         let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    // ---- #619 M4 A3: frame-local HOST-STATE READS route to re-inline. ----
+
+    fn scoreboard_scalar_read(nested_path: Option<Vec<String>>) -> Expr {
+        Expr::ScoreboardQuery {
+            sb: ScoreboardId(0),
+            field: "direct".to_string(),
+            query: crate::ir::ScoreboardQuery::Scalar {
+                scalar: "count".to_string(),
+            },
+            nested_path,
+        }
+    }
+
+    #[test]
+    fn owned_scoreboard_read_in_lifecycle_is_not_shareable() {
+        // An owned/env scoreboard read carries `nested_path: Some` and emits as
+        // a bare `direct.count` run-frame local — undeclared in an out-of-line
+        // body. This is the exact shape of the A3 miscompile. Carried inside an
+        // assert condition (the realistic position), it must exclude sharing.
+        let f = single_block_lifecycle(
+            vec![Stmt::AssertCheck {
+                cond: Expr::Binary(
+                    BinOp::Ge,
+                    Box::new(scoreboard_scalar_read(Some(vec!["direct".to_string()]))),
+                    Box::new(Expr::Literal {
+                        value: 0,
+                        ty: IrType::UInt(Some(32)),
+                    }),
+                ),
+                on_fail: crate::ir::FmtArgs {
+                    fmt: String::new(),
+                    args: vec![],
+                },
+            }],
+            Terminator::Return,
+        );
+        assert_eq!(
+            lifecycle_shareable_kind(&f),
+            None,
+            "a bare-receiver scoreboard read in a lifecycle body must re-inline"
+        );
+    }
+
+    #[test]
+    fn tb_field_scoreboard_read_in_lifecycle_stays_shareable() {
+        // `nested_path: None` is a scoreboard-typed TESTBENCH field, emitted as
+        // `_tb.direct.count`. The prologue aliases `_tb`, so this stays safely
+        // shareable — the A3 fix must not over-reject it.
+        let f = single_block_lifecycle(
+            vec![Stmt::Assign(LocalId(0), scoreboard_scalar_read(None))],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    #[test]
+    fn transactor_state_read_in_lifecycle_is_not_shareable() {
+        let read = Expr::TransactorState {
+            instance: "drv".to_string(),
+            field: "count".to_string(),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn component_path_read_in_lifecycle_is_not_shareable() {
+        // A `ComponentBase::Path` read emits a bare `env.sb.field` receiver.
+        let read = Expr::ComponentField {
+            base: ComponentBase::Path(vec!["env".to_string(), "sb".to_string()]),
+            field: "count".to_string(),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn component_local_read_in_lifecycle_stays_shareable() {
+        // A `ComponentBase::Local` receiver is the lifecycle function's OWN
+        // body-local, so it is in scope out of line and must not over-reject.
+        let read = Expr::ComponentField {
+            base: ComponentBase::Local(LocalId(0)),
+            field: "count".to_string(),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    // ---- Exhaustive follow-up: shapes the first (non-exhaustive) fix missed. ----
+
+    fn lit(v: u64) -> Expr {
+        Expr::Literal {
+            value: v,
+            ty: IrType::UInt(Some(32)),
+        }
+    }
+
+    #[test]
+    fn component_idle_path_read_in_lifecycle_is_not_shareable() {
+        // `agent.idle_in(N)` → `ComponentIdle{base: Path}` emits a bare
+        // `agent._last_in_cycle` frame local. The confirmed-reachable shape the
+        // first fix missed (its match ended in `_ => false`).
+        let read = Expr::ComponentIdle {
+            base: ComponentBase::Path(vec!["tagger".to_string()]),
+            subpath: vec![],
+            kind: IdleKind::In,
+            n: Box::new(lit(2)),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn component_idle_local_base_stays_shareable() {
+        // A `Local` base is a body-local — must not over-reject.
+        let read = Expr::ComponentIdle {
+            base: ComponentBase::Local(LocalId(0)),
+            subpath: vec![],
+            kind: IdleKind::Both,
+            n: Box::new(lit(2)),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    #[test]
+    fn transactor_idle_read_in_lifecycle_is_not_shareable() {
+        let read = Expr::TransactorIdle {
+            field: "drv".to_string(),
+            transactor: TransactorId(0),
+            storage: "drv".to_string(),
+            kind: IdleKind::Out,
+            n: Box::new(lit(3)),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn temporal_slot_read_in_lifecycle_is_not_shareable() {
+        // `_harc_ps<i>` / `_harc_cur<i>` are per-check-closure static cells,
+        // not ambient-prologue names.
+        let read = Expr::TemporalSlot {
+            slot: 0,
+            kind: TemporalFn::Past,
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn width_cast_wrapped_frame_local_read_is_not_shareable() {
+        // `(direct.count as uint<8>)` — the frame-local scoreboard read is
+        // NESTED under a `WidthCast`. The first fix did not descend into
+        // `WidthCast`; the exhaustive walk does.
+        let read = Expr::WidthCast {
+            kind: WidthCastKind::Trunc,
+            width: 8,
+            src_width: Some(32),
+            inner: Box::new(scoreboard_scalar_read(Some(vec!["direct".to_string()]))),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn width_cast_wrapped_safe_read_stays_shareable() {
+        // A width-cast over a literal has no frame local — must stay shareable.
+        let read = Expr::WidthCast {
+            kind: WidthCastKind::Zext,
+            width: 64,
+            src_width: Some(32),
+            inner: Box::new(lit(7)),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    fn dut_vec_port(lane: Option<LaneIndex>) -> PortRef {
+        PortRef {
+            testbench_field: "dut".to_string(),
+            port_path: vec!["vec".to_string()],
+            aggregate_path: false,
+            direction: None,
+            width: None,
+            access: PortAccess::Port,
+            lane,
+        }
+    }
+
+    #[test]
+    fn dut_port_runtime_lane_frame_local_is_not_shareable() {
+        // `dut.vec[direct.count] = 1` — the runtime lane subscript reads a
+        // frame local. The `PortRef` lane is an expression position the first
+        // fix never scanned.
+        let port = dut_vec_port(Some(LaneIndex::Var(Box::new(scoreboard_scalar_read(Some(
+            vec!["direct".to_string()],
+        ))))));
+        let f = single_block_lifecycle(
+            vec![Stmt::DutWrite(port, lit(1))],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), None);
+    }
+
+    #[test]
+    fn dut_port_const_lane_stays_shareable() {
+        // A constant lane renders a literal — must not over-reject.
+        let port = dut_vec_port(Some(LaneIndex::Const(2)));
+        let f = single_block_lifecycle(
+            vec![Stmt::DutWrite(port, lit(1))],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
+    }
+
+    #[test]
+    fn covbin_read_stays_shareable() {
+        // `CovBin` reads `_tb.<cov>.<point>.<bin>` — the prologue aliases
+        // `_tb`, so it stays safely shareable.
+        let read = Expr::CovBin {
+            inst: CovgroupInstance {
+                tb_field: "cg".to_string(),
+                covgroup: CovgroupId(0),
+            },
+            point: "p".to_string(),
+            bin: "b".to_string(),
+        };
+        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), read)], Terminator::Return);
         assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
     }
 }

@@ -202,6 +202,26 @@ tb_lifecycle_concurrent_assert_test | Top | top_counter.sv | - | pass | - | - | 
 tb_lifecycle_concurrent_assert_test | Top | top_counter.sv | - | pass | - | - | ConcurrentAssertB
 tb_lifecycle_method_shadow_test | Top | top_counter.sv | - | pass | - | - | MethodShadowPlain
 tb_lifecycle_method_shadow_test | Top | top_counter.sv | - | pass | - | - | MethodShadowShadows
+# #619 M4 A3: a shared `check` lifecycle body reads a testbench-owned
+# SCOREBOARD field (`direct.count`), which emits as a bare run-coroutine frame
+# local. ShareScan still mints the shared lifecycle, so the out-of-line
+# classifier (`expr_reaches_frame_local`) is the sole gate; it must re-inline
+# the check (an out-of-line body would reference an undeclared `direct` — a
+# real miscompile before the A3 fix). Both codegens re-inline and trace-diff
+# clean; bound by two impls.
+tb_lifecycle_scoreboard_read_test | Top | top_counter.sv | - | pass | - | - | SbLcOne
+tb_lifecycle_scoreboard_read_test | Top | top_counter.sv | - | pass | - | - | SbLcThree
+# #619 M4 A3 (exhaustive follow-up): the same frame-local-read miscompile for
+# shapes the first fix missed. `idle_read` reads an AGENT heartbeat predicate
+# (`tagger.idle_in(2)` → `Expr::ComponentIdle`, bare `tagger._last_in_cycle`);
+# `cast_read` wraps an owned-scoreboard read in a width-cast
+# (`(direct.count as uint<8>)`) so the frame local is NESTED under `WidthCast`.
+# Both were shared out of line (undeclared identifier) until the classifier was
+# made exhaustive. Both codegens re-inline and trace-diff clean; two impls each.
+tb_lifecycle_idle_read_test | Top | top_counter.sv | - | pass | - | - | IdleLcA
+tb_lifecycle_idle_read_test | Top | top_counter.sv | - | pass | - | - | IdleLcB
+tb_lifecycle_cast_read_test | Top | top_counter.sv | - | pass | - | - | CastLcOne
+tb_lifecycle_cast_read_test | Top | top_counter.sv | - | pass | - | - | CastLcTwo
 scoreboard_basic_test | Top | top_counter.sv | - | pass
 scoreboard_data_queue_struct_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass

@@ -985,3 +985,202 @@ end test BadInstantiation
         panic!("a capsule was written despite the diagnostic:\n{body}");
     }
 }
+
+// --------------------------------------------------------------------------
+// #619 M4 hardening (Phase A1): SHARED reusable-testbench lifecycle under the
+// TBIR common (separate interface/common/shard) layout, REAL build + link +
+// run. This is the once-per-suite payoff #619 targets: the shared body is
+// DEFINED once in the common TU (external linkage) with a prototype in the
+// suite header, and every shard CALLS it. The in-process ownership test
+// `m4b_split_common_layout_emits_lifecycle_once_in_common` pins that shape by
+// substring; here the real Verilator build proves the common def + header
+// prototype + shard calls actually link and run.
+//
+// NOTE: `run_common_split` above hardcodes `--codegen v1`, whose common
+// layout is the issue-#643 per-test-capsule emission (`tb__runtime.cpp` +
+// capsules) — a DIFFERENT path that has no out-of-line `_harc_lc` lifecycle
+// symbol. The out-of-line lifecycle lives on the TBIR separate/common path
+// (`<stem>__common.cpp` / `<stem>__suite.hpp` / `<stem>__shardN.cpp`), so
+// this suite runs `--codegen tbir` explicitly.
+// --------------------------------------------------------------------------
+
+const LC_COUNTER_SV: &str = "\
+module LcCounter(input logic clk, input logic rst, input logic en, output logic [7:0] count_out);
+  logic [7:0] c;
+  always_ff @(posedge clk) begin
+    if (rst) c <= 0;
+    else if (en) c <= c + 8'd1;
+  end
+  assign count_out = c;
+endmodule
+";
+
+/// Reusable testbench with a shared suspending (`Coro`) `setup` + a
+/// non-suspending (`Plain`) `check`, bound by two impls.
+const LC_SHARED_TB: &str = "\
+testbench LcSharedTb
+    dut : LcCounter
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail(\"shared check: count=${dut.count_out} exp=${expected}\")
+    end check
+end testbench LcSharedTb
+
+impl LcBumpThree for LcSharedTb
+    run
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        expected = 3
+    end run
+end impl LcBumpThree
+
+impl LcBumpFive for LcSharedTb
+    run
+        dut.en = 1
+        wait 5 cycles
+        dut.en = 0
+        expected = 5
+    end run
+end impl LcBumpFive
+";
+
+/// `harc sim … --codegen tbir --cpp-split tests --cpp-split-layout common`.
+fn run_common_split_tbir(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) -> (bool, String) {
+    let mut cmd = Command::new(harc_bin());
+    cmd.arg("sim")
+        .arg(tb)
+        .arg("--sv")
+        .arg(sv)
+        .arg("--top")
+        .arg("LcCounter")
+        .arg("--codegen")
+        .arg("tbir")
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--cpp-split-layout")
+        .arg("common")
+        .arg("--outdir")
+        .arg(outdir);
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().expect("spawn harc sim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// Files in `outdir` whose name ends with `suffix` (e.g. `__common.cpp`),
+/// as (name, contents) pairs.
+fn read_by_suffix(outdir: &Path, suffix: &str) -> Vec<(String, String)> {
+    fs::read_dir(outdir)
+        .expect("read outdir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().unwrap().to_string_lossy().ends_with(suffix))
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read_to_string(&p).expect("read generated file"),
+            )
+        })
+        .collect()
+}
+
+fn count(hay: &str, needle: &str) -> usize {
+    hay.matches(needle).count()
+}
+
+#[test]
+fn common_layout_shared_lifecycle_defines_body_once_builds_and_runs() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("lc_common");
+    let sv = dir.join("dut.sv");
+    fs::write(&sv, LC_COUNTER_SV).unwrap();
+    let tb = dir.join("lc.harc");
+    fs::write(&tb, LC_SHARED_TB).unwrap();
+    let outdir = dir.join("out");
+
+    // Real build + default dispatch (first impl in source order).
+    let (ok, msg) = run_common_split_tbir(&tb, &sv, &outdir, &[]);
+    assert!(ok, "lifecycle common build failed: {msg}");
+    assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+
+    // Each impl dispatches from the same linked binary.
+    for t in ["LcBumpThree", "LcBumpFive"] {
+        let (ok, msg) = run_common_split_tbir(&tb, &sv, &outdir, &["--test", t]);
+        assert!(ok, "{t} failed: {msg}");
+        assert!(msg.contains("ALL TESTS PASSED"), "{t}: {msg}");
+    }
+
+    // The DEFINITION (signature + `(HarcTestContext…`) lives exactly once in
+    // the common TU. Calls read `(ctx, …)`, so `(HarcTestContext` matches
+    // only the definition, never a call site.
+    let setup_def = "harc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup(HarcTestContext";
+    let check_def = "void _harc_lc__tb_lifecycle_LcSharedTb_Check(HarcTestContext";
+
+    let common = read_by_suffix(&outdir, "__common.cpp");
+    assert_eq!(common.len(), 1, "expected exactly one common TU, got {}", common.len());
+    let (_, common_src) = &common[0];
+    assert_eq!(
+        count(common_src, setup_def),
+        1,
+        "the suspending setup coroutine must be DEFINED exactly once in the common TU"
+    );
+    assert_eq!(
+        count(common_src, check_def),
+        1,
+        "the non-suspending check must be DEFINED exactly once in the common TU"
+    );
+
+    // Zero DEFINITIONS in any shard (they only CALL the shared bodies).
+    let shards = read_by_suffix(&outdir, ".cpp")
+        .into_iter()
+        .filter(|(n, _)| n.contains("__shard"))
+        .collect::<Vec<_>>();
+    assert!(!shards.is_empty(), "expected at least one shard TU");
+    for (n, src) in &shards {
+        assert_eq!(
+            count(src, setup_def),
+            0,
+            "shard {n} must NOT define the shared setup coroutine"
+        );
+        assert_eq!(
+            count(src, check_def),
+            0,
+            "shard {n} must NOT define the shared check function"
+        );
+    }
+
+    // The suite header carries a prototype for each shared body so shards
+    // can call them.
+    let header = read_by_suffix(&outdir, "__suite.hpp");
+    assert_eq!(header.len(), 1, "expected exactly one suite header");
+    let (_, header_src) = &header[0];
+    assert!(
+        header_src.contains("_harc_lc__tb_lifecycle_LcSharedTb_Setup(HarcTestContext"),
+        "suite header must declare the setup coroutine prototype:\n{header_src}"
+    );
+    assert!(
+        header_src.contains("_harc_lc__tb_lifecycle_LcSharedTb_Check(HarcTestContext"),
+        "suite header must declare the check prototype:\n{header_src}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
