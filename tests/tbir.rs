@@ -4031,6 +4031,155 @@ end impl ListQueueTargetTest
     );
 }
 
+/// Dynamic lists of records use the existing `RecordSeq` value type, so a
+/// queue preserves both its record identity and its nested vector carrier.
+#[test]
+fn record_list_queue_elements_lower_as_exact_aggregate_values() {
+    let src = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench RecordListQueueTb
+    dut : Top
+    values : queue<list<Beat>>
+end testbench RecordListQueueTb
+
+impl RecordListQueueTest for RecordListQueueTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl RecordListQueueTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("record-list queue lowers");
+    verify::verify_program(&prog).expect("record-list queue verifies");
+    let beat = prog
+        .records
+        .iter()
+        .position(|record| record.name == "Beat")
+        .map(|index| ir::RecordId(index as u32))
+        .expect("fixture has Beat record");
+    assert_eq!(
+        prog.testbenches[0].queue_fields[0].elem,
+        ir::QueueElem::List {
+            elem: Box::new(ir::IrType::Record(beat)),
+        }
+    );
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("record-list queue emits");
+    assert!(
+        cpp.contains("harc_rt::HarcQueue<std::vector<Beat>> values;")
+            && cpp.contains("std::vector<Beat> observed{};"),
+        "queue storage and inferred pop local retain the record-list type:\n{cpp}"
+    );
+    let v1 = cpp_tb::emit(&merged).expect("v1 emits the retirement control");
+    assert!(
+        v1.contains("harc_rt::HarcQueue<std::vector<uint64_t>> values;"),
+        "documented divergence: v1 silently loses the record list element type:\n{v1}"
+    );
+
+    let owners = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+scoreboard RecordListQueueSb
+    values : queue<list<Beat>>
+end scoreboard RecordListQueueSb
+agent RecordListQueueAgent
+    values : queue<list<Beat>>
+end agent RecordListQueueAgent
+testbench RecordListQueueOwnersTb
+    dut : Top
+    sb : RecordListQueueSb
+    ag : RecordListQueueAgent
+end testbench RecordListQueueOwnersTb
+impl RecordListQueueOwnersTest for RecordListQueueOwnersTb
+    run
+        assert sb.values.empty()
+        assert ag.values.size() == 0
+        wait 1 cycle
+    end run
+end impl RecordListQueueOwnersTest
+"#;
+    let owners_prog = lower_src(owners).expect("component-owned record-list queues lower");
+    verify::verify_program(&owners_prog).expect("component-owned record-list queues verify");
+    let owners_cpp = tbir::emit(
+        &owners_prog,
+        &merged_src(owners),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("component-owned record-list queues emit");
+    assert_eq!(
+        owners_cpp
+            .matches("harc_rt::HarcQueue<std::vector<Beat>> values;")
+            .count(),
+        2,
+        "scoreboard and agent retain record-list queue storage:\n{owners_cpp}"
+    );
+
+    let target = r#"
+transaction Beat
+    data : uint<8>
+end transaction Beat
+bus RecordListQueueBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RecordListQueueBus
+transactor RecordListQueueTarget bound to RecordListQueueBus
+    values : queue<list<Beat>>
+    thread bus.read(addr: uint<8>)
+        assert values.empty()
+        return addr
+    end thread
+end transactor RecordListQueueTarget
+testbench RecordListQueueTargetTb
+    dut : TlmReadInitiator
+end testbench RecordListQueueTargetTb
+impl RecordListQueueTargetTest for RecordListQueueTargetTb
+    let mem : RecordListQueueBus = bind dut
+    let target : RecordListQueueTarget passive = bind mem
+    run
+        assert target.values.size() == 0
+        wait 1 cycle
+    end run
+end impl RecordListQueueTargetTest
+"#;
+    let target_prog = lower_src(target).expect("target-state record-list queue lowers");
+    verify::verify_program(&target_prog).expect("target-state record-list queue verifies");
+    assert!(matches!(
+        target_prog.transactors[0].state_fields[0].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::List { .. }
+        }
+    ));
+
+    let mismatch = src.replace(
+        "let observed = values.pop()",
+        "let observed : list<uint<8>> = values.pop()",
+    );
+    assert!(
+        lower_src(&mismatch).is_err(),
+        "a record-list pop annotation must retain its record element type"
+    );
+
+    let mut broken = prog.clone();
+    let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0] else {
+        panic!("fixture state field is a queue");
+    };
+    field.elem = ir::QueueElem::List {
+        elem: Box::new(ir::IrType::Unknown),
+    };
+    let errors = verify::verify_program(&broken).expect_err("bad record-list metadata rejects");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("invalid dynamic-list element schema")),
+        "verifier names the corrupt record-list schema: {errors:?}"
+    );
+}
+
 /// A source-level type annotation on `queue.pop()` is an assignment slot.
 /// Narrowing or changing signedness is a program error, so it must be
 /// reported by lowering rather than surfacing as an internal verifier error.

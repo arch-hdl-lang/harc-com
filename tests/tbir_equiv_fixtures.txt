@@ -307,6 +307,8 @@ fixed_vec_queue_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
 dynamic_list_queue_test | Top | top_counter.sv | top_counter.arch | pass
 dynamic_list_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
+record_list_queue_test | Top | top_counter.sv | top_counter.arch | pass
+record_list_queue_pop_test | Top | top_counter.sv | top_counter.arch | fail
 scoreboard_record_state_test | Top | top_counter.sv | top_counter.arch | pass
 scoreboard_list_state_test | Top | top_counter.sv | top_counter.arch | pass
 record_list_randomize_test | Top | top_counter.sv | - | pass

@@ -1,0 +1,20 @@
+// Compile/run gate for a record-list queue pop destination and matching push.
+// The queue is intentionally empty, so both backends compile the nested
+// std::vector<Record> value transfers and report the same runtime failure.
+
+transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench RecordListQueuePopTb
+    dut : Top
+    values : queue<list<Beat>>
+end testbench RecordListQueuePopTb
+
+impl RecordListQueuePopTest for RecordListQueuePopTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl RecordListQueuePopTest

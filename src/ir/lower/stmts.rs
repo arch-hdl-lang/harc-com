@@ -1713,8 +1713,11 @@ impl FuncBuilder<'_> {
             }
             crate::ir::QueueElem::List { .. } => {
                 let expected = elem.ir_type();
-                let declared = super::records::record_list_scalar_ir_type(ty)
-                    .map(|elem| IrType::Seq(Box::new(elem)));
+                let declared = super::records::record_list_elem_ir_type(ty, &self.ctx.record_ids)
+                    .map(|elem| match elem {
+                        IrType::Record(record) => IrType::RecordSeq(record),
+                        scalar => IrType::Seq(Box::new(scalar)),
+                    });
                 if declared.as_ref() == Some(&expected) {
                     return Ok(());
                 }

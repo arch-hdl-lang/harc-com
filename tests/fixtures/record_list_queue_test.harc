@@ -1,0 +1,20 @@
+// Dynamic record-list queue storage and read-only queries must compile and
+// run under TBIR. v1 silently substitutes uint64_t for the record element;
+// the empty-query trace remains useful as a retirement-era parity gate.
+
+transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench RecordListQueueTb
+    dut : Top
+    values : queue<list<Beat>>
+end testbench RecordListQueueTb
+
+impl RecordListQueueTest for RecordListQueueTb
+    run
+        assert values.empty()
+        assert values.size() == 0
+        wait 1 cycle
+    end run
+end impl RecordListQueueTest
