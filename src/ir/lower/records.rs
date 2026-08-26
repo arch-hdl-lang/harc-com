@@ -560,7 +560,7 @@ fn lower_record_field(
 
 /// Scalar list element shapes whose C++ storage and random draw v1 preserves.
 /// `int` is intentionally excluded: v1 silently renders it unsigned.
-fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+pub(super) fn record_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Named { name, generics, .. } = t else {
         return None;
     };

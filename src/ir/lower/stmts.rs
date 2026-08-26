@@ -1711,6 +1711,15 @@ impl FuncBuilder<'_> {
                 }
                 format!("a fixed vector {expected:?}")
             }
+            crate::ir::QueueElem::List { .. } => {
+                let expected = elem.ir_type();
+                let declared = super::records::record_list_scalar_ir_type(ty)
+                    .map(|elem| IrType::Seq(Box::new(elem)));
+                if declared.as_ref() == Some(&expected) {
+                    return Ok(());
+                }
+                format!("a dynamic list {expected:?}")
+            }
         };
         let want = match declared_record {
             Some(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
@@ -1737,7 +1746,9 @@ impl FuncBuilder<'_> {
                 .and_then(typed_let_ir_type)
                 .unwrap_or_else(|| ty.clone()),
             crate::ir::QueueElem::Record(rid) => IrType::Record(*rid),
-            crate::ir::QueueElem::FixedVec { .. } => elem.ir_type(),
+            crate::ir::QueueElem::FixedVec { .. } | crate::ir::QueueElem::List { .. } => {
+                elem.ir_type()
+            }
         };
         if let IrType::UInt(Some(width)) | IrType::SInt(Some(width)) = &ty {
             self.let_widths.insert(dest, *width);
@@ -2092,7 +2103,10 @@ impl FuncBuilder<'_> {
         elem: &crate::ir::QueueElem,
         what: &str,
     ) -> Result<(), LowerError> {
-        if matches!(elem, crate::ir::QueueElem::FixedVec { .. }) {
+        if matches!(
+            elem,
+            crate::ir::QueueElem::FixedVec { .. } | crate::ir::QueueElem::List { .. }
+        ) {
             let expected = elem.ir_type();
             let actual = self.expr_type(value);
             if actual.as_ref() == Some(&expected) {
@@ -2102,13 +2116,15 @@ impl FuncBuilder<'_> {
                 "{what} holds {expected:?}, but the pushed value is {}",
                 actual
                     .map(|ty| format!("{ty:?}"))
-                    .unwrap_or_else(|| "not a typed fixed-vector value".to_string())
+                    .unwrap_or_else(|| "not a typed aggregate value".to_string())
             )));
         }
 
         let want = match elem {
             crate::ir::QueueElem::Record(rid) => Some(*rid),
-            crate::ir::QueueElem::Scalar { .. } | crate::ir::QueueElem::FixedVec { .. } => None,
+            crate::ir::QueueElem::Scalar { .. }
+            | crate::ir::QueueElem::FixedVec { .. }
+            | crate::ir::QueueElem::List { .. } => None,
         };
         self.check_slot_type(value, want, what)?;
 

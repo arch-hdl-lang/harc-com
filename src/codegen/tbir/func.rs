@@ -519,7 +519,7 @@ pub(super) fn emit_tseq(
             })?
             .name
             .clone(),
-        IrType::Seq(scalar) => super::local_scalar_cty(scalar).to_string(),
+        IrType::Seq(scalar) => super::field_scalar_cty(scalar),
         _ => {
             return Err(EmitError(format!(
                 "tbir: tseq `{}` has no RecordSeq/Seq return accumulator (lowering bug)",
@@ -1100,7 +1100,7 @@ fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> String {
     match ty {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+        IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
         IrType::Component(c) => prog.components[c.index()].name.clone(),
         other => super::local_scalar_cty(other),
     }
@@ -2589,7 +2589,7 @@ fn declare_locals_except(
             // `std::vector<T>` over the scalar C++ type. v1's tseq scalar
             // accumulator / call-result shape.
             IrType::Seq(ref scalar) => {
-                let cty = super::local_scalar_cty(scalar);
+                let cty = super::field_scalar_cty(scalar);
                 writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
             }
             IrType::Component(c) => {
@@ -2693,7 +2693,7 @@ pub(super) fn declare_method_slot(
         Some(local) => match &local.ty {
             IrType::Record(r) => prog.records[r.index()].name.clone(),
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+            IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
             ty => super::local_scalar_cty(ty).to_string(),
         },
         None => "void".to_string(),
@@ -2711,7 +2711,7 @@ pub(super) fn declare_method_slot(
     param_tys.extend((0..func.params.len()).map(|i| match func.locals[i].ty {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
         ref ty => super::local_scalar_cty(ty).to_string(),
     }));
     let params = param_tys.join(", ");
@@ -2786,7 +2786,7 @@ pub(super) fn emit_method(
         Some(local) => match &local.ty {
             IrType::Record(r) => prog.records[r.index()].name.clone(),
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+            IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
             ty => super::local_scalar_cty(ty).to_string(),
         },
         None => "void".to_string(),
@@ -2813,7 +2813,7 @@ pub(super) fn emit_method(
                     format!("std::vector<{}> {n}", prog.records[r.index()].name)
                 }
                 IrType::Seq(ref scalar) => {
-                    format!("std::vector<{}> {n}", super::local_scalar_cty(scalar))
+                    format!("std::vector<{}> {n}", super::field_scalar_cty(scalar))
                 }
                 ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
             }),
@@ -3314,7 +3314,7 @@ fn emit_component_fn_lambda(
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
             // The scalar-element analogue (`TSeq<uint<N>>`) — `std::vector<T>`
             // over the scalar C++ type (#453).
-            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
             IrType::Component(c) => prog.components[c.index()].name.clone(),
             ref ty => super::local_scalar_cty(ty),
         };

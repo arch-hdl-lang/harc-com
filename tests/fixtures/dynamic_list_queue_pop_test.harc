@@ -1,0 +1,16 @@
+// Compile/run gate for a list-valued queue pop destination and matching push.
+// The queue is intentionally empty, so both backends must compile the nested
+// std::vector value transfers and then report the same runtime failure.
+
+testbench DynamicListQueuePopTb
+    dut : Top
+    values : queue<list<bool>>
+end testbench DynamicListQueuePopTb
+
+impl DynamicListQueuePopTest for DynamicListQueuePopTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl DynamicListQueuePopTest

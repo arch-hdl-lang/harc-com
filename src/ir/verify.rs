@@ -628,6 +628,20 @@ fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<Verif
                 });
             }
         }
+        QueueElem::List { elem } => {
+            if !matches!(
+                elem.as_ref(),
+                IrType::Bool
+                    | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
+                    | IrType::SInt(Some(1..=64))
+            ) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "{what} has invalid dynamic-list element schema {elem:?}; expected a resolved scalar list element"
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -3270,14 +3284,17 @@ impl Checker<'_> {
         if let Expr::Ternary(cond, then_expr, else_expr) = value {
             if matches!(
                 self.aggregate_assignment_expr_type(cond),
-                Some(IrType::Record(_) | IrType::FixedVec { .. })
+                Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
             ) {
                 return true;
             }
             let then_ty = self.aggregate_assignment_expr_type(then_expr);
             let else_ty = self.aggregate_assignment_expr_type(else_expr);
             let aggregate = |ty: &Option<IrType>| {
-                matches!(ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+                matches!(
+                    ty,
+                    Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
+                )
             };
             if (aggregate(&then_ty) || aggregate(&else_ty)) && then_ty != else_ty {
                 return true;
@@ -3289,12 +3306,20 @@ impl Checker<'_> {
                 let rhs_ty = self.aggregate_assignment_expr_type(rhs);
                 let invalid_operands = if matches!(op, BinOp::Eq | BinOp::Ne) {
                     let aggregate = |ty: &Option<IrType>| {
-                        matches!(ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+                        matches!(
+                            ty,
+                            Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
+                        )
                     };
                     (aggregate(&lhs_ty) || aggregate(&rhs_ty)) && lhs_ty != rhs_ty
                 } else {
-                    matches!(lhs_ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
-                        || matches!(rhs_ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+                    matches!(
+                        lhs_ty,
+                        Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
+                    ) || matches!(
+                        rhs_ty,
+                        Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
+                    )
                 };
                 invalid_operands
                     || self.contains_invalid_record_composition(lhs)
@@ -3303,7 +3328,7 @@ impl Checker<'_> {
             Expr::Unary(_, inner) | Expr::BitSlice { target: inner, .. } => {
                 matches!(
                     self.aggregate_assignment_expr_type(inner),
-                    Some(IrType::Record(_) | IrType::FixedVec { .. })
+                    Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
                 ) || self.contains_invalid_record_composition(inner)
             }
             Expr::BitSliceDyn { target, hi, lo } => [target.as_ref(), hi.as_ref(), lo.as_ref()]
@@ -3311,7 +3336,7 @@ impl Checker<'_> {
                 .any(|inner| {
                     matches!(
                         self.aggregate_assignment_expr_type(inner),
-                        Some(IrType::Record(_) | IrType::FixedVec { .. })
+                        Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
                     ) || self.contains_invalid_record_composition(inner)
                 }),
             Expr::Ternary(cond, then_expr, else_expr) => {
@@ -3325,7 +3350,7 @@ impl Checker<'_> {
             | Expr::SeqIndex { index: inner, .. } => {
                 matches!(
                     self.aggregate_assignment_expr_type(inner),
-                    Some(IrType::Record(_) | IrType::FixedVec { .. })
+                    Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
                 ) || self.contains_invalid_record_composition(inner)
             }
             _ => false,
@@ -4427,9 +4452,13 @@ impl Checker<'_> {
                             let actual = self
                                 .aggregate_assignment_expr_type(arg)
                                 .unwrap_or(IrType::Unknown);
-                            if (matches!(expected, IrType::FixedVec { .. })
-                                || matches!(&actual, IrType::FixedVec { .. }))
-                                && *expected != actual
+                            if (matches!(
+                                expected,
+                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                            ) || matches!(
+                                &actual,
+                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                            )) && *expected != actual
                             {
                                 self.errs.push(VerifyError::BadProgramRef {
                                     what: format!(
@@ -5792,9 +5821,13 @@ impl Checker<'_> {
                             let actual = self
                                 .aggregate_assignment_expr_type(arg)
                                 .unwrap_or(IrType::Unknown);
-                            if (matches!(&param.ty, IrType::FixedVec { .. })
-                                || matches!(&actual, IrType::FixedVec { .. }))
-                                && param.ty != actual
+                            if (matches!(
+                                &param.ty,
+                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                            ) || matches!(
+                                &actual,
+                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                            )) && param.ty != actual
                             {
                                 self.errs.push(VerifyError::BadProgramRef {
                                     what: format!(

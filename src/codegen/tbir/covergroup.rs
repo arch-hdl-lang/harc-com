@@ -1314,7 +1314,7 @@ fn param_cty(prog: &TbProgram, ty: &IrType) -> String {
     match ty {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(scalar) => format!("std::vector<{}>", super::local_scalar_cty(scalar)),
+        IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
         IrType::Component(c) => prog.components[c.index()].name.clone(),
         other => super::local_scalar_cty(other),
     }

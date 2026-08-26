@@ -33,6 +33,7 @@ impl Display for TbProgram {
                             QueueElem::FixedVec { elem, len } => {
                                 format!("Vec<{}, {len}>", type_str(elem))
                             }
+                            QueueElem::List { elem } => format!("list<{}>", type_str(elem)),
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         write!(f, " queue {}:{elem}", qf.name)?;
@@ -191,6 +192,9 @@ impl Display for TbProgram {
                             crate::ir::QueueElem::FixedVec { elem, len } => {
                                 format!("Vec<{}, {len}>", type_str(elem))
                             }
+                            crate::ir::QueueElem::List { elem } => {
+                                format!("list<{}>", type_str(elem))
+                            }
                             crate::ir::QueueElem::Record(r) => format!("rec{}", r.index()),
                         };
                         writeln!(f, "    state {} : queue<{}>", sf.name, e)?;
@@ -287,6 +291,7 @@ impl Display for TbProgram {
                             QueueElem::FixedVec { elem, len } => {
                                 format!("Vec<{}, {len}>", type_str(elem))
                             }
+                            QueueElem::List { elem } => format!("list<{}>", type_str(elem)),
                             QueueElem::Record(r) => self.records[r.index()].name.clone(),
                         };
                         format!("queue<{inner}>")

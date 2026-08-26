@@ -1361,6 +1361,13 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
+                if matches!(self.expr_type(&inner), Some(IrType::Seq(_))) {
+                    return Err(not_implemented(
+                        "a scalar unary operator applied to a dynamic-list local",
+                        "index or query the list before applying the operator",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -1425,6 +1432,19 @@ impl FuncBuilder<'_> {
                         ));
                     }
                 }
+                if matches!(lty, Some(IrType::Seq(_))) || matches!(rty, Some(IrType::Seq(_))) {
+                    let matching_equality = matches!(ir_op, BinOp::Eq | BinOp::Ne)
+                        && lty.is_some()
+                        && lty == rty;
+                    if !matching_equality {
+                        return Err(not_implemented(
+                            "a scalar binary operator applied to a dynamic-list local",
+                            "only same-element-type `==`/`!=`, whole-value copies, and queue \
+                             transfers are lowered for dynamic-list locals",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
                 let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
@@ -1465,6 +1485,15 @@ impl FuncBuilder<'_> {
                     return Err(not_implemented(
                         "a ternary mixing a fixed-vector local with another value shape",
                         "both ternary arms must have the same fixed-vector type",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
+                if (matches!(tty, Some(IrType::Seq(_))) || matches!(ety, Some(IrType::Seq(_))))
+                    && (tty.is_none() || tty != ety)
+                {
+                    return Err(not_implemented(
+                        "a ternary mixing a dynamic-list local with another value shape",
+                        "both ternary arms must have the same dynamic-list type",
                         V1Status::EmitsUncompilable,
                     ));
                 }
@@ -1737,6 +1766,13 @@ impl FuncBuilder<'_> {
                         return Err(not_implemented(
                             "a scalar cast applied to a fixed-vector local",
                             "select a scalar lane before casting",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    if matches!(self.expr_type(&inner), Some(IrType::Seq(_))) {
+                        return Err(not_implemented(
+                            "a scalar cast applied to a dynamic-list local",
+                            "index the list before casting",
                             V1Status::EmitsUncompilable,
                         ));
                     }
@@ -2625,6 +2661,11 @@ impl FuncBuilder<'_> {
         if matches!(self.expr_type(e), Some(IrType::FixedVec { .. })) {
             return Err(LowerError::Invalid(format!(
                 "{context} must be a scalar value, not a fixed vector"
+            )));
+        }
+        if matches!(self.expr_type(e), Some(IrType::Seq(_))) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be a scalar value, not a dynamic list"
             )));
         }
         if let Some(record) = self.record_id_of_expr(e) {
@@ -4734,6 +4775,13 @@ impl FuncBuilder<'_> {
             return Err(not_implemented(
                 "a scalar width method applied to a fixed-vector local",
                 "select a scalar lane before resizing",
+                V1Status::EmitsUncompilable,
+            ));
+        }
+        if matches!(self.expr_type(&inner), Some(IrType::Seq(_))) {
+            return Err(not_implemented(
+                "a scalar width method applied to a dynamic-list local",
+                "index the list before resizing",
                 V1Status::EmitsUncompilable,
             ));
         }

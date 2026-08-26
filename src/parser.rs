@@ -3020,7 +3020,17 @@ impl Parser {
                     | TokenKind::TSeqTy
             )
         );
-        if starts_type {
+        // `list<T>` / `List<T>` is a named generic type rather than a
+        // keyword-led builtin. In a surrounding type argument (notably
+        // `queue<list<T>>`) it must stay a type; treating the leading
+        // identifier as an expression makes the nested `<uint...>` parse as
+        // a comparison and fails before lowering can classify the queue.
+        // Accept the formatter's canonical `list#(T)` spelling too.
+        let starts_list_type = matches!(
+            self.peek_kind(),
+            Some(TokenKind::Ident(name)) if matches!(name.as_str(), "list" | "List")
+        ) && matches!(self.peek2_kind(), Some(TokenKind::Lt | TokenKind::Hash));
+        if starts_type || starts_list_type {
             let ty = self.parse_type_expr()?;
             return Ok(TypeArg::Type(ty));
         }

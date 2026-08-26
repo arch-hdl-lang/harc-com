@@ -720,9 +720,9 @@ pub enum ScoreboardScalarDefault {
 }
 
 /// The element type of a `queue<T>` field: an exact scalar IR type, a
-/// scalar-leaf fixed vector, or a value-record carried by struct. Shared by
-/// testbenches, scoreboards, composite components, and transactor state so
-/// every queue owner uses one storage descriptor.
+/// scalar-leaf fixed vector, scalar dynamic list, or a value-record carried
+/// by struct. Shared by testbenches, scoreboards, composite components, and
+/// transactor state so every queue owner uses one storage descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueElem {
     /// `queue<uint<256>>` / `queue<sint<65>>` / `queue<bool>` — the exact
@@ -734,6 +734,10 @@ pub enum QueueElem {
     /// The element schema is recursive, so nested scalar vectors retain
     /// their exact `std::array` layout rather than flattening to a scalar.
     FixedVec { elem: Box<IrType>, len: usize },
+    /// `queue<list<uint<8>>>` — a dynamic scalar list carried by value.
+    /// The element remains exact so storage is `HarcQueue<std::vector<T>>`
+    /// and inferred pop locals retain their list type.
+    List { elem: Box<IrType> },
     /// `queue<CheckerError>` — a value-record element. `RecordId` indexes
     /// `TbProgram::records`; the C++ element type is the record struct.
     Record(RecordId),
@@ -750,6 +754,7 @@ impl QueueElem {
                 elem: elem.clone(),
                 len: *len,
             },
+            Self::List { elem } => IrType::Seq(elem.clone()),
             Self::Record(record) => IrType::Record(*record),
         }
     }
