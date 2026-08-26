@@ -103,6 +103,7 @@ struct RawEnvelope {{
     uint8_t head{{}};
     RawLeaf inner{{}};
     uint32_t lanes[2][5]{{}};
+    uint64_t matrix[3][2]{{}};
 }};
 
 int main() {{
@@ -132,6 +133,9 @@ int main() {{
     envelope.inner = leaf;
     envelope.lanes[0].words[4] = 1u;
     envelope.lanes[1].words[0] = 7u;
+    envelope.matrix[0][0] = 0x12u;
+    envelope.matrix[1][1] = 0x34u;
+    envelope.matrix[2][0] = 0x56u;
     auto packed_envelope = harc_pack_WideEnvelope(envelope);
     assert(harc_unpack_WideEnvelope(packed_envelope) == envelope);
     RawEnvelope raw_envelope{{}};

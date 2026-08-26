@@ -5133,12 +5133,12 @@ end test VecOfStructCppTest
     );
 }
 
-/// A `Vec<Record, N>` whose element record contains a genuinely
-/// unsupported nested-Vec leaf is rejected via the ELEMENT record's own lowering,
-/// and the diagnostic names the complete offending leaf path
-/// (`Inner.bad`), not the vector field (harc#522 acceptance).
+/// A `Vec<Record, N>` whose element record contains a nested fixed vector
+/// reuses that element record's recursive schema. This is the transitive
+/// declaration path: supporting the leaf only on a top-level local would still
+/// reject a nested record when the outer record stores it in another vector.
 #[test]
-fn vec_of_record_with_unsupported_leaf_names_leaf_path() {
+fn vec_of_record_with_nested_vec_leaf_lowers_transitively() {
     let src = r#"
 struct Inner
     bad : Vec<Vec<uint<8>, 2>, 4>
@@ -5155,11 +5155,21 @@ test VecOfBadRecordTest
     end run
 end test VecOfBadRecordTest
 "#;
-    let err = lower_src(src).expect_err("unsupported element leaf must be rejected");
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("nested Vec leaf lowers through a record-element Vec");
+    verify::verify_program(&prog).expect("transitive nested Vec schema verifies");
+    let inner = prog.records.iter().find(|record| record.name == "Inner").unwrap();
     assert!(
-        msg.contains("Inner.bad"),
-        "names the offending leaf path: {msg}"
+        matches!(
+            inner.fields[0].ty,
+            ir::IrType::FixedVec { len: 2, .. }
+        ) && inner.fields[0].vec_len == Some(4),
+        "inner record retains both Vec dimensions: {inner:?}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 4> bad = {};")
+            && cpp.contains("std::array<Inner, 2> entries = {};"),
+        "nested storage survives through the outer record: {cpp}"
     );
 }
 
@@ -12520,16 +12530,87 @@ end impl T"#;
         assert!(v1.contains(draw), "`{ty}`: v1 must emit `{draw}`");
         assert!(tbir.contains(draw), "`{ty}`: TBIR must emit `{draw}`");
     }
-    // Nested fixed arrays still need a recursive element representation.
-    let nested_vec = field("Vec<Vec<uint<8>, 2>, 4>");
-    let msg = assert_unsupported(&lower_src(&nested_vec).unwrap_err());
-    assert!(msg.contains("non-scalar"), "{msg}");
+    // Nested fixed arrays reuse the recursive element representation already
+    // used by component fixed-vector state. The outer count remains in
+    // `vec_len`; the element is an `IrType::FixedVec`, so storage, packed
+    // width, and randomization retain both dimensions.
+    let nested_randomize = field("Vec<Vec<uint<8>, 2>, 4>");
+    let nested_vec = nested_randomize.replace("        randomize(r)\n", "");
+    let nested_prog = lower_src(&nested_vec).expect("nested Vec record field lowers");
+    verify::verify_program(&nested_prog).expect("nested Vec record field verifies");
+    let nested_field = &nested_prog.records[0].fields[0];
+    assert_eq!(nested_field.vec_len, Some(4));
+    assert_eq!(
+        nested_field.ty,
+        ir::IrType::FixedVec {
+            elem: Box::new(ir::IrType::UInt(Some(8))),
+            len: 2,
+        }
+    );
     let nested_v1 = cpp_tb::emit(&merged_src(&nested_vec)).expect("v1 emits nested Vec");
+    let nested_tbir = emit_cpp_src(&nested_vec);
     assert!(
         nested_v1.contains("std::array<std::array<uint64_t, 2>, 4> data")
             && nested_v1.contains("data = {}"),
         "v1 nested Vec control: {nested_v1}"
     );
+    assert!(
+        nested_tbir.contains("std::array<std::array<uint64_t, 2>, 4> data = {}"),
+        "TBIR nested Vec storage: {nested_tbir}"
+    );
+    for packed_lane in [
+        "harc_wide_write_bits(_packed, 0, 8, value.data[0][0])",
+        "harc_wide_write_bits(_packed, 56, 8, value.data[3][1])",
+    ] {
+        assert!(
+            nested_tbir.contains(packed_lane),
+            "nested lanes participate in packed layout: {nested_tbir}"
+        );
+    }
+
+    for corrupt in ["inner length", "outer length", "missing outer length"] {
+        let mut broken = nested_prog.clone();
+        match corrupt {
+            "inner length" => {
+                broken.records[0].fields[0].ty = ir::IrType::FixedVec {
+                    elem: Box::new(ir::IrType::UInt(Some(8))),
+                    len: 0,
+                }
+            }
+            "outer length" => broken.records[0].fields[0].vec_len = Some(0),
+            "missing outer length" => broken.records[0].fields[0].vec_len = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            verify::verify_program(&broken).is_err(),
+            "invalid nested fixed-vector {corrupt} must not verify"
+        );
+    }
+
+    let msg = assert_not_implemented(
+        &lower_src(&nested_randomize).expect_err("nested Vec randomize stays fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("nested fixed-vector field"), "{msg}");
+    for outer_field in ["inner : Resp", "inners : Vec<Resp, 2>"] {
+        let nested_through_record = nested_randomize
+            .replace(
+                "end transaction Resp\n\ntest T",
+                &format!(
+                    "end transaction Resp\n\ntransaction Outer\n    {outer_field}\nend transaction Outer\n\ntest T"
+                ),
+            )
+            .replace("let r : Resp", "let r : Outer");
+        let msg = assert_not_implemented(
+            &lower_src(&nested_through_record)
+                .expect_err("transitive nested Vec randomize stays fenced"),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(
+            msg.contains("nested fixed-vector field"),
+            "`{outer_field}`: {msg}"
+        );
+    }
     // v1 keeps the container but has no per-element draw for it, so the
     // loop body is `[_i] = 0` into a `std::array` — the emitted C++
     // does not compile, for any program that declares the record.

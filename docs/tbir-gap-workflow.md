@@ -88,6 +88,12 @@ family of rejections over a one-site exception. Current implementation order:
   use v1-compatible signed host-scalar semantics; metadata sites explicitly
   consume only the value. Width-aware cover/index paths remain unchanged.
   Wider sized values and compound address expressions remain separate slices.
+- [x] Nested scalar fixed vectors in transaction/struct record state, using
+  the recursive fixed-vector element schema already shared by component state.
+  Declaration, zero-initialization, whole-record copy/equality, and packed
+  layout lower through TBIR. Record randomization remains fenced because both
+  emitters currently generate an invalid scalar assignment for the inner
+  array.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -210,6 +216,12 @@ shadowing parameter case under TBIR. V1 emits self-relative receivers without
 `self.` and produces uncompilable C++, so this is intentionally not an
 emitter-equivalence row; TBIR is authoritative for the spec-valid form as V1
 approaches retirement.
+The nested record fixed-vector schema batch then admits
+`Vec<Vec<scalar, M>, N>` fields as persistent record values, reusing the
+recursive fixed-vector IR, verifier policy, C++ storage, and pack/unpack walks.
+The shared non-scalar record diagnostic still covers other aggregate shapes,
+so the raw inventory remains 118 textual matches (117 constructors plus the
+helper).
 
 ## Review-derived semantic gates
 
@@ -277,6 +289,7 @@ not applicable before requesting review:
    cover-selector, native-width sized-scalar, record-valued tseq-yield, signed
    scalar connect, single named event-payload, component-body dotted-emit, and
    component post-eval cycle-trigger, and component event-direction slices
+   and nested record fixed-vector schema slice
    reduce the count from 174 to 118 textual matches (117 constructors plus the
    helper definition).
    The handler-less unbound-

@@ -1,0 +1,18 @@
+struct NestedGrid
+    lanes : Vec<Vec<uint<8>, 2>, 3>
+    tag   : uint<8> default 7
+end struct NestedGrid
+
+test NestedRecordVecSchemaTest
+    let dut : Top
+
+    run
+        let source : NestedGrid
+        let copy : NestedGrid
+        source.tag = 19
+        copy = source
+        assert copy == source else fail("nested fixed-vector record copy changed value")
+        assert copy.tag == source.tag else fail("nested fixed-vector record tag changed")
+        wait 1 cycle
+    end run
+end test NestedRecordVecSchemaTest

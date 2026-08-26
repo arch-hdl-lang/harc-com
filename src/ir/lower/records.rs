@@ -300,9 +300,9 @@ pub(crate) fn lower_transaction(
 /// into the same `records` table and reuses every record-local
 /// statement/expression (`RecordInit` / `RecordFieldWrite` /
 /// `Expr::RecordField`). The structural subset includes scalar fields,
-/// nested records, and fixed scalar/record `Vec<T, N>` fields; everything
+/// nested records, and recursively fixed scalar/record `Vec<T, N>` fields; everything
 /// else is an explicit rejection, never a silent drop:
-///   - unsupported aggregate / >64-bit fields (e.g. nested `Vec<Vec<...>>`)
+///   - unsupported aggregate fields
 ///     and non-literal defaults (the `field_ir_type` / default gate,
 ///     shared with transactions),
 ///   - `keep` clauses and `when` subtype blocks in the struct body
@@ -492,9 +492,11 @@ fn lower_record_field(
     // A `Vec<T, N>` field is the one aggregate this slice lowers: a
     // fixed-size array of a scalar OR record element type (v1's
     // `std::array<T, N>` record member). `ty` then carries the *element*
-    // type and `vec_len` the count; everything else (bit layout, C++
+    // type and `vec_len` the count. A nested scalar `Vec` uses the same
+    // recursive `IrType::FixedVec` element representation as component
+    // state; everything else (bit layout, C++
     // storage, access) is driven off those two. An unsupported element
-    // type, a non-literal length, or a `Vec`-of-`Vec` is still rejected.
+    // type or a non-literal/zero length is still rejected.
     let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids) {
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
@@ -661,9 +663,15 @@ fn fixed_vec_field(
         }
         _ => return None,
     };
-    let elem_ty = field_ir_type(elem, enum_names)?;
+    let elem_ty = if matches!(elem, TypeExpr::Builtin { name: BuiltinTy::Vec, .. }) {
+        super::components::fixed_vec_elem_ir_type(elem)?
+    } else {
+        field_ir_type(elem, enum_names)?
+    };
     match elem_ty {
-        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => Some((elem_ty, len)),
+        IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::FixedVec { .. } => {
+            Some((elem_ty, len))
+        }
         _ => None,
     }
 }
