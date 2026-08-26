@@ -1,0 +1,47 @@
+// Component event directions are role markers over the same typed callback
+// channel. This fixture proves `in` on a software composition component and
+// `inout` on both a component and event-driven transactor subscribe and fan
+// out through TBIR at runtime.
+
+env EventHub
+    inbound : in event<uint<8>>
+    duplex  : inout event<uint<8>>
+    total   : uint<32> default 0
+
+    on inbound(v)
+        total = total + v
+    end on
+
+    on duplex(v)
+        total = total + v * 10
+    end on
+end env EventHub
+
+transactor DuplexConsumer
+    dut    : Top
+    duplex : inout event<uint<8>>
+    total  : uint<32> default 0
+
+    on duplex(v)
+        total = total + v
+    end on
+end transactor DuplexConsumer
+
+test ComponentEventDirectionsTest
+    let dut      : Top
+    let hub      : EventHub
+    let consumer : DuplexConsumer active
+
+    run
+        consumer.dut = dut
+        emit hub.inbound(2)
+        emit hub.duplex(3)
+        emit consumer.duplex(5)
+
+        assert hub.total == 32
+            else fail("component directional events produced total=${hub.total}, expected 32")
+        assert consumer.total == 5
+            else fail("inout transactor event produced total=${consumer.total}, expected 5")
+        log(info, "PASS: component in/inout event channels delivered every payload")
+    end run
+end test ComponentEventDirectionsTest

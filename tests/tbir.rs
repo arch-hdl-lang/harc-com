@@ -4449,7 +4449,7 @@ end test MonTest
 /// mode, so `passive` keeps working there and must not be swept up.
 #[test]
 fn an_active_only_consumer_rejects_every_mode_but_active() {
-    let consumer = |out_event: bool, active_only: bool, mode: &str| {
+    let consumer = |direction: &str, out_event: bool, active_only: bool, mode: &str| {
         let obs = if out_event {
             "    obs : out event<uint<8>>\n"
         } else {
@@ -4464,7 +4464,7 @@ fn an_active_only_consumer_rejects_every_mode_but_active() {
         format!(
             r#"
 transactor T
-    req : in event<uint<8>>
+    req : {direction} event<uint<8>>
 {obs}    n   : uint<32> default 0
 
 {body}end transactor T
@@ -4483,38 +4483,45 @@ end impl MTest
         )
     };
 
-    for out_event in [false, true] {
-        // Active-only handler: `active` is the only mode that subscribes.
-        let prog = lower_src(&consumer(out_event, true, "active"))
-            .unwrap_or_else(|e| panic!("out_event={out_event}: active lowers: {e:?}"));
-        verify::verify_program(&prog).expect("verifies");
-        let src = consumer(out_event, true, "active");
-        let cpp =
-            tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
-        assert!(
-            cpp.contains("req.push_back"),
-            "out_event={out_event}: the active instance subscribes"
-        );
+    for direction in ["in", "inout"] {
+        for out_event in [false, true] {
+            // Active-only handler: `active` is the only mode that subscribes.
+            let prog = lower_src(&consumer(direction, out_event, true, "active"))
+                .unwrap_or_else(|e| {
+                    panic!("direction={direction} out_event={out_event}: active lowers: {e:?}")
+                });
+            verify::verify_program(&prog).expect("verifies");
+            let src = consumer(direction, out_event, true, "active");
+            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+                .expect("emits");
+            assert!(
+                cpp.contains("req.push_back"),
+                "direction={direction} out_event={out_event}: the active instance subscribes"
+            );
 
-        let err = lower_src(&consumer(out_event, true, "passive"))
-            .expect_err("a passive active-only consumer must be rejected");
-        let msg = assert_unsupported(&err);
-        assert!(
-            msg.contains("when active") && msg.contains("no subscriber"),
-            "out_event={out_event}: the diagnostic should say why: {msg}"
-        );
+            let err = lower_src(&consumer(direction, out_event, true, "passive"))
+                .expect_err("a passive active-only consumer must be rejected");
+            let msg = assert_unsupported(&err);
+            assert!(
+                msg.contains("when active") && msg.contains("no subscriber"),
+                "direction={direction} out_event={out_event}: the diagnostic should say why: {msg}"
+            );
 
-        // Control: an always-on handler registers on every mode, so
-        // `passive` stays legal and stays wired.
-        let src = consumer(out_event, false, "passive");
-        let prog = lower_src(&src)
-            .unwrap_or_else(|e| panic!("out_event={out_event}: always-on passive lowers: {e:?}"));
-        let cpp =
-            tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
-        assert!(
-            cpp.contains("req.push_back"),
-            "out_event={out_event}: an always-on handler wires a passive instance"
-        );
+            // Control: an always-on handler registers on every mode, so
+            // `passive` stays legal and stays wired.
+            let src = consumer(direction, out_event, false, "passive");
+            let prog = lower_src(&src).unwrap_or_else(|e| {
+                panic!(
+                    "direction={direction} out_event={out_event}: always-on passive lowers: {e:?}"
+                )
+            });
+            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+                .expect("emits");
+            assert!(
+                cpp.contains("req.push_back"),
+                "direction={direction} out_event={out_event}: an always-on handler wires a passive instance"
+            );
+        }
     }
 }
 
@@ -10882,6 +10889,9 @@ end impl T
         "    ev : out event<Beat>",
         // The consumer half.
         "    ev : in event<uint<8>>",
+        // A bidirectional pipe uses the same callback-channel storage and is
+        // input-capable for transactor classification.
+        "    ev : inout event<uint<8>>",
     ] {
         lower_src(&prog(ok)).unwrap_or_else(|e| panic!("`{ok}` must lower now: {e:?}"));
         cpp_tb::emit(&merged_src(&prog(ok))).expect("v1 emits");
@@ -10921,7 +10931,6 @@ end impl T
     for still_refused in [
         "    ev : out event<string>",
         "    ev : out event<queue<uint<8>>>",
-        "    ev : inout event<uint<8>>",
     ] {
         let msg = assert_unsupported(&lower_src(&prog(still_refused)).unwrap_err());
         assert!(!msg.is_empty(), "`{still_refused}` keeps a reason");
@@ -11147,6 +11156,67 @@ end impl T
         cpp_tb::emit(&merged_src(&prog("    b : Beat<uint<8>>"))).expect("v1 emits"),
         control_v1,
         "v1's output is byte-identical to the control: the argument list vanishes"
+    );
+}
+
+/// Event direction is a source-level producer/consumer role. All software
+/// component landings share the same typed callback-channel representation,
+/// including the method-bearing scoreboard path where v1 flattens an inout
+/// event incorrectly.
+#[test]
+fn component_event_directions_share_the_callback_channel_schema() {
+    for kind in ["env", "agent", "sequencer", "scoreboard"] {
+        for direction in ["in", "inout"] {
+            let src = format!(
+                r#"
+{kind} C
+    ev : {direction} event<uint<8>>
+    hookable touch(v: uint<8>)
+    end touch
+end {kind} C
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#
+            );
+            let prog = lower_src(&src)
+                .unwrap_or_else(|e| panic!("{kind} {direction} event must lower: {e:?}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("{kind} {direction} event must verify: {e:?}"));
+            let field = prog.components[0].field("ev").expect("event field");
+            assert!(matches!(field.kind, ir::ComponentFieldKind::Event { .. }));
+        }
+    }
+
+    let src = r#"
+transactor Consumer
+    dut : Top
+    ev : inout event<uint<8>>
+    seen : uint<8> default 0
+    on ev(v)
+        seen = v
+    end on
+end transactor Consumer
+
+test T
+    let dut : Top
+    let consumer : Consumer active
+    run
+        consumer.dut = dut
+        emit consumer.ev(7)
+        assert consumer.seen == 7
+    end run
+end test T
+"#;
+    let prog = lower_src(src).expect("inout consumer transactor lowers");
+    verify::verify_program(&prog).expect("inout consumer transactor verifies");
+    assert_eq!(
+        prog.components[0].instance_mode_policy,
+        ir::ComponentInstanceModePolicy::Standard
     );
 }
 

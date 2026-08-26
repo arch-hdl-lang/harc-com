@@ -294,4 +294,5 @@ target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 uint64_unique_randomize_test | Top | top_counter.sv | - | pass | - | uint64_unique_randomize_ref.cpp
 transactor_heartbeat_predicates_test | Top | top_counter.sv | top_counter.arch | pass
 component_cycle_post_eval_test | Top | top_counter.sv | - | pass
+component_event_directions_test | Top | top_counter.sv | - | pass
 enum_variant_scope_test | Top | top_counter.sv | top_counter.arch | pass

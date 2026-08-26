@@ -22,7 +22,7 @@
 
 use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
 use crate::ast::{
-    BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, Direction, ExprKind,
+    BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, ExprKind,
     HookableMethod, TransactorDecl, TransactorMode, TypeArg, TypeExpr,
 };
 use crate::ir::{
@@ -45,7 +45,7 @@ pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
 /// Does a `bound to` transactor ALSO get a component view?
 ///
 /// It does when it carries a non-periodic `on` handler — an
-/// event-driven driver (`in event` + a subscribing `on ev(arg)`) or a
+/// event-driven driver (an input-capable event + subscribing `on ev(arg)`) or a
 /// PASSIVE bus monitor (`on bus.<ch>.handshake(arg)`) — OR when it
 /// declares an EVENT field at all. A `bound to` transactor with
 /// neither (a hookable-method initiator BFM, or a `thread bus.<m>`
@@ -416,7 +416,8 @@ pub(crate) fn transactor_is_function_library(t: &TransactorDecl) -> bool {
 }
 
 /// True when a transactor is an *event-driven consumer* — it has an
-/// `in event<T>` field and a subscribing `on <ev>` handler. These accept
+/// input-capable (`in` or `inout`) `event<T>` field and a subscribing
+/// `on <ev>` handler. These accept
 /// an `active`/`passive` instance mode (a transactor concept) even though
 /// they route to the composite-component table; a pure analysis source
 /// (out-event only, no DUT, no `on`) does not. (A reactive monitor /
@@ -428,7 +429,11 @@ pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f)
-                if is_event_field(f) && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+                if is_event_field(f)
+                    && matches!(
+                        f.direction,
+                        Some(crate::ast::Direction::In | crate::ast::Direction::InOut)
+                    ) =>
             {
                 has_in_event = true;
             }
@@ -473,7 +478,7 @@ pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
 
 /// True when a composite-component transactor is a *reactive monitor /
 /// checker* — it has cycle-trigger and/or periodic `on` handlers but NO
-/// `in event<T>` consumer pipe. Such an instance is purely observational
+/// input-capable event consumer pipe. Such an instance is purely observational
 /// (its handlers are always-on, registered regardless of instance mode),
 /// so unlike an event-driven consumer it accepts a `passive` instance —
 /// there is no `when active` half whose `on req` registration a passive
@@ -485,7 +490,11 @@ pub(crate) fn transactor_is_reactive_monitor(t: &TransactorDecl) -> bool {
     for it in t.items.iter().chain(t.when_active.iter().flatten()) {
         match it {
             ComponentItem::Field(f)
-                if is_event_field(f) && matches!(f.direction, Some(crate::ast::Direction::In)) =>
+                if is_event_field(f)
+                    && matches!(
+                        f.direction,
+                        Some(crate::ast::Direction::In | crate::ast::Direction::InOut)
+                    ) =>
             {
                 has_in_event = true;
             }
@@ -1462,47 +1471,14 @@ fn lower_field(
         // list — direction is a source-level role marker (producer vs
         // consumer), not a distinct runtime shape: the consumer's `on`
         // handler registers a subscriber, and an `emit`/`connect` bridge
-        // fans out over that same list. An `inout` event remains out of
-        // subset. An `in event` is accepted only on a transactor (the
-        // consumer-BFM form); on an env/scoreboard/agent/sequencer it is
-        // still rejected.
+        // fans out over that same list. Direction remains a source-level role
+        // marker; every software component uses the same typed callback-
+        // channel representation in TBIR.
         TypeExpr::Builtin {
             name: BuiltinTy::Event,
             args,
             ..
         } => {
-            // Direction on an event field is NOT a uniform mis-grade —
-            // v1's behavior splits by landing, so this stays as it was.
-            // Measured across all five landings for `inout event<T>`
-            // (2026-08-23, batch-45 discipline — an earlier version of
-            // this comment measured only two and mis-stated the rest):
-            //   - env, agent, sequencer, TRANSACTOR → v1 emits the real
-            //     `std::vector<std::function<void(uint64_t)>> ev;`
-            //     subscriber list, so refusing with a v1-handles-it
-            //     `unsupported` is honest.
-            //   - a method-bearing SCOREBOARD is the lone exception: v1
-            //     emits a bare `uint64_t ev;`, dropping the event, which
-            //     would be `SilentlyMisLowers`.
-            // So four of five landings genuinely want `unsupported` and
-            // one wants `SilentlyMisLowers`. A single grade for the arm
-            // would put a false detail on one side or the other; the
-            // scoreboard is the one landing whose `--codegen v1`
-            // suggestion is a real misdirection. Left for a
-            // landing-split slice.
-            if matches!(f.direction, Some(Direction::InOut)) {
-                return Err(unsupported(
-                    &format!("an `inout` event field `{comp}.{fname}`"),
-                    "only `out event<T>` analysis ports, directionless agent \
-                     self-events, and `in event<T>` transactor input pipes are lowered",
-                ));
-            }
-            if matches!(f.direction, Some(Direction::In)) && !is_transactor {
-                return Err(unsupported(
-                    &format!("an `in` event field `{comp}.{fname}`"),
-                    "an `in event<T>` input pipe is only lowered on an event-driven \
-                     transactor (consumer BFM); use a directionless self-event elsewhere",
-                ));
-            }
             if f.default.is_some() {
                 // v1 emits the default into the member initializer, and
                 // the member is a subscriber LIST:
