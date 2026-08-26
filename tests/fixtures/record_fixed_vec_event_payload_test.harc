@@ -1,0 +1,41 @@
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+transactor RecordFixedVecEventSource
+    observed : out event<Vec<Vec<Beat, 2>, 3>>
+    values : Vec<Vec<Beat, 2>, 3>
+
+    hookable publish()
+        emit observed(values)
+    end publish
+end transactor RecordFixedVecEventSource
+
+scoreboard RecordFixedVecEventSink
+    seen : uint<32> default 0
+
+    hookable collect(payload: Vec<Vec<Beat, 2>, 3>)
+        seen = seen + 1
+    end collect
+end scoreboard RecordFixedVecEventSink
+
+env RecordFixedVecEventEnv
+    source : RecordFixedVecEventSource passive
+    sink : RecordFixedVecEventSink
+
+    connect
+        source.observed -> sink.collect
+    end connect
+end env RecordFixedVecEventEnv
+
+test RecordFixedVecEventPayloadTest
+    let dut : Top
+    let env : RecordFixedVecEventEnv
+
+    run
+        env.source.publish()
+        assert env.sink.seen == 1
+            else fail("record fixed-vector event payload was not delivered")
+        wait 1 cycle
+    end run
+end test RecordFixedVecEventPayloadTest

@@ -962,6 +962,46 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             check_component_function("watchdog", handler.function);
         }
         drop(check_component_function);
+        for method in &component.methods {
+            for (param, ty) in method.param_tys.iter().enumerate() {
+                if matches!(ty, IrType::FixedVec { .. })
+                    && !component_fixed_vec_elem_valid(ty, prog.records.len())
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` method `{}` parameter {param} has invalid fixed-vector schema {ty:?}",
+                            component.name, method.name
+                        ),
+                    });
+                }
+            }
+            if let Some(function) = prog.functions.get(method.function.index()) {
+                let actual: Vec<_> = function
+                    .params
+                    .iter()
+                    .map(|param| param.ty.clone())
+                    .collect();
+                let locals: Vec<_> = function
+                    .locals
+                    .iter()
+                    .take(function.params.len())
+                    .map(|local| local.ty.clone())
+                    .collect();
+                if actual != method.param_tys || locals != actual {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` method `{}` parameter schema {:?} disagrees with fn{} parameters {:?} or parameter locals {:?}",
+                            component.name,
+                            method.name,
+                            method.param_tys,
+                            method.function.0,
+                            actual,
+                            locals
+                        ),
+                    });
+                }
+            }
+        }
         for edge in &component.connects {
             if let Err(detail) =
                 verify_component_connect(prog, ComponentId(ci as u32), edge)
@@ -2031,7 +2071,7 @@ fn verify_event_payload_ref(prog: &TbProgram, payload: &EventPayload) -> Result<
             if *len == 0 {
                 return Err("has a zero-length fixed-vector payload".to_string());
             }
-            if !fixed_vec_elem_valid(&elem) {
+            if !component_fixed_vec_elem_valid(&elem, prog.records.len()) {
                 return Err(format!("has invalid fixed-vector element metadata {elem:?}"));
             }
         }
