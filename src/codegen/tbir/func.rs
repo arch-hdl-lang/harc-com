@@ -3007,7 +3007,7 @@ fn declare_locals_except(
         if matches!(l.ty, IrType::PortSnapshot) {
             continue;
         }
-        match l.ty {
+        match &l.ty {
             IrType::Record(r) => {
                 let rec = prog.records.get(r.index()).ok_or_else(|| {
                     EmitError(format!(
@@ -3028,11 +3028,11 @@ fn declare_locals_except(
                 })?;
                 writeln!(out, "{pad}std::vector<{}> {n}{{}}; (void){n};", rec.name).ok();
             }
-            IrType::FixedVec { ref elem, len } => {
+            IrType::FixedVec { elem, len } => {
                 let cty = super::aggregate_value_cty(
                     &IrType::FixedVec {
                         elem: elem.clone(),
-                        len,
+                        len: *len,
                     },
                     &prog.records,
                 );
@@ -3041,7 +3041,7 @@ fn declare_locals_except(
             // A scalar-element transaction-sequence local —
             // `std::vector<T>` over the scalar C++ type. v1's tseq scalar
             // accumulator / call-result shape.
-            IrType::Seq(ref scalar) => {
+            IrType::Seq(scalar) => {
                 let cty = super::field_scalar_cty(scalar);
                 writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
             }

@@ -1384,7 +1384,7 @@ pub enum ComponentFieldKind {
 /// `payload_type_for_arg`: a scalar widens to `uint64_t`/`int64_t`; a
 /// user-named `transaction`/`struct` payload is carried by value as the
 /// record struct (`std::function<void(<RecordName>)>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
     /// `event<uint<8>>` / `event<sint<…>>` / `event<bool>` — a scalar
     /// payload: its signedness and its declared width.
@@ -1400,20 +1400,15 @@ pub enum EventPayload {
     /// made false.
     ///
     /// Every sibling slot — `QueueElem::Scalar { ty }`,
-    /// `StateFieldKind::Scalar { ty }`, `FixedVecSchema { elem }` —
-    /// carries a whole `IrType`, and this one deliberately does not.
-    /// It cannot: `IrType::Event(EventPayload)` makes the two mutually
-    /// recursive, so an `IrType` here is a type of infinite size and
-    /// would cost `IrType` its `Copy`. The pair of fields says the same
-    /// thing for the scalar case without the cycle.
+    /// `StateFieldKind::Scalar { ty }`, `FixedVecSchema { elem }` — carries a
+    /// whole `IrType`. This scalar variant keeps the compact fields because
+    /// `IrType::Event(EventPayload)` makes an unboxed `IrType` here recursive;
+    /// aggregate payloads below use a box to break that cycle.
     Scalar { signed: bool, width: Option<u32> },
-    /// `event<Vec<uint<8>, 4>>` — one fixed-size vector of scalar values.
-    FixedVec {
-        boolean: bool,
-        signed: bool,
-        width: Option<u32>,
-        len: usize,
-    },
+    /// `event<Vec<T, N>>` — a fixed-size vector value. The boxed element
+    /// breaks the `IrType::Event(EventPayload)` recursion while retaining the
+    /// complete aggregate element shape (including another fixed vector).
+    FixedVec { elem: Box<IrType>, len: usize },
     /// `event<TinyTxn>` — a value-record payload. `RecordId` indexes
     /// `TbProgram::records`; the C++ payload type is the record struct.
     Record(RecordId),
@@ -1440,19 +1435,8 @@ impl EventPayload {
         match self {
             EventPayload::Scalar { .. } => self.scalar_ir_type().expect("scalar payload"),
             EventPayload::Record(record) => IrType::Record(*record),
-            EventPayload::FixedVec {
-                signed,
-                boolean,
-                width,
-                len,
-            } => IrType::FixedVec {
-                elem: Box::new(if *boolean {
-                    IrType::Bool
-                } else if *signed {
-                    IrType::SInt(*width)
-                } else {
-                    IrType::UInt(*width)
-                }),
+            EventPayload::FixedVec { elem, len } => IrType::FixedVec {
+                elem: elem.clone(),
                 len: *len,
             },
         }

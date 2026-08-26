@@ -1008,7 +1008,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for field in &component.fields {
-            if let ComponentFieldKind::Event { payload } = field.kind {
+            if let ComponentFieldKind::Event { payload } = &field.kind {
                 if let Err(detail) = verify_event_payload_ref(prog, payload) {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
@@ -1588,7 +1588,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for (local, schema) in func.locals.iter().enumerate() {
-            if let IrType::Event(payload) = schema.ty {
+            if let IrType::Event(payload) = &schema.ty {
                 if let Err(detail) = verify_event_payload_ref(prog, payload) {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!("fn{} local %{local} event payload {detail}", func.id.0),
@@ -1723,7 +1723,7 @@ fn verify_resolved_connect(
             kind: ComponentFieldKind::Event { payload },
             activation,
             ..
-        }) if *activation == edge.src_activation => *payload,
+        }) if *activation == edge.src_activation => payload,
         _ => {
             return Err(format!(
                 "source `{}.{}` is not an event field",
@@ -1774,7 +1774,7 @@ fn verify_resolved_connect(
                     },
                 activation,
                 ..
-            }) if connect_payloads_bridge(payload, *sink_payload)
+            }) if connect_payloads_bridge(payload, sink_payload)
                 && *activation == edge.sink_activation => {}
             _ => {
                 return Err(format!(
@@ -1961,7 +1961,7 @@ fn resolve_component_queue_elem(
 /// `std::function<void(harc_rt::HarcWide<32>)>` feeding a `uint64_t`
 /// parameter, verify clean, and truncate 960 bits per notification.
 /// Measured by deleting that call and watching `dump-ir` exit 0.
-fn connect_payload_reaches_param(payload: EventPayload, ty: &IrType) -> bool {
+fn connect_payload_reaches_param(payload: &EventPayload, ty: &IrType) -> bool {
     if !crate::ir::lower::components::connect_payload_matches_ir_type(payload, ty) {
         return false;
     }
@@ -1988,7 +1988,7 @@ fn connect_payload_reaches_param(payload: EventPayload, ty: &IrType) -> bool {
 /// re-derives a rule is a second place for it to be wrong, and this
 /// one was wrong in the direction that produces an internal error
 /// rather than a refusal.
-fn connect_payloads_bridge(src: EventPayload, sink: EventPayload) -> bool {
+fn connect_payloads_bridge(src: &EventPayload, sink: &EventPayload) -> bool {
     if !crate::ir::lower::components::event_payloads_agree_in_shape(src, sink) {
         return false;
     }
@@ -1998,11 +1998,11 @@ fn connect_payloads_bridge(src: EventPayload, sink: EventPayload) -> bool {
     }
 }
 
-fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool {
+fn event_payload_accepts_value_type(payload: &EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
         (EventPayload::Scalar { .. }, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => true,
-        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
         (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
             payload.value_ir_type() == *ty
         }
@@ -2010,11 +2010,11 @@ fn event_payload_accepts_value_type(payload: EventPayload, ty: &IrType) -> bool 
     }
 }
 
-fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> bool {
+fn event_payload_handler_matches_type(payload: &EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
         (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
-        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
         (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
             payload.value_ir_type() == *ty
         }
@@ -2022,35 +2022,17 @@ fn event_payload_handler_matches_type(payload: EventPayload, ty: &IrType) -> boo
     }
 }
 
-fn verify_event_payload_ref(prog: &TbProgram, payload: EventPayload) -> Result<(), String> {
+fn verify_event_payload_ref(prog: &TbProgram, payload: &EventPayload) -> Result<(), String> {
     match payload {
         EventPayload::Record(record) if record.index() >= prog.records.len() => {
             return Err(format!("references missing record r{}", record.0));
         }
-        EventPayload::FixedVec {
-            boolean,
-            signed,
-            width,
-            len,
-        } => {
-            if len == 0 {
+        EventPayload::FixedVec { elem, len } => {
+            if *len == 0 {
                 return Err("has a zero-length fixed-vector payload".to_string());
             }
-            let valid_elem = if boolean {
-                !signed && width.is_none()
-            } else {
-                let ty = if signed {
-                    IrType::SInt(width)
-                } else {
-                    IrType::UInt(width)
-                };
-                width.is_some_and(|width| width > 0)
-                    && crate::ir::lower::components::field_scalar_width_ok(&ty)
-            };
-            if !valid_elem {
-                return Err(format!(
-                    "has invalid fixed-vector element metadata boolean={boolean}, signed={signed}, width={width:?}"
-                ));
+            if !fixed_vec_elem_valid(&elem) {
+                return Err(format!("has invalid fixed-vector element metadata {elem:?}"));
             }
         }
         _ => {}
@@ -2064,7 +2046,7 @@ fn verify_component_event_ref(
     base: &ComponentBase,
     component: ComponentId,
     event: &str,
-    payload: EventPayload,
+    payload: &EventPayload,
 ) -> Result<(), String> {
     verify_event_payload_ref(prog, payload)?;
     let ComponentBase::Path(path) = base else {
@@ -2129,7 +2111,7 @@ fn verify_component_event_ref(
         // Swept across `uint`, `bool`, `uint<1|8|64|65|128|160|1024>`
         // and `sint<8|64>` after the payload grew a width: no arm of
         // this match fires on any of them.
-        }) if *field_payload == payload => {
+        }) if field_payload == payload => {
             if !component_mode_includes_activation(resolved.effective_mode, *activation) {
                 return Err(format!(
                     "component event `{}.{event}` is disabled by its instance mode",
@@ -2492,8 +2474,23 @@ impl Checker<'_> {
                     ),
                 });
             }
-            self.check_expr_inner(expr, false, context, true);
-            let actual = self.expr_whole_vec_type(expr).ok().flatten();
+            // Event delivery is the one sanctioned whole-value use for a
+            // recursively nested component vector. The ordinary whole-vector
+            // equality/copy classifier intentionally keeps its existing
+            // one-dimensional boundary, so validate this receiver directly
+            // against the event's exact aggregate type.
+            let actual = if let Expr::ComponentField { base, field } = expr {
+                match self.component_field_whole_vec_type(base, field) {
+                    Ok(actual) => actual,
+                    Err(detail) => {
+                        self.report_bad_component_field(detail);
+                        None
+                    }
+                }
+            } else {
+                self.check_expr_inner(expr, false, context, true);
+                self.expr_whole_vec_type(expr).ok().flatten()
+            };
             if actual != Some(payload.value_ir_type()) {
                 self.errs.push(VerifyError::BadProgramRef {
                     what: format!(
@@ -2508,7 +2505,7 @@ impl Checker<'_> {
         let actual = self
             .aggregate_assignment_expr_type(expr)
             .unwrap_or(IrType::Unknown);
-        if !event_payload_accepts_value_type(payload, &actual) {
+        if !event_payload_accepts_value_type(&payload, &actual) {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} {context} has type {actual:?}, incompatible with payload {payload:?}",
@@ -2774,10 +2771,10 @@ impl Checker<'_> {
                 schema.name
             ));
         };
-        let payload = *payload;
+        let payload = payload.clone();
         match base {
             ComponentBase::Path(_) => {
-                verify_component_event_ref(self.prog, self.func, base, component, event, payload)?;
+                verify_component_event_ref(self.prog, self.func, base, component, event, &payload)?;
             }
             ComponentBase::SelfField => {
                 let active_context = schema.methods.iter().any(|m| {
@@ -2908,6 +2905,29 @@ impl Checker<'_> {
                 "component member `{field}` is not a scalar, record, or fixed-vector field"
             )),
         }
+    }
+
+    fn component_field_whole_vec_type(
+        &self,
+        base: &ComponentBase,
+        field: &str,
+    ) -> Result<Option<IrType>, String> {
+        let cid = self.component_base_id(base)?;
+        let component = self
+            .prog
+            .components
+            .get(cid.index())
+            .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+        if field.contains('.') {
+            return Ok(None);
+        }
+        Ok(component.field(field).and_then(|field| match &field.kind {
+            ComponentFieldKind::FixedVec(vec) => Some(IrType::FixedVec {
+                elem: Box::new(vec.elem.clone()),
+                len: vec.len,
+            }),
+            _ => None,
+        }))
     }
 
     fn component_indexed_field_type(
@@ -4000,7 +4020,7 @@ impl Checker<'_> {
                             match self.event_payload(*event) {
                                 Some(payload) => {
                                     if let Err(detail) =
-                                        verify_event_payload_ref(self.prog, payload)
+                                        verify_event_payload_ref(self.prog, &payload)
                                     {
                                         self.errs.push(VerifyError::BadConcurrentCheck {
                                             func: self.fid,
@@ -4033,7 +4053,7 @@ impl Checker<'_> {
                             payload,
                         } => {
                             if let Err(detail) = verify_component_event_ref(
-                                self.prog, self.func, base, *component, event, *payload,
+                                self.prog, self.func, base, *component, event, payload,
                             ) {
                                 self.errs.push(VerifyError::BadConcurrentCheck {
                                     func: self.fid,
@@ -4041,7 +4061,7 @@ impl Checker<'_> {
                                     detail: format!("EventSubscribe component target: {detail}"),
                                 });
                             }
-                            Some(*payload)
+                            Some(payload.clone())
                         }
                     };
                     match self.prog.functions.get(handler.index()) {
@@ -4059,7 +4079,7 @@ impl Checker<'_> {
                                 });
                             }
                             if let Some(payload) = payload {
-                                if !event_payload_handler_matches_type(payload, &f.params[0].ty) {
+                                if !event_payload_handler_matches_type(&payload, &f.params[0].ty) {
                                     self.errs.push(VerifyError::BadConcurrentCheck {
                                         func: self.fid,
                                         block: self.bid,
@@ -5481,7 +5501,7 @@ impl Checker<'_> {
     /// does not resolve or is not event-typed.
     fn event_payload(&self, l: LocalId) -> Option<crate::ir::EventPayload> {
         match self.func.locals.get(l.index()).map(|t| &t.ty) {
-            Some(IrType::Event(p)) => Some(*p),
+            Some(IrType::Event(p)) => Some(p.clone()),
             _ => None,
         }
     }

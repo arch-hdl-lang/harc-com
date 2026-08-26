@@ -18,7 +18,7 @@
 //! Out of subset, rejected (never mis-lowered): `agent` declarations and
 //! `on <ev>` event handlers, watchdog/phase orchestration, generics,
 //! `bound to` source transactors, and event payloads beyond scalar,
-//! value-record, and one-dimensional fixed-scalar vectors. Those
+//! value-record, and recursively nested fixed-scalar vectors. Those
 //! gate on the agent/sequencer/event slices.
 
 use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
@@ -1201,11 +1201,11 @@ fn event_subscription<'a>(
     let ExprKind::Ident(id) = &*callee.kind else {
         return None;
     };
-    let ComponentFieldKind::Event { payload } = fields.iter().find(|f| f.name == id.name)?.kind
+    let ComponentFieldKind::Event { payload } = &fields.iter().find(|f| f.name == id.name)?.kind
     else {
         return None;
     };
-    Some((id.name.clone(), payload, args.as_slice()))
+    Some((id.name.clone(), payload.clone(), args.as_slice()))
 }
 
 /// The channel name of an `on bus.<ch>.handshake(arg)` monitor handler
@@ -2614,7 +2614,7 @@ where
             kind: ComponentFieldKind::Event { payload },
             activation,
             ..
-        }) => (*payload, *activation),
+        }) => (payload.clone(), *activation),
         _ => {
             return Err(unsupported(
                 &format!(
@@ -2695,7 +2695,7 @@ where
                 V1Status::Rejects,
             ));
         }
-        if !connect_payload_matches_ir_type(src_payload, &sm.param_tys[0]) {
+        if !connect_payload_matches_ir_type(&src_payload, &sm.param_tys[0]) {
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
@@ -2726,7 +2726,7 @@ where
         // event<uint<16>>` — two payloads v1 renders as the same
         // `uint64_t` and TB-IR lowered until this batch. Ask the two
         // questions the bridge actually turns on instead.
-        if !event_payloads_agree_in_shape(src_payload, *payload) {
+        if !event_payloads_agree_in_shape(&src_payload, payload) {
             return Err(connect_payload_mismatch(
                 &endpoint_label(src_path, &src_event),
                 &endpoint_label(sink_path, &sink_name),
@@ -2861,14 +2861,14 @@ pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
 /// Whether an analysis event payload can reach a hookable method through
 /// a `connect` bridge. All scalar payloads can cross signedness through
 /// the emitted C++ conversion; records must retain identity.
-pub(crate) fn connect_payload_matches_ir_type(payload: EventPayload, ty: &IrType) -> bool {
+pub(crate) fn connect_payload_matches_ir_type(payload: &EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
         (
             EventPayload::Scalar { .. },
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool,
         ) => true,
-        (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
         (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
             payload.value_ir_type() == *ty
         }
@@ -2963,7 +2963,7 @@ const CONNECT_NARROWING_CONSTRUCT: &str =
 /// payloads are bridgeable whenever delivery does not lose storage bits,
 /// and that is `connect_delivery_verdict`'s question with its own
 /// diagnostic.
-pub(crate) fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayload) -> bool {
+pub(crate) fn event_payloads_agree_in_shape(src: &EventPayload, sink: &EventPayload) -> bool {
     match (src, sink) {
         (EventPayload::Scalar { .. }, EventPayload::Scalar { .. }) => true,
         (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
@@ -3139,15 +3139,16 @@ pub(crate) fn v1_leaves_the_type_name_undeclared(
 /// subset:
 ///   * a scalar (`uint<W>`/`sint<W>`/`bool`, width per
 ///     `field_scalar_width_ok`) → `Scalar`;
+///   * a recursively nested fixed vector with scalar leaves → `FixedVec`;
 ///   * a user-named `transaction`/`struct` → `Record` (carried by value
 ///     as the record struct, matching v1's `std::function<void(Txn)>`).
 ///
 /// A scalar payload parses as `TypeArg::Type`; a user-named record
 /// payload parses as a bare identifier — `TypeArg::Expr(Ident)` (the
 /// common case) or `TypeArg::Named`. A named type that is neither a
-/// scalar nor a known record (enum / Vec / nested / unknown) is rejected
-/// precisely — those genuinely unsupported payload shapes gate on later
-/// slices.
+/// scalar nor a known record (enum / unknown) is rejected precisely.
+/// Fixed vectors with record leaves remain unsupported and gate on a later
+/// slice.
 pub(crate) fn lower_event_payload(
     comp: &str,
     fname: &str,
@@ -3173,7 +3174,8 @@ pub(crate) fn lower_event_payload(
         not_implemented(
             &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
+                "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                 event<transaction|struct> payloads are lowered \
                  ({}); v1 emits `{named}` as the subscriber's parameter type and declares \
                  no C++ enum, so its output does not compile either",
                 scalar_width_detail()
@@ -3188,8 +3190,9 @@ pub(crate) fn lower_event_payload(
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
-                 ({}); enum and nested/record-vector payloads gate on a later slice",
+                "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                 event<transaction|struct> payloads are lowered \
+                 ({}); enum and record-vector payloads gate on a later slice",
                 scalar_width_detail()
             ),
         )
@@ -3212,27 +3215,7 @@ pub(crate) fn lower_event_payload(
             // `uint<1>`, which is a different declared type, so `None`
             // is the only honest thing the pair can say here.
             if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
-                return match *elem {
-                    IrType::SInt(width) => Ok(EventPayload::FixedVec {
-                        boolean: false,
-                        signed: true,
-                        width,
-                        len,
-                    }),
-                    IrType::UInt(width) => Ok(EventPayload::FixedVec {
-                        boolean: false,
-                        signed: false,
-                        width,
-                        len,
-                    }),
-                    IrType::Bool => Ok(EventPayload::FixedVec {
-                        boolean: true,
-                        signed: false,
-                        width: None,
-                        len,
-                    }),
-                    _ => Err(reject_named("Vec")),
-                };
+                return Ok(EventPayload::FixedVec { elem, len });
             }
             match event_payload_scalar_ir_type(ty) {
                 Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
@@ -3261,7 +3244,8 @@ pub(crate) fn lower_event_payload(
             Err(unsupported(
                 &format!("a non-identifier event payload on `{comp}.{fname}`"),
                 format!(
-                    "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
+                    "only event<scalar>, recursively nested event<Vec<scalar, N>>, and \
+                     event<transaction|struct> payloads are lowered \
                      ({})",
                     scalar_width_detail()
                 ),
@@ -4966,7 +4950,7 @@ impl super::FuncBuilder<'_> {
     fn check_event_payload_arg(
         &self,
         value: &IrExpr,
-        payload: EventPayload,
+        payload: &EventPayload,
         what: &str,
     ) -> Result<(), LowerError> {
         self.check_slot_ir(value, &payload.value_ir_type(), what)?;
@@ -5129,7 +5113,7 @@ impl super::FuncBuilder<'_> {
                 if let Some(payload) = self.component_event_payload(cid, &event) {
                     self.check_event_payload_arg(
                         &lowered[0],
-                        payload,
+                        &payload,
                         &format!("event `{event}`"),
                     )?;
                 }
@@ -5147,7 +5131,7 @@ impl super::FuncBuilder<'_> {
         // (`for (auto& _s : e) _s(x);`).
         if segs.len() == 1 {
             if let Some(local) = self.lookup(&segs[0]) {
-                if let IrType::Event(payload) = *self.local_type(local) {
+                if let IrType::Event(payload) = self.local_type(local).clone() {
                     if args.len() != 1 {
                         return Err(LowerError::Invalid(format!(
                             "`emit {}` carries {} argument(s); an event payload is exactly one",
@@ -5159,7 +5143,7 @@ impl super::FuncBuilder<'_> {
                     if self
                         .check_event_payload_arg(
                             &lowered[0],
-                            payload,
+                            &payload,
                             &format!("event `{}`", segs[0]),
                         )
                         .is_err()
@@ -5232,7 +5216,7 @@ impl super::FuncBuilder<'_> {
         if let Some(payload) = self.component_event_payload(cid, &event) {
             self.check_event_payload_arg(
                 &lowered[0],
-                payload,
+                &payload,
                 &format!("event `{event}`"),
             )?;
         }
@@ -5262,8 +5246,8 @@ impl super::FuncBuilder<'_> {
     /// after that explained what `None` means for the caller as though
     /// it were a live branch. Neither described the code.
     fn component_event_payload(&self, cid: ComponentId, event: &str) -> Option<EventPayload> {
-        match self.ctx.components.get(cid.index())?.field(event)?.kind {
-            ComponentFieldKind::Event { payload, .. } => Some(payload),
+        match &self.ctx.components.get(cid.index())?.field(event)?.kind {
+            ComponentFieldKind::Event { payload, .. } => Some(payload.clone()),
             _ => None,
         }
     }

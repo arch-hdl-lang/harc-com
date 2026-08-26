@@ -4855,13 +4855,13 @@ impl FuncBuilder<'_> {
                     id.name, id.name
                 )));
             };
-            let IrType::Event(payload) = *self.local_type(channel) else {
+            let IrType::Event(payload) = self.local_type(channel) else {
                 return Err(LowerError::Invalid(format!(
                     "`on {}(...)`: `{}` is not an event channel",
                     id.name, id.name
                 )));
             };
-            (EventChannelRef::Local(channel), payload, id.name.clone())
+            (EventChannelRef::Local(channel), payload.clone(), id.name.clone())
         } else {
             let Some(raw) = super::components::dotted_path(callee) else {
                 return Err(LowerError::Invalid(
@@ -4894,7 +4894,7 @@ impl FuncBuilder<'_> {
                     comp.name
                 )));
             };
-            let ComponentFieldKind::Event { payload } = field.kind else {
+            let ComponentFieldKind::Event { payload } = &field.kind else {
                 return Err(LowerError::Invalid(format!(
                     "component `{}.{event}` is not an event field",
                     comp.name
@@ -4916,9 +4916,9 @@ impl FuncBuilder<'_> {
                     base: ComponentBase::Path(recv),
                     component: cid,
                     event,
-                    payload,
+                    payload: payload.clone(),
                 },
-                payload,
+                payload.clone(),
                 display,
             )
         };
