@@ -16,6 +16,7 @@ checked against the code at the cited location.
 
 | PR | Content |
 |---|---|
+| fixed-vector event payload slice (2026-08-26) | `event<Vec<scalar, N>>` now lowers as an exact one-dimensional aggregate payload. `EventPayload::FixedVec` preserves scalar signedness/width and length; component fields, test-scope channels, `on` parameters, `emit`, `connect`, IR display/verification, and C++ callback signatures share the resulting `IrType::FixedVec`/`std::array` ABI. Whole component-vector reads are permitted specifically as event arguments, with exact shape checks during lowering and verification. Nested vectors and record-vector event payloads remain out of scope. Fixture: `fixed_vec_event_payload_test` (v1↔tbir trace-equivalent). |
 | #347 | MVP spine: IR types (`src/ir/mod.rs`), textual form (`src/ir/display.rs`), structural verifier (`src/ir/verify.rs`), AST → IR lowering (`src/ir/lower/`), loop-switch C++ backend (`src/codegen/tbir/`) behind `harc sim --codegen tbir`, and the `harc dump-ir` CLI. |
 | #348 | v1-vs-tbir equivalence harness (`tests/run_tbir_equiv.sh` + `tests/tbir_equiv_fixtures.txt`), CI step, negative tests for out-of-subset constructs. |
 | #349 | Covergroup lowering + emission (`CovgroupSchema`, `SamplerAuto` functions, `CovReport`/`CovBin`, auto-cross matrices). |

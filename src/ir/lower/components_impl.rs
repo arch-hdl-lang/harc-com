@@ -17,7 +17,8 @@
 //!
 //! Out of subset, rejected (never mis-lowered): `agent` declarations and
 //! `on <ev>` event handlers, watchdog/phase orchestration, generics,
-//! `bound to` source transactors, and non-scalar event payloads. Those
+//! `bound to` source transactors, and event payloads beyond scalar,
+//! value-record, and one-dimensional fixed-scalar vectors. Those
 //! gate on the agent/sequencer/event slices.
 
 use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
@@ -2225,11 +2226,9 @@ fn lower_on_handler_body(
         // pair open-coded the conversion with `None`, which is what
         // made a wide payload unrepresentable downstream even once the
         // schema could hold one.
-        EventPayload::Scalar { .. } => oh
-            .arg_payload
-            .scalar_ir_type()
-            .expect("a scalar payload types"),
-        EventPayload::Record(rid) => IrType::Record(rid),
+        EventPayload::Scalar { .. }
+        | EventPayload::Record(_)
+        | EventPayload::FixedVec { .. } => oh.arg_payload.value_ir_type(),
     };
     // The payload binding. `on <event>(<arg>)` binds the source name as a
     // resolvable local so the body reads it. A no-payload `on <event>()`
@@ -2870,6 +2869,9 @@ pub(crate) fn connect_payload_matches_ir_type(payload: EventPayload, ty: &IrType
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool,
         ) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => source == *sink,
+        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
+            payload.value_ir_type() == *ty
+        }
         _ => false,
     }
 }
@@ -2965,6 +2967,7 @@ pub(crate) fn event_payloads_agree_in_shape(src: EventPayload, sink: EventPayloa
     match (src, sink) {
         (EventPayload::Scalar { .. }, EventPayload::Scalar { .. }) => true,
         (EventPayload::Record(a), EventPayload::Record(b)) => a == b,
+        (EventPayload::FixedVec { .. }, EventPayload::FixedVec { .. }) => src == sink,
         _ => false,
     }
 }
@@ -3170,7 +3173,7 @@ pub(crate) fn lower_event_payload(
         not_implemented(
             &format!("an enum event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar> and event<transaction|struct> payloads are lowered \
+                "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
                  ({}); v1 emits `{named}` as the subscriber's parameter type and declares \
                  no C++ enum, so its output does not compile either",
                 scalar_width_detail()
@@ -3185,8 +3188,8 @@ pub(crate) fn lower_event_payload(
         unsupported(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             format!(
-                "only event<scalar> and event<transaction|struct> payloads are lowered \
-                 ({}); enum/Vec/nested payloads gate on a later slice",
+                "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
+                 ({}); enum and nested/record-vector payloads gate on a later slice",
                 scalar_width_detail()
             ),
         )
@@ -3208,6 +3211,29 @@ pub(crate) fn lower_event_payload(
             // only v1 emits `void(bool)`. `width: Some(1)` would mean
             // `uint<1>`, which is a different declared type, so `None`
             // is the only honest thing the pair can say here.
+            if let Some(IrType::FixedVec { elem, len }) = fixed_vec_elem_ir_type(ty) {
+                return match *elem {
+                    IrType::SInt(width) => Ok(EventPayload::FixedVec {
+                        boolean: false,
+                        signed: true,
+                        width,
+                        len,
+                    }),
+                    IrType::UInt(width) => Ok(EventPayload::FixedVec {
+                        boolean: false,
+                        signed: false,
+                        width,
+                        len,
+                    }),
+                    IrType::Bool => Ok(EventPayload::FixedVec {
+                        boolean: true,
+                        signed: false,
+                        width: None,
+                        len,
+                    }),
+                    _ => Err(reject_named("Vec")),
+                };
+            }
             match event_payload_scalar_ir_type(ty) {
                 Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
                     signed: true,
@@ -3235,7 +3261,7 @@ pub(crate) fn lower_event_payload(
             Err(unsupported(
                 &format!("a non-identifier event payload on `{comp}.{fname}`"),
                 format!(
-                    "only event<scalar> and event<transaction|struct> payloads are lowered \
+                    "only event<scalar>, event<Vec<scalar, N>>, and event<transaction|struct> payloads are lowered \
                      ({})",
                     scalar_width_detail()
                 ),
@@ -4904,7 +4930,7 @@ impl super::FuncBuilder<'_> {
                     let CallArg::Named { value, .. } = a else {
                         unreachable!("the expression arm returned above")
                     };
-                    out.push(self.lower_expr_no_ports(value)?);
+                    out.push(self.lower_event_arg_expr(value)?);
                     continue;
                 }
                 // "component call", not "method call": every method
@@ -4921,9 +4947,37 @@ impl super::FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             };
-            out.push(self.lower_expr_no_ports(e)?);
+            out.push(self.lower_event_arg_expr(e)?);
         }
         Ok(out)
+    }
+
+    fn lower_event_arg_expr(&mut self, value: &AstExpr) -> Result<IrExpr, LowerError> {
+        let saved = self.vec_read_ok;
+        let saved_span = self.vec_read_span;
+        self.vec_read_ok = true;
+        self.vec_read_span = Some(super::exprs::unparen_expr(value).span);
+        let lowered = self.lower_expr_no_ports(value);
+        self.vec_read_ok = saved;
+        self.vec_read_span = saved_span;
+        lowered
+    }
+
+    fn check_event_payload_arg(
+        &self,
+        value: &IrExpr,
+        payload: EventPayload,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        self.check_slot_ir(value, &payload.value_ir_type(), what)?;
+        if matches!(payload, EventPayload::FixedVec { .. }) {
+            if self.ir_whole_vec_type(value) != Some(payload.value_ir_type()) {
+                return Err(LowerError::Invalid(format!(
+                    "{what} does not match fixed-vector payload {payload:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Lower `emit <event>(args)` to a `Stmt::ComponentEmit`. Two forms:
@@ -5073,12 +5127,9 @@ impl super::FuncBuilder<'_> {
                 // the other is expected is a hard C++ error in both
                 // backends — measured on all four combinations.
                 if let Some(payload) = self.component_event_payload(cid, &event) {
-                    self.check_slot_type(
+                    self.check_event_payload_arg(
                         &lowered[0],
-                        match payload {
-                            EventPayload::Record(r) => Some(r),
-                            EventPayload::Scalar { .. } => None,
-                        },
+                        payload,
                         &format!("event `{event}`"),
                     )?;
                 }
@@ -5106,12 +5157,9 @@ impl super::FuncBuilder<'_> {
                     }
                     let lowered = self.lower_component_call_args(args, None)?;
                     if self
-                        .check_slot_type(
+                        .check_event_payload_arg(
                             &lowered[0],
-                            match payload {
-                                EventPayload::Record(r) => Some(r),
-                                EventPayload::Scalar { .. } => None,
-                            },
+                            payload,
                             &format!("event `{}`", segs[0]),
                         )
                         .is_err()
@@ -5120,6 +5168,9 @@ impl super::FuncBuilder<'_> {
                             EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
                             EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
                             EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),
+                            EventPayload::FixedVec { .. } => {
+                                format!("{:?}", payload.value_ir_type())
+                            }
                         };
                         return Err(LowerError::Invalid(format!(
                             "`emit {}`: the channel carries `event<{want}>`, but the payload \
@@ -5179,12 +5230,9 @@ impl super::FuncBuilder<'_> {
         }
         let lowered = self.lower_component_call_args(args, None)?;
         if let Some(payload) = self.component_event_payload(cid, &event) {
-            self.check_slot_type(
+            self.check_event_payload_arg(
                 &lowered[0],
-                match payload {
-                    EventPayload::Record(r) => Some(r),
-                    EventPayload::Scalar { .. } => None,
-                },
+                payload,
                 &format!("event `{event}`"),
             )?;
         }

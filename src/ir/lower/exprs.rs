@@ -674,12 +674,15 @@ impl super::FuncBuilder<'_> {
         ))
     }
 
-    /// The `(len, C++ element class)` of a LOWERED whole-`Vec` field
-    /// read, in each of the three lanes that produce one. `None` for
-    /// anything else, including an indexed element read (that is a
-    /// scalar, not an array).
-    fn ir_whole_vec_shape(&self, e: &Expr) -> Option<(usize, String)> {
+    /// The exact element type and length of a LOWERED whole-`Vec` field read,
+    /// in each of the three lanes that produce one. `None` for anything else,
+    /// including an indexed element read (that is a scalar, not an array).
+    pub(crate) fn ir_whole_vec_type(&self, e: &Expr) -> Option<IrType> {
         let (len, ty) = match e {
+            Expr::Local(local) => {
+                let ty = self.local_type(*local).clone();
+                return matches!(ty, IrType::FixedVec { .. }).then_some(ty);
+            }
             Expr::RecordField {
                 local,
                 field,
@@ -711,12 +714,10 @@ impl super::FuncBuilder<'_> {
                 let root = segs.next()?;
                 let root_kind = &self.ctx.components.get(cid.index())?.field(root)?.kind;
                 if let crate::ir::ComponentFieldKind::FixedVec(vec) = root_kind {
-                    return (segs.next().is_none())
-                        .then(|| {
-                            crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem)
-                                .map(|elem| (vec.len, elem))
-                        })
-                        .flatten();
+                    return segs.next().is_none().then(|| IrType::FixedVec {
+                        elem: Box::new(vec.elem.clone()),
+                        len: vec.len,
+                    });
                 }
                 let crate::ir::ComponentFieldKind::Record { record } = root_kind else {
                     return None;
@@ -765,7 +766,20 @@ impl super::FuncBuilder<'_> {
             }
             _ => return None,
         };
-        Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&ty)?))
+        Some(IrType::FixedVec {
+            elem: Box::new(ty),
+            len,
+        })
+    }
+
+    /// The `(len, C++ element class)` of a LOWERED whole-`Vec` field read.
+    /// Event payload matching uses the exact type above because distinct
+    /// widths can share one C++ carrier.
+    pub(crate) fn ir_whole_vec_shape(&self, e: &Expr) -> Option<(usize, String)> {
+        let IrType::FixedVec { elem, len } = self.ir_whole_vec_type(e)? else {
+            unreachable!("whole-vector type is fixed-vector typed")
+        };
+        Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&elem)?))
     }
 
     /// Whether both operands are whole-`Vec` record-field reads of the
@@ -5361,7 +5375,7 @@ impl FuncBuilder<'_> {
     }
 }
 
-fn unparen_expr(mut e: &crate::ast::Expr) -> &crate::ast::Expr {
+pub(crate) fn unparen_expr(mut e: &crate::ast::Expr) -> &crate::ast::Expr {
     while let ExprKind::Paren(inner) = &*e.kind {
         e = inner;
     }

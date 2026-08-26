@@ -4951,10 +4951,9 @@ impl FuncBuilder<'_> {
             // arm open-coded the conversion with `None` — the comment
             // above it said the param "IS widthless" — and that is what
             // made a wide payload unrepresentable downstream.
-            crate::ir::EventPayload::Scalar { .. } => {
-                payload.scalar_ir_type().expect("a scalar payload types")
-            }
-            crate::ir::EventPayload::Record(r) => IrType::Record(r),
+            crate::ir::EventPayload::Scalar { .. }
+            | crate::ir::EventPayload::Record(_)
+            | crate::ir::EventPayload::FixedVec { .. } => payload.value_ir_type(),
         };
         let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
         super::reserve_tb_record_names(&mut b, self.ctx);

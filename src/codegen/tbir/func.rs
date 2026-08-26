@@ -1535,6 +1535,9 @@ fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<S
         Some(IrType::Event(crate::ir::EventPayload::Record(r))) => {
             Ok(prog.records[r.index()].name.clone())
         }
+        Some(IrType::Event(p @ crate::ir::EventPayload::FixedVec { .. })) => {
+            Ok(super::aggregate_value_cty(&p.value_ir_type(), &prog.records))
+        }
         _ => Err(EmitError(format!(
             "tbir: {} uses local {} as an event channel but it is not event-typed",
             cx.func.name, event.0
@@ -1547,6 +1550,7 @@ fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> String {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
         IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
         IrType::Component(c) => prog.components[c.index()].name.clone(),
         other => super::local_scalar_cty(other),
     }
@@ -3067,6 +3071,9 @@ fn declare_locals_except(
                         })?
                         .name
                         .clone(),
+                    crate::ir::EventPayload::FixedVec { .. } => {
+                        super::aggregate_value_cty(&payload.value_ir_type(), &prog.records)
+                    }
                 };
                 writeln!(
                     out,
@@ -3764,6 +3771,9 @@ fn emit_component_fn_lambda(
             // The scalar-element analogue (`TSeq<uint<N>>`) — `std::vector<T>`
             // over the scalar C++ type (#453).
             IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+            ref ty @ IrType::FixedVec { .. } => {
+                super::aggregate_value_cty(ty, &prog.records)
+            }
             IrType::Component(c) => prog.components[c.index()].name.clone(),
             ref ty => super::local_scalar_cty(ty),
         };

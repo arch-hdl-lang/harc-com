@@ -452,6 +452,9 @@ pub(super) fn event_payload_cty(
             super::field_scalar_cty(&p.scalar_ir_type().expect("a scalar payload types"))
         }
         crate::ir::EventPayload::Record(r) => records[r.index()].name.clone(),
+        crate::ir::EventPayload::FixedVec { .. } => {
+            super::aggregate_value_cty(&p.value_ir_type(), records)
+        }
     }
 }
 
