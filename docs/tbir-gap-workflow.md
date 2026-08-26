@@ -94,6 +94,11 @@ family of rejections over a one-site exception. Current implementation order:
   layout lower through TBIR. Record randomization remains fenced because both
   emitters currently generate an invalid scalar assignment for the inner
   array.
+- [x] Fixed-vector queue elements across testbench, scoreboard, component,
+  and transactor-state owners. Nested scalar vectors retain their exact
+  recursive `std::array` layout; inferred pop locals and verifier metadata
+  carry the aggregate element type, while safe empty-state queries run under
+  both emitters.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -230,6 +235,12 @@ bounds are checked at each layer, component-record paths retain their
 component receiver semantics, and the same fixture now observes nonzero lanes
 under both emitters. This routes around existing shared fallbacks, so the raw
 inventory remains 118 textual matches.
+
+The fixed-vector queue-element batch then admits fully specified
+`queue<Vec<scalar, N>>` elements, including recursively nested scalar vectors,
+through the queue schema shared by all persistent-state owners. Its old
+diagnostic constructor still classifies incomplete and other aggregate element
+spellings, so the raw inventory remains 118 textual matches.
 
 ## Review-derived semantic gates
 

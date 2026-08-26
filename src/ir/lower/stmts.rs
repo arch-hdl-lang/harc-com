@@ -1703,6 +1703,14 @@ impl FuncBuilder<'_> {
                 }
                 "a scalar".to_string()
             }
+            crate::ir::QueueElem::FixedVec { .. } => {
+                let expected = elem.ir_type();
+                let declared = super::components::fixed_vec_elem_ir_type(ty);
+                if declared.as_ref() == Some(&expected) {
+                    return Ok(());
+                }
+                format!("a fixed vector {expected:?}")
+            }
         };
         let want = match declared_record {
             Some(rid) => format!("a `{}`", self.ctx.records[rid.index()].name),
@@ -1729,6 +1737,7 @@ impl FuncBuilder<'_> {
                 .and_then(typed_let_ir_type)
                 .unwrap_or_else(|| ty.clone()),
             crate::ir::QueueElem::Record(rid) => IrType::Record(*rid),
+            crate::ir::QueueElem::FixedVec { .. } => elem.ir_type(),
         };
         if let IrType::UInt(Some(width)) | IrType::SInt(Some(width)) = &ty {
             self.let_widths.insert(dest, *width);
@@ -2068,6 +2077,7 @@ impl FuncBuilder<'_> {
                 format!("a `TSeq<{}>`", self.ctx.records[rid.index()].name)
             }
             Slot::Seq(None) => "a scalar `TSeq`".to_string(),
+            Slot::FixedVec => "a fixed-vector value".to_string(),
             Slot::Scalar => "a non-record value".to_string(),
             // Unreachable: `check_slot_shape` returns `Ok` before
             // building a message when either side is `Unknown`.
@@ -2082,9 +2092,23 @@ impl FuncBuilder<'_> {
         elem: &crate::ir::QueueElem,
         what: &str,
     ) -> Result<(), LowerError> {
+        if matches!(elem, crate::ir::QueueElem::FixedVec { .. }) {
+            let expected = elem.ir_type();
+            let actual = self.expr_type(value);
+            if actual.as_ref() == Some(&expected) {
+                return Ok(());
+            }
+            return Err(LowerError::Invalid(format!(
+                "{what} holds {expected:?}, but the pushed value is {}",
+                actual
+                    .map(|ty| format!("{ty:?}"))
+                    .unwrap_or_else(|| "not a typed fixed-vector value".to_string())
+            )));
+        }
+
         let want = match elem {
             crate::ir::QueueElem::Record(rid) => Some(*rid),
-            crate::ir::QueueElem::Scalar { .. } => None,
+            crate::ir::QueueElem::Scalar { .. } | crate::ir::QueueElem::FixedVec { .. } => None,
         };
         self.check_slot_type(value, want, what)?;
 
@@ -6411,6 +6435,9 @@ enum Slot {
     Record(crate::ir::RecordId),
     /// A `TSeq<T>`; `Some(rid)` when the element is a declared record.
     Seq(Option<crate::ir::RecordId>),
+    /// A fixed-size aggregate vector. Exact shape is enforced by queue
+    /// transfers; typed ABI slots must still distinguish it from scalars.
+    FixedVec,
     /// Known to be a scalar — `uint<N>`, `sint<N>`, `bit`, `bool`.
     Scalar,
     /// Not nameable here. Never compared, never reported.
@@ -6433,6 +6460,7 @@ impl Slot {
             IrType::Record(rid) => Slot::Record(*rid),
             IrType::RecordSeq(rid) => Slot::Seq(Some(*rid)),
             IrType::Seq(_) => Slot::Seq(None),
+            IrType::FixedVec { .. } => Slot::FixedVec,
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => Slot::Scalar,
             _ => Slot::Unknown,
         }

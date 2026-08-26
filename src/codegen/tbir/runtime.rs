@@ -361,6 +361,12 @@ fn scalar_field_decl(ty: &crate::ir::IrType, default: u64) -> (String, String) {
 fn queue_elem_cty(elem: &crate::ir::QueueElem, records: &[crate::ir::RecordSchema]) -> String {
     match elem {
         crate::ir::QueueElem::Scalar { ty } => super::field_scalar_cty(ty),
+        crate::ir::QueueElem::FixedVec { elem, len } => super::field_scalar_cty(
+            &crate::ir::IrType::FixedVec {
+                elem: elem.clone(),
+                len: *len,
+            },
+        ),
         crate::ir::QueueElem::Record(r) => records[r.index()].name.clone(),
     }
 }

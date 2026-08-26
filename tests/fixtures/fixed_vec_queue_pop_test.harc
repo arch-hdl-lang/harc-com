@@ -1,0 +1,16 @@
+// Compile/run gate for the generated fixed-vector queue pop destination.
+// The queue is intentionally empty: both backends must compile the nested
+// std::array local plus pop/push transfers, then report the same runtime failure.
+
+testbench FixedVecQueuePopTb
+    dut : Top
+    values : queue<Vec<Vec<uint<8>, 2>, 3>>
+end testbench FixedVecQueuePopTb
+
+impl FixedVecQueuePopTest for FixedVecQueuePopTb
+    run
+        let observed = values.pop()
+        values.push(observed)
+        wait 1 cycle
+    end run
+end impl FixedVecQueuePopTest

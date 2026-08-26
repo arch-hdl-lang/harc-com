@@ -3423,12 +3423,12 @@ end impl QueueBoundaryTest
     }
 }
 
-/// Direct scalar queues deliberately widen only the scalar element
-/// subset. Aggregate elements other than value records stay explicit
-/// refusals instead of being flattened into scalar storage — each on
-/// the grade v1 earns, which is not the same grade for all of them.
+/// Queue elements with incomplete aggregate spellings stay explicit refusals
+/// instead of being flattened into scalar storage — each on the grade v1
+/// earns, which is not the same grade for all of them. Fully specified
+/// `Vec<scalar, N>` elements are covered by the fixed-vector queue test below.
 ///
-/// `Vec` and `list` keep `Unsupported`: v1 gives them a real C++
+/// Bare `Vec` and `list` keep `Unsupported`: v1 gives them a C++
 /// element type and builds. An ENUM does not — v1 emits the bare name
 /// into `HarcQueue<Color>` and declares no C++ enum, so g++ refuses and
 /// `--codegen v1` is a dead end. One label used to cover all three.
@@ -3468,11 +3468,294 @@ end impl AggregateQueueTest
         let msg = assert_unsupported(&lower_src(&prog(elem)).unwrap_err());
         assert!(
             msg.contains("non-scalar queue element")
-                && msg.contains("enum/Vec/nested elements gate on a later slice"),
+                && msg.contains("has no typed queue representation yet"),
             "`queue<{elem}>` must stay explicitly unsupported: {msg}"
         );
         cpp_tb::emit(&merged_src(&prog(elem))).expect("v1 emits these, which keeps it honest");
     }
+}
+
+/// Fixed-vector queue elements retain their aggregate value type instead of
+/// falling through the old scalar-only queue fence. The shared queue schema
+/// serves every owner, while this surface proves nested-array C++ storage,
+/// inferred aggregate pop typing, and safe runtime queries.
+#[test]
+fn fixed_vector_queue_elements_lower_as_exact_aggregate_values() {
+    let src = r#"
+function take_scalar(value: uint<8>) -> uint<8>
+    return value
+end function take_scalar
+
+scoreboard VecScalarSink
+    hookable put(value: uint<8>)
+    end put
+end scoreboard VecScalarSink
+
+testbench FixedVecQueueTb
+    dut    : Top
+    values : queue<Vec<Vec<uint<8>, 2>, 3>>
+    sink   : VecScalarSink
+end testbench FixedVecQueueTb
+
+impl FixedVecQueueTest for FixedVecQueueTb
+    run
+        let observed = values.pop()
+        sink.put(1)
+        wait 1 cycle
+    end run
+end impl FixedVecQueueTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("fixed-vector queue lowers");
+    verify::verify_program(&prog).expect("fixed-vector queue verifies");
+    assert_eq!(
+        prog.testbenches[0].queue_fields[0].elem,
+        ir::QueueElem::FixedVec {
+            elem: Box::new(ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::UInt(Some(8))),
+                len: 2,
+            }),
+            len: 3,
+        }
+    );
+    let cpp =
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("fixed-vector queue emits");
+    let aggregate = "std::array<std::array<uint64_t, 2>, 3>";
+    assert!(
+        cpp.contains(&format!("harc_rt::HarcQueue<{aggregate}> values;")),
+        "queue storage keeps both vector dimensions:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(&format!("{aggregate} observed{{}};")),
+        "an inferred pop local keeps the aggregate element type:\n{cpp}"
+    );
+    let v1 = cpp_tb::emit(&merged).expect("v1 emits the migration control");
+    assert!(
+        v1.contains(&format!("harc_rt::HarcQueue<{aggregate}> values;")),
+        "v1 uses the same queue element layout:\n{v1}"
+    );
+
+    // The same decoder and storage descriptor serve scoreboard and
+    // method-bearing component owners; declarations plus read-only queries
+    // are sufficient to prove these persistent queues are usable while empty.
+    let owners = r#"
+scoreboard VecQueueSb
+    values : queue<Vec<uint<16>, 4>>
+end scoreboard VecQueueSb
+agent VecQueueAgent
+    values : queue<Vec<uint<16>, 4>>
+end agent VecQueueAgent
+testbench VecQueueOwnersTb
+    dut : Top
+    sb : VecQueueSb
+    ag : VecQueueAgent
+end testbench VecQueueOwnersTb
+impl VecQueueOwnersTest for VecQueueOwnersTb
+    run
+        assert sb.values.empty()
+        wait 1 cycle
+    end run
+end impl VecQueueOwnersTest
+"#;
+    let owners_prog = lower_src(owners).expect("scoreboard/component vector queues lower");
+    verify::verify_program(&owners_prog).expect("scoreboard/component vector queues verify");
+    let owners_cpp = tbir::emit(
+        &owners_prog,
+        &merged_src(owners),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("scoreboard/component vector queues emit");
+    assert_eq!(
+        owners_cpp
+            .matches("harc_rt::HarcQueue<std::array<uint64_t, 4>> values;")
+            .count(),
+        2,
+        "both persistent owners keep vector-valued queue storage:\n{owners_cpp}"
+    );
+
+    let target = r#"
+bus VecQueueBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus VecQueueBus
+transactor VecQueueTarget bound to VecQueueBus
+    values : queue<Vec<uint<16>, 4>>
+    thread bus.read(addr: uint<8>)
+        assert values.empty()
+        return addr
+    end thread
+end transactor VecQueueTarget
+testbench VecQueueTargetTb
+    dut : TlmReadInitiator
+end testbench VecQueueTargetTb
+impl VecQueueTargetTest for VecQueueTargetTb
+    let mem : VecQueueBus = bind dut
+    let target : VecQueueTarget passive = bind mem
+    run
+        assert target.values.size() == 0
+        wait 1 cycle
+    end run
+end impl VecQueueTargetTest
+"#;
+    let target_prog = lower_src(target).expect("target-state vector queue lowers");
+    verify::verify_program(&target_prog).expect("target-state vector queue verifies");
+    assert!(matches!(
+        target_prog.transactors[0].state_fields[0].kind,
+        ir::StateFieldKind::Queue {
+            elem: ir::QueueElem::FixedVec { len: 4, .. }
+        }
+    ));
+
+    let bad_use = |expr: &str| {
+        src.replace(
+            "        wait 1 cycle",
+            &format!("        {expr}\n        wait 1 cycle"),
+        )
+    };
+    for (expr, needle) in [
+        ("let bad = observed + 1", "scalar binary operator"),
+        (
+            "values.push(observed + observed)",
+            "scalar binary operator",
+        ),
+        ("let bad = !observed", "scalar unary operator"),
+        ("if observed\n            wait 1 cycle\n        end if", "must be a scalar value"),
+        ("let bad = 1 ? observed : 1", "ternary mixing a fixed-vector"),
+        ("log(info, \"bad=${observed}\")", "aggregate interpolation"),
+        ("let bad = take_scalar(observed)", "fixed-vector value"),
+        ("sink.put(observed)", "fixed-vector value"),
+        (
+            "let scalar_event : event<uint<8>>\n        emit scalar_event(observed)",
+            "payload does not match",
+        ),
+    ] {
+        let err = lower_src(&bad_use(expr))
+            .err()
+            .unwrap_or_else(|| panic!("`{expr}` must reject aggregate scalar use"));
+        assert!(err.to_string().contains(needle), "`{expr}`: {err}");
+    }
+
+    let mut broken = prog.clone();
+    let bad = ir::QueueElem::FixedVec {
+        elem: Box::new(ir::IrType::Unknown),
+        len: 3,
+    };
+    let ir::TbStateFieldSchema::Queue(field) = &mut broken.testbenches[0].state_fields[0] else {
+        panic!("fixture state field is a queue");
+    };
+    field.elem = bad.clone();
+    broken.testbenches[0].queue_fields[0].elem = bad;
+    let errors = verify::verify_program(&broken).expect_err("bad vector queue metadata rejects");
+    assert!(
+        errors.iter().any(|e| e
+            .to_string()
+            .contains("invalid fixed-vector element schema")),
+        "verifier must name the corrupt aggregate schema: {errors:?}"
+    );
+
+    let mut broken_use = prog.clone();
+    let run_id = broken_use.tests[0].run;
+    let observed = broken_use.functions[run_id.index()]
+        .locals
+        .iter()
+        .position(|local| local.name == "observed")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("fixture has inferred aggregate pop local");
+    broken_use.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::TbQueuePush {
+            field: "values".to_string(),
+            value: ir::Expr::Binary(
+                ir::BinOp::Add,
+                Box::new(ir::Expr::Local(observed)),
+                Box::new(ir::Expr::Local(observed)),
+            ),
+        });
+    assert!(
+        verify::verify_program(&broken_use).is_err(),
+        "verifier must reject fixed-vector arithmetic even when it feeds an exact queue slot"
+    );
+
+    let mut broken_ternary = prog.clone();
+    broken_ternary.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::TbQueuePush {
+            field: "values".to_string(),
+            value: ir::Expr::Ternary(
+                Box::new(ir::Expr::Local(observed)),
+                Box::new(ir::Expr::Local(observed)),
+                Box::new(ir::Expr::Local(observed)),
+            ),
+        });
+    assert!(
+        verify::verify_program(&broken_ternary).is_err(),
+        "verifier must reject a fixed-vector local as a ternary condition"
+    );
+
+    let mut broken_truth = prog.clone();
+    broken_truth.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::AssertCheck {
+            cond: ir::Expr::Local(observed),
+            on_fail: ir::FmtArgs {
+                fmt: "bad aggregate truth".to_string(),
+                args: Vec::new(),
+            },
+        });
+    assert!(
+        verify::verify_program(&broken_truth).is_err(),
+        "verifier must reject a bare fixed-vector local as a truth value"
+    );
+
+    let mut broken_call = prog.clone();
+    let take_scalar = broken_call
+        .functions
+        .iter()
+        .find(|function| function.name == "take_scalar")
+        .expect("fixture has scalar helper");
+    let ret = take_scalar
+        .ret
+        .and_then(|local| take_scalar.locals.get(local.index()))
+        .map(|local| local.ty.clone())
+        .expect("scalar helper returns a value");
+    let scalar_dest = ir::LocalId(broken_call.functions[run_id.index()].locals.len() as u32);
+    broken_call.functions[run_id.index()]
+        .locals
+        .push(ir::TypedLocal {
+            name: "broken_scalar_dest".to_string(),
+            ty: ret.clone(),
+        });
+    broken_call.functions[run_id.index()].blocks[0]
+        .stmts
+        .push(ir::Stmt::Assign(
+            scalar_dest,
+            ir::Expr::Call(
+                ir::CallTarget::Helper {
+                    name: "take_scalar".to_string(),
+                    ret,
+                },
+                vec![ir::Expr::Local(observed)],
+            ),
+        ));
+    assert!(
+        verify::verify_program(&broken_call).is_err(),
+        "verifier must reject a fixed-vector argument at a scalar helper ABI"
+    );
+
+    let mut broken_component_call = prog.clone();
+    let call_args = broken_component_call.functions[run_id.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { args, .. } => Some(args),
+            _ => None,
+        })
+        .expect("fixture has a scalar component call");
+    call_args[0] = ir::Expr::Local(observed);
+    assert!(
+        verify::verify_program(&broken_component_call).is_err(),
+        "verifier must reject a fixed-vector argument at a scalar component ABI"
+    );
 }
 
 /// A source-level type annotation on `queue.pop()` is an assignment slot.

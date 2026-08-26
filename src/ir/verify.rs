@@ -604,18 +604,30 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
 }
 
 fn verify_queue_elem_schema(elem: &QueueElem, what: String, errs: &mut Vec<VerifyError>) {
-    let QueueElem::Scalar { ty } = elem else {
-        return;
-    };
-    let valid = matches!(ty, IrType::Bool)
-        || matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 0);
-    if !valid {
-        errs.push(VerifyError::BadProgramRef {
-            what: format!(
-                "{what} has invalid scalar element type {ty:?}; expected bool or a resolved, \
-                 nonzero UInt/SInt"
-            ),
-        });
+    match elem {
+        QueueElem::Record(_) => {}
+        QueueElem::Scalar { ty } => {
+            let valid = matches!(ty, IrType::Bool)
+                || matches!(ty, IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 0);
+            if !valid {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "{what} has invalid scalar element type {ty:?}; expected bool or a \
+                         resolved, nonzero UInt/SInt"
+                    ),
+                });
+            }
+        }
+        QueueElem::FixedVec { elem, len } => {
+            if *len == 0 || !fixed_vec_elem_valid(elem) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "{what} has invalid fixed-vector element schema {elem:?} x {len}; \
+                         expected a nonempty vector with resolved scalar leaves"
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -2333,7 +2345,10 @@ impl Checker<'_> {
     fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
         self.check_expr(expr, ports_ok, context);
         let ty = self.aggregate_assignment_expr_type(expr);
-        if matches!(ty, Some(IrType::Record(_) | IrType::Seq(_)))
+        if matches!(
+            ty,
+            Some(IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
+        )
             || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
@@ -2349,7 +2364,7 @@ impl Checker<'_> {
         self.check_expr(expr, ports_ok, context);
         if matches!(
             self.aggregate_assignment_expr_type(expr),
-            Some(IrType::Record(_) | IrType::Seq(_))
+            Some(IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
         ) || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
@@ -3185,11 +3200,15 @@ impl Checker<'_> {
                 base,
                 field,
                 index_pos,
+                inner_index,
                 ..
             } => self
                 .component_indexed_field_type(base, field, *index_pos)
                 .ok()
-                .map(|(ty, _)| ty)
+                .map(|(ty, _)| match (ty, inner_index) {
+                    (IrType::FixedVec { elem, .. }, Some(_)) => *elem,
+                    (ty, _) => ty,
+                })
                 .or(Some(IrType::Unknown)),
             Expr::RecordField {
                 local,
@@ -3242,27 +3261,25 @@ impl Checker<'_> {
         }
     }
 
-    /// Reject record values consumed by scalar operators, plus aggregate
-    /// ternaries whose arms cannot denote one record type. The general scalar
-    /// classifier intentionally returns `Unknown` for several of these forms;
-    /// aggregate destinations must not interpret that as a wildcard.
+    /// Reject record/fixed-vector values consumed by scalar operators, plus
+    /// aggregate ternaries whose arms cannot denote one exact aggregate type.
+    /// The general scalar classifier intentionally returns `Unknown` for
+    /// several of these forms; aggregate destinations must not interpret that
+    /// as a wildcard.
     fn contains_invalid_record_composition(&self, value: &Expr) -> bool {
         if let Expr::Ternary(cond, then_expr, else_expr) = value {
             if matches!(
                 self.aggregate_assignment_expr_type(cond),
-                Some(IrType::Record(_))
+                Some(IrType::Record(_) | IrType::FixedVec { .. })
             ) {
                 return true;
             }
             let then_ty = self.aggregate_assignment_expr_type(then_expr);
             let else_ty = self.aggregate_assignment_expr_type(else_expr);
-            if (matches!(then_ty, Some(IrType::Record(_)))
-                || matches!(else_ty, Some(IrType::Record(_))))
-                && !matches!(
-                    (then_ty, else_ty),
-                    (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) if lhs == rhs
-                )
-            {
+            let aggregate = |ty: &Option<IrType>| {
+                matches!(ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+            };
+            if (aggregate(&then_ty) || aggregate(&else_ty)) && then_ty != else_ty {
                 return true;
             }
         }
@@ -3271,14 +3288,13 @@ impl Checker<'_> {
                 let lhs_ty = self.aggregate_assignment_expr_type(lhs);
                 let rhs_ty = self.aggregate_assignment_expr_type(rhs);
                 let invalid_operands = if matches!(op, BinOp::Eq | BinOp::Ne) {
-                    match (lhs_ty, rhs_ty) {
-                        (Some(IrType::Record(lhs)), Some(IrType::Record(rhs))) => lhs != rhs,
-                        (Some(IrType::Record(_)), _) | (_, Some(IrType::Record(_))) => true,
-                        _ => false,
-                    }
+                    let aggregate = |ty: &Option<IrType>| {
+                        matches!(ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+                    };
+                    (aggregate(&lhs_ty) || aggregate(&rhs_ty)) && lhs_ty != rhs_ty
                 } else {
-                    matches!(lhs_ty, Some(IrType::Record(_)))
-                        || matches!(rhs_ty, Some(IrType::Record(_)))
+                    matches!(lhs_ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
+                        || matches!(rhs_ty, Some(IrType::Record(_) | IrType::FixedVec { .. }))
                 };
                 invalid_operands
                     || self.contains_invalid_record_composition(lhs)
@@ -3287,7 +3303,7 @@ impl Checker<'_> {
             Expr::Unary(_, inner) | Expr::BitSlice { target: inner, .. } => {
                 matches!(
                     self.aggregate_assignment_expr_type(inner),
-                    Some(IrType::Record(_))
+                    Some(IrType::Record(_) | IrType::FixedVec { .. })
                 ) || self.contains_invalid_record_composition(inner)
             }
             Expr::BitSliceDyn { target, hi, lo } => [target.as_ref(), hi.as_ref(), lo.as_ref()]
@@ -3295,7 +3311,7 @@ impl Checker<'_> {
                 .any(|inner| {
                     matches!(
                         self.aggregate_assignment_expr_type(inner),
-                        Some(IrType::Record(_))
+                        Some(IrType::Record(_) | IrType::FixedVec { .. })
                     ) || self.contains_invalid_record_composition(inner)
                 }),
             Expr::Ternary(cond, then_expr, else_expr) => {
@@ -3309,7 +3325,7 @@ impl Checker<'_> {
             | Expr::SeqIndex { index: inner, .. } => {
                 matches!(
                     self.aggregate_assignment_expr_type(inner),
-                    Some(IrType::Record(_))
+                    Some(IrType::Record(_) | IrType::FixedVec { .. })
                 ) || self.contains_invalid_record_composition(inner)
             }
             _ => false,
@@ -4381,9 +4397,52 @@ impl Checker<'_> {
                         }
                     }
                 }
-                Stmt::ComponentCall { args, dest, .. } => {
+                Stmt::ComponentCall {
+                    component,
+                    method,
+                    args,
+                    dest,
+                    ..
+                } => {
                     for a in args {
                         self.check_expr(a, false, "ComponentCall arg");
+                    }
+                    if let Some(schema) = self
+                        .prog
+                        .components
+                        .get(component.index())
+                        .and_then(|component| component.method(method))
+                    {
+                        if schema.param_tys.len() != args.len() {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentCall `{method}` argument count mismatch",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                        }
+                        for (index, (arg, expected)) in
+                            args.iter().zip(&schema.param_tys).enumerate()
+                        {
+                            let actual = self
+                                .aggregate_assignment_expr_type(arg)
+                                .unwrap_or(IrType::Unknown);
+                            if (matches!(expected, IrType::FixedVec { .. })
+                                || matches!(&actual, IrType::FixedVec { .. }))
+                                && *expected != actual
+                            {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} ComponentCall `{method}` argument {} expects {:?}, got {:?}",
+                                        self.fid.0,
+                                        self.bid.0,
+                                        index + 1,
+                                        expected,
+                                        actual
+                                    ),
+                                });
+                            }
+                        }
                     }
                     if let Some(d) = dest {
                         self.check_local(*d);
@@ -5723,6 +5782,34 @@ impl Checker<'_> {
                 self.check_expr(index, ports_ok, context);
             }
             Expr::Call(target, args) => {
+                if let CallTarget::Helper { name, .. } = target {
+                    if let Some(helper) = self.prog.functions.iter().find(|function| {
+                        function.kind == FunctionKind::Helper && function.name == *name
+                    }) {
+                        for (index, (arg, param)) in
+                            args.iter().zip(&helper.params).enumerate()
+                        {
+                            let actual = self
+                                .aggregate_assignment_expr_type(arg)
+                                .unwrap_or(IrType::Unknown);
+                            if (matches!(&param.ty, IrType::FixedVec { .. })
+                                || matches!(&actual, IrType::FixedVec { .. }))
+                                && param.ty != actual
+                            {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} helper `{name}` argument {} expects {:?}, got {:?}",
+                                        self.fid.0,
+                                        self.bid.0,
+                                        index + 1,
+                                        param.ty,
+                                        actual
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 // Seam rule: a call edge is never an expression VALUE.
                 // It reaches the verifier only as the top-level Assign
                 // RHS (bus) or the root payload of `Stmt::TransactorCall`

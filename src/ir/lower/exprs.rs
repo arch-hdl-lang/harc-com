@@ -1354,6 +1354,13 @@ impl FuncBuilder<'_> {
             ExprKind::Paren(inner) => self.lower_expr(inner),
             ExprKind::Unary { op, expr } => {
                 let inner = self.lower_expr(expr)?;
+                if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {
+                    return Err(not_implemented(
+                        "a scalar unary operator applied to a fixed-vector local",
+                        "select a scalar lane before applying the operator",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -1402,6 +1409,22 @@ impl FuncBuilder<'_> {
                 self.vec_read_ok = saved;
                 self.vec_read_span = saved_span;
                 let (l, r) = (l?, r?);
+                let (lty, rty) = (self.expr_type(&l), self.expr_type(&r));
+                if matches!(lty, Some(IrType::FixedVec { .. }))
+                    || matches!(rty, Some(IrType::FixedVec { .. }))
+                {
+                    let matching_equality = matches!(ir_op, BinOp::Eq | BinOp::Ne)
+                        && lty.is_some()
+                        && lty == rty;
+                    if !matching_equality {
+                        return Err(not_implemented(
+                            "a scalar binary operator applied to a fixed-vector local",
+                            "only same-shape `==`/`!=`, whole-value copies, and queue transfers \
+                             are lowered for fixed-vector locals",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
                 let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
@@ -1434,6 +1457,17 @@ impl FuncBuilder<'_> {
                 self.validate_truth_expr(&c, "ternary condition")?;
                 let t = self.lower_expr(then_branch)?;
                 let e = self.lower_expr(else_branch)?;
+                let (tty, ety) = (self.expr_type(&t), self.expr_type(&e));
+                if (matches!(tty, Some(IrType::FixedVec { .. }))
+                    || matches!(ety, Some(IrType::FixedVec { .. })))
+                    && (tty.is_none() || tty != ety)
+                {
+                    return Err(not_implemented(
+                        "a ternary mixing a fixed-vector local with another value shape",
+                        "both ternary arms must have the same fixed-vector type",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
                 Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
             }
             ExprKind::Call { callee, args } => {
@@ -1699,6 +1733,13 @@ impl FuncBuilder<'_> {
                         self.infer_expr_width(expr).filter(|w| *w > 0)
                     };
                     let inner = self.lower_expr(expr)?;
+                    if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {
+                        return Err(not_implemented(
+                            "a scalar cast applied to a fixed-vector local",
+                            "select a scalar lane before casting",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
                     return Ok(Expr::WidthCast {
                         kind,
                         width,
@@ -2581,6 +2622,11 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn validate_truth_expr(&self, e: &Expr, context: &str) -> Result<(), LowerError> {
+        if matches!(self.expr_type(e), Some(IrType::FixedVec { .. })) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be a scalar value, not a fixed vector"
+            )));
+        }
         if let Some(record) = self.record_id_of_expr(e) {
             let name = &self.ctx.records[record.index()].name;
             return Err(LowerError::Invalid(format!(
@@ -4684,6 +4730,13 @@ impl FuncBuilder<'_> {
         // unknown, which selects the plain-cast shape instead.
         let src_width = src_width.filter(|w| *w > 0);
         let inner = self.lower_expr(target)?;
+        if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {
+            return Err(not_implemented(
+                "a scalar width method applied to a fixed-vector local",
+                "select a scalar lane before resizing",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         Ok(Expr::WidthCast {
             kind,
             width,
