@@ -1036,6 +1036,16 @@ pub(crate) fn lower_component_schema(
     let mut cycle_handlers: Vec<crate::ir::CycleTriggerHandlerSchema> = Vec::new();
     for (h, monitor_channel, activation) in &cycle_asts {
         validate_cycle_handler(name, h)?;
+        if monitor_channel.is_some() && matches!(h.phase, crate::ast::OnPhase::PostEval) {
+            return Err(not_implemented(
+                &format!(
+                    "a `phase post_eval` modifier on a bound handshake monitor on `{name}`"
+                ),
+                "v1 lowers a bound handshake monitor as its fixed-phase actor and silently \
+                 ignores the phase modifier",
+                V1Status::SilentlyMisLowers,
+            ));
+        }
         let fid = FunctionId(*next_fn);
         *next_fn += 1;
         // A handshake-monitor synthesizes a rising-edge `valid && ready`
@@ -1050,6 +1060,7 @@ pub(crate) fn lower_component_schema(
             trigger: crate::ir::Expr::CycleCount, // placeholder; pass 2 fills it
             edge,
             function: fid,
+            phase: crate::ir::HandlerPhase::from_ast(h.phase),
             monitor_channel: monitor_channel.clone(),
             activation: *activation,
         });
@@ -1241,10 +1252,8 @@ fn edge_to_ir(e: crate::ast::EdgeMode) -> crate::ir::CycleEdge {
     }
 }
 
-/// Validate an `on <bool-expr> ... end on` cycle-trigger handler: no
-/// `pre`/`post` hook side, and (in this subset) the default `Checker`
-/// phase. A `post_eval`-phased cycle-trigger is the reactive monitor form
-/// handled elsewhere; only the checker phase is lowered here.
+/// Validate an `on <bool-expr> ... end on` cycle-trigger handler: it may
+/// select either scheduling phase, but takes no `pre`/`post` hook side.
 fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
     if h.hook.is_some() {
         // v1 drops the hook side and lowers the trigger as an ordinary
@@ -1282,21 +1291,6 @@ fn validate_cycle_handler(comp: &str, h: &crate::ast::OnHandler) -> Result<(), L
             "cycle-trigger handlers take no hook side; v1 accepts one, drops the hook and \
              lowers the trigger as a plain cycle trigger, so the requested ordering is lost",
             V1Status::SilentlyMisLowers,
-        ));
-    }
-    if !matches!(h.phase, crate::ast::OnPhase::Checker) {
-        // NOT the same: v1 implements this one. `phase post_eval` emits
-        // `_post_eval_services.push_back` where the default emits
-        // `_checkers.push_back` — the phase selects the dispatch vector
-        // and it works, so `--codegen v1` is a real escape hatch.
-        //
-        // The two arms sit four lines apart and looked interchangeable.
-        // They were probed with a shared control that changed the
-        // trigger AND the modifier at once, which made both read as
-        // "differs"; against a one-token control they split.
-        return Err(unsupported(
-            &format!("a non-default-phase cycle-trigger `on` handler on `{comp}`"),
-            "only the default (checker) phase is lowered for cycle-trigger handlers",
         ));
     }
     Ok(())

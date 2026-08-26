@@ -817,7 +817,7 @@ pub struct ComponentSchema {
     /// observer half of an agent-mode transactor). Each fires its body
     /// once per primary-clock cycle that the trigger predicate satisfies
     /// the requested edge mode (rising/falling/level), dispatched from a
-    /// `_checkers` closure with per-instance static prev-state. The body
+    /// selected cycle-service closure with per-instance static prev-state. The body
     /// is lowered as a zero-arg `ComponentMethod` function (`self` only);
     /// bare field reads resolve self-relatively, `dut.<sig>` reads resolve
     /// to the DUT handle, and `sb.<f>` writes resolve to the sub-scoreboard.
@@ -922,6 +922,10 @@ pub struct CycleTriggerHandlerSchema {
     /// Lowered handler body (`kind: ComponentMethod`, zero params — `self`
     /// only).
     pub function: FunctionId,
+    /// `phase` modifier (`on <expr> phase post_eval`). `Checker` (default)
+    /// dispatches from the per-cycle `_checkers` vector; `PostEval`
+    /// dispatches from `_post_eval_services`.
+    pub phase: HandlerPhase,
     /// `Some(channel)` when this cycle-trigger handler is the desugared
     /// form of an `on bus.<ch>.handshake(arg)` passive bus-monitor handler
     /// on a `bound to <Bus>` transactor (v1's `emit_bound_monitor_actors`).
@@ -939,7 +943,7 @@ pub struct CycleTriggerHandlerSchema {
     /// bound monitor as a `wait_until(valid && ready)` + `wait_cycles(1)`
     /// coroutine loop, so a continuously-held handshake samples every OTHER
     /// cycle (one beat, then the `wait_cycles(1)` re-arm consumes the next).
-    /// The tbir `_checkers` emission reproduces this with a fire-then-cooldown
+    /// The tbir cycle-service emission reproduces this with a fire-then-cooldown
     /// latch (see `mod::emit_lifecycle_checkers`), NOT the `edge` field — for
     /// a monitor channel the stored `edge` (`Rising`) is vestigial.
     pub monitor_channel: Option<String>,

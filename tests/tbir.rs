@@ -1364,6 +1364,20 @@ fn bound_monitor_handshake_handlers_lower_passive() {
         "monitor trigger should read the bound binding wires, got dump:\n{trig}"
     );
     let _ = w_mon;
+
+    let mut bad = lower_with_stdlib_bus("transactor_passive_only_test.harc", "BusAxiLite.arch")
+        .expect("fresh monitor control lowers");
+    bad.components
+        .iter_mut()
+        .find(|c| c.name == "AxilXactor")
+        .expect("AxilXactor component")
+        .cycle_handlers
+        .iter_mut()
+        .find(|ch| ch.monitor_channel.is_some())
+        .expect("bound handshake monitor")
+        .phase = ir::HandlerPhase::PostEval;
+    let msg = format!("{:?}", verify::verify_program(&bad).unwrap_err());
+    assert!(msg.contains("bound handshake monitor scheduled at post_eval"), "{msg}");
 }
 
 /// A `passive` bound instance of a PURE-DRIVER transactor (no monitor
@@ -30857,9 +30871,9 @@ fn bound_transactor_thread_component_host_corruption_is_rejected() {
     );
 }
 
-/// The `components.rs` handler-validator family: THREE hook arms and one
-/// phase arm, and the hook arms and the phase arm classify opposite ways
-/// despite sitting four lines apart.
+/// The `components.rs` handler-validator family: the three hook arms remain
+/// rejected because v1 drops their ordering, while both scheduling phases
+/// are represented in TBIR.
 ///
 /// A `pre`/`post` hook on a cycle-trigger, periodic, or event-
 /// subscription handler is `SilentlyMisLowers`: v1 emits the handler
@@ -30867,10 +30881,9 @@ fn bound_transactor_thread_component_host_corruption_is_rejected() {
 /// written without it. The user asks for pre/post ordering and gets the
 /// default.
 ///
-/// A non-default PHASE is not the same. v1 implements it —
+/// A non-default PHASE is not the same. Both backends preserve it:
 /// `phase post_eval` emits `_post_eval_services.push_back` where the
-/// default emits `_checkers.push_back` — so v1 is a real escape hatch
-/// and that arm keeps `Unsupported`.
+/// default emits `_checkers.push_back`.
 ///
 /// Every byte-identity below is paired with its OWN anchor (the same
 /// mutation with the handler removed rather than the hook added). A
@@ -30878,7 +30891,7 @@ fn bound_transactor_thread_component_host_corruption_is_rejected() {
 /// nothing about the others, and in an uninstantiated component it is
 /// vacuously true for all of them.
 #[test]
-fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
+fn a_handler_hook_is_dropped_but_a_handler_phase_is_lowered() {
     let fixture = fixture("agent_periodic_test.harc");
     const PERIODIC: &str = "    on 10 cycles";
 
@@ -30930,8 +30943,20 @@ fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
 
     // The PHASE, by contrast, v1 implements.
     let c_phase = fixture.replacen(PERIODIC, "    on beats > 0 phase post_eval", 1);
-    let msg = assert_unsupported(&lower_src(&c_phase).unwrap_err());
-    assert!(msg.contains("non-default-phase"), "{msg}");
+    let prog = lower_src(&c_phase).expect("tbir lowers the post-eval cycle trigger");
+    let cycle = prog
+        .components
+        .iter()
+        .flat_map(|component| &component.cycle_handlers)
+        .next()
+        .expect("one component cycle trigger");
+    assert_eq!(cycle.phase, ir::HandlerPhase::PostEval);
+    let tbir_phase = tbir::emit(&prog, &merged_src(&c_phase), &cpp_tb::EmitOpts::default())
+        .expect("tbir emits the post-eval cycle trigger");
+    assert!(
+        tbir_phase.contains("_post_eval_services.push_back"),
+        "tbir must preserve the selected dispatch phase"
+    );
     let v1_phase = cpp_tb::emit(&merged_src(&c_phase)).expect("v1 emits");
     assert!(
         v1_phase.contains("_post_eval_services.push_back"),
@@ -30941,6 +30966,26 @@ fn a_handler_hook_is_dropped_but_a_handler_phase_is_implemented() {
         v1_c_ctl.contains("_checkers.push_back")
             && !v1_c_ctl.contains("_post_eval_services.push_back"),
         "and the default registers into `_checkers` only, so the phase is not a no-op"
+    );
+
+    // A bound handshake monitor is a different execution form: v1 lowers
+    // it as a fixed-phase actor and drops the phase modifier. Keep that
+    // spelling out of this ordinary boolean-trigger slice.
+    let monitor = self::fixture("tlm_target_thread_monitor_test.harc");
+    let phased_monitor = monitor.replacen(
+        "    on bus.observed_req.handshake(req)",
+        "    on bus.observed_req.handshake(req) phase post_eval",
+        1,
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&phased_monitor).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("bound handshake monitor"), "{msg}");
+    assert_eq!(
+        cpp_tb::emit(&merged_src(&phased_monitor)).expect("v1 emits phased monitor"),
+        cpp_tb::emit(&merged_src(&monitor)).expect("v1 emits monitor control"),
+        "v1 silently drops the handshake monitor phase modifier"
     );
 }
 
