@@ -1,0 +1,48 @@
+// Fixed-vector tseq elements: each yield copies one complete Vec value into
+// the materialized sequence, and iteration preserves the aggregate shape.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+struct Row
+    data : Vec<uint<8>, 3>
+end struct Row
+
+tseq Rows(n: int) -> TSeq<Vec<uint<8>, 3>>
+    let row : Row
+    for i in 1 .. n
+        row.data[0] = i
+        row.data[1] = i + 1
+        row.data[2] = i + 2
+        yield row.data
+    end for
+end tseq Rows
+
+testbench TseqFixedVecTb
+    dut : Top
+end testbench TseqFixedVecTb
+
+impl TseqFixedVecTest for TseqFixedVecTb
+    clock clk = SysDomain
+
+    run
+        let rows = Rows(2)
+        let expected : Row
+        expected.data[0] = 1
+        expected.data[1] = 2
+        expected.data[2] = 3
+        let count = 0
+        for row in rows
+            assert row[0] == expected.data[0] else fail("yielded row[0] content/order mismatch")
+            assert row[1] == expected.data[1] else fail("yielded row[1] content/order mismatch")
+            assert row[2] == expected.data[2] else fail("yielded row[2] content/order mismatch")
+            expected.data[0] = expected.data[0] + 1
+            expected.data[1] = expected.data[1] + 1
+            expected.data[2] = expected.data[2] + 1
+            count = count + 1
+        end for
+        assert count == 2 else fail("expected two rows, saw ${count}")
+        log(info, "PASS: fixed-vector tseq yield and iteration")
+    end run
+end impl TseqFixedVecTest

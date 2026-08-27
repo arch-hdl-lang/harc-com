@@ -4788,6 +4788,24 @@ impl FuncBuilder<'_> {
                 self.push(Stmt::SeqPush { seq, value: v });
                 Ok(())
             }
+            expected @ IrType::FixedVec { .. } => {
+                let saved = self.vec_read_ok;
+                let saved_span = self.vec_read_span;
+                self.vec_read_ok = true;
+                self.vec_read_span = Some(super::exprs::unparen_expr(value).span);
+                let v = self.lower_expr_no_ports(value);
+                self.vec_read_ok = saved;
+                self.vec_read_span = saved_span;
+                let v = v?;
+                let actual = self.ir_whole_vec_type(&v);
+                if actual.as_ref() != Some(&expected) {
+                    return Err(LowerError::Invalid(format!(
+                        "`yield` into a fixed-vector tseq expects {expected:?}, got {actual:?}"
+                    )));
+                }
+                self.push(Stmt::SeqPush { seq, value: v });
+                Ok(())
+            }
             other => Err(LowerError::Invalid(format!(
                 "tseq accumulator has unexpected element type {other:?} (lowering bug)"
             ))),

@@ -31552,13 +31552,11 @@ end impl MTest"#;
     assert!(msg.contains("non-scalar value"), "{msg}");
 
     // A PRESENT but unusable annotation must not reach the default
-    // either: v1 renders each of these differently (`TSeq<int>` ->
-    // `vector<uint64_t>`, `TSeq<Vec<..>>` -> `vector<std::array<..>>`),
-    // so defaulting them to `int64_t` would silently change the element
-    // type rather than close a gap.
+    // either: v1 renders `TSeq<int>` as `vector<uint64_t>`, so defaulting
+    // it to `int64_t` would silently change the element type rather than
+    // close a gap. Fixed-vector elements are covered by the positive test
+    // below.
     for ret in [
-        "TSeq<int>",
-        "TSeq<time>",
         // A PRESENT non-`TSeq` return has no `TSeq` args either, so
         // gating on "the args did not resolve" would have let these
         // default silently. The gate is `return_ty` being ABSENT.
@@ -31568,6 +31566,18 @@ end impl MTest"#;
         let src = SRC.replace(DECL, &format!("tseq Gen(n: int) -> {ret}"));
         let msg = assert_unsupported(&lower_src(&src).unwrap_err());
         assert!(msg.contains("element type"), "`-> {ret}`: {msg}");
+    }
+
+    // The two remaining builtin scalar spellings use v1's uint64_t
+    // sequence storage rather than falling into the signed default.
+    for ret in ["TSeq<int>", "TSeq<time>"] {
+        let src = SRC
+            .replace(DECL, &format!("tseq Gen(n: int) -> {ret}"))
+            .replace(
+                "        let t : Req\n        t.a = i\n        yield t\n",
+                "        yield i\n",
+            );
+        assert!(emit_cpp_src(&src).contains("std::vector<uint64_t>"), "{ret}");
     }
 
     // The default still applies where it is safe: an unannotated tseq
@@ -31580,6 +31590,99 @@ end impl MTest"#;
         emit_cpp_src(&scalar).contains("-> std::vector<int64_t>"),
         "an unannotated scalar tseq still defaults"
     );
+}
+
+/// A fixed-vector tseq element is a first-class value: the accumulator and
+/// call result are `Seq<FixedVec>`, `yield` copies one complete array, and a
+/// consumer can iterate the aggregate result.
+#[test]
+fn fixed_vector_tseq_elements_lower_and_emit() {
+    let src = r#"struct Row
+    data : Vec<uint<8>, 3>
+end struct Row
+
+tseq Rows(n: int) -> TSeq<Vec<uint<8>, 3>>
+    let row : Row
+    row.data[0] = 1
+    row.data[1] = 2
+    row.data[2] = 3
+    for _ in 1 .. n
+        yield row.data
+    end for
+end tseq Rows
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl FixedVectorTseqTest for Tb
+    run
+        let rows = Rows(2)
+        for row in rows
+            wait 0 cycles
+        end for
+        wait 1 cycle
+    end run
+end impl FixedVectorTseqTest"#;
+
+    let prog = lower_src(src).expect("fixed-vector tseq lowers");
+    verify::verify_program(&prog).expect("fixed-vector tseq verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::array<uint64_t, 3>>"),
+        "fixed-vector result type must retain its shape:\n{cpp}"
+    );
+    assert!(cpp.contains("__result.push_back(row.data)"), "{cpp}");
+    assert!(cpp.contains("std::array<uint64_t, 3> row{}"), "{cpp}");
+
+    let tseq = prog
+        .functions
+        .iter()
+        .position(|function| matches!(function.kind, ir::FunctionKind::Tseq { .. }))
+        .expect("tseq function");
+    let ret = prog.functions[tseq].ret.expect("tseq return local");
+    let mut wrong_return = prog.clone();
+    wrong_return.functions[tseq].locals[ret.index()].ty =
+        ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))));
+    verify::verify_program(&wrong_return)
+        .expect_err("tseq element metadata must agree with its return local");
+
+    let (caller, call_dest) = prog
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(fidx, function)| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq(_), _)) => {
+                        Some((fidx, *dest))
+                    }
+                    _ => None,
+                })
+        })
+        .expect("tseq call assignment");
+    let mut wrong_call_dest = prog.clone();
+    wrong_call_dest.functions[caller].locals[call_dest.index()].ty =
+        ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))));
+    verify::verify_program(&wrong_call_dest)
+        .expect_err("tseq call result must agree with its receiving local");
+
+    let loop_elem = prog.functions[caller]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::SeqIndex { .. }) => Some(*dest),
+            _ => None,
+        })
+        .expect("sequence iteration element assignment");
+    let mut wrong_loop_elem = prog;
+    wrong_loop_elem.functions[caller].locals[loop_elem.index()].ty = ir::IrType::UInt(Some(8));
+    verify::verify_program(&wrong_loop_elem)
+        .expect_err("sequence index element must agree with the loop local");
 }
 
 /// The record-element twin of the scalar-element yield check above: a

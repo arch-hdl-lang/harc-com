@@ -2390,6 +2390,25 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         }
     }
 
+    if let FunctionKind::Tseq { elem } = &func.kind {
+        let expected = elem.seq_type();
+        match func.ret.and_then(|ret| func.locals.get(ret.index())) {
+            Some(local) if local.ty == expected => {}
+            Some(local) => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} tseq `{}` element metadata expects return {:?}, got {:?}",
+                    fid.0, func.name, expected, local.ty
+                ),
+            }),
+            None => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} tseq `{}` has no resolvable sequence return local",
+                    fid.0, func.name
+                ),
+            }),
+        }
+    }
+
     // Invariant 6 — successors resolve (checked before reachability so
     // the walk below can't index out of bounds).
     for (bi, b) in func.blocks.iter().enumerate() {
@@ -3837,6 +3856,10 @@ impl Checker<'_> {
                         self.check_bus_call_edge(Some(*l), bus_field, method, args);
                         continue;
                     }
+                    if let Expr::Call(CallTarget::Tseq(name), args) = e {
+                        self.check_tseq_call(*l, name, args);
+                        continue;
+                    }
                     self.check_expr(e, false, "Assign value");
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
@@ -4745,9 +4768,6 @@ impl Checker<'_> {
                 }
                 Stmt::SeqPush { seq, value } => {
                     self.check_local(*seq);
-                    // The yielded expression follows the no-inline-port
-                    // rule like any host-state assignment.
-                    self.check_expr(value, false, "SeqPush value");
                     let expected = match self.func.locals.get(seq.index()).map(|l| &l.ty) {
                         Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
                         Some(IrType::Seq(elem)) => Some((**elem).clone()),
@@ -4763,7 +4783,22 @@ impl Checker<'_> {
                         None => None,
                     };
                     if let Some(expected) = expected {
-                        let actual = self.aggregate_assignment_expr_type(value);
+                        // A fixed-vector yield is one of the explicit
+                        // whole-value copy landings. Preserve the collection
+                        // shape instead of classifying its leaf scalar, and
+                        // authorize that exact expression in the structural
+                        // whole-vector checker.
+                        let fixed = matches!(expected, IrType::FixedVec { .. });
+                        if fixed {
+                            self.check_expr_inner(value, false, "SeqPush value", true);
+                        } else {
+                            self.check_expr(value, false, "SeqPush value");
+                        }
+                        let actual = if fixed {
+                            self.expr_whole_vec_type(value).ok().flatten()
+                        } else {
+                            self.aggregate_assignment_expr_type(value)
+                        };
                         let compatible = match &expected {
                             IrType::Record(_) => {
                                 actual.as_ref() == Some(&expected)
@@ -6094,11 +6129,11 @@ impl Checker<'_> {
                 self.check_local(*seq);
                 if !matches!(
                     self.func.locals.get(seq.index()).map(|local| &local.ty),
-                    Some(IrType::RecordSeq(_) | IrType::Seq(_))
+                    Some(IrType::RecordSeq(_) | IrType::Seq(_) | IrType::FixedVec { .. })
                 ) {
                     self.errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "fn{} b{} sequence index receiver %{} is not sequence-typed",
+                            "fn{} b{} sequence/fixed-vector index receiver %{} is not indexable",
                             self.fid.0, self.bid.0, seq.0
                         ),
                     });
@@ -6166,10 +6201,90 @@ impl Checker<'_> {
                         ),
                     });
                 }
+                if let CallTarget::Tseq(name) = target {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} tseq `{name}` call in a disallowed position ({context}); \
+                             it must be the entire RHS of an Assign",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
                 for a in args {
                     self.check_expr(a, ports_ok, context);
                 }
             }
+        }
+    }
+
+    fn check_tseq_call(&mut self, dest: LocalId, name: &str, args: &[Expr]) {
+        let mut matches = self.prog.functions.iter().filter(|function| {
+            function.name == name && matches!(function.kind, FunctionKind::Tseq { .. })
+        });
+        let Some(target) = matches.next() else {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} tseq call `{name}` resolves to no Tseq function",
+                    self.fid.0, self.bid.0
+                ),
+            });
+            return;
+        };
+        if matches.next().is_some() {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} tseq call `{name}` resolves ambiguously",
+                    self.fid.0, self.bid.0
+                ),
+            });
+            return;
+        }
+        if args.len() != target.params.len() {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} tseq call `{name}` takes {} arguments, got {}",
+                    self.fid.0,
+                    self.bid.0,
+                    target.params.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (index, (arg, param)) in args.iter().zip(&target.params).enumerate() {
+            self.check_expr(arg, false, "Tseq argument");
+            let actual = self
+                .aggregate_assignment_expr_type(arg)
+                .unwrap_or(IrType::Unknown);
+            if actual != IrType::Unknown && !assign_compatible(&param.ty, &actual) {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} tseq call `{name}` argument {} expects {:?}, got {:?}",
+                        self.fid.0,
+                        self.bid.0,
+                        index + 1,
+                        param.ty,
+                        actual
+                    ),
+                });
+            }
+        }
+        let expected = match &target.kind {
+            FunctionKind::Tseq { elem } => elem.seq_type(),
+            _ => unreachable!("filtered to Tseq functions"),
+        };
+        if self
+            .func
+            .locals
+            .get(dest.index())
+            .is_some_and(|local| local.ty != expected)
+        {
+            self.errs.push(VerifyError::TypeMismatch {
+                func: self.fid,
+                block: self.bid,
+                local: dest,
+                expected,
+                actual: self.func.local(dest).ty.clone(),
+            });
         }
     }
 
@@ -6552,6 +6667,12 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Local(l) => func.locals.get(l.index()).map(|t| t.ty.clone()),
+        Expr::SeqIndex { seq, .. } => match func.locals.get(seq.index()).map(|local| &local.ty) {
+            Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
+            Some(IrType::Seq(elem)) => Some((**elem).clone()),
+            Some(IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+            _ => None,
+        },
         Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
         // Runtime bounds: unsigned, width unknown until the slice runs.
         // `UInt(None)` is invariant 15's widthless wildcard, which is

@@ -794,6 +794,11 @@ helpers), a `tseq RandomRegs(5)` of random writes/reads through the
 `axil_write`/`axil_read` impure helpers. Both trace-diff clean v1↔tbir at
 seed 1; both need Z3.
 
+Scalar-leaf fixed-vector elements are also lowered: `TSeq<Vec<scalar, N>>` is represented as
+`Seq<FixedVec<T, N>>` and emitted as `std::vector<std::array<T, N>>`.
+`tseq_fixed_vec_test` is registered and trace-diff clean v1↔tbir; it yields
+complete rows, materializes two of them, and iterates the aggregate result.
+
 The remaining corpus tseq fixtures lower their tseq now but reject one
 level deeper. After the transactor-state-field slice (2026-06-13) the
 state-field blocker is gone for the unbound forms; residual first-blocker
