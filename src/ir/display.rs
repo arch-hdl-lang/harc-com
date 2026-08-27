@@ -688,6 +688,20 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             regblock.0,
             expr_str(func, addr)
         ),
+        Stmt::RecordWrite {
+            local,
+            binding,
+            regblock,
+            addr,
+            value,
+        } => format!(
+            "RecordWrite({}, {}, rb{}, {}, {})",
+            local_str(func, *local),
+            binding,
+            regblock.0,
+            expr_str(func, addr),
+            expr_str(func, value)
+        ),
         Stmt::RecordWriteCb {
             local,
             binding,

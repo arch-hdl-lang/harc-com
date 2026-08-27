@@ -8259,6 +8259,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::Assign(_, e)
                 | ir::Stmt::DutWrite(_, e)
                 | ir::Stmt::RecordRead { addr: e, .. } => in_expr(e),
+                ir::Stmt::RecordWrite { addr, value, .. } => {
+                    in_expr(addr).or_else(|| in_expr(value))
+                }
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
@@ -8519,6 +8522,10 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::Assign(_, e)
                 | ir::Stmt::DutWrite(_, e)
                 | ir::Stmt::RecordRead { addr: e, .. } => fill_expr(e, instance),
+                ir::Stmt::RecordWrite { addr, value, .. } => {
+                    fill_expr(addr, instance);
+                    fill_expr(value, instance);
+                }
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
@@ -8830,6 +8837,10 @@ fn fill_initiator_bus_prefix(
                     | Stmt::TransactorStateWrite { value: e, .. }
                     | Stmt::ComponentFieldWrite { value: e, .. } => {
                         visit_expr(e, placeholder, binding, remap, rewrite, &mut conflict)
+                    }
+                    Stmt::RecordWrite { addr, value, .. } => {
+                        visit_expr(addr, placeholder, binding, remap, rewrite, &mut conflict);
+                        visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict);
                     }
                     Stmt::TransactorStateRecordFieldWrite {
                         mid_indices,

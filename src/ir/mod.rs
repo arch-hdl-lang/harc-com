@@ -1798,7 +1798,7 @@ pub struct RegblockBinding {
     pub helper_field: String,
     /// Per-register `on regs.REG` write callbacks: `(register-name,
     /// callback-function)`, registration order. Each callback is a
-    /// one-param (`data : uint`) `FunctionKind::TransactorBody` function;
+    /// one-param (`data : uint`) `FunctionKind::TestHook` function;
     /// `record_write` fires the matching register's callback after the
     /// mirror update, with a per-binding recursion-depth guard (v1's
     /// `<regs>_cb_depth` / `HARC_RAL_CB_MAX_DEPTH`). Empty when the test
@@ -2162,6 +2162,16 @@ pub enum Stmt {
         local: LocalId,
         regblock: RegblockId,
         addr: Expr,
+    },
+    /// `regs.record_write(addr, data)` with a runtime address. The owner
+    /// testbench binding supplies callback registration metadata; the
+    /// regblock schema supplies the source-ordered offset/width decoder.
+    RecordWrite {
+        local: LocalId,
+        binding: String,
+        regblock: RegblockId,
+        addr: Expr,
+        value: Expr,
     },
     /// `regs.record_write(addr, data)` where the binding has a per-register
     /// `on regs.REG` write callback registered — the firing form of the

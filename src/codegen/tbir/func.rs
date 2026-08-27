@@ -1918,6 +1918,77 @@ fn emit_stmt(
             }
             writeln!(out, "{pad}}}").ok();
         }
+        Stmt::RecordWrite {
+            local,
+            binding,
+            regblock,
+            addr,
+            value,
+        } => {
+            let mirror = &names[local.index()];
+            let addr = expr_cpp(cx, addr)?;
+            let value = expr_cpp(cx, value)?;
+            let schema = &prog.regblocks[regblock.index()];
+            let binding_schema = func
+                .owner
+                .and_then(|owner| prog.testbenches.get(owner.index()))
+                .and_then(|tb| {
+                    tb.regblock_bindings
+                        .iter()
+                        .find(|b| b.field == *binding && b.regblock == *regblock)
+                })
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: RecordWrite binding `{binding}` and regblock in {} do not resolve through its owner testbench",
+                        func.name
+                    ))
+                })?;
+            writeln!(out, "{pad}{{").ok();
+            let p1 = INDENT.repeat(depth + 1);
+            let p2 = INDENT.repeat(depth + 2);
+            writeln!(out, "{p1}uint64_t _rec_addr = (uint64_t)({addr});").ok();
+            writeln!(out, "{p1}uint64_t _rec_data = (uint64_t)({value});").ok();
+            let has_callbacks = !binding_schema.callbacks.is_empty();
+            if has_callbacks {
+                writeln!(
+                    out,
+                    "{p1}if ({binding}_cb_depth >= HARC_RAL_CB_MAX_DEPTH) {{ \
+                     sim_log_line(\"FATAL\", \"RAL record_write callback recursion exceeded \
+                     HARC_RAL_CB_MAX_DEPTH (%u) on binding `{binding}` at addr 0x%llx\", \
+                     (unsigned)HARC_RAL_CB_MAX_DEPTH, (unsigned long long)_rec_addr); \
+                     ctx.errors++; _fatal = true; }} else {{"
+                )
+                .ok();
+                writeln!(out, "{p2}{binding}_cb_depth++;").ok();
+            }
+            let decode_pad = if has_callbacks { &p2 } else { &p1 };
+            for (i, reg) in schema.registers.iter().enumerate() {
+                let kw = if i == 0 { "if" } else { "else if" };
+                let mask = if reg.width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << reg.width) - 1
+                };
+                let callback = binding_schema
+                    .callbacks
+                    .iter()
+                    .find(|(field, _)| field == &reg.name)
+                    .map(|(_, fid)| format!(" {}(_rec_data);", prog.function(*fid).name))
+                    .unwrap_or_default();
+                writeln!(
+                    out,
+                    "{decode_pad}{kw} (_rec_addr == {offset}ull) {{ {mirror}.{field} = _rec_data & 0x{mask:x}ull;{callback} }}",
+                    offset = reg.offset,
+                    field = reg.name,
+                )
+                .ok();
+            }
+            if has_callbacks {
+                writeln!(out, "{p2}{binding}_cb_depth--;").ok();
+                writeln!(out, "{p1}}}").ok();
+            }
+            writeln!(out, "{pad}}}").ok();
+        }
         Stmt::RecordWriteCb {
             local,
             binding,

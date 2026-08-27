@@ -1735,6 +1735,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
+        RecordWrite { addr, value, .. } => expr_has_probe(addr) || expr_has_probe(value),
         TransactorStateRecordFieldWrite {
             mid_indices,
             index,
@@ -2020,6 +2021,10 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         | ComponentFieldWrite { value: e, .. }
         | TransactorCall { call: e, .. }
         | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
+        RecordWrite { addr, value, .. } => {
+            for_each_port_in_expr(addr, f);
+            for_each_port_in_expr(value, f);
+        }
         TransactorStateRecordFieldWrite {
             mid_indices,
             index,

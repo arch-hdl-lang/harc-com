@@ -341,8 +341,11 @@ not applicable before requesting review:
    route through the same shared aggregate decoder/read fence, so this slice
    likewise leaves the raw inventory unchanged.
    Runtime-address passive `record_read` now carries the regblock decoder in
-   `Stmt::RecordRead`; the adjacent runtime-address `record_write` constructor
-   remains, so this slice also leaves the raw inventory unchanged.
+   `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
+   symmetric decoder plus owner-binding callback dispatch in
+   `Stmt::RecordWrite`. The shared constant-address diagnostic constructor
+   remains for unmatched constants, so these slices leave the raw inventory
+   unchanged.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently
