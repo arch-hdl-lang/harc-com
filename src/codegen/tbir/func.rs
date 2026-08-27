@@ -3298,6 +3298,7 @@ pub(super) fn declare_method_slot(
             IrType::Record(r) => prog.records[r.index()].name.clone(),
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
             IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+            ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
             ty => super::local_scalar_cty(ty).to_string(),
         },
         None => "void".to_string(),
@@ -3316,6 +3317,7 @@ pub(super) fn declare_method_slot(
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
         IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+        ref ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
         ref ty => super::local_scalar_cty(ty).to_string(),
     }));
     let params = param_tys.join(", ");
@@ -3391,6 +3393,7 @@ pub(super) fn emit_method(
             IrType::Record(r) => prog.records[r.index()].name.clone(),
             IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
             IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+            ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
             ty => super::local_scalar_cty(ty).to_string(),
         },
         None => "void".to_string(),
@@ -3418,6 +3421,9 @@ pub(super) fn emit_method(
                 }
                 IrType::Seq(ref scalar) => {
                     format!("std::vector<{}> {n}", super::field_scalar_cty(scalar))
+                }
+                ref ty @ IrType::FixedVec { .. } => {
+                    format!("{} {n}", super::aggregate_value_cty(ty, &prog.records))
                 }
                 ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
             }),

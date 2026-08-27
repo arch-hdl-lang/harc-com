@@ -1315,6 +1315,7 @@ fn param_cty(prog: &TbProgram, ty: &IrType) -> String {
         IrType::Record(r) => prog.records[r.index()].name.clone(),
         IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
         IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
+        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
         IrType::Component(c) => prog.components[c.index()].name.clone(),
         other => super::local_scalar_cty(other),
     }

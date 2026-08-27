@@ -16960,6 +16960,161 @@ end impl BoundTest"#;
 }
 
 #[test]
+fn fixed_vector_transactor_params_are_typed_end_to_end() {
+    let src = fixture("fixed_vec_transactor_param_test.harc");
+    let prog = lower_src(&src).expect("fixed-vector transactor params lower");
+    verify::verify_program(&prog).expect("fixed-vector transactor params verify");
+
+    let expected = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    };
+    let schema = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "VecParamSink")
+        .unwrap();
+    let wrong_shape = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 3,
+    };
+    for (name, expected_params) in [
+        ("consume", vec![expected.clone(), expected.clone()]),
+        (
+            "relay",
+            vec![expected.clone(), expected.clone(), wrong_shape.clone()],
+        ),
+    ] {
+        let method = schema.method(name).unwrap();
+        assert_eq!(method.param_tys, expected_params);
+        let function = prog.function(method.function);
+        assert_eq!(
+            function
+                .params
+                .iter()
+                .map(|param| param.ty.clone())
+                .collect::<Vec<_>>(),
+            method.param_tys
+        );
+    }
+
+    let run = prog.function(prog.tests[0].run);
+    assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        matches!(stmt, ir::Stmt::TransactorCall { call: ir::Expr::Call(_, args), .. }
+            if matches!(args.as_slice(), [ir::Expr::TbField(a), ir::Expr::TbField(b), ir::Expr::TbField(c)]
+                if a == "values" && b == "expected" && c == "wrong_shape"))
+    }));
+    let relay = prog.function(schema.method("relay").unwrap().function);
+    assert!(relay.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        matches!(stmt, ir::Stmt::TransactorSelfCall { call: ir::Expr::Call(_, args), .. }
+            if matches!(args.as_slice(), [ir::Expr::Local(_), ir::Expr::Local(_)]))
+    }));
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("std::function<void(std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
+            && cpp.contains("VecParamSink_relay = [&](std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
+        "{cpp}"
+    );
+
+    let mut broken = prog.clone();
+    broken.transactors[0].methods[0].param_tys[0] = ir::IrType::UInt(Some(8));
+    verify::verify_program(&broken)
+        .expect_err("method schema and fixed-vector parameter slots must agree");
+
+    let mut broken_local = prog.clone();
+    let method_fn = broken_local.transactors[0].methods[0].function;
+    broken_local.functions[method_fn.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+    verify::verify_program(&broken_local)
+        .expect_err("method parameter locals and the schema ABI must agree");
+
+    let mut broken_call = prog.clone();
+    let run = broken_call.tests[0].run;
+    let call = broken_call.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(_, args),
+                ..
+            } => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    call[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(8)),
+    };
+    verify::verify_program(&broken_call)
+        .expect_err("a scalar cannot corrupt a fixed-vector transactor call slot");
+
+    let mut broken_shape = prog.clone();
+    let run = broken_shape.tests[0].run;
+    let call = broken_shape.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(_, args),
+                ..
+            } => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    call[0] = ir::Expr::TbField("wrong_shape".to_string());
+    verify::verify_program(&broken_shape)
+        .expect_err("a different fixed-vector shape cannot enter the call slot");
+
+    let mut broken_sibling_shape = prog.clone();
+    let relay_fn = broken_sibling_shape.transactors[0]
+        .method("relay")
+        .unwrap()
+        .function;
+    let call = broken_sibling_shape.functions[relay_fn.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorSelfCall {
+                call: ir::Expr::Call(_, args),
+                ..
+            } => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    call[0] = ir::Expr::Local(ir::LocalId(2));
+    verify::verify_program(&broken_sibling_shape)
+        .expect_err("a different fixed-vector shape cannot enter a sibling call slot");
+
+    let bound = r#"use BusAxiLite
+transactor BoundVecParam bound to BusAxiLite
+    when active
+        hookable send(values: Vec<uint<8>, 2>)
+        end send
+    end when
+end transactor BoundVecParam
+testbench BoundVecTb
+    dut : AxiLiteRegs
+end testbench BoundVecTb
+impl BoundVecTest for BoundVecTb
+    run
+        wait 1 cycle
+    end run
+end impl BoundVecTest"#;
+    let bound = lower_with_stdlib_bus_src(bound)
+        .expect("bound-initiator fixed-vector parameter declaration lowers");
+    verify::verify_program(&bound).expect("bound-initiator fixed-vector parameter verifies");
+    assert!(bound.transactors.iter().any(|schema| {
+        schema.name == "BoundVecParam"
+            && schema.method("send").is_some_and(|method| {
+                method.param_tys == vec![expected.clone()]
+            })
+    }));
+}
+
+#[test]
 fn expression_transactor_results_retain_type_and_allow_widening() {
     let direct = r#"
 transactor SignedDriver

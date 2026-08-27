@@ -178,4 +178,5 @@ record_list_queue_test | Top             | top_counter.sv         |
 scoreboard_record_state_test | Top        | top_counter.sv         |
 component_wide_scalar_state_test | Top | top_counter.sv    |
 wide_transactor_return_test | Top | top_counter.sv    |
+fixed_vec_transactor_param_test | Top | top_counter.sv |
 enum_variant_scope_test | Top            | top_counter.sv         |
