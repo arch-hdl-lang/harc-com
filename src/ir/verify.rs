@@ -1258,6 +1258,44 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             let Some(function) = prog.functions.get(method.function.index()) else {
                 continue;
             };
+            let function_param_tys = function
+                .params
+                .iter()
+                .map(|param| param.ty.clone())
+                .collect::<Vec<_>>();
+            let function_param_local_tys = function
+                .locals
+                .iter()
+                .take(function.params.len())
+                .map(|local| local.ty.clone())
+                .collect::<Vec<_>>();
+            if method.param_names.len() != method.param_tys.len()
+                || method.param_tys != function_param_tys
+                || method.param_tys != function_param_local_tys
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` parameter schema {:?} disagrees with fn{} params {:?} / locals {:?}",
+                        method.name,
+                        method.param_tys,
+                        method.function.0,
+                        function_param_tys,
+                        function_param_local_tys
+                    ),
+                });
+            }
+            for ty in &method.param_tys {
+                if matches!(ty, IrType::FixedVec { .. })
+                    && !component_fixed_vec_elem_valid(ty, prog.records.len())
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} method `{}` has invalid fixed-vector parameter type {ty:?}",
+                            method.name
+                        ),
+                    });
+                }
+            }
             let function_ret = function
                 .ret
                 .and_then(|ret| function.locals.get(ret.index()))
@@ -3678,6 +3716,16 @@ impl Checker<'_> {
                 .map(|local| local.ty.clone())
                 .filter(|ty| matches!(ty, IrType::FixedVec { .. })));
         }
+        if let Expr::TbField(field) = expr {
+            return Ok(self
+                .tb_scalar_field_ty(field)
+                .filter(|ty| matches!(ty, IrType::FixedVec { .. })));
+        }
+        if let Expr::ComponentField { base, field } = expr {
+            if let Some(ty) = self.component_field_whole_vec_type(base, field)? {
+                return Ok(Some(ty));
+            }
+        }
         let Some((len, _)) = self.expr_whole_vec_shape(expr)? else {
             return Ok(None);
         };
@@ -5476,9 +5524,6 @@ impl Checker<'_> {
             ));
             return;
         };
-        for a in args {
-            self.check_expr(a, false, "TransactorCall arg");
-        }
         let Some(owner) = self.func.owner else {
             self.errs.push(bad(format!(
                 "`{bus_field}.{method}` called from a function with no owner testbench"
@@ -5517,6 +5562,38 @@ impl Checker<'_> {
             )));
             return;
         };
+        for (i, arg) in args.iter().enumerate() {
+            let expected = resolved.param_tys.get(i);
+            self.check_expr_inner(
+                arg,
+                false,
+                "TransactorCall arg",
+                matches!(expected, Some(IrType::FixedVec { .. })),
+            );
+            if let Some(expected) = expected {
+                let actual = if matches!(expected, IrType::FixedVec { .. }) {
+                    self.expr_whole_vec_type(arg).ok().flatten()
+                } else {
+                    expr_type(self.prog, self.func, arg)
+                };
+                match actual {
+                    Some(actual) if assign_compatible(expected, &actual) => {}
+                    Some(actual) => self.errs.push(bad(format!(
+                        "transactor method `{}.{method}` parameter {} expects {expected:?}, got {actual:?}",
+                        schema.name,
+                        i + 1
+                    ))),
+                    None if matches!(expected, IrType::FixedVec { .. }) => {
+                        self.errs.push(bad(format!(
+                            "transactor method `{}.{method}` parameter {} expects {expected:?}, got a non-fixed-vector value",
+                            schema.name,
+                            i + 1
+                        )));
+                    }
+                    None => {}
+                }
+            }
+        }
         if let Some(dest) = dest {
             let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);
             match (&resolved.ret_ty, actual) {
@@ -6113,9 +6190,6 @@ impl Checker<'_> {
                 .push(bad("payload is not a TransactorSelfMethod call".to_string()));
             return;
         };
-        for a in args {
-            self.check_expr(a, false, "TransactorSelfCall arg");
-        }
         let FunctionKind::TransactorBody { transactor: xid } = self.func.kind else {
             self.errs.push(bad(format!(
                 "`{transactor}.{method}` sibling call outside a transactor method body"
@@ -6148,6 +6222,38 @@ impl Checker<'_> {
                 m.param_names.len(),
                 args.len()
             )));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let expected = m.param_tys.get(i);
+            self.check_expr_inner(
+                arg,
+                false,
+                "TransactorSelfCall arg",
+                matches!(expected, Some(IrType::FixedVec { .. })),
+            );
+            if let Some(expected) = expected {
+                let actual = if matches!(expected, IrType::FixedVec { .. }) {
+                    self.expr_whole_vec_type(arg).ok().flatten()
+                } else {
+                    expr_type(self.prog, self.func, arg)
+                };
+                match actual {
+                    Some(actual) if assign_compatible(expected, &actual) => {}
+                    Some(actual) => self.errs.push(bad(format!(
+                        "transactor method `{}.{method}` parameter {} expects {expected:?}, got {actual:?}",
+                        schema.name,
+                        i + 1
+                    ))),
+                    None if matches!(expected, IrType::FixedVec { .. }) => {
+                        self.errs.push(bad(format!(
+                            "transactor method `{}.{method}` parameter {} expects {expected:?}, got a non-fixed-vector value",
+                            schema.name,
+                            i + 1
+                        )));
+                    }
+                    None => {}
+                }
+            }
         }
         if let Some(dest) = dest {
             let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);

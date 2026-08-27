@@ -4266,9 +4266,9 @@ impl FuncBuilder<'_> {
             &format!("transactor method call `{tb_field}.{method}(...)`"),
         )?;
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
+        for (a, ty) in args.iter().zip(m.param_tys.iter()) {
             let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
-            lowered.push(self.lower_expr_no_ports(e)?);
+            lowered.push(self.lower_transactor_arg_expr(e, ty)?);
         }
         // Same rule as the component-method call one screen up, at the
         // transactor spelling of it. The schema had to learn
@@ -4375,9 +4375,9 @@ impl FuncBuilder<'_> {
             &format!("transactor sibling method call `{transactor}.{name}(...)`"),
         )?;
         let mut lowered = Vec::with_capacity(args.len());
-        for a in args {
+        for (a, ty) in args.iter().zip(param_tys.iter()) {
             let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
-            lowered.push(self.lower_expr_no_ports(e)?);
+            lowered.push(self.lower_transactor_arg_expr(e, ty)?);
         }
         // The SIBLING spelling of the parameter rule — `inner(1)` from
         // another method of the same transactor, where the bound-
@@ -4401,6 +4401,28 @@ impl FuncBuilder<'_> {
             },
             lowered,
         )))
+    }
+
+    /// Whole fixed vectors are legal only at an explicitly typed aggregate
+    /// seam. Temporarily enable the same whole-vector read mode used by
+    /// event payloads; scalar/record/sequence parameters keep the ordinary
+    /// expression restrictions.
+    fn lower_transactor_arg_expr(
+        &mut self,
+        value: &crate::ast::Expr,
+        expected: &IrType,
+    ) -> Result<Expr, LowerError> {
+        if !matches!(expected, IrType::FixedVec { .. }) {
+            return self.lower_expr_no_ports(value);
+        }
+        let saved = self.vec_read_ok;
+        let saved_span = self.vec_read_span;
+        self.vec_read_ok = true;
+        self.vec_read_span = Some(super::exprs::unparen_expr(value).span);
+        let lowered = self.lower_expr_no_ports(value);
+        self.vec_read_ok = saved;
+        self.vec_read_span = saved_span;
+        lowered
     }
 
     /// `_tb.<xfield>.<dut_field> = dut` — the instance's DUT bind.

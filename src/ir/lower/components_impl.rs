@@ -3375,6 +3375,16 @@ pub(crate) fn queue_fixed_vec_elem_ir_type(
     fixed_vec_elem_ir_type_with_records(t, record_ids)
 }
 
+/// Decode a fixed-vector value type for method parameters and other
+/// by-value aggregate seams. Unlike `fixed_vec_elem_ir_type`, declared
+/// records are valid recursive leaves.
+pub(crate) fn fixed_vec_ir_type_with_records(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
+    fixed_vec_elem_ir_type_with_records(t, record_ids)
+}
+
 fn fixed_vec_elem_ir_type_with_records(
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,

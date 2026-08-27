@@ -487,6 +487,11 @@ pub(crate) fn lower_transactor(
     let mut sibling_methods = HashMap::new();
     for (h, active_only) in &methods_ast {
         let mname = h.name.name.clone();
+        let param_tys = h
+            .params
+            .iter()
+            .map(|p| method_param_ir_type(tname, &mname, p, &method_ctx.record_ids))
+            .collect::<Result<Vec<_>, _>>()?;
         if sibling_methods
             .insert(
                 mname.clone(),
@@ -495,15 +500,7 @@ pub(crate) fn lower_transactor(
                         .iter()
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
-                    h.params
-                        .iter()
-                        .map(|p| {
-                            super::helpers::ir_type_of_with_records(
-                                p.ty.as_ref(),
-                                &method_ctx.record_ids,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
+                    param_tys,
                     h.return_ty.as_ref().map(|ty| {
                         super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
                     }),
@@ -1537,6 +1534,11 @@ fn lower_bound_initiator_transactor(
     let mut sibling_methods = HashMap::new();
     for (h, active_only) in &methods_ast {
         let mname = h.name.name.clone();
+        let param_tys = h
+            .params
+            .iter()
+            .map(|p| method_param_ir_type(tname, &mname, p, &method_ctx.record_ids))
+            .collect::<Result<Vec<_>, _>>()?;
         if sibling_methods
             .insert(
                 mname.clone(),
@@ -1545,15 +1547,7 @@ fn lower_bound_initiator_transactor(
                         .iter()
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
-                    h.params
-                        .iter()
-                        .map(|p| {
-                            super::helpers::ir_type_of_with_records(
-                                p.ty.as_ref(),
-                                &method_ctx.record_ids,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
+                    param_tys,
                     h.return_ty.as_ref().map(|ty| {
                         super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
                     }),
@@ -2088,15 +2082,11 @@ fn record_id_of_type(ctx: &super::LowerCtx, t: &TypeExpr) -> Option<ir::RecordId
 }
 
 /// Resolve a method parameter's `IrType`. A `Named` type that names a
-/// declared `transaction`/`struct` lowers to `IrType::Record` (passed
-/// by value — the method body binds the record param and reads its
-/// fields, mirroring v1's by-value struct param). Everything else goes
+/// declared `transaction`/`struct` lowers to `IrType::Record`; a fixed
+/// `Vec<T, N>` lowers recursively to `IrType::FixedVec`, including record
+/// leaves. Both are passed by value, matching v1. Everything else goes
 /// through `check_method_param_ty` and lowers as a scalar (`uint<N>`/
-/// `sint<N>`/`bool`); any width flows through the wide-value ABI (u64 /
-/// `_harc_u128` / `HarcWide<N>` per `local_scalar_cty`), and a non-scalar
-/// type is rejected precisely there. The `Vec`-of-record / nested-record
-/// cases are not reachable: a record param is a flat value-record, exactly
-/// as v1 emits.
+/// `sint<N>`/`bool`); any width flows through the wide-value ABI.
 fn method_param_ir_type(
     tname: &str,
     mname: &str,
@@ -2116,6 +2106,11 @@ fn method_param_ir_type(
     // (`[&](Drv& self, const std::vector<Beat>& txns)`).
     if let Some(seq) = helpers::tseq_ir_type(p.ty.as_ref(), record_ids) {
         return Ok(seq);
+    }
+    if let Some(fixed @ IrType::FixedVec { .. }) = p.ty.as_ref().and_then(|ty| {
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    }) {
+        return Ok(fixed);
     }
     check_method_param_ty(
         tname,

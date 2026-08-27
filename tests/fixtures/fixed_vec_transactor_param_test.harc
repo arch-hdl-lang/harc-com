@@ -1,0 +1,35 @@
+transactor VecParamSink
+    dut : Top
+
+    when active
+        hookable consume(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>)
+            assert values == expected else fail("fixed-vector parameter changed")
+            dut.en = 1
+        end consume
+
+        hookable relay(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>, spare: Vec<uint<8>, 3>)
+            consume(values, expected)
+        end relay
+    end when
+end transactor VecParamSink
+
+testbench FixedVecTransactorParamTb
+    dut : Top
+    sink : VecParamSink active
+    values : Vec<uint<8>, 2>
+    expected : Vec<uint<8>, 2>
+    wrong_shape : Vec<uint<8>, 3>
+end testbench FixedVecTransactorParamTb
+
+impl FixedVecTransactorParamTest for FixedVecTransactorParamTb
+    run
+        sink.dut = dut
+        values[0] = 3
+        values[1] = 7
+        expected[0] = 3
+        expected[1] = 7
+        sink.relay(values, expected, wrong_shape)
+        wait 1 cycle
+        assert dut.count_out == 1 else fail("fixed-vector transactor call did not run")
+    end run
+end impl FixedVecTransactorParamTest

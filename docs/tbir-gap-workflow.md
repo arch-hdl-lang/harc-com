@@ -337,6 +337,9 @@ not applicable before requesting review:
    remains 119 textual matches (118 constructors plus the helper definition).
    Wide scalar transactor returns route around the shared width diagnostic, so
    this slice also leaves that raw inventory unchanged.
+   Fixed-vector transactor method parameters and whole-vector call arguments
+   route through the same shared aggregate decoder/read fence, so this slice
+   likewise leaves the raw inventory unchanged.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently

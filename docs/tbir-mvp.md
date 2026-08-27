@@ -9379,6 +9379,19 @@ former `transaction` group lives in
      the deliberate empty-pop failure; the unit test pins the generated type
      divergence directly.
 
+152. **Fixed-vector transactor method parameters (2026-08-26).**
+
+     Dedicated `TransactorSchema` methods now carry recursive
+     `IrType::FixedVec` parameter types through sibling signature prepasses,
+     method locals, bound-instance and sibling call arguments, verifier
+     invariants, hook vectors, and emitted `std::array` lambda/function
+     signatures. Whole testbench/component vector reads are admitted only at
+     a callee slot with the exact fixed-vector type; ordinary bare aggregate
+     reads remain fenced. The registered runtime fixture passes two vectors
+     through a bound call and a sibling call, compares their values in the
+     callee, and trace-diffs v1 against TBIR. Recursive dynamic lists remain
+     outside this batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

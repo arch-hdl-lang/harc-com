@@ -683,6 +683,10 @@ impl super::FuncBuilder<'_> {
                 let ty = self.local_type(*local).clone();
                 return matches!(ty, IrType::FixedVec { .. }).then_some(ty);
             }
+            Expr::TbField(field) => {
+                let ty = self.ctx.tb_scalar_fields.get(field)?.clone();
+                return matches!(ty, IrType::FixedVec { .. }).then_some(ty);
+            }
             Expr::RecordField {
                 local,
                 field,
@@ -1109,12 +1113,13 @@ impl FuncBuilder<'_> {
                     // A fixed-vector host field is scalar-shaped storage but
                     // a whole-`Vec` value; its element access lowers in the
                     // indexed lane (`as_tb_vec_field`). A bare whole-`Vec`
-                    // read is not a scalar `TbField` — fall through so it is
-                    // refused rather than mis-lowered.
-                    if !matches!(
+                    // read is admitted only at an explicitly typed aggregate
+                    // landing such as an event or method parameter.
+                    let is_fixed = matches!(
                         self.ctx.tb_scalar_fields.get(&field),
                         Some(IrType::FixedVec { .. })
-                    ) {
+                    );
+                    if !is_fixed || self.whole_vec_read_allowed(e) {
                         return Ok(Expr::TbField(field));
                     }
                 }
@@ -1142,6 +1147,13 @@ impl FuncBuilder<'_> {
                 }
                 if let Some(cov_bin) = self.as_cov_bin(e)? {
                     return Ok(cov_bin);
+                }
+                // Whole fixed-vector testbench field (`_tb.values`) at an
+                // explicitly typed aggregate landing (event/method arg).
+                if self.whole_vec_read_allowed(e) {
+                    if let Some((field, _)) = self.as_tb_vec_field(e) {
+                        return Ok(Expr::TbField(field));
+                    }
                 }
                 // Scalar testbench field read (`_tb.expected`).
                 if let Some(field) = self.as_tb_scalar_field(e) {
