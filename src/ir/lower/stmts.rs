@@ -2346,6 +2346,13 @@ impl FuncBuilder<'_> {
         if let Some(field) = self.as_tb_scalar_field(target) {
             let e = self.lower_expr_no_ports(value)?;
             self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
+            if let Some(expected) = self.ctx.tb_scalar_fields.get(&field) {
+                self.check_owner_scalar_field_write(
+                    &e,
+                    expected,
+                    &format!("testbench field `{field}`"),
+                )?;
+            }
             self.reject_wide_narrowing_into(
                 self.ctx.tb_scalar_fields.get(&field).cloned(),
                 &e,
@@ -2371,6 +2378,13 @@ impl FuncBuilder<'_> {
                     ) {
                         let e = self.lower_expr_no_ports(value)?;
                         self.reject_record_into_scalar(&e, &format!("testbench field `{field}`"))?;
+                        if let Some(expected) = self.ctx.tb_scalar_fields.get(&field) {
+                            self.check_owner_scalar_field_write(
+                                &e,
+                                expected,
+                                &format!("testbench field `{field}`"),
+                            )?;
+                        }
                         self.push(Stmt::TbFieldWrite { field, value: e });
                         return Ok(());
                     }

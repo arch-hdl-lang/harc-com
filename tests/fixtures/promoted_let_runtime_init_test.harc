@@ -1,0 +1,29 @@
+// A check-phase read promotes `observed` into shared testbench state. Its
+// initializer is runtime work, so TBIR must execute it in source order rather
+// than trying to encode it as a C++ member default.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+function seed() -> uint<32>
+    return 7
+end function seed
+
+test PromotedLetRuntimeInitTest
+    let dut : Top
+    let first : uint<32> = seed()
+    let middle : uint<32> = first + 1
+    let observed : uint<32> = middle + 1
+
+    clock clk = SysDomain
+
+    run
+        wait 1 cycle
+    end run
+
+    check
+        assert observed == 9 else fail("runtime-promoted value was ${observed}, expected 9")
+        log(info, "PASS: runtime-initialized promoted let persisted into check")
+    end check
+end test PromotedLetRuntimeInitTest

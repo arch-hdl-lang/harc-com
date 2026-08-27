@@ -5338,8 +5338,10 @@ fn lower_test(
     }
     // Promote each captured let: drop its `let` declaration (it becomes a
     // `_tb` field with a default) and register it as a scalar host field.
-    // The init must be a compile-time constant (the field's `default`);
-    // v1's captured lets in these fixtures all init to literals.
+    // Constant initializers live in the field's `default`; a typed runtime
+    // initializer becomes a source-ordered `_tb.<name> = <expr>` at the
+    // original declaration position in the run function.
+    let mut promoted_runtime_inits: HashMap<String, AstStmt> = HashMap::new();
     if !promoted_lets.is_empty() {
         // Register one `_tb` scalar field per promoted let, in declaration
         // order (deterministic schema order).
@@ -5399,16 +5401,31 @@ fn lower_test(
                 }
                 Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
-                _ => {
-                    return Err(unsupported(
-                        &format!(
-                            "a promoted test-scope `let {}` with a non-constant initializer",
-                            l.name.name
-                        ),
-                        "a test-scope let captured by a closure hook OR read in the check phase \
-                         is promoted to a `_tb` host field whose default must be a compile-time \
-                         constant; assign the computed value in the run body instead",
-                    ));
+                Some(_) => {
+                    if l.ty.as_ref().and_then(tb_scalar_field_ir_type).is_none() {
+                        return Err(unsupported(
+                            &format!(
+                                "an untyped promoted test-scope `let {}` with a runtime initializer",
+                                l.name.name
+                            ),
+                            "declare the promoted let's scalar type so its shared `_tb` storage \
+                             can be sized before the run expression is lowered",
+                        ));
+                    }
+                    promoted_runtime_inits.insert(
+                        l.name.name.clone(),
+                        AstStmt {
+                            kind: StmtKind::Assign {
+                                target: crate::ast::Expr::new(
+                                    ExprKind::Ident(l.name.clone()),
+                                    l.name.span,
+                                ),
+                                value: l.value.as_ref().expect("matched Some initializer").clone(),
+                            },
+                            span: l.span,
+                        },
+                    );
+                    0
                 }
             };
             let scalar = ir::TbScalarFieldSchema {
@@ -5419,12 +5436,6 @@ fn lower_test(
             scalar_fields.push(scalar.clone());
             state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
         }
-        // Drop the promoted lets from the hoisted-let list — they are now
-        // `_tb` host fields, not run-function locals.
-        test_let_stmts.retain(|s| match &s.kind {
-            StmtKind::Let(l) => !promoted_lets.contains(&l.name.name),
-            _ => true,
-        });
     }
 
     let tb_id = TestbenchId(prog.testbenches.len() as u32);
@@ -5467,7 +5478,18 @@ fn lower_test(
     // Hoisted test-scope lets first (v1 evaluates them at `main` scope
     // before the coroutine bootstraps — i.e. before any body statement
     // and before the first clock edge), then the body in scope order.
-    let mut run_stmts: Vec<&AstStmt> = test_let_stmts.iter().collect();
+    let mut run_stmts: Vec<&AstStmt> = Vec::with_capacity(test_let_stmts.len());
+    for stmt in &test_let_stmts {
+        let StmtKind::Let(l) = &stmt.kind else {
+            run_stmts.push(stmt);
+            continue;
+        };
+        if let Some(init) = promoted_runtime_inits.get(&l.name.name) {
+            run_stmts.push(init);
+        } else if !promoted_lets.contains(&l.name.name) {
+            run_stmts.push(stmt);
+        }
+    }
     let n_hoisted_lets = run_stmts.len();
     let mut check_stmts: Vec<&AstStmt> = Vec::new();
     // Bare statements that precede the `scope` block run before its

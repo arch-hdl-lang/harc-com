@@ -22135,6 +22135,104 @@ end test CheckPhaseBoolTest
     );
 }
 
+/// A typed promoted let may compute its initial value at runtime. The
+/// synthesized `_tb` write stays at the declaration's source position, so it
+/// can depend on preceding hoisted locals before the check phase reads it.
+#[test]
+fn promoted_typed_let_runtime_initializer_lowers_in_source_order() {
+    let src = r#"function seed() -> uint<32>
+    return 7
+end function seed
+
+test RuntimePromotedLetTest
+    let dut : Top
+    let first : uint<32> = seed()
+    let middle : uint<32> = first + 1
+    let observed : uint<32> = middle + 1
+
+    run
+        wait 1 cycle
+    end run
+
+    check
+        assert observed == 9
+    end check
+end test RuntimePromotedLetTest"#;
+
+    let prog = lower_src(src).expect("typed runtime initializer lowers");
+    verify::verify_program(&prog).expect("typed runtime initializer verifies");
+    let cpp = emit_cpp_src(src);
+    let first = cpp
+        .find("first = harc_helper_seed()")
+        .expect("first local initializes");
+    let middle = cpp.find("middle = (first + 1)").expect("middle local initializes");
+    let observed = cpp
+        .find("_tb.observed = (middle + 1)")
+        .expect("promoted field initializes at runtime");
+    assert!(first < middle && middle < observed, "source order changed:\n{cpp}");
+    assert!(cpp.contains("uint64_t observed = 0;"), "{cpp}");
+
+    let untyped = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed = middle + 1",
+    );
+    let msg = assert_unsupported(&lower_src(&untyped).unwrap_err());
+    assert!(msg.contains("untyped promoted test-scope `let observed`"), "{msg}");
+    assert!(msg.contains("declare the promoted let's scalar type"), "{msg}");
+
+    let narrowing = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed : uint<8> = first",
+    );
+    let msg = lower_src(&narrowing)
+        .expect_err("a promoted initializer must not narrow its declared field")
+        .to_string();
+    assert!(msg.contains("32-bit value") && msg.contains("narrows"), "{msg}");
+
+    let signedness = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed : sint<32> = first",
+    );
+    let msg = lower_src(&signedness)
+        .expect_err("a promoted initializer must preserve signedness")
+        .to_string();
+    assert!(msg.contains("Signedness must match"), "{msg}");
+
+    // A later pass must not be able to bypass the lowering checks. Corrupt
+    // the valid promoted-field initialization independently in both ways.
+    for bad_value in [
+        ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(64)),
+        },
+        ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::SInt(Some(32)),
+        },
+    ] {
+        let mut broken = prog.clone();
+        let run = &mut broken.functions[broken.tests[0].run.index()];
+        let write = run
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.stmts.iter_mut())
+            .find_map(|stmt| match stmt {
+                ir::Stmt::TbFieldWrite { field, value } if field == "observed" => Some(value),
+                _ => None,
+            })
+            .expect("promoted initializer emits a testbench field write");
+        *write = bad_value;
+        let errors = verify::verify_program(&broken)
+            .expect_err("corrupted promoted field type must not verify");
+        assert!(
+            errors.iter().any(|error| error
+                .to_string()
+                .contains("testbench field `observed` declared UInt(Some(32))")),
+            "verifier must diagnose the incompatible promoted field write: {errors:?}"
+        );
+    }
+}
+
 /// Transaction-typed testbench fields are shared host record state. Each
 /// lowered run/check/helper body sees a synthetic record local for normal
 /// `RecordFieldWrite`/`RecordField` lowering, but TBIR C++ declares the
