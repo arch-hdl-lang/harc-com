@@ -127,7 +127,7 @@ fn emit_fixture(path: &PathBuf, name: &str, failures: &mut Vec<String>) -> Optio
 
     match cpp_tb::emit(&to_emit) {
         Ok(cpp) => Some(cpp),
-        Err(err) if benign_emit_error(&err.0) => None,
+        Err(err) if benign_emit_error(name, &err.0) => None,
         Err(err) => {
             failures.push(format!("[emit] {name}: {}", err.0));
             None
@@ -135,7 +135,7 @@ fn emit_fixture(path: &PathBuf, name: &str, failures: &mut Vec<String>) -> Optio
     }
 }
 
-fn benign_emit_error(msg: &str) -> bool {
+fn benign_emit_error(name: &str, msg: &str) -> bool {
     msg.contains("no `test` declaration")
         || msg.contains("let dut")
         || msg.contains("only non-sim impls")
@@ -152,4 +152,9 @@ fn benign_emit_error(msg: &str) -> bool {
         // <method>". Such fixtures are exercised via the default (tbir)
         // backend in tests/run_fixtures.sh, not this v1 emit sweep.
         || msg.contains("has no signal or channel named")
+        // Direct non-fork out_of_order calls are intentionally TBIR-only;
+        // this sweep checks the legacy v1 emitter only as a way to discover
+        // randomize-bearing fixtures.
+        || (name == "tlm_direct_ooo_bus_test.harc"
+            && msg.contains("supports only `blocking` tlm_method calls"))
 }

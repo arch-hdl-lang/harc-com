@@ -1053,6 +1053,7 @@ fn lower_bound_target_transactor(
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&body_ctx, helper_registry, side_tables);
+        b.concurrent_target_ooo_lanes = ooo_tags.is_some();
         b.current_body_name = Some(format!(
             "transactor `{tname}` {} target thread `bus.{mname}`",
             if matches!(activation, Activation::Always) {

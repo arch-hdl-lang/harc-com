@@ -149,7 +149,7 @@ is_subset_gap() {
 # numerator alone sees nothing.
 #
 # It floors DISTINCT fixture names, not raw rows. A raw count is satisfied
-# by 149 copies of one row, and no sibling gate catches that either:
+# by 191 copies of one row, and no sibling gate catches that either:
 # check_fixture_registration.sh only asserts each fixture is named
 # somewhere under tests/, which other list files already do.
 #
@@ -157,15 +157,16 @@ is_subset_gap() {
 # exactly the sense that got MIN_COMPARED deleted — a solver fixture
 # becoming a subset gap or gaining an exemption drops it — so its floor
 # has to absorb every sanctioned drop MAX_UNCHECKED already tolerates:
-# 15 solver fixtures minus 10 permitted unchecked is 5. That still catches
-# what this floor is for, which is the constraint-text half collapsing to
-# nothing, and never fires on a path the gate itself sanctions. A tighter
-# value red-lights legitimate edits and leaves lowering the floor as the
-# only way out — the reflex this comment block exists to prevent.
+# 17 solver fixtures minus 10 permitted unchecked leaves 7; the floor of
+# 5 retains two more rows of headroom for legitimate corpus changes. It
+# still catches what this floor is for, which is the constraint-text half
+# collapsing to nothing, and never fires on a path the gate itself
+# sanctions. A tighter value red-lights legitimate edits and leaves
+# lowering the floor as the only way out — the reflex this comment block
+# exists to prevent.
 #
-# Current values: 149 rows, 1 unchecked (one known exemption), 15 with
-# solver text. Headroom is for a few legitimate changes, not a third of
-# the corpus.
+# Current values: 191 rows, 2 unchecked (known exemptions), 17 with solver
+# text. Headroom is for a few legitimate changes, not a third of the corpus.
 MIN_ROWS="${MIN_ROWS:-140}"
 MAX_UNCHECKED="${MAX_UNCHECKED:-10}"
 MIN_SOLVER="${MIN_SOLVER:-5}"

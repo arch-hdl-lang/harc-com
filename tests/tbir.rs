@@ -19004,12 +19004,12 @@ end impl MixTest
     );
 }
 
-/// A direct (non-fork) call of an `out_of_order` method is rejected by
-/// mode, naming the mode and the call site — and NOT by pointing at v1,
-/// which rejects the same shape (see
-/// `the_remaining_bus_shapes_are_not_v1_escape_hatches`).
+/// A direct (non-fork) call of an `out_of_order` method is synchronous:
+/// it lowers to one tagged request plus an immediate one-entry drain. A
+/// sequence of direct calls may reuse tag zero because each response is
+/// consumed before the next issue.
 #[test]
-fn bus_ooo_direct_call_is_rejected_by_mode() {
+fn bus_ooo_direct_call_lowers_to_immediate_tagged_drain() {
     let src = r#"
 bus OooBus
     tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
@@ -19022,15 +19022,85 @@ end testbench OooTb
 impl OooTest for OooTb
     let mem : OooBus = bind dut
     run
+        let a = fork mem.read_ooo(11)
+        let b = fork mem.read_ooo(12)
+        join_all
         let x = mem.read_ooo(9)
+        let y = mem.read_ooo(10)
+        let c = fork mem.read_ooo(13)
+        let d = fork mem.read_ooo(14)
+        join_all
     end run
 end impl OooTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    let prog = lower_src(src).expect("direct OOO calls lower");
+    verify::verify_program(&prog).expect("direct OOO calls verify");
+    let text = format!("{prog}");
     assert!(
-        msg.contains("`out_of_order` tlm_method calls") && msg.contains("mem.read_ooo"),
-        "{msg}"
+        text.contains("TlmFork(%x = mem.read_ooo([9]) tag=0)")
+            && text.contains("TlmJoinAll([%x = mem.read_ooo([9]) tag=0])")
+            && text.contains("TlmFork(%y = mem.read_ooo([10]) tag=0)")
+            && text.contains("TlmJoinAll([%y = mem.read_ooo([10]) tag=0])")
+            && text.contains("TlmFork(%a = mem.read_ooo([11]) tag=0)")
+            && text.contains("TlmFork(%b = mem.read_ooo([12]) tag=1)")
+            && text.contains("TlmFork(%c = mem.read_ooo([13]) tag=0)")
+            && text.contains("TlmFork(%d = mem.read_ooo([14]) tag=1)"),
+        "direct calls must issue and drain independently with reusable tag zero:\n{text}"
+    );
+
+    let void_return = src
+        .replace(
+            "tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;",
+            "tlm_method read_ooo(addr: uint<8>): out_of_order tags 2;",
+        )
+        .replace("let a = fork mem.read_ooo(11)", "mem.read_ooo(11)")
+        .replace("let b = fork mem.read_ooo(12)", "mem.read_ooo(12)")
+        .replace("let c = fork mem.read_ooo(13)", "mem.read_ooo(13)")
+        .replace("let d = fork mem.read_ooo(14)", "mem.read_ooo(14)")
+        .replace("        join_all\n", "");
+    let message = lower_src(&void_return)
+        .expect_err("a direct void call cannot initialize a let")
+        .to_string();
+    assert!(message.contains("use it as a statement"), "{message}");
+    assert!(!message.contains("`fork` it"), "{message}");
+
+    let concurrent_forwarding = r#"
+bus FrontOooBus
+    tlm_method read(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus FrontOooBus
+
+bus BackOooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus BackOooBus
+
+transactor ForwardingTarget bound to FrontOooBus
+    thread bus.read(addr: uint<8>)
+        let data = back.read_ooo(addr)
+        return data
+    end thread
+end transactor ForwardingTarget
+
+testbench ForwardingTb
+    dut : Top
+end testbench ForwardingTb
+
+impl ForwardingTest for ForwardingTb
+    let front : FrontOooBus = bind dut
+    let back : BackOooBus = bind dut
+    let target : ForwardingTarget passive = bind front
+    run
+        wait 1 cycle
+    end run
+end impl ForwardingTest
+"#;
+    let message = assert_not_implemented(
+        &lower_src(&concurrent_forwarding).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(
+        message.contains("inside a concurrently instanced out_of_order target responder body")
+            && message.contains("runtime-safe tag ownership"),
+        "{message}"
     );
 }
 
@@ -29991,18 +30061,16 @@ fn the_remaining_bus_shapes_are_not_v1_escape_hatches() {
     emit_cpp_src(&tlm);
     cpp_tb::emit(&merged_src(&tlm)).expect("v1 emits the control");
 
-    // A DIRECT (non-`fork`) call on an `out_of_order` method. The parser
-    // admits only `blocking` and `out_of_order`, so this is the sole way
-    // to reach `lower_tlm_method_call`'s mode guard.
-    //
-    // The three `fork` RHS shape guards follow: not a call, a call whose
+    // A direct (non-`fork`) OOO call is now a TBIR-only capability; v1
+    // still rejects it during retirement. The remaining three `fork` RHS
+    // shape guards follow: not a call, a call whose
     // callee is a bare ident, and a field chain that is not rooted at a
     // bus binding.
+    let direct = tlm.replacen(FORKED, "let forked0 = mem.read_ooo(9)", 1);
+    lower_src(&direct).expect("TBIR lowers a direct OOO call");
+    cpp_tb::emit(&merged_src(&direct)).expect_err("v1 still rejects a direct OOO call");
+
     for (mutation, needle) in [
-        (
-            "let forked0 = mem.read_ooo(9)",
-            "`out_of_order` tlm_method calls",
-        ),
         ("let forked0 = fork 9", "not a direct bus tlm_method call"),
         (
             "let forked0 = fork read_ooo(9)",

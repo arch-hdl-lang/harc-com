@@ -525,6 +525,16 @@ nested forwarding — is now resolved too; see the nested-forwarding
 section above.) Target-side OOO responder lanes are now resolved as well
 — see the OOO-responder lanes section above.
 
+A direct non-`fork` call on an `out_of_order tags N` method is synchronous
+in TBIR: it lowers to the same tagged request issue followed immediately by
+a one-entry response drain, reusing tag zero once the response completes.
+An explicit fork still pending on that same binding/method must be joined
+first. Completed explicit barriers release their tags for the next group.
+A direct downstream OOO call inside an OOO front-side responder remains
+rejected because its body runs concurrently in multiple lanes and needs
+runtime tag ownership. **Registered** (TBIR-only, v1 rejects):
+`tlm_direct_ooo_bus_test`.
+
 ### bus `bind ... with { ... }` signal remaps — RESOLVED 2026-06-13
 
 > ~~`bind ... with { ch.sig: "port" }` signal remaps~~

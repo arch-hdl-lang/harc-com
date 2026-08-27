@@ -1,0 +1,30 @@
+// TBIR-only direct out-of-order TLM call smoke test. A non-fork call is
+// synchronous: issue tag zero, drain its response, then reuse tag zero.
+
+bus DirectOooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus DirectOooBus
+
+testbench DirectOooTb
+    dut : TlmMemory
+end testbench DirectOooTb
+
+impl DirectOooTest for DirectOooTb
+    let mem : DirectOooBus = bind dut
+
+    run
+        dut.rst = 1
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let first = mem.read_ooo(9)
+        let second = mem.read_ooo(10)
+        assert first == 265
+            else fail("direct OOO read got 0x${first:08x}, expected 0x00000109")
+        assert second == 266
+            else fail("second direct OOO read got 0x${second:08x}, expected 0x0000010a")
+    end run
+end impl DirectOooTest

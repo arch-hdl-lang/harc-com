@@ -5410,7 +5410,14 @@ fn all_fixtures_emit_cleanly() {
                     // backend in tests/run_fixtures.sh; the v1 emit sweep
                     // legitimately can't emit them.
                     || (msg.contains("has no signal or channel named")
-                        && name.starts_with("msg_suspending_call"));
+                        && name.starts_with("msg_suspending_call"))
+                    // A direct non-fork call to an out_of_order TLM method is
+                    // intentionally TBIR-only while v1 is retired. The
+                    // default fixture runner exercises it through TBIR; this
+                    // legacy-v1 standalone emit sweep must not treat that
+                    // documented backend gap as a fixture regression.
+                    || (name == "tlm_direct_ooo_bus_test.harc"
+                        && msg.contains("supports only `blocking` tlm_method calls"));
                 if !benign {
                     failures.push(format!("[emit] {name}: {msg}"));
                 }

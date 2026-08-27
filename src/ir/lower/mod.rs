@@ -7368,6 +7368,11 @@ pub(crate) struct FuncBuilder<'a> {
     /// `Stmt::TlmJoinAll` (v1's `pending_tlm_forks`). Empty between
     /// join_alls.
     pub(crate) pending_tlm_forks: Vec<crate::ir::TlmForkDesc>,
+    /// True while lowering a target responder body that is instantiated once
+    /// per `out_of_order tags N` lane. The same IR body can execute
+    /// concurrently, so it cannot use compile-time tag-zero reuse for a
+    /// downstream direct OOO call.
+    pub(crate) concurrent_target_ooo_lanes: bool,
     /// Next OOO request tag per `(bus_field, method)`, allocated when a
     /// fork issues against an `out_of_order tags N` method (v1's
     /// `next_tlm_fork_tag`). Function-scoped — a fresh builder starts at
@@ -7739,6 +7744,7 @@ impl<'a> FuncBuilder<'a> {
             temporal_slots: HashMap::new(),
             tseq_result: None,
             pending_tlm_forks: Vec::new(),
+            concurrent_target_ooo_lanes: false,
             next_tlm_fork_tag: HashMap::new(),
         }
     }
