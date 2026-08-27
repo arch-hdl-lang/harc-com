@@ -22135,11 +22135,12 @@ end test CheckPhaseBoolTest
     );
 }
 
-/// A typed promoted let may compute its initial value at runtime. The
+/// A promoted let may compute its initial value at runtime. Its scalar type
+/// may be explicit or inferred from declarations visible at that point. The
 /// synthesized `_tb` write stays at the declaration's source position, so it
 /// can depend on preceding hoisted locals before the check phase reads it.
 #[test]
-fn promoted_typed_let_runtime_initializer_lowers_in_source_order() {
+fn promoted_let_runtime_initializer_lowers_in_source_order() {
     let src = r#"function seed() -> uint<32>
     return 7
 end function seed
@@ -22165,20 +22166,111 @@ end test RuntimePromotedLetTest"#;
     let first = cpp
         .find("first = harc_helper_seed()")
         .expect("first local initializes");
-    let middle = cpp.find("middle = (first + 1)").expect("middle local initializes");
+    let middle = cpp
+        .find("middle = (first + 1)")
+        .expect("middle local initializes");
     let observed = cpp
         .find("_tb.observed = (middle + 1)")
         .expect("promoted field initializes at runtime");
-    assert!(first < middle && middle < observed, "source order changed:\n{cpp}");
+    assert!(
+        first < middle && middle < observed,
+        "source order changed:\n{cpp}"
+    );
     assert!(cpp.contains("uint64_t observed = 0;"), "{cpp}");
 
     let untyped = src.replace(
         "let observed : uint<32> = middle + 1",
         "let observed = middle + 1",
     );
-    let msg = assert_unsupported(&lower_src(&untyped).unwrap_err());
-    assert!(msg.contains("untyped promoted test-scope `let observed`"), "{msg}");
-    assert!(msg.contains("declare the promoted let's scalar type"), "{msg}");
+    let untyped_prog = lower_src(&untyped).expect("untyped runtime initializer type is inferred");
+    verify::verify_program(&untyped_prog).expect("inferred runtime initializer verifies");
+    let untyped_tb = &untyped_prog.testbenches[untyped_prog.tests[0].testbench.index()];
+    assert_eq!(
+        untyped_tb
+            .scalar_fields
+            .iter()
+            .find(|field| field.name == "observed")
+            .map(|field| &field.ty),
+        Some(&ir::IrType::UInt(Some(32)))
+    );
+    let untyped_cpp = emit_cpp_src(&untyped);
+    assert!(
+        untyped_cpp.contains("uint64_t observed = 0;"),
+        "{untyped_cpp}"
+    );
+    assert!(
+        untyped_cpp.contains("_tb.observed = (middle + 1)"),
+        "{untyped_cpp}"
+    );
+
+    let helper_result = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed = seed()",
+    );
+    let helper_prog =
+        lower_src(&helper_result).expect("helper return declaration supplies the type");
+    let helper_tb = &helper_prog.testbenches[helper_prog.tests[0].testbench.index()];
+    assert_eq!(
+        helper_tb
+            .scalar_fields
+            .iter()
+            .find(|field| field.name == "observed")
+            .map(|field| &field.ty),
+        Some(&ir::IrType::UInt(Some(32)))
+    );
+
+    let unresolved = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed = dut.count_out",
+    );
+    let msg = assert_unsupported(&lower_src(&unresolved).unwrap_err());
+    assert!(
+        msg.contains("untyped promoted test-scope `let observed`"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("declare the promoted let's scalar type"),
+        "{msg}"
+    );
+
+    for initializer in ["-4'd1", "~4'd0", "~(middle + 4'd0)"] {
+        let sized_unary = src.replace(
+            "let observed : uint<32> = middle + 1",
+            &format!("let observed = {initializer}"),
+        );
+        let sized_prog =
+            lower_src(&sized_unary).unwrap_or_else(|error| panic!("{initializer} lowers: {error}"));
+        verify::verify_program(&sized_prog)
+            .unwrap_or_else(|errors| panic!("{initializer} verifies: {errors:?}"));
+        let sized_tb = &sized_prog.testbenches[sized_prog.tests[0].testbench.index()];
+        assert_eq!(
+            sized_tb
+                .scalar_fields
+                .iter()
+                .find(|field| field.name == "observed")
+                .map(|field| &field.ty),
+            Some(&ir::IrType::SInt(None)),
+            "{initializer} must retain v1's signed host-scalar provenance"
+        );
+    }
+
+    let mixed_width = src
+        .replace("let first : uint<32> = seed()", "let first : uint = seed()")
+        .replace(
+            "let observed : uint<32> = middle + 1",
+            "let observed = first + middle",
+        );
+    let mixed_prog = lower_src(&mixed_width).expect("mixed widthless and fixed operands lower");
+    let mixed_tb = &mixed_prog.testbenches[mixed_prog.tests[0].testbench.index()];
+    assert_eq!(
+        mixed_tb
+            .scalar_fields
+            .iter()
+            .find(|field| field.name == "observed")
+            .map(|field| &field.ty),
+        Some(&ir::IrType::UInt(Some(64))),
+        "the promoted field must share canonical composed-width typing"
+    );
 
     let narrowing = src.replace(
         "let observed : uint<32> = middle + 1",
@@ -22187,7 +22279,10 @@ end test RuntimePromotedLetTest"#;
     let msg = lower_src(&narrowing)
         .expect_err("a promoted initializer must not narrow its declared field")
         .to_string();
-    assert!(msg.contains("32-bit value") && msg.contains("narrows"), "{msg}");
+    assert!(
+        msg.contains("32-bit value") && msg.contains("narrows"),
+        "{msg}"
+    );
 
     let signedness = src.replace(
         "let observed : uint<32> = middle + 1",

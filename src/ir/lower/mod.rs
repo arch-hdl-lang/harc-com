@@ -5342,23 +5342,44 @@ fn lower_test(
     // initializer becomes a source-ordered `_tb.<name> = <expr>` at the
     // original declaration position in the run function.
     let mut promoted_runtime_inits: HashMap<String, AstStmt> = HashMap::new();
+    let mut test_let_scalar_types: HashMap<String, IrType> = HashMap::new();
     if !promoted_lets.is_empty() {
         // Register one `_tb` scalar field per promoted let, in declaration
         // order (deterministic schema order).
         for s in &test_let_stmts {
             let StmtKind::Let(l) = &s.kind else { continue };
             if !promoted_lets.contains(&l.name.name) {
+                if let Some(ty) = l.ty.as_ref().and_then(tb_scalar_field_ir_type).or_else(|| {
+                    l.value.as_ref().and_then(|value| {
+                        infer_promoted_scalar_type(
+                            value,
+                            &test_let_scalar_types,
+                            helpers,
+                            extern_fns,
+                            record_ids,
+                        )
+                        .filter(|ty| !matches!(ty, IrType::Unknown))
+                    })
+                }) {
+                    test_let_scalar_types.insert(l.name.name.clone(), ty);
+                }
                 continue;
             }
-            let inferred_ty = match l.value.as_ref().map(|v| &*v.kind) {
-                Some(ExprKind::Bool(_)) => Some(IrType::Bool),
-                _ => None,
-            };
-            let ty =
-                l.ty.as_ref()
-                    .and_then(tb_scalar_field_ir_type)
-                    .or(inferred_ty)
-                    .unwrap_or(IrType::UInt(None));
+            let inferred_ty = l.value.as_ref().and_then(|value| {
+                infer_promoted_scalar_type(
+                    value,
+                    &test_let_scalar_types,
+                    helpers,
+                    extern_fns,
+                    record_ids,
+                )
+                .filter(|ty| !matches!(ty, IrType::Unknown))
+            });
+            let declared_ty = l.ty.as_ref().and_then(tb_scalar_field_ir_type);
+            let ty = declared_ty
+                .clone()
+                .or_else(|| inferred_ty.clone())
+                .unwrap_or(IrType::UInt(None));
             let default = match l.value.as_ref().map(|v| &*v.kind) {
                 Some(ExprKind::Int(s)) => {
                     match exprs::parse_int_literal_checked(s) {
@@ -5402,7 +5423,7 @@ fn lower_test(
                 Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
                 Some(_) => {
-                    if l.ty.as_ref().and_then(tb_scalar_field_ir_type).is_none() {
+                    if declared_ty.is_none() && inferred_ty.is_none() {
                         return Err(unsupported(
                             &format!(
                                 "an untyped promoted test-scope `let {}` with a runtime initializer",
@@ -5428,6 +5449,7 @@ fn lower_test(
                     0
                 }
             };
+            test_let_scalar_types.insert(l.name.name.clone(), ty.clone());
             let scalar = ir::TbScalarFieldSchema {
                 name: l.name.name.clone(),
                 ty,
@@ -6502,6 +6524,129 @@ pub(super) fn tb_scalar_field_ir_type(t: &TypeExpr) -> Option<IrType> {
     // with the other field-type decoder. The two may differ about which
     // SPELLINGS they admit; they must not differ about width.
     components::field_scalar_width_ok(&ty).then_some(ty)
+}
+
+/// Infer the scalar storage type needed before a promoted test-scope let's
+/// runtime initializer is lowered. This deliberately covers only expression
+/// forms whose result type is determined by declarations or operators; an
+/// unresolved/aggregate form remains `None` and keeps the actionable
+/// unsupported diagnostic instead of guessing a `_tb` ABI.
+fn infer_promoted_scalar_type(
+    expr: &crate::ast::Expr,
+    prior_lets: &HashMap<String, IrType>,
+    helpers: &helpers::HelperRegistry<'_>,
+    extern_fns: &ExternFnTable,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
+    use crate::ast::{BinaryOp, UnaryOp};
+
+    let inferred = match &*expr.kind {
+        ExprKind::Bool(_) => Some(IrType::Bool),
+        // General value lowering deliberately erases literal widths to the
+        // host-scalar `Unknown` type. The caller filters a bare unsized
+        // literal back into the historical promoted-field fallback, while
+        // the normalization below preserves sized-literal signed provenance.
+        ExprKind::Int(_) => Some(IrType::Unknown),
+        ExprKind::Ident(id) => prior_lets.get(&id.name).cloned(),
+        ExprKind::Paren(inner) => {
+            infer_promoted_scalar_type(inner, prior_lets, helpers, extern_fns, record_ids)
+        }
+        ExprKind::Cast { ty, .. } => tb_scalar_field_ir_type(ty),
+        ExprKind::Unary { op, expr } => match op {
+            UnaryOp::Not | UnaryOp::NotKw => Some(IrType::Bool),
+            UnaryOp::BitNot if exprs::ast_expr_contains_sized_literal(expr) => {
+                Some(IrType::SInt(None))
+            }
+            UnaryOp::Neg | UnaryOp::BitNot => {
+                infer_promoted_scalar_type(expr, prior_lets, helpers, extern_fns, record_ids)
+            }
+        },
+        ExprKind::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge
+            | BinaryOp::AndAnd
+            | BinaryOp::OrOr
+            | BinaryOp::AndKw
+            | BinaryOp::OrKw => Some(IrType::Bool),
+            BinaryOp::Shl | BinaryOp::Shr => {
+                infer_promoted_scalar_type(lhs, prior_lets, helpers, extern_fns, record_ids)
+            }
+            BinaryOp::Add
+            | BinaryOp::AddWrap
+            | BinaryOp::Sub
+            | BinaryOp::SubWrap
+            | BinaryOp::Mul
+            | BinaryOp::MulWrap
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => {
+                let lhs =
+                    infer_promoted_scalar_type(lhs, prior_lets, helpers, extern_fns, record_ids);
+                let rhs =
+                    infer_promoted_scalar_type(rhs, prior_lets, helpers, extern_fns, record_ids);
+                match (lhs, rhs) {
+                    (Some(lhs), Some(rhs)) => exprs::common_expr_type(Some(lhs), Some(rhs)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        ExprKind::Ternary {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let then_ty = infer_promoted_scalar_type(
+                then_branch,
+                prior_lets,
+                helpers,
+                extern_fns,
+                record_ids,
+            );
+            let else_ty = infer_promoted_scalar_type(
+                else_branch,
+                prior_lets,
+                helpers,
+                extern_fns,
+                record_ids,
+            );
+            match (then_ty, else_ty) {
+                (Some(then_ty), Some(else_ty)) => {
+                    exprs::common_expr_type(Some(then_ty), Some(else_ty))
+                }
+                _ => None,
+            }
+        }
+        ExprKind::Call { callee, .. } => {
+            let ExprKind::Ident(id) = &*callee.kind else {
+                return None;
+            };
+            if let Some(entry) = helpers.get(&id.name) {
+                let ty =
+                    helpers::ir_type_of_with_records(entry.decl.return_ty.as_ref(), record_ids);
+                return matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
+                    .then_some(ty);
+            }
+            extern_fns.get(&id.name).and_then(|(_, _, ty)| {
+                matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
+                    .then_some(ty.clone())
+            })
+        }
+        _ => None,
+    };
+
+    match inferred {
+        Some(IrType::Unknown) if exprs::ast_expr_contains_sized_literal(expr) => {
+            Some(IrType::SInt(None))
+        }
+        other => other,
+    }
 }
 
 /// Simple (last-segment) name of a `Named` type expression, if any.
