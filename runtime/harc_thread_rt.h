@@ -839,7 +839,7 @@ inline uint64_t harc_bits(const HarcWide<N>& value, uint32_t hi, uint32_t lo) {
     return out;
 }
 
-// ── Flattened `Vec<Bus, N>` / multi-lane port lane access ────────────
+// ── Packed DUT port lane / scalar bit access ─────────────────────────
 // A `Vec<Bus, N>` port (or any multi-lane bus port) flattens in
 // `arch build`'s SystemVerilog to a PACKED vector that Verilator
 // exposes as a single packed C++ scalar (`CData`/`SData`/`IData`/…):
@@ -849,10 +849,10 @@ inline uint64_t harc_bits(const HarcWide<N>& value, uint32_t hi, uint32_t lo) {
 //
 // Lane `i` lives at bits `[i*W +: W]`. The ARCH native sim, by contrast,
 // exposes the very same port as a true C++ array (`uint8_t m_ar_id[3]`),
-// where lane `i` is just `m_ar_id[i]`. The HARC source writes
-// `dut.m_ar_id[i]` for both; these helpers make that lower correctly
-// against either backend from the *same* generated C++ by branching on
-// whether the port type is array-indexable at compile time.
+// where lane `i` is just `m_ar_id[i]`. A native scalar `UInt<N>` port is
+// also a C++ integer, so its HARC bit-select `dut.scalar[i]` needs the
+// packed branch with W=1. These helpers lower both shapes correctly from
+// the same generated C++ by branching on the concrete C++ port type.
 //
 // `W` is the per-lane bit-width, supplied by the TB codegen from the SV
 // port shape (defaults to 1 for single-dimension lanes). The packed

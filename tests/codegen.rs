@@ -3,7 +3,7 @@
 //! `harc sim` invocation in `examples/`-driven scripts validates that.
 //! Here we just snapshot the C++ that comes out of `cpp_tb::emit`.
 
-use harc::codegen::{cpp_tb, merge};
+use harc::codegen::{cpp_tb, merge, tbir};
 use harc::parser::parse_source;
 
 fn compile_and_run_runtime_cpp(name: &str, body: &str) {
@@ -59,6 +59,36 @@ fn missing_test_is_a_clean_error() {
     let parsed = parse_source("transaction T\n  addr : uint<32>\nend transaction T").unwrap();
     let err = cpp_tb::emit(&parsed).unwrap_err();
     assert!(err.0.contains("no `test` declaration"));
+}
+
+#[test]
+fn arch_scalar_bit_select_uses_lane_helper_in_both_emitters() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let parsed = parse_source(include_str!("fixtures/lazy_message_calls_fail_test.harc"))
+        .expect("parse scalar bit-select fixture");
+    let merged = merge::merge_for_sim(vec![parsed], Some("LazyMessageCallsFailTest"))
+        .expect("merge selected test");
+
+    let scalar_widths = cpp_tb::dut_port_widths_from_files(
+        &[root.join("tests/dut/top_counter.arch")],
+        "Top",
+    );
+    let mut opts = cpp_tb::EmitOpts::default();
+    cpp_tb::add_arch_scalar_bit_lanes(&mut opts.vec_lane_widths, &scalar_widths);
+
+    let v1 = cpp_tb::emit_with_opts(&merged, opts.clone()).expect("v1 emits");
+    let prog = harc::ir::lower::lower_program(&merged).expect("TBIR lowers");
+    harc::ir::verify::verify_program(&prog).expect("TBIR verifies");
+    let tbir = tbir::emit(&prog, &merged, &opts).expect("TBIR emits");
+
+    assert!(
+        v1.contains("harc_rt::harc_vec_lane_read<1>(dut->count_out"),
+        "v1 must lower the scalar bit-select"
+    );
+    assert!(
+        tbir.contains("harc_rt::harc_vec_lane_read<1>"),
+        "TBIR must lower the scalar bit-select"
+    );
 }
 
 #[test]

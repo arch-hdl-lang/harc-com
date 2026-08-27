@@ -188,6 +188,22 @@ pub fn dut_port_widths_from_files(
     out
 }
 
+/// Add scalar ARCH DUT ports to the packed-lane table as one-bit lanes.
+///
+/// The native ARCH model exposes `UInt<N>`/`SInt<N>` ports as C++ integer
+/// scalars, so a HARC bit-select must use `harc_vec_lane_{read,write}<1>`
+/// rather than raw `operator[]`. `scalar_port_widths` comes from
+/// [`dut_port_widths_from_files`], which deliberately excludes unpacked Vec
+/// and bus ports; those must keep their existing direct-array lowering.
+pub fn add_arch_scalar_bit_lanes(
+    lane_widths: &mut std::collections::HashMap<String, u32>,
+    scalar_port_widths: &std::collections::HashMap<String, u32>,
+) {
+    for name in scalar_port_widths.keys() {
+        lane_widths.entry(name.clone()).or_insert(1);
+    }
+}
+
 fn collect_port_widths_from_src(
     src: &str,
     top: &str,
@@ -195,53 +211,90 @@ fn collect_port_widths_from_src(
 ) -> bool {
     let mut in_top = false;
     let mut found_top = false;
+    let mut pending_port = String::new();
     for raw in src.lines() {
         let line = raw.split("//").next().unwrap_or(raw).trim();
         if let Some(rest) = line.strip_prefix("module ") {
             in_top = rest.split_whitespace().next() == Some(top);
             found_top |= in_top;
+            pending_port.clear();
             continue;
         }
         if line.starts_with("end module") {
+            if in_top && !pending_port.is_empty() {
+                collect_scalar_port_width_from_decl(&pending_port, out);
+            }
+            pending_port.clear();
             in_top = false;
             continue;
         }
         if !in_top {
             continue;
         }
-        let Some(rest) = line.strip_prefix("port ") else {
-            continue;
-        };
-        let Some(colon) = rest.find(':') else {
-            continue;
-        };
-        let name = rest[..colon].trim();
-        if name.is_empty() || !is_simple_ident(name) {
-            continue;
+        if pending_port.is_empty() {
+            if !line.starts_with("port ") {
+                continue;
+            }
+            pending_port.push_str(line);
+        } else if !line.is_empty() {
+            pending_port.push(' ');
+            pending_port.push_str(line);
         }
-        let after_colon = rest[colon + 1..].trim();
-        let ty_tail = if let Some(t) = after_colon.strip_prefix("in ") {
-            t
-        } else if let Some(t) = after_colon.strip_prefix("out ") {
-            t
-        } else {
-            // Bus perspectives flatten to multiple physical signals; their
-            // widths come from the generated SV table when that path is used.
-            continue;
-        };
-        let ty_tail = ty_tail.split(';').next().unwrap_or(ty_tail).trim();
-        let ty_str = leading_arch_type_str(ty_tail);
-        let ty_str = outer_element_type_str(&ty_str, "pipe_reg").unwrap_or(ty_str);
-        let Ok(ty) = crate::parser::parse_type_expr_fragment(&ty_str) else {
-            continue;
-        };
-        let width = concrete_port_type_bit_width(&ty)
-            .or_else(|| scalar_port_type_has_unresolved_width(&ty).then_some(u32::MAX));
-        if let Some(width) = width {
-            out.entry(name.to_string()).or_insert(width);
+        while let Some(end) = pending_port.find(';') {
+            let decl = pending_port[..=end].to_string();
+            let tail = pending_port[end + 1..].trim_start().to_string();
+            collect_scalar_port_width_from_decl(&decl, out);
+            pending_port = tail;
+            // A physical line may contain several valid `port ...;`
+            // declarations. Anything else after a completed declaration is
+            // module body text, not a continuation of port metadata.
+            if !pending_port.is_empty() && !pending_port.starts_with("port ") {
+                pending_port.clear();
+                break;
+            }
         }
     }
     found_top
+}
+
+fn collect_scalar_port_width_from_decl(
+    decl: &str,
+    out: &mut std::collections::HashMap<String, u32>,
+) {
+    let Some(rest) = decl.strip_prefix("port ") else {
+        return;
+    };
+    // Legacy registered outputs spell the declaration `port reg q:`.
+    // `reg` is storage metadata, not part of the port name.
+    let rest = rest.strip_prefix("reg ").unwrap_or(rest);
+    let Some(colon) = rest.find(':') else {
+        return;
+    };
+    let name = rest[..colon].trim();
+    if name.is_empty() || !is_simple_ident(name) {
+        return;
+    }
+    let after_colon = rest[colon + 1..].trim();
+    let ty_tail = if let Some(t) = after_colon.strip_prefix("in ") {
+        t
+    } else if let Some(t) = after_colon.strip_prefix("out ") {
+        t
+    } else {
+        // Bus perspectives flatten to multiple physical signals; their
+        // widths come from the generated SV table when that path is used.
+        return;
+    };
+    let ty_tail = ty_tail.split(';').next().unwrap_or(ty_tail).trim();
+    let ty_str = leading_arch_type_str(ty_tail);
+    let ty_str = outer_element_type_str(&ty_str, "pipe_reg").unwrap_or(ty_str);
+    let Ok(ty) = crate::parser::parse_type_expr_fragment(&ty_str) else {
+        return;
+    };
+    let width = concrete_port_type_bit_width(&ty)
+        .or_else(|| scalar_port_type_has_unresolved_width(&ty).then_some(u32::MAX));
+    if let Some(width) = width {
+        out.entry(name.to_string()).or_insert(width);
+    }
 }
 
 fn leading_arch_type_str(ty_tail: &str) -> String {
@@ -507,16 +560,14 @@ pub struct EmitOpts {
     /// barrier sync per posedge. Off → all coroutines share `sched`
     /// and tick cooperatively in the main thread.
     pub mt: bool,
-    /// Map of DUT top-module port-name → per-lane bit-width for ports
-    /// that flatten to a PACKED SystemVerilog vector (a `Vec<Bus, N>`
-    /// or any multi-lane bus port). Populated from the `--sv` DUT port
-    /// table (see `vec_lane_widths_from_sv`). When a HARC `dut.port[i]`
-    /// index targets a port in this map, the codegen routes through
-    /// `harc_rt::harc_vec_lane_{read,write}<W>` so the lane access works
-    /// against Verilator's packed scalar (bit-extract) as well as the
-    /// ARCH native sim's C++ array (direct index). Empty on the `--dut`
-    /// path — there the existing direct `port[i]` array indexing is
-    /// already correct.
+    /// Map of DUT top-module port-name → per-lane bit-width for packed
+    /// accesses. Populated from the `--sv` DUT port table for packed
+    /// multi-lane ports (see `vec_lane_widths_from_sv`) and from scalar
+    /// `.arch`/`.archi` ports with lane width 1. When a HARC
+    /// `dut.port[i]` index targets a port in this map, the codegen routes
+    /// through `harc_rt::harc_vec_lane_{read,write}<W>` so the access works
+    /// against both Verilator packed scalars and ARCH native scalar ports.
+    /// True unpacked Vec ports are absent and retain direct array indexing.
     pub vec_lane_widths: std::collections::HashMap<String, u32>,
     /// Total packed width of each DUT top-module port discovered from `--sv`.
     /// Coverpoint schemas lower before a DUT interface is available, so this
@@ -21527,16 +21578,15 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
         }
     }
 
-    /// If `e` is an index into a DUT port that flattens to a packed
-    /// multi-lane SV vector (i.e. `dut.<port>[i]` with `<port>` recorded
-    /// in `vec_lane_widths`), return `(port-name, lane-width, &index)`.
+    /// If `e` indexes a packed DUT port (i.e. `dut.<port>[i]` with
+    /// `<port>` recorded in `vec_lane_widths`), return
+    /// `(port-name, lane-width, &index)`.
     /// Used to route the lane access through the backend-agnostic
     /// `harc_rt::harc_vec_lane_*` helpers instead of a raw C++ subscript
-    /// (which only works on the ARCH native sim's array port, not on
-    /// Verilator's packed scalar). Returns `None` for any other shape —
-    /// including indexing a true unpacked-`Vec` port (those aren't in the
-    /// map; their direct `port[i]` array index is correct on both
-    /// backends).
+    /// (which does not work on an ARCH native scalar or Verilator packed
+    /// scalar). Returns `None` for any other shape, including indexing a
+    /// true unpacked-`Vec` port (those aren't in the map; direct
+    /// `port[i]` array indexing is correct on both backends).
     fn dut_packed_lane<'e>(&self, e: &'e Expr) -> Option<(String, String, u32, &'e Expr)> {
         let ExprKind::Index { target, index } = &*e.kind else {
             return None;
@@ -21555,18 +21605,18 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
             return None;
         }
         // The map is keyed by top-module DUT port names (from the `--sv`
-        // port table); only the DUT pointer's ports can match.
+        // port table and scalar `.arch`/`.archi` interface); only the DUT
+        // pointer's ports can match.
         let w = *self.vec_lane_widths.get(&port.name)?;
         Some((root_id.name.clone(), port.name.clone(), w, index))
     }
 
     fn emit_signal_assignment(&mut self, target: &Expr, value: &Expr, depth: usize) {
-        // Packed multi-lane `Vec<Bus>` port lane write: `dut.<port>[i] =
-        // expr`. On the `--sv` (Verilator) backend `<port>` is a single
-        // packed scalar, so a raw `dut-><port>[i] = …` subscript won't
-        // compile; route through `harc_vec_lane_write<W>` which bit-
-        // deposits the lane (and still array-indexes the ARCH native sim
-        // port via `if constexpr`). See `vec_lane_widths_from_sv`.
+        // Packed DUT lane/bit write: `dut.<port>[i] = expr`. A raw C++
+        // subscript does not compile for either Verilator packed scalars or
+        // ARCH native scalar ports; route through
+        // `harc_vec_lane_write<W>`, which deposits into a packed value and
+        // still array-indexes true array ports via `if constexpr`.
         if let Some((root, port, w, index)) = self.dut_packed_lane(target) {
             write!(
                 self.out,
@@ -22082,12 +22132,11 @@ writeln!(self.out, "// Auto-generated by harc — do not edit.").ok();
                 }
             }
             ExprKind::Index { target, index } => {
-                // Packed multi-lane `Vec<Bus>` port lane read:
-                // `dut.<port>[i]`. On Verilator `<port>` is a packed
-                // scalar, so a raw `dut-><port>[i]` subscript won't
-                // compile; route the lane read through
-                // `harc_vec_lane_read<W>` (bit-extract on the packed
-                // scalar, direct index on the ARCH native sim array).
+                // Packed DUT lane/bit read: `dut.<port>[i]`. A raw C++
+                // subscript does not compile for either Verilator packed
+                // scalars or ARCH native scalar ports; route through
+                // `harc_vec_lane_read<W>` (bit-extract on a packed value,
+                // direct index on a true array).
                 // Only fires for ports recorded in `vec_lane_widths`
                 // (built from the `--sv` port table) — genuine
                 // unpacked-`Vec` ports and wide-signal `VlWide` word
@@ -26900,20 +26949,41 @@ end bus B"#,
     // ── DUT-port-level override ingestion (fix/bus-port-override-from-archi) ──
 
     use super::{
-        bus_param_env_with_port_override, collect_port_overrides_from_src,
-        collect_port_widths_from_src, dut_bus_port_overrides_from_files,
-        dut_port_widths_from_files,
+        add_arch_scalar_bit_lanes, bus_param_env_with_port_override,
+        collect_port_overrides_from_src, collect_port_widths_from_src,
+        dut_bus_port_overrides_from_files, dut_port_widths_from_files,
     };
 
     #[test]
     fn concrete_arch_scalar_port_widths_are_ingested() {
-        let archi = "module M\n  port clk: in Clock<SysDomain>;\n  port data: out UInt<1024>;\n  port flag: in Bool;\n  port symbolic: out UInt<WIDTH>;\n  port bus: target SomeBus;\nend module M\n";
+        let archi = "module M\n  port clk: in Clock<SysDomain>;\n  port data: out UInt<1024>;\n  port flag: in Bool;\n  port symbolic: out UInt<WIDTH>;\n  port reg legacy: out UInt<8>;\n  port multiline:\n    out UInt<16>;\n  port same_a: in Bool; port same_q: out UInt<8>;\n  port bus: target SomeBus;\nend module M\n";
         let mut widths = std::collections::HashMap::new();
         collect_port_widths_from_src(archi, "M", &mut widths);
         assert_eq!(widths.get("data"), Some(&1024));
         assert_eq!(widths.get("flag"), Some(&1));
         assert_eq!(widths.get("symbolic"), Some(&u32::MAX));
+        assert_eq!(widths.get("legacy"), Some(&8));
+        assert_eq!(widths.get("multiline"), Some(&16));
+        assert_eq!(widths.get("same_a"), Some(&1));
+        assert_eq!(widths.get("same_q"), Some(&8));
         assert_eq!(widths.get("bus"), None);
+    }
+
+    #[test]
+    fn arch_scalar_ports_become_one_bit_lane_accesses() {
+        let archi = "module Top\n  port count_out: out UInt<8>;\n  port symbolic: out UInt<WIDTH>;\n  port lanes: out Vec<UInt<8>, 4>;\n  port bus: target SomeBus;\nend module Top\n";
+        let mut scalar_widths = std::collections::HashMap::new();
+        collect_port_widths_from_src(archi, "Top", &mut scalar_widths);
+
+        let mut lanes = std::collections::HashMap::new();
+        lanes.insert("already_scanned".to_string(), 8);
+        add_arch_scalar_bit_lanes(&mut lanes, &scalar_widths);
+
+        assert_eq!(lanes.get("count_out"), Some(&1));
+        assert_eq!(lanes.get("symbolic"), Some(&1));
+        assert_eq!(lanes.get("lanes"), None);
+        assert_eq!(lanes.get("bus"), None);
+        assert_eq!(lanes.get("already_scanned"), Some(&8));
     }
 
     #[test]
