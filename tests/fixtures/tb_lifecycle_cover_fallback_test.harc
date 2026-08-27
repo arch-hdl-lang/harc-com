@@ -1,0 +1,33 @@
+// #619 M4 hardening Phase B: a concurrent `cover` inside a reusable
+// testbench lifecycle mints per-test side-table state. ShareScan must reject
+// sharing for the whole testbench, leaving the historical per-test inline
+// lifecycle with no TestbenchLifecycle ownership functions.
+
+testbench CoverLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 0
+        dut.en = 0
+    end setup
+
+    check
+        cover dut.count_out == expected
+        assert dut.count_out == expected
+            else fail("cover lifecycle: count=${dut.count_out} exp=${expected}")
+        log(info, "cover lifecycle ShareScan fallback passed")
+    end check
+end testbench CoverLifecycleTb
+
+impl CoverLcA for CoverLifecycleTb
+    run
+        expected = 0
+    end run
+end impl CoverLcA
+
+impl CoverLcB for CoverLifecycleTb
+    run
+        expected = 0
+    end run
+end impl CoverLcB

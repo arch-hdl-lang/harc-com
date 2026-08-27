@@ -567,7 +567,8 @@ pub(super) enum LifecycleEmit {
 ///
 /// Terminators then decide Plain vs Coro vs re-inline:
 ///   * `Jump`/`Branch`/`Return` — pure control flow; neither suspends nor
-///     reaches the frame.
+///     reaches the frame after every expression operand has passed the
+///     frame-local scan below.
 ///   * `WaitCycles(None)`/`WaitUntil`/`WaitUntilTimeout` — suspend on the
 ///     shared `_slot` only → force the `Coro` variant.
 ///   * `Randomize` — an `harc_rng`-global Z3 solve that an out-of-line body
@@ -585,6 +586,9 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
     let mut suspends = false;
     for b in &func.blocks {
         if !b.stmts.iter().all(stmt_out_of_line_safe) {
+            return None;
+        }
+        if terminator_rvalue_reaches_frame_local(&b.terminator) {
             return None;
         }
         match &b.terminator {
@@ -617,6 +621,36 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
     } else {
         LifecycleEmit::Plain
     })
+}
+
+/// A terminator may carry the same frame-local host-state reads as a
+/// whitelisted statement. These operands are emitted inside the out-of-line
+/// lifecycle body (branch conditions, wait counts/predicates, and fatal
+/// formatting), so scan them exhaustively before classifying the body.
+fn terminator_rvalue_reaches_frame_local(t: &Terminator) -> bool {
+    match t {
+        Terminator::Jump(_)
+        | Terminator::WaitTimePs(..)
+        | Terminator::Randomize { .. }
+        | Terminator::Return
+        | Terminator::TbLifecycleCall { .. } => false,
+        Terminator::Branch(cond, ..)
+        | Terminator::WaitCycles(cond, ..)
+        | Terminator::WaitCyclesSync(cond, ..) => expr_reaches_frame_local(cond),
+        Terminator::WaitUntil { preds, .. } => preds
+            .iter()
+            .any(|pred| expr_reaches_frame_local(&pred.expr)),
+        Terminator::WaitUntilTimeout { preds, cycles, .. } => {
+            expr_reaches_frame_local(cycles)
+                || preds
+                    .iter()
+                    .any(|pred| expr_reaches_frame_local(&pred.expr))
+        }
+        Terminator::Fatal(args) => args
+            .args
+            .iter()
+            .any(|arg| expr_reaches_frame_local(&arg.expr)),
+    }
 }
 
 /// Whitelist of `Stmt` kinds whose emission touches only `ctx`-reachable
@@ -659,6 +693,7 @@ fn stmt_out_of_line_safe(s: &Stmt) -> bool {
             | Stmt::TbQueuePush { .. }
             | Stmt::TbQueuePop { .. }
             | Stmt::Log { .. }
+            | Stmt::FailDiag { .. }
             | Stmt::AssertCheck { .. }
             | Stmt::AssumeCheck { .. }
     );
@@ -866,6 +901,10 @@ fn stmt_rvalue_reaches_frame_local(s: &Stmt) -> bool {
                 || expr_reaches_frame_local(value)
         }
         Stmt::Log { args, .. } => args.args.iter().any(|a| expr_reaches_frame_local(&a.expr)),
+        Stmt::FailDiag { guard, args } => {
+            guard.as_ref().is_some_and(expr_reaches_frame_local)
+                || args.args.iter().any(|a| expr_reaches_frame_local(&a.expr))
+        }
         Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
             expr_reaches_frame_local(cond)
                 || on_fail.args.iter().any(|a| expr_reaches_frame_local(&a.expr))
@@ -5221,6 +5260,39 @@ mod lifecycle_classifier_tests {
     }
 
     #[test]
+    fn wallclock_and_fatal_terminators_are_not_shareable() {
+        let wallclock = single_block_lifecycle(vec![], Terminator::WaitTimePs(10_000, BlockId(0)));
+        assert_eq!(
+            lifecycle_shareable_kind(&wallclock),
+            None,
+            "WaitTimePs reaches scheduler-time frame locals and must re-inline"
+        );
+
+        // No parser statement currently lowers to Terminator::Fatal:
+        // source-level `log(fatal, ...)` is Stmt::Log + Return. Keep the IR
+        // terminator's conservative fallback pinned in case it becomes
+        // source-reachable later.
+        let fatal = single_block_lifecycle(
+            vec![Stmt::Log {
+                level: LogLevel::Fatal,
+                args: crate::ir::FmtArgs {
+                    fmt: "boom".to_string(),
+                    args: vec![],
+                },
+            }],
+            Terminator::Fatal(crate::ir::FmtArgs {
+                fmt: "boom".to_string(),
+                args: vec![],
+            }),
+        );
+        assert_eq!(
+            lifecycle_shareable_kind(&fatal),
+            None,
+            "a Fatal terminator must re-inline if it becomes source-reachable"
+        );
+    }
+
+    #[test]
     fn pure_helper_call_lifecycle_is_shareable_plain() {
         // A pure-helper call resolves to a file-scope symbol → safe to share.
         let call = Expr::Call(
@@ -5244,6 +5316,68 @@ mod lifecycle_classifier_tests {
                 scalar: "count".to_string(),
             },
             nested_path,
+        }
+    }
+
+    fn pred(expr: Expr) -> crate::ir::PredSrc {
+        crate::ir::PredSrc {
+            expr,
+            src_text: "direct.count".to_string(),
+        }
+    }
+
+    #[test]
+    fn frame_local_reads_in_terminator_operands_are_not_shareable() {
+        let literal = || Expr::Literal {
+            value: 1,
+            ty: IrType::UInt(Some(32)),
+        };
+        let cases = [
+            Terminator::Branch(
+                scoreboard_scalar_read(Some(vec!["direct".to_string()])),
+                BlockId(0),
+                BlockId(0),
+            ),
+            Terminator::WaitCycles(
+                scoreboard_scalar_read(Some(vec!["direct".to_string()])),
+                None,
+                BlockId(0),
+            ),
+            Terminator::WaitUntil {
+                preds: vec![pred(scoreboard_scalar_read(Some(vec![
+                    "direct".to_string()
+                ])))],
+                mode: crate::ir::WaitMode::Single,
+                succ: BlockId(0),
+            },
+            // Any-of timeout diagnostics have no FailDiag guard, so only the
+            // terminator predicate scan can reject this reachable shape.
+            Terminator::WaitUntilTimeout {
+                preds: vec![
+                    pred(scoreboard_scalar_read(Some(vec!["direct".to_string()]))),
+                    pred(literal()),
+                ],
+                mode: crate::ir::WaitMode::AnyOf,
+                cycles: literal(),
+                on_fire: BlockId(0),
+                on_timeout: BlockId(0),
+            },
+            Terminator::WaitUntilTimeout {
+                preds: vec![pred(literal())],
+                mode: crate::ir::WaitMode::Single,
+                cycles: scoreboard_scalar_read(Some(vec!["direct".to_string()])),
+                on_fire: BlockId(0),
+                on_timeout: BlockId(0),
+            },
+        ];
+
+        for terminator in cases {
+            let f = single_block_lifecycle(vec![], terminator);
+            assert_eq!(
+                lifecycle_shareable_kind(&f),
+                None,
+                "a frame-local terminator operand must force re-inline"
+            );
         }
     }
 
@@ -5275,6 +5409,24 @@ mod lifecycle_classifier_tests {
             None,
             "a bare-receiver scoreboard read in a lifecycle body must re-inline"
         );
+    }
+
+    #[test]
+    fn timeout_fail_diag_frame_local_guard_is_not_shareable() {
+        // WaitUntilTimeout diagnostics are otherwise safe to emit out of
+        // line, but their re-evaluated predicate guard can still read a
+        // run-frame-local receiver. The FailDiag whitelist must scan it.
+        let f = single_block_lifecycle(
+            vec![Stmt::FailDiag {
+                guard: Some(scoreboard_scalar_read(Some(vec!["direct".to_string()]))),
+                args: crate::ir::FmtArgs {
+                    fmt: "not ready".to_string(),
+                    args: vec![],
+                },
+            }],
+            Terminator::Return,
+        );
+        assert_eq!(lifecycle_shareable_kind(&f), None);
     }
 
     #[test]

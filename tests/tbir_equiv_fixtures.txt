@@ -222,6 +222,30 @@ tb_lifecycle_idle_read_test | Top | top_counter.sv | - | pass | - | - | IdleLcA
 tb_lifecycle_idle_read_test | Top | top_counter.sv | - | pass | - | - | IdleLcB
 tb_lifecycle_cast_read_test | Top | top_counter.sv | - | pass | - | - | CastLcOne
 tb_lifecycle_cast_read_test | Top | top_counter.sv | - | pass | - | - | CastLcTwo
+# #619 M4 hardening Phase B: lifecycle classifier decision-space coverage.
+# `wait_until` proves both WaitUntil and WaitUntilTimeout classify as shared
+# Coro bodies. `wallclock` is minted by ShareScan but must be re-inlined by the
+# out-of-line classifier. Source-level `log(fatal)` is an out-of-line-safe Log
+# statement (the parser-unreachable Fatal terminator is pinned in a unit test).
+# Statement-position `on` is rejected earlier by ShareScan because it carries
+# per-test context. `cover` is pinned by the ownership test only: deprecated v1
+# still has the separately tracked #690 orphan-counter build bug for a cover in
+# a lifecycle, so it cannot join this real-build equivalence registry. The fatal
+# rows deliberately fail; every other row must pass and all rows must remain
+# trace-identical between v1 and tbir.
+tb_lifecycle_wait_until_test | Top | top_counter.sv | - | pass | - | - | WaitUntilLcThree
+tb_lifecycle_wait_until_test | Top | top_counter.sv | - | pass | - | - | WaitUntilLcFive
+tb_lifecycle_wallclock_fallback_test | Top | top_counter.sv | - | pass | - | - | WallclockLcTwo
+tb_lifecycle_wallclock_fallback_test | Top | top_counter.sv | - | pass | - | - | WallclockLcFour
+tb_lifecycle_fatal_fallback_test | Top | top_counter.sv | - | fail | - | - | FatalLcA
+tb_lifecycle_fatal_fallback_test | Top | top_counter.sv | - | fail | - | - | FatalLcB
+tb_lifecycle_on_fallback_test | Top | top_counter.sv | - | pass | - | - | OnLcA
+tb_lifecycle_on_fallback_test | Top | top_counter.sv | - | pass | - | - | OnLcB
+# #619 M4 hardening Phase C: reusable native lifecycle coexists with a
+# per-test covergroup/report; also reused by VCD, MT, coverage-json, and cosim
+# gates so all feature interactions share one deterministic fixture.
+tb_lifecycle_coverage_test | Top | top_counter.sv | - | pass | - | - | LifecycleCoverageTwo
+tb_lifecycle_coverage_test | Top | top_counter.sv | - | pass | - | - | LifecycleCoverageFour
 scoreboard_basic_test | Top | top_counter.sv | - | pass
 scoreboard_data_queue_struct_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass

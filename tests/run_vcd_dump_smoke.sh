@@ -1,9 +1,11 @@
 #!/bin/bash
-# End-to-end smoke test for issue #477: a clocked testbench with an active
+# End-to-end waveform smoke test for issue #477 plus #619 M4 lifecycle
+# feature interactions. A clocked testbench with an active
 # `phase post_eval` transactor service, run under VCD tracing, must NOT
 # produce Verilator `previous dump at t=..., dump call ignored` warnings
 # (which mean a duplicate same-timestamp dump silently dropped the settled
-# post_eval state).
+# post_eval state). A reusable-testbench lifecycle also runs under VCD,
+# cooperative-vs-MT trace comparison, and functional coverage JSON.
 #
 # Run from harc-com repo root:
 #     ./tests/run_vcd_dump_smoke.sh
@@ -18,6 +20,10 @@ FIX_DIR="tests/fixtures"
 FIXTURE="post_eval_vcd_smoke_test"
 TOP="Top"
 SV="top_counter.sv"
+LIFECYCLE_FIXTURE="tb_lifecycle_coverage_test"
+LIFECYCLE_TEST="LifecycleCoverageFour"
+MT_LIFECYCLE_FIXTURE="tb_lifecycle_wait_setup_test"
+MT_LIFECYCLE_TEST="WaitSetupSix"
 
 if [ ! -x "$HARC" ]; then
     echo "Building harc..."
@@ -74,10 +80,96 @@ else
     status=1
 fi
 
+# 4. Native out-of-line reusable-testbench lifecycle under VCD. This is a
+# separate build because trace support changes Verilator compile flags.
+lc_vcd_out="$OUTDIR/lifecycle_vcd"
+lc_vcd_out_text="$("$HARC" sim \
+    --sv "$DUT_DIR/$SV" \
+    "$FIX_DIR/$LIFECYCLE_FIXTURE.harc" \
+    --top "$TOP" --test "$LIFECYCLE_TEST" \
+    --waves --wave-format vcd \
+    --outdir "$lc_vcd_out" 2>&1)"
+if [[ "$lc_vcd_out_text" == *"ALL TESTS PASSED"* ]]; then
+    echo "  PASS  lifecycle fixture passed under VCD"
+else
+    echo "  FAIL  lifecycle fixture did not pass under VCD"
+    echo "$lc_vcd_out_text" | tail -30 | sed 's/^/      /'
+    status=1
+fi
+lc_dup="$(echo "$lc_vcd_out_text" | grep -c "previous dump at t=")"
+if [ "$lc_dup" -eq 0 ]; then
+    echo "  PASS  lifecycle VCD has no duplicate-timestamp warnings"
+else
+    echo "  FAIL  lifecycle VCD produced $lc_dup duplicate-timestamp warning(s)"
+    status=1
+fi
+lc_vcd="$(find "$lc_vcd_out" -name '*.vcd' -size +0c 2>/dev/null | head -1)"
+if [ -n "$lc_vcd" ]; then
+    echo "  PASS  lifecycle produced a non-empty VCD ($(basename "$lc_vcd"))"
+else
+    echo "  FAIL  lifecycle produced no non-empty VCD"
+    status=1
+fi
+
+# 5. Actor-free CORO lifecycle is deterministic under --mt. Unlike the broad
+# MT sweep (verdict-only because actor ordering may vary), this fixture has no
+# actors, but its shared setup and teardown both suspend, so the cooperative
+# and MT semantic traces must match exactly across real lifecycle yield loops.
+lc_feature_out="$OUTDIR/lifecycle_features"
+lc_mt_outdir="$OUTDIR/lifecycle_mt_features"
+coop_trace="$OUTDIR/lifecycle_coop.jsonl"
+mt_trace="$OUTDIR/lifecycle_mt.jsonl"
+coop_out="$("$HARC" sim \
+    --sv "$DUT_DIR/$SV" \
+    "$FIX_DIR/$MT_LIFECYCLE_FIXTURE.harc" \
+    --top "$TOP" --test "$MT_LIFECYCLE_TEST" \
+    --record-trace "$coop_trace" \
+    --outdir "$lc_mt_outdir" 2>&1)"
+mt_out="$("$HARC" sim \
+    --sv "$DUT_DIR/$SV" \
+    "$FIX_DIR/$MT_LIFECYCLE_FIXTURE.harc" \
+    --top "$TOP" --test "$MT_LIFECYCLE_TEST" --mt \
+    --record-trace "$mt_trace" \
+    --outdir "$lc_mt_outdir" 2>&1)"
+if [[ "$coop_out" == *"ALL TESTS PASSED"* && "$mt_out" == *"ALL TESTS PASSED"* ]]; then
+    if trace_diff_out="$("$HARC" trace-diff "$coop_trace" "$mt_trace" 2>&1)"; then
+        echo "  PASS  actor-free Coro lifecycle cooperative trace == MT trace"
+    else
+        echo "  FAIL  actor-free Coro lifecycle cooperative/MT trace divergence"
+        echo "$trace_diff_out" | tail -30 | sed 's/^/      /'
+        status=1
+    fi
+else
+    echo "  FAIL  actor-free Coro lifecycle did not pass in cooperative and MT modes"
+    echo "$coop_out" | tail -15 | sed 's/^/      coop: /'
+    echo "$mt_out" | tail -15 | sed 's/^/      mt: /'
+    status=1
+fi
+
+# 6. Functional coverage JSON emitted from the bound test's covergroup while
+# the reusable setup/check lifecycle remains native and out of line.
+coverage_json="$OUTDIR/lifecycle_coverage.jsonl"
+coverage_out="$("$HARC" sim \
+    --sv "$DUT_DIR/$SV" \
+    "$FIX_DIR/$LIFECYCLE_FIXTURE.harc" \
+    --top "$TOP" --test "$LIFECYCLE_TEST" \
+    --coverage-json "$coverage_json" \
+    --outdir "$lc_feature_out" 2>&1)"
+if [[ "$coverage_out" == *"ALL TESTS PASSED"* ]] \
+    && [ -s "$coverage_json" ] \
+    && grep -q '"type":"covergroup"' "$coverage_json" \
+    && grep -q '"type":"coverpoint_bin"' "$coverage_json"; then
+    echo "  PASS  lifecycle functional coverage JSON contains summary and bin records"
+else
+    echo "  FAIL  lifecycle functional coverage JSON is missing or incomplete"
+    echo "$coverage_out" | tail -20 | sed 's/^/      /'
+    status=1
+fi
+
 echo
 if [ "$status" -eq 0 ]; then
-    echo "Result: VCD dup-dump smoke test passed"
+    echo "Result: VCD and lifecycle feature-interaction smoke test passed"
 else
-    echo "Result: VCD dup-dump smoke test FAILED"
+    echo "Result: VCD and lifecycle feature-interaction smoke test FAILED"
 fi
 exit "$status"

@@ -297,14 +297,15 @@ fn count_occurrences(hay: &str, needle: &str) -> usize {
 }
 
 #[test]
-fn m4b_suspending_setup_emitted_once_as_coroutine() {
+fn m4b_suspending_setup_and_teardown_emit_once_as_coroutines() {
     // #619 M4b (suspending slice): a bound testbench whose `setup` waits
     // DIRECTLY in the lifecycle body (`wait N cycles` → coroutine
     // WaitCycles, not the method-call WaitCyclesSync) is emitted OUT-OF-LINE
     // exactly ONCE as a `harc_rt::HarcThread` coroutine, and each binding
     // test drives it via the parent-drives-child loop
     // (`co_await harc_rt::harc_lifecycle_yield()`). The non-suspending
-    // `check` is emitted once as a plain `void` function. Two impls bind it.
+    // `check` is emitted once as a plain `void` function, and the suspending
+    // `teardown` is emitted once as a second coroutine. Two impls bind it.
     let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
     let cpp = with_switch(true, || {
         let prog = lower::lower_program(&merged).expect("lowers (switch on)");
@@ -334,6 +335,14 @@ fn m4b_suspending_setup_emitted_once_as_coroutine() {
         1,
         "non-suspending check must be emitted exactly once as a plain void function"
     );
+    assert_eq!(
+        count_occurrences(
+            &cpp,
+            "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Teardown("
+        ),
+        1,
+        "suspending teardown must be emitted exactly once as a HarcThread coroutine"
+    );
 
     // Two binding tests each drive the shared setup coroutine via the
     // parent-drives-child loop (start, yield-loop, destroy).
@@ -347,14 +356,48 @@ fn m4b_suspending_setup_emitted_once_as_coroutine() {
     );
     assert_eq!(
         count_occurrences(&cpp, "co_await harc_rt::harc_lifecycle_yield();"),
-        2,
-        "each drive loop yields to the scheduler while re-driving the child"
+        4,
+        "setup and teardown drive loops both yield for each impl"
     );
     // Two call sites also invoke the shared check (plain call).
     assert_eq!(
         count_occurrences(&cpp, "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _tb);"),
         2,
         "both impls' check coroutines call the shared check function"
+    );
+    assert_eq!(
+        count_occurrences(
+            &cpp,
+            "auto _lc_sub = _harc_lc__tb_lifecycle_WaitSetupTb_Teardown(ctx, _tb, _slot); _lc_sub.resume();"
+        ),
+        2,
+        "both impls' teardown coroutines drive the shared teardown coroutine"
+    );
+}
+
+#[test]
+fn m4b_plain_teardown_emits_once_and_is_called_by_both_impls() {
+    let merged = merged_fixture("tb_lifecycle_nowait_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+    assert_eq!(
+        count_occurrences(
+            &cpp,
+            "static void _harc_lc__tb_lifecycle_CounterNoWaitTb_Teardown("
+        ),
+        1,
+        "plain teardown must be defined once out of line"
+    );
+    assert_eq!(
+        count_occurrences(
+            &cpp,
+            "_harc_lc__tb_lifecycle_CounterNoWaitTb_Teardown(ctx, _tb);"
+        ),
+        2,
+        "both impls must call the shared plain teardown"
     );
 }
 
@@ -399,6 +442,8 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
     let merged = merged_fixture("tb_lifecycle_wait_setup_test.harc");
     let coro_sig = "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Setup(HarcTestContext";
     let check_sig = "void _harc_lc__tb_lifecycle_WaitSetupTb_Check(HarcTestContext";
+    let teardown_sig =
+        "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitSetupTb_Teardown(HarcTestContext";
 
     let (iface, common, shards) = with_switch(true, || {
         let prog = lower::lower_program(&merged).expect("lowers (switch on)");
@@ -438,6 +483,11 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
         1,
         "the non-suspending check must be DEFINED exactly once in common.cpp"
     );
+    assert_eq!(
+        count_occurrences(&common, &format!("{teardown_sig}& ctx")),
+        1,
+        "the suspending teardown must be DEFINED exactly once in common.cpp"
+    );
 
     // The header carries a prototype for each (so shards can call them).
     assert!(
@@ -448,10 +498,17 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
         iface.contains(&format!("{check_sig}& ctx, WaitSetupTb& _tb);")),
         "interface header must declare the check function prototype"
     );
+    assert!(
+        iface.contains(&format!(
+            "{teardown_sig}& ctx, WaitSetupTb& _tb, harc_rt::ThreadSlot* _slot);"
+        )),
+        "interface header must declare the teardown coroutine prototype"
+    );
 
     // NO shard defines or re-inlines the bodies; each shard CALLS them.
     let mut setup_drives = 0;
     let mut check_calls = 0;
+    let mut teardown_drives = 0;
     for (i, shard) in shards.iter().enumerate() {
         assert_eq!(
             count_occurrences(shard, coro_sig),
@@ -462,6 +519,11 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
             count_occurrences(shard, check_sig),
             0,
             "shard {i} must NOT define/redefine the shared check function"
+        );
+        assert_eq!(
+            count_occurrences(shard, teardown_sig),
+            0,
+            "shard {i} must NOT define/redefine the shared teardown coroutine"
         );
         // Re-inline would emit the named loop-switch comment; a call must not.
         assert!(
@@ -474,9 +536,18 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
         );
         check_calls +=
             count_occurrences(shard, "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _tb);");
+        teardown_drives += count_occurrences(
+            shard,
+            "_harc_lc__tb_lifecycle_WaitSetupTb_Teardown(ctx, _tb, _slot)",
+        );
     }
     assert_eq!(setup_drives, shards.len(), "every shard drives the shared setup coroutine");
     assert_eq!(check_calls, shards.len(), "every shard calls the shared check");
+    assert_eq!(
+        teardown_drives,
+        shards.len(),
+        "every shard drives the shared teardown coroutine"
+    );
 }
 
 #[test]
@@ -533,7 +604,9 @@ fn m4_a3_scoreboard_read_in_lifecycle_check_falls_back() {
     // frame locals emitted as a bare `direct.count`; the out-of-line ambient
     // prologue provides only `ctx`/`_tb`/`dut` + log lambdas, so an out-of-line
     // body referenced an undeclared `direct` — a real miscompile (`use of
-    // undeclared identifier 'direct'`). ShareScan still mints the shared
+    // undeclared identifier 'direct'`). The fixture also carries `direct`
+    // through untimed and timed-any-of wait terminators, pinning the same
+    // safety rule outside statements. ShareScan still mints the shared
     // TestbenchLifecycle (a scoreboard is not randomize side-table state), so
     // the out-of-line classifier is the sole gate: the check must fall back to
     // re-inline (no `_harc_lc..._Check` symbol). The v1==tbir build+trace-diff
@@ -637,6 +710,135 @@ fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
             body.contains("Gen(")
         });
     assert!(!leaked, "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def");
+}
+
+#[test]
+fn m4b_wait_until_lifecycle_bodies_emit_once_as_coroutines() {
+    let merged = merged_fixture("tb_lifecycle_wait_until_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+    for phase in ["Setup", "Check"] {
+        let symbol = format!(
+            "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}("
+        );
+        assert_eq!(
+            count_occurrences(&cpp, &symbol),
+            1,
+            "wait-until {phase} must be defined once as a coroutine"
+        );
+        let call = format!(
+            "_harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}(ctx, _tb, _slot)"
+        );
+        assert_eq!(
+            count_occurrences(&cpp, &call),
+            2,
+            "both impls must drive the shared wait-until {phase} coroutine"
+        );
+    }
+}
+
+#[test]
+fn m4b_coverage_interaction_lifecycle_stays_native_and_out_of_line() {
+    let merged = merged_fixture("tb_lifecycle_coverage_test.harc");
+    let cpp = with_switch(true, || {
+        let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+        verify::verify_program(&prog).expect("verifies (switch on)");
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
+    });
+    for phase in ["Setup", "Check"] {
+        let definition = format!(
+            "static void _harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}("
+        );
+        assert_eq!(
+            count_occurrences(&cpp, &definition),
+            1,
+            "coverage interaction {phase} must be defined once out of line"
+        );
+        let call = format!(
+            "_harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}(ctx, _tb);"
+        );
+        assert_eq!(
+            count_occurrences(&cpp, &call),
+            2,
+            "both coverage implementations must call the shared {phase}"
+        );
+    }
+}
+
+#[test]
+fn m4b_wallclock_wait_reinlines_but_source_fatal_log_shares() {
+    let wallclock = merged_fixture("tb_lifecycle_wallclock_fallback_test.harc");
+    let wallclock_cpp = with_switch(true, || {
+        let prog = lower::lower_program(&wallclock).expect("wallclock lowers");
+        verify::verify_program(&prog).expect("wallclock verifies");
+        tbir::emit(&prog, &wallclock, &cpp_tb::EmitOpts::default()).expect("wallclock emits")
+    });
+    assert_eq!(
+        count_occurrences(
+            &wallclock_cpp,
+            "_harc_lc__tb_lifecycle_WallclockLifecycleTb_Setup"
+        ),
+        0,
+        "WaitTimePs setup must re-inline because it reaches scheduler-time frame locals"
+    );
+    assert!(
+        wallclock_cpp.contains("_harc_lc__tb_lifecycle_WallclockLifecycleTb_Check"),
+        "the clean sibling check must still share out of line"
+    );
+
+    // The real source surface is `log(fatal, ...)`, which lowers as a fatal
+    // Log statement followed by Return. It is out-of-line safe; only the
+    // synthetic/parser-unreachable Terminator::Fatal is rejected by the
+    // classifier (pinned in func.rs).
+    let fatal = merged_fixture("tb_lifecycle_fatal_fallback_test.harc");
+    let fatal_cpp = with_switch(true, || {
+        let prog = lower::lower_program(&fatal).expect("fatal lowers");
+        verify::verify_program(&prog).expect("fatal verifies");
+        tbir::emit(&prog, &fatal, &cpp_tb::EmitOpts::default()).expect("fatal emits")
+    });
+    assert_eq!(
+        count_occurrences(
+            &fatal_cpp,
+            "static void _harc_lc__tb_lifecycle_FatalLifecycleTb_Check("
+        ),
+        1,
+        "source-level fatal Log lifecycle must be shared once as a plain function"
+    );
+    assert_eq!(
+        count_occurrences(
+            &fatal_cpp,
+            "_harc_lc__tb_lifecycle_FatalLifecycleTb_Check(ctx, _tb);"
+        ),
+        2,
+        "both impls must call the shared fatal Log lifecycle"
+    );
+}
+
+#[test]
+fn m4a_cover_and_statement_on_lifecycles_fall_back_in_share_scan() {
+    for fixture in [
+        "tb_lifecycle_cover_fallback_test.harc",
+        "tb_lifecycle_on_fallback_test.harc",
+    ] {
+        let merged = merged_fixture(fixture);
+        let prog = with_switch(true, || {
+            let prog = lower::lower_program(&merged).expect("lowers (switch on)");
+            verify::verify_program(&prog).expect("verifies (switch on)");
+            prog
+        });
+        assert_eq!(
+            lifecycle_fn_count(&prog),
+            0,
+            "{fixture}: ShareScan must reject per-test side-table/context state"
+        );
+        assert!(
+            !any_lifecycle_call(&prog),
+            "{fixture}: ShareScan fallback must leave no lifecycle call edges"
+        );
+    }
 }
 
 #[test]

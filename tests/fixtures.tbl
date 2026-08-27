@@ -50,6 +50,14 @@ testbench_basic_test    | Top            | top_counter.sv         | | | Testbenc
 testbench_basic_test    | Top            | top_counter.sv         | | | TestbenchMethodCallsMethod
 testbench_lifecycle_test | Top           | top_counter.sv         | | | LifecycleBumpThree
 testbench_lifecycle_test | Top           | top_counter.sv         | | | LifecycleBumpFive
+# #619 M4 lifecycle hardening: Plain + Coro lifecycle coverage is consumed by
+# both the direct fixture runner and its --cosim dpi wrapper.
+tb_lifecycle_nowait_test | Top            | top_counter.sv         | | | NoWaitBumpTwo
+tb_lifecycle_nowait_test | Top            | top_counter.sv         | | | NoWaitBumpFour
+tb_lifecycle_wait_setup_test | Top         | top_counter.sv         | | | WaitSetupSix
+tb_lifecycle_wait_setup_test | Top         | top_counter.sv         | | | WaitSetupTwo
+tb_lifecycle_coverage_test | Top           | top_counter.sv         | | | LifecycleCoverageTwo
+tb_lifecycle_coverage_test | Top           | top_counter.sv         | | | LifecycleCoverageFour
 width_methods_test      | Top            | top_counter.sv         |
 wide_cast_test          | Top            | top_counter.sv         |
 wide_record_test        | Top            | top_counter.sv         |

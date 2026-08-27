@@ -13,7 +13,10 @@ it, reproducing the shape that matters to split emission:
   * suite-global scaffolding (transaction records with `keep` constraints
     and a `randomize` site per test) so the run exercises the solver
     problem table and randomize snippets, which are built once per suite
-    and reused by every shard.
+    and reused by every shard;
+  * a bound reusable testbench with shared setup/check lifecycle bodies,
+    proving the common split layout emits lifecycle implementation once per
+    suite while every generated test shard calls it.
 
 Defaults give 352 tests / 11 shards at group size 32 — the same shape as
 the measurement recorded in harc#538.
@@ -45,10 +48,30 @@ def record(i):
     )
 
 
+def testbench():
+    return """\
+testbench SplitBench
+    dut : SplitAdder
+    lifecycle_seen : uint<32> default 0
+
+    setup
+        dut.a = 0
+        dut.b = 0
+        lifecycle_seen = 1
+        log(debug, "shared lifecycle benchmark body v1")
+    end setup
+
+    check
+        assert lifecycle_seen == 1
+            else fail("shared lifecycle setup did not run")
+    end check
+end testbench SplitBench
+"""
+
+
 def test(i, stmts, nrec):
     body = [
-        f"test B{i}",
-        "    let dut : SplitAdder",
+        f"impl B{i} for SplitBench",
         "    run",
         f"        let r : Rec{i % nrec}",
         "        randomize(r) with",
@@ -65,7 +88,7 @@ def test(i, stmts, nrec):
             "        wait 1 cycle",
             f"        assert dut.sum == {a + b}",
         ]
-    body += ["    end run", f"end test B{i}"]
+    body += ["    end run", f"end impl B{i}"]
     return "\n".join(body)
 
 
@@ -83,7 +106,8 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    parts = [record(r) for r in range(args.records)]
+    parts = [testbench()]
+    parts += [record(r) for r in range(args.records)]
     parts += [test(i, args.stmts, args.records) for i in range(args.tests)]
 
     harc_path = os.path.join(args.outdir, "suite.harc")
