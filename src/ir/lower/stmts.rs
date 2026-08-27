@@ -1430,7 +1430,12 @@ impl FuncBuilder<'_> {
                 // that would re-type every existing untyped getter
                 // local at once.
                 let inferred = declared_scalar_ty.clone().or_else(|| match &m.ret_ty {
-                    Some(ty @ (IrType::Record(_) | IrType::RecordSeq(_) | IrType::Seq(_))) => {
+                    Some(
+                        ty @ (IrType::Record(_)
+                        | IrType::RecordSeq(_)
+                        | IrType::Seq(_)
+                        | IrType::FixedVec { .. }),
+                    ) => {
                         Some(ty.clone())
                     }
                     Some(ty @ (IrType::UInt(Some(w)) | IrType::SInt(Some(w)))) if *w > 64 => {

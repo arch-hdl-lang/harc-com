@@ -9443,6 +9443,20 @@ former `transaction` group lives in
      control. Nested state-vector element access remains explicitly fenced;
      recursive dynamic lists are not part of this batch.
 
+156. **Fixed-vector component method returns (2026-08-27).**
+
+     Component and hookable methods may now return `Vec<T, N>` values. The
+     method schema and return slot retain the complete `IrType::FixedVec`,
+     explicit returns use the same whole-vector copy gate as component fields,
+     generated lambdas return the corresponding `std::array`, and untyped
+     call-result locals inherit the aggregate type. Verification checks schema
+     and function-return agreement, return-value shape, fixed-vector record
+     references, and component-call destination types. The registered
+     `component_fixed_vec_test` fixture covers a field return and a parameter
+     echo under both emitters with matching traces; TBIR tests also cover
+     record-element vectors and malformed return IR. Recursive dynamic-list
+     returns remain outside this batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

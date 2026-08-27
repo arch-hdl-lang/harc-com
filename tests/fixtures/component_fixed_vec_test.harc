@@ -22,6 +22,15 @@ scoreboard FixedTable
     hookable store_nested(index: uint<32>, value: uint<8>)
         bundle.kids[index].value = value
     end store_nested
+
+    hookable snapshot_words() -> Vec<uint<64>, 4>
+        return words
+    end snapshot_words
+
+    hookable echo_words(input: Vec<uint<64>, 4>) -> Vec<uint<64>, 4>
+        return input
+    end echo_words
+
 end scoreboard FixedTable
 
 testbench ComponentVecTb
@@ -42,6 +51,9 @@ impl ComponentVecTest for ComponentVecTb
         right.store(2, 0x5678)
         left.store_nested(1, 0x5a)
         right.store_nested(1, 0xa5)
+        let word_snapshot = left.snapshot_words()
+        let echoed_words = left.echo_words(word_snapshot)
+        assert echoed_words[2] == 0x1234 else fail("scalar-vector return lost element")
         assert left.bundle.kids[1].value == 0x5a else fail("left nested record-vector write failed")
         assert right.bundle.kids[1].value == 0xa5 else fail("right nested record-vector write failed")
         assert left.words[2] == 0x1234 else fail("right write aliased left value")

@@ -9988,6 +9988,9 @@ end impl T"#
     ] {
         let prog = lower_src(&seq_ret(ok))
             .unwrap_or_else(|e| panic!("`{ok}` lowers (v1 compiles it): {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|errs| {
+            panic!("`{ok}` keeps its legacy sequence-return classification: {errs:?}")
+        });
         // Not just "is accepted" — the local must carry the SEQUENCE
         // type. Accepting it is only half the fix and the weaker half:
         // an untyped local is waved through by the `Unknown` rule
@@ -42446,8 +42449,13 @@ end impl CT"#;
     value : uint<8>
 end transaction Beat
 scoreboard Returns
-    hookable unsupported_return() -> Vec<Beat, 4>
-    end unsupported_return
+    values : Vec<Beat, 4>
+    hookable snapshot() -> Vec<Beat, 4>
+        return values
+    end snapshot
+    hookable echo(input: Vec<Beat, 4>) -> Vec<Beat, 4>
+        return input
+    end echo
 end scoreboard Returns
 testbench RTb
     dut : Top
@@ -42455,11 +42463,24 @@ testbench RTb
 end testbench RTb
 impl RT for RTb
     run
+        let got = returns.snapshot()
+        let echoed = returns.echo(got)
+        assert echoed == got
         wait 1 cycle
     end run
 end impl RT"#;
-    let aggregate_return = lower_src(aggregate_return)
-        .expect("the existing aggregate-return fallback remains independently classified");
+    let aggregate_cpp = emit_cpp_src(aggregate_return);
+    assert!(
+        aggregate_cpp.contains("-> std::array<Beat, 4>"),
+        "{aggregate_cpp}"
+    );
+    assert!(
+        aggregate_cpp.contains("std::array<Beat, 4> got{};"),
+        "{aggregate_cpp}"
+    );
+    let aggregate_return =
+        lower_src(aggregate_return).expect("fixed-vector component return lowers");
+    verify::verify_program(&aggregate_return).expect("fixed-vector component return verifies");
     let method = aggregate_return
         .components
         .iter()
@@ -42467,13 +42488,115 @@ end impl RT"#;
         .unwrap()
         .methods
         .iter()
-        .find(|method| method.name == "unsupported_return")
+        .find(|method| method.name == "snapshot")
         .unwrap();
-    assert_eq!(method.ret_ty, Some(ir::IrType::Unknown));
+    let expected_return = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(0))),
+        len: 4,
+    };
+    assert_eq!(method.ret_ty, Some(expected_return.clone()));
     let function = &aggregate_return.functions[method.function.index()];
     assert_eq!(
         function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
-        Some(ir::IrType::Unknown)
+        Some(expected_return.clone())
+    );
+    let (caller, dest) = aggregate_return
+        .functions
+        .iter()
+        .find_map(|function| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::ComponentCall {
+                        method,
+                        dest: Some(dest),
+                        ..
+                    } if method == "snapshot" => Some((function.id, *dest)),
+                    _ => None,
+                })
+        })
+        .expect("fixture captures the vector return");
+    assert_eq!(
+        aggregate_return.functions[caller.index()].locals[dest.index()].ty,
+        expected_return,
+        "an untyped let inherits the method's fixed-vector return type"
+    );
+
+    let mut wrong_schema = aggregate_return.clone();
+    let snapshot_schema = wrong_schema
+        .components
+        .iter_mut()
+        .find(|component| component.name == "Returns")
+        .unwrap()
+        .methods
+        .iter_mut()
+        .find(|method| method.name == "snapshot")
+        .unwrap();
+    snapshot_schema.ret_ty = Some(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 4,
+    });
+    assert!(
+        verify::verify_program(&wrong_schema).is_err(),
+        "component method schemas reject invalid fixed-vector return records"
+    );
+
+    let mut wrong_dest = aggregate_return.clone();
+    wrong_dest.functions[caller.index()].locals[dest.index()].ty = ir::IrType::UInt(Some(8));
+    assert!(
+        verify::verify_program(&wrong_dest).is_err(),
+        "component-call destinations must match the fixed-vector return schema"
+    );
+
+    let mut unknown_dest = aggregate_return.clone();
+    unknown_dest.functions[caller.index()].locals[dest.index()].ty = ir::IrType::Unknown;
+    let unknown_dest_errs =
+        verify::verify_program(&unknown_dest).expect_err("Unknown fixed-vector destination fails");
+    assert!(
+        format!("{unknown_dest_errs:?}").contains(
+            "ComponentCall `snapshot` returns FixedVec"
+        ) && format!("{unknown_dest_errs:?}").contains("destination is Unknown"),
+        "fixed-vector component-call destinations cannot use the scalar Unknown escape: {unknown_dest_errs:?}"
+    );
+
+    let mut wrong_return_value = aggregate_return.clone();
+    let return_assign = wrong_return_value.functions[method.function.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::Assign(local, _) if Some(*local) == function.ret))
+        .expect("explicit return assigns the return slot");
+    let ir::Stmt::Assign(_, value) = return_assign else {
+        unreachable!()
+    };
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&wrong_return_value).is_err(),
+        "fixed-vector return slots reject scalar IR values"
+    );
+
+    let scalar_return = r#"scoreboard Returns
+    values : Vec<uint<8>, 4>
+    hookable snapshot() -> Vec<uint<8>, 4>
+        return 1
+    end snapshot
+end scoreboard Returns
+test T
+    let dut : Top
+    let returns : Returns
+    run
+        let got = returns.snapshot()
+    end run
+end test T"#;
+    let err = lower_src(scalar_return).expect_err("a scalar cannot satisfy a vector return");
+    assert!(
+        assert_invalid(&err).contains("matching whole-vector value"),
+        "{err}"
     );
 }
 

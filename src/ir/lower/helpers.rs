@@ -648,7 +648,23 @@ impl FuncBuilder<'_> {
         }
         if let Some(ret) = self.helper_ret {
             if let Some(e) = value {
-                let ir = self.lower_expr_no_ports(e)?;
+                let expected = self.local_type(ret).clone();
+                let ir = if let IrType::FixedVec { elem, len } = &expected {
+                    let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                        .map(|class| (*len, class));
+                    let value = match shape {
+                        Some(shape) => self.whole_vec_copy_rhs(shape, e)?,
+                        None => None,
+                    };
+                    value.ok_or_else(|| {
+                        LowerError::Invalid(
+                            "fixed-vector method return requires a matching whole-vector value"
+                                .to_string(),
+                        )
+                    })?
+                } else {
+                    self.lower_expr_no_ports(e)?
+                };
                 if self.scalar_helper_abi {
                     if self.record_id_of_expr(&ir).is_some() {
                         return Err(not_implemented(
@@ -658,7 +674,6 @@ impl FuncBuilder<'_> {
                             V1Status::EmitsUncompilable,
                         ));
                     }
-                    let expected = self.local_type(ret).clone();
                     self.check_slot_ir(&ir, &expected, "pure-helper return")?;
                 }
                 self.push(Stmt::Assign(ret, ir));
